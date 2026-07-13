@@ -1217,7 +1217,6 @@ export default function App() {
     setVoiceRecording("uploading");
     const form = new FormData();
     form.set("audio", blob, `voice-turn.${mimeType.includes("mp4") ? "m4a" : mimeType.includes("ogg") ? "ogg" : "webm"}`);
-    form.set("mimeType", mimeType);
     try {
       const response = await fetch(`/api/voice/${encodeURIComponent(roomId)}/turns`, { method: "POST", body: form, credentials: "same-origin" });
       const result = (await response.json()) as { ok: boolean; error?: string };

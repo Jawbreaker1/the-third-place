@@ -246,7 +246,7 @@ const parseVoiceTurnForm = async (request: Request): Promise<VoiceTurnForm> =>
     }
     const parser = Busboy({
       headers: request.headers,
-      limits: { fileSize: 6 * 1024 * 1024, files: 1, fields: 1, parts: 2, fieldSize: 256 },
+      limits: { fileSize: 6 * 1024 * 1024, files: 1, fields: 0, parts: 2, fieldSize: 256 },
     });
     let audio: Buffer | undefined;
     let mimeType = "";
@@ -277,6 +277,9 @@ const parseVoiceTurnForm = async (request: Request): Promise<VoiceTurnForm> =>
     });
     parser.on("filesLimit", () => {
       parseError = new VoiceSpeechError("Send one voice clip at a time.", 400, "TOO_MANY_AUDIO_FILES");
+    });
+    parser.on("fieldsLimit", () => {
+      parseError = new VoiceSpeechError("Voice turns accept one audio file and no text fields.", 400, "TOO_MANY_AUDIO_PARTS");
     });
     parser.on("partsLimit", () => {
       parseError = new VoiceSpeechError("Too many voice turn fields.", 400, "TOO_MANY_AUDIO_PARTS");
