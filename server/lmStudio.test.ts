@@ -153,6 +153,55 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain("counterexample, pointed question, practical consequence or respectful challenge");
     expect(prompt).not.toContain("normally 4–35 words");
   });
+
+  it("gives a sequential considered question responder the response limit and a compatible ending policy", () => {
+    const responder = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "ambient",
+      conversationMode: "considered",
+      consideredRole: "response",
+      consideredResponseRole: "question",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [responder],
+      history: [],
+      wordLimits: { [responder.id]: { minimum: 8, maximum: 24 } },
+    });
+
+    expect(prompt).toContain("response phase of a rare considered beat");
+    expect(prompt).toContain("writes 8–28 words");
+    expect(prompt).toContain("assigned question move");
+    expect(prompt).toContain("Required scene-role length: 8–24 words");
+    expect(prompt).toContain("End with exactly one precise, genuine question required by this scene role");
+    expect(prompt).not.toContain("45–75 word scene contract may override");
+    expect(prompt).not.toContain("do not ask a question in this message");
+  });
+
+  it("uses calmer sampling for quick and considered ambient scenes", async () => {
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const completionBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return completionResponse([]);
+    }));
+    const lm = new LmStudioClient();
+    const baseRequest: SceneRequest = {
+      kind: "ambient",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [sana],
+      history: [],
+      premise: "Compare deterministic orchestration with model-led routing.",
+    };
+
+    await expect(lm.generateScene(baseRequest)).resolves.toEqual([]);
+    await expect(lm.generateScene({ ...baseRequest, conversationMode: "considered" })).resolves.toEqual([]);
+
+    expect(completionBodies).toHaveLength(2);
+    expect(completionBodies[0]).toMatchObject({ temperature: 0.74, top_p: 0.88, repeat_penalty: 1.12 });
+    expect(completionBodies[1]).toMatchObject({ temperature: 0.72, top_p: 0.88, repeat_penalty: 1.12 });
+  });
 });
 
 describe("LM Studio one-pass humanizer", () => {
@@ -260,6 +309,32 @@ describe("LM Studio one-pass humanizer", () => {
     expect(lines.map((line) => line.content.split(/\s+/u).length)).toEqual([50, 18]);
   });
 
+  it("repairs a thin quick ambient contribution against its explicit scene-role minimum", async () => {
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const words = (prefix: string, count: number) => Array.from({ length: count }, (_, index) => `${prefix}${index}`).join(" ");
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return completionCalls === 1
+        ? completionResponse([{ personaId: sana.id, content: words("tunn", 4) }])
+        : completionResponse([{ personaId: sana.id, content: words("konkret", 12) }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [sana],
+      history: [],
+      mustReplyIds: [sana.id],
+      wordLimits: { [sana.id]: { minimum: 8, maximum: 24 } },
+    });
+
+    expect(completionCalls).toBe(2);
+    expect(lines[0]?.content.split(/\s+/u)).toHaveLength(12);
+  });
+
   it("repairs a high-severity illusion break once and preserves code and URLs", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     const completionBodies: Array<Record<string, unknown>> = [];
@@ -293,6 +368,15 @@ describe("LM Studio one-pass humanizer", () => {
     expect(JSON.stringify(completionBodies[1])).toContain("humanized_chat_lines");
     expect(JSON.stringify(completionBodies[1])).not.toContain("fetch(url)");
     expect(JSON.stringify(completionBodies[1])).not.toContain("https://example.com/docs");
+    const initialMessages = completionBodies[0]?.messages as Array<{ role: string; content: string }>;
+    const repairMessages = completionBodies[1]?.messages as Array<{ role: string; content: string }>;
+    const repairPayload = JSON.parse(repairMessages[1]!.content) as {
+      candidates: Array<{ stableVoice: string }>;
+    };
+    expect(initialMessages[0]?.content).toContain(repairPayload.candidates[0]?.stableVoice);
+    expect(repairPayload.candidates[0]?.stableVoice).toContain("Turn policy / emoji");
+    expect(repairPayload.candidates[0]?.stableVoice).toContain("Turn policy / habit");
+    expect(repairPayload.candidates[0]?.stableVoice).toContain("Turn policy / ending");
     expect(lines).toEqual([expect.objectContaining({
       personaId: sana.id,
       content: "testa `fetch(url)` mot https://example.com/docs först, felet brukar synas direkt",

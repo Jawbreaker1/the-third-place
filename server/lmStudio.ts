@@ -27,6 +27,11 @@ export interface TranscriptLine {
 export interface SceneRequest {
   kind: SceneKind;
   conversationMode?: "quick" | "considered";
+  /** Explicit phase for sequential considered beats; omitted keeps the legacy combined-scene contract. */
+  consideredRole?: "lead" | "response";
+  consideredResponseRole?: "challenge" | "example" | "question";
+  /** Trusted per-actor publication contract used by both the prompt and validator. */
+  wordLimits?: Record<string, { minimum: number; maximum: number }>;
   /** Mutable per-event budget shared by primary and focused retries; never serialized to the model. */
   humanizerBudget?: { repairsRemaining: number };
   channelId?: string;
@@ -205,6 +210,41 @@ const sanitizeObservationList = (values: string[], maxItems: number, maxLength: 
   return sanitized;
 };
 
+const sceneStyleTurnKey = (request: SceneRequest): string => {
+  const latestHistory = request.history.at(-1);
+  const event = request.trigger?.messageId
+    ?? (request.trigger ? `${request.trigger.author}\u0000${request.trigger.content}` : undefined)
+    ?? (latestHistory ? `${latestHistory.author}\u0000${latestHistory.createdAt}` : undefined)
+    ?? request.premise
+    ?? "empty-scene";
+  // This value is consumed only by the deterministic hash in personaStyle.
+  // It never enters a prompt or shared memory, and the room identity keeps the
+  // same words in two channels from coupling their style budgets.
+  return JSON.stringify({
+    kind: request.kind,
+    mode: request.conversationMode ?? "quick",
+    consideredRole: request.consideredRole ?? "combined",
+    responseRole: request.consideredResponseRole ?? "none",
+    room: request.channelId ?? request.channelName,
+    event,
+    actors: request.selected.map((persona) => persona.id),
+  });
+};
+
+const scenePersonaStyleNote = (request: SceneRequest, persona: Persona): string =>
+  buildPersonaStylePromptNote(persona, {
+    medium: request.kind === "voice" ? "voice" : "text",
+    turnKey: sceneStyleTurnKey(request),
+    endingOverride: request.conversationMode === "considered" && request.consideredRole === "response"
+      ? request.consideredResponseRole === "question" ? "question-required" : "statement"
+      : undefined,
+  });
+
+const consideredRoleFor = (request: SceneRequest, selectedIndex: number): "lead" | "response" | undefined => {
+  if (request.conversationMode !== "considered") return undefined;
+  return request.consideredRole ?? (selectedIndex === 0 ? "lead" : "response");
+};
+
 export const buildSceneSystemPrompt = (request: SceneRequest): string => {
   const profile = request.channelId ? getChannelProfile(request.channelId) : undefined;
   const roomFrame = profile
@@ -215,18 +255,30 @@ export const buildSceneSystemPrompt = (request: SceneRequest): string => {
   const cards = request.selected
     .map((persona, index) => {
       const expertise = request.actorExpertiseNotes?.[persona.id];
-      const style = buildPersonaStylePromptNote(persona, { medium: request.kind === "voice" ? "voice" : "text" });
-      const consideredOverride = request.conversationMode === "considered" && index === 0
+      const style = scenePersonaStyleNote(request, persona);
+      const wordLimit = request.wordLimits?.[persona.id];
+      const wordLimitNote = wordLimit
+        ? ` Required scene-role length: ${wordLimit.minimum}–${wordLimit.maximum} words.`
+        : "";
+      const consideredOverride = consideredRoleFor(request, index) === "lead"
         ? " For this rare considered lead turn only, the 45–75 word scene contract may override the ordinary style maximum; preserve every other style trait."
         : "";
-      return `- ${persona.id} (${persona.name}): ${persona.prompt} Interests: ${persona.interests.join(", ")}.${persona.connections ? ` Existing dynamics: ${persona.connections}` : ""}${expertise ? ` Room calibration: ${expertise}` : ""}\n${style}${consideredOverride}`;
+      return `- ${persona.id} (${persona.name}): ${persona.prompt} Interests: ${persona.interests.join(", ")}.${persona.connections ? ` Existing dynamics: ${persona.connections}` : ""}${expertise ? ` Room calibration: ${expertise}` : ""}${wordLimitNote}\n${style}${consideredOverride}`;
     })
     .join("\n");
   const required = request.mustReplyIds?.length
     ? `At least these directly addressed actors must answer: ${request.mustReplyIds.join(", ")}.`
     : "Silence is valid; do not make every candidate speak.";
   const consideredRules = request.conversationMode === "considered"
-    ? `
+    ? request.consideredRole === "lead"
+      ? `
+- This is the lead phase of a rare considered beat. The one selected actor writes 45–75 words with one concrete observation, causal mechanism, example or tension that gives the room something real to discuss.
+- Only the selected lead speaks. Keep it conversational rather than essay-like: no thesis framing, conclusion paragraph, headings, numbered structure or generic invitation for everyone to share their thoughts.`
+      : request.consideredRole === "response"
+        ? `
+- This is the response phase of a rare considered beat. The selected actor writes 8–28 words and responds directly to the latest AI transcript line with the assigned ${request.consideredResponseRole ?? "response"} move. Never paraphrase the lead or open a different topic.
+- Only the selected responder speaks. Keep the reply conversational: no headings, numbered structure, summary or generic invitation for everyone to share their thoughts.`
+        : `
 - This is a rare considered beat, not a normal quick reply. ${request.selected[0]?.name ?? "The first selected actor"} may write 45–75 words with one concrete observation, example or tension that gives the room something real to discuss.
 - Any other selected actor stays at 8–28 words and must add a genuinely different move: a counterexample, pointed question, practical consequence or respectful challenge. Never paraphrase the lead.
 - Keep it conversational rather than essay-like: no thesis framing, conclusion paragraph, headings, numbered structure or generic invitation for everyone to share their thoughts.`
@@ -539,8 +591,14 @@ export class LmStudioClient {
       return `Shorten the complete line to at most ${maximumCharacters} characters without cutting or changing any technical token; the rejected draft had ${line.content.length}.`;
     }
     const selectedIndex = request.selected.findIndex((candidate) => candidate.id === line.personaId);
+    const explicitWordLimit = request.wordLimits?.[line.personaId];
+    if (explicitWordLimit) {
+      return wordCount < explicitWordLimit.minimum || wordCount > explicitWordLimit.maximum
+        ? `Keep this scene role between ${explicitWordLimit.minimum} and ${explicitWordLimit.maximum} words; the rejected draft had ${wordCount}.`
+        : undefined;
+    }
     if (request.conversationMode === "considered") {
-      const [minimum, maximum] = selectedIndex === 0 ? [45, 75] : [8, 28];
+      const [minimum, maximum] = consideredRoleFor(request, selectedIndex) === "lead" ? [45, 75] : [8, 28];
       return wordCount < minimum || wordCount > maximum
         ? `Keep this scene role between ${minimum} and ${maximum} words; the rejected draft had ${wordCount}.`
         : undefined;
@@ -749,25 +807,34 @@ export class LmStudioClient {
           content: JSON.stringify({
             sceneType: request.kind,
             conversationMode: request.conversationMode ?? "quick",
+            consideredRole: request.consideredRole ?? "combined",
+            consideredResponseRole: request.consideredResponseRole ?? null,
+            wordLimits: request.wordLimits ?? {},
             room: request.channelName,
             premise: request.premise ?? "",
             candidates: prepared.map((entry) => ({
               personaId: entry.reviewed.line.personaId,
               actor: entry.reviewed.persona.name,
-              stableVoice: `${buildPersonaStylePromptNote(entry.reviewed.persona, {
-                medium: request.kind === "voice" ? "voice" : "text",
-              })}${
-                request.conversationMode === "considered" && request.selected[0]?.id === entry.reviewed.line.personaId
+              stableVoice: `${scenePersonaStyleNote(request, entry.reviewed.persona)}${
+                consideredRoleFor(
+                  request,
+                  request.selected.findIndex((candidate) => candidate.id === entry.reviewed.line.personaId),
+                ) === "lead"
                   ? "\nFor this rare considered lead only, the scene's 45–75 word range overrides the ordinary style maximum."
                   : ""
               }`,
               sceneRole: request.conversationMode === "considered"
-                ? request.selected[0]?.id === entry.reviewed.line.personaId
+                ? consideredRoleFor(
+                    request,
+                    request.selected.findIndex((candidate) => candidate.id === entry.reviewed.line.personaId),
+                  ) === "lead"
                   ? "considered lead: 45–75 words with one concrete observation, example or tension"
-                  : "considered responder: 8–28 words adding a counterexample, precise question, consequence or challenge"
-                : request.kind === "voice"
-                  ? `spoken reply: at most ${Math.min(25, entry.reviewed.persona.style.hardMaxWords)} words`
-                  : `ordinary chat: at most ${entry.reviewed.persona.style.hardMaxWords} words`,
+                  : `considered responder: 8–28 words adding the assigned ${request.consideredResponseRole ?? "counterexample, precise question, consequence or challenge"} move`
+                : request.wordLimits?.[entry.reviewed.line.personaId]
+                  ? `scene contribution: ${request.wordLimits[entry.reviewed.line.personaId]!.minimum}–${request.wordLimits[entry.reviewed.line.personaId]!.maximum} words`
+                  : request.kind === "voice"
+                    ? `spoken reply: at most ${Math.min(25, entry.reviewed.persona.style.hardMaxWords)} words`
+                    : `ordinary chat: at most ${entry.reviewed.persona.style.hardMaxWords} words`,
               rejectedDraft: entry.protectedDraft,
               failureCodes: entry.reviewed.assessment.reasonCodes,
               rewriteRequirements: entry.instruction,
@@ -918,9 +985,11 @@ export class LmStudioClient {
         { role: "system", content: this.systemPrompt(request) },
         { role: "user", content: JSON.stringify(this.sceneData(request)) },
       ],
-      temperature: request.kind === "dm" ? 0.78 : request.kind === "voice" ? 0.82 : request.conversationMode === "considered" ? 0.86 : 0.9,
-      top_p: 0.92,
-      repeat_penalty: 1.08,
+      temperature: request.kind === "ambient"
+        ? request.conversationMode === "considered" ? 0.72 : 0.74
+        : request.kind === "dm" ? 0.78 : request.kind === "voice" ? 0.82 : 0.9,
+      top_p: request.kind === "ambient" ? 0.88 : 0.92,
+      repeat_penalty: request.kind === "ambient" ? 1.12 : 1.08,
       max_tokens: effectiveMaxTokens,
       stream: false,
       ...(structured ? { response_format: responseFormat } : {}),
@@ -1024,6 +1093,9 @@ export class LmStudioClient {
     return {
       sceneType: request.kind,
       conversationMode: request.conversationMode ?? "quick",
+      consideredRole: request.consideredRole ?? "combined",
+      consideredResponseRole: request.consideredResponseRole ?? null,
+      wordLimits: request.wordLimits ?? {},
       room: request.channelName,
       premise: request.premise ?? "",
       triggeringEvent: request.trigger ?? null,
