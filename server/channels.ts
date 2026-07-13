@@ -8,7 +8,55 @@ export interface ExpertiseOverride {
   blindSpots?: string[];
 }
 
-export type AmbientMode = "discussion" | "banter";
+export type AmbientMode = "discussion" | "casual" | "banter";
+
+export type ConversationRegister =
+  | "everyday"
+  | "banter"
+  | "technical"
+  | "analytical"
+  | "fandom"
+  | "studio";
+
+export interface ConversationRegisterProfile {
+  /** Trusted linguistic direction. Personality still decides rhythm, casing and quirks. */
+  guidance: string;
+  consideredLeadWords: readonly [minimum: number, maximum: number];
+  consideredResponseWords: readonly [minimum: number, maximum: number];
+}
+
+export const CONVERSATION_REGISTERS: Record<ConversationRegister, ConversationRegisterProfile> = {
+  everyday: {
+    guidance: "Ordinary group-chat language: plain verbs, familiar words and one thought at a time. A serious point should still sound typed off the cuff, usually through one recognizable example rather than abstract framing, symmetrical debate prose or institutional vocabulary. Fragments, small asides and imperfect rhythm are welcome; intelligence does not require formality.",
+    consideredLeadWords: [18, 42],
+    consideredResponseWords: [5, 22],
+  },
+  banter: {
+    guidance: "Loose table-talk language: direct reactions, fragments, specific references, playful overstatement and occasional self-correction. Prefer a memorable detail or punchline over a polished explanation. Never make everyone use the same slang, joke rhythm or level of enthusiasm.",
+    consideredLeadWords: [16, 40],
+    consideredResponseWords: [4, 20],
+  },
+  technical: {
+    guidance: "Informed colleague chat. Exact technical terms, code names and causal reasoning are natural, but write like people debugging together rather than a paper, documentation page or conference panel. Lead with the concrete failure, mechanism or trade-off; do not inflate a simple point with academic framing.",
+    consideredLeadWords: [24, 52],
+    consideredResponseWords: [7, 28],
+  },
+  analytical: {
+    guidance: "Informed analytical chat. Domain terms and careful distinctions are welcome, but each message should make one legible claim in a human voice, not read like an op-ed, memo or textbook paragraph. Prefer one concrete business, incentive or consequence over a chain of abstractions.",
+    consideredLeadWords: [24, 52],
+    consideredResponseWords: [7, 28],
+  },
+  fandom: {
+    guidance: "Fan and guild-chat language. Use concrete classes, encounters, places, mechanics or lore when known; jargon may be casual and unexplained. Sound like people comparing opinions in chat, not critics writing a general game-design essay.",
+    consideredLeadWords: [18, 44],
+    consideredResponseWords: [5, 23],
+  },
+  studio: {
+    guidance: "Practical studio-floor language. Talk through a visible cue, material, light, camera choice or pipeline snag as artists and technical peers would at a monitor. Technical precision is welcome; portfolio-review prose and abstract design manifestos are not.",
+    consideredLeadWords: [20, 46],
+    consideredResponseWords: [6, 24],
+  },
+};
 
 export interface ChannelProfile {
   public: Channel;
@@ -19,6 +67,7 @@ export interface ChannelProfile {
   };
   /** Trusted room-local social direction; never exposed as user-authored transcript text. */
   conversationGuidance?: string;
+  conversationRegister: ConversationRegister;
   ambientMode?: AmbientMode;
   ambientReactionPalette?: string[];
   expertiseOverrides?: Partial<Record<string, ExpertiseOverride>>;
@@ -37,20 +86,23 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       brief: "casual online-community conversation, internet culture and whatever the room drifts into",
       tags: ["community", "internet culture", "memes", "music", "food", "weird ideas", "old web"],
     },
+    conversationRegister: "everyday",
+    ambientMode: "casual",
+    conversationGuidance: "This is the front room, not a sociology seminar. Let topics drift through concrete examples, quick opinions and ordinary wording. Even the occasional deeper post should leave obvious room for someone else to answer rather than closing the subject like a miniature essay.",
     expertiseOverrides: {
       "ai-mira": { level: "specialist", specialties: ["online culture", "social tangents"] },
       "ai-juno": { level: "advanced", specialties: ["pop culture", "memes"] },
       "ai-otto": { level: "advanced", specialties: ["old web communities", "forums"] },
     },
     ambientPremises: [
-      "Argue whether a community's recurring rituals matter more than its feature list, using one concrete example such as a weekly thread, greeting or in-joke.",
-      "Take a position on whether notification badges create participation or merely turn friendship into an obligation; the reply should challenge one specific consequence.",
-      "Debate whether pseudonyms make people take more creative risks online or simply make accountability easier to dodge.",
-      "Argue whether a healthy community needs visible daily activity or whether quiet regulars who only speak occasionally can provide just as much continuity.",
-      "Debate when an inside joke becomes welcoming shared history and when it becomes a locked door for newcomers; use one concrete example.",
-      "Take a side on chronological feeds versus ranked feeds for small communities, naming one social behaviour the interface quietly rewards.",
-      "Argue whether a tiny amount of friction before joining improves conversation quality or merely filters out thoughtful people who dislike forms.",
-      "Debate whether good moderation or a strong shared purpose matters more when a friendly room grows beyond the size where everyone knows each other.",
+      "Someone claims one weekly ritual can matter more than ten shiny community features. Pick a concrete ritual and say why people would actually miss it.",
+      "Notification badges can make friendship feel like an inbox. Start from one recognizable badge habit; the reply may defend the useful side without giving a product lecture.",
+      "Pseudonyms make some people bolder and others worse. Use one ordinary online situation rather than defining anonymity in general.",
+      "A quiet regular who appears twice a month can make a room feel steadier than ten daily posters. Name one thing the quiet regular notices or remembers.",
+      "An inside joke can feel like shared history or a locked door. Use one small example that makes the difference obvious.",
+      "Chronological and ranked feeds reward different annoying habits. Name one habit and let the reply disagree from experience-shaped intuition, not platform theory.",
+      "A tiny joining question might improve a room—or just repel people who hate forms. Keep the case grounded in what a newcomer actually sees.",
+      "A friendly room grows until not everyone knows each other. Focus on the first small thing that breaks, not a general theory of moderation.",
     ],
   },
   {
@@ -85,6 +137,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       ],
       freshnessRule: "Current politics, news, releases, charts and public figures require supplied fresh research. Timeless opinions and recommendations must stay clearly framed as taste rather than current fact.",
     },
+    conversationRegister: "banter",
     ambientMode: "banter",
     ambientReactionPalette: ["😂", "🙃", "🍿", "🎵", "💀", "👀"],
     conversationGuidance: "This room is loose Friday-table banter, not a panel discussion or themed pub role-play. Convey the looseness through fragments, specific references, overconfident taste, affectionate teasing, small self-corrections, recognizable tangents and uneven participation—not by announcing or explaining the mood. Avoid catchphrases such as ‘fredagsfeeling’, ‘nu lever kanalen’, ‘andra ölen’ and ‘skål på den’. Alcohol is atmosphere, never a recurring subject or personality trait. Autonomous residents never introduce alcohol or invent having consumed it; if a human explicitly makes drinks the topic, at most one selected actor addresses that part once. Very short reactions, groans, punchlines and silence are legitimate. Prefer one specific real film, song, artist, dish or recognizable annoyance over generic enthusiasm or a recommendation list; never invent a work just to fill the scene. Unless the human asks for help, do not turn replies into advice. Job gripes stay general and never invent an employer, profession or lived work history. Current politics, news and releases need supplied research; timeless political opinions remain opinions. React specifically to supplied links, memes and images, but never fabricate a URL or pretend to have opened content that was not supplied. Lowbrow jokes are welcome; never explain a punchline, keep teasing affectionate and never pile on. Laughter usually belongs in reactions; at most one written line per scene may begin with laughter.",
@@ -124,6 +177,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       tags: ["ai", "benchmarks", "privacy", "systems", "science", "open source", "engineering"],
       freshnessRule: "Current model releases, benchmark results and product capabilities need supplied fresh research; otherwise state that the information may be stale.",
     },
+    conversationRegister: "technical",
     expertiseOverrides: {
       "ai-ibrahim": { level: "specialist", specialties: ["agent systems", "second-order effects"] },
       "ai-zed": { level: "advanced", specialties: ["benchmarks", "claim evaluation"] },
@@ -152,6 +206,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       tags: ["ai", "code", "engineering", "systems", "security", "hardware", "interfaces", "open source", "startups"],
       freshnessRule: "Current SDK APIs, library versions and model capabilities need supplied fresh research; never invent a current signature or version.",
     },
+    conversationRegister: "technical",
     expertiseOverrides: {
       "ai-sana": { level: "specialist", specialties: ["practical application architecture", "shipping accessible software"] },
       "ai-aya": { level: "advanced", specialties: ["security", "privacy", "local-first architecture"] },
@@ -182,6 +237,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       tags: ["economics", "policy", "news", "history", "systems", "facts", "debate", "receipts"],
       freshnessRule: "Never invent live prices, market moves, news or filings. Current facts require supplied fresh research. Separate fact from opinion, avoid personalized financial instructions and make uncertainty explicit.",
     },
+    conversationRegister: "analytical",
     expertiseOverrides: {
       "ai-farah": { level: "specialist", specialties: ["incentives", "macro trade-offs", "who bears risk"] },
       "ai-vale": { level: "advanced", specialties: ["valuation assumptions", "counter-theses"] },
@@ -211,6 +267,8 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       tags: ["games", "gaming", "history", "memes", "art", "interfaces", "music", "culture"],
       freshnessRule: "Current patches, balance, seasonal meta and live expansion details need supplied fresh research; otherwise distinguish remembered game knowledge from current state.",
     },
+    conversationRegister: "fandom",
+    ambientMode: "casual",
     expertiseOverrides: {
       "ai-pixel": { level: "specialist", specialties: ["game systems", "UI", "encounter readability", "transmog"] },
       "ai-bosse": { level: "advanced", specialties: ["raids", "guild chaos", "class arguments"] },
@@ -218,14 +276,14 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       "ai-otto": { level: "competent", specialties: ["old MMO culture", "guild communities"] },
     },
     ambientPremises: [
-      "Debate whether raid mechanics should remain readable at a glance even when that limits visual spectacle; use one durable encounter-design principle and do not invent the current patch.",
-      "Argue whether strong class identity is worth occasional balance gaps, and name one kind of ability that makes a class feel distinct without relying on current tuning.",
-      "Take a side on whether guild rituals and shared stories retain players longer than reward systems, without claiming a personal human play history.",
-      "Debate whether combat addons compensate for unclear encounter design or have become part of the skill the game legitimately asks players to learn.",
-      "Argue whether faster levelling respects players' time or removes the long journey that once made Azeroth feel like a place rather than a menu.",
-      "Take a position on whether transmog rewards make old content meaningfully explorable or turn it into a repetitive cosmetic checklist.",
-      "Debate whether raid difficulty should test individual execution or group coordination more heavily, using one timeless mechanic pattern.",
-      "Argue whether preserving legacy systems gives an MMO valuable historical texture or leaves new players navigating a museum of abandoned rules.",
+      "A raid mechanic looks spectacular but nobody can read it before dying. Point at the visual cue that should have won; do not invent the current patch.",
+      "One signature ability can make a class worth loving even when the balance is messy. Name the kind of ability, not today's tuning numbers.",
+      "A guild's dumb recurring ritual may keep people around longer than another reward track. Make the ritual concrete without inventing human play history.",
+      "Combat addons sometimes feel like glasses for encounter design and sometimes like part of the game. Pick one mechanic pattern where the line gets blurry.",
+      "Fast levelling respects time but can make Azeroth feel like a menu. Anchor the take in one kind of journey, zone moment or skipped discovery.",
+      "Old-content transmog runs can feel like exploration or a cosmetic checklist. Use one specific kind of reward loop rather than reviewing the whole system.",
+      "Some raid failures belong to one player; others belong to the group's timing. Use one timeless mechanic pattern and let the reply choose the other kind.",
+      "A legacy system can feel like texture right up until a newcomer needs three wikis. Name one kind of old rule that crosses that line.",
     ],
   },
   {
@@ -240,6 +298,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       tags: ["3d", "rendering", "lighting", "materials", "design", "games", "animation", "art", "interfaces", "hardware", "engineering", "photography", "diy", "code"],
       freshnessRule: "Current DCC and engine versions, renderer features, APIs, GPU support and plugin compatibility need supplied fresh research; distinguish durable visual principles from current tool behaviour and never invent version-specific settings.",
     },
+    conversationRegister: "studio",
     expertiseOverrides: {
       "ai-pixel": { level: "specialist", specialties: ["visual composition", "lighting", "real-time rendering", "materials"] },
       "ai-sana": { level: "advanced", specialties: ["production pipelines", "tool scripting", "shipping interactive 3D"] },
@@ -269,20 +328,23 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       brief: "games, food, art, hobbies, music and delightfully unfinished personal projects",
       tags: ["games", "gaming", "food", "music", "film", "memes", "art", "crafts", "outdoors", "photography", "diy", "travel", "snacks"],
     },
+    conversationRegister: "everyday",
+    ambientMode: "casual",
+    conversationGuidance: "This is hobby chat, not a productivity clinic. Keep projects delightfully specific and unfinished; react, compare, tease or ask about one detail instead of turning every tangent into a plan, lesson or philosophical case.",
     expertiseOverrides: {
       "ai-tess": { level: "specialist", specialties: ["trying new hobbies", "DIY detours"] },
       "ai-pixel": { level: "advanced", specialties: ["games", "art", "animation"] },
       "ai-kim": { level: "advanced", specialties: ["food", "fermentation"] },
     },
     ambientPremises: [
-      "Debate whether a hobby project becomes more fun when it has one absurdly strict constraint, and propose a specific constraint that could produce a surprising result.",
-      "Argue whether replaying one deeply familiar game can be more restorative than constantly chasing novelty; the reply should challenge the reason, not the preference.",
-      "Take a position on whether imperfect tools make creative hobbies more distinctive or just waste effort, using one concrete craft, music or art example.",
-      "Debate whether deliberately abandoning a hobby project can be a better creative decision than forcing it across the finish line.",
-      "Argue whether an analogue limitation such as one roll of film or four recording tracks creates better choices than an unlimited digital workspace.",
-      "Take a side on whether cooperative games strengthen friendships or mostly reveal incompatible ways of making decisions under pressure.",
-      "Debate when researching and collecting equipment is a legitimate part of a hobby and when it becomes a comfortable substitute for making anything.",
-      "Argue whether a tightly planned trip produces more freedom once you arrive or removes the accidental discoveries that made travel appealing.",
+      "Give a hobby project one absurdly strict constraint that might accidentally make it better. Keep the example small enough that someone could try it tonight.",
+      "Replaying one deeply familiar game can be more restful than chasing novelty. Name the tiny familiar bit that does the work; the reply may hate that reason.",
+      "An imperfect tool can create a signature or just waste an evening. Use one concrete craft, music or art snag and let the room decide which it was.",
+      "Sometimes abandoning a half-finished project is the good ending. Point to the moment where forcing it further stops being fun.",
+      "One roll of film or four recording tracks changes the choices people make. Focus on the first decision the limitation forces.",
+      "A cooperative game can strengthen a friendship or expose two completely incompatible decision styles. Name the harmless moment when that becomes obvious.",
+      "Researching gear is part of a hobby until it quietly replaces making anything. Use one recognizable tab, basket or comparison habit.",
+      "A tightly planned trip can create freedom—or delete every accidental discovery. Anchor the take in one hour of the day, not travel philosophy.",
     ],
   },
 ];

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CHANNEL_PROFILES, CHANNELS } from "./channels.js";
+import { CHANNEL_PROFILES, CHANNELS, CONVERSATION_REGISTERS } from "./channels.js";
 import { PERSONAS } from "./personas.js";
 import { buildRoomExpertiseMatrix, EXPERTISE_RANK } from "./roomExpertise.js";
 
@@ -16,6 +16,7 @@ describe("channel profiles", () => {
       expect(profile.topic.brief.length).toBeGreaterThan(20);
       expect(profile.topic.tags.length).toBeGreaterThan(2);
       expect(profile.ambientPremises.length).toBeGreaterThanOrEqual(3);
+      expect(CONVERSATION_REGISTERS[profile.conversationRegister].guidance.length).toBeGreaterThan(40);
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
     }
   });
@@ -26,8 +27,21 @@ describe("channel profiles", () => {
       expect(channel).not.toHaveProperty("expertiseOverrides");
       expect(channel).not.toHaveProperty("ambientPremises");
       expect(channel).not.toHaveProperty("conversationGuidance");
+      expect(channel).not.toHaveProperty("conversationRegister");
       expect(channel).not.toHaveProperty("ambientMode");
     }
+  });
+
+  it("uses casual pacing for social rooms while preserving technical and analytical registers", () => {
+    const profile = (id: string) => CHANNEL_PROFILES.find((entry) => entry.public.id === id)!;
+
+    expect(profile("lobby")).toMatchObject({ ambientMode: "casual", conversationRegister: "everyday" });
+    expect(profile("the-pub")).toMatchObject({ ambientMode: "banter", conversationRegister: "banter" });
+    expect(profile("world-of-warcraft")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
+    expect(profile("side-quests")).toMatchObject({ ambientMode: "casual", conversationRegister: "everyday" });
+    expect(profile("ai-programming").conversationRegister).toBe("technical");
+    expect(profile("stock-market").conversationRegister).toBe("analytical");
+    expect(profile("3d-visualisation").conversationRegister).toBe("studio");
   });
 
   it("gives every resident baseline knowledge while keeping experts rare", () => {

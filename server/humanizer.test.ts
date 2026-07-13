@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  analyzeConversationRegister,
   assessCandidate,
   buildHumanizerRepairInstruction,
   compareHumanizerSimilarity,
+  conversationRegisterMismatch,
   HumanStyleMemory,
   protectTechnicalFragments,
   restoreTechnicalFragments,
@@ -115,6 +117,34 @@ describe("humanizer tone checks", () => {
     expect(result.severity).toBe("high");
     expect(result.acceptable).toBe(false);
   });
+
+  it("rejects the reported academic lobby paragraph without making technical rooms less capable", () => {
+    const text = "Spänningen ligger i att hög aktivitet ofta driver kortsiktig engagemangsmätning, medan de tysta stammisarna bygger den långsiktiga infrastrukturen. Om en plattform bara premierar dagligt brus riskerar man att förlora det institutionella minnet; utan de som dyker upp mer sällan men med tyngd, blir diskussionerna en serie isolerade händelser istället för en sammanhängande utveckling över tid.";
+    const lobby = assessCandidate({ personaId: "ai-ibrahim", text, register: "everyday" });
+    const programming = assessCandidate({ personaId: "ai-ibrahim", text, register: "technical" });
+
+    expect(lobby.reasonCodes).toContain("register_mismatch");
+    expect(lobby.severity).toBe("high");
+    expect(lobby.acceptable).toBe(false);
+    expect(programming.reasonCodes).not.toContain("register_mismatch");
+    expect(conversationRegisterMismatch(text, "everyday").mismatch).toBe(true);
+    expect(conversationRegisterMismatch(text, "analytical").mismatch).toBe(false);
+    expect(analyzeConversationRegister(text).structureSignals.length).toBeGreaterThanOrEqual(2);
+    expect(analyzeConversationRegister(text).abstractionSignals.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("asks the repair pass for everyday wording while preserving the actual thought", () => {
+    const result = assessCandidate({
+      personaId: "ai-ibrahim",
+      register: "everyday",
+      text: "The tension lies in rewarding short-term engagement while institutional infrastructure carries the long-term memory. If a platform optimizes only for daily noise, it risks losing continuity; without quieter regulars, coherent development becomes a sequence of isolated events.",
+    });
+    const instruction = buildHumanizerRepairInstruction(result);
+
+    expect(result.reasonCodes).toContain("register_mismatch");
+    expect(instruction).toContain("vardaglig chatt");
+    expect(instruction).toContain("Behåll tanken och intelligensen");
+  });
 });
 
 describe("humanizer false-positive guardrails", () => {
@@ -122,6 +152,24 @@ describe("humanizer false-positive guardrails", () => {
     for (const text of ["Absolut!", "nä, håller inte med", "haha exakt", "kör 🫡"]) {
       expect(assessCandidate({ personaId: "ai-a", text }).reasonCodes).toEqual([]);
     }
+  });
+
+  it("allows a longer concrete anecdote and an isolated formal term in an everyday room", () => {
+    const anecdote = "Vi hade en person som bara dök upp ibland, men hon mindes alltid vem som byggt vilken liten grej. När alla andra fastnade i samma gamla diskussion skrev hon typ två rader och plötsligt fattade vi varför beslutet såg så konstigt ut.";
+    const shortFormal = "Institutionellt minne spelar faktiskt roll här.";
+
+    expect(assessCandidate({ personaId: "ai-a", text: anecdote, register: "everyday" }).reasonCodes)
+      .not.toContain("register_mismatch");
+    expect(assessCandidate({ personaId: "ai-a", text: shortFormal, register: "everyday" }).reasonCodes)
+      .not.toContain("register_mismatch");
+  });
+
+  it("does not count code or URLs as academic-register evidence", () => {
+    const result = conversationRegisterMismatch(
+      "Jag klistrade in `institutional infrastructure while long-term engagement metrics` och länken https://example.com/structural-systemic-infrastructure; det är fortfarande bara ett kodexempel i chatten.",
+      "everyday",
+    );
+    expect(result.mismatch).toBe(false);
   });
 
   it("does not mistake shared technical terms for duplicate prose", () => {

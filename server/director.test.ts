@@ -10,6 +10,7 @@ import {
   consideredConversationLeadPremise,
   consideredConversationPremise,
   consideredConversationResponsePremise,
+  consideredConversationWordLimits,
   ensureEvidenceResponder,
   normalizeGeneratedMessageContent,
   selectAmbientLead,
@@ -150,8 +151,8 @@ describe("social director", () => {
     expect(premise).toContain("specific, defensible claim");
     expect(premise).toContain("counterexample or hidden cost");
     expect(premise).toContain("Exactly the selected residents speak in order");
-    expect(limits[lead.id]).toEqual({ minimum: 16, maximum: lead.style.hardMaxWords });
-    expect(limits[responder.id]).toEqual({ minimum: 8, maximum: 28 });
+    expect(limits[lead.id]).toEqual({ minimum: lead.style.typicalWords[0], maximum: lead.style.hardMaxWords });
+    expect(limits[responder.id]).toEqual({ minimum: responder.style.typicalWords[0] - 1, maximum: 28 });
   });
 
   it("turns the same machinery into short social banter for the pub", () => {
@@ -165,8 +166,28 @@ describe("social director", () => {
     expect(premise).toContain("countertake, adjacent recommendation, punchline");
     expect(premise).not.toContain("specific, defensible claim");
     expect(premise).not.toContain("counterexample or hidden cost");
-    expect(limits[lead.id]).toEqual({ minimum: 7, maximum: 28 });
-    expect(limits[responder.id]).toEqual({ minimum: 3, maximum: 22 });
+    expect(limits[lead.id]).toEqual({ minimum: lead.style.typicalWords[0], maximum: 26 });
+    expect(limits[responder.id]).toEqual({ minimum: 2, maximum: 20 });
+  });
+
+  it("uses an everyday, shorter contract in casual rooms without rewarding complexity as the house voice", () => {
+    const lead = PERSONAS.find((persona) => persona.id === "ai-ibrahim")!;
+    const responder = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const premise = ambientConversationPremise(
+      "A quiet regular remembers why the room made an odd decision.",
+      lead,
+      responder,
+      false,
+      false,
+      "casual",
+    );
+    const limits = ambientSceneWordLimits(lead, responder, false, "casual");
+
+    expect(premise).toContain("ordinary phrase, recognizable example or specific detail");
+    expect(premise).toContain("No miniature essay");
+    expect(premise).not.toContain("specific, defensible claim");
+    expect(limits[lead.id]!.maximum).toBeLessThan(lead.style.hardMaxWords);
+    expect(limits[lead.id]!.minimum).toBe(lead.style.typicalWords[0]);
   });
 
   it("keeps autonomous rooms silent when the model is offline or returns no valid lines", async () => {
@@ -330,10 +351,10 @@ describe("social director", () => {
     const responsePremise = consideredConversationResponsePremise(plan!);
     const examplePremise = consideredConversationPremise({ ...plan!, responseRole: "example" });
     const questionPremise = consideredConversationPremise({ ...plan!, responseRole: "question" });
-    expect(challengePremise).toContain("45–75-word post");
-    expect(challengePremise).toContain("8–28 words");
-    expect(examplePremise).toContain("8–28 words");
-    expect(questionPremise).toContain("8–24 words");
+    expect(challengePremise).toContain("24–52 words");
+    expect(challengePremise).toContain("7–28 words");
+    expect(examplePremise).toContain("7–28 words");
+    expect(questionPremise).toContain("7–24 words");
     expect([challengePremise, examplePremise, questionPremise].join(" ")).not.toContain("12–35 words");
     expect(challengePremise).toContain("hidden assumption");
     expect(challengePremise).toContain("nobody piles on");
@@ -352,10 +373,31 @@ describe("social director", () => {
     const lead = consideredConversationLeadPremise(plan, "Defend one flawed film.", "banter");
     const response = consideredConversationResponsePremise(plan, "banter");
     const combined = consideredConversationPremise(plan, "Defend one flawed film.", "banter");
-    expect(lead).toContain("30–52-word");
-    expect(response).toContain("6–24 words");
+    expect(lead).toContain("16–40-word");
+    expect(response).toContain("4–20 words");
     expect(combined).toContain("deeper table-talk beat");
     expect(combined).not.toContain("45–75-word");
+  });
+
+  it("keeps every register inside the actor's own hard maximum", () => {
+    const plan = {
+      lead: PERSONAS.find((persona) => persona.id === "ai-ibrahim")!,
+      responder: PERSONAS.find((persona) => persona.id === "ai-farah")!,
+      responseRole: "challenge" as const,
+    };
+    const everyday = consideredConversationWordLimits(plan, "everyday");
+    const technical = consideredConversationWordLimits(plan, "technical");
+    const fandom = consideredConversationWordLimits(plan, "fandom");
+    const studio = consideredConversationWordLimits(plan, "studio");
+
+    for (const limits of [everyday, technical, fandom, studio]) {
+      expect(limits.lead.maximum).toBeLessThanOrEqual(plan.lead.style.hardMaxWords);
+      expect(limits.response.maximum).toBeLessThanOrEqual(plan.responder.style.hardMaxWords);
+      expect(limits.lead.minimum).toBeLessThanOrEqual(limits.lead.maximum);
+    }
+    expect(everyday.lead.maximum).toBeLessThan(technical.lead.maximum);
+    expect(everyday.lead.maximum).toBeLessThan(fandom.lead.maximum);
+    expect(studio.lead.maximum).toBe(plan.lead.style.hardMaxWords);
   });
 
   it("does not recruit a relevant resident who is still cooling down", () => {

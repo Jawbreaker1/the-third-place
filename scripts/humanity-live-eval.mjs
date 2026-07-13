@@ -7,6 +7,7 @@ import {
   ambientSceneWordLimits,
   consideredConversationLeadPremise,
   consideredConversationResponsePremise,
+  consideredConversationWordLimits,
 } from "../server/director.ts";
 import { LmStudioClient } from "../server/lmStudio.ts";
 import { PERSONAS } from "../server/personas.ts";
@@ -82,6 +83,7 @@ if (!health.connected) {
     responder: consideredSelected[1],
     responseRole: "example",
   };
+  const consideredLimits = consideredConversationWordLimits(consideredPlan, "technical");
   const consideredLead = await lm.generateScene({
     kind: "ambient",
     conversationMode: "considered",
@@ -91,11 +93,13 @@ if (!health.connected) {
     selected: [consideredPlan.lead],
     history: extendedHistory,
     mustReplyIds: [consideredPlan.lead.id],
-    wordLimits: { [consideredPlan.lead.id]: { minimum: 45, maximum: 75 } },
+    wordLimits: { [consideredPlan.lead.id]: consideredLimits.lead },
     languageHint: "Swedish",
     premise: consideredConversationLeadPremise(
       consideredPlan,
       "När blir agentiska kodverktyg svårare att felsöka än vanlig kod, och vilken dold återkopplingsloop orsakar det?",
+      "discussion",
+      consideredLimits.lead,
     ),
   });
   const consideredResponse = consideredLead[0]
@@ -117,12 +121,39 @@ if (!health.connected) {
           },
         ],
         mustReplyIds: [consideredPlan.responder.id],
-        wordLimits: { [consideredPlan.responder.id]: { minimum: 8, maximum: 28 } },
+        wordLimits: { [consideredPlan.responder.id]: consideredLimits.response },
         languageHint: "Swedish",
-        premise: consideredConversationResponsePremise(consideredPlan),
+        premise: consideredConversationResponsePremise(consideredPlan, "discussion", consideredLimits.response),
       })
     : [];
   const considered = [...consideredLead, ...consideredResponse];
+
+  const casualPlan = {
+    lead: byId("ai-ibrahim"),
+    responder: byId("ai-mira"),
+    responseRole: "challenge",
+  };
+  const casualLimits = consideredConversationWordLimits(casualPlan, "everyday");
+  const casualConsidered = await lm.generateScene({
+    kind: "ambient",
+    conversationMode: "considered",
+    consideredRole: "lead",
+    channelId: "lobby",
+    channelName: "lobby",
+    selected: [casualPlan.lead],
+    history: [],
+    mustReplyIds: [casualPlan.lead.id],
+    wordLimits: { [casualPlan.lead.id]: casualLimits.lead },
+    languageHint: "Swedish",
+    premise: consideredConversationLeadPremise(
+      casualPlan,
+      "A quiet regular who appears twice a month can make a room steadier than ten daily posters. Name one thing the quiet regular remembers.",
+      "casual",
+      casualLimits.lead,
+    ),
+    actorChannelNotes: actorChannels.promptNotes([casualPlan.lead], "lobby"),
+    actorExpertiseNotes: actorChannels.expertiseNotes([casualPlan.lead], "lobby"),
+  });
 
   const kim = byId("ai-kim");
   const kimPrompts = [
@@ -225,10 +256,22 @@ if (!health.connected) {
   });
 
   const issues = [];
+  const registerByLabel = {
+    first: "technical",
+    second: "technical",
+    considered: "technical",
+    ambientSubstance: "studio",
+    pubAmbient: "banter",
+    pubHuman: "banter",
+  };
   for (const [label, lines] of [["first", first], ["second", second], ["considered", considered], ["ambientSubstance", ambientSubstance], ["pubAmbient", pubAmbient], ["pubHuman", pubHuman]]) {
     if (lines.length !== 2) issues.push(`${label}: expected 2 lines, got ${lines.length}`);
     for (const line of lines) {
-      const assessment = assessCandidate({ personaId: line.personaId, text: line.content });
+      const assessment = assessCandidate({
+        personaId: line.personaId,
+        text: line.content,
+        register: registerByLabel[label],
+      });
       if (!assessment.acceptable) issues.push(`${label}/${line.personaId}: ${assessment.reasonCodes.join(",")}`);
     }
   }
@@ -241,8 +284,25 @@ if (!health.connected) {
   }
   const leadWords = words(considered.find((line) => line.personaId === "ai-ibrahim")?.content ?? "");
   const responseWords = words(considered.find((line) => line.personaId === "ai-tess")?.content ?? "");
-  if (leadWords < 45 || leadWords > 75) issues.push(`considered lead: ${leadWords} words, expected 45–75`);
-  if (responseWords < 8 || responseWords > 28) issues.push(`considered response: ${responseWords} words, expected 8–28`);
+  if (leadWords < consideredLimits.lead.minimum || leadWords > consideredLimits.lead.maximum) {
+    issues.push(`considered lead: ${leadWords} words, expected ${consideredLimits.lead.minimum}–${consideredLimits.lead.maximum}`);
+  }
+  if (responseWords < consideredLimits.response.minimum || responseWords > consideredLimits.response.maximum) {
+    issues.push(`considered response: ${responseWords} words, expected ${consideredLimits.response.minimum}–${consideredLimits.response.maximum}`);
+  }
+  const casualLeadWords = words(casualConsidered[0]?.content ?? "");
+  if (casualConsidered.length !== 1) issues.push(`casual considered: expected 1 line, got ${casualConsidered.length}`);
+  if (casualLeadWords < casualLimits.lead.minimum || casualLeadWords > casualLimits.lead.maximum) {
+    issues.push(`casual considered lead: ${casualLeadWords} words, expected ${casualLimits.lead.minimum}–${casualLimits.lead.maximum}`);
+  }
+  if (casualConsidered[0]) {
+    const assessment = assessCandidate({
+      personaId: casualConsidered[0].personaId,
+      text: casualConsidered[0].content,
+      register: "everyday",
+    });
+    if (!assessment.acceptable) issues.push(`casual considered/${casualConsidered[0].personaId}: ${assessment.reasonCodes.join(",")}`);
+  }
   const kimMissing = kimNonFood.filter((line) => !line).length;
   const kimFoodReferences = kimNonFood.filter((line) => line && hasFoodMotif(line.content)).length;
   const kimEmojis = kimNonFood.reduce((total, line) => total + (line ? emojiCount(line.content) : 0), 0);
@@ -280,8 +340,8 @@ if (!health.connected) {
   const report = {
     model: health.id,
     latencyMs: health.latencyMs,
-    scenes: { first, second, considered, ambientSubstance, pubAmbient, pubHuman, kimNonFood, kimFood },
-    consideredWordCounts: { lead: leadWords, response: responseWords },
+    scenes: { first, second, considered, casualConsidered, ambientSubstance, pubAmbient, pubHuman, kimNonFood, kimFood },
+    consideredWordCounts: { lead: leadWords, response: responseWords, casualLead: casualLeadWords },
     kimMetrics: {
       prompts: kimPrompts.length,
       missing: kimMissing,

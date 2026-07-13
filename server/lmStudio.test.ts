@@ -148,11 +148,12 @@ describe("LM Studio room prompt", () => {
       channelName: "the-pub",
       selected: [juno],
       history: [],
-      wordLimits: { [juno.id]: { minimum: 30, maximum: 52 } },
+      wordLimits: { [juno.id]: { minimum: 16, maximum: 32 } },
     });
-    expect(prompt).toContain("writes 30–52 words");
-    expect(prompt).toContain("30–52 word scene contract may override");
-    expect(prompt).not.toContain("writes 45–75 words");
+    expect(prompt).toContain("writes 16–32 words");
+    expect(prompt).toContain("Loose table-talk language");
+    expect(prompt).toContain("Preserve the actor's ordinary voice and hard maximum");
+    expect(prompt).not.toContain("may override the ordinary style maximum");
   });
 
   it("allows only one drink reference when a human explicitly asks and drops invented pub URLs", async () => {
@@ -319,8 +320,10 @@ describe("LM Studio room prompt", () => {
       selected: [lead, responder],
       history: [],
     });
-    expect(prompt).toContain(`${lead.name} may write 45–75 words`);
-    expect(prompt).toContain("the 45–75 word scene contract may override the ordinary style maximum");
+    expect(prompt).toContain(`${lead.name} writes 24–46 words`);
+    expect(prompt).toContain("Informed colleague chat");
+    expect(prompt).toContain("Preserve each actor's ordinary voice and hard maximum");
+    expect(prompt).not.toContain("may override the ordinary style maximum");
     expect(prompt).toContain("Never paraphrase the lead");
     expect(prompt).toContain("counterexample, pointed question, practical consequence or respectful challenge");
     expect(prompt).not.toContain("normally 4–35 words");
@@ -340,12 +343,12 @@ describe("LM Studio room prompt", () => {
       wordLimits: { [responder.id]: { minimum: 8, maximum: 24 } },
     });
 
-    expect(prompt).toContain("response phase of a rare considered beat");
+    expect(prompt).toContain("response phase of a rare deeper chat beat");
     expect(prompt).toContain("writes 8–24 words");
     expect(prompt).toContain("assigned question move");
     expect(prompt).toContain("Required scene-role length: 8–24 words");
     expect(prompt).toContain("End with exactly one precise, genuine question required by this scene role");
-    expect(prompt).not.toContain("45–75 word scene contract may override");
+    expect(prompt).not.toContain("may override the ordinary style maximum");
     expect(prompt).not.toContain("do not ask a question in this message");
   });
 
@@ -478,6 +481,88 @@ describe("LM Studio one-pass humanizer", () => {
     expect(completionCalls).toBe(4);
   });
 
+  it("repairs the reported academic lobby paragraph into Ibrahim's everyday register", async () => {
+    const ibrahim = PERSONAS.find((persona) => persona.id === "ai-ibrahim")!;
+    const academic = "Spänningen ligger i att hög aktivitet ofta driver kortsiktig engagemangsmätning, medan de tysta stammisarna bygger den långsiktiga infrastrukturen. Om en plattform bara premierar dagligt brus riskerar man att förlora det institutionella minnet; utan de som dyker upp mer sällan men med tyngd, blir diskussionerna en serie isolerade händelser istället för en sammanhängande utveckling över tid.";
+    const natural = "De tysta stammisarna är typ kanalens backup. Belönar man bara dagligt brus tappar man dem som faktiskt minns varför saker blev som de blev.";
+    const completionBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return completionBodies.length === 1
+        ? completionResponse([{ personaId: ibrahim.id, content: academic }])
+        : completionResponse([{ personaId: ibrahim.id, content: natural }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      conversationMode: "considered",
+      consideredRole: "lead",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [ibrahim],
+      history: [],
+      mustReplyIds: [ibrahim.id],
+      wordLimits: { [ibrahim.id]: { minimum: 18, maximum: 42 } },
+    });
+
+    expect(completionBodies).toHaveLength(2);
+    expect(JSON.stringify(completionBodies[1])).toContain("register_mismatch");
+    expect(JSON.stringify(completionBodies[1])).toContain("vardaglig chatt");
+    const repairMessages = completionBodies[1]!.messages as Array<{ content: string }>;
+    expect(JSON.parse(repairMessages[1]!.content)).toMatchObject({ roomRegister: "everyday" });
+    expect(lines).toEqual([expect.objectContaining({ personaId: ibrahim.id, content: natural })]);
+  });
+
+  it("allows academic vocabulary inside the technical register when the line stays chat-sized", async () => {
+    const ibrahim = PERSONAS.find((persona) => persona.id === "ai-ibrahim")!;
+    const technical = "Spänningen ligger i att hög aktivitet driver kortsiktig mätning, medan den långsiktiga infrastrukturen bär systemets minne. Om eventloggen bara premierar dagligt brus riskerar man att förlora institutionell kontinuitet; utan snapshots blir varje incident en isolerad händelse.";
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return completionResponse([{ personaId: ibrahim.id, content: technical }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      conversationMode: "considered",
+      consideredRole: "lead",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [ibrahim],
+      history: [],
+      mustReplyIds: [ibrahim.id],
+      wordLimits: { [ibrahim.id]: { minimum: 24, maximum: 46 } },
+    });
+
+    expect(completionCalls).toBe(1);
+    expect(lines[0]?.content).toBe(technical);
+  });
+
+  it("does not impose the lobby register on an unprofiled private conversation", async () => {
+    const ibrahim = PERSONAS.find((persona) => persona.id === "ai-ibrahim")!;
+    const technicalDm = "Spänningen ligger i att hög aktivitet driver kortsiktig mätning, medan den långsiktiga infrastrukturen bär systemets minne. Om eventloggen bara premierar dagligt brus riskerar man att förlora institutionell kontinuitet; utan snapshots blir varje incident en isolerad händelse.";
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return completionResponse([{ personaId: ibrahim.id, content: technicalDm }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "dm",
+      channelId: "dm-human-guest-ai-ibrahim",
+      channelName: "private chat with guest",
+      selected: [ibrahim],
+      history: [],
+      mustReplyIds: [ibrahim.id],
+    });
+
+    expect(completionCalls).toBe(1);
+    expect(lines[0]?.content).toBe(technicalDm);
+  });
+
   it("repairs considered word-boundary misses as one batch", async () => {
     const ibrahim = PERSONAS.find((persona) => persona.id === "ai-ibrahim")!;
     const tess = PERSONAS.find((persona) => persona.id === "ai-tess")!;
@@ -488,11 +573,11 @@ describe("LM Studio one-pass humanizer", () => {
       completionCalls += 1;
       return completionCalls === 1
         ? completionResponse([
-            { personaId: ibrahim.id, content: words("lead", 44) },
+            { personaId: ibrahim.id, content: words("lead", 47) },
             { personaId: tess.id, content: words("svar", 29) },
           ])
         : completionResponse([
-            { personaId: ibrahim.id, content: words("nylead", 50) },
+            { personaId: ibrahim.id, content: words("nylead", 40) },
             { personaId: tess.id, content: words("nyttsvar", 18) },
           ]);
     }));
@@ -508,7 +593,7 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(2);
-    expect(lines.map((line) => line.content.split(/\s+/u).length)).toEqual([50, 18]);
+    expect(lines.map((line) => line.content.split(/\s+/u).length)).toEqual([40, 18]);
   });
 
   it("repairs a thin quick ambient contribution against its explicit scene-role minimum", async () => {

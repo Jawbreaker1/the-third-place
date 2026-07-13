@@ -10,7 +10,13 @@ import type {
   VisualObservation,
 } from "../shared/types.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
-import { CHANNELS, getChannelProfile, type AmbientMode } from "./channels.js";
+import {
+  CHANNELS,
+  CONVERSATION_REGISTERS,
+  getChannelProfile,
+  type AmbientMode,
+  type ConversationRegister,
+} from "./channels.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import { type GeneratedLine, type TranscriptLine, LmStudioClient } from "./lmStudio.js";
 import { createMessage, RoomStore } from "./store.js";
@@ -280,6 +286,13 @@ export function selectAmbientLead(
           persona.curiosity * 0.1 +
           persona.warmth * 0.06 +
           persona.style.complexityAppetite * 0.08
+        : mode === "casual"
+          ? affinity(persona.id) * 0.46 +
+            persona.talkativeness * 0.18 +
+            persona.curiosity * 0.14 +
+            persona.warmth * 0.1 +
+            persona.mischief * 0.04 +
+            persona.style.complexityAppetite * 0.08
         : affinity(persona.id) * 0.5 +
           persona.style.complexityAppetite * 0.22 +
           persona.conscientiousness * 0.1 +
@@ -305,20 +318,31 @@ export function ambientSceneWordLimits(
   continuation = false,
   mode: AmbientMode = "discussion",
 ): Record<string, { minimum: number; maximum: number }> {
+  const leadRoomMaximum = mode === "banter"
+    ? continuation ? 22 : 26
+    : mode === "casual"
+      ? continuation ? 26 : 30
+      : continuation ? 36 : 42;
   const leadMaximum = Math.min(
-    mode === "banter" ? (continuation ? 24 : 28) : (continuation ? 36 : 42),
+    leadRoomMaximum,
     lead.style.hardMaxWords,
   );
   const limits: Record<string, { minimum: number; maximum: number }> = {
     [lead.id]: {
-      minimum: Math.min(mode === "banter" ? (continuation ? 4 : 7) : (continuation ? 12 : 16), leadMaximum),
+      minimum: Math.min(
+        Math.max(2, lead.style.typicalWords[0] - (continuation ? 2 : 0)),
+        leadMaximum,
+      ),
       maximum: leadMaximum,
     },
   };
   if (responder) {
-    const responseMaximum = Math.min(mode === "banter" ? 22 : 28, responder.style.hardMaxWords);
+    const responseMaximum = Math.min(
+      mode === "banter" ? 20 : mode === "casual" ? 23 : 28,
+      responder.style.hardMaxWords,
+    );
     limits[responder.id] = {
-      minimum: Math.min(mode === "banter" ? 3 : 8, responseMaximum),
+      minimum: Math.min(Math.max(2, responder.style.typicalWords[0] - 1), responseMaximum),
       maximum: responseMaximum,
     };
   }
@@ -346,6 +370,16 @@ export function ambientConversationPremise(
       : "";
     return `${opening} ${leadRole} ${responseRole} Do not recap, broadly agree, offer advice or an assistant-style overview, explain a punchline, introduce alcohol, perform the room's Friday mood or invite the whole room to answer. Exactly the selected residents speak in order; short fragments and silence remain valid.`.replace(/\s+/g, " ").trim();
   }
+  if (mode === "casual") {
+    const opening = continuation
+      ? `Continue only the live thread built from this exact seed: “${seed}”. Follow the latest concrete detail instead of restating the whole idea.`
+      : `Start a fresh everyday thread from this exact seed: “${seed}”. Ignore unrelated older drift.`;
+    const leadRole = `${lead.name} gives one chat-sized take in ${leadLimit.minimum}–${leadLimit.maximum} words, using an ordinary phrase, recognizable example or specific detail rather than formal debate framing.`;
+    const responseRole = responder
+      ? `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words with a different reaction, counterexample, small tangent or genuine question. Do not summarize.`
+      : "";
+    return `${opening} ${leadRole} ${responseRole} One thought per message. No miniature essay, panel-discussion language, generic room invitation or assistant-style overview. Exactly the selected residents speak in order; fragments and silence remain valid.`.replace(/\s+/g, " ").trim();
+  }
   const opening = continuation
     ? `Continue only the unresolved thread built from this exact seed: “${seed}”. Do not switch topics or extend an unrelated metaphor from older history.`
     : `Start a fresh room-relevant thread from this exact seed: “${seed}”. Ignore unrelated drift in older history.`;
@@ -366,6 +400,38 @@ export interface ConsideredConversationPlan {
   lead: Persona;
   responder: Persona;
   responseRole: ConsideredResponseRole;
+}
+
+export interface ConversationWordLimit {
+  minimum: number;
+  maximum: number;
+}
+
+/**
+ * A deeper turn may stretch toward the room's register, but never past the
+ * actor's own hard maximum. The actor's ordinary upper range also keeps the
+ * minimum from padding a naturally terse resident into house-style prose.
+ */
+export function consideredConversationWordLimits(
+  plan: ConsideredConversationPlan,
+  register: ConversationRegister,
+): { lead: ConversationWordLimit; response: ConversationWordLimit } {
+  const profile = CONVERSATION_REGISTERS[register];
+  const leadMaximum = Math.min(profile.consideredLeadWords[1], plan.lead.style.hardMaxWords);
+  const responseRoomMaximum = plan.responseRole === "question"
+    ? Math.min(profile.consideredResponseWords[1], 24)
+    : profile.consideredResponseWords[1];
+  const responseMaximum = Math.min(responseRoomMaximum, plan.responder.style.hardMaxWords);
+  return {
+    lead: {
+      minimum: Math.min(profile.consideredLeadWords[0], plan.lead.style.typicalWords[1], leadMaximum),
+      maximum: leadMaximum,
+    },
+    response: {
+      minimum: Math.min(profile.consideredResponseWords[0], plan.responder.style.typicalWords[1], responseMaximum),
+      maximum: responseMaximum,
+    },
+  };
 }
 
 export interface ConsideredConversationGate {
@@ -472,17 +538,35 @@ export function selectConsideredConversation(
   return { lead, responder, responseRole };
 }
 
-const consideredResponseDirection = (plan: ConsideredConversationPlan, mode: AmbientMode = "discussion"): string => ({
+const consideredResponseDirection = (
+  plan: ConsideredConversationPlan,
+  mode: AmbientMode = "discussion",
+  limit?: ConversationWordLimit,
+): string => {
+  const fallback = mode === "banter"
+    ? { minimum: 4, maximum: plan.responseRole === "question" ? 18 : 20 }
+    : mode === "casual"
+      ? { minimum: 5, maximum: plan.responseRole === "question" ? 20 : 22 }
+      : { minimum: 7, maximum: plan.responseRole === "question" ? 24 : 28 };
+  const words = limit ?? fallback;
+  return ({
   challenge: mode === "banter"
-    ? `${plan.responder.name} replies in 6–24 words with one compact countertake or precise objection. Do not restate the post.`
-    : `${plan.responder.name} replies in 8–28 words by challenging one hidden assumption, while briefly acknowledging the strongest part. Do not restate the post.`,
+    ? `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words with one compact countertake or precise objection. Do not restate the post.`
+    : mode === "casual"
+      ? `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words with one plain countertake or recognizable exception. No formal concession is required.`
+      : `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words by challenging one hidden assumption, while briefly acknowledging the strongest part. Do not restate the post.`,
   example: mode === "banter"
-    ? `${plan.responder.name} replies in 6–24 words with one concrete alternative, example or punchline that was not already mentioned.`
-    : `${plan.responder.name} replies in 8–28 words with one concrete example or counterexample that was not already mentioned. Do not merely agree or summarize.`,
+    ? `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words with one concrete alternative, example or punchline that was not already mentioned.`
+    : mode === "casual"
+      ? `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words with one recognizable example or small tangent that changes the angle.`
+      : `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words with one concrete example or counterexample that was not already mentioned. Do not merely agree or summarize.`,
   question: mode === "banter"
-    ? `${plan.responder.name} replies in 6–22 words with one genuine, specific question about the unresolved detail. Do not paraphrase the post.`
-    : `${plan.responder.name} replies in 8–24 words with one precise question about the unresolved tension. Do not paraphrase the post.`,
-})[plan.responseRole];
+    ? `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words with one genuine, specific question about the unresolved detail. Do not paraphrase the post.`
+    : mode === "casual"
+      ? `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words with one natural question about the detail that is still unclear.`
+      : `${plan.responder.name} replies in ${words.minimum}–${words.maximum} words with one precise question about the unresolved tension. Do not paraphrase the post.`,
+  })[plan.responseRole];
+};
 
 const consideredSeedAnchor = (seed?: string): string => seed
   ? `Ground the conversation in this exact room-specific question: “${seed}”. Do not drift into a different topic or an extended metaphor.`
@@ -492,32 +576,58 @@ export function consideredConversationLeadPremise(
   plan: ConsideredConversationPlan,
   seed?: string,
   mode: AmbientMode = "discussion",
+  limit?: ConversationWordLimit,
 ): string {
+  const words = limit ?? (mode === "banter"
+    ? { minimum: 16, maximum: 40 }
+    : mode === "casual"
+      ? { minimum: 18, maximum: 42 }
+      : { minimum: 24, maximum: 52 });
   if (mode === "banter") {
-    return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens with one unusually substantive but still conversational 30–52-word recommendation, gripe, story-shaped observation or opinion. Anchor it in a concrete title, detail, ritual or trade-off. No essay framing, advice service, room-performance commentary or alcohol. Only ${plan.lead.name} speaks in this generation.`.trim();
+    return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens with one unusually substantive but still conversational ${words.minimum}–${words.maximum}-word recommendation, gripe, story-shaped observation or opinion. Anchor it in a concrete title, detail, ritual or trade-off. No essay framing, advice service, room-performance commentary or alcohol. Only ${plan.lead.name} speaks in this generation.`.trim();
   }
-  return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens with one substantive 45–75-word post grounded in this room's subject. Include a specific observation, causal mechanism, real tension or defensible claim; avoid generic inspiration, meta-commentary and an empty “what do you think?” ending. Only ${plan.lead.name} speaks in this generation.`.trim();
+  if (mode === "casual") {
+    return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens a slightly deeper but still off-the-cuff chat turn in ${words.minimum}–${words.maximum} words. Use one recognizable example, ordinary phrase or concrete disagreement; leave some conversational rough edge instead of resolving it like an essay. Only ${plan.lead.name} speaks in this generation.`.trim();
+  }
+  return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens a deeper but still conversational ${words.minimum}–${words.maximum}-word post grounded in this room's subject. Make one concrete claim through a mechanism, example or trade-off; write like a knowledgeable peer in chat, not a paper or panel summary. Only ${plan.lead.name} speaks in this generation.`.trim();
 }
 
 export function consideredConversationResponsePremise(
   plan: ConsideredConversationPlan,
   mode: AmbientMode = "discussion",
+  limit?: ConversationWordLimit,
 ): string {
-  return `Respond directly to ${plan.lead.name}'s latest transcript line. ${consideredResponseDirection(plan, mode)} Only ${plan.responder.name} speaks in this generation; do not open a new topic.`;
+  return `Respond directly to ${plan.lead.name}'s latest transcript line. ${consideredResponseDirection(plan, mode, limit)} Only ${plan.responder.name} speaks in this generation; do not open a new topic.`;
 }
 
 export function consideredConversationPremise(
   plan: ConsideredConversationPlan,
   seed?: string,
   mode: AmbientMode = "discussion",
+  limits?: { lead: ConversationWordLimit; response: ConversationWordLimit },
 ): string {
   const anchor = seed
     ? consideredSeedAnchor(seed)
     : "";
+  const defaults = limits ?? {
+    lead: mode === "banter"
+      ? { minimum: 16, maximum: 40 }
+      : mode === "casual"
+        ? { minimum: 18, maximum: 42 }
+        : { minimum: 24, maximum: 52 },
+    response: mode === "banter"
+      ? { minimum: 4, maximum: plan.responseRole === "question" ? 18 : 20 }
+      : mode === "casual"
+        ? { minimum: 5, maximum: plan.responseRole === "question" ? 20 : 22 }
+        : { minimum: 7, maximum: plan.responseRole === "question" ? 24 : 28 },
+  };
   if (mode === "banter") {
-    return `${anchor} ${plan.lead.name} starts a rare deeper table-talk beat in 30–52 words, anchored in one concrete title, detail, ritual, complaint or trade-off rather than an essay. ${consideredResponseDirection(plan, mode)} Exactly these two residents speak, in this order; nobody piles on or performs the room's mood.`.trim();
+    return `${anchor} ${plan.lead.name} starts a rare deeper table-talk beat in ${defaults.lead.minimum}–${defaults.lead.maximum} words, anchored in one concrete title, detail, ritual, complaint or trade-off rather than an essay. ${consideredResponseDirection(plan, mode, defaults.response)} Exactly these two residents speak, in this order; nobody piles on or performs the room's mood.`.trim();
   }
-  return `${anchor} ${plan.lead.name} starts a rare considered conversation with one substantive 45–75-word post grounded in this room's subject. Include a specific observation, causal mechanism, real tension or defensible claim; avoid generic inspiration, meta-commentary and an empty “what do you think?” ending. ${consideredResponseDirection(plan, mode)} Exactly these two residents speak, in this order; nobody piles on.`.trim();
+  if (mode === "casual") {
+    return `${anchor} ${plan.lead.name} starts a rare deeper everyday-chat beat in ${defaults.lead.minimum}–${defaults.lead.maximum} words with one recognizable example, detail or disagreement, not a miniature essay. ${consideredResponseDirection(plan, mode, defaults.response)} Exactly these two residents speak, in this order; nobody piles on.`.trim();
+  }
+  return `${anchor} ${plan.lead.name} starts a rare deeper peer conversation in ${defaults.lead.minimum}–${defaults.lead.maximum} words with one concrete claim, mechanism, example or trade-off. Keep it chat-shaped rather than paper-shaped. ${consideredResponseDirection(plan, mode, defaults.response)} Exactly these two residents speak, in this order; nobody piles on.`.trim();
 }
 
 export interface PublicCandidateGuardInput {
@@ -1257,19 +1367,12 @@ export class SocialDirector {
     plan: ConsideredConversationPlan,
     thread: AmbientThreadState,
   ): Promise<void> {
-    const ambientMode = getChannelProfile(channel.id)?.ambientMode ?? "discussion";
-    const leadWordLimit = ambientMode === "banter"
-      ? { minimum: 30, maximum: 52 }
-      : { minimum: 45, maximum: 75 };
-    const responseWordLimit = {
-      minimum: Math.min(ambientMode === "banter" ? 6 : 8, plan.responder.style.hardMaxWords),
-      maximum: Math.min(
-        ambientMode === "banter"
-          ? plan.responseRole === "question" ? 22 : 24
-          : plan.responseRole === "question" ? 24 : 28,
-        plan.responder.style.hardMaxWords,
-      ),
-    };
+    const channelProfile = getChannelProfile(channel.id);
+    const ambientMode = channelProfile?.ambientMode ?? "discussion";
+    const register = channelProfile?.conversationRegister ?? "everyday";
+    const consideredLimits = consideredConversationWordLimits(plan, register);
+    const leadWordLimit = consideredLimits.lead;
+    const responseWordLimit = consideredLimits.response;
     this.consideredConversationInFlight = true;
     this.lastConsideredConversationAt = this.now();
     this.setTyping(channel.id, plan.lead.id, true);
@@ -1287,7 +1390,7 @@ export class SocialDirector {
             channelName: channel.name,
             selected: [plan.lead],
             history,
-            premise: consideredConversationLeadPremise(plan, thread.seed, ambientMode),
+            premise: consideredConversationLeadPremise(plan, thread.seed, ambientMode, leadWordLimit),
             mustReplyIds: [plan.lead.id],
             wordLimits: { [plan.lead.id]: leadWordLimit },
             languageHint: thread.languageHint,
@@ -1316,7 +1419,7 @@ export class SocialDirector {
                   createdAt: new Date(this.now()).toISOString(),
                 },
               ],
-              premise: consideredConversationResponsePremise(plan, ambientMode),
+              premise: consideredConversationResponsePremise(plan, ambientMode, responseWordLimit),
               mustReplyIds: [plan.responder.id],
               wordLimits: { [plan.responder.id]: responseWordLimit },
               languageHint: thread.languageHint,

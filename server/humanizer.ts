@@ -1,5 +1,13 @@
 export type HumanizerMode = "chat" | "voice" | "technical";
 
+export type HumanizerRegister =
+  | "everyday"
+  | "banter"
+  | "technical"
+  | "analytical"
+  | "fandom"
+  | "studio";
+
 export type HumanizerSeverity = "none" | "low" | "medium" | "high";
 
 export type HumanizerReasonCode =
@@ -9,6 +17,7 @@ export type HumanizerReasonCode =
   | "assistant_cliche"
   | "ai_meta_language"
   | "overly_polished"
+  | "register_mismatch"
   | "list_like_reply"
   | "room_contract"
   | "style_contract";
@@ -55,6 +64,8 @@ export interface AssessCandidateInput {
   recentOwnTexts?: readonly string[];
   peerTexts?: readonly string[];
   mode?: HumanizerMode;
+  /** Room-level formality ceiling. This never replaces the persona's own voice. */
+  register?: HumanizerRegister;
   /** Set this when a structured answer was explicitly requested by a human. */
   allowList?: boolean;
   /** Set only when the human explicitly asks about the resident's AI identity. */
@@ -89,6 +100,8 @@ const OPENING_HINT = "Börja direkt i sak med en annan öppning och meningsrytm.
 const CLICHE_HINT = "Ta bort servicefrasen och skriv som en person mitt i ett pågående samtal.";
 const META_HINT = "Skriv som personen själv; nämn inte AI, språkmodell, prompt eller hur svaret skapades.";
 const POLISHED_HINT = "Gör repliken rakare och mindre uppsatslik; behåll bara den poäng personen faktiskt vill göra.";
+const REGISTER_HINT =
+  "Behåll tanken och intelligensen, men skriv den som vardaglig chatt: en konkret poäng, enklare verb och lite mänsklig ojämnhet i stället för abstrakt seminarie- eller debattprosa.";
 const LIST_HINT = "Gör om listan till en eller två naturliga chattrader om ingen uttryckligen bad om en lista.";
 
 const collapseWhitespace = (value: string) => value.replace(/\s+/gu, " ").trim();
@@ -322,6 +335,82 @@ const transitionLabels = (input: string): string[] => {
   return transitions.filter(([pattern]) => pattern.test(plain)).map(([, label]) => label);
 };
 
+export interface ConversationRegisterAnalysis {
+  wordCount: number;
+  structureSignals: readonly string[];
+  abstractionSignals: readonly string[];
+}
+
+/**
+ * Detects combinations characteristic of op-ed/essay prose. A single formal
+ * word is intentionally harmless: casual-room rejection requires both an
+ * essay-shaped structure and a separate concentration of abstractions.
+ */
+export const analyzeConversationRegister = (input: string): ConversationRegisterAnalysis => {
+  const protectedText = protectTechnicalFragments(input);
+  let prose = protectedText.text;
+  for (const fragment of protectedText.fragments) prose = prose.split(fragment.placeholder).join(" ");
+  const plain = normalizeAnalysisText(prose);
+  const words = plain.match(/[\p{L}\p{M}\p{N}]+(?:['-][\p{L}\p{M}\p{N}]+)*/gu) ?? [];
+  const structureSignals: string[] = [];
+  const abstractionSignals: string[] = [];
+
+  if (/^(?:(?:spänningen|utmaningen|paradoxen|nyckeln|problemet) (?:ligger|finns) i|(?:the )?(?:tension|challenge|paradox|key|problem) (?:lies|is found) in)\b/iu.test(plain)) {
+    structureSignals.push("abstract-thesis-opening");
+  }
+  if (/\b(?:medan|samtidigt som|å ena sidan|å andra sidan|whereas|on the one hand|on the other hand)\b/iu.test(plain)) {
+    structureSignals.push("balanced-contrast");
+  }
+  if (/\b(?:om|if)\b.{8,120}\b(?:riskerar|leder|innebär|risks?|leads?|means?)\b/iu.test(plain)) {
+    structureSignals.push("conditional-consequence");
+  }
+  if (/\b(?:utan|without)\b.{8,120}\b(?:blir|förlorar|saknar|becomes?|loses?|lacks?)\b/iu.test(plain)) {
+    structureSignals.push("counterfactual-consequence");
+  }
+  if (words.length >= 30 && prose.includes(";")) structureSignals.push("long-semicolon-contrast");
+  const sentences = prose.split(/[.!?]+/u).map((sentence) => sentence.trim()).filter(Boolean);
+  if (words.length >= 34 && words.length / Math.max(1, sentences.length) >= 20) {
+    structureSignals.push("long-balanced-sentences");
+  }
+
+  const hasShortHorizon = /\b(?:kortsiktig\w*|kort sikt|short[- ]term)\b/iu.test(plain);
+  const hasLongHorizon = /\b(?:långsiktig\w*|lång sikt|long[- ]term)\b/iu.test(plain);
+  if (hasShortHorizon && hasLongHorizon) abstractionSignals.push("paired-time-horizons");
+
+  const abstractTerms = plain.match(
+    /\b(?:institutionell\w*|engagemangsmätning\w*|infrastruktur\w*|strukturell\w*|systemisk\w*|sammanhängande utveckling|isolerade händelser|institutional\w*|engagement metric\w*|infrastructure\w*|structural\w*|systemic\w*|coherent development|isolated events)\b/giu,
+  ) ?? [];
+  if (new Set(abstractTerms.map((term) => term.toLocaleLowerCase())).size >= 2) {
+    abstractionSignals.push("dense-institutional-vocabulary");
+  }
+
+  const formalConnectors = plain.match(
+    /\b(?:i förlängningen|på ett övergripande plan|ur ett [\p{L}\p{M}-]+ perspektiv|därmed|följaktligen|riskerar man att|in the longer term|at a structural level|from an? [\p{L}\p{M}-]+ perspective|consequently|thereby)\b/giu,
+  ) ?? [];
+  if (new Set(formalConnectors.map((term) => term.toLocaleLowerCase())).size >= 2) {
+    abstractionSignals.push("formal-connector-density");
+  }
+
+  return { wordCount: words.length, structureSignals, abstractionSignals };
+};
+
+export const conversationRegisterMismatch = (
+  input: string,
+  register: HumanizerRegister,
+): ConversationRegisterAnalysis & { mismatch: boolean } => {
+  const analysis = analyzeConversationRegister(input);
+  if (register === "technical" || register === "analytical") return { ...analysis, mismatch: false };
+  const minimumWords = register === "banter" ? 24 : register === "everyday" ? 28 : 32;
+  const minimumStructures = register === "banter" || register === "everyday" ? 2 : 3;
+  return {
+    ...analysis,
+    mismatch:
+      analysis.wordCount >= minimumWords &&
+      analysis.structureSignals.length >= minimumStructures &&
+      analysis.abstractionSignals.length >= 1,
+  };
+};
+
 const addReason = (reasons: HumanizerReason[], reason: HumanizerReason): void => {
   if (!reasons.some((candidate) => candidate.code === reason.code)) reasons.push(reason);
 };
@@ -415,10 +504,10 @@ export const assessCandidate = (input: AssessCandidateInput): HumanizerAssessmen
 
   const lists = listItemCount(input.text);
   const headings = headingCount(input.text);
-  if (!input.allowList && mode !== "technical" && (lists >= 3 || headings >= 2)) {
+  if (!input.allowList && (lists >= 3 || headings >= 2)) {
     addReason(reasons, {
       code: "list_like_reply",
-      severity: lists >= 5 || headings >= 3 ? "medium" : "low",
+      severity: lists >= 5 || headings >= 3 ? "high" : "low",
       message: `Repliken ser ut som ett assistentsvar (${lists} listpunkter, ${headings} rubriker).`,
       hint: LIST_HINT,
       evidence: [`listpunkter:${lists}`, `rubriker:${headings}`],
@@ -435,6 +524,19 @@ export const assessCandidate = (input: AssessCandidateInput): HumanizerAssessmen
       hint: POLISHED_HINT,
       evidence: transitions,
     });
+  }
+
+  if (input.register) {
+    const registerFit = conversationRegisterMismatch(input.text, input.register);
+    if (registerFit.mismatch) {
+      addReason(reasons, {
+        code: "register_mismatch",
+        severity: "high",
+        message: "Repliken är sakligt relevant men betydligt mer essä- eller seminarieformad än rummets språkregister.",
+        hint: REGISTER_HINT,
+        evidence: [...registerFit.structureSignals, ...registerFit.abstractionSignals],
+      });
+    }
   }
 
   let severity = reasons.reduce<HumanizerSeverity>(
