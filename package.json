@@ -1,0 +1,53 @@
+{
+  "name": "the-third-place",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A living AI community powered by a local LM Studio model and a deterministic social director.",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c yellow,cyan \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
+    "build": "tsc -p tsconfig.server.json && vite build",
+    "start": "NODE_ENV=production node dist-server/server/index.js",
+    "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "test": "vitest run",
+    "lm:check": "node scripts/lm-check.mjs",
+    "smoke:e2e": "node scripts/e2e-smoke.mjs",
+    "smoke:voice": "node scripts/voice-smoke.mjs",
+    "smoke:image": "node scripts/image-smoke.mjs",
+    "smoke:research": "node scripts/research-smoke.mjs",
+    "smoke:history-links": "node scripts/history-link-smoke.mjs",
+    "audit:humanity": "node scripts/humanity-audit.mjs",
+    "eval:humanity": "node --import tsx scripts/humanity-live-eval.mjs",
+    "test:audit:humanity": "node --test scripts/humanity-audit.node-test.mjs"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "ipaddr.js": "^2.4.0",
+    "parse5": "^8.0.1",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "sharp": "^0.35.3",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "@types/busboy": "^1.5.4",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.32",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.5.2",
+    "concurrently": "^9.1.2",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

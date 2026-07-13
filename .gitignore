@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-server/
+.env*
+!.env.example
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+.DS_Store
+data/
+coverage/
+*.log

@@ -1,0 +1,1262 @@
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { createServer } from "node:http";
+import { resolve } from "node:path";
+import dotenv from "dotenv";
+import Busboy from "busboy";
+import express, { type Request, type Response } from "express";
+import helmet from "helmet";
+import { Server } from "socket.io";
+import { z } from "zod";
+import type {
+  ActionResult,
+  ChatMessage,
+  HistoryPage,
+  ImageAnalysis,
+  ImageAnalysisPayload,
+  ImageMessageResult,
+  JoinResult,
+  LinkPreviewPayload,
+  Member,
+  PublicPreview,
+  RoomSnapshot,
+  ServerHealth,
+  VoiceCreateResult,
+  VoiceIceServer,
+  VoiceInviteBotResult,
+  VoiceJoinResult,
+  VoiceLeaveResult,
+  VoiceRoomView,
+} from "../shared/types.js";
+import { ActorChannelRuntime } from "./actorChannels.js";
+import { SocialDirector } from "./director.js";
+import { LinkPreviewBroker } from "./linkPreviewBroker.js";
+import { fetchRemoteImage, ImageStore, ImageStoreError } from "./imageStore.js";
+import { LmStudioClient } from "./lmStudio.js";
+import { CHANNELS } from "./channels.js";
+import { PERSONAS, memberView } from "./personas.js";
+import { ResearchBroker } from "./researchBroker.js";
+import { createMessage, type HistoryPosition, RoomStore } from "./store.js";
+import { VoiceDirector } from "./voiceDirector.js";
+import { VoiceRoomRuntime } from "./voiceRooms.js";
+import { VoiceSpeechError, VoiceSpeechService } from "./voiceSpeech.js";
+
+dotenv.config();
+
+const PORT = Number.parseInt(process.env.PORT ?? "4000", 10);
+const HOST = process.env.HOST ?? "127.0.0.1";
+const INVITE_CODE = process.env.ROOM_INVITE_CODE?.trim();
+const SESSION_COOKIE = "atrium_session";
+const PUBLIC_REACTIONS = new Set(["👍", "👀", "😂", "💀", "🤔", "💛", "🔥", "✨", "🙌", "😬", "🫡", "🌿"]);
+const PACE: ServerHealth["aiPace"] =
+  process.env.AI_PACE === "calm" || process.env.AI_PACE === "party" ? process.env.AI_PACE : "lively";
+const VOICE_ENABLED = process.env.VOICE_ENABLED !== "false";
+const VOICE_RECONNECT_GRACE_MS = Math.max(
+  3_000,
+  Math.min(60_000, Number.parseInt(process.env.VOICE_RECONNECT_GRACE_MS ?? "15000", 10) || 15_000),
+);
+
+const readVoiceIceServers = (): VoiceIceServer[] => {
+  const configured = process.env.VOICE_ICE_SERVERS_JSON?.trim();
+  if (!configured) {
+    return [
+      {
+        urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"],
+      },
+    ];
+  }
+  try {
+    const parsed = z
+      .array(
+        z
+          .object({
+            urls: z.union([z.string().url(), z.array(z.string().url()).min(1).max(8)]),
+            username: z.string().max(256).optional(),
+            credential: z.string().max(512).optional(),
+          })
+          .strict(),
+      )
+      .max(8)
+      .parse(JSON.parse(configured));
+    return parsed;
+  } catch (error) {
+    console.warn("VOICE_ICE_SERVERS_JSON is invalid; voice will use public STUN only:", error instanceof Error ? error.message : error);
+    return [{ urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] }];
+  }
+};
+
+interface HumanSession {
+  tokenHash: string;
+  member: Member;
+  socketIds: Set<string>;
+  lastSeenAt: number;
+  historyBucket: TokenBucket;
+  imageBucket: TokenBucket;
+  voiceBucket: TokenBucket;
+}
+
+class TokenBucket {
+  private tokens: number;
+  private updatedAt = Date.now();
+
+  constructor(
+    private readonly capacity: number,
+    private readonly refillPerSecond: number,
+  ) {
+    this.tokens = capacity;
+  }
+
+  take(cost = 1): boolean {
+    const now = Date.now();
+    this.tokens = Math.min(this.capacity, this.tokens + ((now - this.updatedAt) / 1_000) * this.refillPerSecond);
+    this.updatedAt = now;
+    if (this.tokens < cost) return false;
+    this.tokens -= cost;
+    return true;
+  }
+}
+
+const normalizeName = (raw: string): string =>
+  raw
+    .normalize("NFKC")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const joinSchema = z.object({
+  name: z.string().min(2).max(48),
+  inviteCode: z.string().max(100).optional(),
+});
+const messageSchema = z.object({
+  channelId: z.string().min(1).max(160),
+  content: z.string().min(1).max(500),
+  replyToId: z.string().max(100).optional(),
+});
+const reactionSchema = z.object({
+  channelId: z.string().min(1).max(80),
+  messageId: z.string().min(1).max(100),
+  emoji: z.string().min(1).max(12),
+});
+const voiceRoomIdSchema = z.object({ roomId: z.string().uuid() }).strict();
+const voiceCreateSchema = z.object({ channelId: z.string().min(1).max(80) }).strict();
+const voiceStateSchema = z
+  .object({ roomId: z.string().uuid(), muted: z.boolean().optional(), deafened: z.boolean().optional(), speaking: z.boolean().optional() })
+  .strict();
+const voiceBotSchema = z.object({ roomId: z.string().uuid(), personaId: z.string().min(1).max(100) }).strict();
+const voiceTextTurnSchema = z.object({ roomId: z.string().uuid(), text: z.string().min(1).max(500) }).strict();
+
+interface ImageMessageForm {
+  content: string;
+  replyToId?: string;
+  imageUrl?: string;
+  file?: { body: Buffer; mimeType: string };
+}
+
+const parseImageMessageForm = async (request: Request): Promise<ImageMessageForm> =>
+  await new Promise((resolveForm, rejectForm) => {
+    if (!request.headers["content-type"]?.toLocaleLowerCase().startsWith("multipart/form-data")) {
+      rejectForm(new ImageStoreError("Send the image as multipart form data.", 415));
+      return;
+    }
+    const parser = Busboy({
+      headers: request.headers,
+      limits: { fileSize: 8 * 1024 * 1024, files: 1, fields: 3, parts: 4, fieldSize: 2_048 },
+    });
+    const fields = new Map<string, string>();
+    let file: ImageMessageForm["file"];
+    let fileSeen = false;
+    let parseError: Error | undefined;
+    parser.on("field", (name, value) => {
+      if (["content", "replyToId", "imageUrl"].includes(name)) fields.set(name, value);
+    });
+    parser.on("file", (_name, stream, info) => {
+      if (fileSeen) {
+        parseError = new ImageStoreError("Attach one image at a time.");
+        stream.resume();
+        return;
+      }
+      fileSeen = true;
+      const chunks: Buffer[] = [];
+      let limited = false;
+      stream.on("limit", () => {
+        limited = true;
+        parseError = new ImageStoreError("Images can be at most 8 MB.", 413);
+      });
+      stream.on("data", (chunk: Buffer) => {
+        if (!limited) chunks.push(chunk);
+      });
+      stream.on("end", () => {
+        if (!limited) file = { body: Buffer.concat(chunks), mimeType: info.mimeType };
+      });
+    });
+    parser.on("filesLimit", () => {
+      parseError = new ImageStoreError("Attach one image at a time.");
+    });
+    parser.on("fieldsLimit", () => {
+      parseError = new ImageStoreError("Too many image message fields.");
+    });
+    parser.on("partsLimit", () => {
+      parseError = new ImageStoreError("Too many image message parts.");
+    });
+    parser.on("error", rejectForm);
+    request.once("aborted", () => rejectForm(new ImageStoreError("The image upload was interrupted.")));
+    parser.on("finish", () => {
+      if (parseError) {
+        rejectForm(parseError);
+        return;
+      }
+      resolveForm({
+        content: fields.get("content") ?? "",
+        ...(fields.get("replyToId") ? { replyToId: fields.get("replyToId") } : {}),
+        ...(fields.get("imageUrl") ? { imageUrl: fields.get("imageUrl") } : {}),
+        ...(file ? { file } : {}),
+      });
+    });
+    request.pipe(parser);
+  });
+
+interface VoiceTurnForm {
+  audio: Buffer;
+  mimeType: string;
+}
+
+const parseVoiceTurnForm = async (request: Request): Promise<VoiceTurnForm> =>
+  await new Promise((resolveForm, rejectForm) => {
+    if (!request.headers["content-type"]?.toLocaleLowerCase().startsWith("multipart/form-data")) {
+      rejectForm(new VoiceSpeechError("Send the voice turn as multipart form data.", 415, "INVALID_MULTIPART"));
+      return;
+    }
+    const parser = Busboy({
+      headers: request.headers,
+      limits: { fileSize: 6 * 1024 * 1024, files: 1, fields: 1, parts: 2, fieldSize: 256 },
+    });
+    let audio: Buffer | undefined;
+    let mimeType = "";
+    let seenFile = false;
+    let parseError: Error | undefined;
+    parser.on("file", (_name, stream, info) => {
+      if (seenFile) {
+        parseError = new VoiceSpeechError("Send one voice clip at a time.", 400, "TOO_MANY_AUDIO_FILES");
+        stream.resume();
+        return;
+      }
+      seenFile = true;
+      const chunks: Buffer[] = [];
+      let limited = false;
+      stream.on("limit", () => {
+        limited = true;
+        parseError = new VoiceSpeechError("Voice clips can be at most 6 MB.", 413, "AUDIO_TOO_LARGE");
+      });
+      stream.on("data", (chunk: Buffer) => {
+        if (!limited) chunks.push(chunk);
+      });
+      stream.on("end", () => {
+        if (!limited) {
+          audio = Buffer.concat(chunks);
+          mimeType = info.mimeType;
+        }
+      });
+    });
+    parser.on("filesLimit", () => {
+      parseError = new VoiceSpeechError("Send one voice clip at a time.", 400, "TOO_MANY_AUDIO_FILES");
+    });
+    parser.on("partsLimit", () => {
+      parseError = new VoiceSpeechError("Too many voice turn fields.", 400, "TOO_MANY_AUDIO_PARTS");
+    });
+    parser.on("error", rejectForm);
+    request.once("aborted", () => rejectForm(new VoiceSpeechError("The voice upload was interrupted.", 400, "UPLOAD_ABORTED")));
+    parser.on("finish", () => {
+      if (parseError) return rejectForm(parseError);
+      if (!audio?.length || !mimeType) {
+        rejectForm(new VoiceSpeechError("Choose a voice clip to transcribe.", 400, "EMPTY_AUDIO"));
+        return;
+      }
+      resolveForm({ audio, mimeType });
+    });
+    request.pipe(parser);
+  });
+
+const parseCookies = (header?: string): Record<string, string> =>
+  Object.fromEntries(
+    (header ?? "")
+      .split(";")
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const separator = part.indexOf("=");
+        return [decodeURIComponent(part.slice(0, separator)), decodeURIComponent(part.slice(separator + 1))];
+      }),
+  );
+const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
+const safeNameKey = (name: string) => name.toLocaleLowerCase().replace(/[\s._-]/g, "");
+const randomAvatar = (): Member["avatar"] => {
+  const palettes = [
+    ["#ff7163", "#ffb866"],
+    ["#5f73ea", "#8ad8ff"],
+    ["#4abf98", "#a7e7c4"],
+    ["#bb65db", "#f6a5dd"],
+    ["#d8934d", "#f4d47d"],
+  ];
+  const [color, accent] = palettes[Math.floor(Math.random() * palettes.length)] as [string, string];
+  return { color, accent, glyph: "?" };
+};
+
+const app = express();
+app.disable("x-powered-by");
+if (process.env.TRUST_PROXY === "true") app.set("trust proxy", 1);
+app.use(
+  helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        connectSrc: ["'self'", "ws:", "wss:"],
+        fontSrc: ["'self'"],
+      },
+    },
+  }),
+);
+app.use((_request, response, next) => {
+  response.setHeader("Permissions-Policy", "microphone=(self)");
+  next();
+});
+app.use(express.json({ limit: "16kb" }));
+
+const httpServer = createServer(app);
+const configuredOrigins = (process.env.ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const io = new Server(httpServer, {
+  maxHttpBufferSize: 64 * 1024,
+  pingInterval: 22_000,
+  pingTimeout: 20_000,
+  connectionStateRecovery: { maxDisconnectionDuration: 120_000, skipMiddlewares: false },
+  cors: {
+    origin: (origin, callback) => {
+      if (!origin || configuredOrigins.length === 0 || configuredOrigins.includes(origin)) callback(null, true);
+      else callback(new Error("Origin not allowed"));
+    },
+    credentials: true,
+  },
+});
+
+const store = new RoomStore();
+const lm = new LmStudioClient();
+const actorChannels = new ActorChannelRuntime();
+const researchBroker = new ResearchBroker();
+const linkPreviewBroker = new LinkPreviewBroker();
+const imageStore = new ImageStore();
+const voiceSpeech = new VoiceSpeechService();
+const voiceSpeechCapabilities = await voiceSpeech.capabilities();
+const voiceRooms = new VoiceRoomRuntime(
+  CHANNELS.map((channel) => channel.id),
+  {
+    capabilities: {
+      transcription: true,
+      speechToText: voiceSpeechCapabilities.stt.available,
+      textToSpeech: voiceSpeechCapabilities.tts.available,
+      iceServers: readVoiceIceServers(),
+    },
+  },
+);
+const sessions = new Map<string, HumanSession>();
+const joinAttempts = new Map<string, number[]>();
+const socketBuckets = new Map<
+  string,
+  {
+    messages: TokenBucket;
+    reactions: TokenBucket;
+    typing: TokenBucket;
+    voiceActions: TokenBucket;
+    voiceSignals: TokenBucket;
+  }
+>();
+const MAX_CONCURRENT_IMAGE_INGESTS = 2;
+let activeImageIngests = 0;
+const MAX_CONCURRENT_VOICE_INGESTS = 2;
+let activeVoiceIngests = 0;
+
+const encodeHistoryCursor = (message: Pick<ChatMessage, "createdAt" | "id">): string =>
+  Buffer.from(JSON.stringify({ v: 1, createdAt: message.createdAt, id: message.id }), "utf8").toString("base64url");
+
+const decodeHistoryCursor = (raw: string | undefined): HistoryPosition | undefined => {
+  if (!raw) return undefined;
+  try {
+    const decoded = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as unknown;
+    const parsed = z
+      .object({ v: z.literal(1), createdAt: z.string().datetime(), id: z.string().min(1).max(100) })
+      .safeParse(decoded);
+    return parsed.success ? { createdAt: parsed.data.createdAt, id: parsed.data.id } : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const historyPageFor = (channelId: string, before?: HistoryPosition, limit = 40): HistoryPage => {
+  const page = store.getHistoryPage(channelId, before, limit);
+  const first = page.messages[0];
+  return {
+    ...page,
+    ...(page.hasMore && first ? { before: encodeHistoryCursor(first) } : {}),
+  };
+};
+
+const getMembers = (): Member[] => [
+  ...PERSONAS.map((persona) => ({ ...memberView(persona), activity: actorChannels.activityLabel(persona) })),
+  ...[...sessions.values()].map((session) => ({ ...session.member })),
+];
+const replyPreviewFor = (message: ChatMessage) => ({
+  authorId: message.authorId,
+  authorName:
+    getMembers().find((member) => member.id === message.authorId)?.name ??
+    message.authorSnapshot?.name ??
+    (message.system ? "room" : "someone"),
+  content: (message.content || (message.attachments?.length ? "Shared an image" : "")).slice(0, 140),
+});
+const onlineHumanCount = () => [...sessions.values()].filter((session) => session.member.status === "online").length;
+const getHealth = (): ServerHealth => ({
+  ok: true,
+  model: lm.health(),
+  onlineHumans: onlineHumanCount(),
+  aiPace: PACE,
+});
+const director = new SocialDirector(io, store, lm, actorChannels, researchBroker, getMembers, onlineHumanCount);
+
+const voiceSocketRoom = (roomId: string) => `voice:${roomId}`;
+const publishVoiceRooms = (): void => {
+  io.to("public").emit("voice:rooms:update", voiceRooms.listRooms());
+  director.setVoiceRoomActive(voiceRooms.listRooms().length > 0);
+};
+const publishVoiceRoom = (room: VoiceRoomView): void => {
+  io.to(voiceSocketRoom(room.id)).emit("voice:room:update", room);
+  publishVoiceRooms();
+};
+const voiceDirector = new VoiceDirector({
+  runtime: voiceRooms,
+  lm,
+  speech: voiceSpeech,
+  actorChannels,
+  events: {
+    roomChanged: publishVoiceRoom,
+    transcriptFinal: (entry) => io.to(voiceSocketRoom(entry.roomId)).emit("voice:transcript:final", entry),
+    aiSpeech: (payload) => io.to(voiceSocketRoom(payload.roomId)).emit("voice:ai-speech", payload),
+    aiStop: (payload) => io.to(voiceSocketRoom(payload.roomId)).emit("voice:ai-stop", payload),
+  },
+});
+
+const analyzeImageMessage = (message: ChatMessage, human: Member): void => {
+  const attachment = message.attachments?.[0];
+  if (!attachment) return;
+  void imageStore.read(attachment.id).then(async (image) => {
+    let analysis: ImageAnalysis = { status: "unavailable" };
+    try {
+      if (!image) throw new Error("Sanitized image was unavailable");
+      const observation = await lm.analyzeImage(image, message.content, 1);
+      analysis = { status: "ready", observation };
+    } catch (error) {
+      console.warn("Image analysis unavailable:", error instanceof Error ? error.message : error);
+    }
+    const updated = store.setImageAnalysis(message.channelId, message.id, attachment.id, analysis);
+    if (!updated) return;
+    imageStore.update(updated);
+    const payload: ImageAnalysisPayload = {
+      channelId: message.channelId,
+      messageId: message.id,
+      attachmentId: attachment.id,
+      analysis,
+    };
+    io.to("public").emit("image-analysis:update", payload);
+    director.onHumanImageReady(message, human, analysis.status === "ready" ? analysis.observation : undefined);
+  });
+};
+
+const sessionFromRequest = (request: Request): HumanSession | undefined => {
+  const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
+  return token ? sessions.get(hashToken(token)) : undefined;
+};
+
+const clientIp = (request: Request): string => {
+  if (process.env.TRUST_PROXY === "true") {
+    const cloudflareIp = request.headers["cf-connecting-ip"];
+    if (typeof cloudflareIp === "string") return cloudflareIp;
+  }
+  return request.ip || request.socket.remoteAddress || "unknown";
+};
+
+const hasAllowedOrigin = (request: Request): boolean => {
+  const origin = request.headers.origin;
+  if (!origin) return true;
+  if (configuredOrigins.includes(origin) || process.env.PUBLIC_ORIGIN === origin) return true;
+  try {
+    return new URL(origin).host === request.get("host");
+  } catch {
+    return false;
+  }
+};
+
+const allowJoinAttempt = (ip: string): boolean => {
+  const now = Date.now();
+  const recent = (joinAttempts.get(ip) ?? []).filter((timestamp) => now - timestamp < 10 * 60_000);
+  if (recent.length >= 8) return false;
+  recent.push(now);
+  joinAttempts.set(ip, recent);
+  return true;
+};
+
+const snapshotFor = (session: HumanSession): RoomSnapshot => {
+  const pages = CHANNELS.map((channel) => historyPageFor(channel.id));
+  return {
+    me: { ...session.member },
+    members: getMembers(),
+    channels: CHANNELS,
+    messages: pages
+      .flatMap((page) => page.messages)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)),
+    historyPageInfo: Object.fromEntries(
+      pages.map((page) => [page.channelId, { before: page.before, hasMore: page.hasMore }]),
+    ),
+    dmThreads: store.getDmThreads(session.member.id),
+    inviteRequired: Boolean(INVITE_CODE),
+    health: getHealth(),
+    directorEvents: director.getEvents(),
+  };
+};
+
+const attachLinkPreview = (message: ChatMessage, requesterId: string): void => {
+  void linkPreviewBroker.previewMessage(message.content, requesterId).then((linkPreview) => {
+    if (!linkPreview || !store.setLinkPreview(message.channelId, message.id, linkPreview)) return;
+    const payload: LinkPreviewPayload = { channelId: message.channelId, messageId: message.id, linkPreview };
+    io.to("public").emit("link-preview:update", payload);
+  });
+};
+
+const setSessionCookie = (request: Request, response: Response, token: string): void => {
+  const secure = request.secure || process.env.PUBLIC_ORIGIN?.startsWith("https://");
+  response.setHeader(
+    "Set-Cookie",
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${secure ? "; Secure" : ""}`,
+  );
+};
+
+app.get("/api/voice/capabilities", (_request, response) => {
+  const capabilities = voiceRooms.capabilities();
+  response.json({
+    ok: true,
+    enabled: VOICE_ENABLED,
+    capabilities: {
+      ...capabilities,
+      // TURN credentials are delivered only in authenticated create/join acks.
+      iceServers: capabilities.iceServers.map(({ urls }) => ({ urls })),
+    },
+    speech: voiceSpeechCapabilities,
+  });
+});
+
+app.get("/api/voice/audio/:audioId", (request, response) => {
+  const session = sessionFromRequest(request);
+  const roomId = typeof request.query.roomId === "string" ? request.query.roomId : "";
+  if (!session) {
+    response.status(401).json({ ok: false, error: "Join the room to hear AI voice audio." });
+    return;
+  }
+  if (!z.string().uuid().safeParse(roomId).success || !voiceRooms.isMemberInRoom(roomId, session.member.id)) {
+    response.status(403).json({ ok: false, error: "Join that voice room to hear its audio." });
+    return;
+  }
+  const audio = voiceSpeech.lookupAudio(request.params.audioId, roomId);
+  if (!audio) {
+    response.status(404).json({ ok: false, error: "That voice response has expired." });
+    return;
+  }
+  response.setHeader("Content-Type", audio.metadata.mimeType);
+  response.setHeader("Content-Length", String(audio.body.length));
+  response.setHeader("Cache-Control", "private, no-store");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("Content-Disposition", "inline");
+  response.send(audio.body);
+});
+
+app.post("/api/voice/:roomId/turns", async (request, response) => {
+  const session = sessionFromRequest(request);
+  const roomId = request.params.roomId;
+  if (!session) {
+    response.status(401).json({ ok: false, error: "Join the room before sending a voice turn." });
+    return;
+  }
+  if (!VOICE_ENABLED || !voiceSpeechCapabilities.stt.available) {
+    response.status(503).json({ ok: false, error: "Server speech-to-text is not configured. Use the typed voice turn instead." });
+    return;
+  }
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, error: "That voice upload origin is not allowed." });
+    return;
+  }
+  if (!z.string().uuid().safeParse(roomId).success || !voiceRooms.isMemberInRoom(roomId, session.member.id)) {
+    response.status(403).json({ ok: false, error: "Join that voice room before sending audio." });
+    return;
+  }
+  if (!session.voiceBucket.take()) {
+    response.status(429).json({ ok: false, error: "Voice turn cooldown — let the room answer first." });
+    return;
+  }
+  if (activeVoiceIngests >= MAX_CONCURRENT_VOICE_INGESTS) {
+    response.status(503).json({ ok: false, error: "The transcription desk is busy. Try again in a moment." });
+    return;
+  }
+
+  activeVoiceIngests += 1;
+  const speechAbort = new AbortController();
+  const abortSpeech = () => speechAbort.abort(new Error("Voice upload connection closed"));
+  const abortOnEarlyResponseClose = () => {
+    if (!response.writableEnded) abortSpeech();
+  };
+  request.once("aborted", abortSpeech);
+  response.once("close", abortOnEarlyResponseClose);
+  try {
+    const form = await parseVoiceTurnForm(request);
+    const transcript = await voiceSpeech.transcribe({ audio: form.audio, mimeType: form.mimeType, signal: speechAbort.signal });
+    const appended = voiceRooms.appendFinalTranscript(roomId, session.member.id, transcript.text);
+    if (!appended.ok) throw new VoiceSpeechError(appended.error, 409, appended.code);
+    io.to(voiceSocketRoom(roomId)).emit("voice:transcript:final", appended.entry);
+    const room = voiceRooms.getRoom(roomId);
+    if (room) director.noteHumanVoiceActivity(room.channelId);
+    voiceDirector.onHumanFinal(appended.entry);
+    response.status(201).json({ ok: true, text: appended.entry.text, entry: appended.entry });
+  } catch (error) {
+    const status = error instanceof VoiceSpeechError ? error.status : 400;
+    response.status(status).json({ ok: false, error: error instanceof Error ? error.message : "That voice turn could not be transcribed." });
+  } finally {
+    request.removeListener("aborted", abortSpeech);
+    response.removeListener("close", abortOnEarlyResponseClose);
+    activeVoiceIngests -= 1;
+  }
+});
+
+app.get("/api/images/:imageId", async (request, response) => {
+  if (!sessionFromRequest(request)) {
+    response.status(401).json({ ok: false, error: "Join the room to view shared images." });
+    return;
+  }
+  const image = await imageStore.read(request.params.imageId, request.query.variant === "thumbnail");
+  if (!image) {
+    response.status(404).json({ ok: false, error: "That image is no longer available." });
+    return;
+  }
+  response.setHeader("Content-Type", "image/webp");
+  response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("Content-Disposition", "inline");
+  response.send(image);
+});
+
+app.post("/api/channels/:channelId/image-messages", async (request, response) => {
+  const session = sessionFromRequest(request);
+  if (!session) {
+    response.status(401).json({ ok: false, error: "Join the room before sharing an image." } satisfies ImageMessageResult);
+    return;
+  }
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, error: "That upload origin is not allowed." } satisfies ImageMessageResult);
+    return;
+  }
+  if (!session.imageBucket.take()) {
+    response.status(429).json({ ok: false, error: "Image cooldown — give the room a moment." } satisfies ImageMessageResult);
+    return;
+  }
+  if (activeImageIngests >= MAX_CONCURRENT_IMAGE_INGESTS) {
+    response
+      .status(503)
+      .json({ ok: false, error: "The image desk is busy — try again in a moment." } satisfies ImageMessageResult);
+    return;
+  }
+  const channelId = request.params.channelId;
+  if (!CHANNELS.some((channel) => channel.id === channelId)) {
+    response.status(404).json({ ok: false, error: "That public channel does not exist." } satisfies ImageMessageResult);
+    return;
+  }
+
+  let attachmentId: string | undefined;
+  activeImageIngests += 1;
+  try {
+    const form = await parseImageMessageForm(request);
+    const content = form.content
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+      .trim();
+    if (content.length > 500) throw new ImageStoreError("Captions can be up to 500 characters.");
+    if (form.replyToId && form.replyToId.length > 100) throw new ImageStoreError("That reply target is invalid.");
+    if (form.imageUrl && form.imageUrl.length > 2_048) throw new ImageStoreError("That image URL is too long.");
+    if (Boolean(form.file) === Boolean(form.imageUrl)) {
+      throw new ImageStoreError("Attach exactly one uploaded image or direct HTTPS image URL.");
+    }
+    const replied = form.replyToId ? store.getMessage(form.replyToId) : undefined;
+    if (form.replyToId && (!replied || replied.channelId !== channelId)) {
+      throw new ImageStoreError("That reply target is no longer available in this channel.");
+    }
+
+    const input = form.file ?? (form.imageUrl ? await fetchRemoteImage(form.imageUrl) : undefined);
+    if (!input) throw new ImageStoreError("Choose an image to share.");
+    const attachment = await imageStore.create(input.body, "mimeType" in input ? input.mimeType : input.contentType);
+    attachmentId = attachment.id;
+    const message = createMessage(channelId, session.member.id, content, {
+      replyToId: form.replyToId,
+      ...(replied ? { replyPreview: replyPreviewFor(replied) } : {}),
+      authorSnapshot: { ...session.member, status: "offline" },
+      attachments: [attachment],
+    });
+    store.addPublicMessage(message);
+    io.to("public").emit("message:new", message);
+    director.onHumanImagePosted(message);
+    analyzeImageMessage(message, session.member);
+    response.status(201).json({ ok: true, message } satisfies ImageMessageResult);
+  } catch (error) {
+    if (attachmentId) await imageStore.remove(attachmentId);
+    const status = error instanceof ImageStoreError ? error.status : 400;
+    const message = error instanceof Error ? error.message : "That image could not be shared.";
+    response.status(status).json({ ok: false, error: message } satisfies ImageMessageResult);
+  } finally {
+    activeImageIngests -= 1;
+  }
+});
+
+app.get("/api/preview", (_request, response) => {
+  const preview: PublicPreview = {
+    members: getMembers().filter((member) => member.kind === "ai" || member.status === "online"),
+    channels: CHANNELS,
+    messages: CHANNELS.flatMap((channel) => store.getRecent(channel.id, 15))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((message) =>
+        message.attachments?.length
+          ? { ...message, content: message.content || "Shared an image — join to view", attachments: undefined }
+          : message,
+      ),
+    inviteRequired: Boolean(INVITE_CODE),
+    health: getHealth(),
+  };
+  response.json(preview);
+});
+
+app.get("/api/health", (_request, response) => response.json(getHealth()));
+
+app.get("/api/channels/:channelId/messages", (request, response) => {
+  const session = sessionFromRequest(request);
+  if (!session) {
+    response.status(401).json({ ok: false, error: "Join the room to load history." });
+    return;
+  }
+  if (!session.historyBucket.take()) {
+    response.status(429).json({ ok: false, error: "History is loading too quickly. Try again in a moment." });
+    return;
+  }
+  const channelId = request.params.channelId;
+  if (!CHANNELS.some((channel) => channel.id === channelId)) {
+    response.status(404).json({ ok: false, error: "That channel does not exist." });
+    return;
+  }
+  const beforeRaw = typeof request.query.before === "string" ? request.query.before : undefined;
+  if (beforeRaw && beforeRaw.length > 256) {
+    response.status(400).json({ ok: false, error: "Invalid history cursor." });
+    return;
+  }
+  const before = decodeHistoryCursor(beforeRaw);
+  if (beforeRaw && !before) {
+    response.status(400).json({ ok: false, error: "Invalid history cursor." });
+    return;
+  }
+  const requestedLimit = typeof request.query.limit === "string" ? Number.parseInt(request.query.limit, 10) : 40;
+  const limit = Number.isFinite(requestedLimit) ? Math.max(20, Math.min(80, requestedLimit)) : 40;
+  response.json({ ok: true, page: historyPageFor(channelId, before, limit) });
+});
+
+app.get("/api/session", (request, response) => {
+  const session = sessionFromRequest(request);
+  if (!session) {
+    response.status(401).json({ ok: false });
+    return;
+  }
+  response.json({ ok: true, me: session.member });
+});
+
+app.post("/api/session", (request, response) => {
+  if (!allowJoinAttempt(clientIp(request))) {
+    response.status(429).json({ ok: false, error: "Too many join attempts. Wait a few minutes and try again." });
+    return;
+  }
+  const parsed = joinSchema.safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).json({ ok: false, error: "Choose a display name between 2 and 24 characters." });
+    return;
+  }
+  if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
+    response.status(403).json({ ok: false, error: "That invite code doesn't open this room." });
+    return;
+  }
+
+  const name = normalizeName(parsed.data.name);
+  if (name.length < 2 || name.length > 24 || !/^[\p{L}\p{N}][\p{L}\p{N} ._-]*$/u.test(name)) {
+    response.status(400).json({ ok: false, error: "Use 2–24 letters, numbers, spaces, dots, dashes or underscores." });
+    return;
+  }
+  const reserved = new Set(getMembers().map((member) => safeNameKey(member.name)));
+  if (reserved.has(safeNameKey(name))) {
+    response.status(409).json({ ok: false, error: "That name is already in the room. Try a small variation." });
+    return;
+  }
+
+  const token = randomBytes(32).toString("base64url");
+  const tokenHash = hashToken(token);
+  const avatar = randomAvatar();
+  avatar.glyph = name.slice(0, 1).toLocaleUpperCase();
+  const session: HumanSession = {
+    tokenHash,
+    member: {
+      id: `human-${randomUUID()}`,
+      name,
+      kind: "human",
+      status: "offline",
+      avatar,
+      role: "Guest",
+      bio: "A real person visiting The Third Place.",
+    },
+    socketIds: new Set(),
+    lastSeenAt: Date.now(),
+    historyBucket: new TokenBucket(8, 1),
+    imageBucket: new TokenBucket(3, 1 / 25),
+    voiceBucket: new TokenBucket(8, 0.35),
+  };
+  sessions.set(tokenHash, session);
+  setSessionCookie(request, response, token);
+  response.status(201).json({ ok: true, me: session.member });
+});
+
+io.use((socket, next) => {
+  const token = parseCookies(socket.handshake.headers.cookie)[SESSION_COOKIE];
+  const session = token ? sessions.get(hashToken(token)) : undefined;
+  if (!session) {
+    next(new Error("AUTH_REQUIRED"));
+    return;
+  }
+  socket.data.sessionHash = session.tokenHash;
+  next();
+});
+
+io.on("connection", (socket) => {
+  const session = sessions.get(socket.data.sessionHash as string);
+  if (!session) return socket.disconnect(true);
+  const wasOffline = session.socketIds.size === 0;
+  session.socketIds.add(socket.id);
+  session.member.status = "online";
+  session.lastSeenAt = Date.now();
+  socket.join("public");
+  socket.join(`user:${session.member.id}`);
+  socketBuckets.set(socket.id, {
+    messages: new TokenBucket(5, 0.45),
+    reactions: new TokenBucket(12, 1.6),
+    typing: new TokenBucket(8, 2),
+    voiceActions: new TokenBucket(12, 1),
+    voiceSignals: new TokenBucket(120, 40),
+  });
+
+  socket.emit("room:snapshot", snapshotFor(session));
+  socket.emit("voice:rooms:update", voiceRooms.listRooms());
+  io.to("public").emit("presence:update", { members: getMembers() });
+
+  if (wasOffline) {
+    const joinMessage = createMessage("lobby", "system", `${session.member.name} joined the room`, { system: true });
+    store.addPublicMessage(joinMessage);
+    io.to("public").emit("message:new", joinMessage);
+    void director.welcome(session.member);
+  }
+
+  const voiceFailure = (error: string): VoiceCreateResult => ({ ok: false, code: "NOT_AUTHORIZED", error });
+  const joinedVoiceIdentity = () => ({
+    socketId: socket.id,
+    memberId: session.member.id,
+    name: session.member.name,
+  });
+  const leaveVoiceRoom = (): VoiceLeaveResult => {
+    const existing = voiceRooms.getRoomForSocket(socket.id);
+    const result = voiceRooms.leaveRoom(socket.id);
+    if (!result.ok) return result;
+    if (existing) void socket.leave(voiceSocketRoom(existing.id));
+    if (result.closed) {
+      voiceDirector.forgetRoom(result.roomId);
+      voiceSpeech.audioStore.deleteRoom(result.roomId);
+      io.to(voiceSocketRoom(result.roomId)).emit("voice:room:closed", { roomId: result.roomId });
+      publishVoiceRooms();
+    } else {
+      publishVoiceRoom(result.room);
+    }
+    return result;
+  };
+
+  socket.on("voice:room:create", (raw: unknown, acknowledge?: (result: VoiceCreateResult) => void) => {
+    if (!VOICE_ENABLED) {
+      acknowledge?.(voiceFailure("Voice rooms are disabled on this server."));
+      return;
+    }
+    if (!socketBuckets.get(socket.id)?.voiceActions.take()) {
+      acknowledge?.(voiceFailure("Voice controls are moving too quickly. Give it a moment."));
+      return;
+    }
+    const parsed = voiceCreateSchema.safeParse(raw);
+    if (!parsed.success) {
+      acknowledge?.(voiceFailure("Choose a valid public channel for voice."));
+      return;
+    }
+    const result = voiceRooms.createRoom(parsed.data.channelId, joinedVoiceIdentity());
+    if (result.ok) {
+      void socket.join(voiceSocketRoom(result.room.id));
+      publishVoiceRoom(result.room);
+      socket.emit("voice:transcript:history", voiceRooms.getTranscript(result.room.id));
+    }
+    acknowledge?.(result);
+  });
+
+  socket.on("voice:room:join", (raw: unknown, acknowledge?: (result: VoiceJoinResult) => void) => {
+    if (!VOICE_ENABLED) {
+      acknowledge?.(voiceFailure("Voice rooms are disabled on this server."));
+      return;
+    }
+    if (!socketBuckets.get(socket.id)?.voiceActions.take()) {
+      acknowledge?.(voiceFailure("Voice controls are moving too quickly. Give it a moment."));
+      return;
+    }
+    const parsed = voiceRoomIdSchema.safeParse(raw);
+    if (!parsed.success) {
+      acknowledge?.(voiceFailure("That voice room is invalid."));
+      return;
+    }
+    const alreadyOnSocket = voiceRooms.getRoomForSocket(socket.id);
+    let result: VoiceJoinResult;
+    if (alreadyOnSocket?.id === parsed.data.roomId) {
+      result = { ok: true, room: alreadyOnSocket, capabilities: voiceRooms.capabilities() };
+    } else {
+      const existingMemberRoom = voiceRooms.getRoomForMember(session.member.id);
+      const oldSocketId = existingMemberRoom?.id === parsed.data.roomId
+        ? voiceRooms.getSocketIdForMember(parsed.data.roomId, session.member.id)
+        : undefined;
+      result = oldSocketId && !io.sockets.sockets.has(oldSocketId)
+        ? voiceRooms.rebindHumanSocket(parsed.data.roomId, session.member.id, socket.id)
+        : voiceRooms.joinRoom(parsed.data.roomId, joinedVoiceIdentity());
+    }
+    if (result.ok) {
+      void socket.join(voiceSocketRoom(result.room.id));
+      publishVoiceRoom(result.room);
+      socket.emit("voice:transcript:history", voiceRooms.getTranscript(result.room.id));
+    }
+    acknowledge?.(result);
+  });
+
+  socket.on("voice:room:leave", (raw: unknown, acknowledge?: (result: VoiceLeaveResult) => void) => {
+    const parsed = voiceRoomIdSchema.safeParse(raw);
+    const current = voiceRooms.getRoomForSocket(socket.id);
+    if (!parsed.success || !current || current.id !== parsed.data.roomId) {
+      acknowledge?.({ ok: false, code: "NOT_IN_ROOM", error: "You are not in that voice room." });
+      return;
+    }
+    acknowledge?.(leaveVoiceRoom());
+  });
+
+  socket.on("voice:self-state", (raw: unknown, acknowledge?: (result: VoiceInviteBotResult) => void) => {
+    if (!socketBuckets.get(socket.id)?.voiceActions.take(0.25)) return;
+    const parsed = voiceStateSchema.safeParse(raw);
+    if (!parsed.success) {
+      acknowledge?.({ ok: false, code: "NOT_AUTHORIZED", error: "That voice state is invalid." });
+      return;
+    }
+    const result = voiceRooms.setHumanState(parsed.data.roomId, socket.id, parsed.data);
+    if (result.ok) publishVoiceRoom(result.room);
+    acknowledge?.(result);
+  });
+
+  socket.on("voice:signal", (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
+    if (!socketBuckets.get(socket.id)?.voiceSignals.take()) {
+      acknowledge?.({ ok: false, error: "Voice signaling rate limit reached." });
+      return;
+    }
+    const result = voiceRooms.routeSignal(socket.id, raw);
+    if (!result.ok) {
+      acknowledge?.({ ok: false, error: result.error });
+      return;
+    }
+    io.to(result.targetSocketId).emit("voice:signal", result.forward);
+    acknowledge?.({ ok: true });
+  });
+
+  socket.on("voice:bot:invite", (raw: unknown, acknowledge?: (result: VoiceInviteBotResult) => void) => {
+    if (!socketBuckets.get(socket.id)?.voiceActions.take(2)) {
+      acknowledge?.({ ok: false, code: "NOT_AUTHORIZED", error: "Wait a moment before changing the AI guests." });
+      return;
+    }
+    const parsed = voiceBotSchema.safeParse(raw);
+    const persona = parsed.success ? PERSONAS.find((candidate) => candidate.id === parsed.data.personaId) : undefined;
+    if (!parsed.success || !persona) {
+      acknowledge?.({ ok: false, code: "TARGET_NOT_FOUND", error: "That AI resident is not available." });
+      return;
+    }
+    let result = voiceRooms.inviteBot(parsed.data.roomId, socket.id, { personaId: persona.id, name: persona.name });
+    if (result.ok) result = voiceRooms.setBotState(parsed.data.roomId, persona.id, "listening");
+    if (result.ok) {
+      voiceDirector.invalidateRoom(parsed.data.roomId);
+      publishVoiceRoom(result.room);
+    }
+    acknowledge?.(result);
+  });
+
+  socket.on("voice:bot:remove", (raw: unknown, acknowledge?: (result: VoiceInviteBotResult) => void) => {
+    if (!socketBuckets.get(socket.id)?.voiceActions.take(2)) return;
+    const parsed = voiceBotSchema.safeParse(raw);
+    if (!parsed.success) {
+      acknowledge?.({ ok: false, code: "TARGET_NOT_FOUND", error: "That AI resident is invalid." });
+      return;
+    }
+    const result = voiceRooms.removeBot(parsed.data.roomId, socket.id, parsed.data.personaId);
+    if (result.ok) {
+      voiceDirector.invalidateRoom(parsed.data.roomId);
+      publishVoiceRoom(result.room);
+    }
+    acknowledge?.(result);
+  });
+
+  socket.on("voice:text-turn", (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
+    if (!socketBuckets.get(socket.id)?.voiceActions.take() || !session.voiceBucket.take(0.5)) {
+      acknowledge?.({ ok: false, error: "Voice turn cooldown — let the room answer first." });
+      return;
+    }
+    const parsed = voiceTextTurnSchema.safeParse(raw);
+    if (!parsed.success || !voiceRooms.isMemberInRoom(parsed.data.roomId, session.member.id)) {
+      acknowledge?.({ ok: false, error: "Join that voice room before speaking to its AI residents." });
+      return;
+    }
+    const appended = voiceRooms.appendFinalTranscript(parsed.data.roomId, session.member.id, parsed.data.text);
+    if (!appended.ok) {
+      acknowledge?.({ ok: false, error: appended.error });
+      return;
+    }
+    io.to(voiceSocketRoom(parsed.data.roomId)).emit("voice:transcript:final", appended.entry);
+    const room = voiceRooms.getRoom(parsed.data.roomId);
+    if (room) director.noteHumanVoiceActivity(room.channelId);
+    voiceDirector.onHumanFinal(appended.entry);
+    acknowledge?.({ ok: true });
+  });
+
+  socket.on("message:send", (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
+    const bucket = socketBuckets.get(socket.id)?.messages;
+    if (!bucket?.take()) {
+      acknowledge?.({ ok: false, error: "Slow down for a moment — the room is listening." });
+      return;
+    }
+    const parsed = messageSchema.safeParse(raw);
+    if (!parsed.success) {
+      acknowledge?.({ ok: false, error: "Messages can be up to 500 characters." });
+      return;
+    }
+    const content = parsed.data.content.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").trim();
+    if (!content) {
+      acknowledge?.({ ok: false, error: "That message came through empty." });
+      return;
+    }
+
+    if (CHANNELS.some((channel) => channel.id === parsed.data.channelId)) {
+      const replied = parsed.data.replyToId ? store.getMessage(parsed.data.replyToId) : undefined;
+      if (parsed.data.replyToId && (!replied || replied.channelId !== parsed.data.channelId)) {
+        acknowledge?.({ ok: false, error: "That reply target is no longer available in this channel." });
+        return;
+      }
+      const message = createMessage(parsed.data.channelId, session.member.id, content, {
+        replyToId: parsed.data.replyToId,
+        ...(replied ? { replyPreview: replyPreviewFor(replied) } : {}),
+        // Current presence comes from the live member map. The persisted
+        // fallback must never show a stale green dot after the guest leaves.
+        authorSnapshot: { ...session.member, status: "offline" },
+      });
+      store.addPublicMessage(message);
+      io.to("public").emit("message:new", message);
+      attachLinkPreview(message, session.member.id);
+      director.onHumanMessage(message, session.member);
+      acknowledge?.({ ok: true });
+      return;
+    }
+
+    const participants = store.getDmParticipants(parsed.data.channelId);
+    if (!participants?.includes(session.member.id)) {
+      acknowledge?.({ ok: false, error: "That private conversation isn't available." });
+      return;
+    }
+    const message = store.addDmMessage(parsed.data.channelId, session.member.id, content, parsed.data.replyToId);
+    if (!message) {
+      acknowledge?.({ ok: false, error: "Could not send that private message." });
+      return;
+    }
+    emitDmUpdate(participants, message);
+    const peerId = participants.find((id) => id !== session.member.id);
+    const persona = PERSONAS.find((candidate) => candidate.id === peerId);
+    if (persona) void director.onDirectMessage(message, session.member, persona);
+    acknowledge?.({ ok: true });
+  });
+
+  socket.on("dm:open", (raw: unknown, acknowledge?: (result: unknown) => void) => {
+    const parsed = z.object({ peerId: z.string().min(1).max(100) }).safeParse(raw);
+    const peer = parsed.success ? getMembers().find((member) => member.id === parsed.data.peerId) : undefined;
+    if (!peer || peer.id === session.member.id || peer.status === "offline") {
+      acknowledge?.({ ok: false, error: "That person isn't available for a private chat." });
+      return;
+    }
+    acknowledge?.({ ok: true, thread: store.openDm(session.member.id, peer.id) });
+  });
+
+  socket.on("reaction:toggle", (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
+    if (!socketBuckets.get(socket.id)?.reactions.take()) {
+      acknowledge?.({ ok: false, error: "Reaction cooldown — one beat." });
+      return;
+    }
+    const parsed = reactionSchema.safeParse(raw);
+    if (!parsed.success || !PUBLIC_REACTIONS.has(parsed.data.emoji)) {
+      acknowledge?.({ ok: false, error: "That reaction isn't available." });
+      return;
+    }
+    const reaction = store.togglePublicReaction(
+      parsed.data.channelId,
+      parsed.data.messageId,
+      parsed.data.emoji,
+      session.member.id,
+    );
+    if (!reaction) {
+      acknowledge?.({ ok: false, error: "That message is no longer available." });
+      return;
+    }
+    io.to("public").emit("reaction:update", {
+      channelId: parsed.data.channelId,
+      messageId: parsed.data.messageId,
+      reaction,
+    });
+    acknowledge?.({ ok: true });
+  });
+
+  socket.on("typing:set", (raw: unknown) => {
+    if (!socketBuckets.get(socket.id)?.typing.take(0.25)) return;
+    const parsed = z.object({ channelId: z.string().max(160), active: z.boolean() }).safeParse(raw);
+    if (!parsed.success) return;
+    const payload = { channelId: parsed.data.channelId, memberId: session.member.id, active: parsed.data.active };
+    if (CHANNELS.some((channel) => channel.id === parsed.data.channelId)) {
+      socket.to("public").emit("typing:member", payload);
+      return;
+    }
+    const participants = store.getDmParticipants(parsed.data.channelId);
+    const peerId = participants?.find((id) => id !== session.member.id);
+    if (peerId) socket.to(`user:${peerId}`).emit("typing:member", payload);
+  });
+
+  socket.on("message:report", (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
+    const parsed = z.object({ messageId: z.string().max(100), reason: z.string().max(120).optional() }).safeParse(raw);
+    if (!parsed.success || !store.getMessage(parsed.data.messageId)) {
+      acknowledge?.({ ok: false, error: "That message couldn't be reported." });
+      return;
+    }
+    console.info("Simulated moderation report", { messageId: parsed.data.messageId, reporterId: session.member.id });
+    socket.emit("toast", {
+      tone: "success",
+      title: "Sent to Runa",
+      message: "This is an internal simulation report; nothing was sent outside the room.",
+    });
+    acknowledge?.({ ok: true });
+  });
+
+  socket.on("disconnect", () => {
+    if (voiceRooms.getRoomForSocket(socket.id)) {
+      const timer = setTimeout(() => {
+        if (!io.sockets.sockets.has(socket.id) && voiceRooms.getRoomForSocket(socket.id)) leaveVoiceRoom();
+      }, VOICE_RECONNECT_GRACE_MS);
+      timer.unref();
+    }
+    socketBuckets.delete(socket.id);
+    session.socketIds.delete(socket.id);
+    session.lastSeenAt = Date.now();
+    if (session.socketIds.size === 0) session.member.status = "offline";
+    io.to("public").emit("presence:update", { members: getMembers() });
+  });
+});
+
+function emitDmUpdate(participants: [string, string], message: ChatMessage): void {
+  for (const viewerId of participants) {
+    const peerId = participants.find((id) => id !== viewerId);
+    if (!peerId || viewerId.startsWith("ai-")) continue;
+    io.to(`user:${viewerId}`).emit("dm:update", {
+      thread: store.openDm(viewerId, peerId),
+      message,
+    });
+  }
+}
+
+const distPath = resolve(process.cwd(), "dist");
+if (existsSync(distPath)) {
+  // This is a fast-moving live demo: always let reloads pick up the newest
+  // hashed asset manifest instead of holding an old index page for an hour.
+  app.use(express.static(distPath, { maxAge: 0 }));
+  app.get(/^(?!\/api\/).*/, (_request, response) => response.sendFile(resolve(distPath, "index.html")));
+}
+
+app.use((error: unknown, _request: Request, response: Response, _next: unknown) => {
+  console.error(error);
+  response.status(500).json({ ok: false, error: "The room tripped over a cable." });
+});
+
+await store.load();
+await imageStore.initialize(store.getAllMessages());
+store.onMessagesRemoved((removed) => {
+  for (const message of removed) {
+    for (const attachment of message.attachments ?? []) void imageStore.remove(attachment.id);
+  }
+});
+for (const message of store.getAllMessages()) {
+  for (const attachment of message.attachments ?? []) {
+    if (attachment.analysis.status !== "pending") continue;
+    const unavailable: ImageAnalysis = { status: "unavailable" };
+    const updated = store.setImageAnalysis(message.channelId, message.id, attachment.id, unavailable);
+    if (updated) imageStore.update(updated);
+  }
+}
+actorChannels.restore(store.getAllMessages());
+await lm.probe();
+director.start();
+
+const healthInterval = setInterval(async () => {
+  const now = Date.now();
+  for (const [tokenHash, session] of sessions) {
+    if (session.socketIds.size === 0 && now - session.lastSeenAt > 7 * 24 * 60 * 60_000) {
+      sessions.delete(tokenHash);
+      director.forgetHuman(session.member.id);
+      store.forgetDmParticipant(session.member.id);
+    }
+  }
+  for (const [ip, timestamps] of joinAttempts) {
+    const recent = timestamps.filter((timestamp) => now - timestamp < 10 * 60_000);
+    if (recent.length > 0) joinAttempts.set(ip, recent);
+    else joinAttempts.delete(ip);
+  }
+  await lm.probe();
+  io.to("public").emit("health:update", getHealth());
+}, 15_000);
+healthInterval.unref();
+
+httpServer.listen(PORT, HOST, () => {
+  console.log(`The Third Place is live on http://${HOST}:${PORT}`);
+  console.log(`LM Studio: ${lm.health().connected ? lm.health().id : "offline — deterministic fallbacks remain active"}`);
+});
+
+const shutdown = async (signal: string) => {
+  console.log(`${signal}: closing the room gracefully…`);
+  clearInterval(healthInterval);
+  director.stop();
+  io.close();
+  await store.flush();
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5_000).unref();
+};
+
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));

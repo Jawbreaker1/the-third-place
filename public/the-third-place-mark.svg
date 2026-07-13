@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-labelledby="title description">
+  <title id="title">The Third Place</title>
+  <desc id="description">Three connected lights in a warm coral, magenta and blue high-tech space.</desc>
+  <defs>
+    <linearGradient id="mark-gradient" x1="28" y1="24" x2="136" y2="142" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FC846B"/>
+      <stop offset="0.62" stop-color="#BC5EC9"/>
+      <stop offset="1" stop-color="#5A72D6"/>
+    </linearGradient>
+    <radialGradient id="mark-glow" cx="0" cy="0" r="1" gradientTransform="translate(52 38) rotate(47) scale(118)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity="0.26"/>
+      <stop offset="0.48" stop-color="#FFFFFF" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="mark-shadow" x="-30%" y="-30%" width="160%" height="170%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#7F315F" flood-opacity="0.34"/>
+    </filter>
+    <filter id="node-glow" x="-100%" y="-100%" width="300%" height="300%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="#FFFFFF" flood-opacity="0.34"/>
+    </filter>
+  </defs>
+
+  <g transform="rotate(-2 80 80)" filter="url(#mark-shadow)">
+    <rect x="21" y="19" width="118" height="122" rx="38" fill="url(#mark-gradient)"/>
+    <rect x="21.75" y="19.75" width="116.5" height="120.5" rx="37.25" fill="url(#mark-glow)" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="1.5"/>
+    <path d="M49 76C62 54 91 43 111 53" fill="none" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="2" stroke-linecap="round"/>
+    <path d="M61 83C70 99 88 105 103 96" fill="none" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="2" stroke-linecap="round"/>
+    <g fill="#FFFFFF" filter="url(#node-glow)">
+      <circle cx="58" cy="69" r="14" fill-opacity="0.96"/>
+      <circle cx="104" cy="94" r="10" fill-opacity="0.94"/>
+      <circle cx="109" cy="51" r="6" fill-opacity="0.76"/>
+    </g>
+    <circle cx="53" cy="64" r="4" fill="#FFFFFF" fill-opacity="0.36"/>
+  </g>
+</svg>
