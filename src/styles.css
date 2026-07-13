@@ -647,6 +647,10 @@ textarea:focus-visible,
 .voice-invite-panel .avatar-sm { width: 19px; height: 19px; border-radius: 6px; font-size: 8px; }
 .voice-invite-panel .ai-badge { transform: scale(.84); }
 
+.voice-listening-note { display: flex; width: min(680px, 100%); align-items: center; gap: 7px; margin: 14px auto -3px; padding: 8px 10px; border: 1px solid rgba(255,255,255,.055); border-radius: 10px; color: #858d9a; background: rgba(255,255,255,.018); font-size: 10px; line-height: 1.4; }
+.voice-listening-note.live { color: #9bcfbd; border-color: rgba(86,213,173,.15); background: rgba(86,213,173,.045); }
+.voice-listening-note.live svg { color: var(--mint); }
+
 .voice-typed-turn { display: flex; width: min(680px, 100%); min-height: 42px; align-items: center; gap: 8px; margin: 14px auto 0; padding: 5px 6px 5px 10px; border: 1px solid var(--line-strong); border-radius: 11px; color: #7d8492; background: #1d212a; }
 .voice-typed-turn input { min-width: 0; flex: 1; border: 0; outline: 0; color: #e0e3e8; background: transparent; font-size: 13px; }
 .voice-typed-turn button { height: 30px; padding: 0 10px; border: 0; border-radius: 8px; color: #17201d; background: var(--mint); cursor: pointer; font-size: 11px; font-weight: 700; }
@@ -658,6 +662,7 @@ textarea:focus-visible,
 .voice-prejoin button { display: inline-flex; min-width: 74px; height: 43px; align-items: center; justify-content: center; gap: 5px; padding: 0 12px; border: 1px solid var(--line); border-radius: 11px; color: #9ba2ae; background: rgba(255,255,255,.035); cursor: pointer; font-size: 11px; }
 .voice-controls button.active { color: #e58b98; border-color: rgba(228,95,112,.18); background: rgba(228,95,112,.07); }
 .voice-controls .voice-record { min-width: 132px; color: #17201d; border-color: transparent; background: var(--mint); font-weight: 740; }
+.voice-controls .voice-record:not(.active) { color: #9ba2ae; border-color: var(--line); background: rgba(255,255,255,.035); }
 .voice-controls .voice-record.recording { color: #fff; background: #d75768; box-shadow: 0 0 0 4px rgba(215,87,104,.09); }
 .voice-controls .voice-disconnect { color: #f0a1ad; border-color: rgba(228,95,112,.18); background: rgba(228,95,112,.08); }
 .voice-controls button:disabled,

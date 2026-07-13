@@ -30,6 +30,7 @@ import type {
   VoiceTranscriptEntry,
 } from "../shared/types";
 import { VoicePeerMesh } from "./voicePeer";
+import { VoiceActivityDetector, type VoiceActivityEvent } from "./voiceActivity";
 import {
   createBrowserVoicePlaybackController,
   type VoiceAiSpeechPayload,
@@ -44,6 +45,23 @@ type ConnectionState = "preview" | "connecting" | "live" | "reconnecting" | "off
 type Panel = "rooms" | "people" | null;
 type VoiceJoinState = "idle" | "requesting-permission" | "joining" | "connected" | "reconnecting" | "leaving" | "error";
 type VoiceRecordingState = "idle" | "recording" | "uploading" | "error";
+type ActiveVoiceCapture = {
+  generation: number;
+  roomId: string;
+  utteranceId: string;
+  recorder: MediaRecorder;
+  chunks: Blob[];
+  bytes: number;
+  startedAt: number;
+  discard: boolean;
+};
+type VoiceUploadJob = {
+  generation: number;
+  roomId: string;
+  utteranceId: string;
+  blob: Blob;
+  mimeType: string;
+};
 type ImageDraft = {
   id: string;
   channelId: string;
@@ -316,12 +334,15 @@ export default function App() {
   const [voiceJoinState, setVoiceJoinState] = useState<VoiceJoinState>("idle");
   const [voiceMuted, setVoiceMuted] = useState(true);
   const [voiceDeafened, setVoiceDeafened] = useState(false);
+  const [voiceHandsFree, setVoiceHandsFree] = useState(true);
   const [voiceRecording, setVoiceRecording] = useState<VoiceRecordingState>("idle");
+  const [voicePendingUploads, setVoicePendingUploads] = useState(0);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceCreateOpen, setVoiceCreateOpen] = useState(false);
   const [voiceAiAudioBlocked, setVoiceAiAudioBlocked] = useState(false);
   const [voiceRemoteAudioBlocked, setVoiceRemoteAudioBlocked] = useState(false);
   const [voiceBrowserSpeech, setVoiceBrowserSpeech] = useState(false);
+  const [voiceVadPaused, setVoiceVadPaused] = useState(false);
   const [voiceTranscripts, setVoiceTranscripts] = useState<Record<string, VoiceTranscriptEntry[]>>({});
   const [voiceTypedTurn, setVoiceTypedTurn] = useState("");
   const [, setRemoteStreamRevision] = useState(0);
@@ -349,24 +370,43 @@ export default function App() {
   const voiceRemoteAudio = useRef(new Map<string, HTMLAudioElement>());
   const voiceRemoteAudioBlockedMembers = useRef(new Set<string>());
   const voicePlaybackRef = useRef<VoicePlaybackController | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const voiceChunksRef = useRef<Blob[]>([]);
-  const voiceTurnBytesRef = useRef(0);
+  const voicePlaybackActiveRef = useRef(false);
+  const voiceRemoteSpeakingRef = useRef(false);
+  const voiceCaptureRef = useRef<ActiveVoiceCapture | null>(null);
+  const voiceRestartAfterStopRef = useRef(false);
+  const voiceBeginCaptureRef = useRef<() => void>(() => undefined);
+  const voiceFinishCaptureRef = useRef<(discard: boolean) => void>(() => undefined);
+  const voiceSessionGenerationRef = useRef(0);
+  const voiceUploadQueueRef = useRef<VoiceUploadJob[]>([]);
+  const voiceUploadRunningRef = useRef(false);
+  const voiceUploadAbortRef = useRef<AbortController | null>(null);
   const voiceRecordingTimer = useRef<number | undefined>(undefined);
   const voiceCapabilitiesRef = useRef<VoiceCapabilities | null>(null);
   const voiceDeafenedRef = useRef(false);
   const voiceMutedRef = useRef(true);
+  const voiceHandsFreeRef = useRef(true);
+  const voiceHasAiListenerRef = useRef(false);
   const voiceRecordingRef = useRef(false);
   const voiceAudioContextRef = useRef<AudioContext | null>(null);
+  const voiceActivityRef = useRef(new VoiceActivityDetector());
+  const voiceActivityEventRef = useRef<(event: VoiceActivityEvent) => void>(() => undefined);
   const voiceVadFrameRef = useRef<number | undefined>(undefined);
   const voiceVadSpeakingRef = useRef(false);
-  const voiceVadLastEmitRef = useRef(0);
   const voiceAudioBlocked = voiceAiAudioBlocked || voiceRemoteAudioBlocked;
+  voiceHasAiListenerRef.current = voiceRooms.some(
+    (room) => room.id === joinedVoiceRoomId && room.participants.some((participant) => participant.kind === "ai"),
+  );
+  voiceRemoteSpeakingRef.current = voiceRooms.some(
+    (room) => room.id === joinedVoiceRoomId && room.participants.some(
+      (participant) => participant.kind === "human" && participant.memberId !== me?.id && participant.speaking,
+    ),
+  );
 
   const getVoicePlayback = useCallback((): VoicePlaybackController => {
     voicePlaybackRef.current ??= createBrowserVoicePlaybackController({
       onAutoplayBlocked: setVoiceAiAudioBlocked,
       onModeChanged: (mode) => setVoiceBrowserSpeech(mode === "browser"),
+      onPlaybackActive: (active) => { voicePlaybackActiveRef.current = active; },
       onUnavailable: (_speech, reason) => {
         if (reason === "browser fallback disabled") {
           setVoiceError("AI speech audio is unavailable on this server; the transcript is still shown.");
@@ -415,21 +455,28 @@ export default function App() {
     });
   }, []);
 
+  const ensureVoiceVadRunning = useCallback(async (): Promise<boolean> => {
+    const context = voiceAudioContextRef.current;
+    if (!context || context.state === "closed") return false;
+    try {
+      if (context.state === "suspended") await context.resume();
+    } catch {
+      // Safari may require a fresh user gesture after permission/backgrounding.
+    }
+    const running = context.state === "running";
+    setVoiceVadPaused(!running);
+    return running;
+  }, []);
+
   const stopVoiceVad = useCallback(() => {
     if (voiceVadFrameRef.current !== undefined) cancelAnimationFrame(voiceVadFrameRef.current);
     voiceVadFrameRef.current = undefined;
-    if (voiceVadSpeakingRef.current && joinedVoiceRoomRef.current) {
-      socketRef.current?.emit("voice:self-state", {
-        roomId: joinedVoiceRoomRef.current,
-        muted: voiceMutedRef.current,
-        deafened: voiceDeafenedRef.current,
-        speaking: false,
-      });
-    }
-    voiceVadSpeakingRef.current = false;
+    for (const event of voiceActivityRef.current.reset(performance.now())) voiceActivityEventRef.current(event);
     const context = voiceAudioContextRef.current;
     voiceAudioContextRef.current = null;
+    if (context) context.onstatechange = null;
     if (context && context.state !== "closed") void context.close();
+    setVoiceVadPaused(false);
   }, []);
 
   const startVoiceVad = useCallback((stream: MediaStream) => {
@@ -441,64 +488,47 @@ export default function App() {
     analyser.smoothingTimeConstant = 0.62;
     context.createMediaStreamSource(stream).connect(analyser);
     voiceAudioContextRef.current = context;
+    context.onstatechange = () => setVoiceVadPaused(context.state !== "running" && context.state !== "closed");
+    voiceActivityRef.current = new VoiceActivityDetector({ startFrames: 2, minSpeechMs: 140 });
     const samples = new Float32Array(analyser.fftSize);
-    let loudFrames = 0;
-    let quietSince = performance.now();
-    const emitSpeaking = (speaking: boolean, now: number) => {
-      if (voiceVadSpeakingRef.current === speaking || now - voiceVadLastEmitRef.current < 250) return;
-      // This VAD drives human presence only. Speaker/remote echo can reach the
-      // microphone even with AEC, so it must not barge into AI playback. The
-      // explicit push-to-talk and typed-turn paths below own local AI barge-in.
-      voiceVadSpeakingRef.current = speaking;
-      voiceVadLastEmitRef.current = now;
-      if (!joinedVoiceRoomRef.current) return;
-      socketRef.current?.emit("voice:self-state", {
-        roomId: joinedVoiceRoomRef.current,
-        muted: voiceMutedRef.current,
-        deafened: voiceDeafenedRef.current,
-        speaking,
-      });
-    };
     const sample = () => {
       analyser.getFloatTimeDomainData(samples);
       let energy = 0;
       for (const value of samples) energy += value * value;
       const rms = Math.sqrt(energy / samples.length);
       const now = performance.now();
-      if (voiceRecordingRef.current) {
-        loudFrames = 0;
-        quietSince = now;
-        voiceVadFrameRef.current = requestAnimationFrame(sample);
-        return;
-      }
-      const suppressed = voiceMutedRef.current || voiceDeafenedRef.current;
-      if (!suppressed && rms > 0.042) {
-        loudFrames += 1;
-        quietSince = now;
-        if (loudFrames >= 3) emitSpeaking(true, now);
-      } else {
-        loudFrames = 0;
-        if (rms > 0.021 && !suppressed) quietSince = now;
-        if (suppressed || now - quietSince > 360) emitSpeaking(false, now);
+      const events = voiceActivityRef.current.push({
+        nowMs: now,
+        rms,
+        suppressed: !joinedVoiceRoomRef.current || voiceMutedRef.current || voiceDeafenedRef.current,
+        playbackActive: voicePlaybackActiveRef.current || voiceRemoteSpeakingRef.current,
+      });
+      for (const event of events) {
+        voiceActivityEventRef.current(event);
       }
       voiceVadFrameRef.current = requestAnimationFrame(sample);
     };
-    void context.resume();
+    void ensureVoiceVadRunning();
     voiceVadFrameRef.current = requestAnimationFrame(sample);
-  }, [stopVoiceVad]);
+  }, [ensureVoiceVadRunning, stopVoiceVad]);
 
   const clearVoiceMedia = useCallback(() => {
+    voiceSessionGenerationRef.current += 1;
+    voiceUploadAbortRef.current?.abort();
+    voiceUploadAbortRef.current = null;
+    voiceUploadQueueRef.current = [];
+    voiceRestartAfterStopRef.current = false;
+    setVoicePendingUploads(0);
     if (voiceRecordingTimer.current) window.clearTimeout(voiceRecordingTimer.current);
     voiceRecordingTimer.current = undefined;
-    const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== "inactive") {
-      recorder.ondataavailable = null;
-      recorder.onstop = null;
-      recorder.stop();
+    const capture = voiceCaptureRef.current;
+    voiceCaptureRef.current = null;
+    if (capture?.recorder && capture.recorder.state !== "inactive") {
+      capture.recorder.ondataavailable = null;
+      capture.recorder.onstop = null;
+      capture.recorder.onerror = null;
+      capture.recorder.stop();
     }
-    mediaRecorderRef.current = null;
-    voiceChunksRef.current = [];
-    voiceTurnBytesRef.current = 0;
     stopVoiceVad();
     voiceMeshRef.current?.close();
     voiceMeshRef.current = null;
@@ -515,6 +545,7 @@ export default function App() {
     setRemoteStreamRevision((value) => value + 1);
     voiceMutedRef.current = true;
     voiceRecordingRef.current = false;
+    voicePlaybackActiveRef.current = false;
     setVoiceRecording("idle");
   }, [stopVoiceVad]);
 
@@ -537,7 +568,7 @@ export default function App() {
       },
     });
     voiceMeshRef.current = mesh;
-    mesh.setInputEnabled(false);
+    mesh.setInputEnabled(!voiceMutedRef.current && !voiceDeafenedRef.current);
     mesh.syncPeers(room.participants.filter((participant) => participant.kind === "human").map((participant) => participant.memberId), room.revision);
   }, []);
 
@@ -569,15 +600,25 @@ export default function App() {
     for (const track of stream.getAudioTracks()) {
       track.enabled = false;
       track.onended = () => {
+        if (localVoiceStreamRef.current === stream) localVoiceStreamRef.current = null;
         setVoiceMuted(true);
         voiceMutedRef.current = true;
+        voiceMeshRef.current?.setInputEnabled(false);
+        stopVoiceVad();
+        voiceFinishCaptureRef.current(true);
+        if (joinedVoiceRoomRef.current) socketRef.current?.emit("voice:self-state", {
+          roomId: joinedVoiceRoomRef.current,
+          muted: true,
+          deafened: voiceDeafenedRef.current,
+          speaking: false,
+        });
         setVoiceError("The microphone was disconnected.");
       };
     }
     localVoiceStreamRef.current = stream;
     startVoiceVad(stream);
     return stream;
-  }, [startVoiceVad]);
+  }, [startVoiceVad, stopVoiceVad]);
 
   const playVoiceAiSpeech = useCallback((speech: VoiceAiSpeechPayload) => {
     if (speech.roomId !== joinedVoiceRoomRef.current || voiceDeafenedRef.current) return;
@@ -1174,6 +1215,10 @@ export default function App() {
     }
     if (generation !== voiceJoinGeneration.current) {
       for (const track of stream?.getTracks() ?? []) track.stop();
+      if (stream && stream === localVoiceStreamRef.current) {
+        localVoiceStreamRef.current = null;
+        stopVoiceVad();
+      }
       return;
     }
     setVoiceJoinState("joining");
@@ -1182,7 +1227,10 @@ export default function App() {
       if (generation !== voiceJoinGeneration.current) return;
       if (!result.ok) {
         for (const track of stream?.getTracks() ?? []) track.stop();
-        if (stream === localVoiceStreamRef.current) localVoiceStreamRef.current = null;
+        if (stream === localVoiceStreamRef.current) {
+          localVoiceStreamRef.current = null;
+          stopVoiceVad();
+        }
         setVoiceJoinState("error");
         setVoiceError(result.error);
         return;
@@ -1192,11 +1240,12 @@ export default function App() {
       joinedVoiceRoomRef.current = result.room.id;
       setJoinedVoiceRoomId(result.room.id);
       setVoiceViewRoomId(result.room.id);
-      setVoiceMuted(true);
-      voiceMutedRef.current = true;
+      const initialMuted = !stream;
+      setVoiceMuted(initialMuted);
+      voiceMutedRef.current = initialMuted;
       setVoiceDeafened(false);
       voiceDeafenedRef.current = false;
-      socketRef.current?.emit("voice:self-state", { roomId: result.room.id, muted: true, deafened: false, speaking: false }, (stateResult: VoiceInviteBotResult) => {
+      socketRef.current?.emit("voice:self-state", { roomId: result.room.id, muted: initialMuted, deafened: false, speaking: false }, (stateResult: VoiceInviteBotResult) => {
         const finalRoom = stateResult.ok ? stateResult.room : result.room;
         upsertVoiceRoom(finalRoom);
         createVoiceMesh(finalRoom, me.id, stream);
@@ -1231,6 +1280,7 @@ export default function App() {
   const toggleVoiceMute = async () => {
     if (!joinedVoiceRoomRef.current) return;
     const nextMuted = !voiceMuted;
+    if (!nextMuted && voiceDeafenedRef.current) return;
     if (!nextMuted && !localVoiceStreamRef.current) {
       setVoiceJoinState("requesting-permission");
       try {
@@ -1244,8 +1294,14 @@ export default function App() {
     }
     setVoiceMuted(nextMuted);
     voiceMutedRef.current = nextMuted;
-    voiceMeshRef.current?.setInputEnabled(!nextMuted);
-    socketRef.current?.emit("voice:self-state", { roomId: joinedVoiceRoomRef.current, muted: nextMuted, deafened: voiceDeafened });
+    voiceMeshRef.current?.setInputEnabled(!nextMuted && !voiceDeafenedRef.current);
+    if (!nextMuted) void ensureVoiceVadRunning();
+    else {
+      for (const event of voiceActivityRef.current.push({ nowMs: performance.now(), rms: 0, suppressed: true })) {
+        voiceActivityEventRef.current(event);
+      }
+    }
+    socketRef.current?.emit("voice:self-state", { roomId: joinedVoiceRoomRef.current, muted: nextMuted, deafened: voiceDeafenedRef.current, speaking: false });
     setVoiceJoinState("connected");
   };
 
@@ -1253,6 +1309,14 @@ export default function App() {
     const next = !voiceDeafened;
     setVoiceDeafened(next);
     voiceDeafenedRef.current = next;
+    if (next) {
+      setVoiceMuted(true);
+      voiceMutedRef.current = true;
+      voiceMeshRef.current?.setInputEnabled(false);
+      for (const event of voiceActivityRef.current.push({ nowMs: performance.now(), rms: 0, suppressed: true })) {
+        voiceActivityEventRef.current(event);
+      }
+    }
     for (const audio of voiceRemoteAudio.current.values()) audio.muted = next;
     getVoicePlayback().setDeafened(next);
     if (next) {
@@ -1262,7 +1326,7 @@ export default function App() {
       setVoiceBrowserSpeech(false);
     }
     if (joinedVoiceRoomRef.current) {
-      socketRef.current?.emit("voice:self-state", { roomId: joinedVoiceRoomRef.current, muted: voiceMuted, deafened: next });
+      socketRef.current?.emit("voice:self-state", { roomId: joinedVoiceRoomRef.current, muted: next ? true : voiceMutedRef.current, deafened: next, speaking: false });
     }
   };
 
@@ -1284,53 +1348,76 @@ export default function App() {
     setVoiceRemoteAudioBlocked(voiceRemoteAudioBlockedMembers.current.size > 0);
   };
 
-  const uploadVoiceTurn = useCallback(async (roomId: string, blob: Blob, mimeType: string) => {
-    voiceRecordingRef.current = false;
-    setVoiceRecording("uploading");
-    const form = new FormData();
-    form.set("audio", blob, `voice-turn.${mimeType.includes("mp4") ? "m4a" : mimeType.includes("ogg") ? "ogg" : "webm"}`);
+  const pumpVoiceUploads = useCallback(async () => {
+    if (voiceUploadRunningRef.current) return;
+    voiceUploadRunningRef.current = true;
     try {
-      const response = await fetch(`/api/voice/${encodeURIComponent(roomId)}/turns`, { method: "POST", body: form, credentials: "same-origin" });
-      const result = (await response.json()) as { ok: boolean; error?: string };
-      if (!response.ok || !result.ok) throw new Error(result.error ?? "The voice turn could not be transcribed.");
-      setVoiceRecording("idle");
-    } catch (error) {
-      setVoiceRecording("error");
-      setVoiceError(error instanceof Error ? error.message : "The voice turn could not be transcribed.");
+      while (voiceUploadQueueRef.current.length > 0) {
+        const job = voiceUploadQueueRef.current.shift();
+        if (!job || job.generation !== voiceSessionGenerationRef.current) continue;
+        setVoicePendingUploads(voiceUploadQueueRef.current.length + 1);
+        if (!voiceCaptureRef.current) setVoiceRecording("uploading");
+        const abort = new AbortController();
+        voiceUploadAbortRef.current = abort;
+        const form = new FormData();
+        form.set("audio", job.blob, `voice-turn.${job.mimeType.includes("mp4") ? "m4a" : job.mimeType.includes("ogg") ? "ogg" : "webm"}`);
+        form.set("utteranceId", job.utteranceId);
+        try {
+          const response = await fetch(`/api/voice/${encodeURIComponent(job.roomId)}/turns`, {
+            method: "POST",
+            body: form,
+            credentials: "same-origin",
+            signal: abort.signal,
+          });
+          const result = (await response.json()) as { ok: boolean; error?: string };
+          if (!response.ok || !result.ok) throw new Error(result.error ?? "The voice turn could not be transcribed.");
+        } catch (error) {
+          if (!abort.signal.aborted && job.generation === voiceSessionGenerationRef.current) {
+            setVoiceRecording("error");
+            setVoiceError(error instanceof Error ? error.message : "The voice turn could not be transcribed.");
+          }
+        } finally {
+          if (voiceUploadAbortRef.current === abort) voiceUploadAbortRef.current = null;
+        }
+      }
+    } finally {
+      voiceUploadRunningRef.current = false;
+      setVoicePendingUploads(0);
+      if (!voiceCaptureRef.current) setVoiceRecording((current) => current === "error" ? current : "idle");
     }
   }, []);
 
-  const stopVoiceRecording = useCallback(() => {
+  const queueVoiceUpload = useCallback((job: VoiceUploadJob) => {
+    if (voiceUploadQueueRef.current.length >= 4) {
+      setVoiceRecording("error");
+      setVoiceError("Voice transcription is falling behind. Pause for a moment so the room can catch up.");
+      return;
+    }
+    voiceUploadQueueRef.current.push(job);
+    setVoicePendingUploads(voiceUploadQueueRef.current.length + (voiceUploadRunningRef.current ? 1 : 0));
+    void pumpVoiceUploads();
+  }, [pumpVoiceUploads]);
+
+  const finishVoiceCapture = useCallback((discard: boolean) => {
+    const capture = voiceCaptureRef.current;
+    if (!capture) return;
+    capture.discard ||= discard;
     if (voiceRecordingTimer.current) window.clearTimeout(voiceRecordingTimer.current);
     voiceRecordingTimer.current = undefined;
-    const recorder = mediaRecorderRef.current;
-    if (recorder?.state === "recording") recorder.stop();
+    if (capture.recorder.state === "recording") capture.recorder.stop();
   }, []);
 
-  const toggleVoiceRecording = async () => {
+  voiceFinishCaptureRef.current = finishVoiceCapture;
+
+  const beginVoiceCapture = useCallback(() => {
     const roomId = joinedVoiceRoomRef.current;
-    if (!roomId || voiceRecording === "uploading") return;
-    if (voiceRecording === "recording") {
-      stopVoiceRecording();
-      return;
-    }
-    if (!voiceCapabilities?.speechToText || !("MediaRecorder" in window)) {
-      setVoiceError("Speech-to-text is unavailable. Send a typed turn instead.");
-      return;
-    }
-    let stream: MediaStream;
-    try {
-      stream = await acquireVoiceStream();
-      await voiceMeshRef.current?.setLocalStream(stream);
-    } catch (error) {
-      setVoiceError(describeMicrophoneError(error));
-      return;
-    }
-    // Push-to-talk is a human barge-in: do not make them wait for the current
-    // bot clip (or any queued bot clip) before their turn can begin.
-    voicePlaybackRef.current?.bargeIn();
-    setVoiceAiAudioBlocked(false);
-    setVoiceBrowserSpeech(false);
+    const stream = localVoiceStreamRef.current;
+    if (
+      !roomId || !stream?.active || voiceCaptureRef.current || !voiceHandsFreeRef.current ||
+      voiceMutedRef.current || voiceDeafenedRef.current || !voiceHasAiListenerRef.current ||
+      !voiceCapabilitiesRef.current?.speechToText || !("MediaRecorder" in window)
+    ) return;
+
     const mimeType = [
       "audio/webm;codecs=opus",
       "audio/ogg;codecs=opus",
@@ -1340,49 +1427,139 @@ export default function App() {
     ].find((candidate) => MediaRecorder.isTypeSupported(candidate));
     try {
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
-      voiceChunksRef.current = [];
-      voiceTurnBytesRef.current = 0;
+      const generation = voiceSessionGenerationRef.current;
+      const capture: ActiveVoiceCapture = {
+        generation,
+        roomId,
+        utteranceId: crypto.randomUUID(),
+        recorder,
+        chunks: [],
+        bytes: 0,
+        startedAt: performance.now(),
+        discard: false,
+      };
+      voiceCaptureRef.current = capture;
       recorder.ondataavailable = (event) => {
-        if (!event.data.size) return;
-        voiceChunksRef.current.push(event.data);
-        voiceTurnBytesRef.current += event.data.size;
-        if (voiceTurnBytesRef.current > 6 * 1024 * 1024 && recorder.state === "recording") recorder.stop();
+        if (!event.data.size || voiceCaptureRef.current !== capture) return;
+        capture.chunks.push(event.data);
+        capture.bytes += event.data.size;
+        if (capture.bytes > 6 * 1024 * 1024 && recorder.state === "recording") {
+          capture.discard = true;
+          recorder.stop();
+        }
       };
       recorder.onstop = () => {
+        if (voiceCaptureRef.current !== capture) return;
+        voiceCaptureRef.current = null;
         voiceRecordingRef.current = false;
-        mediaRecorderRef.current = null;
-        voiceMeshRef.current?.setInputEnabled(!voiceMuted);
-        socketRef.current?.emit("voice:self-state", { roomId, muted: voiceMuted, deafened: voiceDeafened, speaking: false });
+        if (voiceRecordingTimer.current) window.clearTimeout(voiceRecordingTimer.current);
+        voiceRecordingTimer.current = undefined;
         const actualType = recorder.mimeType || mimeType || "audio/webm";
-        const blob = new Blob(voiceChunksRef.current, { type: actualType });
-        const exceededLimit = voiceTurnBytesRef.current > 6 * 1024 * 1024;
-        voiceChunksRef.current = [];
-        voiceTurnBytesRef.current = 0;
-        if (exceededLimit) {
+        const blob = new Blob(capture.chunks, { type: actualType });
+        if (capture.bytes > 6 * 1024 * 1024) {
           setVoiceRecording("error");
           setVoiceError("That voice turn exceeded 6 MB. Try a shorter turn.");
-        } else if (blob.size) void uploadVoiceTurn(roomId, blob, actualType);
-        else setVoiceRecording("error");
+        } else if (!capture.discard && blob.size && capture.generation === voiceSessionGenerationRef.current) {
+          queueVoiceUpload({
+            generation: capture.generation,
+            roomId: capture.roomId,
+            utteranceId: capture.utteranceId,
+            blob,
+            mimeType: actualType,
+          });
+        } else if (!voiceUploadRunningRef.current && voiceUploadQueueRef.current.length === 0) {
+          setVoiceRecording("idle");
+        }
+        const restartAfterBoundary = voiceRestartAfterStopRef.current && voiceVadSpeakingRef.current;
+        voiceRestartAfterStopRef.current = false;
+        if (restartAfterBoundary) queueMicrotask(() => voiceBeginCaptureRef.current());
       };
       recorder.onerror = () => {
+        if (voiceCaptureRef.current === capture) voiceCaptureRef.current = null;
         voiceRecordingRef.current = false;
         setVoiceRecording("error");
-        setVoiceError("Recording failed. Try the typed turn instead.");
+        setVoiceError("Recording failed. You can still use the typed voice turn below.");
       };
-      voiceMeshRef.current?.setInputEnabled(true);
-      socketRef.current?.emit("voice:self-state", { roomId, muted: false, deafened: voiceDeafened, speaking: !voiceDeafened });
-      recorder.start(500);
+      recorder.start(250);
       voiceRecordingRef.current = true;
       setVoiceRecording("recording");
-      // Stop just inside the server's 30-second decoded-audio ceiling.
-      voiceRecordingTimer.current = window.setTimeout(stopVoiceRecording, 29_000);
+      setVoiceError(null);
+      voiceRecordingTimer.current = window.setTimeout(() => finishVoiceCapture(false), 28_000);
     } catch (error) {
+      voiceCaptureRef.current = null;
       voiceRecordingRef.current = false;
-      setVoiceError(error instanceof Error ? error.message : "Recording could not start.");
       setVoiceRecording("error");
+      setVoiceError(error instanceof Error ? error.message : "Recording could not start.");
+    }
+  }, [finishVoiceCapture, queueVoiceUpload]);
+
+  voiceBeginCaptureRef.current = beginVoiceCapture;
+
+  voiceActivityEventRef.current = (event) => {
+    const roomId = joinedVoiceRoomRef.current;
+    if (event.type === "speechStarted") {
+      voiceVadSpeakingRef.current = true;
+      voicePlaybackRef.current?.bargeIn();
+      setVoiceAiAudioBlocked(false);
+      setVoiceBrowserSpeech(false);
+      if (roomId) socketRef.current?.emit("voice:self-state", {
+        roomId,
+        muted: voiceMutedRef.current,
+        deafened: voiceDeafenedRef.current,
+        speaking: true,
+      });
+    } else if (event.type === "segmentStarted") {
+      if (event.reason === "continuation") {
+        if (voiceCaptureRef.current) voiceRestartAfterStopRef.current = true;
+        else voiceBeginCaptureRef.current();
+      } else {
+        voiceBeginCaptureRef.current();
+      }
+    } else if (event.type === "speechEnded") {
+      voiceVadSpeakingRef.current = false;
+      voiceRestartAfterStopRef.current = false;
+      if (roomId) socketRef.current?.emit("voice:self-state", {
+        roomId,
+        muted: voiceMutedRef.current,
+        deafened: voiceDeafenedRef.current,
+        speaking: false,
+      });
+    } else if (event.type === "segmentStopped") {
+      finishVoiceCapture(false);
+    } else if (event.type === "segmentDiscarded") {
+      finishVoiceCapture(true);
     }
   };
+
+  const toggleVoiceHandsFree = () => {
+    if (!voiceCapabilities?.speechToText || !("MediaRecorder" in window) || !("AudioContext" in window)) {
+      setVoiceError("Speech-to-text is unavailable. Send a typed turn instead.");
+      return;
+    }
+    if (voiceHandsFree && voiceVadPaused) {
+      void ensureVoiceVadRunning();
+      return;
+    }
+    const next = !voiceHandsFree;
+    setVoiceHandsFree(next);
+    voiceHandsFreeRef.current = next;
+    if (!next) finishVoiceCapture(true);
+    else void ensureVoiceVadRunning();
+  };
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        for (const event of voiceActivityRef.current.push({ nowMs: performance.now(), rms: 0, suppressed: true })) {
+          voiceActivityEventRef.current(event);
+        }
+      } else if (!voiceMutedRef.current && voiceHandsFreeRef.current) {
+        void ensureVoiceVadRunning();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, [ensureVoiceVadRunning]);
 
   const sendTypedVoiceTurn = (event: FormEvent) => {
     event.preventDefault();
@@ -1650,7 +1827,7 @@ export default function App() {
       >
         {dragActive && !voiceViewRoomId && <div className="image-drop-overlay" aria-hidden="true"><span><Icon name="image" size={28} /></span><strong>Drop image to share</strong><small>JPEG, PNG or WebP · max 8 MB</small></div>}
         {voiceViewRoomId && (
-          <section className="voice-stage" aria-label="Voice room">
+          <section className="voice-stage" aria-label="Voice room" data-voice-room-id={voiceRoomInView?.id}>
             {voiceRoomInView ? (
               <>
                 <header className="voice-stage-header">
@@ -1696,7 +1873,7 @@ export default function App() {
 
                   {voiceRoomTranscripts.length > 0 && (
                     <div className="voice-transcript" aria-live="polite">
-                      <p className="eyebrow">Recent voice context</p>
+                      <p className="eyebrow">Recent spoken context</p>
                       {voiceRoomTranscripts.slice(-4).map((entry) => <p key={entry.id}><strong>{entry.speakerName}</strong><span>{entry.text}</span></p>)}
                     </div>
                   )}
@@ -1709,16 +1886,50 @@ export default function App() {
                   )}
 
                   {joinedVoiceRoomId === voiceRoomInView.id && (
-                    <form className="voice-typed-turn" onSubmit={sendTypedVoiceTurn}>
-                      <Icon name="message" size={15} /><input value={voiceTypedTurn} onChange={(event) => setVoiceTypedTurn(event.target.value)} maxLength={500} placeholder="Type what you want to say to the AI residents" /><button type="submit" disabled={!voiceTypedTurn.trim()}>Send</button>
-                    </form>
+                    <>
+                      {voiceCapabilities?.speechToText && voiceHandsFree && (
+                        <div className={`voice-listening-note ${!voiceVadPaused && !voiceMuted && voiceRoomInView.participants.some((participant) => participant.kind === "ai") ? "live" : ""}`}>
+                          <Icon name="radio" size={14} />
+                          <span>{voiceVadPaused
+                            ? "The browser paused microphone analysis. Press Resume listening below to continue hands-free."
+                            : voiceMuted
+                            ? "Hands-free AI is ready and starts only when you unmute."
+                            : voiceRoomInView.participants.some((participant) => participant.kind === "ai")
+                              ? "Hands-free AI listening is on. Natural pauses send each spoken turn for transcription."
+                              : "Hands-free is ready. Invite an AI resident to let them hear transcribed turns."}</span>
+                        </div>
+                      )}
+                      <form className="voice-typed-turn" onSubmit={sendTypedVoiceTurn}>
+                        <Icon name="message" size={15} /><input value={voiceTypedTurn} onChange={(event) => setVoiceTypedTurn(event.target.value)} maxLength={500} placeholder="Typed fallback — treated as something said in this voice room" /><button type="submit" disabled={!voiceTypedTurn.trim()}>Send</button>
+                      </form>
+                    </>
                   )}
                 </div>
 
                 {joinedVoiceRoomId === voiceRoomInView.id ? (
                   <div className="voice-controls" aria-label="Voice controls">
-                    <button type="button" className={voiceMuted ? "active" : ""} onClick={() => void toggleVoiceMute()} disabled={voiceJoinState === "requesting-permission" || voiceRecording === "recording" || voiceRecording === "uploading"} aria-label={voiceMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={voiceMuted}><Icon name={voiceMuted ? "micOff" : "mic"} /><span>{voiceMuted ? "Unmute" : "Mute"}</span></button>
-                    <button type="button" className={`voice-record ${voiceRecording === "recording" ? "recording" : ""}`} onClick={() => void toggleVoiceRecording()} disabled={voiceRecording === "uploading"} aria-label={voiceRecording === "recording" ? "Stop and send AI voice turn" : voiceRecording === "uploading" ? "Transcribing AI voice turn" : "Talk to AI"} aria-pressed={voiceRecording === "recording"}><Icon name={voiceRecording === "recording" ? "stop" : "radio"} /><span>{voiceRecording === "recording" ? "Stop & send" : voiceRecording === "uploading" ? "Transcribing…" : "Talk to AI"}</span></button>
+                    <button type="button" className={voiceMuted ? "active" : ""} onClick={() => void toggleVoiceMute()} disabled={voiceJoinState === "requesting-permission" || voiceDeafened} aria-label={voiceMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={voiceMuted}><Icon name={voiceMuted ? "micOff" : "mic"} /><span>{voiceMuted ? "Unmute" : "Mute"}</span></button>
+                    <button
+                      type="button"
+                      className={`voice-record ${voiceHandsFree ? "active" : ""} ${voiceRecording === "recording" ? "recording" : ""}`}
+                      onClick={toggleVoiceHandsFree}
+                      disabled={!voiceCapabilities?.speechToText || !("MediaRecorder" in window) || !("AudioContext" in window)}
+                      aria-label={voiceVadPaused ? "Resume hands-free AI listening" : voiceHandsFree ? "Pause hands-free AI listening" : "Enable hands-free AI listening"}
+                      aria-pressed={voiceHandsFree}
+                    >
+                      <Icon name="radio" />
+                      <span>{!voiceCapabilities?.speechToText
+                        ? "Typed only"
+                        : voiceVadPaused
+                          ? "Resume listening"
+                        : voiceRecording === "recording"
+                        ? "Listening…"
+                        : voicePendingUploads > 0
+                          ? `Transcribing${voicePendingUploads > 1 ? ` ${voicePendingUploads}` : "…"}`
+                          : voiceHandsFree
+                            ? voiceMuted ? "Hands-free ready" : "AI listening"
+                            : "Enable hands-free"}</span>
+                    </button>
                     <button type="button" className={voiceDeafened ? "active" : ""} onClick={toggleVoiceDeafen} aria-label={voiceDeafened ? "Undeafen voice room" : "Deafen voice room"} aria-pressed={voiceDeafened}><Icon name="headphones" /><span>{voiceDeafened ? "Undeafen" : "Deafen"}</span></button>
                     <button type="button" className="voice-disconnect" onClick={leaveVoiceRoom} aria-label="Leave voice room"><Icon name="phoneOff" /><span>Leave</span></button>
                   </div>

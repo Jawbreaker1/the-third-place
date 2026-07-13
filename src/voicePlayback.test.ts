@@ -60,6 +60,7 @@ class FakeSynthesis implements VoicePlaybackSpeechSynthesis {
   resumeCount = 0;
   readonly spoken: FakeUtterance[] = [];
   blockAttempts = 0;
+  emitStart = true;
 
   constructor(private readonly voices: VoicePlaybackVoice[] = []) {}
 
@@ -89,7 +90,7 @@ class FakeSynthesis implements VoicePlaybackSpeechSynthesis {
     }
     this.pending = false;
     this.speaking = true;
-    fake.onstart?.();
+    if (this.emitStart) fake.onstart?.();
   }
 
   finish(): void {
@@ -156,6 +157,27 @@ const environment = (options: {
 const settle = async () => await Promise.resolve();
 
 describe("VoicePlaybackController", () => {
+  it("reports audible playback from start through natural completion and barge-in", async () => {
+    const audible: boolean[] = [];
+    const fake = environment();
+    const controller = new VoicePlaybackController(fake.value, {
+      onPlaybackActive: (active) => audible.push(active),
+    });
+
+    controller.enqueue(speech("audible"));
+    await settle();
+    expect(audible).toEqual([true]);
+
+    fake.audios[0]?.finish();
+    expect(audible).toEqual([true, false]);
+
+    controller.enqueue(speech("interrupted"));
+    await settle();
+    expect(audible.at(-1)).toBe(true);
+    controller.bargeIn();
+    expect(audible.at(-1)).toBe(false);
+  });
+
   it("plays AI clips FIFO without overlap", async () => {
     const fake = environment();
     const controller = new VoicePlaybackController(fake.value);
@@ -300,6 +322,23 @@ describe("VoicePlaybackController", () => {
     fake.runNextTimer();
     expect(synthesis.spoken).toHaveLength(2);
     expect(synthesis.cancelCount).toBeGreaterThanOrEqual(3);
+  });
+
+  it("marks browser speech audible when Safari omits onstart but reports speaking", () => {
+    const synthesis = new FakeSynthesis();
+    synthesis.emitStart = false;
+    const fake = environment({ synthesis });
+    const audible: boolean[] = [];
+    const controller = new VoicePlaybackController(fake.value, {
+      onPlaybackActive: (active) => audible.push(active),
+    });
+
+    controller.enqueue(speech("missing-onstart", { audioUrl: undefined }));
+    expect(audible).toEqual([]);
+    fake.runNextTimer();
+    expect(audible).toEqual([true]);
+    synthesis.finish();
+    expect(audible).toEqual([true, false]);
   });
 
   it("falls through a server play promise that never settles", () => {

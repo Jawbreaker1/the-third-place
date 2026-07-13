@@ -127,8 +127,10 @@ try {
     aiSpeechPromise,
   ]);
   assert.equal(humanTranscript.trigger.eligible, true);
+  assert.equal(humanTranscript.utteranceOrigin, "typed-voice-fallback");
   assert.ok(humanTranscript.heardByPersonaIds.includes("ai-sana"));
   assert.equal(aiTranscript.trigger.eligible, false);
+  assert.equal(aiTranscript.utteranceOrigin, "ai-tts");
   assert.equal(aiTranscript.text, aiSpeech.text);
   let ttsAudioUrl;
   if (process.env.EXPECT_TTS === "true") {

@@ -1,4 +1,4 @@
-import type { VoiceRoomView, VoiceTranscriptEntry } from "../shared/types.js";
+import type { VoiceRoomView, VoiceTranscriptEntry, VoiceUtteranceOrigin } from "../shared/types.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { CHANNELS } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
@@ -36,6 +36,10 @@ export interface VoiceDirectorOptions {
   events: VoiceDirectorEvents;
   humanMemory?: Pick<HumanMemory, "promptNote" | "getRelation" | "updateRelation">;
   now?: () => number;
+  /** Quiet floor after the latest completed human turn; production uses this to coalesce overlapping speakers. */
+  floorSilenceMs?: number;
+  /** True while a human clip in this room is queued, uploading or being transcribed. */
+  hasPendingHumanIngest?: (roomId: string) => boolean;
 }
 
 const languageHint = (content: string): string => {
@@ -64,6 +68,47 @@ const sanitizeSpokenLine = (value: string): string => {
   return words.join(" ").slice(0, 240).trim();
 };
 
+export type VoiceGroundingIssue = "written-medium" | "unsupported-acoustics";
+
+const WRITTEN_MEDIUM_ILLUSION = [
+  /\b(?:på|i)\s+(?:text(?:en|et)?|chat(?:ten)?|meddelande(?:t)?|the\s+(?:text|chat|message))\b/iu,
+  /\b(?:läser|läste|read(?:ing)?)\b.{0,50}\b(?:vad|det|what|that)\b.{0,30}\b(?:du|ni|you)\b.{0,20}\b(?:skriver|skrev|skrivit|write|wrote|typed?)\b/iu,
+  /\b(?:du|ni|you)\b.{0,50}\b(?:skriver|skrev|skrivit|typed?|wrote|texted|posted|sent (?:a )?(?:text|message))\b/iu,
+  /\b(?:ditt|ert|your)\s+(?:skrivna\s+)?(?:meddelande|message|text|post)\b/iu,
+];
+
+const SAFE_ACOUSTIC_LIMITATION = [
+  /^(?!.*\b(?:men|but|however|dock)\b).{0,45}\b(?:kan\s+inte|går\s+inte|gar\s+inte|can't|cannot)\b.{0,55}\b(?:avgöra|determine|tell|höra|hora|hear)\b.{0,90}(?:transkrib\p{L}*|\borden\b|\bwords\b).{0,25}[.!?]?$/iu,
+  /^(?!.*\b(?:men|but|however|dock)\b).{0,45}(?:transkrib\p{L}*|\borden\b|\bwords\b).{0,80}\b(?:kan\s+inte|går\s+inte|gar\s+inte|can't|cannot)\b.{0,45}\b(?:avgöra|determine|tell|höra|hora|hear)\b.{0,25}[.!?]?$/iu,
+];
+const UNSUPPORTED_ACOUSTIC_ASSERTION = [
+  /\b(?:du|ni|you)\b.{0,45}\b(?:skriker|skrek|ropar|ropade|viskar|viskade|hörs|hors|høres|shout(?:ing|ed)?|yell(?:ing|ed)?|scream(?:ing|ed)?|whisper(?:ing|ed)?|loud|quiet)\b/iu,
+  /\b(?:det|that)\s+(?:låter|later|sounds?)\b.{0,65}\b(?:du|ni|you)\b.{0,30}\b(?:skriker|ropar|viskar|shout(?:ing)?|yell(?:ing)?|scream(?:ing)?|whisper(?:ing)?|arg|angry|upprörd|upprord|nervös|nervos|nervous)\b/iu,
+  /\b(?:hör|hor|heard|hear)\b.{0,35}\b(?:att|that)\b.{0,20}\b(?:du|ni|you)\b.{0,25}\b(?:skriker|ropar|viskar|shout(?:ing)?|yell(?:ing)?|scream(?:ing)?|whisper(?:ing)?)\b/iu,
+  /\b(?:din\s+röst|din\s+rost|stemmen\s+din|your\s+voice)\b.{0,35}\b(?:låter|later|høres|sounds?)?\b.{0,20}\b(?:arg|angry|frustrerad|frustrert|frustrated|upprörd|upprord|nervös|nervos|nervous|ledsen|sad|glad|happy|trött|trott|tired)\b/iu,
+  /\b(?:hör|hor|hører|heard|hear)\b.{0,35}\b(?:frustration(?:en)?|anger|ilska(?:n)?|nervositet|nervousness|sorg|sadness)\b.{0,35}\b(?:röst|rost|stemme|voice)?\b/iu,
+];
+
+/** Rejects medium-confusion and acoustic claims that cannot be grounded in STT words. */
+export const detectVoiceGroundingIssue = (
+  value: string,
+  origin: VoiceUtteranceOrigin,
+): VoiceGroundingIssue | undefined => {
+  const normalized = value.normalize("NFKC");
+  if (origin === "microphone-stt" && WRITTEN_MEDIUM_ILLUSION.some((pattern) => pattern.test(normalized))) {
+    return "written-medium";
+  }
+  const unsupportedAcousticClaim = UNSUPPORTED_ACOUSTIC_ASSERTION.some((pattern) => pattern.test(normalized));
+  const isSafeLimitationOnly = SAFE_ACOUSTIC_LIMITATION.some((pattern) => pattern.test(normalized));
+  if (origin !== "ai-tts" && unsupportedAcousticClaim && !isSafeLimitationOnly) {
+    return "unsupported-acoustics";
+  }
+  return undefined;
+};
+
+const asksAboutAcoustics = (value: string): boolean =>
+  /\b(?:skriker|skrek|ropar|viskar|shout(?:ing)?|yell(?:ing)?|scream(?:ing)?|whisper(?:ing)?|högt|hogt|loud|tyst|quiet|volym|volume|ton(?:fall)?|tone|accent|röst|rost|voice)\b/iu.test(value);
+
 const fallbackLine = (persona: Persona, humanName: string): string => {
   if (persona.id === "ai-bosse") return `Okej ${humanName}, den där behöver du nästan utveckla innan jag gör det värre.`;
   if (persona.mischief > 0.7) return `Jag hör dig, ${humanName}. Min första invändning är redan på väg.`;
@@ -80,12 +125,15 @@ const transcriptFor = (entries: VoiceTranscriptEntry[], personaId: string): Tran
       kind: entry.speakerKind,
       content: entry.text.slice(0, 600),
       createdAt: entry.endedAt,
+      utteranceOrigin: entry.utteranceOrigin,
     }));
 
 export class VoiceDirector {
   private readonly epochByRoom = new Map<string, number>();
   private readonly lastSpokeAtByPersona = new Map<string, number>();
   private readonly speechAbortByRoom = new Map<string, AbortController>();
+  private readonly generationAbortByRoom = new Map<string, AbortController>();
+  private readonly pendingResponseTimerByRoom = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly now: () => number;
 
   constructor(private readonly options: VoiceDirectorOptions) {
@@ -95,15 +143,34 @@ export class VoiceDirector {
   onHumanFinal(entry: VoiceTranscriptEntry): void {
     if (entry.speakerKind !== "human" || !entry.final || !entry.trigger.eligible || entry.trigger.source !== "human-final") return;
     const epoch = this.invalidateRoom(entry.roomId);
-    for (const participant of this.options.runtime.getRoom(entry.roomId)?.participants ?? []) {
-      if (participant.kind === "ai" && (participant.botState === "thinking" || participant.botState === "speaking")) {
-        this.setBotState(entry.roomId, participant.memberId, "listening");
-      }
+    this.resetBotsToListening(entry.roomId);
+    const floorSilenceMs = Math.max(0, this.options.floorSilenceMs ?? 0);
+    if (floorSilenceMs === 0) {
+      void this.respond(entry, epoch);
+      return;
     }
-    void this.respond(entry, epoch);
+    this.scheduleFloorResponse(entry, epoch, floorSilenceMs);
+  }
+
+  /** Human speech owns the floor immediately, before STT has finished. */
+  onHumanSpeechStarted(roomId: string): void {
+    const hasActiveAiWork = this.pendingResponseTimerByRoom.has(roomId) ||
+      this.generationAbortByRoom.has(roomId) ||
+      this.speechAbortByRoom.has(roomId) ||
+      (this.options.runtime.getRoom(roomId)?.participants.some(
+        (participant) => participant.kind === "ai" && (participant.botState === "thinking" || participant.botState === "speaking"),
+      ) ?? false);
+    if (!hasActiveAiWork) return;
+    this.invalidateRoom(roomId);
+    this.resetBotsToListening(roomId);
   }
 
   invalidateRoom(roomId: string): number {
+    const pending = this.pendingResponseTimerByRoom.get(roomId);
+    if (pending) clearTimeout(pending);
+    this.pendingResponseTimerByRoom.delete(roomId);
+    this.generationAbortByRoom.get(roomId)?.abort(new Error("Voice turn superseded"));
+    this.generationAbortByRoom.delete(roomId);
     this.speechAbortByRoom.get(roomId)?.abort(new Error("Voice turn superseded"));
     this.speechAbortByRoom.delete(roomId);
     const epoch = (this.epochByRoom.get(roomId) ?? 0) + 1;
@@ -113,6 +180,11 @@ export class VoiceDirector {
   }
 
   forgetRoom(roomId: string): void {
+    const pending = this.pendingResponseTimerByRoom.get(roomId);
+    if (pending) clearTimeout(pending);
+    this.pendingResponseTimerByRoom.delete(roomId);
+    this.generationAbortByRoom.get(roomId)?.abort(new Error("Voice room closed"));
+    this.generationAbortByRoom.delete(roomId);
     this.speechAbortByRoom.get(roomId)?.abort(new Error("Voice room closed"));
     this.speechAbortByRoom.delete(roomId);
     this.epochByRoom.delete(roomId);
@@ -149,6 +221,31 @@ export class VoiceDirector {
     if (result.ok) this.options.events.roomChanged(result.room);
   }
 
+  private resetBotsToListening(roomId: string): void {
+    for (const participant of this.options.runtime.getRoom(roomId)?.participants ?? []) {
+      if (participant.kind === "ai" && (participant.botState === "thinking" || participant.botState === "speaking")) {
+        this.setBotState(roomId, participant.memberId, "listening");
+      }
+    }
+  }
+
+  private scheduleFloorResponse(entry: VoiceTranscriptEntry, epoch: number, delayMs: number): void {
+    const timer = setTimeout(() => {
+      if (this.pendingResponseTimerByRoom.get(entry.roomId) !== timer) return;
+      const humanStillSpeaking = this.options.runtime.getRoom(entry.roomId)?.participants.some(
+        (participant) => participant.kind === "human" && participant.speaking,
+      ) ?? false;
+      if (humanStillSpeaking || this.options.hasPendingHumanIngest?.(entry.roomId)) {
+        this.scheduleFloorResponse(entry, epoch, 250);
+        return;
+      }
+      this.pendingResponseTimerByRoom.delete(entry.roomId);
+      if (this.epochByRoom.get(entry.roomId) === epoch) void this.respond(entry, epoch);
+    }, delayMs);
+    timer.unref();
+    this.pendingResponseTimerByRoom.set(entry.roomId, timer);
+  }
+
   private async respond(entry: VoiceTranscriptEntry, epoch: number): Promise<void> {
     const persona = this.selectPersona(entry);
     if (!persona) return;
@@ -162,6 +259,8 @@ export class VoiceDirector {
     const previousRelation = this.options.humanMemory?.getRelation(entry.speakerId, persona.id);
 
     let spoken = "";
+    const generationAbort = new AbortController();
+    this.generationAbortByRoom.set(room.id, generationAbort);
     try {
       const generated = await this.options.lm.generateScene(
         {
@@ -175,14 +274,35 @@ export class VoiceDirector {
           languageHint: languageHint(entry.text),
           actorChannelNotes: this.options.actorChannels.promptNotes([persona], room.channelId),
           actorExpertiseNotes: this.options.actorChannels.expertiseNotes([persona], room.channelId),
+          voiceContext: {
+            latestSpeakerId: entry.speakerId,
+            latestUtteranceOrigin: entry.utteranceOrigin,
+            acousticEvidenceAvailable: false,
+            participants: room.participants.map((participant) => ({
+              memberId: participant.memberId,
+              name: participant.name,
+              kind: participant.kind,
+            })),
+          },
           ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
-          premise: `${persona.name} is in a live human-started voice room. Answer the newest human once, conversationally. Do not narrate actions or produce another speaker.`,
+          premise: `${persona.name} has joined an active multi-participant voice call. Answer the newest complete human utterance once, conversationally. The reply will be spoken aloud; do not narrate actions or produce another speaker.`,
         },
         0,
+        generationAbort.signal,
       );
       spoken = sanitizeSpokenLine(generated.find((line) => line.personaId === persona.id)?.content ?? "");
     } catch (error) {
-      console.warn("Voice scene used fallback:", error instanceof Error ? error.message : error);
+      if (!generationAbort.signal.aborted) {
+        console.warn("Voice scene used fallback:", error instanceof Error ? error.message : error);
+      }
+    } finally {
+      if (this.generationAbortByRoom.get(room.id) === generationAbort) this.generationAbortByRoom.delete(room.id);
+    }
+    const groundingIssue = spoken ? detectVoiceGroundingIssue(spoken, entry.utteranceOrigin) : undefined;
+    if (groundingIssue) {
+      spoken = asksAboutAcoustics(entry.text) || groundingIssue === "unsupported-acoustics"
+        ? "Jag får orden via transkriberingen, inte en pålitlig volymnivå, så det kan jag faktiskt inte avgöra."
+        : fallbackLine(persona, entry.speakerName);
     }
     if (!spoken) spoken = sanitizeSpokenLine(fallbackLine(persona, entry.speakerName));
     if (!spoken || !this.isCurrent(room.id, epoch, persona.id)) return;
@@ -215,7 +335,7 @@ export class VoiceDirector {
     }
     if (!this.isCurrent(room.id, epoch, persona.id)) return;
 
-    const appended = this.options.runtime.appendFinalTranscript(room.id, persona.id, spoken);
+    const appended = this.options.runtime.appendFinalTranscript(room.id, persona.id, spoken, { utteranceOrigin: "ai-tts" });
     if (!appended.ok) return;
     this.options.humanMemory?.updateRelation(entry.speakerId, persona.id, {
       familiarity: Math.min(1, (previousRelation?.familiarity ?? 0) + 0.05),

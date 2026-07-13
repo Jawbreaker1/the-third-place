@@ -66,6 +66,8 @@ export type VoicePlaybackMode = "server" | "browser" | null;
 export interface VoicePlaybackCallbacks {
   onAutoplayBlocked?: (blocked: boolean) => void;
   onModeChanged?: (mode: VoicePlaybackMode) => void;
+  /** True only while AI audio is actually audible, not while it is queued or autoplay-blocked. */
+  onPlaybackActive?: (active: boolean) => void;
   onUnavailable?: (speech: VoiceAiSpeechPayload, reason: string) => void;
 }
 
@@ -143,6 +145,7 @@ export class VoicePlaybackController {
   private active?: ActivePlayback;
   private token = 0;
   private deafened = false;
+  private playbackActive = false;
 
   constructor(
     private readonly environment: VoicePlaybackEnvironment,
@@ -174,6 +177,7 @@ export class VoicePlaybackController {
     this.token += 1;
     this.queue.length = 0;
     this.disposeActive();
+    this.setPlaybackActive(false);
     this.callbacks.onAutoplayBlocked?.(false);
     this.callbacks.onModeChanged?.(null);
     if (options.resetSeen) {
@@ -266,6 +270,7 @@ export class VoicePlaybackController {
       active.blocked = false;
       this.callbacks.onAutoplayBlocked?.(false);
       this.callbacks.onModeChanged?.("server");
+      this.setPlaybackActive(true);
       this.armTerminalWatchdog(active);
       return true;
     } catch (error) {
@@ -284,6 +289,7 @@ export class VoicePlaybackController {
   private failServer(active: ServerPlayback, reason: string): void {
     if (!this.isActive(active)) return;
     this.cleanupServer(active);
+    this.setPlaybackActive(false);
     this.active = undefined;
     this.callbacks.onAutoplayBlocked?.(false);
     this.beginBrowser(active.speech, active.token, reason);
@@ -325,6 +331,7 @@ export class VoicePlaybackController {
       this.clearBrowserStartWatchdog(active);
       this.armTerminalWatchdog(active);
       this.callbacks.onAutoplayBlocked?.(false);
+      this.setPlaybackActive(true);
     };
     utterance.onend = () => this.complete(active);
     utterance.onerror = (event) => {
@@ -334,6 +341,7 @@ export class VoicePlaybackController {
         this.cleanupBrowser(active);
         active.utterance = undefined;
         active.blocked = true;
+        this.setPlaybackActive(false);
         this.callbacks.onAutoplayBlocked?.(true);
         return;
       }
@@ -349,6 +357,7 @@ export class VoicePlaybackController {
           active.startWatchdog = undefined;
           if (synthesis.speaking) {
             active.started = true;
+            this.setPlaybackActive(true);
             this.armTerminalWatchdog(active);
             this.callbacks.onAutoplayBlocked?.(false);
             return;
@@ -389,8 +398,10 @@ export class VoicePlaybackController {
     if (!this.isActive(active)) return;
     if (active.kind === "server") this.cleanupServer(active);
     else this.cleanupBrowser(active, cancelBrowser);
+    this.setPlaybackActive(false);
     this.active = undefined;
     this.callbacks.onAutoplayBlocked?.(false);
+    this.callbacks.onModeChanged?.(null);
     this.pump();
   }
 
@@ -399,10 +410,18 @@ export class VoicePlaybackController {
     this.active = undefined;
     if (!active) {
       this.environment.speechSynthesis?.cancel();
+      this.setPlaybackActive(false);
       return;
     }
     if (active.kind === "server") this.cleanupServer(active);
     else this.cleanupBrowser(active);
+    this.setPlaybackActive(false);
+  }
+
+  private setPlaybackActive(active: boolean): void {
+    if (this.playbackActive === active) return;
+    this.playbackActive = active;
+    this.callbacks.onPlaybackActive?.(active);
   }
 
   private cleanupServer(active: ServerPlayback): void {

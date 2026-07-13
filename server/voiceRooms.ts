@@ -13,6 +13,7 @@ import type {
   VoiceSignalForward,
   VoiceSignalPayload,
   VoiceTranscriptEntry,
+  VoiceUtteranceOrigin,
 } from "../shared/types.js";
 
 const MAX_HUMANS = 6;
@@ -78,6 +79,13 @@ export type VoiceSignalRouteResult =
 export type VoiceTranscriptAppendResult =
   | { ok: true; entry: VoiceTranscriptEntry }
   | VoiceActionFailure;
+
+export interface VoiceTranscriptAppendOptions {
+  startedAt?: number;
+  endedAt?: number;
+  /** Human callers may explicitly mark the typed fallback; AI origin is server-derived. */
+  utteranceOrigin?: VoiceUtteranceOrigin;
+}
 
 interface InternalParticipant {
   view: VoiceParticipantView;
@@ -369,10 +377,14 @@ export class VoiceRoomRuntime {
     if (!participant || participant.view.kind !== "human") {
       return failure("NOT_AUTHORIZED", "Join the voice room before changing voice state.");
     }
+    const nextDeafened = state.deafened ?? participant.view.deafened;
+    const nextMuted = nextDeafened ? true : state.muted ?? participant.view.muted;
+    const nextSpeaking = nextMuted || nextDeafened ? false : state.speaking ?? participant.view.speaking;
+    const normalized = { muted: nextMuted, deafened: nextDeafened, speaking: nextSpeaking };
     let changed = false;
     for (const key of ["muted", "deafened", "speaking"] as const) {
-      const value = state[key];
-      if (value !== undefined && participant.view[key] !== value) {
+      const value = normalized[key];
+      if (participant.view[key] !== value) {
         participant.view[key] = value;
         changed = true;
       }
@@ -428,7 +440,7 @@ export class VoiceRoomRuntime {
     roomId: string,
     speakerId: string,
     text: string,
-    timing: { startedAt?: number; endedAt?: number } = {},
+    options: VoiceTranscriptAppendOptions = {},
   ): VoiceTranscriptAppendResult {
     const room = this.rooms.get(roomId);
     if (!room) return failure("ROOM_NOT_FOUND", "That voice room no longer exists.");
@@ -437,8 +449,8 @@ export class VoiceRoomRuntime {
     const cleaned = cleanTranscript(text);
     if (!cleaned) return failure("INVALID_TRANSCRIPT", "The final transcript was empty.");
     const now = this.now();
-    const endedAt = timing.endedAt ?? now;
-    const startedAt = timing.startedAt ?? endedAt;
+    const endedAt = options.endedAt ?? now;
+    const startedAt = options.startedAt ?? endedAt;
     if (startedAt > endedAt || endedAt > now + 5_000 || endedAt - startedAt > 5 * 60_000) {
       return failure("INVALID_TRANSCRIPT", "The final transcript timing was invalid.");
     }
@@ -453,6 +465,9 @@ export class VoiceRoomRuntime {
       .map((participant) => participant.view.memberId)
       .sort();
     const isHuman = speaker.view.kind === "human";
+    const utteranceOrigin: VoiceUtteranceOrigin = isHuman
+      ? options.utteranceOrigin === "typed-voice-fallback" ? "typed-voice-fallback" : "microphone-stt"
+      : "ai-tts";
     const entry: VoiceTranscriptEntry = {
       id: randomUUID(),
       roomId: room.id,
@@ -460,6 +475,7 @@ export class VoiceRoomRuntime {
       speakerId: speaker.view.memberId,
       speakerName: speaker.view.name,
       speakerKind: speaker.view.kind,
+      utteranceOrigin,
       text: cleaned,
       startedAt: new Date(startedAt).toISOString(),
       endedAt: new Date(endedAt).toISOString(),

@@ -145,6 +145,15 @@ describe("voice room runtime", () => {
     expect(state.room.participants.find((participant) => participant.memberId === "human-1")).toMatchObject({
       muted: true,
       deafened: true,
+      speaking: false,
+    });
+    const impossible = runtime.setHumanState(created.room.id, "socket-1", { muted: false, deafened: true, speaking: true });
+    expect(impossible.ok).toBe(true);
+    if (!impossible.ok) throw new Error(impossible.error);
+    expect(impossible.room.participants.find((participant) => participant.memberId === "human-1")).toMatchObject({
+      muted: true,
+      deafened: true,
+      speaking: false,
     });
     expect(runtime.setHumanState(created.room.id, "not-in-room", { muted: true })).toMatchObject({
       ok: false,
@@ -239,14 +248,29 @@ describe("voice room runtime", () => {
       entry: {
         text: "hello Sana",
         final: true,
+        utteranceOrigin: "microphone-stt",
         heardByPersonaIds: ["ai-sana"],
         trigger: { eligible: true, source: "human-final" },
       },
     });
-    const aiFinal = runtime.appendFinalTranscript(created.room.id, "ai-sana", "I heard you.");
+    const typedFinal = runtime.appendFinalTranscript(created.room.id, "human-1", "typed fallback", {
+      utteranceOrigin: "typed-voice-fallback",
+    });
+    expect(typedFinal).toMatchObject({
+      ok: true,
+      entry: { speakerKind: "human", utteranceOrigin: "typed-voice-fallback" },
+    });
+    const aiFinal = runtime.appendFinalTranscript(created.room.id, "ai-sana", "I heard you.", {
+      // Caller input can never relabel synthesized AI speech as a human fallback.
+      utteranceOrigin: "typed-voice-fallback",
+    });
     expect(aiFinal).toMatchObject({
       ok: true,
-      entry: { speakerKind: "ai", trigger: { eligible: false, source: "ai-final" } },
+      entry: {
+        speakerKind: "ai",
+        utteranceOrigin: "ai-tts",
+        trigger: { eligible: false, source: "ai-final" },
+      },
     });
     expect(JSON.stringify(runtime.getTranscript(created.room.id))).not.toMatch(/audio|buffer|base64/i);
   });

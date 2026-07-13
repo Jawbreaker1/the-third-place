@@ -27,6 +27,7 @@ import type {
   VoiceJoinResult,
   VoiceLeaveResult,
   VoiceRoomView,
+  VoiceTranscriptEntry,
 } from "../shared/types.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { SocialDirector } from "./director.js";
@@ -40,6 +41,7 @@ import { configuredPersonaProviderVoices } from "./personaVoices.js";
 import { ResearchBroker } from "./researchBroker.js";
 import { createMessage, type HistoryPosition, RoomStore } from "./store.js";
 import { VoiceDirector } from "./voiceDirector.js";
+import { VoiceIngestGate, VoiceIngestGateError, type VoiceIngestRelease } from "./voiceIngestGate.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
 import { VoiceSpeechError, VoiceSpeechService } from "./voiceSpeech.js";
 
@@ -132,7 +134,7 @@ const createHumanSession = (
   lastSeenAt,
   historyBucket: new TokenBucket(8, 1),
   imageBucket: new TokenBucket(3, 1 / 25),
-  voiceBucket: new TokenBucket(8, 0.35),
+  voiceBucket: new TokenBucket(12, 0.5),
 });
 
 const normalizeName = (raw: string): string =>
@@ -237,6 +239,7 @@ const parseImageMessageForm = async (request: Request): Promise<ImageMessageForm
 interface VoiceTurnForm {
   audio: Buffer;
   mimeType: string;
+  utteranceId?: string;
 }
 
 const parseVoiceTurnForm = async (request: Request): Promise<VoiceTurnForm> =>
@@ -247,11 +250,12 @@ const parseVoiceTurnForm = async (request: Request): Promise<VoiceTurnForm> =>
     }
     const parser = Busboy({
       headers: request.headers,
-      limits: { fileSize: 6 * 1024 * 1024, files: 1, fields: 1, parts: 3, fieldSize: 256 },
+      limits: { fileSize: 6 * 1024 * 1024, files: 1, fields: 2, parts: 4, fieldSize: 256 },
     });
     let audio: Buffer | undefined;
     let mimeType = "";
     let seenFile = false;
+    let utteranceId: string | undefined;
     let parseError: Error | undefined;
     parser.on("file", (_name, stream, info) => {
       if (seenFile) {
@@ -279,10 +283,16 @@ const parseVoiceTurnForm = async (request: Request): Promise<VoiceTurnForm> =>
     parser.on("filesLimit", () => {
       parseError = new VoiceSpeechError("Send one voice clip at a time.", 400, "TOO_MANY_AUDIO_FILES");
     });
-    parser.on("field", (name) => {
+    parser.on("field", (name, value) => {
       // Older tabs sent this redundant field. The file part remains the only
       // trusted MIME source, but accepting the bounded name keeps hot reloads compatible.
-      if (name !== "mimeType") {
+      if (name === "utteranceId") {
+        if (!z.string().uuid().safeParse(value).success) {
+          parseError = new VoiceSpeechError("That voice turn id is invalid.", 400, "INVALID_UTTERANCE_ID");
+        } else {
+          utteranceId = value;
+        }
+      } else if (name !== "mimeType") {
         parseError = new VoiceSpeechError("Voice turns accept one audio file.", 400, "TOO_MANY_AUDIO_PARTS");
       }
     });
@@ -300,7 +310,7 @@ const parseVoiceTurnForm = async (request: Request): Promise<VoiceTurnForm> =>
         rejectForm(new VoiceSpeechError("Choose a voice clip to transcribe.", 400, "EMPTY_AUDIO"));
         return;
       }
-      resolveForm({ audio, mimeType });
+      resolveForm({ audio, mimeType, ...(utteranceId ? { utteranceId } : {}) });
     });
     request.pipe(parser);
   });
@@ -415,8 +425,37 @@ const socketBuckets = new Map<
 >();
 const MAX_CONCURRENT_IMAGE_INGESTS = 2;
 let activeImageIngests = 0;
-const MAX_CONCURRENT_VOICE_INGESTS = 2;
-let activeVoiceIngests = 0;
+const voiceIngestGate = new VoiceIngestGate({ maxActive: 2, maxQueued: 10 });
+const voiceIngestGatesByRoom = new Map<string, VoiceIngestGate>();
+const pendingVoiceIngestsByRoom = new Map<string, number>();
+const pendingVoiceIngestsByMember = new Map<string, number>();
+const completedVoiceTurns = new Map<string, { expiresAt: number; entry: VoiceTranscriptEntry }>();
+const VOICE_TURN_DEDUP_TTL_MS = 10 * 60_000;
+const VOICE_QUEUE_TIMEOUT_MS = 15_000;
+
+const adjustCounter = (counts: Map<string, number>, key: string, delta: number): number => {
+  const next = Math.max(0, (counts.get(key) ?? 0) + delta);
+  if (next === 0) counts.delete(key);
+  else counts.set(key, next);
+  return next;
+};
+
+const voiceIngestGateForRoom = (roomId: string): VoiceIngestGate => {
+  const existing = voiceIngestGatesByRoom.get(roomId);
+  if (existing) return existing;
+  const created = new VoiceIngestGate({ maxActive: 1, maxQueued: 6 });
+  voiceIngestGatesByRoom.set(roomId, created);
+  return created;
+};
+
+const forgetVoiceIngestRoom = (roomId: string): void => {
+  const gate = voiceIngestGatesByRoom.get(roomId);
+  if (!gate || (gate.activeCount === 0 && gate.queuedCount === 0)) voiceIngestGatesByRoom.delete(roomId);
+  pendingVoiceIngestsByRoom.delete(roomId);
+  for (const key of completedVoiceTurns.keys()) {
+    if (key.startsWith(`${roomId}:`)) completedVoiceTurns.delete(key);
+  }
+};
 
 const encodeHistoryCursor = (message: Pick<ChatMessage, "createdAt" | "id">): string =>
   Buffer.from(JSON.stringify({ v: 1, createdAt: message.createdAt, id: message.id }), "utf8").toString("base64url");
@@ -481,6 +520,8 @@ const voiceDirector = new VoiceDirector({
   speech: voiceSpeech,
   actorChannels,
   humanMemory,
+  floorSilenceMs: 650,
+  hasPendingHumanIngest: (roomId) => (pendingVoiceIngestsByRoom.get(roomId) ?? 0) > 0,
   events: {
     roomChanged: publishVoiceRoom,
     transcriptFinal: (entry) => io.to(voiceSocketRoom(entry.roomId)).emit("voice:transcript:final", entry),
@@ -653,13 +694,23 @@ app.post("/api/voice/:roomId/turns", async (request, response) => {
     response.status(429).json({ ok: false, error: "Voice turn cooldown — let the room answer first." });
     return;
   }
-  if (activeVoiceIngests >= MAX_CONCURRENT_VOICE_INGESTS) {
-    response.status(503).json({ ok: false, error: "The transcription desk is busy. Try again in a moment." });
+  const memberPendingKey = `${roomId}:${session.member.id}`;
+  if ((pendingVoiceIngestsByMember.get(memberPendingKey) ?? 0) >= 2) {
+    response.status(429).json({ ok: false, error: "Finish the voice turns already being transcribed before sending another." });
     return;
   }
-
-  activeVoiceIngests += 1;
+  adjustCounter(pendingVoiceIngestsByMember, memberPendingKey, 1);
+  adjustCounter(pendingVoiceIngestsByRoom, roomId, 1);
   const speechAbort = new AbortController();
+  let releaseIngest: VoiceIngestRelease | undefined;
+  let releaseRoomIngest: VoiceIngestRelease | undefined;
+  let queueTimedOut = false;
+  const queueTimeout = setTimeout(() => {
+    queueTimedOut = true;
+    speechAbort.abort(new Error("Voice transcription queue timed out"));
+  }, VOICE_QUEUE_TIMEOUT_MS);
+  queueTimeout.unref();
+  const roomIngestGate = voiceIngestGateForRoom(roomId);
   const abortSpeech = () => speechAbort.abort(new Error("Voice upload connection closed"));
   const abortOnEarlyResponseClose = () => {
     if (!response.writableEnded) abortSpeech();
@@ -667,22 +718,56 @@ app.post("/api/voice/:roomId/turns", async (request, response) => {
   request.once("aborted", abortSpeech);
   response.once("close", abortOnEarlyResponseClose);
   try {
+    releaseRoomIngest = await roomIngestGate.acquire(speechAbort.signal);
+    releaseIngest = await voiceIngestGate.acquire(speechAbort.signal);
+    clearTimeout(queueTimeout);
+    if (!voiceRooms.isMemberInRoom(roomId, session.member.id)) {
+      throw new VoiceSpeechError("That voice room closed before this turn could be transcribed.", 409, "ROOM_CLOSED");
+    }
     const form = await parseVoiceTurnForm(request);
+    const now = Date.now();
+    for (const [key, completed] of completedVoiceTurns) {
+      if (completed.expiresAt <= now) completedVoiceTurns.delete(key);
+    }
+    const completedKey = form.utteranceId ? `${roomId}:${session.member.id}:${form.utteranceId}` : undefined;
+    const previous = completedKey ? completedVoiceTurns.get(completedKey) : undefined;
+    if (previous) {
+      response.status(200).json({ ok: true, text: previous.entry.text, entry: previous.entry, deduplicated: true });
+      return;
+    }
     const transcript = await voiceSpeech.transcribe({ audio: form.audio, mimeType: form.mimeType, signal: speechAbort.signal });
-    const appended = voiceRooms.appendFinalTranscript(roomId, session.member.id, transcript.text);
+    const appended = voiceRooms.appendFinalTranscript(roomId, session.member.id, transcript.text, {
+      utteranceOrigin: "microphone-stt",
+    });
     if (!appended.ok) throw new VoiceSpeechError(appended.error, 409, appended.code);
+    if (completedKey) completedVoiceTurns.set(completedKey, { expiresAt: now + VOICE_TURN_DEDUP_TTL_MS, entry: appended.entry });
     io.to(voiceSocketRoom(roomId)).emit("voice:transcript:final", appended.entry);
     const room = voiceRooms.getRoom(roomId);
     if (room) director.noteHumanVoiceActivity(room.channelId);
     voiceDirector.onHumanFinal(appended.entry);
     response.status(201).json({ ok: true, text: appended.entry.text, entry: appended.entry });
   } catch (error) {
-    const status = error instanceof VoiceSpeechError ? error.status : 400;
-    response.status(status).json({ ok: false, error: error instanceof Error ? error.message : "That voice turn could not be transcribed." });
+    const normalized = error instanceof VoiceIngestGateError
+      ? new VoiceSpeechError(
+          error.code === "QUEUE_FULL"
+            ? "The transcription queue is full. Pause for a moment and try again."
+            : queueTimedOut ? "The transcription queue took too long. Try that turn again." : "The voice upload was interrupted.",
+          error.code === "QUEUE_FULL" || queueTimedOut ? 503 : 400,
+          error.code,
+        )
+      : error;
+    if (!request.readableEnded && !request.destroyed) request.resume();
+    const status = normalized instanceof VoiceSpeechError ? normalized.status : 400;
+    response.status(status).json({ ok: false, error: normalized instanceof Error ? normalized.message : "That voice turn could not be transcribed." });
   } finally {
+    clearTimeout(queueTimeout);
+    releaseIngest?.();
+    releaseRoomIngest?.();
+    adjustCounter(pendingVoiceIngestsByRoom, roomId, -1);
+    adjustCounter(pendingVoiceIngestsByMember, memberPendingKey, -1);
+    if (roomIngestGate.activeCount === 0 && roomIngestGate.queuedCount === 0) voiceIngestGatesByRoom.delete(roomId);
     request.removeListener("aborted", abortSpeech);
     response.removeListener("close", abortOnEarlyResponseClose);
-    activeVoiceIngests -= 1;
   }
 });
 
@@ -986,6 +1071,7 @@ io.on("connection", (socket) => {
     if (existing) void socket.leave(voiceSocketRoom(existing.id));
     if (result.closed) {
       voiceDirector.forgetRoom(result.roomId);
+      forgetVoiceIngestRoom(result.roomId);
       voiceSpeech.audioStore.deleteRoom(result.roomId);
       io.to(voiceSocketRoom(result.roomId)).emit("voice:room:closed", { roomId: result.roomId });
       publishVoiceRooms();
@@ -1070,8 +1156,19 @@ io.on("connection", (socket) => {
       acknowledge?.({ ok: false, code: "NOT_AUTHORIZED", error: "That voice state is invalid." });
       return;
     }
+    const wasSpeaking = voiceRooms.getRoom(parsed.data.roomId)?.participants
+      .find((participant) => participant.memberId === session.member.id)?.speaking ?? false;
     const result = voiceRooms.setHumanState(parsed.data.roomId, socket.id, parsed.data);
-    if (result.ok) publishVoiceRoom(result.room);
+    if (result.ok) {
+      publishVoiceRoom(result.room);
+      const isSpeakingNow = result.room.participants.find(
+        (participant) => participant.memberId === session.member.id,
+      )?.speaking ?? false;
+      if (parsed.data.speaking === true && !wasSpeaking && isSpeakingNow) {
+        voiceDirector.onHumanSpeechStarted(parsed.data.roomId);
+        director.noteHumanVoiceActivity(result.room.channelId);
+      }
+    }
     acknowledge?.(result);
   });
 
@@ -1134,7 +1231,9 @@ io.on("connection", (socket) => {
       acknowledge?.({ ok: false, error: "Join that voice room before speaking to its AI residents." });
       return;
     }
-    const appended = voiceRooms.appendFinalTranscript(parsed.data.roomId, session.member.id, parsed.data.text);
+    const appended = voiceRooms.appendFinalTranscript(parsed.data.roomId, session.member.id, parsed.data.text, {
+      utteranceOrigin: "typed-voice-fallback",
+    });
     if (!appended.ok) {
       acknowledge?.({ ok: false, error: appended.error });
       return;

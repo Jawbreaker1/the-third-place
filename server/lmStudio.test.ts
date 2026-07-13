@@ -241,11 +241,72 @@ describe("LM Studio room prompt", () => {
       selected: [sana],
       history: [],
       mustReplyIds: [sana.id],
+      voiceContext: {
+        latestSpeakerId: "human-jaw-b",
+        latestUtteranceOrigin: "microphone-stt",
+        acousticEvidenceAvailable: false,
+        participants: [
+          { memberId: "human-jaw-b", name: "Jaw_B", kind: "human" },
+          { memberId: sana.id, name: sana.name, kind: "ai" },
+        ],
+      },
     });
     expect(prompt).toContain("spoken voice chat");
     expect(prompt).toContain("5–25 spoken words");
     expect(prompt).toContain("no markdown, emoji, links");
     expect(prompt).toContain("Never create dialogue for another human");
+    expect(prompt).toContain("came from microphone speech-to-text");
+    expect(prompt).toContain("Never say they wrote, typed, posted or sent a text/message");
+    expect(prompt).toContain("not reliable audio features");
+    expect(prompt).toContain("volume, shouting, whispering, tone of voice, accent, emotion");
+    expect(prompt).toContain("liveVoiceContext roster");
+  });
+
+  it("serializes the live voice roster and transport origin as structured scene data", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let completionBody: { messages: Array<{ role: string; content: string }> } | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionBody = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      return completionResponse([{ personaId: mira.id, content: "Nej, det kan jag inte avgöra från transkriberingen." }]);
+    }));
+
+    await new LmStudioClient().generateScene({
+      kind: "voice",
+      channelId: "lobby",
+      channelName: "lobby voice",
+      selected: [mira],
+      history: [{
+        author: "Jaw_B",
+        kind: "human",
+        content: "Jeg skriker vel ikke?",
+        createdAt: new Date().toISOString(),
+        utteranceOrigin: "microphone-stt",
+      }],
+      trigger: { author: "Jaw_B", content: "Jeg skriker vel ikke?" },
+      mustReplyIds: [mira.id],
+      voiceContext: {
+        latestSpeakerId: "human-jaw-b",
+        latestUtteranceOrigin: "microphone-stt",
+        acousticEvidenceAvailable: false,
+        participants: [
+          { memberId: "human-jaw-b", name: "Jaw_B", kind: "human" },
+          { memberId: mira.id, name: mira.name, kind: "ai" },
+        ],
+      },
+    });
+
+    const userContent = completionBody?.messages.find((message) => message.role === "user")?.content ?? "{}";
+    const scene = JSON.parse(userContent) as Record<string, unknown>;
+    expect(scene.liveVoiceContext).toEqual({
+      latestSpeakerId: "human-jaw-b",
+      latestUtteranceOrigin: "microphone-stt",
+      acousticEvidenceAvailable: false,
+      participants: [
+        { memberId: "human-jaw-b", name: "Jaw_B", kind: "human" },
+        { memberId: mira.id, name: mira.name, kind: "ai" },
+      ],
+    });
   });
 
   it("gives a rare considered beat one lead and non-echoing responder roles", () => {
@@ -316,6 +377,36 @@ describe("LM Studio room prompt", () => {
 });
 
 describe("LM Studio one-pass humanizer", () => {
+  it("aborts an active scene when its external turn signal is superseded", async () => {
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      markStarted?.();
+      return await new Promise<Response>((_resolve, reject) => {
+        const fail = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+        if (init?.signal?.aborted) fail();
+        else init?.signal?.addEventListener("abort", fail, { once: true });
+      });
+    }));
+    const lm = new LmStudioClient();
+    const controller = new AbortController();
+    const generation = lm.generateScene({
+      kind: "voice",
+      channelId: "lobby",
+      channelName: "lobby voice",
+      selected: [sana],
+      history: [],
+      mustReplyIds: [sana.id],
+    }, 0, controller.signal);
+
+    await started;
+    controller.abort(new Error("new human speech superseded this turn"));
+
+    await expect(generation).rejects.toThrow("new human speech superseded this turn");
+  });
+
   it("preempts a running ambient generation when live conversation enters the queue", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     let releaseStarted: (() => void) | undefined;

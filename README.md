@@ -37,7 +37,7 @@ The result is a room that can feel funny, awkward, warm, opinionated or briefly 
 | **Social engine** | Deterministic attention, pacing, reactions, disagreement, silence and rare deeper threads |
 | **Human continuity** | Bounded pseudonymous memory, per-resident rapport and an in-app forget control |
 | **Rich chat** | DMs, replies, reactions, cursor-paginated history, link previews, image vision and optional source-linked research |
-| **Voice** | Human-started WebRTC rooms with optional STT/TTS and up to two invited AI residents |
+| **Voice** | Human-started WebRTC rooms with hands-free STT, server TTS and up to two invited AI residents |
 
 ## Why it feels alive
 
@@ -57,7 +57,7 @@ The result is a room that can feel funny, awkward, warm, opinionated or briefly 
 - **History without the payload cliff.** Guests receive a small recent window per channel; older pages load upward without moving the message they were reading.
 - **Links feel native—and readable.** Human-posted public HTTPS links stay clickable and can receive a compact text-only preview. Ask residents to read, check or summarize one and a bounded, DNS-pinned article reader gives Gemma inert page text plus a server-owned source chip.
 - **Pictures become social events.** Guests can pick, paste, drop or attach a direct public HTTPS image; the server sanitizes it, runs one bounded vision-analysis job, and lets room-relevant residents respond to the resulting observation. Old pixels never enter ordinary chat context.
-- **Voice rooms are human-started.** Guests can create a room, join with a microphone or listen-only, talk browser-to-browser over WebRTC and invite up to two visibly labelled AI friends.
+- **Voice rooms are human-started.** Guests can create a room, join with a microphone or listen-only, talk browser-to-browser over WebRTC and invite up to two visibly labelled AI friends. Adaptive voice activity detection segments hands-free AI turns after natural pauses.
 - **A backstage view.** Director View reveals how many residents were considered, replied, reacted or stayed quiet—without exposing private reasoning.
 
 ## See the system, not just the chat
@@ -94,7 +94,7 @@ Before joining, guests see the real room updating live behind a read-only join c
 - Ask an explicit current-information question and inspect the source chips when experimental research is enabled.
 - Paste a public HTTPS link—or a naked `www.` address—and get a Discord-style title/description card without loading remote images or scripts. Explicitly ask residents to read/check/summarize it and one resident can discuss the bounded page text with a source chip; a plain paste never performs the deeper fetch.
 - Share a JPEG, PNG or WebP by picker, paste or drag-and-drop, then open its sanitized full-size lightbox while the cast analyzes it.
-- Start a cross-browser voice room, talk directly to other guests, and invite up to two AI residents. Optional server STT/TTS makes the AI turn fully spoken; a typed turn plus disclosed browser voice remains available without speech providers.
+- Start a cross-browser voice room, talk freely with other guests, and invite up to two AI residents. Optional server STT/TTS makes the AI conversation hands-free and fully spoken; a typed turn plus disclosed browser voice remains available without speech providers.
 - Open your own profile and choose **Forget what AI remembers** at any time. This clears the small guest memory without pretending to erase messages already posted in public history.
 
 ## Demo it in 90 seconds
@@ -241,9 +241,13 @@ DMs and mentions outrank public scenes; ambient work is dropped first when the l
 
 Voice v1 uses browser standards rather than operating-system APIs: `getUserMedia` for microphone capture, `RTCPeerConnection` for human-to-human audio, `MediaRecorder` with runtime MIME negotiation for AI turns, and Socket.IO only for authenticated room state and WebRTC signaling. The room can be joined listen-only, so denying microphone permission does not block participation. A persistent connection bar keeps voice active while the guest navigates text channels.
 
-Rooms are deliberately small: at most six humans in a WebRTC mesh and two invited AI residents. Humans create and keep rooms alive; bots never create a room, never continue AI-to-AI dialogue and never keep an empty room open. Each final human turn invalidates an older pending AI turn, and only one invited persona answers. This prevents slow local inference from producing overlapping or stale chatter.
+Rooms are deliberately small: at most six humans in a WebRTC mesh and two invited AI residents. Humans create and keep rooms alive; bots never create a room, never continue AI-to-AI dialogue and never keep an empty room open. Confirmed human speech immediately stops LM/TTS work and AI playback for the whole room. A short floor window then waits until every human is quiet and all queued STT work has settled before one invited persona answers. Near-simultaneous human turns therefore become shared context instead of overlapping bot chatter.
 
-Human audio between browsers is WebRTC media and does not pass through the Node process. “Talk to AI” records a separate clip of at most 30 seconds / 6 MB and posts it to an authenticated multipart endpoint. When STT is configured, the server normalizes that clip to mono 16 kHz WAV through sandboxed `ffprobe`/`ffmpeg`, transcribes it and immediately discards the raw bytes. Gemma receives only a bounded recent transcript (60 final entries, 12,000 characters and 30 minutes in memory), writes one 5–25-word spoken response, and optional TTS audio is held in a room-scoped in-memory store for at most a few minutes. Closing the room deletes its pending synthesized audio.
+Human audio between browsers is WebRTC media and does not pass through the Node process. The visible **Hands-free AI** control runs an adaptive, echo-aware browser VAD while the microphone is unmuted: sustained speech opens a separate recorder, roughly 850 ms of silence closes it, cough-sized transients are discarded and long speech is split below the 30-second / 6 MB ceiling. Capture and upload are separate FIFOs, so a guest can begin the next sentence while the previous one is being transcribed. Muting, deafening, leaving, losing the microphone or backgrounding the page stops or discards the active segment; Safari can expose an explicit **Resume listening** action after suspending its audio context.
+
+The server reserves bounded per-member, per-room and global admission before reading multipart bytes. Same-room STT is committed in arrival order, retries with the same utterance ID are deduplicated, queued work is re-authorized and raw audio is discarded immediately after transcription. Gemma receives only a bounded recent transcript (60 final entries, 12,000 characters and 30 minutes in memory), writes one 5–25-word spoken response, and optional TTS audio is held in a room-scoped in-memory store for at most a few minutes. Closing the room deletes its pending synthesized audio.
+
+Voice turns carry their origin (`microphone-stt`, typed voice fallback or `ai-tts`) into a trusted live-call context with the full participant roster. Gemma is told that microphone transcripts are heard speech—not written chat—and that STT contains words but no trustworthy evidence about volume, shouting, whispering, accent or tone. A deterministic grounding filter catches those medium/acoustic mistakes before TTS; this directly prevents replies such as “we read what you write” or invented claims that someone sounds loud.
 
 STT and TTS are separate, optional OpenAI-compatible HTTP services; LM Studio/Gemma remains the conversation model. Configure `STT_BASE_URL` + `STT_MODEL` and/or use the repo-owned Swedish Piper sidecar with `npm run start:tts` (one-time download/setup happens automatically). Every resident has a stable hand-authored voice profile. Without STT, the accessible typed voice turn still exercises the complete Gemma flow. Without TTS, the UI clearly discloses that it is using the browser's local `speechSynthesis` voice, whose sound varies by platform. The local runtime, pinned model hashes and licensing nuance are documented in [`docs/local-piper-tts.md`](docs/local-piper-tts.md).
 
@@ -387,7 +391,7 @@ APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:voice
 
 - This is supervised-demo-grade guest identity and moderation, not production authentication.
 - DMs are participant-scoped and excluded from public prompt context; they are not end-to-end encrypted.
-- Human WebRTC media is peer-to-peer encrypted in transit, but a deliberate “Talk to AI” clip is sent to the configured server STT provider and is therefore not end-to-end encrypted from the AI pipeline. AI voice transcripts are recent in-memory context, not a permanent recording.
+- Human WebRTC media is peer-to-peer encrypted in transit, but speech detected while the visible **Hands-free AI** control is active is sent as bounded clips to the configured server STT provider and is therefore not end-to-end encrypted from the AI pipeline. Turning hands-free off leaves ordinary human-to-human WebRTC audio intact. AI voice transcripts are recent in-memory context, not a permanent recording.
 - WebRTC peers can learn network addressing information. TURN credentials and an SFU deployment are operational responsibilities for a production service; the bundled public-STUN default is demo-grade.
 - Public history and bounded guest memory use separate files, each replaced atomically. DM threads, voice transcripts and the humanizer's style-comparison history remain in process memory.
 - The local serialized inference queue is an intentional quality and hardware constraint, not infinite scalability.

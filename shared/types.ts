@@ -338,6 +338,13 @@ export type VoiceTranscriptTrigger =
   | { eligible: true; source: "human-final" }
   | { eligible: false; source: "ai-final" };
 
+/**
+ * Trusted transport metadata for a finalized voice-room utterance. It is kept
+ * separate from transcript text so the model cannot mistake microphone speech
+ * for an ordinary chat message (or vice versa).
+ */
+export type VoiceUtteranceOrigin = "microphone-stt" | "typed-voice-fallback" | "ai-tts";
+
 export interface VoiceTranscriptEntry {
   id: string;
   roomId: string;
@@ -345,6 +352,7 @@ export interface VoiceTranscriptEntry {
   speakerId: string;
   speakerName: string;
   speakerKind: MemberKind;
+  utteranceOrigin: VoiceUtteranceOrigin;
   text: string;
   startedAt: string;
   endedAt: string;
