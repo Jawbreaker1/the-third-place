@@ -35,6 +35,7 @@ import {
   type VoiceAiSpeechPayload,
   type VoicePlaybackController,
 } from "./voicePlayback";
+import { clearChannelNotice, nextDmUnread, noteChannelMessage, type ChannelNotices } from "./unread";
 
 const REACTIONS = ["👍", "👀", "😂", "💀", "🤔", "💛", "🔥", "✨"];
 const CLIENT_CHANNEL_MESSAGE_LIMIT = 600;
@@ -299,8 +300,7 @@ export default function App() {
   const [toasts, setToasts] = useState<Array<ToastPayload & { id: number }>>([]);
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
-  const [unread, setUnread] = useState<Record<string, number>>({});
-  const [channelActivity, setChannelActivity] = useState<Record<string, number>>({});
+  const [channelNotices, setChannelNotices] = useState<ChannelNotices>({});
   const [historyPageInfo, setHistoryPageInfo] = useState<Record<string, { before?: string; hasMore: boolean }>>({});
   const [historyLoading, setHistoryLoading] = useState<Record<string, boolean>>({});
   const [historyError, setHistoryError] = useState<Record<string, string | undefined>>({});
@@ -609,10 +609,7 @@ export default function App() {
       setMessages((current) =>
         current.some((item) => item.id === message.id) ? current : boundPublicMessages([...current, message]),
       );
-      setChannelActivity((current) => ({ ...current, [message.channelId]: Date.now() }));
-      if (message.channelId !== activeChannelRef.current) {
-        setUnread((current) => ({ ...current, [message.channelId]: Math.min(99, (current[message.channelId] ?? 0) + 1) }));
-      }
+      setChannelNotices((current) => noteChannelMessage(current, message, activeChannelRef.current, meRef.current));
     });
     socket.on("reaction:update", (payload: ReactionPayload) => {
       setMessages((current) =>
@@ -728,12 +725,13 @@ export default function App() {
         const previousUnread = current.find((thread) => thread.id === payload.thread.id)?.unread ?? 0;
         const nextThread = {
           ...payload.thread,
-          unread:
-            payload.message && payload.thread.id !== activeChannelRef.current
-              ? Math.min(99, previousUnread + 1)
-              : payload.thread.id === activeChannelRef.current
-                ? 0
-                : previousUnread,
+          unread: nextDmUnread(
+            previousUnread,
+            payload.message,
+            payload.thread.id,
+            activeChannelRef.current,
+            meRef.current?.id,
+          ),
         };
         const exists = current.some((thread) => thread.id === payload.thread.id);
         return exists ? current.map((thread) => (thread.id === payload.thread.id ? nextThread : thread)) : [...current, nextThread];
@@ -1505,8 +1503,6 @@ export default function App() {
       setVoiceCreateOpen(false);
       shouldStickToBottom.current = true;
       setActiveChannelId(result.thread.id);
-      setUnread((current) => ({ ...current, [result.thread!.id]: 0 }));
-      setChannelActivity((current) => ({ ...current, [result.thread!.id]: 0 }));
       setProfile(null);
       setMobilePanel(null);
     });
@@ -1530,8 +1526,7 @@ export default function App() {
     activeChannelRef.current = id;
     shouldStickToBottom.current = true;
     setActiveChannelId(id);
-    setUnread((current) => ({ ...current, [id]: 0 }));
-    setChannelActivity((current) => ({ ...current, [id]: 0 }));
+    setChannelNotices((current) => clearChannelNotice(current, id));
     setDmThreads((current) => current.map((thread) => (thread.id === id ? { ...thread, unread: 0 } : thread)));
     setReplyTo(null);
     setSearch("");
@@ -1559,16 +1554,25 @@ export default function App() {
         <div className="sidebar-scroll">
           <section className="nav-section">
             <p className="eyebrow">Hangouts</p>
-            {channels.map((channel) => (
-              <button key={channel.id} className={`channel-button ${activeChannelId === channel.id ? "active" : ""}`} onClick={() => selectChannel(channel.id)}>
-                <Icon name="hash" size={17} /><span>{channel.name}</span>
-                {(unread[channel.id] ?? 0) > 0 ? (
-                  <i className="channel-unread" aria-label={`${unread[channel.id]} unread messages`}>{unread[channel.id]! > 9 ? "9+" : unread[channel.id]}</i>
-                ) : channelActivity[channel.id] && activeChannelId !== channel.id ? (
-                  <i className="activity-wave"><b /><b /><b /></i>
-                ) : null}
-              </button>
-            ))}
+            {channels.map((channel) => {
+              const isActive = activeChannelId === channel.id;
+              const notice = channelNotices[channel.id];
+              const hasUnread = Boolean(notice?.unread) && !isActive;
+              const mentions = isActive ? 0 : notice?.mentions ?? 0;
+              return (
+                <button
+                  key={channel.id}
+                  className={`channel-button ${isActive ? "active" : ""} ${hasUnread ? "unread" : ""}`}
+                  onClick={() => selectChannel(channel.id)}
+                  aria-label={`${channel.name}${mentions > 0 ? `, ${mentions} unread mention${mentions === 1 ? "" : "s"}` : hasUnread ? ", unread messages" : ""}`}
+                >
+                  <Icon name="hash" size={17} /><span>{channel.name}</span>
+                  {mentions > 0 && (
+                    <i className="channel-unread" aria-hidden="true">{mentions > 9 ? "9+" : mentions}</i>
+                  )}
+                </button>
+              );
+            })}
           </section>
 
           <section className="nav-section voice-section">

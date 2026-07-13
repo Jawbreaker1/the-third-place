@@ -240,16 +240,27 @@ textarea:focus-visible,
   content: "";
 }
 
-.channel-button.active svg {
-  color: var(--coral);
+.channel-button.unread:not(.active) {
+  color: #e5e7ec;
+  font-weight: 750;
 }
 
-.activity-wave {
-  display: flex;
-  align-items: flex-end;
-  gap: 2px;
-  height: 12px;
-  margin-left: auto;
+.channel-button.unread:not(.active)::before {
+  position: absolute;
+  left: 0;
+  width: 4px;
+  height: 8px;
+  border-radius: 0 4px 4px 0;
+  background: #f1f2f4;
+  content: "";
+}
+
+.channel-button.unread:not(.active) svg {
+  color: #aeb3c0;
+}
+
+.channel-button.active svg {
+  color: var(--coral);
 }
 
 .channel-unread {
@@ -268,17 +279,12 @@ textarea:focus-visible,
   font-weight: 800;
 }
 
-.activity-wave b,
 .signal-bars i {
   width: 2px;
   border-radius: 4px;
   background: var(--mint);
   animation: wave 1.2s ease-in-out infinite alternate;
 }
-
-.activity-wave b:nth-child(1) { height: 5px; animation-delay: -0.2s; }
-.activity-wave b:nth-child(2) { height: 10px; animation-delay: -0.7s; }
-.activity-wave b:nth-child(3) { height: 7px; animation-delay: -0.4s; }
 
 @keyframes wave {
   0% { transform: scaleY(0.55); opacity: 0.65; }

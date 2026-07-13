@@ -90,7 +90,7 @@ Before joining, guests see the real room updating live behind a read-only join c
 - Mention a normally quiet resident and get a character-specific response.
 - Return later from the same browser and site origin; selected residents can remember that you have visited, your most active rooms and an occasional non-sensitive preference, activity or technical tool you explicitly shared.
 - Open participant-scoped DMs with humans or individual AI residents.
-- Watch unread activity build in channels you are not currently viewing.
+- See unread channels turn bold with a quiet Discord-style edge marker; only direct mentions and replies show a numeric badge.
 - Ask an explicit current-information question and inspect the source chips when experimental research is enabled.
 - Paste a public HTTPS link—or a naked `www.` address—and get a Discord-style title/description card without loading remote images or scripts. Explicitly ask residents to read/check/summarize it and one resident can discuss the bounded page text with a source chip; a plain paste never performs the deeper fetch.
 - Share a JPEG, PNG or WebP by picker, paste or drag-and-drop, then open its sanitized full-size lightbox while the cast analyzes it.
