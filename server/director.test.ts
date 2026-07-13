@@ -3,15 +3,53 @@ import { PERSONAS } from "./personas.js";
 import {
   analyzeSocialSignals,
   consideredConversationPremise,
+  ensureEvidenceResponder,
   normalizeGeneratedMessageContent,
   selectConsideredConversation,
   selectResponders,
   shouldRejectPublicCandidate,
   shouldStartConsideredConversation,
+  sourceIdsForPageResponder,
   type ConsideredConversationGate,
 } from "./director.js";
 
 describe("social director", () => {
+  it("keeps mentions while reserving one bounded slot for a capable evidence reader", () => {
+    const researcher = PERSONAS.find((persona) => persona.canResearch)!;
+    const nonResearchers = PERSONAS.filter((persona) => !persona.canResearch).slice(0, 3);
+    const result = ensureEvidenceResponder(
+      nonResearchers,
+      [researcher, ...nonResearchers],
+      [nonResearchers[0]!.id],
+      new Map([[researcher.id, 1]]),
+    );
+    expect(result.selected).toHaveLength(3);
+    expect(result.selected.map((persona) => persona.id)).toContain(nonResearchers[0]!.id);
+    expect(result.selected.map((persona) => persona.id)).toContain(researcher.id);
+    expect(result.responder?.id).toBe(researcher.id);
+  });
+
+  it("can designate a mentioned resident for a supplied page when all three slots are mentioned", () => {
+    const mentioned = PERSONAS.filter((persona) => !persona.canResearch).slice(0, 3);
+    const result = ensureEvidenceResponder(mentioned, mentioned, mentioned.map((persona) => persona.id), new Map(), false);
+    expect(result.selected).toEqual(mentioned);
+    expect(result.responder?.id).toBe(mentioned[0]?.id);
+  });
+
+  it("guarantees the validated page source on the designated generated answer only", () => {
+    const pageResearch = {
+      kind: "page" as const,
+      query: "read it",
+      retrievedAt: new Date().toISOString(),
+      results: [{ id: "S1", title: "Example", url: "https://example.com", snippet: "evidence" }],
+    };
+    expect(sourceIdsForPageResponder(pageResearch, [], true)).toEqual(["S1"]);
+    expect(sourceIdsForPageResponder(pageResearch, ["S1"], true)).toEqual(["S1"]);
+    expect(sourceIdsForPageResponder(pageResearch, [], false)).toEqual([]);
+    expect(sourceIdsForPageResponder(pageResearch, ["S1"], false)).toEqual([]);
+    expect(sourceIdsForPageResponder({ ...pageResearch, kind: "search" }, [], true)).toEqual([]);
+  });
+
   it("always prioritises a directly mentioned quiet resident", () => {
     const signals = analyzeSocialSignals("@moss what do you think about this?");
     const selected = selectResponders(PERSONAS, signals, new Map(), Date.now(), () => 0.99);
@@ -216,6 +254,14 @@ describe("social director", () => {
   it("preserves technical fragments and intentional line breaks through publication cleanup", () => {
     const input = "Testa i den här ordningen:\n1. Kör `npm test`\n2. Läs https://example.com/docs.\n```ts\nconst x = 1;\n```";
     expect(normalizeGeneratedMessageContent(input)).toBe(input);
+  });
+
+  it("removes standalone model-written source tokens in common punctuation forms", () => {
+    const cleaned = normalizeGeneratedMessageContent("[S1]: svar\n[S2]; mer\n[S3]-slut\n`[S4]` kod");
+    expect(cleaned).not.toMatch(/\[S\d+\]/u);
+    expect(cleaned).toContain("svar");
+    expect(cleaned).toContain("mer");
+    expect(normalizeGeneratedMessageContent("Läs https://example.com/[S1]/docs")).toContain("https://example.com/[S1]/docs");
   });
 
   it("rejects an overlong generated message atomically instead of cutting a URL", () => {

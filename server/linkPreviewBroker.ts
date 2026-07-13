@@ -1,8 +1,13 @@
-import { lookup } from "node:dns/promises";
-import { request as httpsRequest } from "node:https";
-import ipaddr from "ipaddr.js";
-import { parse } from "parse5";
 import type { LinkPreview } from "../shared/types.js";
+import { parseHtmlWithBudget } from "./boundedHtml.js";
+import {
+  extractPublicHttpsUrls,
+  fetchPublicHttps,
+  validatePublicHttpsUrl,
+} from "./safeHttpsFetch.js";
+
+export { isPublicAddress, resolvePublicAddress } from "./safeHttpsFetch.js";
+export const validatePreviewUrl = validatePublicHttpsUrl;
 
 interface CachedPreview {
   expiresAt: number;
@@ -17,125 +22,91 @@ interface ParsedNode {
   value?: string;
 }
 
-interface FetchResult {
-  finalUrl: URL;
-  html: string;
+interface PreviewWalkEntry {
+  node: ParsedNode;
+  depth: number;
 }
 
-type LookupAll = (
-  hostname: string,
-  options: { all: true; verbatim: true },
-) => Promise<Array<{ address: string; family: number }>>;
+const MAX_PREVIEW_NODES = 12_000;
+const MAX_PREVIEW_DEPTH = 64;
+const BLOCKED_HEAD_TAGS = new Set(["script", "style", "noscript", "template"]);
 
-const MAX_URL_LENGTH = 2_048;
-const MAX_HTML_BYTES = 384 * 1024;
-const MAX_REDIRECTS = 2;
-const BLOCKED_HOST_SUFFIXES = [
-  ".localhost",
-  ".local",
-  ".internal",
-  ".lan",
-  ".home.arpa",
-  ".onion",
-  ".invalid",
-  ".test",
-];
-
-const stripTrailingPunctuation = (value: string): string => value.replace(/[),.!?;:\]]+$/g, "");
+const childEntries = (node: ParsedNode, depth: number): PreviewWalkEntry[] =>
+  (node.childNodes ?? []).map((child) => ({ node: child, depth })).reverse();
 
 const sanitizeText = (value: string | undefined, limit: number): string | undefined => {
   if (!value) return undefined;
   const cleaned = value
     .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
-    .replace(/\s+/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
+    .replace(/\s+/gu, " ")
     .trim()
     .slice(0, limit);
   return cleaned || undefined;
 };
 
-const normalizedAddress = (raw: string): string => {
-  const parsed = ipaddr.parse(raw);
-  const ipv6 = parsed.kind() === "ipv6" ? (parsed as ipaddr.IPv6) : undefined;
-  return ipv6?.isIPv4MappedAddress()
-    ? ipv6.toIPv4Address().toString()
-    : parsed.toNormalizedString();
-};
-
-export const isPublicAddress = (raw: string): boolean => {
-  try {
-    const parsed = ipaddr.parse(raw);
-    const ipv6 = parsed.kind() === "ipv6" ? (parsed as ipaddr.IPv6) : undefined;
-    const normalized = ipv6?.isIPv4MappedAddress() ? ipv6.toIPv4Address() : parsed;
-    return normalized.range() === "unicast";
-  } catch {
-    return false;
-  }
-};
-
-export const validatePreviewUrl = (raw: string): URL | undefined => {
-  if (!raw || raw.length > MAX_URL_LENGTH || /[\u0000-\u001f\u007f]/.test(raw)) return undefined;
-  try {
-    const url = new URL(raw);
-    const host = url.hostname.toLocaleLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-    if (
-      url.protocol !== "https:" ||
-      url.username ||
-      url.password ||
-      (url.port && url.port !== "443") ||
-      !host ||
-      host.length > 253 ||
-      host.split(".").some((label) => !label || label.length > 63) ||
-      ipaddr.isValid(host) ||
-      host === "localhost" ||
-      BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix)) ||
-      /%(?:0[0-9a-f]|7f)/i.test(`${url.pathname}${url.search}`)
-    ) {
-      return undefined;
-    }
-    url.hostname = host;
-    url.hash = "";
-    return url;
-  } catch {
-    return undefined;
-  }
-};
-
-export const extractPreviewUrl = (content: string): URL | undefined => {
-  const match = content.match(/https:\/\/[^\s<>"']+/iu)?.[0];
-  return match ? validatePreviewUrl(stripTrailingPunctuation(match)) : undefined;
-};
+export const extractPreviewUrl = (content: string): URL | undefined => extractPublicHttpsUrls(content, 1)[0];
 
 const textContent = (node: ParsedNode): string => {
-  if (node.nodeName === "#text") return node.value ?? "";
-  return (node.childNodes ?? []).map(textContent).join("");
+  const stack: PreviewWalkEntry[] = [{ node, depth: 0 }];
+  const parts: string[] = [];
+  let visited = 0;
+  let length = 0;
+  while (stack.length > 0 && visited < MAX_PREVIEW_NODES && length < 2_000) {
+    const current = stack.pop()!;
+    if (current.depth > MAX_PREVIEW_DEPTH || (current.node.tagName && BLOCKED_HEAD_TAGS.has(current.node.tagName))) continue;
+    visited += 1;
+    if (current.node.nodeName === "#text") {
+      const value = (current.node.value ?? "").slice(0, 2_000 - length);
+      parts.push(value);
+      length += value.length;
+      continue;
+    }
+    stack.push(...childEntries(current.node, current.depth + 1));
+  }
+  return parts.join("");
 };
 
 const findHead = (node: ParsedNode): ParsedNode | undefined => {
-  if (node.tagName === "head") return node;
-  for (const child of node.childNodes ?? []) {
-    const found = findHead(child);
-    if (found) return found;
+  const stack: PreviewWalkEntry[] = [{ node, depth: 0 }];
+  let visited = 0;
+  while (stack.length > 0 && visited < MAX_PREVIEW_NODES) {
+    const current = stack.pop()!;
+    if (current.depth > MAX_PREVIEW_DEPTH) continue;
+    visited += 1;
+    if (current.node.tagName === "head") return current.node;
+    stack.push(...childEntries(current.node, current.depth + 1));
   }
   return undefined;
 };
 
-export const parseLinkMetadata = (html: string, finalUrl: URL): LinkPreview | undefined => {
-  const document = parse(html) as unknown as ParsedNode;
+export const parseLinkMetadata = (html: string, finalUrl: URL, clickUrl: URL = finalUrl): LinkPreview | undefined => {
+  const document = parseHtmlWithBudget(html, {
+    maxInputBytes: 384 * 1024,
+    maxNodes: MAX_PREVIEW_NODES,
+    maxDepth: MAX_PREVIEW_DEPTH,
+    maxAttributesPerTag: 256,
+    maxTotalAttributes: 2_000,
+  }) as unknown as ParsedNode | undefined;
+  if (!document) return undefined;
   const head = findHead(document);
   if (!head) return undefined;
   const meta = new Map<string, string>();
   let documentTitle: string | undefined;
-  const visit = (node: ParsedNode): void => {
-    if (node.tagName === "title" && !documentTitle) documentTitle = textContent(node);
-    if (node.tagName === "meta") {
-      const attrs = Object.fromEntries((node.attrs ?? []).map((attribute) => [attribute.name.toLocaleLowerCase(), attribute.value]));
+  const stack: PreviewWalkEntry[] = [{ node: head, depth: 0 }];
+  let visited = 0;
+  while (stack.length > 0 && visited < MAX_PREVIEW_NODES) {
+    const current = stack.pop()!;
+    if (current.depth > MAX_PREVIEW_DEPTH || (current.node.tagName && BLOCKED_HEAD_TAGS.has(current.node.tagName))) continue;
+    visited += 1;
+    if (current.node.tagName === "title" && !documentTitle) documentTitle = textContent(current.node);
+    if (current.node.tagName === "meta") {
+      const attrs = Object.fromEntries((current.node.attrs ?? []).map((attribute) => [attribute.name.toLocaleLowerCase(), attribute.value]));
       const key = (attrs.property || attrs.name || "").toLocaleLowerCase();
       if (key && attrs.content && !meta.has(key)) meta.set(key, attrs.content);
     }
-    for (const child of node.childNodes ?? []) visit(child);
-  };
-  visit(head);
+    stack.push(...childEntries(current.node, current.depth + 1));
+  }
   const title = sanitizeText(meta.get("og:title") ?? meta.get("twitter:title") ?? documentTitle, 160);
   if (!title) return undefined;
   const displayHost = finalUrl.hostname.toLocaleLowerCase();
@@ -145,7 +116,10 @@ export const parseLinkMetadata = (html: string, finalUrl: URL): LinkPreview | un
     320,
   );
   return {
-    url: finalUrl.toString(),
+    // Keep the guest-shared URL as the click target so redirect-minted query
+    // tokens are never republished, while labelling metadata with the actual
+    // validated destination host that supplied it.
+    url: clickUrl.toString(),
     displayHost,
     title,
     ...(description ? { description } : {}),
@@ -154,151 +128,15 @@ export const parseLinkMetadata = (html: string, finalUrl: URL): LinkPreview | un
   };
 };
 
-export const resolvePublicAddress = async (
-  hostname: string,
-  deadline: number,
-  lookupImpl: LookupAll = lookup as LookupAll,
-): Promise<{ address: string; family: 4 | 6 } | undefined> => {
-  const remaining = deadline - Date.now();
-  if (remaining <= 0) return undefined;
-  let deadlineTimer: NodeJS.Timeout | undefined;
-  try {
-    const results = await Promise.race([
-      lookupImpl(hostname, { all: true, verbatim: true }),
-      new Promise<undefined>((resolve) => {
-        deadlineTimer = setTimeout(() => resolve(undefined), remaining);
-      }),
-    ]);
-    if (!results || results.length === 0 || results.some((result) => !isPublicAddress(result.address))) {
-      return undefined;
-    }
-    const chosen = results[0];
-    return chosen ? { address: chosen.address, family: chosen.family === 6 ? 6 : 4 } : undefined;
-  } catch {
-    return undefined;
-  } finally {
-    if (deadlineTimer) clearTimeout(deadlineTimer);
-  }
-};
-
-const requestHeadHtml = async (url: URL, deadline: number): Promise<{ html?: string; redirect?: string }> => {
-  const address = await resolvePublicAddress(url.hostname, deadline);
-  if (!address || Date.now() >= deadline) return {};
-  return await new Promise((resolve) => {
-    let settled = false;
-    let bodyTimer: NodeJS.Timeout | undefined;
-    const finish = (value: { html?: string; redirect?: string }): void => {
-      if (settled) return;
-      settled = true;
-      if (bodyTimer) clearTimeout(bodyTimer);
-      resolve(value);
-    };
-    const request = httpsRequest(
-      {
-        protocol: "https:",
-        hostname: url.hostname,
-        port: 443,
-        path: `${url.pathname}${url.search}`,
-        method: "GET",
-        servername: url.hostname,
-        agent: false,
-        rejectUnauthorized: true,
-        maxHeaderSize: 16 * 1024,
-        timeout: Math.max(100, deadline - Date.now()),
-        lookup: (_hostname, options, callback) => {
-          if (typeof options === "object" && options.all) {
-            callback(null, [{ address: address.address, family: address.family }]);
-          } else {
-            callback(null, address.address, address.family);
-          }
-        },
-        headers: {
-          Accept: "text/html,application/xhtml+xml",
-          "Accept-Encoding": "identity",
-          "Cache-Control": "no-cache",
-          "User-Agent": "TheThirdPlace-LinkPreview/1.0",
-        },
-      },
-      (response) => {
-        const status = response.statusCode ?? 0;
-        if ([301, 302, 303, 307, 308].includes(status) && response.headers.location) {
-          response.destroy();
-          finish({ redirect: response.headers.location });
-          return;
-        }
-        const contentType = response.headers["content-type"]?.toLocaleLowerCase() ?? "";
-        const encoding = response.headers["content-encoding"]?.toLocaleLowerCase() ?? "identity";
-        const announcedLength = Number.parseInt(response.headers["content-length"] ?? "0", 10);
-        if (
-          status < 200 ||
-          status >= 300 ||
-          (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) ||
-          (encoding !== "identity" && encoding !== "") ||
-          (Number.isFinite(announcedLength) && announcedLength > MAX_HTML_BYTES)
-        ) {
-          response.destroy();
-          finish({});
-          return;
-        }
-        const chunks: Buffer[] = [];
-        let total = 0;
-        const resetBodyTimer = (): void => {
-          if (bodyTimer) clearTimeout(bodyTimer);
-          bodyTimer = setTimeout(() => {
-            response.destroy();
-            finish({});
-          }, Math.min(2_000, Math.max(100, deadline - Date.now())));
-        };
-        resetBodyTimer();
-        response.on("data", (chunk: Buffer) => {
-          total += chunk.length;
-          if (total > MAX_HTML_BYTES || Date.now() >= deadline) {
-            response.destroy();
-            finish({});
-            return;
-          }
-          chunks.push(chunk);
-          const html = Buffer.concat(chunks).toString("utf8");
-          const headEnd = html.toLocaleLowerCase().indexOf("</head>");
-          if (headEnd >= 0) {
-            response.destroy();
-            finish({ html: html.slice(0, headEnd + 7) });
-            return;
-          }
-          resetBodyTimer();
-        });
-        response.on("end", () => finish({ html: Buffer.concat(chunks).toString("utf8") }));
-        response.on("error", () => finish({}));
-      },
-    );
-    request.on("socket", (socket) => {
-      socket.once("secureConnect", () => {
-        const remote = socket.remoteAddress;
-        if (!remote || normalizedAddress(remote) !== normalizedAddress(address.address)) request.destroy();
-      });
-    });
-    request.on("timeout", () => request.destroy());
-    request.on("error", () => finish({}));
-    request.end();
-  });
-};
-
-const fetchPinnedHtml = async (startUrl: URL): Promise<FetchResult | undefined> => {
-  const deadline = Date.now() + 7_000;
-  const visited = new Set<string>();
-  let current = startUrl;
-  for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
-    if (visited.has(current.toString())) return undefined;
-    visited.add(current.toString());
-    const result = await requestHeadHtml(current, deadline);
-    if (result.html) return { finalUrl: current, html: result.html };
-    if (!result.redirect || redirects === MAX_REDIRECTS) return undefined;
-    const next = validatePreviewUrl(new URL(result.redirect, current).toString());
-    if (!next) return undefined;
-    current = next;
-  }
-  return undefined;
-};
+const previewPolicy = {
+  timeoutMs: 7_000,
+  maxRedirects: 2,
+  maxBodyBytes: 384 * 1024,
+  acceptedMediaTypes: ["text/html", "application/xhtml+xml"],
+  acceptHeader: "text/html,application/xhtml+xml",
+  userAgent: "TheThirdPlace-LinkPreview/1.1",
+  stopAfterAsciiSequence: "</head>",
+} as const;
 
 export class LinkPreviewBroker {
   private readonly cache = new Map<string, CachedPreview>();
@@ -320,8 +158,8 @@ export class LinkPreviewBroker {
     if (existing) return existing;
     if (this.activeRequests >= 3 || !this.reserve(requesterId, url.origin)) return undefined;
     this.activeRequests += 1;
-    const request = fetchPinnedHtml(url)
-      .then((result) => (result ? parseLinkMetadata(result.html, result.finalUrl) : undefined))
+    const request = fetchPublicHttps(url, previewPolicy)
+      .then((result) => (result ? parseLinkMetadata(result.body.toString("utf8"), result.finalUrl, url) : undefined))
       .catch(() => undefined)
       .then((preview) => {
         this.cache.set(key, {

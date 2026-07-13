@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import ipaddr from "ipaddr.js";
 import sharp from "sharp";
 import type { ChatMessage, ImageAttachment } from "../shared/types.js";
-import { resolvePublicAddress, validatePreviewUrl } from "./linkPreviewBroker.js";
+import { resolvePublicAddress, validatePublicHttpsUrl } from "./safeHttpsFetch.js";
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_INPUT_PIXELS = 20_000_000;
@@ -186,7 +186,7 @@ const requestPinnedImage = async (
 };
 
 export const fetchRemoteImage = async (rawUrl: string): Promise<{ body: Buffer; contentType: string }> => {
-  let current = validatePreviewUrl(rawUrl);
+  let current = validatePublicHttpsUrl(rawUrl);
   if (!current) throw new ImageStoreError("Use a direct public HTTPS image URL.");
   const deadline = Date.now() + FETCH_TIMEOUT_MS;
   const visited = new Set<string>();
@@ -196,7 +196,7 @@ export const fetchRemoteImage = async (rawUrl: string): Promise<{ body: Buffer; 
     const result = await requestPinnedImage(current, deadline);
     if (result.body && result.contentType) return { body: result.body, contentType: result.contentType };
     if (!result.redirect || redirects === MAX_REDIRECTS) break;
-    const next = validatePreviewUrl(new URL(result.redirect, current).toString());
+    const next = validatePublicHttpsUrl(new URL(result.redirect, current).toString());
     if (!next) break;
     current = next;
   }

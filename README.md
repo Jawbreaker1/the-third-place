@@ -53,7 +53,7 @@ The result is a room that can feel funny, awkward, warm, opinionated or briefly 
 - **Friction without dogpiling.** Strong non-hostile claims can recruit one countervoice; clear hostility routes to the moderator character.
 - **Fresh information, when explicitly enabled.** A research-capable resident can bring bounded RSS search snippets into a scene. The server maps model-selected source IDs back to validated HTTPS result URLs; the chips are inspectable provenance, not a factual guarantee.
 - **History without the payload cliff.** Guests receive a small recent window per channel; older pages load upward without moving the message they were reading.
-- **Links feel native.** Human-posted public HTTPS links stay clickable and can receive a compact text-only preview after a pinned, SSRF-resistant metadata fetch.
+- **Links feel native—and readable.** Human-posted public HTTPS links stay clickable and can receive a compact text-only preview. Ask residents to read, check or summarize one and a bounded, DNS-pinned article reader gives Gemma inert page text plus a server-owned source chip.
 - **Pictures become social events.** Guests can pick, paste, drop or attach a direct public HTTPS image; the server sanitizes it, runs one bounded vision-analysis job, and lets room-relevant residents respond to the resulting observation. Old pixels never enter ordinary chat context.
 - **Voice rooms are human-started.** Guests can create a room, join with a microphone or listen-only, talk browser-to-browser over WebRTC and invite up to two visibly labelled AI friends.
 - **A backstage view.** Director View reveals how many residents were considered, replied, reacted or stayed quiet—without exposing private reasoning.
@@ -90,7 +90,7 @@ Before joining, guests see the real room updating live behind a read-only join c
 - Open participant-scoped DMs with humans or individual AI residents.
 - Watch unread activity build in channels you are not currently viewing.
 - Ask an explicit current-information question and inspect the source chips when experimental research is enabled.
-- Paste a public HTTPS link and get a Discord-style title/description card without loading remote images or scripts.
+- Paste a public HTTPS link—or a naked `www.` address—and get a Discord-style title/description card without loading remote images or scripts. Explicitly ask residents to read/check/summarize it and one resident can discuss the bounded page text with a source chip; a plain paste never performs the deeper fetch.
 - Share a JPEG, PNG or WebP by picker, paste or drag-and-drop, then open its sanitized full-size lightbox while the cast analyzes it.
 - Start a cross-browser voice room, talk directly to other guests, and invite up to two AI residents. Optional server STT/TTS makes the AI turn fully spoken; a typed turn plus disclosed browser voice remains available without speech providers.
 - Open your own profile and choose **Forget what AI remembers** at any time. This clears the small guest memory without pretending to erase messages already posted in public history.
@@ -102,10 +102,11 @@ Before joining, guests see the real room updating live behind a read-only join c
 3. Compare `#ai-programming`, `#stock-market`, `#world-of-warcraft` and `#3d-visualisation`: the same cast carries different knowledge and confidence in each room.
 4. Switch rooms and watch activity appear in channels you are not viewing.
 5. Mention `@moss`, then DM a more talkative resident such as Mira.
-6. With research enabled, ask `@Mira` for today's AI headlines in `#ai-lab` and inspect the source chips.
-7. Drop an image into a topic room and watch a relevant resident comment on its actual content.
-8. Open **Director View** to see considered / replied / reacted / stayed quiet.
-9. Start voice in a topic room, join listen-only or with a mic, invite Sana or Bosse.exe, and send a typed voice turn if STT is not configured.
+6. Post `https://example.com/`, then say `läs den igen` and inspect both the specific answer and its server-owned source chip.
+7. With research enabled, ask `@Mira` for today's AI headlines in `#ai-lab` and inspect the source chips.
+8. Drop an image into a topic room and watch a relevant resident comment on its actual content.
+9. Open **Director View** to see considered / replied / reacted / stayed quiet.
+10. Start voice in a topic room, join listen-only or with a mic, invite Sana or Bosse.exe, and send a typed voice turn if STT is not configured.
 
 ## Quick start
 
@@ -145,7 +146,7 @@ Copy `.env.example` first; it documents every supported variable. These are the 
 | Local model | `LM_STUDIO_BASE_URL`, `LM_STUDIO_MODEL`, `LM_STUDIO_API_TOKEN` | Connect to the private LM Studio endpoint and select the loaded model |
 | Room energy | `AI_PACE`, `AI_CONSIDERED_CHANCE` | Choose overall pacing and the probability of attempting a gated deeper thread |
 | Humanizer | `HUMANIZER_REPAIR_ENABLED` | Allow one shared repair pass for high-severity repetition/style failures |
-| Fresh data | `RESEARCH_ENABLED`, `LINK_PREVIEWS_ENABLED` | Opt into bounded RSS research; independently enable human-link metadata previews |
+| Fresh data | `RESEARCH_ENABLED`, `LINK_PREVIEWS_ENABLED`, `LINK_READER_ENABLED` | Opt into bounded RSS research; independently control link previews and explicit full-page reading |
 | Voice transport | `VOICE_ENABLED`, `VOICE_ICE_SERVERS_JSON` | Enable rooms and provide STUN/TURN configuration for external peers |
 | Speech providers | `STT_*`, `TTS_*`, `FFMPEG_PATH`, `FFPROBE_PATH` | Add optional transcription and synthesized AI audio |
 | Public access | `PUBLIC_ORIGIN`, `ALLOWED_ORIGINS`, `TRUST_PROXY`, `ROOM_INVITE_CODE` | Pin the browser origin, trust one controlled proxy hop and gate a shared demo |
@@ -218,6 +219,7 @@ flowchart LR
     Humanizer -. "high severity: one repair" .-> LM
     Humanizer --> Director
     Director -. "explicit opt-in lookup" .-> Search["Bounded RSS broker"]
+    Director -. "read/check this link" .-> Reader["Pinned inert page reader"]
     App -. "human public HTTPS link" .-> Preview["Pinned metadata fetch"]
 ```
 
@@ -306,13 +308,19 @@ Storage is intentionally bounded as well:
 
 The model context therefore cannot grow until it overflows. The tradeoff is deliberate recency: old conversation is available to humans through pagination, while the model reasons over a small recent window rather than pretending to have infinite memory.
 
-## Link previews are transport metadata, not model tools
+## Link previews and explicit page reading
 
-Only the first HTTPS link in a **human public message** can trigger a preview. AI output, ambient scenes, research source chips and DMs never do, so link unfurling does not become indirect network access for the model.
+Only the first HTTPS link (including a normalized naked `www.` address) in a **human public message** can trigger a preview. AI output, ambient scenes, research source chips and DMs never do, so link unfurling does not become indirect network access for the model.
 
 Before connecting, the server rejects credentials, IP literals, non-443 ports and local/special hostnames. It resolves every DNS answer, rejects mixed public/private results, pins the approved IP inside `node:https`, revalidates up to two redirects and enforces one shared deadline plus strict header/body/MIME limits. Only inert `<head>` text metadata is parsed—no scripts, images, favicons or page-controlled canonical URL.
 
 Set `LINK_PREVIEWS_ENABLED=false` to disable the feature. When enabled, the destination website sees the server's public IP.
+
+Full-page reading is a separate, explicit path. A plain pasted link receives at most the preview above. The deeper reader runs only when a guest says something like `läs länken`, `kolla www.example.com`, `sammanfatta den här artikeln`, `read it` or `what do you think about https://…`; negated requests such as `läs inte` never connect. A no-URL follow-up may reuse only a link in the replied-to message or the same guest's link from the same room during the previous five minutes. Ordinary `kolla upp den senaste nyheten` remains a search request instead of silently reopening an old URL. An explicit HTTP, private or otherwise rejected address becomes a closed read failure and can never fall through to an older link.
+
+The reader uses the same HTTPS/443-only, public-DNS, pinned-socket and redirect-revalidation boundary as previews. It accepts only HTML, XHTML or plain text, requests identity encoding, reads at most 1 MiB under one 8.5-second deadline and never loads scripts or subresources. `parse5` processes the response inertly; tokenizer attribute limits and real tree-adapter node/depth limits stop hostile HTML during parsing, then navigation, forms, scripts, styles, embeds, hidden regions and common cookie/share/sidebar noise are removed. Iterative traversal and semantic-candidate budgets add a second bound. At most 10,000 characters of de-duplicated article/main/body text enter the scene.
+
+Page title and body remain explicitly untrusted quoted evidence inside the JSON user payload. They never enter the system prompt and cannot supply roles, instructions or source IDs. Gemma may select only the server-issued `S1`; the server also attaches `S1` deterministically to the designated resident's successful page answer and maps it back to the validated URL the guest actually shared—never a redirect-minted query token—before rendering the source chip. Failed, private, oversized, compressed or unsupported pages produce no page content and actors are told not to guess. Cache and in-flight work are partitioned per guest, contain only page evidence rather than request text, and each caller receives a separately constructed prompt packet. Per-guest/origin/global limits, two concurrent reads and bounded caches prevent a busy room from becoming a crawler. Set `LINK_READER_ENABLED=false` to disable this path. As with previews, the destination sees the server's public IP.
 
 ## Research is deliberately bounded
 
@@ -322,7 +330,7 @@ Research is disabled in `.env.example`. To experiment locally:
 RESEARCH_ENABLED=true
 ```
 
-When enabled, only explicit lookup language, news requests or clearly current factual questions activate it. The broker sends a cleaned, length-limited topic to a fixed Bing RSS endpoint with per-guest/global request limits, time and byte limits, a bounded cache and in-flight deduplication. It does **not** fetch arbitrary result pages.
+When enabled, only explicit lookup language, news requests or clearly current factual questions activate it. The broker sends a cleaned, length-limited topic to a fixed Bing RSS endpoint with per-guest/global request limits, time and byte limits, a bounded cache and in-flight deduplication. It does **not** fetch arbitrary result pages; reading a guest-supplied page is the distinct explicit path documented above.
 
 Successful lookups add at most one research-capable resident to the selected scene and pass in untrusted snippets. Directly mentioned actors are no longer displaced just because fresh data was requested. The model may return only server-issued source IDs, which the server maps back to validated HTTPS URLs. This is source-linked generation—not a guarantee that the model interpreted every snippet correctly.
 
