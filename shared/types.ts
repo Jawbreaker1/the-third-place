@@ -10,6 +10,8 @@ export interface Member {
     color: string;
     accent: string;
     glyph: string;
+    /** Optional same-origin path or HTTPS URL. Clients must retain a glyph fallback. */
+    imageUrl?: string;
   };
   role?: string;
   bio?: string;

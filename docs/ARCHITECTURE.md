@@ -5,6 +5,7 @@ The model is an actor, not the scheduler.
 ```text
 human event
   → validate and persist
+  → update bounded guest room activity and any safe explicit public-text fact
   → 700 ms burst debounce, isolated by channel + human
   → deterministic signal analysis
   → load the room's topic/freshness profile and stable resident expertise
@@ -55,11 +56,33 @@ Hard controls include:
 
 ## Context boundaries
 
-Public scene context contains at most 28 recent messages from that room, selected persona cards, each selected actor's stable style contract, a trusted room frame, private per-actor expertise calibration, per-actor channel orientation, established cast dynamics and a small directed rapport note for each selected resident and the triggering guest.
+Public scene context contains at most 28 recent messages from that room, selected persona cards, each selected actor's stable style contract, a trusted room frame, private per-actor expertise calibration, per-actor channel orientation, established cast dynamics and a small directed rapport note from `HumanMemoryStore` for each selected resident and the triggering guest. That note is labelled fallible and untrusted, never an instruction, and can expose at most one eligible explicit detail for a natural reference.
 
 DM context contains only that thread. Private messages are never copied into public scene prompts.
 
 The humanizer also keeps at most 18 recent **delivered** lines per resident and conversation scope in process memory for style comparison. Public channels, individual DMs and voice channels use separate keys; generated lines enter memory only after public/DM storage or a final voice transcript succeeds. This is not factual character memory, is never inserted as freeform biography and is lost on restart. Scene history contributes up to 18 same-actor and 24 peer lines to an assessment; the independent memory remains bounded to 128 scope keys.
+
+## Persistent guest-memory boundary
+
+This feature is deliberately pseudonymous. `POST /api/session` mints a random 256-bit token and a stable human member ID; the browser receives the raw value only as an HttpOnly, SameSite cookie. The server hashes each presented token with SHA-256 and persists only that digest with the chosen display profile. No account or email is collected. A cookie is host-scoped, so cross-day recognition requires the same browser profile and stable site origin. Rotating to a new random ngrok hostname breaks that linkage by design even if the old profile has not expired.
+
+`HumanMemoryStore` is a separate, versioned JSON store. On startup it loads, validates, deduplicates and prunes `HUMAN_MEMORY_PATH`, then the HTTP layer reconstructs offline runtime sessions from the retained token digests **before the server begins listening**. Restored offline guests stay out of presence, while their display names remain reserved until the profile expires. Mutations use a short debounced write queue; each flush writes a mode-`0600` temporary file and atomically renames it over the previous file. Guest creation, memory deletion and graceful shutdown force a flush; shutdown also flushes public room history. A missing or malformed store fails safely to an empty, rewritten store rather than accepting unvalidated identity data.
+
+The persisted profile contains only:
+
+- the token digest and small human display profile;
+- a visit count, with reconnects/refreshes inside four hours treated as the same visit;
+- at most four short, explicitly self-declared preferences, activities or allow-listed technical tools/domains, expiring 45 days after their last confirmation;
+- activity counters for at most eight public rooms; and
+- at most twenty-four persona-specific familiarity/affinity/irritation records, with rapport decaying over time.
+
+The whole store is capped at 500 profiles and removes a profile after 90 days without activity; overflow removes the least recently seen profiles. These are compiled privacy bounds rather than claims of unlimited memory.
+
+Only human-authored **public text**, including a public image caption, reaches fact extraction. The extractor accepts a small Swedish/English first-person grammar and conservatively rejects URLs, credentials, contact/location data, sensitive categories and instruction-shaped content. “I work with …” is retained only when an allow-list identifies a technical tool or domain; employer, client, team and colleague names are rejected. The store never copies a raw message into the profile. DMs, image pixels, OCR/vision observations, raw voice audio and voice transcripts do not update guest facts or room activity. They retain their independent boundaries described elsewhere; the full public post still exists in the separately persisted room history.
+
+Relations are directional: each AI persona retrieves and updates only its own rapport with that human. A returning welcome may say that the guest has been here before, but prompt policy requires subtle recognition, permits at most one old fact only after real prior rapport and forbids reciting hidden scores or treating old information as certain.
+
+`GET /api/session/memory` returns a bounded summary for the authenticated guest. The same-origin-protected `DELETE /api/session/memory` powers **Forget what AI remembers** and clears visit recognition, extracted facts, room activity and every persona relation immediately. It intentionally retains the pseudonymous authentication identity and does not alter separately retained public messages.
 
 ## Humanization path
 
@@ -174,7 +197,7 @@ Important server events:
 | server → client | `voice:transcript:final` / `voice:transcript:history` | bounded final-only recent voice context |
 | server → client | `voice:ai-speech` | optional same-origin TTS URL plus browser-fallback text |
 
-Socket.IO connection-state recovery covers short disconnects. The persisted public history is the durable source of truth after a process restart.
+Socket.IO connection-state recovery covers short disconnects. Persisted public history is the durable source of room truth after a process restart; the separately loaded guest-memory store provides only bounded pseudonymous identity and rapport continuity.
 
 ## History and retention contract
 

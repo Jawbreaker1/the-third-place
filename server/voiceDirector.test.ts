@@ -59,6 +59,78 @@ describe("VoiceDirector", () => {
     expect(generated).toBe(1);
   });
 
+  it("uses prior rapport for a voice reply and only strengthens that persona relationship", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-memory", memberId: "human-memory", name: "Kim" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const invited = runtime.inviteBot(created.room.id, "socket-memory", { personaId: "ai-sana", name: "Sana" });
+    expect(invited.ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-memory", "Sana, minns du mig?");
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+
+    const callOrder: string[] = [];
+    let sceneRelationshipNotes: Record<string, string> | undefined;
+    const relationUpdates: Array<{ humanId: string; personaId: string; familiarity?: number }> = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        generateScene: async (request) => {
+          callOrder.push("generate");
+          sceneRelationshipNotes = request.relationshipNotes;
+          return [{ personaId: "ai-sana", content: "Ja, lite faktiskt. Kul att höra dig igen.", source: "lm", sourceIds: [] }];
+        },
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      humanMemory: {
+        promptNote: (humanId, personaId) => {
+          callOrder.push("promptNote");
+          expect([humanId, personaId]).toEqual(["human-memory", "ai-sana"]);
+          return "Fallible prior memory: Kim has visited before; keep recognition subtle.";
+        },
+        getRelation: () => {
+          callOrder.push("getRelation");
+          return { familiarity: 0.4, affinity: 0.2, irritation: 0, updatedAt: 1_000 };
+        },
+        updateRelation: (humanId, personaId, update) => {
+          callOrder.push("updateRelation");
+          relationUpdates.push({ humanId, personaId, ...update });
+          return { familiarity: update.familiarity ?? 0.4, affinity: 0.2, irritation: 0, updatedAt: 2_000 };
+        },
+      },
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: () => undefined,
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await settle();
+
+    expect(sceneRelationshipNotes).toEqual({
+      "ai-sana": "Fallible prior memory: Kim has visited before; keep recognition subtle.",
+    });
+    expect(relationUpdates).toEqual([{
+      humanId: "human-memory",
+      personaId: "ai-sana",
+      familiarity: 0.45,
+    }]);
+    expect(callOrder).toEqual(["promptNote", "getRelation", "generate", "updateRelation"]);
+  });
+
   it("removes written-only artifacts and bounds spoken output", () => {
     const words = Array.from({ length: 40 }, (_, index) => `ord${index}`).join(" ");
     const spoken = sanitizeSpokenLine(`# Rubrik\n[skrattar] ${words} 😀 https://example.com`);

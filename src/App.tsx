@@ -89,10 +89,57 @@ const Icon = ({ name, size = 18 }: { name: string; size?: number }) => {
   );
 };
 
-const Avatar = ({ member, size = "md", showStatus = true }: { member: Member; size?: "sm" | "md" | "lg" | "xl"; showStatus?: boolean }) => (
-  <span className={`avatar avatar-${size}`} style={{ "--avatar": member.avatar.color, "--accent": member.avatar.accent } as React.CSSProperties}>
-    <span>{member.avatar.glyph}</span>
-    {showStatus && <i className={`presence presence-${member.status}`} />}
+const resolveAvatarImageUrl = (value?: string) => {
+  const candidate = value?.trim();
+  if (!candidate) return undefined;
+
+  try {
+    const parsed = new URL(candidate, window.location.origin);
+    const isSameOriginHttp = parsed.protocol === "http:" && parsed.origin === window.location.origin;
+    return parsed.protocol === "https:" || isSameOriginHttp ? parsed.href : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const Avatar = ({ member, size = "md", showStatus = true }: { member: Member; size?: "sm" | "md" | "lg" | "xl"; showStatus?: boolean }) => {
+  const imageUrl = resolveAvatarImageUrl(member.avatar.imageUrl);
+  const [failedImageUrl, setFailedImageUrl] = useState<string>();
+  const showImage = Boolean(imageUrl && failedImageUrl !== imageUrl);
+
+  return (
+    <span
+      aria-label={`${member.name} avatar`}
+      className={`avatar avatar-${size}`}
+      data-avatar-kind={showImage ? "image" : "glyph"}
+      role="img"
+      style={{ "--avatar": member.avatar.color, "--accent": member.avatar.accent } as React.CSSProperties}
+    >
+      <span aria-hidden="true" className="avatar-glyph">{member.avatar.glyph}</span>
+      {imageUrl && failedImageUrl !== imageUrl && (
+        <img
+          alt=""
+          className="avatar-image"
+          decoding="async"
+          draggable={false}
+          onError={() => setFailedImageUrl(imageUrl)}
+          referrerPolicy="no-referrer"
+          src={imageUrl}
+        />
+      )}
+      {showStatus && <i aria-hidden="true" className={`presence presence-${member.status}`} />}
+    </span>
+  );
+};
+
+const BrandMark = ({ large = false }: { large?: boolean }) => (
+  <span aria-hidden="true" className={`brand-mark${large ? " large" : ""}`}>
+    <img
+      alt=""
+      decoding="async"
+      draggable={false}
+      src={large ? "/the-third-place-mark.svg" : "/favicon.svg"}
+    />
   </span>
 );
 
@@ -186,6 +233,7 @@ export default function App() {
   const [joining, setJoining] = useState(false);
   const [showDirector, setShowDirector] = useState(false);
   const [profile, setProfile] = useState<Member | null>(null);
+  const [forgettingMemory, setForgettingMemory] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<Panel>(null);
   const [toasts, setToasts] = useState<Array<ToastPayload & { id: number }>>([]);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -984,6 +1032,36 @@ export default function App() {
     }
   };
 
+  const forgetAiMemory = async () => {
+    if (forgettingMemory) return;
+    setForgettingMemory(true);
+    try {
+      const response = await fetch("/api/session/memory", {
+        method: "DELETE",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      });
+      const result = await response.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+      if (!response.ok || result?.ok === false) {
+        throw new Error(result?.error ?? "The saved memory could not be cleared.");
+      }
+      setProfile(null);
+      pushToast({
+        tone: "success",
+        title: "AI memory cleared",
+        message: "The residents will treat your next visit as a fresh start.",
+      });
+    } catch (error) {
+      pushToast({
+        tone: "warning",
+        title: "Memory not cleared",
+        message: error instanceof Error ? error.message : "Try again in a moment.",
+      });
+    } finally {
+      setForgettingMemory(false);
+    }
+  };
+
   const startVoiceRoom = () => {
     if (!socketRef.current || !me || !activeChannel) return;
     if (joinedVoiceRoomRef.current) {
@@ -1392,7 +1470,7 @@ export default function App() {
     <div className="app-shell">
       <aside className={`sidebar ${mobilePanel === "rooms" ? "mobile-open" : ""}`}>
         <div className="brand-row">
-          <div className="brand-mark"><span /></div>
+          <BrandMark />
           <div><strong>The Third Place</strong><small><i /> live social experiment</small></div>
           <button className="icon-button mobile-only" onClick={() => setMobilePanel(null)} aria-label="Close rooms"><Icon name="close" /></button>
         </div>
@@ -1852,7 +1930,7 @@ export default function App() {
         <div className="join-overlay">
           <form className="join-card" onSubmit={join}>
             <div className="join-live"><i /> LIVE ROOM <span>{preview?.health.onlineHumans ?? 0} real guests here now</span></div>
-            <div className="join-logo"><div className="brand-mark large"><span /></div></div>
+            <div className="join-logo"><BrandMark large /></div>
             <p className="join-kicker">THE THIRD PLACE</p>
             <h2>Join the conversation.</h2>
             <p className="join-copy">A living online room populated by distinct AI characters — and real people like you.</p>
@@ -1860,7 +1938,7 @@ export default function App() {
             {preview?.inviteRequired && <label><span>Invite code</span><input value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="Enter the code" type="password" /></label>}
             {joinError && <div className="join-error">{joinError}</div>}
             <button className="join-button" type="submit" disabled={joining || joinName.trim().length < 2}>{joining ? <><span className="spinner" />Opening the door…</> : <>Enter the room <Icon name="chevron" size={17} /></>}</button>
-            <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Humans and AI are always labelled.</strong> AI generation runs locally. Optional research uses Bing; public HTTPS links may be fetched by this server for text previews. No account or email required.</span></div>
+            <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Humans and AI are always labelled.</strong> This server keeps a small local memory of return visits, rooms you use most, and non-sensitive preferences, activities or technical tools you explicitly share. No account or email is required, and you can erase it from your profile. AI runs locally; optional research and public link previews use the web.</span></div>
             <p className="preview-hint"><i /><span>You're seeing the real room live behind this card.</span></p>
           </form>
         </div>
@@ -1896,7 +1974,7 @@ export default function App() {
             <div className="profile-cover" style={{ "--profile": profile.avatar.color, "--accent": profile.avatar.accent } as React.CSSProperties} />
             <button className="profile-close" onClick={() => setProfile(null)}><Icon name="close" /></button>
             <Avatar member={profile} size="xl" />
-            <div className="profile-body"><div className="profile-name"><h2>{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div><p className="profile-role">{profile.role}</p><p className="profile-bio">{profile.bio}</p><div className="profile-facts"><span><small>STATUS</small><b><i className={`presence-${profile.status}`} />{profile.status}</b></span>{profile.activity && <span><small>CURRENTLY</small><b>{profile.activity}</b></span>}<span><small>MEMORY</small><b>{profile.kind === "ai" ? "Recent room context" : "Human guest"}</b></span></div>{me && profile.id !== me.id && profile.status !== "offline" && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message {profile.name}</button>}</div>
+            <div className="profile-body"><div className="profile-name"><h2>{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div><p className="profile-role">{profile.role}</p><p className="profile-bio">{profile.bio}</p><div className="profile-facts"><span><small>STATUS</small><b><i className={`presence-${profile.status}`} />{profile.status}</b></span>{profile.activity && <span><small>CURRENTLY</small><b>{profile.activity}</b></span>}<span><small>MEMORY</small><b>{me && profile.id === me.id ? "Small local memory" : profile.kind === "ai" ? "Recent room context" : "Human guest"}</b></span></div>{me && profile.id === me.id && <button type="button" className="profile-forget" onClick={() => void forgetAiMemory()} disabled={forgettingMemory} aria-busy={forgettingMemory}>{forgettingMemory ? <><span className="button-spinner" aria-hidden="true" />Forgetting…</> : "Forget what AI remembers"}</button>}{me && profile.id !== me.id && profile.status !== "offline" && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message {profile.name}</button>}</div>
           </article>
         </div>
       )}

@@ -1,6 +1,7 @@
 import type { VoiceRoomView, VoiceTranscriptEntry } from "../shared/types.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { CHANNELS } from "./channels.js";
+import type { HumanMemory } from "./humanMemory.js";
 import type { LmStudioClient, TranscriptLine } from "./lmStudio.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import type { VoiceRoomRuntime } from "./voiceRooms.js";
@@ -28,6 +29,7 @@ export interface VoiceDirectorOptions {
   speech: Pick<VoiceSpeechService, "capabilities" | "synthesize">;
   actorChannels: ActorChannelRuntime;
   events: VoiceDirectorEvents;
+  humanMemory?: Pick<HumanMemory, "promptNote" | "getRelation" | "updateRelation">;
   now?: () => number;
 }
 
@@ -149,6 +151,11 @@ export class VoiceDirector {
     if (!room) return;
     this.setBotState(room.id, persona.id, "thinking");
 
+    // Capture only the memory that predates this turn. Voice transcripts never
+    // enter long-term memory; a completed exchange merely strengthens rapport.
+    const relationshipNote = this.options.humanMemory?.promptNote(entry.speakerId, persona.id);
+    const previousRelation = this.options.humanMemory?.getRelation(entry.speakerId, persona.id);
+
     let spoken = "";
     try {
       const generated = await this.options.lm.generateScene(
@@ -163,6 +170,7 @@ export class VoiceDirector {
           languageHint: languageHint(entry.text),
           actorChannelNotes: this.options.actorChannels.promptNotes([persona], room.channelId),
           actorExpertiseNotes: this.options.actorChannels.expertiseNotes([persona], room.channelId),
+          ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
           premise: `${persona.name} is in a live human-started voice room. Answer the newest human once, conversationally. Do not narrate actions or produce another speaker.`,
         },
         0,
@@ -192,6 +200,9 @@ export class VoiceDirector {
 
     const appended = this.options.runtime.appendFinalTranscript(room.id, persona.id, spoken);
     if (!appended.ok) return;
+    this.options.humanMemory?.updateRelation(entry.speakerId, persona.id, {
+      familiarity: Math.min(1, (previousRelation?.familiarity ?? 0) + 0.05),
+    });
     this.options.lm.rememberDeliveredLine?.(persona.id, spoken, {
       kind: "voice",
       channelId: room.channelId,
