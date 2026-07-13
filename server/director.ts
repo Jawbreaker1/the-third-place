@@ -21,7 +21,7 @@ import { PERSONAS, type Persona } from "./personas.js";
 import { type GeneratedLine, type TranscriptLine, LmStudioClient } from "./lmStudio.js";
 import { createMessage, RoomStore } from "./store.js";
 import { ResearchBroker, type ResearchPacket } from "./researchBroker.js";
-import { PageReader } from "./pageReader.js";
+import { PageReader, type PageReadRequest } from "./pageReader.js";
 import { assessCandidate, protectTechnicalFragments, restoreTechnicalFragments } from "./humanizer.js";
 import type { HumanMemory } from "./humanMemory.js";
 
@@ -677,13 +677,17 @@ export function ensureEvidenceResponder(
   const existing = requireResearchCapability
     ? selected.find((persona) => persona.canResearch)
     : selected.find((persona) => mentionedIds.includes(persona.id)) ?? selected.find((persona) => persona.canResearch) ?? selected[0];
-  const responder = existing ?? [...candidates]
+  const preferred = existing ?? [...candidates]
     .filter((persona) => !requireResearchCapability || persona.canResearch)
     .sort(
       (a, b) =>
         Number(b.canResearch) * 0.5 + (attention.get(b.id) ?? 0) + b.curiosity -
         (Number(a.canResearch) * 0.5 + (attention.get(a.id) ?? 0) + a.curiosity),
     )[0];
+  // Evidence is fetched by the server, so an already selected resident can
+  // still report the bounded result when no research-specialist is currently
+  // attentive in this room. Never leave an explicit request without an owner.
+  const responder = preferred ?? selected[0] ?? candidates[0];
   if (!responder) return { selected: [...selected] };
   const next = [...selected];
   if (!next.some((persona) => persona.id === responder.id)) {
@@ -715,6 +719,132 @@ export function sourceIdsForPageResponder(
     return forcePageSource && research.results.some((result) => result.id === "S1") ? ["S1"] : [];
   }
   return [...new Set(sourceIds)].slice(0, 3);
+}
+
+const isAvanzaMarketEvidence = (research: ResearchPacket | undefined): boolean => {
+  const first = research?.kind === "page" ? research.results.find((result) => result.id === "S1") : undefined;
+  if (first?.title !== "Avanza – Börsen idag") return false;
+  try {
+    const host = new URL(first.url).hostname.toLocaleLowerCase();
+    return host === "avanza.se" || host === "www.avanza.se";
+  } catch {
+    return false;
+  }
+};
+
+export function pageEvidenceAnswerContract(research?: ResearchPacket): string {
+  const concrete = "Give at least one concrete supported detail from the page; a generic acknowledgement or capability statement does not answer the request.";
+  const first = research?.kind === "page" ? research.results[0] : undefined;
+  if (!first) return concrete;
+  if (isAvanzaMarketEvidence(research)) {
+    return `${concrete} For this Avanza market overview, state the supplied headline-index level, today's percentage change and update time before clarifying that an individual share requires its name or ticker.`;
+  }
+  try {
+    const url = new URL(first.url);
+    const host = url.hostname.toLocaleLowerCase();
+    if ((host === "blizzard.com" || host.endsWith(".blizzard.com")) && /(?:^|\/)news(?:\/|$)/iu.test(url.pathname)) {
+      return `${concrete} Name an exact supplied headline and one supported reason it stands out instead of offering generic game-release excitement.`;
+    }
+  } catch {
+    // Research URLs were validated before reaching the director. Keep the
+    // generic contract if a synthetic/test packet does not contain one.
+  }
+  return concrete;
+}
+
+export interface GroundedEvidenceAnswer {
+  content: string;
+  sourceIds: string[];
+}
+
+const visibleGroundedEvidence = (value: string, maxLength: number): string =>
+  boundedUntrustedText(
+    value
+      .replace(/https?:\/\/[^\s<>"'`]+/giu, " ")
+      .replace(/\[S\d+\]/giu, " "),
+    maxLength,
+  );
+
+const swedishEvidenceReply = (languageOrContent: string): boolean =>
+  /^\s*(?:sv|swedish)\s*$/iu.test(languageOrContent) || languageHint(languageOrContent) === "Swedish";
+
+const completeAvanzaIndexRow = (
+  snippet: string,
+): { label: string; level: string; change: string; updated: string } | undefined => {
+  const rowPattern = /^([^:\n]{1,120}):\s*([−+\-]?\d[\d\s\u00a0\u202f]*(?:[,.]\d+)?)\s+indexpunkter,\s*([−+\-]?\d+(?:[,.]\d+)?)\s+%\s+idag,\s*uppdaterad\s+(\d{1,2}:\d{2})\.?$/iu;
+  for (const segment of snippet.split(/\n+/u)) {
+    const match = visibleGroundedEvidence(segment, 280).match(rowPattern);
+    if (!match) continue;
+    const [, rawLabel, level, change, updated] = match;
+    const label = visibleGroundedEvidence(rawLabel ?? "", 120);
+    if (label && level && change && updated) return { label, level, change, updated };
+  }
+  return undefined;
+};
+
+/**
+ * Last-resort answer assembled only from the already validated research packet.
+ * It deliberately avoids model generation, visible URLs and arbitrary source IDs.
+ */
+export function groundedEvidenceFallback(
+  research: ResearchPacket | undefined,
+  languageOrContent = "",
+): GroundedEvidenceAnswer | undefined {
+  if (!research) return undefined;
+  const first = research.results.find((result) => result.id === "S1");
+  if (!first) return undefined;
+  const swedish = swedishEvidenceReply(languageOrContent);
+
+  if (isAvanzaMarketEvidence(research)) {
+    const row = completeAvanzaIndexRow(first.snippet);
+    if (row) {
+      return {
+        content: swedish
+          ? `Avanza visar ${row.label}: ${row.level} indexpunkter, ${row.change} % idag (uppdaterad ${row.updated}). Säg vilken aktie eller ticker du menar om du vill ha en enskild kurs.`
+          : `Avanza shows ${row.label} at ${row.level} index points, ${row.change}% today (updated ${row.updated}). Name the share or ticker if you want an individual quote.`,
+        sourceIds: ["S1"],
+      };
+    }
+  }
+
+  const title = visibleGroundedEvidence(first.title, 110);
+  if (!title) return undefined;
+  if (research.kind === "page") {
+    const titleKey = title.toLocaleLowerCase();
+    const block = first.snippet
+      .split(/\n{2,}|\r?\n/u)
+      .map((value) => visibleGroundedEvidence(value, 210))
+      .find((value) => value.length >= 8 && value.toLocaleLowerCase() !== titleKey);
+    if (!block) return undefined;
+    return {
+      content: swedish
+        ? `På “${title}” står bland annat: ${block}`
+        : `From “${title}”: ${block}`,
+      sourceIds: ["S1"],
+    };
+  }
+
+  return {
+    content: swedish ? `Första källträffen är “${title}”.` : `The first source result is “${title}”.`,
+    sourceIds: ["S1"],
+  };
+}
+
+export function evidenceFailureFallback(
+  pageRequested: boolean,
+  languageOrContent = "",
+): GroundedEvidenceAnswer {
+  const swedish = swedishEvidenceReply(languageOrContent);
+  return {
+    content: pageRequested
+      ? swedish
+        ? "Jag fick inte fram något läsbart från just den länken den här gången."
+        : "I couldn't get readable content from that link this time."
+      : swedish
+        ? "Jag fick ingen användbar källträff på just den sökningen den här gången."
+        : "I didn't get a usable source result for that search this time.",
+    sourceIds: [],
+  };
 }
 
 export class SocialDirector {
@@ -903,6 +1033,32 @@ export class SocialDirector {
     this.channelEpoch.set(message.channelId, (this.channelEpoch.get(message.channelId) ?? 0) + 1);
   }
 
+  private async resolveRequestedEvidence(
+    pageReadRequest: PageReadRequest | undefined,
+    searchRequested: boolean,
+    content: string,
+    requesterId: string,
+    channelId?: string,
+  ): Promise<ResearchPacket | undefined> {
+    if (pageReadRequest) {
+      const page = await this.pageReader.read(pageReadRequest, requesterId).catch((error) => {
+        console.warn("Exact linked-page read failed open:", error instanceof Error ? error.message : error);
+        return undefined;
+      });
+      if (page) return page;
+      if (!pageReadRequest.url) return undefined;
+      return this.researchBroker.researchUrlFallback(content, pageReadRequest.url, requesterId).catch((error) => {
+        console.warn("Same-site evidence fallback failed open:", error instanceof Error ? error.message : error);
+        return undefined;
+      });
+    }
+    if (!searchRequested) return undefined;
+    return this.researchBroker.research(content, requesterId, channelId).catch((error) => {
+      console.warn("Fresh evidence lookup failed open:", error instanceof Error ? error.message : error);
+      return undefined;
+    });
+  }
+
   async onDirectMessage(message: ChatMessage, human: Member, persona: Persona): Promise<void> {
     this.lastHumanActivityAt = this.now();
     // Snapshot prior-visit context before recording this turn. Updating first
@@ -929,15 +1085,10 @@ export class SocialDirector {
       replyTarget: message.replyToId ? dmMessages.find((candidate) => candidate.id === message.replyToId) : undefined,
       now: this.now(),
     });
-    const searchRequested = !pageReadRequest && persona.canResearch && this.researchBroker.shouldResearch(message.content);
+    const searchRequested = Boolean(!pageReadRequest && persona.canResearch && this.researchBroker.shouldResearch(message.content));
     try {
       if (pageReadRequest || searchRequested) {
-        research = await (pageReadRequest
-          ? this.pageReader.read(pageReadRequest, human.id)
-          : this.researchBroker.research(message.content, human.id)).catch((error) => {
-          console.warn("DM research failed open:", error instanceof Error ? error.message : error);
-          return undefined;
-        });
+        research = await this.resolveRequestedEvidence(pageReadRequest, searchRequested, message.content, human.id);
       }
       const generated = await this.lm.generateScene(
         {
@@ -952,12 +1103,15 @@ export class SocialDirector {
           languageHint: languageHint(message.content),
           actorChannelNotes: this.actorChannels.promptNotes([persona]),
           research,
+          evidenceOutcome: pageReadRequest || searchRequested ? (research ? "succeeded" : "failed") : undefined,
           premise: pageReadRequest
             ? research
-              ? `${persona.name} opened the exact linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it.`
-              : "The linked page could not be read safely. Say that plainly and never invent what it contains."
+              ? research.kind === "page"
+                ? `${persona.name} opened the exact linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)} The page is already available: never claim that external pages cannot be fetched or that this link is dead.`
+                : `${persona.name} could not extract the exact page, but a same-site lookup returned the supplied evidence. Answer only what those snippets support, cite the relevant source IDs, and never claim to have opened the page itself.`
+              : "This specific linked-page attempt and its same-site fallback returned no readable evidence. Say only that it could not be retrieved this time; never invent a cause, call the link dead, or claim permanent inability to access external sites."
             : searchRequested && !research
-              ? "The live lookup was unavailable. Say so briefly instead of inventing current facts."
+              ? "This specific live lookup returned no usable source. Say so briefly as a temporary result, not a permanent lack of web access, and never invent current facts."
               : undefined,
         },
         0,
@@ -970,22 +1124,30 @@ export class SocialDirector {
     }
 
     await delay(clamp(persona.latency[0] * 0.35, 500, 2_300));
-    const generatedReply = line ? normalizeGeneratedMessageContent(line.content) : undefined;
-    const replyText = generatedReply ?? normalizeGeneratedMessageContent(this.fallback(persona, human.name, "dm"))!;
+    const evidenceRequested = Boolean(pageReadRequest || searchRequested);
+    const mayUseGeneratedReply = !evidenceRequested || Boolean(research);
+    const generatedReply = mayUseGeneratedReply && line
+      ? normalizeGeneratedMessageContent(line.content)
+      : undefined;
+    const evidenceReply = generatedReply || !evidenceRequested
+      ? undefined
+      : groundedEvidenceFallback(research, message.content)
+        ?? evidenceFailureFallback(Boolean(pageReadRequest), message.content);
+    const replyText = generatedReply ?? evidenceReply?.content ?? normalizeGeneratedMessageContent(this.fallback(persona, human.name, "dm"))!;
+    const replySourceIds = generatedReply
+      ? sourceIdsForPageResponder(
+          research,
+          line?.sourceIds ?? [],
+          Boolean(pageReadRequest),
+        )
+      : evidenceReply?.sourceIds ?? [];
     const reply = this.store.addDmMessage(
       message.channelId,
       persona.id,
       replyText,
       message.id,
       generatedReply ? "lm" : "fallback",
-      this.messageSources(
-        research,
-        sourceIdsForPageResponder(
-          research,
-          generatedReply ? line?.sourceIds ?? [] : [],
-          Boolean(pageReadRequest && generatedReply),
-        ),
-      ),
+      this.messageSources(research, replySourceIds),
     );
     if (!reply) return;
     const thread = this.store.openDm(human.id, persona.id);
@@ -1079,7 +1241,7 @@ export class SocialDirector {
     const requiredIds = [
       ...new Set([
         ...signals.mentionedIds.filter((id) => selected.some((persona) => persona.id === id)),
-        ...(pageReadRequest && evidenceResponder ? [evidenceResponder.id] : []),
+        ...(evidenceRequested && evidenceResponder ? [evidenceResponder.id] : []),
         ...(signals.claimStrength > 0.28
           ? selected.filter((persona) => (persona.disagreement ?? 0) >= 0.65).slice(0, 1).map((persona) => persona.id)
           : []),
@@ -1090,20 +1252,23 @@ export class SocialDirector {
     let evidencePremise = "";
     try {
       if (pageReadRequest || searchRequested) {
-        research = await (pageReadRequest
-          ? this.pageReader.read(pageReadRequest, human.id)
-          : this.researchBroker.research(combined, human.id, trigger.channelId)).catch((error) => {
-          console.warn("Public evidence lookup failed open:", error instanceof Error ? error.message : error);
-          return undefined;
-        });
+        research = await this.resolveRequestedEvidence(
+          pageReadRequest,
+          searchRequested,
+          combined,
+          human.id,
+          trigger.channelId,
+        );
         if (research) triggerType = "research";
         evidencePremise = pageReadRequest
           ? research
-            ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact linked page and is solely responsible for answering the request from the supplied page evidence. Other selected residents may react briefly but must not claim to have read it. Attach S1 to every message that relies on the page.`
-            : `${evidenceResponder?.name ?? "The designated resident"} is responsible for saying that the linked page could not be read safely. Nobody may guess its contents.`
+            ? research.kind === "page"
+              ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact linked page and is solely responsible for answering the request from the supplied page evidence. ${pageEvidenceAnswerContract(research)} The page is already available: this resident must not claim that external pages cannot be fetched, that the content is unavailable, or that the link is dead. Other selected residents may react briefly but must not claim to have read it. Attach S1 to every message that relies on the page.`
+              : `${evidenceResponder?.name ?? "The designated resident"} could not extract the exact page, but a same-site lookup returned the supplied evidence. This resident answers only what those snippets support and cites the relevant source IDs, without claiming to have opened the page. Other selected residents must not discuss retrieval or repeat a limitation.`
+            : `${evidenceResponder?.name ?? "The designated resident"} alone says that this specific linked-page attempt and its same-site fallback returned no readable evidence. Phrase it as a temporary result; never invent a cause, call the link dead, or claim permanent inability to access external sites. Nobody may guess contents or repeat the failure.`
           : research
-            ? "A selected resident deliberately looked up fresh evidence. Use it selectively and attach only source IDs that support each factual claim."
-            : "The live lookup was unavailable. Say so briefly instead of inventing current facts.";
+            ? `${evidenceResponder?.name ?? "The designated resident"} deliberately looked up fresh evidence and is responsible for the sourced answer. Use it selectively and attach only source IDs that support each factual claim. Other selected residents must not pretend to have performed the lookup.`
+            : `${evidenceResponder?.name ?? "The designated resident"} alone says this specific live lookup returned no usable source. Phrase it as temporary, never as a permanent lack of web access, and do not invent current facts or let other residents repeat the failure.`;
       }
       const dissenter = selected.find((persona) => (persona.disagreement ?? 0) >= 0.65);
       const premise = [
@@ -1136,6 +1301,7 @@ export class SocialDirector {
           actorExpertiseNotes: this.actorChannels.expertiseNotes(selected, trigger.channelId),
           visualObservation,
           research,
+          evidenceOutcome: evidenceRequested ? (research ? "succeeded" : "failed") : undefined,
           premise: premise || undefined,
         },
         signals.mentionedIds.length ? 0 : 2,
@@ -1150,6 +1316,7 @@ export class SocialDirector {
     for (const requiredId of requiredIds.filter((id) => !lines.some((line) => line.personaId === id))) {
       const persona = selected.find((candidate) => candidate.id === requiredId);
       if (!persona) continue;
+      if (evidenceRequested && !research && evidenceResponder?.id === persona.id) continue;
       this.setTyping(trigger.channelId, persona.id, true);
       try {
         const focused = await this.lm.generateScene(
@@ -1168,12 +1335,13 @@ export class SocialDirector {
             actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], trigger.channelId),
             visualObservation,
             research,
+            evidenceOutcome: evidenceRequested ? (research ? "succeeded" : "failed") : undefined,
             premise: [
               evidencePremise,
               signals.mentionedIds.includes(persona.id)
                 ? `${persona.name} was directly addressed and must answer in their own concise voice.`
-                : pageReadRequest && evidenceResponder?.id === persona.id
-                  ? `${persona.name} is the one resident responsible for answering the explicit linked-page request concisely.`
+                : evidenceRequested && evidenceResponder?.id === persona.id
+                  ? `${persona.name} is the one resident responsible for answering the evidence request concisely.`
                   : "Answer the triggering message in your assigned conversational role without inventing a linked-page request.",
             ].filter(Boolean).join(" "),
           },
@@ -1186,16 +1354,34 @@ export class SocialDirector {
         this.setTyping(trigger.channelId, persona.id, false);
       }
     }
-    for (const persona of selected) {
-      if (!lines.some((line) => line.personaId === persona.id) && (required.has(persona.id) || lines.length === 0)) {
-        lines.push({
-          personaId: persona.id,
-          content: hasImage
-            ? this.imageFallback(persona, human.name, Boolean(visualObservation))
-            : this.fallback(persona, human.name, "public", trigger.content),
-          source: "fallback",
-          sourceIds: [],
-        });
+    if (evidenceRequested && !research) {
+      const failedResponder = evidenceResponder ?? selected[0];
+      const failed = evidenceFailureFallback(Boolean(pageReadRequest), trigger.content);
+      lines = failedResponder
+        ? [{
+            personaId: failedResponder.id,
+            content: failed.content,
+            source: "fallback",
+            sourceIds: failed.sourceIds,
+          }]
+        : [];
+    }
+    if (!(evidenceRequested && !research)) {
+      for (const persona of selected) {
+        if (!lines.some((line) => line.personaId === persona.id) && (required.has(persona.id) || lines.length === 0)) {
+          const grounded = evidenceRequested && evidenceResponder?.id === persona.id
+            ? groundedEvidenceFallback(research, trigger.content)
+              ?? evidenceFailureFallback(Boolean(pageReadRequest), trigger.content)
+            : undefined;
+          lines.push({
+            personaId: persona.id,
+            content: grounded?.content ?? (hasImage
+              ? this.imageFallback(persona, human.name, Boolean(visualObservation))
+              : this.fallback(persona, human.name, "public", trigger.content)),
+            source: "fallback",
+            sourceIds: grounded?.sourceIds ?? [],
+          });
+        }
       }
     }
     lines.sort((a, b) => Number(required.has(b.personaId)) - Number(required.has(a.personaId)));
@@ -1231,19 +1417,28 @@ export class SocialDirector {
           sourceIdsForPageResponder(
             research,
             line.sourceIds,
-            Boolean(pageReadRequest && evidenceResponder?.id === line.personaId && line.source === "lm"),
+            Boolean(
+              pageReadRequest &&
+              evidenceResponder?.id === line.personaId &&
+              (line.source === "lm" || line.sourceIds.includes("S1")),
+            ),
           ),
         ),
       );
       if (!posted && required.has(persona.id)) {
+        const grounded = evidenceRequested && evidenceResponder?.id === persona.id
+          ? groundedEvidenceFallback(research, trigger.content)
+            ?? evidenceFailureFallback(Boolean(pageReadRequest), trigger.content)
+          : undefined;
         this.postPublic(
           trigger.channelId,
           persona,
-          hasImage
+          grounded?.content ?? (hasImage
             ? this.imageFallback(persona, human.name, Boolean(visualObservation))
-            : this.fallback(persona, human.name, "public", trigger.content),
+            : this.fallback(persona, human.name, "public", trigger.content)),
           trigger.id,
           "fallback",
+          this.messageSources(research, grounded?.sourceIds ?? []),
         );
       }
     }

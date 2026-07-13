@@ -19,6 +19,8 @@ export type HumanizerReasonCode =
   | "overly_polished"
   | "register_mismatch"
   | "list_like_reply"
+  | "evidence_denial"
+  | "evidence_ungrounded"
   | "room_contract"
   | "style_contract";
 

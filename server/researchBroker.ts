@@ -25,17 +25,20 @@ type SearchMode = "news" | "web";
 const NEWS_INTENT = /\b(nyhet(?:er|erna)?|nyhetsläget|rubriker|news|headlines|breaking)\b/i;
 const EXPLICIT_LOOKUP =
   /\b(kolla upp|sök(?: efter| på webben)?|slå upp|googla|webbsök|leta upp|check online|search(?: for| the web)?|look up|browse(?: the web)?)\b/i;
-const FRESHNESS = /\b(senaste|aktuell(?:t|a)?|just nu|idag|den här veckan|current|latest|right now|today|this week|recent)\b/i;
-const QUESTION = /[?]|\b(vad|vem|vilka|hur|var|när|what|who|which|how|where|when)\b/i;
+const FRESHNESS = /\b(senaste|aktuell(?:t|a)?|just nu|i dag|idag|dagens|nuvarande|live|den här veckan|current|latest|right now|today|this week|recent)\b/i;
+const QUESTION = /[?]|\b(vad|vem|vilken|vilket|vilka|hur|var|när|what|who|which|how|where|when)\b/i;
 const PERSONAL_CHAT = /\b(du|dig|din|ditt|dina|you|your|yours)\b/i;
+const URL_TARGET = /(?:https?:\/\/|www\.)[^\s<>"'`]+|(?:^|[^@\p{L}\p{N}_])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})(?::\d{1,5})?(?:\/[^\s<>"'`]*)?/giu;
 const ROOM_FRESHNESS: Partial<Record<string, RegExp>> = {
   "the-pub": /\b(regering(?:en)?|riksdag(?:en)?|minister|partiledare|president|val(?:et)?|opinionsmätning|polls?|ny(?:a|tt)? (?:film|album|låt|serie)|premiär(?:en)?|topplista|charts?|turné|tour dates?)\b/i,
-  "stock-market": /\b(aktie(?:n|r|kurs|kursen)?|börskurs(?:en)?|kursen|handlas|marknadsvärde|market cap|stock price|share price|trading at|quote)\b/i,
+  "stock-market": /\b(aktie(?:n|r|kurs|kursen|kurser|kurserna)?|börskurs(?:en|er|erna)?|kurs(?:en|er|erna)?|index|handlas|marknadsvärde|market cap|stock price|share price|trading at|quote)\b/i,
   "world-of-warcraft": /\b(patch(?:en)?|hotfix|season|säsong|meta|tier list|current expansion|senaste expansion)\b/i,
   "ai-programming": /\b(sdk-version|api-version|library version|biblioteksversion|modellversion|model version|senaste version)\b/i,
   "ai-lab": /\b(modellversion|model version|benchmark result|benchmarkresultat|release date|releasedatum)\b/i,
   "3d-visualisation": /\b(blender-version|unreal-version|unity-version|rendererversion|renderer version|plugin compatibility|plugin-kompatibilitet|gpu support|gpu-stöd)\b/i,
 };
+
+const withoutUrlTargets = (content: string): string => content.replace(URL_TARGET, " ");
 
 const decodeXml = (value: string): string =>
   value
@@ -130,15 +133,50 @@ export class ResearchBroker {
 
   shouldResearch(content: string, channelId?: string): boolean {
     if (process.env.RESEARCH_ENABLED !== "true") return false;
-    if (NEWS_INTENT.test(content) || EXPLICIT_LOOKUP.test(content)) return true;
-    if (channelId && ROOM_FRESHNESS[channelId]?.test(content) && QUESTION.test(content)) return true;
-    return FRESHNESS.test(content) && QUESTION.test(content) && !PERSONAL_CHAT.test(content);
+    const intent = withoutUrlTargets(content);
+    if (NEWS_INTENT.test(intent) || EXPLICIT_LOOKUP.test(intent)) return true;
+    if (channelId && ROOM_FRESHNESS[channelId]?.test(intent) && QUESTION.test(intent)) return true;
+    return FRESHNESS.test(intent) && QUESTION.test(intent) && !PERSONAL_CHAT.test(intent);
   }
 
   async research(content: string, requesterId = "anonymous", channelId?: string): Promise<ResearchPacket | undefined> {
     if (!this.shouldResearch(content, channelId)) return undefined;
-    const mode = NEWS_INTENT.test(content) ? "news" : "web";
+    const mode = NEWS_INTENT.test(withoutUrlTargets(content)) ? "news" : "web";
     const query = this.toQuery(content);
+    return this.researchQuery(query, mode, requesterId);
+  }
+
+  async researchUrlFallback(
+    content: string,
+    url: URL,
+    requesterId = "anonymous",
+  ): Promise<ResearchPacket | undefined> {
+    if (process.env.RESEARCH_ENABLED !== "true" || url.protocol !== "https:" || !url.hostname.includes(".")) return undefined;
+    const mode = NEWS_INTENT.test(withoutUrlTargets(content)) || /(?:^|\/)news(?:\/|$)/iu.test(url.pathname)
+      ? "news"
+      : "web";
+    const topic = this.toQuery(content)
+      .replace(/\b(?:länk(?:en)?|sida(?:n)?|sajt(?:en)?|artikel(?:n)?|link|page|site|article)\b/giu, " ")
+      .replace(/\b(?:har\s+(?:du|ni|någon)\s+läst|have\s+you\s+read|läs|kolla|öppna|försök|prova|read|check|open|try)\b/giu, " ")
+      .replace(/\s+/gu, " ")
+      .trim();
+    const host = url.hostname.toLocaleLowerCase();
+    const query = `site:${host}${topic ? ` ${topic}` : ""}`.slice(0, 160);
+    const packet = await this.researchQuery(query, mode, requesterId);
+    if (!packet) return undefined;
+    const results = packet.results
+      .filter((result) => {
+        try {
+          return new URL(result.url).hostname.toLocaleLowerCase() === host;
+        } catch {
+          return false;
+        }
+      })
+      .map((result, index) => ({ ...result, id: `S${index + 1}` }));
+    return results.length > 0 ? { ...packet, results } : undefined;
+  }
+
+  private async researchQuery(query: string, mode: SearchMode, requesterId: string): Promise<ResearchPacket | undefined> {
     if (query.length < 3) return undefined;
     const key = `${mode}:${query.toLocaleLowerCase()}`;
     this.pruneCache();
@@ -231,15 +269,16 @@ export class ResearchBroker {
   }
 
   private toQuery(content: string): string {
-    return content
+    return withoutUrlTargets(content)
       .replace(/@[\p{L}\p{N}_.-]+/gu, " ")
-      .replace(/https?:\/\/\S+/gi, " ")
       .replace(/^[\s,.:;-]+/, "")
       .replace(/([?！!]).*$/s, " ")
       .replace(EXPLICIT_LOOKUP, " ")
+      .replace(/^(?:kan|kunde|skulle|vill)\s+(?:du|ni|någon)\s+(?:kolla|läsa|öppna|söka|leta)(?:\s+upp)?\s+/iu, "")
       .replace(/^(?:kan|skulle)\s+du\s+/i, "")
-      .replace(/^(?:vilka|vad|vem|hur|var|när|what|who|which|how|where|when)\s+(?:är|har|händer|finns|is|are|has|happens)?\s*(?:de|det|den|the)?\s*/i, "")
-      .replace(/\b(senaste|just nu|idag|den här veckan|latest|right now|today|this week)\b/gi, " ")
+      .replace(/^(?:vilken|vilket|vilka|vad|vem|hur|var|när|what|who|which|how|where|when)\s+(?:är|har|händer|finns|is|are|has|happens)?\s*(?:de|det|den|the)?\s*/i, "")
+      .replace(/\b(senaste|just nu|i dag|idag|dagens|nuvarande|live|den här veckan|latest|right now|today|this week)\b/gi, " ")
+      .replace(/\b(?:på|hos|at|on)\s*$/iu, " ")
       .replace(/[?！!]+/g, " ")
       .replace(/\s+/g, " ")
       .trim()

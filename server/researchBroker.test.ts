@@ -30,6 +30,7 @@ describe("research broker", () => {
   });
 
   it("recognises naturally phrased live-data questions in freshness-sensitive rooms", () => {
+    expect(broker.shouldResearch("Kan någon kolla dagens kurser på avanza.com?", "stock-market")).toBe(true);
     expect(broker.shouldResearch("Vad står Saab-aktien i?", "stock-market")).toBe(true);
     expect(broker.shouldResearch("What is NVDA trading at?", "stock-market")).toBe(true);
     expect(broker.shouldResearch("Vad är P/E?", "stock-market")).toBe(false);
@@ -39,6 +40,11 @@ describe("research broker", () => {
     expect(broker.shouldResearch("Vilken ny film har premiär?", "the-pub")).toBe(true);
     expect(broker.shouldResearch("Politiska slogans är mest tomma ord", "the-pub")).toBe(false);
     expect(broker.shouldResearch("Con Air är bättre än National Treasure", "the-pub")).toBe(false);
+  });
+
+  it("does not mistake News inside a pasted URL for a news-search request", () => {
+    expect(broker.shouldResearch("https://worldofwarcraft.blizzard.com/en-us/News", "world-of-warcraft")).toBe(false);
+    expect(broker.shouldResearch("den här var kul https://example.com/News", "the-pub")).toBe(false);
   });
 
   it("stays fully local unless the operator explicitly enables research", () => {
@@ -66,5 +72,30 @@ describe("research broker", () => {
     expect(parsedRequest.searchParams.get("q")).toBe("AI-nyheterna");
     expect(packet?.results[0]?.url).toBe("https://example.com/story");
     expect(packet?.results[0]?.publishedAt).toContain("2026");
+  });
+
+  it("builds a bounded same-site fallback when an explicitly requested page is unreadable", async () => {
+    let requestedUrl = "";
+    const rss = `<?xml version="1.0"?><rss><channel><item>
+      <title>Official update</title>
+      <link>https://worldofwarcraft.blizzard.com/en-us/news/official-update</link>
+      <description>A current official update with concrete details.</description>
+      <pubDate>Mon, 13 Jul 2026 18:00:00 GMT</pubDate>
+    </item></channel></rss>`;
+    const mockedFetch = async (input: string | URL | Request): Promise<Response> => {
+      requestedUrl = String(input);
+      return new Response(rss, { status: 200, headers: { "content-type": "application/rss+xml" } });
+    };
+    const testBroker = new ResearchBroker(mockedFetch as typeof fetch);
+    const packet = await testBroker.researchUrlFallback(
+      "vilken nyhet på länken är intressantast?",
+      new URL("https://worldofwarcraft.blizzard.com/en-us/News"),
+      "guest-1",
+    );
+    const parsedRequest = new URL(requestedUrl);
+    expect(parsedRequest.pathname).toBe("/news/search");
+    expect(parsedRequest.searchParams.get("q")).toMatch(/^site:worldofwarcraft\.blizzard\.com\b/u);
+    expect(parsedRequest.searchParams.get("q")).toContain("nyhet");
+    expect(packet?.kind).toBe("search");
   });
 });

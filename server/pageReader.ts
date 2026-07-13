@@ -56,6 +56,7 @@ interface CachedRead {
 interface PageEvidence {
   retrievedAt: string;
   result: ResearchResult;
+  cacheTtlMs?: number;
 }
 
 type PageFetcher = (
@@ -76,21 +77,45 @@ const MAX_PARSE_DEPTH = 128;
 
 const NEGATED_READ_REQUEST =
   /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:snälla|please)\s+)?(?:(?:läs|kolla(?:\s+(?:på|in))?|öppna|sammanfatta|summera|granska)(?:\s+[\p{L}-]{1,20}){0,6}\s+(?:inte|aldrig)|(?:do\s+not|don['’]?t|never)\s+(?:read|check(?:\s+out)?|open|summari[sz]e|review)|(?:(?:kan|kunde|vill)\s+(?:du|ni|någon)|skulle\s+(?:du|ni|någon)\s+(?:kunna\s+)?)\s+(?:inte|aldrig)\s+(?:läsa|kolla|öppna|sammanfatta|summera|granska)|(?:(?:can|could|would|will)\s+(?:you|someone)\s+)(?:not|never)\s+(?:read|check|open|summari[sz]e|review))(?=$|[^\p{L}\p{N}_])/iu;
+const NEGATED_RETRY_REQUEST =
+  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:försök|prova)\s+(?:inte|aldrig)|(?:do\s+not|don['’]?t|never)\s+try)(?=$|[^\p{L}\p{N}_])/iu;
+const MENTION_NEGATED_READ_REQUEST =
+  /(?:^|[^\p{L}\p{N}_])@[^\s,;:]+\s+(?:(?:läs|kolla|öppna|sammanfatta|summera|granska|försök|prova)(?:\s+[\p{L}-]{1,20}){0,6}\s+(?:inte|aldrig)|(?:do\s+not|don['’]?t|never)\s+(?:read|check(?:\s+out)?|open|summari[sz]e|review|try))(?=$|[^\p{L}\p{N}_])/iu;
 const START_MODAL_READ_REQUEST =
   /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*)|(?:[\p{L}\p{N}_-]{2,32}\s+(?=(?:kan|kunde|vill|skulle|can|could|would|will)\b)))?(?:(?:snälla|please)\s+)?(?:(?:(?:kan|kunde|vill)\s+(?:du|ni|någon)|skulle\s+(?:du|ni|någon)\s+(?:kunna\s+)?|går\s+det\s+att)\s+(?:läsa|kolla(?:\s+(?:på|in))?|öppna|sammanfatta|summera|granska|se)|(?:(?:can|could|would|will)\s+(?:you|someone)\s+)(?:read|check(?:\s+out)?|open|summari[sz]e|review|see))(?=$|[^\p{L}\p{N}_])/iu;
 const START_DIRECT_READ_REQUEST =
   /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:snälla|please)\s+)?(?:(?:(?:läs|kolla(?:\s+(?:på|in))?|öppna|sammanfatta|summera|granska|read|check(?:\s+out)?|open|summari[sz]e|review)\s*[:;\-–—]?\s*(?:(?:[a-z][a-z0-9+.-]*:\/\/|www\.)[^\s<>"']+|länk(?:en)?|sida(?:n)?|sajt(?:en)?|artikel(?:n)?|den(?:\s+här)?|det(?:\s+här|\s+där)?|följande|vad\s+som\s+står|link|page|site|article|it|this|that|the\s+(?:linked\s+)?(?:link|page|site|article))|(?:kör\s+)?webfetch|visa\s+att\s+(?:ni|du)\s+kan\s+se))(?=$|[^\p{L}\p{N}_])/iu;
 const START_PAGE_QUESTION =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:vad\s+(?:står|handlar)|vad\s+tycker\s+(?:ni|du)|kan\s+(?:ni|du)\s+se\s+vad\s+som\s+står|what\s+does|what\s+do\s+you\s+think)(?=$|[^\p{L}\p{N}_])/iu;
+  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:vad\s+(?:står|handlar)|vad\s+tycker\s+(?:ni|du)|kan\s+(?:ni|du)\s+se\s+vad\s+som\s+står|(?:vad|vilken|vilket|vilka)\b[^\n]{0,80}\b(?:på|i|från)\s+(?:länk(?:en)?|webbsida(?:n)?|sajt(?:en)?|artikel(?:n)?|nyhetssida(?:n)?)|what\s+does|what\s+do\s+you\s+think|(?:what|which)\b[^\n]{0,80}\b(?:on|in|from)\s+(?:the\s+)?(?:link|webpage|site|article))(?=$|[^\p{L}\p{N}_])/iu;
+const START_SOCIAL_READ_REQUEST =
+  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:har|hade)\s+(?:du|ni|någon)\s+(?:läst|sett|kollat(?:\s+på)?)|(?:have|has|did)\s+(?:you|anyone|someone)\s+(?:read|seen|see|checked(?:\s+out)?))(?=$|[^\p{L}\p{N}_])/iu;
+const START_RETRY_READ_REQUEST =
+  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:försök|prova)(?:\s+igen)?|try\s+again|give\s+it\s+a\s+try)(?=$|[^\p{L}\p{N}_])/iu;
 const FOLLOWUP_ACTION_REFERENCE =
   /(?:^|[^\p{L}\p{N}_])(?:läs(?:a|er)?|öppna|sammanfatta|summera|granska|kolla(?:\s+(?:på|in))?|read|open|summari[sz]e|review|check(?:\s+out)?)\s+(?:(?:om|på)\s+)?(?:(?:(?:den(?:\s+här)?|det(?:\s+här|\s+där)?|this|that)\s+)?(?:länk(?:en)?|sida(?:n)?|sajt(?:en)?|artikel(?:n)?|link|page|site|article)(?:\s+igen)?(?=$|[^\p{L}\p{N}_])|(?:den(?:\s+här)?|det(?:\s+här|\s+där)?|it|this|that)(?:\s+igen)?(?=\s*(?:$|[?.!,;:\-–—])))/iu;
 const FOLLOWUP_CAPABILITY_REFERENCE =
   /(?:^|[^\p{L}\p{N}_])(?:(?:kan\s+(?:ni|du)\s+(?:läsa|öppna|kolla|se))|(?:visa\s+att\s+(?:ni|du)\s+kan\s+se)|(?:(?:can|could|would|will)\s+(?:you|someone)\s+(?:read|open|check(?:\s+out)?|see)))\s+(?:(?:(?:den(?:\s+här)?|det(?:\s+här|\s+där)?|this|that)\s+)?(?:länk(?:en)?|sida(?:n)?|sajt(?:en)?|artikel(?:n)?|link|page|site|article)(?=$|[^\p{L}\p{N}_])|(?:den(?:\s+här)?|det(?:\s+här|\s+där)?|it|this|that)(?=\s*(?:$|[?.!,;:\-–—])))/iu;
 const FOLLOWUP_PAGE_QUESTION =
-  /(?:^|[^\p{L}\p{N}_])(?:vad\s+(?:står|handlar)|vad\s+tycker\s+(?:ni|du)|what\s+does|what\s+do\s+you\s+think)[^\n]{0,80}(?:länk(?:en)?|sida(?:n)?|sajt(?:en)?|artikel(?:n)?|link|page|site|article)(?=$|[^\p{L}\p{N}_])/iu;
+  /(?:^|[^\p{L}\p{N}_])(?:(?:vad\s+(?:står|handlar)|vad\s+tycker\s+(?:ni|du))[^\n]{0,80}(?:länk(?:en)?|webbsida(?:n)?|sajt(?:en)?|artikel(?:n)?|nyhetssida(?:n)?)|(?:vad|vilken|vilket|vilka)\b[^\n]{0,80}\b(?:på|i|från)\s+(?:länk(?:en)?|webbsida(?:n)?|sajt(?:en)?|artikel(?:n)?|nyhetssida(?:n)?)|(?:what\s+does|what\s+do\s+you\s+think)[^\n]{0,80}(?:link|webpage|site|article)|(?:what|which)\b[^\n]{0,80}\b(?:on|in|from)\s+(?:the\s+)?(?:link|webpage|site|article))(?=$|[^\p{L}\p{N}_])/iu;
 const EXPLICIT_WEBFETCH = /^\s*(?:kör\s+)?webfetch(?=$|[^\p{L}\p{N}_])/iu;
-const LINK_LIKE_CANDIDATE = /(?:[a-z][a-z0-9+.-]*:\/\/|www\.)[^\s<>"'`]*/iu;
-const LINK_LIKE_CANDIDATE_GLOBAL = /(?:[a-z][a-z0-9+.-]*:\/\/|www\.)[^\s<>"'`]*/giu;
+const BARE_PUBLIC_DOMAIN = /(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})(?::\d{1,5})?(?:\/[^\s<>"'`]*)?/iu;
+const BARE_PUBLIC_DOMAIN_FULL = new RegExp(`^${BARE_PUBLIC_DOMAIN.source}$`, "iu");
+const BARE_DOMAIN_ABBREVIATION = /^(?:t\.ex|m\.fl)(?=$|[/?.,!;:])/iu;
+// Keep this deliberately narrower than a file-extension catalogue. Several
+// extension-looking suffixes (.cc, .md, .py, .rs, .sh, .zip, …) are real TLDs
+// and must remain valid public-domain candidates. Paths, ports and explicit
+// schemes are never classified as filenames either.
+const BARE_FILENAME_SUFFIX = /\.(?:css|csv|gif|go|html?|jpe?g|js|json|jsx|lock|mjs|pdf|png|toml|ts|tsx|txt|webp|xml|ya?ml)$/iu;
+const bareCandidateLooksLikeFilename = (raw: string): boolean =>
+  !/[/:?]/u.test(raw) && BARE_FILENAME_SUFFIX.test(raw);
+const LEADING_READ_ACTION =
+  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:snälla\s+)?(?:läs(?!\s+mer\b)|kolla(?:\s+(?:på|in))?|öppna|sammanfatta|summera|granska|försök|prova)(?=$|[^\p{L}\p{N}_])/iu;
+const TRAILING_MENTION_READ_ACTION =
+  /(?:^|[^\p{L}\p{N}_])@[^\s,;:]+\s+(?:läs(?!\s+mer\b)|kolla|öppna|sammanfatta|summera|granska|försök|prova)(?:\s+(?:gärna|snälla|nu|igen))?\s*[!?.,;:]*\s*$/iu;
+const LINK_LIKE_CANDIDATE_GLOBAL = new RegExp(
+  `(?:[a-z][a-z0-9+.-]*:\\/\\/|www\\.)[^\\s<>"'\u0060]*|${BARE_PUBLIC_DOMAIN.source}`,
+  "giu",
+);
 const CORRECTION_PREFIX = /^\s*(?:(?:sorry|oops|oj|ursäkta)\b[\s,;:!.\-–—]*)?(?:(?:nej|no)\b[\s,;:!.\-–—]*(?:(?:fel\s+länk(?:en)?|wrong\s+link|jag\s+menade|i\s+meant)\b[\s,;:!.\-–—]*)?|(?:fel\s+länk(?:en)?|wrong\s+link|jag\s+menade|i\s+meant)\b[\s,;:!.\-–—]*)/iu;
 const BURST_CANCEL = /^(?:\s*nej\b|\s*no(?:\s*[,;:!.\-–—]|\s*$|\s+(?:wrong|stop|forget|cancel)\b)|\s*(?:glöm\s+det|forget\s+it|avbryt(?:\s+(?:den|det))?|cancel(?:\s+it)?|stopp?)\b)/iu;
 const PERSONA_NAMES = [...PERSONAS].map((persona) => persona.name.toLocaleLowerCase()).sort((a, b) => b.length - a.length);
@@ -116,7 +141,7 @@ const BLOCKED_TAGS = new Set([
   "textarea",
   "dialog",
 ]);
-const CONTENT_TAGS = new Set(["h1", "h2", "h3", "p", "li", "blockquote", "pre", "figcaption"]);
+const CONTENT_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "pre", "figcaption"]);
 const NOISE_TOKEN = /(?:^|[-_\s])(?:cookie|consent|newsletter|share|sharing|social|related|sidebar|advert|ads|promo|modal|popup|paywall)(?:$|[-_\s])/iu;
 
 const attrsOf = (node: ParsedNode): Record<string, string> =>
@@ -210,8 +235,14 @@ const collectBlocks = (root: ParsedNode): string[] => {
     visited += 1;
     const tagName = current.node.tagName ?? "";
     if ((tagName && BLOCKED_TAGS.has(tagName)) || isHiddenOrNoise(current.node)) continue;
-    if (CONTENT_TAGS.has(tagName)) {
-      push(visibleText(current.node), tagName);
+    const attrs = attrsOf(current.node);
+    const semanticLabel = `${attrs.id ?? ""} ${attrs.class ?? ""}`.toLocaleLowerCase();
+    const headlineLike =
+      attrs.role?.toLocaleLowerCase() === "heading" ||
+      /(?:^|\s)(?:headline|title)(?:\s|$)/iu.test((attrs.itemprop ?? "").toLocaleLowerCase()) ||
+      /(?:^|[-_\s])(?:headline|title)(?:$|[-_\s])/iu.test(semanticLabel);
+    if (CONTENT_TAGS.has(tagName) || headlineLike) {
+      push(visibleText(current.node), headlineLike ? "h4" : tagName);
       continue;
     }
     stack.push(...childEntries(current.node, current.depth + 1));
@@ -385,7 +416,12 @@ const requestLineVariants = (line: string): string[] => {
 };
 
 const hasNegatedReadRequest = (content: string): boolean =>
-  content.split(/\r?\n/u).some((line) => requestLineVariants(line).some((variant) => NEGATED_READ_REQUEST.test(variant)));
+  content.split(/\r?\n/u).some((line) => requestLineVariants(line).some((variant) =>
+    NEGATED_READ_REQUEST.test(variant) || NEGATED_RETRY_REQUEST.test(variant) || MENTION_NEGATED_READ_REQUEST.test(variant),
+  ));
+
+const isRetryReadRequest = (content: string): boolean =>
+  !hasNegatedReadRequest(content) && requestLineVariants(content).some((variant) => START_RETRY_READ_REQUEST.test(variant));
 
 const intentRequestsReading = (content: string): boolean => {
   if (hasNegatedReadRequest(content)) return false;
@@ -395,6 +431,8 @@ const intentRequestsReading = (content: string): boolean => {
       START_MODAL_READ_REQUEST.test(variant) ||
       START_DIRECT_READ_REQUEST.test(variant) ||
       START_PAGE_QUESTION.test(variant) ||
+      START_SOCIAL_READ_REQUEST.test(variant) ||
+      START_RETRY_READ_REQUEST.test(variant) ||
       EXPLICIT_WEBFETCH.test(variant),
     ));
 };
@@ -403,6 +441,7 @@ const intentReferencesRecentPage = (content: string): boolean =>
   (FOLLOWUP_ACTION_REFERENCE.test(content) ||
     FOLLOWUP_CAPABILITY_REFERENCE.test(content) ||
     FOLLOWUP_PAGE_QUESTION.test(content) ||
+    isRetryReadRequest(content) ||
     EXPLICIT_WEBFETCH.test(content));
 
 interface LinkCandidate {
@@ -412,18 +451,27 @@ interface LinkCandidate {
 }
 
 const linkCandidates = (content: string): LinkCandidate[] =>
-  [...content.matchAll(LINK_LIKE_CANDIDATE_GLOBAL)].map((match) => {
+  [...content.matchAll(LINK_LIKE_CANDIDATE_GLOBAL)].flatMap((match): LinkCandidate[] => {
     const raw = match[0] ?? "";
     // Never mine a nested HTTPS substring out of a rejected outer scheme such
     // as http://private/https://public. The entire candidate must begin with a
     // supported form before the shared validator may normalize it.
-    const supportedStart = /^(?:https:\/\/|www\.)/iu.test(raw) &&
-      hasStandaloneUrlBoundary(content, match.index ?? 0);
-    return {
+    const standalone = hasStandaloneUrlBoundary(content, match.index ?? 0);
+    const explicitForm = /^(?:[a-z][a-z0-9+.-]*:\/\/|www\.)/iu.test(raw);
+    if (!standalone) return [{ index: match.index ?? 0, raw }];
+    if (!explicitForm && (BARE_DOMAIN_ABBREVIATION.test(raw) || bareCandidateLooksLikeFilename(raw))) return [];
+    const supportedStart = /^(?:https:\/\/|www\.)/iu.test(raw) && standalone;
+    const bareDomain = BARE_PUBLIC_DOMAIN_FULL.test(raw) && !BARE_DOMAIN_ABBREVIATION.test(raw);
+    const url = supportedStart
+      ? extractPublicHttpsUrls(raw, 1)[0]
+      : bareDomain
+        ? extractPublicHttpsUrls(`https://${raw}`, 1)[0]
+        : undefined;
+    return [{
       index: match.index ?? 0,
       raw,
-      url: supportedStart ? extractPublicHttpsUrls(raw, 1)[0] : undefined,
-    };
+      url,
+    }];
   });
 
 const candidateFromTrailingReadIntent = (
@@ -432,10 +480,12 @@ const candidateFromTrailingReadIntent = (
 ): LinkCandidate | undefined => {
   if (hasNegatedReadRequest(content)) return undefined;
   for (const candidate of candidates) {
+    const leading = content.slice(0, candidate.index);
     const trailing = content
       .slice(candidate.index + candidate.raw.length)
       .replace(/^[\s()[\]{},.;:!?\-–—]+/u, "");
-    if (!intentRequestsReading(trailing)) continue;
+    const colocated = LEADING_READ_ACTION.test(leading) || TRAILING_MENTION_READ_ACTION.test(trailing);
+    if (!intentRequestsReading(trailing) && !colocated) continue;
     return linkCandidates(trailing)[0] ?? candidate;
   }
   return undefined;
@@ -522,6 +572,138 @@ const readerPolicy: SafeHttpsFetchPolicy = {
   userAgent: "TheThirdPlace-PageReader/1.0",
 };
 
+const avanzaJsonPolicy: SafeHttpsFetchPolicy = {
+  timeoutMs: 4_000,
+  maxRedirects: 0,
+  maxBodyBytes: 64 * 1024,
+  acceptedMediaTypes: ["application/json"],
+  acceptHeader: "application/json",
+  userAgent: "TheThirdPlace-AvanzaReader/1.0",
+};
+
+const AVANZA_HOSTS = new Set(["avanza.se", "www.avanza.se"]);
+const AVANZA_MARKET_PATH = /^\/(?:start|borsen-idag(?:\.html)?|hall-koll\/borsen-idag\.html|marknadsoversikt)?\/?$/iu;
+
+type JsonRecord = Record<string, unknown>;
+
+const jsonRecord = (value: unknown): JsonRecord | undefined =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : undefined;
+
+const boundedJsonString = (value: unknown, limit: number): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  const cleaned = sanitizePageText(value, limit);
+  return cleaned || undefined;
+};
+
+const finiteIndexLevel = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 1_000_000_000
+    ? value
+    : undefined;
+
+const boundedDailyPercent = (value: unknown): string | undefined => {
+  const raw = boundedJsonString(value, 20);
+  if (!raw || !/^[+-]?\d{1,3}(?:[,.]\d{1,6})?$/u.test(raw)) return undefined;
+  const numeric = Number(raw.replace(",", "."));
+  return Number.isFinite(numeric) && Math.abs(numeric) <= 100 ? raw : undefined;
+};
+
+const validMarketTime = (value: unknown): string | undefined => {
+  const raw = boundedJsonString(value, 8);
+  const match = raw?.match(/^(\d{1,2}):(\d{2})$/u);
+  if (!match) return undefined;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 ? raw : undefined;
+};
+
+interface AvanzaHeaderIndex {
+  orderbookId: string;
+  name: string;
+  shortName?: string;
+  changeToday?: string;
+  updated?: string;
+}
+
+const parseAvanzaHeaderIndexes = (body: Buffer): AvanzaHeaderIndex[] => {
+  try {
+    const parsed = jsonRecord(JSON.parse(body.toString("utf8")));
+    if (!parsed || !Array.isArray(parsed.indexes)) return [];
+    return parsed.indexes.slice(0, 8).flatMap((raw): AvanzaHeaderIndex[] => {
+      const row = jsonRecord(raw);
+      const link = jsonRecord(row?.link);
+      const orderbookId = boundedJsonString(link?.orderbookId, 16);
+      const name = boundedJsonString(link?.linkDisplay, 100);
+      if (!orderbookId || !/^\d{1,12}$/u.test(orderbookId) || !name) return [];
+      const shortName = boundedJsonString(link?.shortLinkDisplay, 24);
+      const changeToday = boundedDailyPercent(row?.quoteChangeToday);
+      const updated = validMarketTime(row?.todayPriceUpdated);
+      return [{ orderbookId, name, ...(shortName ? { shortName } : {}), ...(changeToday ? { changeToday } : {}), ...(updated ? { updated } : {}) }];
+    });
+  } catch {
+    return [];
+  }
+};
+
+const parseAvanzaLastPrices = (body: Buffer, allowedIds: ReadonlySet<string>): Map<string, number> => {
+  const prices = new Map<string, number>();
+  try {
+    const parsed = jsonRecord(JSON.parse(body.toString("utf8")));
+    if (!parsed || !Array.isArray(parsed.orderbooks)) return prices;
+    for (const raw of parsed.orderbooks.slice(0, 8)) {
+      const row = jsonRecord(raw);
+      const orderbookId = boundedJsonString(row?.orderbookId, 16);
+      const lastPrice = finiteIndexLevel(row?.lastPrice);
+      if (orderbookId && allowedIds.has(orderbookId) && lastPrice !== undefined) prices.set(orderbookId, lastPrice);
+    }
+  } catch {
+    return prices;
+  }
+  return prices;
+};
+
+const isAvanzaMarketRequest = (url: URL): boolean =>
+  AVANZA_HOSTS.has(url.hostname.toLocaleLowerCase()) && AVANZA_MARKET_PATH.test(url.pathname);
+
+const avanzaMarketEvidence = async (
+  fetcher: PageFetcher,
+  requestedUrl: URL,
+): Promise<PageEvidence | undefined> => {
+  const headerUrl = new URL("https://www.avanza.se/_api/market-index/header-index");
+  const header = await fetcher(headerUrl, avanzaJsonPolicy).catch(() => undefined);
+  if (!header || header.finalUrl.toString() !== headerUrl.toString()) return undefined;
+  const indexes = parseAvanzaHeaderIndexes(header.body);
+  if (indexes.length === 0) return undefined;
+
+  const allowedIds = new Set(indexes.map((index) => index.orderbookId));
+  const dataUrl = new URL("https://www.avanza.se/_api/market-overview/data/orderbooks");
+  dataUrl.searchParams.set("orderbookIds", [...allowedIds].join(","));
+  const data = await fetcher(dataUrl, avanzaJsonPolicy).catch(() => undefined);
+  const prices = data && data.finalUrl.toString() === dataUrl.toString()
+    ? parseAvanzaLastPrices(data.body, allowedIds)
+    : new Map<string, number>();
+  const completeIndexes = indexes.filter((index) =>
+    prices.has(index.orderbookId) && index.changeToday !== undefined && index.updated !== undefined,
+  );
+  if (completeIndexes.length === 0) return undefined;
+  const numberFormat = new Intl.NumberFormat("sv-SE", { maximumFractionDigits: 2 });
+  const rows = completeIndexes.map((index) => {
+    const price = prices.get(index.orderbookId)!;
+    const label = index.shortName && index.shortName !== index.name ? `${index.name} (${index.shortName})` : index.name;
+    return `${label}: ${numberFormat.format(price)} indexpunkter, ${index.changeToday!.replace(".", ",")} % idag, uppdaterad ${index.updated}.`;
+  });
+  const retrievedAt = new Date().toISOString();
+  return {
+    retrievedAt,
+    cacheTtlMs: 45_000,
+    result: {
+      id: "S1",
+      title: "Avanza – Börsen idag",
+      url: requestedUrl.toString(),
+      snippet: `Avanzas publika marknadsöversikt, hämtad ${retrievedAt}. Detta är huvudindex, inte en full lista över enskilda aktier.\n${rows.join("\n")}`,
+    },
+  };
+};
+
 export class PageReader {
   private readonly cache = new Map<string, CachedRead>();
   private readonly inFlight = new Map<string, Promise<PageEvidence | undefined>>();
@@ -603,13 +785,18 @@ export class PageReader {
     const key = `${requesterId}\u0000${requestedUrl.toString()}`;
     this.prune();
     const cached = this.cache.get(key);
-    if (cached && cached.expiresAt > Date.now()) return this.packetFor(request, cached.evidence);
+    if (cached && cached.expiresAt > Date.now()) {
+      const explicitRetry = isRetryReadRequest(request.intent);
+      if (cached.evidence || !explicitRetry) return this.packetFor(request, cached.evidence);
+      this.cache.delete(key);
+    }
     const existing = this.inFlight.get(key);
     if (existing) return existing.then((evidence) => this.packetFor(request, evidence));
     if (this.activeRequests >= 2 || !this.reserve(requesterId, requestedUrl.origin)) return undefined;
     this.activeRequests += 1;
-    const pending = this.fetcher(requestedUrl, readerPolicy)
-      .then((result) => {
+    const evidenceRequest: Promise<PageEvidence | undefined> = isAvanzaMarketRequest(requestedUrl)
+      ? avanzaMarketEvidence(this.fetcher, requestedUrl)
+      : this.fetcher(requestedUrl, readerPolicy).then((result) => {
         if (!result) return undefined;
         const extracted = extractReadablePage(result.body, result.mediaType, result.finalUrl);
         if (!extracted) return undefined;
@@ -622,10 +809,11 @@ export class PageReader {
             snippet: extracted.text,
           },
         };
-      })
+      });
+    const pending = evidenceRequest
       .catch(() => undefined)
       .then((evidence) => {
-        this.cache.set(key, { evidence, expiresAt: Date.now() + (evidence ? 20 * 60_000 : 90_000) });
+        this.cache.set(key, { evidence, expiresAt: Date.now() + (evidence?.cacheTtlMs ?? (evidence ? 20 * 60_000 : 90_000)) });
         return evidence;
       })
       .finally(() => {

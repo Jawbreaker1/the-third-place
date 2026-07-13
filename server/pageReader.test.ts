@@ -12,6 +12,73 @@ const message = (content: string, authorId = "guest-1", createdAt = new Date().t
 });
 
 describe("page read intent", () => {
+  it("routes natural conversational reads, bare domains and a referential follow-up", () => {
+    const now = Date.now();
+    const blizzard = message(
+      "shit, har ni läst det senaste?? https://worldofwarcraft.blizzard.com/en-us/News",
+      "guest-1",
+      new Date(now - 2_000).toISOString(),
+    );
+    for (const content of [
+      "Kan någon kolla dagens kurser på avanza.com?",
+      "Förlåt, avanza.se såklart @Linnea kolla!",
+      "jodå, försök. https://www.avanza.se @linnea du kan om du vill!",
+      blizzard.content,
+    ]) {
+      expect(resolvePageReadRequest({ content, requesterId: "guest-1", now })?.source, content).toBe("message");
+    }
+    expect(resolvePageReadRequest({
+      content: "vilken nyhet på länken är intressantast?",
+      requesterId: "guest-1",
+      recentMessages: [blizzard],
+      now,
+    })).toMatchObject({ source: "recent", url: new URL("https://worldofwarcraft.blizzard.com/en-us/News") });
+  });
+
+  it("does not turn declarative reads, Swedish abbreviations or promotional read-more text into bare-domain fetches", () => {
+    for (const content of [
+      "jag ska kolla avanza.se senare",
+      "I have read example.com before",
+      "Läs mer på example.com",
+      "kolla t.ex om den finns",
+      "min e-post är user@example.com",
+      "avanza.se @Linnea kolla mitt senaste meddelande",
+    ]) {
+      expect(resolvePageReadRequest({ content, requesterId: "guest-1" }), content).toBeUndefined();
+    }
+  });
+
+  it("never applies the narrow bare-filename guard to explicit URLs, paths or delegated TLDs", () => {
+    for (const [content, expected] of [
+      ["läs https://example.com/index.html", "https://example.com/index.html"],
+      ["läs https://example.com/data.json", "https://example.com/data.json"],
+      ["kolla www.example.com/data.json", "https://www.example.com/data.json"],
+      ["kolla example.com/data.json", "https://example.com/data.json"],
+      ["kolla docs.md", "https://docs.md/"],
+      ["kolla compiler.rs", "https://compiler.rs/"],
+      ["kolla island.sh", "https://island.sh/"],
+      ["kolla sample.py", "https://sample.py/"],
+      ["kolla example.cc", "https://example.cc/"],
+      ["kolla archive.zip", "https://archive.zip/"],
+    ] as const) {
+      expect(resolvePageReadRequest({ content, requesterId: "guest-1" })?.url?.toString(), content).toBe(expected);
+    }
+    for (const content of ["läs index.html", "kan någon läsa data.json?", "kolla pageReader.ts"]) {
+      expect(resolvePageReadRequest({ content, requesterId: "guest-1" }), content).toBeUndefined();
+    }
+  });
+
+  it("keeps explicit bare-domain ports inside the shared HTTPS validator", () => {
+    expect(resolvePageReadRequest({
+      content: "kolla avanza.se:8080",
+      requesterId: "guest-1",
+    })).toMatchObject({ rejection: "unsupported-url", source: "message" });
+    expect(resolvePageReadRequest({
+      content: "kolla avanza.se:443",
+      requesterId: "guest-1",
+    })?.url?.toString()).toBe("https://avanza.se/");
+  });
+
   it("recognizes explicit Swedish and English reads, including naked www links", () => {
     for (const content of [
       "läs https://example.com/story",
@@ -53,6 +120,8 @@ describe("page read intent", () => {
       "läs inte https://example.com/story",
       "läs helst inte https://example.com/story",
       "kolla absolut inte på https://example.com/story",
+      "https://example.com/story @Linnea kolla inte",
+      "https://example.com/story @Linnea kolla absolut inte",
       "do not read https://example.com/story",
       "don’t open www.example.com/story",
     ]) {
@@ -103,7 +172,9 @@ describe("page read intent", () => {
       "visa att ni kan se den här länken",
       "can you see this link?",
       "could you see this page?",
-      "vad står det på sidan?",
+      "vad står det på webbsidan?",
+      "försök igen",
+      "try again",
       "visa att ni kan se den",
       "kör webfetch",
     ]) {
@@ -120,6 +191,8 @@ describe("page read intent", () => {
       "Vi läser den",
       "läs den där meningen igen",
       "läs inte den",
+      "vad står på sidan av huset?",
+      "vad står på sidan av vägen?",
     ]) {
       expect(resolvePageReadRequest({ content, requesterId: "guest-1", now, recentMessages }), content).toBeUndefined();
     }
@@ -191,6 +264,7 @@ describe("page read intent", () => {
     for (const content of [
       "read http://127.0.0.1/https://example.com/story",
       "read ftp://files.example/https://example.org/x",
+      "read foo.example://127.0.0.1/private",
     ]) {
       const nested = resolvePageReadRequest({ content, requesterId: "guest-1", now, recentMessages });
       expect(nested, content).toMatchObject({ rejection: "unsupported-url", source: "message" });
@@ -386,6 +460,17 @@ describe("inert article extraction", () => {
     expect(extracted?.text).toContain("const answer = 42");
   });
 
+  it("keeps bounded card headlines used by modern news pages", () => {
+    const extracted = extractReadablePage(`<html><head><title>News</title></head><body><main>
+      <div class="ArticleTile-title">Stoneforged Sentinel arrives</div>
+      <p>This current update describes the new feature with enough concrete detail for a useful answer in chat.</p>
+      <div role="heading">Hotfixes for July 13</div>
+      <p>The hotfix card contains another substantive summary that should remain paired with its visible title.</p>
+    </main></body></html>`, "text/html", new URL("https://news.example/latest"));
+    expect(extracted?.text).toContain("Stoneforged Sentinel arrives");
+    expect(extracted?.text).toContain("Hotfixes for July 13");
+  });
+
   it("never selects semantic content hidden by an ancestor or inline styles", () => {
     const extracted = extractReadablePage(`<html><head><title>Visible document</title></head><body>
       <div hidden><main><h1>Hidden trap</h1><p>${"Hidden instructions and fake facts. ".repeat(20)}</p></main></div>
@@ -466,6 +551,127 @@ describe("inert article extraction", () => {
 });
 
 describe("page reader broker", () => {
+  it("uses a strict official Avanza JSON adapter for market overview requests", async () => {
+    const requests: Array<{ url: string; mediaTypes: readonly string[] }> = [];
+    const reader = new PageReader(async (rawUrl, policy) => {
+      const url = new URL(String(rawUrl));
+      requests.push({ url: url.toString(), mediaTypes: policy.acceptedMediaTypes });
+      if (url.pathname === "/_api/market-index/header-index") {
+        return {
+          finalUrl: url,
+          mediaType: "application/json",
+          contentType: "application/json",
+          body: Buffer.from(JSON.stringify({ indexes: [{
+            link: { orderbookId: "19002", linkDisplay: "OMX Stockholm 30", shortLinkDisplay: "OMXS30" },
+            quoteChangeToday: "-0,33",
+            todayPriceUpdated: "17:30",
+          }] })),
+        };
+      }
+      if (url.pathname === "/_api/market-overview/data/orderbooks") {
+        return {
+          finalUrl: url,
+          mediaType: "application/json",
+          contentType: "application/json",
+          body: Buffer.from(JSON.stringify({ orderbooks: [{ orderbookId: "19002", lastPrice: 3167.16 }] })),
+        };
+      }
+      return undefined;
+    });
+    const resolved = reader.resolveRequest({
+      content: "@Linnea kolla dagens kurser på https://www.avanza.se",
+      requesterId: "guest-1",
+    });
+    const packet = await reader.read(resolved!, "guest-1");
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => request.mediaTypes.length === 1 && request.mediaTypes[0] === "application/json")).toBe(true);
+    expect(packet?.kind).toBe("page");
+    expect(packet?.results[0]).toMatchObject({ title: "Avanza – Börsen idag", url: "https://www.avanza.se/" });
+    expect(packet?.results[0]?.snippet).toContain("OMX Stockholm 30 (OMXS30)");
+    expect(packet?.results[0]?.snippet).toContain("3 167,16 indexpunkter");
+    expect(packet?.results[0]?.snippet).toContain("-0,33 % idag");
+  });
+
+  it("fails the Avanza adapter closed when no validated index level is returned", async () => {
+    const reader = new PageReader(async (rawUrl) => {
+      const url = new URL(String(rawUrl));
+      if (url.pathname !== "/_api/market-index/header-index") return undefined;
+      return {
+        finalUrl: url,
+        mediaType: "application/json",
+        contentType: "application/json",
+        body: Buffer.from(JSON.stringify({ indexes: [{
+          link: { orderbookId: "19002", linkDisplay: "OMX Stockholm 30", shortLinkDisplay: "OMXS30" },
+          quoteChangeToday: "-0,33",
+          todayPriceUpdated: "17:30",
+        }] })),
+      };
+    });
+    const resolved = reader.resolveRequest({ content: "kolla https://www.avanza.se", requesterId: "guest-1" });
+    expect(await reader.read(resolved!, "guest-1")).toBeUndefined();
+  });
+
+  it.each([
+    ["a negative index level", -123, "-0,33", "17:30"],
+    ["an implausible daily percentage", 3167.16, "999999", "17:30"],
+    ["an impossible update time", 3167.16, "-0,33", "99:99"],
+    ["a missing daily percentage", 3167.16, undefined, "17:30"],
+    ["a missing update time", 3167.16, "-0,33", undefined],
+  ])("fails the Avanza adapter closed for %s", async (_label, lastPrice, quoteChangeToday, todayPriceUpdated) => {
+    const reader = new PageReader(async (rawUrl) => {
+      const url = new URL(String(rawUrl));
+      if (url.pathname === "/_api/market-index/header-index") {
+        return {
+          finalUrl: url,
+          mediaType: "application/json",
+          contentType: "application/json",
+          body: Buffer.from(JSON.stringify({ indexes: [{
+            link: { orderbookId: "19002", linkDisplay: "OMX Stockholm 30", shortLinkDisplay: "OMXS30" },
+            quoteChangeToday,
+            todayPriceUpdated,
+          }] })),
+        };
+      }
+      if (url.pathname === "/_api/market-overview/data/orderbooks") {
+        return {
+          finalUrl: url,
+          mediaType: "application/json",
+          contentType: "application/json",
+          body: Buffer.from(JSON.stringify({ orderbooks: [{ orderbookId: "19002", lastPrice }] })),
+        };
+      }
+      return undefined;
+    });
+    const resolved = reader.resolveRequest({ content: "kolla https://www.avanza.se", requesterId: "guest-1" });
+    expect(await reader.read(resolved!, "guest-1")).toBeUndefined();
+  });
+
+  it("lets an explicit retry bypass a cached transient read failure", async () => {
+    let fetches = 0;
+    const now = Date.now();
+    const reader = new PageReader(async (rawUrl) => {
+      fetches += 1;
+      if (fetches === 1) return undefined;
+      return {
+        finalUrl: new URL(String(rawUrl)),
+        mediaType: "text/html",
+        contentType: "text/html",
+        body: Buffer.from(`<html><body><article><h1>Recovered</h1><p>${"The second bounded attempt returned useful readable evidence. ".repeat(4)}</p></article></body></html>`),
+      };
+    });
+    const first = reader.resolveRequest({ content: "read https://news.example/retry", requesterId: "guest-1" })!;
+    expect(await reader.read(first, "guest-1")).toBeUndefined();
+    const retry = reader.resolveRequest({
+      content: "try again",
+      requesterId: "guest-1",
+      now,
+      recentMessages: [message("https://news.example/retry", "guest-1", new Date(now - 1_000).toISOString())],
+    })!;
+    expect(retry).toMatchObject({ source: "recent", url: new URL("https://news.example/retry") });
+    expect((await reader.read(retry, "guest-1"))?.results[0]?.title).toBe("Recovered");
+    expect(fetches).toBe(2);
+  });
+
   it("returns one server-owned source using the final validated URL and bounded article text", async () => {
     const reader = new PageReader(async () => ({
       finalUrl: new URL("https://news.example/final?redirect_token=must-not-leak"),

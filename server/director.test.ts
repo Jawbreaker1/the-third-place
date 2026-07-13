@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { PERSONAS } from "./personas.js";
+import { RoomStore } from "./store.js";
 import {
   addressedPersonaIds,
   ambientConversationPremise,
@@ -12,7 +13,10 @@ import {
   consideredConversationResponsePremise,
   consideredConversationWordLimits,
   ensureEvidenceResponder,
+  evidenceFailureFallback,
+  groundedEvidenceFallback,
   normalizeGeneratedMessageContent,
+  pageEvidenceAnswerContract,
   selectAmbientLead,
   selectConsideredConversation,
   selectResponders,
@@ -25,6 +29,194 @@ import {
 } from "./director.js";
 
 describe("social director", () => {
+  it("requires concrete host-aware answers from successful page reads", () => {
+    const packet = (title: string, url: string) => ({
+      kind: "page" as const,
+      query: "read it",
+      retrievedAt: new Date().toISOString(),
+      results: [{ id: "S1", title, url, snippet: "A concrete supported detail from the page." }],
+    });
+    expect(pageEvidenceAnswerContract(packet("Avanza – Börsen idag", "https://www.avanza.se/"))).toContain("headline-index level");
+    expect(pageEvidenceAnswerContract(packet("Avanza article", "https://www.avanza.se/placera/redaktionellt/article")))
+      .not.toContain("headline-index level");
+    expect(pageEvidenceAnswerContract(packet("Avanza – Börsen idag", "https://example.com/spoof")))
+      .not.toContain("headline-index level");
+    expect(pageEvidenceAnswerContract(packet("News - WoW", "https://worldofwarcraft.blizzard.com/en-us/News")))
+      .toContain("exact supplied headline");
+    expect(pageEvidenceAnswerContract(packet("Example", "https://example.com/article")))
+      .toContain("at least one concrete supported detail");
+  });
+
+  it("builds a Swedish Avanza fallback from only the first complete validated index row", () => {
+    const answer = groundedEvidenceFallback({
+      kind: "page",
+      query: "dagens kurser",
+      retrievedAt: new Date().toISOString(),
+      results: [{
+        id: "S1",
+        title: "Avanza – Börsen idag",
+        url: "https://www.avanza.se/",
+        snippet: "Avanzas publika marknadsöversikt. Detta är huvudindex.\nOMX Stockholm 30 (OMXS30): 3 167,16 indexpunkter, -0,33 % idag, uppdaterad 17:30.\nDow Jones U.S. Index (DJUS): 1 826,71 indexpunkter, -0,78 % idag, uppdaterad 22:04.",
+      }],
+    }, "vilka är dagens kurser?");
+    expect(answer).toEqual({
+      content: "Avanza visar OMX Stockholm 30 (OMXS30): 3 167,16 indexpunkter, -0,33 % idag (uppdaterad 17:30). Säg vilken aktie eller ticker du menar om du vill ha en enskild kurs.",
+      sourceIds: ["S1"],
+    });
+    expect(answer?.content).not.toContain("Dow Jones");
+  });
+
+  it("preserves punctuation in the first validated Avanza index label", () => {
+    const answer = groundedEvidenceFallback({
+      kind: "page",
+      query: "dagens kurser",
+      retrievedAt: new Date().toISOString(),
+      results: [{
+        id: "S1",
+        title: "Avanza – Börsen idag",
+        url: "https://www.avanza.se/",
+        snippet: "Avanzas publika marknadsöversikt.\nDow Jones U.S. Index (DJUS): 1 826,71 indexpunkter, -0,78 % idag, uppdaterad 22:04.",
+      }],
+    }, "dagens kurser?");
+    expect(answer?.content).toContain("Dow Jones U.S. Index (DJUS)");
+    expect(answer?.content).not.toContain("Avanza visar Index (DJUS)");
+  });
+
+  it("builds bounded page and search fallbacks with the server-owned source", () => {
+    const page = groundedEvidenceFallback({
+      kind: "page",
+      query: "read it",
+      retrievedAt: new Date().toISOString(),
+      results: [{
+        id: "S1",
+        title: "News - WoW",
+        url: "https://worldofwarcraft.blizzard.com/en-us/News",
+        snippet: "Stoneforged Sentinel arrives\n\nThe mount supports more than 300,000 customization combinations.\n\nA second unrelated block.",
+      }],
+    }, "which item is interesting?");
+    expect(page).toEqual({
+      content: "From “News - WoW”: Stoneforged Sentinel arrives",
+      sourceIds: ["S1"],
+    });
+    expect(page?.content.length).toBeLessThanOrEqual(360);
+
+    const search = groundedEvidenceFallback({
+      kind: "search",
+      query: "site:example.com update",
+      retrievedAt: new Date().toISOString(),
+      results: [{ id: "S1", title: "Official update", url: "https://example.com/update", snippet: "Details" }],
+    }, "vad hittade du?");
+    expect(search).toEqual({ content: "Första källträffen är “Official update”.", sourceIds: ["S1"] });
+    expect(groundedEvidenceFallback({
+      kind: "search",
+      query: "missing source",
+      retrievedAt: new Date().toISOString(),
+      results: [{ id: "S2", title: "Wrong source", url: "https://example.com", snippet: "Details" }],
+    })).toBeUndefined();
+  });
+
+  it("uses a temporary deterministic failure instead of generic social chatter", () => {
+    expect(evidenceFailureFallback(true, "kan ni läsa länken?")).toEqual({
+      content: "Jag fick inte fram något läsbart från just den länken den här gången.",
+      sourceIds: [],
+    });
+    expect(evidenceFailureFallback(false, "please check the latest prices")).toEqual({
+      content: "I didn't get a usable source result for that search this time.",
+      sourceIds: [],
+    });
+  });
+
+  it("wires DM evidence fallbacks to the actual message source metadata", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-evidence",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-linnea")!;
+      const pagePacket = {
+        kind: "page" as const,
+        query: "dagens kurser",
+        retrievedAt: new Date().toISOString(),
+        results: [{
+          id: "S1",
+          title: "Avanza – Börsen idag",
+          url: "https://www.avanza.se/",
+          snippet: "Avanzas publika marknadsöversikt.\nOMX Stockholm 30 (OMXS30): 3 167,16 indexpunkter, -0,33 % idag, uppdaterad 17:30.",
+        }],
+      };
+      const runCase = async (evidence: typeof pagePacket | undefined) => {
+        const emit = vi.fn();
+        const store = new RoomStore("/tmp/director-evidence-test-unused.json");
+        const thread = store.openDm(human.id, persona.id);
+        const incoming = store.addDmMessage(
+          thread.id,
+          human.id,
+          "@Linnea kolla dagens kurser på https://www.avanza.se",
+        )!;
+        const lm = {
+          generateScene: vi.fn(async () => evidence ? [] : [{
+            personaId: persona.id,
+            content: "okej, det där fick min uppmärksamhet",
+            source: "lm" as const,
+            sourceIds: [],
+          }]),
+          rememberDeliveredLine: vi.fn(),
+        };
+        const pageReader = {
+          resolveRequest: vi.fn(() => ({
+            url: new URL("https://www.avanza.se/"),
+            requestedAt: new Date().toISOString(),
+            intent: incoming.content,
+            source: "message" as const,
+          })),
+          read: vi.fn(async () => evidence),
+        };
+        const researchBroker = {
+          shouldResearch: vi.fn(() => false),
+          researchUrlFallback: vi.fn(async () => undefined),
+        };
+        const humanMemory = {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+        };
+        const director = new SocialDirector(
+          { to: vi.fn(() => ({ emit })) } as never,
+          store,
+          lm as never,
+          new ActorChannelRuntime(),
+          researchBroker as never,
+          humanMemory as never,
+          () => [human, ...PERSONAS],
+          () => 1,
+          { pageReader: pageReader as never, now: () => Date.now() },
+        );
+        const pending = director.onDirectMessage(incoming, human, persona);
+        await vi.runAllTimersAsync();
+        await pending;
+        director.stop();
+        return store.getDmMessages(thread.id).at(-1)!;
+      };
+
+      const sourced = await runCase(pagePacket);
+      expect(sourced.generation).toBe("fallback");
+      expect(sourced.content).toContain("OMX Stockholm 30 (OMXS30)");
+      expect(sourced.sources).toEqual([{ title: "Avanza – Börsen idag", url: "https://www.avanza.se/" }]);
+
+      const failed = await runCase(undefined);
+      expect(failed.generation).toBe("fallback");
+      expect(failed.content).toBe("Jag fick inte fram något läsbart från just den länken den här gången.");
+      expect(failed.sources).toEqual([]);
+      expect(failed.content).not.toContain("uppmärksamhet");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps mentions while reserving one bounded slot for a capable evidence reader", () => {
     const researcher = PERSONAS.find((persona) => persona.canResearch)!;
     const nonResearchers = PERSONAS.filter((persona) => !persona.canResearch).slice(0, 3);
@@ -45,6 +237,13 @@ describe("social director", () => {
     const result = ensureEvidenceResponder(mentioned, mentioned, mentioned.map((persona) => persona.id), new Map(), false);
     expect(result.selected).toEqual(mentioned);
     expect(result.responder?.id).toBe(mentioned[0]?.id);
+  });
+
+  it("always gives explicit evidence a single owner when no specialist is attentive", () => {
+    const ordinary = PERSONAS.filter((persona) => !persona.canResearch).slice(0, 2);
+    const result = ensureEvidenceResponder(ordinary, ordinary, [], new Map(), true);
+    expect(result.responder?.id).toBe(ordinary[0]?.id);
+    expect(result.selected.filter((persona) => persona.id === result.responder?.id)).toHaveLength(1);
   });
 
   it("guarantees the validated page source on the designated generated answer only", () => {
