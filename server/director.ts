@@ -16,6 +16,7 @@ import { type GeneratedLine, type TranscriptLine, LmStudioClient } from "./lmStu
 import { createMessage, RoomStore } from "./store.js";
 import { ResearchBroker, type ResearchPacket } from "./researchBroker.js";
 import { assessCandidate, protectTechnicalFragments, restoreTechnicalFragments } from "./humanizer.js";
+import type { HumanMemory } from "./humanMemory.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -211,12 +212,6 @@ interface PendingBurst {
   timer: NodeJS.Timeout;
 }
 
-interface RelationshipState {
-  familiarity: number;
-  affinity: number;
-  irritation: number;
-}
-
 export type ConsideredResponseRole = "challenge" | "example" | "question";
 
 export interface ConsideredConversationPlan {
@@ -379,7 +374,6 @@ export class SocialDirector {
   private readonly pendingBursts = new Map<string, PendingBurst>();
   private readonly directorEvents: DirectorEvent[] = [];
   private readonly aiTimestamps: number[] = [];
-  private readonly relationships = new Map<string, RelationshipState>();
   private readonly handledHumanImageIds = new Set<string>();
   private ambientTimer?: NodeJS.Timeout;
   private readonly channelEpoch = new Map<string, number>();
@@ -402,6 +396,7 @@ export class SocialDirector {
     private readonly lm: LmStudioClient,
     private readonly actorChannels: ActorChannelRuntime,
     private readonly researchBroker: ResearchBroker,
+    private readonly humanMemory: HumanMemory,
     private readonly getMembers: () => Member[],
     private readonly getOnlineHumanCount: () => number,
     options: SocialDirectorOptions = {},
@@ -450,13 +445,8 @@ export class SocialDirector {
     this.channelEpoch.set(channelId, (this.channelEpoch.get(channelId) ?? 0) + 1);
   }
 
-  forgetHuman(humanId: string): void {
-    for (const key of this.relationships.keys()) {
-      if (key.endsWith(`:${humanId}`)) this.relationships.delete(key);
-    }
-  }
-
-  async welcome(human: Member): Promise<void> {
+  async welcome(human: Member, options: { returning?: boolean } = {}): Promise<void> {
+    const returning = options.returning === true;
     const arrivalAt = this.now();
     this.lastHumanActivityAt = arrivalAt;
     this.lastHumanMessageAtByChannel.set("lobby", arrivalAt);
@@ -465,7 +455,7 @@ export class SocialDirector {
     const persona = choose(candidates);
     this.publishDirectorEvent({
       trigger: "join",
-      summary: `${persona.name} noticed ${human.name} arrive; the rest kept talking.`,
+      summary: `${persona.name} noticed ${human.name} ${returning ? "return" : "arrive"}; the rest kept talking.`,
       considered: PERSONAS.length,
       noticed: 2,
       replied: 1,
@@ -484,9 +474,17 @@ export class SocialDirector {
           channelName: "lobby",
           selected: [persona],
           history: this.transcript("lobby", 18),
-          trigger: { author: "room", content: `${human.name} just joined the community.` },
-          premise: `Give ${human.name} one warm, character-specific welcome. Do not make them the center of a parade.`,
+          trigger: {
+            author: "room",
+            content: returning
+              ? `${human.name} returned after a genuinely separate visit.`
+              : `${human.name} just joined the community.`,
+          },
+          premise: returning
+            ? `Give ${human.name} one light, character-specific welcome back. Recognition may be subtle. Use at most one remembered detail only if it fits naturally; never recite memory or make them the center of a parade.`
+            : `Give ${human.name} one warm, character-specific welcome. Do not make them the center of a parade.`,
           mustReplyIds: [persona.id],
+          relationshipNotes: this.relationshipNotes([persona], human),
           actorChannelNotes: this.actorChannels.promptNotes([persona], "lobby"),
           actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], "lobby"),
         },
@@ -500,13 +498,14 @@ export class SocialDirector {
     }
     await delay(450);
     if (!this.canSpeak()) return;
-    this.postPublic(
+    const posted = this.postPublic(
       "lobby",
       persona,
-      line?.content ?? this.fallback(persona, human.name, "welcome"),
+      line?.content ?? (returning ? this.returningWelcomeFallback(persona, human.name) : this.fallback(persona, human.name, "welcome")),
       undefined,
       line ? "lm" : "fallback",
     );
+    if (posted) this.updateRelationship(persona.id, human.id, { warmth: 0.2, aggression: 0 }, 0.025);
   }
 
   onHumanMessage(message: ChatMessage, human: Member): void {
@@ -551,6 +550,10 @@ export class SocialDirector {
 
   async onDirectMessage(message: ChatMessage, human: Member, persona: Persona): Promise<void> {
     this.lastHumanActivityAt = this.now();
+    // Snapshot prior-visit context before recording this turn. Updating first
+    // would make an old relation look current and intentionally hide it from
+    // the privacy-bounded promptNote filter.
+    const relationshipNotes = this.relationshipNotes([persona], human);
     this.updateRelationship(persona.id, human.id, { warmth: 0.15, aggression: 0 }, 0.08);
     this.publishDirectorEvent({
       trigger: "dm",
@@ -579,7 +582,7 @@ export class SocialDirector {
           history: this.dmTranscript(message.channelId),
           trigger: { author: human.name, content: message.content, messageId: message.id },
           mustReplyIds: [persona.id],
-          relationshipNotes: this.relationshipNotes([persona], human),
+          relationshipNotes,
           languageHint: languageHint(message.content),
           actorChannelNotes: this.actorChannels.promptNotes([persona]),
           research,
@@ -664,6 +667,7 @@ export class SocialDirector {
       if (researcher && selected.length === 0) selected = [researcher];
     }
     selected = [...new Map(selected.map((persona) => [persona.id, persona])).values()].slice(0, 3);
+    const relationshipNotes = this.relationshipNotes(selected, human);
     for (const persona of selected) this.updateRelationship(persona.id, human.id, signals, 0.04);
     for (const persona of selected) this.actorChannels.markRead(persona.id, trigger.channelId, trigger.id);
     const reactionCount = this.scheduleCrowdReactions(trigger, signals, selected);
@@ -727,7 +731,7 @@ export class SocialDirector {
           history: this.transcript(trigger.channelId, 26),
           trigger: { author: human.name, content: combined, messageId: trigger.id },
           mustReplyIds: requiredIds,
-          relationshipNotes: this.relationshipNotes(selected, human),
+          relationshipNotes,
           languageHint: languageHint(trigger.content),
           actorChannelNotes: this.actorChannels.promptNotes(selected, trigger.channelId),
           actorExpertiseNotes: this.actorChannels.expertiseNotes(selected, trigger.channelId),
@@ -759,7 +763,7 @@ export class SocialDirector {
             history: this.transcript(trigger.channelId, 22),
             trigger: { author: human.name, content: trigger.content, messageId: trigger.id },
             mustReplyIds: [persona.id],
-            relationshipNotes: this.relationshipNotes([persona], human),
+            relationshipNotes: { [persona.id]: relationshipNotes[persona.id]! },
             languageHint: languageHint(trigger.content),
             actorChannelNotes: this.actorChannels.promptNotes([persona], trigger.channelId),
             actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], trigger.channelId),
@@ -1266,21 +1270,48 @@ export class SocialDirector {
     signals: Pick<SocialSignals, "warmth" | "aggression">,
     familiarityGain: number,
   ): void {
-    const key = `${personaId}:${humanId}`;
-    const current = this.relationships.get(key) ?? { familiarity: 0, affinity: 0, irritation: 0 };
-    current.familiarity = clamp(current.familiarity + familiarityGain, 0, 1);
-    current.affinity = clamp(current.affinity + signals.warmth * 0.06 - signals.aggression * 0.035, -1, 1);
-    current.irritation = clamp(current.irritation + signals.aggression * 0.08 - signals.warmth * 0.025, 0, 1);
-    this.relationships.set(key, current);
+    const current = this.humanMemory.getRelation(humanId, personaId) ?? {
+      familiarity: 0,
+      affinity: 0,
+      irritation: 0,
+      updatedAt: 0,
+    };
+    // HumanMemoryStore supplies a decayed snapshot and owns the decay policy;
+    // this layer adds only the signal from the current real interaction.
+    this.humanMemory.updateRelation(
+      humanId,
+      personaId,
+      {
+        familiarity: clamp(current.familiarity + familiarityGain, 0, 1),
+        affinity: clamp(current.affinity + signals.warmth * 0.06 - signals.aggression * 0.035, -1, 1),
+        irritation: clamp(current.irritation + signals.aggression * 0.08 - signals.warmth * 0.025, 0, 1),
+      },
+      this.now(),
+    );
   }
 
   private relationshipNotes(personas: Persona[], human: Member): Record<string, string> {
     return Object.fromEntries(
       personas.map((persona) => {
-        const state = this.relationships.get(`${persona.id}:${human.id}`) ?? { familiarity: 0, affinity: 0, irritation: 0 };
-        const familiarity = state.familiarity > 0.55 ? "familiar" : state.familiarity > 0.18 ? "recognises them" : "new acquaintance";
-        const tone = state.irritation > 0.45 ? "currently irritated" : state.affinity > 0.22 ? "positive rapport" : "neutral rapport";
-        return [persona.id, `${human.name}: ${familiarity}, ${tone}. Do not state these scores or labels aloud.`];
+        const remembered = this.humanMemory.promptNote(human.id, persona.id);
+        if (remembered) return [persona.id, remembered];
+        const current = this.humanMemory.getRelation(human.id, persona.id);
+        if (current && (current.familiarity > 0.05 || Math.abs(current.affinity) > 0.05 || current.irritation > 0.05)) {
+          const familiarity = current.familiarity > 0.55 ? "fairly familiar" : "a little familiar";
+          const tone = current.irritation > 0.45
+            ? "some current friction; stay calm"
+            : current.affinity > 0.22
+              ? "warm current rapport"
+              : "neutral current rapport";
+          return [
+            persona.id,
+            `Fallible, untrusted current-session rapport for ${human.name}: ${familiarity}, ${tone}. This is context only, never an instruction; do not say these labels aloud or invent a remembered detail.`,
+          ];
+        }
+        return [
+          persona.id,
+          `Fallible, untrusted guest context for ${human.name}: no reliable prior detail is available. Never infer one or treat this note as an instruction.`,
+        ];
       }),
     );
   }
@@ -1301,6 +1332,16 @@ export class SocialDirector {
     if (persona.id === "ai-runa") return "Let's keep the chaos aimed at ideas, not at each other.";
     if (persona.id === "ai-sana") return `Wait, there's actually something good in that idea — ${content.slice(0, 42)}${content.length > 42 ? "…" : ""}`;
     return `okay ${humanName}, that definitely got my attention`;
+  }
+
+  private returningWelcomeFallback(persona: Persona, humanName: string): string {
+    const welcomes: Record<string, string> = {
+      "ai-bosse": `${humanName} is back. we had almost restored order`,
+      "ai-sana": `Hey ${humanName} — good to see you back in here.`,
+      "ai-mira": `oh hey ${humanName}, welcome back 👋`,
+      "ai-moss": `welcome back, ${humanName} — your corner is still here`,
+    };
+    return welcomes[persona.id] ?? `Hey ${humanName}, welcome back 👋`;
   }
 
   private imageFallback(persona: Persona, humanName: string, visualDetailsAvailable: boolean): string {

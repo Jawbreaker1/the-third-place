@@ -32,6 +32,7 @@ import { ActorChannelRuntime } from "./actorChannels.js";
 import { SocialDirector } from "./director.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
 import { fetchRemoteImage, ImageStore, ImageStoreError } from "./imageStore.js";
+import { HUMAN_MEMORY_DEFAULTS, HumanMemoryStore } from "./humanMemory.js";
 import { LmStudioClient } from "./lmStudio.js";
 import { CHANNELS } from "./channels.js";
 import { PERSONAS, memberView } from "./personas.js";
@@ -47,6 +48,9 @@ const PORT = Number.parseInt(process.env.PORT ?? "4000", 10);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const INVITE_CODE = process.env.ROOM_INVITE_CODE?.trim();
 const SESSION_COOKIE = "atrium_session";
+const SESSION_RETENTION_MS = HUMAN_MEMORY_DEFAULTS.retentionMs;
+const SESSION_COOKIE_MAX_AGE_SECONDS = Math.floor(SESSION_RETENTION_MS / 1_000);
+const SESSION_HEARTBEAT_MS = 10 * 60_000;
 const PUBLIC_REACTIONS = new Set(["👍", "👀", "😂", "💀", "🤔", "💛", "🔥", "✨", "🙌", "😬", "🫡", "🌿"]);
 const PACE: ServerHealth["aiPace"] =
   process.env.AI_PACE === "calm" || process.env.AI_PACE === "party" ? process.env.AI_PACE : "lively";
@@ -115,6 +119,20 @@ class TokenBucket {
     return true;
   }
 }
+
+const createHumanSession = (
+  tokenHash: string,
+  member: Member,
+  lastSeenAt = Date.now(),
+): HumanSession => ({
+  tokenHash,
+  member: { ...member, avatar: { ...member.avatar }, status: "offline" },
+  socketIds: new Set(),
+  lastSeenAt,
+  historyBucket: new TokenBucket(8, 1),
+  imageBucket: new TokenBucket(3, 1 / 25),
+  voiceBucket: new TokenBucket(8, 0.35),
+});
 
 const normalizeName = (raw: string): string =>
   raw
@@ -345,6 +363,7 @@ const io = new Server(httpServer, {
 });
 
 const store = new RoomStore();
+const humanMemory = new HumanMemoryStore();
 const lm = new LmStudioClient();
 const actorChannels = new ActorChannelRuntime();
 const researchBroker = new ResearchBroker();
@@ -364,6 +383,14 @@ const voiceRooms = new VoiceRoomRuntime(
   },
 );
 const sessions = new Map<string, HumanSession>();
+const synchronizeOfflineSessionsWithMemory = (): void => {
+  const rememberedTokenHashes = new Set(humanMemory.listRestorableProfiles().map((profile) => profile.tokenHash));
+  for (const [tokenHash, session] of sessions) {
+    if (session.socketIds.size > 0 || rememberedTokenHashes.has(tokenHash)) continue;
+    sessions.delete(tokenHash);
+    store.forgetDmParticipant(session.member.id);
+  }
+};
 const joinAttempts = new Map<string, number[]>();
 const socketBuckets = new Map<
   string,
@@ -407,7 +434,9 @@ const historyPageFor = (channelId: string, before?: HistoryPosition, limit = 40)
 
 const getMembers = (): Member[] => [
   ...PERSONAS.map((persona) => ({ ...memberView(persona), activity: actorChannels.activityLabel(persona) })),
-  ...[...sessions.values()].map((session) => ({ ...session.member })),
+  ...[...sessions.values()]
+    .filter((session) => session.member.status === "online")
+    .map((session) => ({ ...session.member })),
 ];
 const replyPreviewFor = (message: ChatMessage) => ({
   authorId: message.authorId,
@@ -424,7 +453,7 @@ const getHealth = (): ServerHealth => ({
   onlineHumans: onlineHumanCount(),
   aiPace: PACE,
 });
-const director = new SocialDirector(io, store, lm, actorChannels, researchBroker, getMembers, onlineHumanCount);
+const director = new SocialDirector(io, store, lm, actorChannels, researchBroker, humanMemory, getMembers, onlineHumanCount);
 
 const voiceSocketRoom = (roomId: string) => `voice:${roomId}`;
 const publishVoiceRooms = (): void => {
@@ -440,6 +469,7 @@ const voiceDirector = new VoiceDirector({
   lm,
   speech: voiceSpeech,
   actorChannels,
+  humanMemory,
   events: {
     roomChanged: publishVoiceRoom,
     transcriptFinal: (entry) => io.to(voiceSocketRoom(entry.roomId)).emit("voice:transcript:final", entry),
@@ -477,6 +507,15 @@ const analyzeImageMessage = (message: ChatMessage, human: Member): void => {
 const sessionFromRequest = (request: Request): HumanSession | undefined => {
   const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
   return token ? sessions.get(hashToken(token)) : undefined;
+};
+
+const authenticatedSessionFromRequest = (
+  request: Request,
+): { session: HumanSession; token: string } | undefined => {
+  const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
+  if (!token) return undefined;
+  const session = sessions.get(hashToken(token));
+  return session ? { session, token } : undefined;
 };
 
 const clientIp = (request: Request): string => {
@@ -538,7 +577,7 @@ const setSessionCookie = (request: Request, response: Response, token: string): 
   const secure = request.secure || process.env.PUBLIC_ORIGIN?.startsWith("https://");
   response.setHeader(
     "Set-Cookie",
-    `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${secure ? "; Secure" : ""}`,
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_COOKIE_MAX_AGE_SECONDS}${secure ? "; Secure" : ""}`,
   );
 };
 
@@ -709,6 +748,7 @@ app.post("/api/channels/:channelId/image-messages", async (request, response) =>
     });
     store.addPublicMessage(message);
     io.to("public").emit("message:new", message);
+    if (message.content) humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
     director.onHumanImagePosted(message);
     analyzeImageMessage(message, session.member);
     response.status(201).json({ ok: true, message } satisfies ImageMessageResult);
@@ -772,15 +812,50 @@ app.get("/api/channels/:channelId/messages", (request, response) => {
 });
 
 app.get("/api/session", (request, response) => {
-  const session = sessionFromRequest(request);
-  if (!session) {
+  response.setHeader("Cache-Control", "private, no-store");
+  const authenticated = authenticatedSessionFromRequest(request);
+  if (!authenticated) {
     response.status(401).json({ ok: false });
     return;
   }
-  response.json({ ok: true, me: session.member });
+  authenticated.session.lastSeenAt = Date.now();
+  humanMemory.noteSeen(authenticated.session.member.id, authenticated.session.lastSeenAt);
+  setSessionCookie(request, response, authenticated.token);
+  response.json({ ok: true, me: authenticated.session.member });
 });
 
-app.post("/api/session", (request, response) => {
+app.get("/api/session/memory", (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  const authenticated = authenticatedSessionFromRequest(request);
+  if (!authenticated) {
+    response.status(401).json({ ok: false, error: "Join the room to view your saved memory." });
+    return;
+  }
+  authenticated.session.lastSeenAt = Date.now();
+  humanMemory.noteSeen(authenticated.session.member.id, authenticated.session.lastSeenAt);
+  setSessionCookie(request, response, authenticated.token);
+  response.json({ ok: true, memory: humanMemory.clientSummary(authenticated.session.member.id) });
+});
+
+app.delete("/api/session/memory", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, error: "This memory request did not come from the room." });
+    return;
+  }
+  const authenticated = authenticatedSessionFromRequest(request);
+  if (!authenticated) {
+    response.status(401).json({ ok: false, error: "Join the room before clearing saved memory." });
+    return;
+  }
+  authenticated.session.lastSeenAt = Date.now();
+  humanMemory.resetRememberedDetails(authenticated.session.member.id, authenticated.session.lastSeenAt);
+  await humanMemory.flush();
+  setSessionCookie(request, response, authenticated.token);
+  response.json({ ok: true, memory: humanMemory.clientSummary(authenticated.session.member.id) });
+});
+
+app.post("/api/session", async (request, response) => {
   if (!allowJoinAttempt(clientIp(request))) {
     response.status(429).json({ ok: false, error: "Too many join attempts. Wait a few minutes and try again." });
     return;
@@ -800,7 +875,10 @@ app.post("/api/session", (request, response) => {
     response.status(400).json({ ok: false, error: "Use 2–24 letters, numbers, spaces, dots, dashes or underscores." });
     return;
   }
-  const reserved = new Set(getMembers().map((member) => safeNameKey(member.name)));
+  const reserved = new Set([
+    ...PERSONAS.map((persona) => safeNameKey(persona.name)),
+    ...humanMemory.listRestorableProfiles().map((profile) => safeNameKey(profile.member.name)),
+  ]);
   if (reserved.has(safeNameKey(name))) {
     response.status(409).json({ ok: false, error: "That name is already in the room. Try a small variation." });
     return;
@@ -810,24 +888,25 @@ app.post("/api/session", (request, response) => {
   const tokenHash = hashToken(token);
   const avatar = randomAvatar();
   avatar.glyph = name.slice(0, 1).toLocaleUpperCase();
-  const session: HumanSession = {
-    tokenHash,
-    member: {
-      id: `human-${randomUUID()}`,
-      name,
-      kind: "human",
-      status: "offline",
-      avatar,
-      role: "Guest",
-      bio: "A real person visiting The Third Place.",
-    },
-    socketIds: new Set(),
-    lastSeenAt: Date.now(),
-    historyBucket: new TokenBucket(8, 1),
-    imageBucket: new TokenBucket(3, 1 / 25),
-    voiceBucket: new TokenBucket(8, 0.35),
-  };
+  const session = createHumanSession(tokenHash, {
+    id: `human-${randomUUID()}`,
+    name,
+    kind: "human",
+    status: "offline",
+    avatar,
+    role: "Guest",
+    bio: "A real person visiting The Third Place.",
+  });
   sessions.set(tokenHash, session);
+  humanMemory.upsertSession({ tokenHash, member: session.member, seenAt: session.lastSeenAt });
+  synchronizeOfflineSessionsWithMemory();
+  try {
+    await humanMemory.flush();
+  } catch (error) {
+    sessions.delete(tokenHash);
+    humanMemory.forgetProfile(session.member.id);
+    throw error;
+  }
   setSessionCookie(request, response, token);
   response.status(201).json({ ok: true, me: session.member });
 });
@@ -850,6 +929,7 @@ io.on("connection", (socket) => {
   session.socketIds.add(socket.id);
   session.member.status = "online";
   session.lastSeenAt = Date.now();
+  humanMemory.noteSeen(session.member.id, session.lastSeenAt);
   socket.join("public");
   socket.join(`user:${session.member.id}`);
   socketBuckets.set(socket.id, {
@@ -865,10 +945,21 @@ io.on("connection", (socket) => {
   io.to("public").emit("presence:update", { members: getMembers() });
 
   if (wasOffline) {
-    const joinMessage = createMessage("lobby", "system", `${session.member.name} joined the room`, { system: true });
-    store.addPublicMessage(joinMessage);
-    io.to("public").emit("message:new", joinMessage);
-    void director.welcome(session.member);
+    const visit = humanMemory.noteVisit(session.member.id, session.lastSeenAt);
+    // A tab refresh or brief network reconnect is transport recovery, not a
+    // social arrival. Only a first visit or a genuinely later return gets a
+    // room event and one light welcome.
+    if (!visit || visit.counted) {
+      const joinMessage = createMessage(
+        "lobby",
+        "system",
+        visit?.returning ? `${session.member.name} came back` : `${session.member.name} joined the room`,
+        { system: true },
+      );
+      store.addPublicMessage(joinMessage);
+      io.to("public").emit("message:new", joinMessage);
+      void director.welcome(session.member, { returning: visit?.returning ?? false });
+    }
   }
 
   const voiceFailure = (error: string): VoiceCreateResult => ({ ok: false, code: "NOT_AUTHORIZED", error });
@@ -1077,6 +1168,7 @@ io.on("connection", (socket) => {
       store.addPublicMessage(message);
       io.to("public").emit("message:new", message);
       attachLinkPreview(message, session.member.id);
+      humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
       director.onHumanMessage(message, session.member);
       acknowledge?.({ ok: true });
       return;
@@ -1176,6 +1268,7 @@ io.on("connection", (socket) => {
     socketBuckets.delete(socket.id);
     session.socketIds.delete(socket.id);
     session.lastSeenAt = Date.now();
+    humanMemory.noteSeen(session.member.id, session.lastSeenAt);
     if (session.socketIds.size === 0) session.member.status = "offline";
     io.to("public").emit("presence:update", { members: getMembers() });
   });
@@ -1205,6 +1298,10 @@ app.use((error: unknown, _request: Request, response: Response, _next: unknown) 
   response.status(500).json({ ok: false, error: "The room tripped over a cable." });
 });
 
+await humanMemory.load();
+for (const profile of humanMemory.listRestorableProfiles()) {
+  sessions.set(profile.tokenHash, createHumanSession(profile.tokenHash, profile.member, profile.lastSeenAt));
+}
 await store.load();
 await imageStore.initialize(store.getAllMessages());
 store.onMessagesRemoved((removed) => {
@@ -1227,12 +1324,21 @@ director.start();
 const healthInterval = setInterval(async () => {
   const now = Date.now();
   for (const [tokenHash, session] of sessions) {
-    if (session.socketIds.size === 0 && now - session.lastSeenAt > 7 * 24 * 60 * 60_000) {
+    if (session.socketIds.size > 0) {
+      if (now - session.lastSeenAt >= SESSION_HEARTBEAT_MS) {
+        session.lastSeenAt = now;
+        humanMemory.noteSeen(session.member.id, now);
+      }
+      continue;
+    }
+    if (session.socketIds.size === 0 && now - session.lastSeenAt > SESSION_RETENTION_MS) {
       sessions.delete(tokenHash);
-      director.forgetHuman(session.member.id);
+      humanMemory.forgetProfile(session.member.id);
       store.forgetDmParticipant(session.member.id);
     }
   }
+  humanMemory.prune(now);
+  synchronizeOfflineSessionsWithMemory();
   for (const [ip, timestamps] of joinAttempts) {
     const recent = timestamps.filter((timestamp) => now - timestamp < 10 * 60_000);
     if (recent.length > 0) joinAttempts.set(ip, recent);
@@ -1253,7 +1359,7 @@ const shutdown = async (signal: string) => {
   clearInterval(healthInterval);
   director.stop();
   io.close();
-  await store.flush();
+  await Promise.all([store.flush(), humanMemory.flush()]);
   httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5_000).unref();
 };
