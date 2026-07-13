@@ -142,7 +142,7 @@ const BrandMark = ({ large = false }: { large?: boolean }) => (
       alt=""
       decoding="async"
       draggable={false}
-      src={large ? "/the-third-place-mark.svg" : "/favicon.svg"}
+      src={large ? "/the-third-place-mark.svg?v=2" : "/favicon.svg?v=2"}
     />
   </span>
 );

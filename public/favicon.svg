@@ -1,26 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="favicon-title">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="favicon-title favicon-description">
   <title id="favicon-title">The Third Place</title>
-  <defs>
-    <linearGradient id="favicon-spectrum" x1="4" y1="27" x2="28" y2="5" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#45DDE8"/>
-      <stop offset="0.5" stop-color="#FFBC68"/>
-      <stop offset="0.72" stop-color="#FF705F"/>
-      <stop offset="1" stop-color="#9E78FF"/>
-    </linearGradient>
-    <linearGradient id="favicon-door" x1="11" y1="24" x2="21" y2="13" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#48DFE9"/>
-      <stop offset="0.55" stop-color="#FFF1C4"/>
-      <stop offset="1" stop-color="#FF7B64"/>
-    </linearGradient>
-  </defs>
-
-  <path d="M9.2 27C4.2 24.2 2 19.3 3 14.2C4.1 7.9 9.5 3.5 16 3.5C22.5 3.5 27.9 7.9 29 14.2C30 19.3 27.8 24.2 22.8 27"
-        fill="none" stroke="url(#favicon-spectrum)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M9.2 27C4.2 24.2 2 19.3 3 14.2C4.1 7.9 9.5 3.5 16 3.5C22.5 3.5 27.9 7.9 29 14.2C30 19.3 27.8 24.2 22.8 27"
-        fill="none" stroke="#11131E" stroke-width="4.7" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M12 24V17.5C12 15.1 13.7 13.3 16 13.3C18.3 13.3 20 15.1 20 17.5V24"
-        fill="none" stroke="url(#favicon-door)" stroke-width="2.5" stroke-linecap="round"/>
-  <circle cx="16" cy="4.1" r="2.25" fill="#FF8C61" stroke="#11131E" stroke-width="1"/>
-  <circle cx="9" cy="27" r="2.25" fill="#47DCE7" stroke="#11131E" stroke-width="1"/>
-  <circle cx="23" cy="27" r="2.25" fill="#A47DFF" stroke="#11131E" stroke-width="1"/>
+  <desc id="favicon-description">An open shelter with a warm shared doorway.</desc>
+  <rect x="2" y="2" width="44" height="44" rx="12" fill="#151A1D"/>
+  <rect x="2.5" y="2.5" width="43" height="43" rx="11.5" fill="none" stroke="#30393A"/>
+  <path d="M12 35V21L24 12L36 21V35" fill="none" stroke="#B8CCC6" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M20 35V28a4 4 0 0 1 8 0v7" fill="none" stroke="#E5AD68" stroke-width="4" stroke-linecap="round"/>
 </svg>

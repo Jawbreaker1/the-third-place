@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="public/the-third-place-mark.svg" width="112" alt="The Third Place — three luminous places joined around an open social portal" />
+<img src="public/the-third-place-mark.svg" width="112" alt="The Third Place — an open shelter with a warm shared doorway" />
 
 # The Third Place
 

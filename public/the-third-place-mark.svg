@@ -1,79 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-labelledby="tp-title tp-description">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="tp-title tp-description">
   <title id="tp-title">The Third Place</title>
-  <desc id="tp-description">Three luminous places joined around an open social portal.</desc>
-  <defs>
-    <linearGradient id="tp-spectrum" x1="21" y1="127" x2="141" y2="31" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#43D9E7"/>
-      <stop offset="0.46" stop-color="#FFBF67"/>
-      <stop offset="0.7" stop-color="#FF745F"/>
-      <stop offset="1" stop-color="#9B75FF"/>
-    </linearGradient>
-    <linearGradient id="tp-door" x1="57" y1="113" x2="104" y2="65" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#48DBE8"/>
-      <stop offset="0.52" stop-color="#FFF0C5"/>
-      <stop offset="1" stop-color="#FF8067"/>
-    </linearGradient>
-    <radialGradient id="tp-room-light" cx="0" cy="0" r="1" gradientTransform="translate(80 86) rotate(90) scale(56)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFBD70" stop-opacity="0.22"/>
-      <stop offset="0.54" stop-color="#9B75FF" stop-opacity="0.08"/>
-      <stop offset="1" stop-color="#0F111C" stop-opacity="0"/>
-    </radialGradient>
-    <radialGradient id="tp-coral-node" cx="0" cy="0" r="1" gradientTransform="translate(75 18) rotate(52) scale(17)">
-      <stop stop-color="#FFE6B0"/>
-      <stop offset="0.46" stop-color="#FFAA67"/>
-      <stop offset="1" stop-color="#FF665E"/>
-    </radialGradient>
-    <radialGradient id="tp-cyan-node" cx="0" cy="0" r="1" gradientTransform="translate(42 125) rotate(50) scale(17)">
-      <stop stop-color="#D9FFFF"/>
-      <stop offset="0.44" stop-color="#58E9EE"/>
-      <stop offset="1" stop-color="#24AFCB"/>
-    </radialGradient>
-    <radialGradient id="tp-violet-node" cx="0" cy="0" r="1" gradientTransform="translate(105 125) rotate(39) scale(19)">
-      <stop stop-color="#F0E7FF"/>
-      <stop offset="0.43" stop-color="#B88AFF"/>
-      <stop offset="1" stop-color="#7958E9"/>
-    </radialGradient>
-    <filter id="tp-halo" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
-      <feGaussianBlur stdDeviation="4" result="blur"/>
-      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 .62 0"/>
-    </filter>
-  </defs>
-
-  <!-- A single, open pavilion replaces the conventional app-tile silhouette. -->
-  <path d="M47 132C25 117 17 93 21 67C26 39 51 20 80 20C109 20 134 39 139 67C143 93 135 117 113 132"
-        fill="none" stroke="url(#tp-spectrum)" stroke-width="36" stroke-linecap="round" stroke-linejoin="round" opacity="0.36" filter="url(#tp-halo)"/>
-  <path d="M47 132C25 117 17 93 21 67C26 39 51 20 80 20C109 20 134 39 139 67C143 93 135 117 113 132"
-        fill="none" stroke="url(#tp-spectrum)" stroke-width="35" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M47 132C25 117 17 93 21 67C26 39 51 20 80 20C109 20 134 39 139 67C143 93 135 117 113 132"
-        fill="none" stroke="#10121D" stroke-width="27" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M47 132C25 117 17 93 21 67C26 39 51 20 80 20C109 20 134 39 139 67C143 93 135 117 113 132"
-        fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1.5" stroke-linecap="round"/>
-
-  <!-- The shared interior is deliberately open at the bottom: a place to enter. -->
-  <path d="M42 109C37 96 36 80 40 67C46 46 62 34 80 34C98 34 114 46 120 67C124 80 123 96 118 109C108 132 94 144 80 151C66 144 52 132 42 109Z"
-        fill="#0F111C"/>
-  <path d="M42 109C37 96 36 80 40 67C46 46 62 34 80 34C98 34 114 46 120 67C124 80 123 96 118 109C108 132 94 144 80 151C66 144 52 132 42 109Z"
-        fill="url(#tp-room-light)"/>
-
-  <!-- Three paths converge on the doorway without closing it off. -->
-  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M80 26V57" stroke="#FF9764" stroke-opacity="0.42" stroke-width="5"/>
-    <path d="M49 130L61 112" stroke="#44D7E5" stroke-opacity="0.45" stroke-width="5"/>
-    <path d="M111 130L99 112" stroke="#A47BFF" stroke-opacity="0.45" stroke-width="5"/>
-    <path d="M59 116V83C59 70 68 61 80 61C92 61 101 70 101 83V116" stroke="#090B13" stroke-width="13"/>
-    <path d="M59 116V83C59 70 68 61 80 61C92 61 101 70 101 83V116" stroke="url(#tp-door)" stroke-width="7"/>
-    <path d="M66 121C75 126 85 126 94 121" stroke="#FFCB7A" stroke-opacity="0.78" stroke-width="3"/>
-  </g>
-
-  <!-- The three places are structural keystones, not floating decoration. -->
-  <g stroke="#0B0D16" stroke-width="4">
-    <circle cx="80" cy="20" r="11" fill="url(#tp-coral-node)"/>
-    <circle cx="47" cy="132" r="11" fill="url(#tp-cyan-node)"/>
-    <circle cx="113" cy="132" r="11" fill="url(#tp-violet-node)"/>
-  </g>
-  <g fill="#FFFFFF">
-    <circle cx="77" cy="17" r="2.5" fill-opacity="0.72"/>
-    <circle cx="44" cy="129" r="2.5" fill-opacity="0.68"/>
-    <circle cx="110" cy="129" r="2.5" fill-opacity="0.68"/>
-  </g>
+  <desc id="tp-description">An open shelter with a warm shared doorway.</desc>
+  <rect x="2" y="2" width="44" height="44" rx="12" fill="#151A1D"/>
+  <rect x="2.5" y="2.5" width="43" height="43" rx="11.5" fill="none" stroke="#30393A"/>
+  <path d="M12 35V21L24 12L36 21V35" fill="none" stroke="#B8CCC6" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M20 35V28a4 4 0 0 1 8 0v7" fill="none" stroke="#E5AD68" stroke-width="4" stroke-linecap="round"/>
 </svg>
