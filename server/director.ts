@@ -15,6 +15,7 @@ import { PERSONAS, type Persona } from "./personas.js";
 import { type GeneratedLine, type TranscriptLine, LmStudioClient } from "./lmStudio.js";
 import { createMessage, RoomStore } from "./store.js";
 import { ResearchBroker, type ResearchPacket } from "./researchBroker.js";
+import { PageReader } from "./pageReader.js";
 import { assessCandidate, protectTechnicalFragments, restoreTechnicalFragments } from "./humanizer.js";
 import type { HumanMemory } from "./humanMemory.js";
 
@@ -55,12 +56,15 @@ const boundedUntrustedText = (value: string, maxLength: number): string =>
 export const normalizeGeneratedMessageContent = (value: string, maxLength = 500): string | undefined => {
   const protectedText = protectTechnicalFragments(value);
   const normalized = protectedText.text
-    .replace(/\s*\[S\d+\](?=[\s.,!?]|$)/giu, " ")
+    .replace(/\s*\[S\d+\](?:\s*[:;,\-–—]\s*|(?=[\s.,!?)]|$))/giu, " ")
     .replace(/[^\S\r\n]+/gu, " ")
     .replace(/ *\r?\n */gu, "\n")
     .replace(/\n{3,}/gu, "\n\n")
     .trim();
-  const restored = restoreTechnicalFragments(normalized, protectedText.fragments);
+  const restored = restoreTechnicalFragments(normalized, protectedText.fragments)
+    .replace(/(?<![\p{L}\p{N}_/])`+\[S\d+\]`+(?=$|[\s.,!?:;)])/giu, "")
+    .replace(/[^\S\r\n]+/gu, " ")
+    .trim();
   return restored && restored.length <= maxLength ? restored : undefined;
 };
 
@@ -240,6 +244,7 @@ export interface SocialDirectorOptions {
   consideredConversationChance?: number;
   consideredConversationCooldownMs?: number;
   consideredConversationHumanQuietMs?: number;
+  pageReader?: PageReader;
 }
 
 /**
@@ -369,6 +374,56 @@ export function shouldRejectPublicCandidate(input: PublicCandidateGuardInput): b
   );
 }
 
+export function ensureEvidenceResponder(
+  selected: readonly Persona[],
+  candidates: readonly Persona[],
+  mentionedIds: readonly string[],
+  attention: ReadonlyMap<string, number> = new Map(),
+  requireResearchCapability = true,
+): { selected: Persona[]; responder?: Persona } {
+  const existing = requireResearchCapability
+    ? selected.find((persona) => persona.canResearch)
+    : selected.find((persona) => mentionedIds.includes(persona.id)) ?? selected.find((persona) => persona.canResearch) ?? selected[0];
+  const responder = existing ?? [...candidates]
+    .filter((persona) => !requireResearchCapability || persona.canResearch)
+    .sort(
+      (a, b) =>
+        Number(b.canResearch) * 0.5 + (attention.get(b.id) ?? 0) + b.curiosity -
+        (Number(a.canResearch) * 0.5 + (attention.get(a.id) ?? 0) + a.curiosity),
+    )[0];
+  if (!responder) return { selected: [...selected] };
+  const next = [...selected];
+  if (!next.some((persona) => persona.id === responder.id)) {
+    if (next.length < 2) next.push(responder);
+    else {
+      let replaceAt = -1;
+      for (let index = next.length - 1; index >= 0; index -= 1) {
+        if (!mentionedIds.includes(next[index]!.id)) {
+          replaceAt = index;
+          break;
+        }
+      }
+      if (replaceAt >= 0) next[replaceAt] = responder;
+      else if (next.length < 3) next.push(responder);
+    }
+  }
+  const deduplicated = [...new Map(next.map((persona) => [persona.id, persona])).values()].slice(0, 3);
+  return deduplicated.some((persona) => persona.id === responder.id)
+    ? { selected: deduplicated, responder }
+    : { selected: deduplicated };
+}
+
+export function sourceIdsForPageResponder(
+  research: ResearchPacket | undefined,
+  sourceIds: readonly string[],
+  forcePageSource: boolean,
+): string[] {
+  if (research?.kind === "page") {
+    return forcePageSource && research.results.some((result) => result.id === "S1") ? ["S1"] : [];
+  }
+  return [...new Set(sourceIds)].slice(0, 3);
+}
+
 export class SocialDirector {
   private readonly lastSpoke = new Map<string, number>();
   private readonly pendingBursts = new Map<string, PendingBurst>();
@@ -389,6 +444,7 @@ export class SocialDirector {
   private readonly consideredConversationChance: number;
   private readonly consideredConversationCooldownMs: number;
   private readonly consideredConversationHumanQuietMs: number;
+  private readonly pageReader: PageReader;
 
   constructor(
     private readonly io: Server,
@@ -403,6 +459,7 @@ export class SocialDirector {
   ) {
     this.rng = options.rng ?? Math.random;
     this.now = options.now ?? Date.now;
+    this.pageReader = options.pageReader ?? new PageReader();
     const envChance = Number.parseFloat(process.env.AI_CONSIDERED_CHANCE ?? "0.1");
     this.consideredConversationChance = clamp(
       options.consideredConversationChance ?? (Number.isFinite(envChance) ? envChance : 0.1),
@@ -566,9 +623,20 @@ export class SocialDirector {
     this.setTyping(message.channelId, persona.id, true, [`user:${human.id}`]);
     let line: GeneratedLine | undefined;
     let research: ResearchPacket | undefined;
+    const dmMessages = this.store.getDmMessages(message.channelId);
+    const pageReadRequest = this.pageReader.resolveRequest({
+      content: message.content,
+      requesterId: human.id,
+      recentMessages: dmMessages.slice(-120),
+      replyTarget: message.replyToId ? dmMessages.find((candidate) => candidate.id === message.replyToId) : undefined,
+      now: this.now(),
+    });
+    const searchRequested = !pageReadRequest && persona.canResearch && this.researchBroker.shouldResearch(message.content);
     try {
-      if (persona.canResearch && this.researchBroker.shouldResearch(message.content)) {
-        research = await this.researchBroker.research(message.content, human.id).catch((error) => {
+      if (pageReadRequest || searchRequested) {
+        research = await (pageReadRequest
+          ? this.pageReader.read(pageReadRequest, human.id)
+          : this.researchBroker.research(message.content, human.id)).catch((error) => {
           console.warn("DM research failed open:", error instanceof Error ? error.message : error);
           return undefined;
         });
@@ -586,6 +654,13 @@ export class SocialDirector {
           languageHint: languageHint(message.content),
           actorChannelNotes: this.actorChannels.promptNotes([persona]),
           research,
+          premise: pageReadRequest
+            ? research
+              ? `${persona.name} opened the exact linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it.`
+              : "The linked page could not be read safely. Say that plainly and never invent what it contains."
+            : searchRequested && !research
+              ? "The live lookup was unavailable. Say so briefly instead of inventing current facts."
+              : undefined,
         },
         0,
       );
@@ -605,7 +680,14 @@ export class SocialDirector {
       replyText,
       message.id,
       generatedReply ? "lm" : "fallback",
-      this.messageSources(research, generatedReply ? line?.sourceIds ?? [] : []),
+      this.messageSources(
+        research,
+        sourceIdsForPageResponder(
+          research,
+          generatedReply ? line?.sourceIds ?? [] : [],
+          Boolean(pageReadRequest && generatedReply),
+        ),
+      ),
     );
     if (!reply) return;
     const thread = this.store.openDm(human.id, persona.id);
@@ -652,19 +734,26 @@ export class SocialDirector {
       )[0];
       if (mostRelevant) selected = [mostRelevant];
     }
-    const researchRequested = this.researchBroker.shouldResearch(combined, trigger.channelId);
-    if (researchRequested) {
-      const researcher =
-        selected.find((persona) => persona.canResearch) ??
-        candidates
-          .filter((persona) => persona.canResearch)
-          .sort(
-            (a, b) =>
-              this.actorChannels.affinity(b.id, trigger.channelId) + b.curiosity -
-              (this.actorChannels.affinity(a.id, trigger.channelId) + a.curiosity),
-          )[0];
-      if (researcher && !selected.some((persona) => persona.id === researcher.id)) selected.push(researcher);
-      if (researcher && selected.length === 0) selected = [researcher];
+    const pageReadRequest = this.pageReader.resolveBurst({
+      messages,
+      requesterId: human.id,
+      recentMessages: this.store.getRecent(trigger.channelId, 120),
+      replyTargetFor: (message) => message.replyToId ? this.store.getMessage(message.replyToId) : undefined,
+      now: this.now(),
+    });
+    const searchRequested = !pageReadRequest && this.researchBroker.shouldResearch(combined, trigger.channelId);
+    const evidenceRequested = Boolean(pageReadRequest) || searchRequested;
+    let evidenceResponder: Persona | undefined;
+    if (evidenceRequested) {
+      const evidenceSelection = ensureEvidenceResponder(
+        selected,
+        candidates,
+        signals.mentionedIds,
+        attention,
+        !pageReadRequest,
+      );
+      selected = evidenceSelection.selected;
+      evidenceResponder = evidenceSelection.responder;
     }
     selected = [...new Map(selected.map((persona) => [persona.id, persona])).values()].slice(0, 3);
     const relationshipNotes = this.relationshipNotes(selected, human);
@@ -690,6 +779,7 @@ export class SocialDirector {
     const requiredIds = [
       ...new Set([
         ...signals.mentionedIds.filter((id) => selected.some((persona) => persona.id === id)),
+        ...(pageReadRequest && evidenceResponder ? [evidenceResponder.id] : []),
         ...(signals.claimStrength > 0.28
           ? selected.filter((persona) => (persona.disagreement ?? 0) >= 0.65).slice(0, 1).map((persona) => persona.id)
           : []),
@@ -697,13 +787,23 @@ export class SocialDirector {
     ];
     let lines: GeneratedLine[] = [];
     let research: ResearchPacket | undefined;
+    let evidencePremise = "";
     try {
-      if (researchRequested) {
-        research = await this.researchBroker.research(combined, human.id, trigger.channelId).catch((error) => {
-          console.warn("Public research failed open:", error instanceof Error ? error.message : error);
+      if (pageReadRequest || searchRequested) {
+        research = await (pageReadRequest
+          ? this.pageReader.read(pageReadRequest, human.id)
+          : this.researchBroker.research(combined, human.id, trigger.channelId)).catch((error) => {
+          console.warn("Public evidence lookup failed open:", error instanceof Error ? error.message : error);
           return undefined;
         });
         if (research) triggerType = "research";
+        evidencePremise = pageReadRequest
+          ? research
+            ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact linked page and is solely responsible for answering the request from the supplied page evidence. Other selected residents may react briefly but must not claim to have read it. Attach S1 to every message that relies on the page.`
+            : `${evidenceResponder?.name ?? "The designated resident"} is responsible for saying that the linked page could not be read safely. Nobody may guess its contents.`
+          : research
+            ? "A selected resident deliberately looked up fresh evidence. Use it selectively and attach only source IDs that support each factual claim."
+            : "The live lookup was unavailable. Say so briefly instead of inventing current facts.";
       }
       const dissenter = selected.find((persona) => (persona.disagreement ?? 0) >= 0.65);
       const premise = [
@@ -713,8 +813,7 @@ export class SocialDirector {
         hasImage && !visualObservation
           ? "The human shared an image, but visual analysis was unavailable. Never claim to see or know visual details; respond only to the caption, or briefly acknowledge that the image details are unavailable."
           : "",
-        research ? "The selected resident deliberately looked up fresh evidence. Use it selectively and attach only source IDs that support each factual claim." : "",
-        researchRequested && !research ? "The live lookup was unavailable. Say so briefly instead of inventing current facts." : "",
+        evidencePremise,
         signals.claimStrength > 0.28 && dissenter
           ? `${dissenter.name} should make one specific respectful disagreement, acknowledge any valid part, and avoid a pile-on. Other actors must add a different angle rather than echoing the challenge.`
           : "",
@@ -769,7 +868,14 @@ export class SocialDirector {
             actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], trigger.channelId),
             visualObservation,
             research,
-            premise: `${persona.name} was directly addressed and must answer in their own concise voice.`,
+            premise: [
+              evidencePremise,
+              signals.mentionedIds.includes(persona.id)
+                ? `${persona.name} was directly addressed and must answer in their own concise voice.`
+                : pageReadRequest && evidenceResponder?.id === persona.id
+                  ? `${persona.name} is the one resident responsible for answering the explicit linked-page request concisely.`
+                  : "Answer the triggering message in your assigned conversational role without inventing a linked-page request.",
+            ].filter(Boolean).join(" "),
           },
           0,
         );
@@ -820,7 +926,14 @@ export class SocialDirector {
         line.content,
         trigger.id,
         line.source,
-        this.messageSources(research, line.sourceIds),
+        this.messageSources(
+          research,
+          sourceIdsForPageResponder(
+            research,
+            line.sourceIds,
+            Boolean(pageReadRequest && evidenceResponder?.id === line.personaId && line.source === "lm"),
+          ),
+        ),
       );
       if (!posted && required.has(persona.id)) {
         this.postPublic(

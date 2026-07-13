@@ -9,6 +9,7 @@ export interface ResearchResult {
 }
 
 export interface ResearchPacket {
+  kind?: "search" | "page";
   query: string;
   retrievedAt: string;
   results: ResearchResult[];
@@ -225,7 +226,7 @@ export class ResearchBroker {
     }
     if (parsedResults.length === 0) return undefined;
     const results = parsedResults.map((result, index) => ({ id: `S${index + 1}`, ...result }));
-    return { query, retrievedAt: new Date().toISOString(), results };
+    return { kind: "search", query, retrievedAt: new Date().toISOString(), results };
   }
 
   private toQuery(content: string): string {

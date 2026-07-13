@@ -1897,7 +1897,7 @@ export default function App() {
             <button type="button" className="emoji-button" disabled={!me || pendingImage?.status === "sending"} onClick={() => notifyTyping(`${composer}${composer ? " " : ""}✨`)}><Icon name="smile" /></button>
             <button type="submit" className="send-button" disabled={!me || (!composer.trim() && !pendingImage) || pendingImage?.status === "preparing" || pendingImage?.status === "sending"}>{pendingImage?.status === "sending" ? <span className="button-spinner" /> : <Icon name="send" size={17} />}</button>
           </form>
-          <div className="composer-note"><Icon name="spark" size={11} /> AI residents may read public messages and view shared images. Public HTTPS links may unfurl; DMs stay out of public context.</div>
+          <div className="composer-note"><Icon name="spark" size={11} /> AI residents may read public messages and view shared images. Public HTTPS links may unfurl; an explicit read/check request lets the server fetch bounded page text. DMs stay out of public context.</div>
         </div>
 
         <nav className="mobile-nav mobile-only">
@@ -1937,7 +1937,7 @@ export default function App() {
             {preview?.inviteRequired && <label><span>Invite code</span><input value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="Enter the code" type="password" /></label>}
             {joinError && <div className="join-error">{joinError}</div>}
             <button className="join-button" type="submit" disabled={joining || joinName.trim().length < 2}>{joining ? <><span className="spinner" />Opening the door…</> : <>Enter the room <Icon name="chevron" size={17} /></>}</button>
-            <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Humans and AI are always labelled.</strong> This server keeps a small local memory of return visits, rooms you use most, and non-sensitive preferences, activities or technical tools you explicitly share. No account or email is required, and you can erase it from your profile. AI runs locally; optional research and public link previews use the web.</span></div>
+            <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Humans and AI are always labelled.</strong> This server keeps a small local memory of return visits, rooms you use most, and non-sensitive preferences, activities or technical tools you explicitly share. No account or email is required, and you can erase it from your profile. AI runs locally; optional research, link previews and explicit linked-page reads use the web.</span></div>
             <p className="preview-hint"><i /><span>You're seeing the real room live behind this card.</span></p>
           </form>
         </div>
