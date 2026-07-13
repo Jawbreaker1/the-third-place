@@ -133,6 +133,13 @@ describe("social director", () => {
     expect(leads).not.toContain(undefined);
   });
 
+  it("lets sociable voices open pub banter while quieter experts remain available to reply", () => {
+    const candidates = PERSONAS.filter((persona) => ["ai-juno", "ai-mira", "ai-farah"].includes(persona.id));
+    const lead = selectAmbientLead(candidates, () => 0.8, () => 0, "banter");
+    expect(["ai-juno", "ai-mira"]).toContain(lead?.id);
+    expect(lead?.id).not.toBe("ai-farah");
+  });
+
   it("turns a concrete seed into a bounded claim-and-response contract", () => {
     const lead = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     const responder = PERSONAS.find((persona) => persona.id === "ai-vale")!;
@@ -145,6 +152,21 @@ describe("social director", () => {
     expect(premise).toContain("Exactly the selected residents speak in order");
     expect(limits[lead.id]).toEqual({ minimum: 16, maximum: lead.style.hardMaxWords });
     expect(limits[responder.id]).toEqual({ minimum: 8, maximum: 28 });
+  });
+
+  it("turns the same machinery into short social banter for the pub", () => {
+    const lead = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const responder = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const seed = "Put one beloved film on trial for its ending.";
+    const premise = ambientConversationPremise(seed, lead, responder, false, true, "banter");
+    const limits = ambientSceneWordLimits(lead, responder, false, "banter");
+    expect(premise).toContain(seed);
+    expect(premise).toContain("one concrete social hook");
+    expect(premise).toContain("countertake, adjacent recommendation, punchline");
+    expect(premise).not.toContain("specific, defensible claim");
+    expect(premise).not.toContain("counterexample or hidden cost");
+    expect(limits[lead.id]).toEqual({ minimum: 7, maximum: 28 });
+    expect(limits[responder.id]).toEqual({ minimum: 3, maximum: 22 });
   });
 
   it("keeps autonomous rooms silent when the model is offline or returns no valid lines", async () => {
@@ -319,6 +341,21 @@ describe("social director", () => {
     expect(leadPremise).toContain("Only Sana speaks in this generation");
     expect(responsePremise).toContain("Respond directly to Sana's latest transcript line");
     expect(responsePremise).toContain("Only Vale speaks in this generation");
+  });
+
+  it("keeps a rare deeper pub beat conversational and shorter than a technical considered post", () => {
+    const plan = {
+      lead: PERSONAS.find((persona) => persona.id === "ai-juno")!,
+      responder: PERSONAS.find((persona) => persona.id === "ai-nox")!,
+      responseRole: "example" as const,
+    };
+    const lead = consideredConversationLeadPremise(plan, "Defend one flawed film.", "banter");
+    const response = consideredConversationResponsePremise(plan, "banter");
+    const combined = consideredConversationPremise(plan, "Defend one flawed film.", "banter");
+    expect(lead).toContain("30–52-word");
+    expect(response).toContain("6–24 words");
+    expect(combined).toContain("deeper table-talk beat");
+    expect(combined).not.toContain("45–75-word");
   });
 
   it("does not recruit a relevant resident who is still cooling down", () => {

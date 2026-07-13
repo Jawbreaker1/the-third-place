@@ -8,7 +8,7 @@ human event
   → update bounded guest room activity and any safe explicit public-text fact
   → 700 ms burst debounce, isolated by channel + human
   → deterministic signal analysis
-  → load the room's topic/freshness profile and stable resident expertise
+  → load the room's topic, freshness and social-mode profile plus stable resident expertise
   → score channel-subscribed residents by mention, topic, attention, disagreement and cooldown
   → optionally retrieve bounded fresh evidence for an explicit live-info request
   → select 0–3 possible speakers
@@ -27,15 +27,17 @@ The director controls scarce attention. Residents have different `talkativeness`
 
 Each resident has an in-process channel runtime with subscribed rooms, current focus, per-room attention and unread counts. Public history is replayed into that state on restart, so the latest room focus survives. Ambient scenes choose a quiet eligible channel independently of the guest's currently visible channel and rotate away from the most recent ambient room.
 
-Long-lived room expertise is deliberately separate from that mutable attention state. `channels.ts` owns a single internal definition for each room: public metadata, topic tags, trusted freshness rules, ambient premises and a few cast anchors. `roomExpertise.ts` combines those anchors with resident interests and a stable hash. For the twenty-person cast, each room has one specialist, two advanced residents, five competent residents and a larger basic/casual population. Reordering the cast or restarting the server does not change those assignments.
+Long-lived room expertise is deliberately separate from that mutable attention state. `channels.ts` owns a single internal definition for each of the eight public rooms: public metadata, topic tags, trusted freshness and social guidance, an ambient conversation mode and premises, plus a few cast anchors. `roomExpertise.ts` combines those anchors with resident interests and a stable hash. For the twenty-person cast, each room has one specialist, two advanced residents, five competent residents and a larger basic/casual population. Reordering the cast or restarting the server does not change those assignments.
 
 All residents have at least broad vocabulary for every configured topic, but only subscribed residents normally enter its candidate pool; exact mentions can still wake an outsider. Expertise calibrates confidence and detail in the trusted system prompt without overriding voice, cooldown or message length. It never grows from reading activity and is never exposed as an in-character label.
 
-Reactions are the pressure valve. A strange message can be visibly noticed by seven residents while only two take the floor. Director View exposes that choice without showing chain-of-thought or private prompt state.
+Social mode is room-local and independent of persona identity. Discussion rooms ask an ambient lead for one concrete contribution and a responder for a distinct consequence, example, question or counterpoint. `#the-pub` uses banter mode: film and music recommendations, work-culture grumbles, politics, food, memes, small jokes, fragments and brief topic pivots are legitimate moves. Its late-Friday looseness is carried by rhythm and selection rather than repeated literal claims about drinking. No actor is required to mention alcohol, Friday or the room's premise, and a pub rule can never mutate that actor's stable voice in another channel.
 
-Ordinary ambient scenes stay short, but the director can occasionally open one considered thread. The gate is intentionally global rather than per channel: by default it has a 10% chance on an otherwise eligible ambient tick, then enforces a ten-minute cooldown from the start of the last considered attempt. It also requires at least 75 seconds of human quiet, queue depth zero, two free publication slots, no active voice room and no other considered thread in flight. These gates are checked again after generation and before each publication.
+Reactions are the pressure valve. A strange message can be visibly noticed by seven residents while only two take the floor. In the pub, laughter and side-eye should usually discharge through a few delayed reactions rather than recruiting a wall of near-identical one-liners. Director View exposes that choice without showing chain-of-thought or private prompt state.
 
-A considered plan contains exactly two cooled-down, room-relevant residents. The lead gets a 45–75-word contract grounded in the room subject. The responder gets one explicit non-echo role—challenge, concrete example/counterexample or precise question—and an 8–28-word contract. There is no shallow deterministic fallback: if Gemma cannot supply both valid roles, the room stays quiet. Human text or voice activity advances the channel epoch; a newly queued live scene also aborts an in-flight lower-priority ambient HTTP request, while the epoch check still prevents stale publication and can stop the responder after the lead has landed.
+Ordinary ambient scenes stay short, but the director can occasionally open one considered thread. The gate is intentionally global rather than per channel: by default it has a 20% chance on an otherwise eligible ambient tick, then enforces a six-minute cooldown from the start of the last considered attempt. It also requires at least 75 seconds of human quiet, queue depth zero, two free publication slots, no active voice room and no other considered thread in flight. These gates are checked again after generation and before each publication.
+
+A considered plan contains exactly two cooled-down, room-relevant residents. In discussion mode, the lead gets a 45–75-word contract grounded in the room subject and the responder gets one explicit non-echo role—challenge, concrete example/counterexample or precise question—and an 8–28-word contract. Pub-banter keeps even a considered beat conversational: one grounded recommendation, observation, complaint or story hook followed by a shorter genuinely distinct reaction, never a miniature panel debate or obligatory “what do you think?” ending. There is no shallow deterministic fallback: if Gemma cannot supply both valid roles, the room stays quiet. Human text or voice activity advances the channel epoch; a newly queued live scene also aborts an in-flight lower-priority ambient HTTP request, while the epoch check still prevents stale publication and can stop the responder after the lead has landed.
 
 Hard controls include:
 
@@ -50,13 +52,14 @@ Hard controls include:
 - individual cooldowns from 14 seconds to three minutes;
 - exact recent-message suppression plus high-confidence same-person fuzzy suppression at publication;
 - one bounded humanizer repair batch only when a candidate reaches high severity, shared across a human event's primary and focused scene;
-- considered beats gated by global ten-minute cooldown, 75 seconds of human quiet, empty inference queue, spare publication budget and inactive voice;
+- considered beats gated by a global six-minute cooldown, 75 seconds of human quiet, empty inference queue, spare publication budget and inactive voice;
 - stale non-mention scenes discarded after 45 seconds;
-- ambient scenes only when a human is online and the room has been quiet.
+- ambient scenes only when a human is online and the room has been quiet; and
+- room-specific social modes may narrow prose shape and reaction style, but never raise speaker, queue, publication or thread limits.
 
 ## Context boundaries
 
-Public scene context contains at most 28 recent messages from that room, selected persona cards, each selected actor's stable style contract, a trusted room frame, private per-actor expertise calibration, per-actor channel orientation, established cast dynamics and a small directed rapport note from `HumanMemoryStore` for each selected resident and the triggering guest. That note is labelled fallible and untrusted, never an instruction, and can expose at most one eligible explicit detail for a natural reference.
+Public scene context contains at most 28 recent messages from that room, selected persona cards, each selected actor's stable style contract, a trusted room frame containing topic, freshness and social guidance, private per-actor expertise calibration, per-actor channel orientation, established cast dynamics and a small directed rapport note from `HumanMemoryStore` for each selected resident and the triggering guest. That note is labelled fallible and untrusted, never an instruction, and can expose at most one eligible explicit detail for a natural reference.
 
 DM context contains only that thread. Private messages are never copied into public scene prompts.
 
@@ -88,7 +91,7 @@ Relations are directional: each AI persona retrieves and updates only its own ra
 
 `personas.ts` gives all twenty residents an explicit `PersonaStyleFingerprint`. Its fields are normal/hard word limits, sentence range, casing, punctuation, approximate emoji rate and palette, complexity appetite, correction mode, disagreement mode, three optional conversational habits and persona-specific phrases to avoid. `personaStyle.ts` turns that data into a stable text or voice writing contract. The prompt explicitly treats the traits as distributions: habits rotate, emoji rates are approximate, and no trait is required in every line.
 
-The first generation remains the authoritative attempt. `humanizer.ts` then assesses each candidate in `chat`, `voice` or `technical` mode against recent same-actor lines, peer lines from history and the same generated scene, and the bounded accepted-line memory. Its checks cover:
+The first generation remains the authoritative attempt. Room-local social guidance may loosen the shape of a pub line, but it does not weaken the actor's style fingerprint or publication checks. `humanizer.ts` then assesses each candidate in `chat`, `voice` or `technical` mode against recent same-actor lines, peer lines from history and the same generated scene, and the bounded accepted-line memory. Its checks cover:
 
 - length-aware token/character/vocabulary similarity for self-duplicates and peer echo;
 - repeated three/four-word openings;
@@ -103,7 +106,7 @@ The rejected drafts and recent lines enter that request as untrusted quoted data
 
 Publication adds a separate race-safe guard against an exact duplicate in the last 40 channel messages and high-severity fuzzy repetition among that persona's last 12 channel lines. Peer similarity is not used at this final boundary, avoiding false positives when multiple residents naturally mention the same technical term.
 
-`AI_CONSIDERED_CHANCE` is parsed as a `0..1` probability and defaults to `0.1`. It changes only the roll after all hard considered-beat gates pass; it does not bypass cooldown, quiet, voice, queue or message-budget controls. `HUMANIZER_REPAIR_ENABLED=false` is the fail-closed/low-latency option: validation stays active, but rejected high-severity lines are dropped without a second model call.
+`AI_CONSIDERED_CHANCE` is parsed as a `0..1` probability and defaults to `0.2`. It changes only the roll after all hard considered-beat gates pass; it does not bypass cooldown, quiet, voice, queue or message-budget controls. `HUMANIZER_REPAIR_ENABLED=false` is the fail-closed/low-latency option: validation stays active, but rejected high-severity lines are dropped without a second model call.
 
 `npm run audit:humanity` is an offline, read-only diagnostic over `ROOM_STATE_PATH` (default `./data/room-state.json`). It filters persisted AI messages and reports global and per-persona repeated openings, exact/near duplicates, cross-persona echo, Swedish/English assistant clichés, emoji use and median length. `--json` emits the complete report. `--strict` exits non-zero only for deliberately generous gross-regression thresholds; the audit is a trend/CI guard, not a claim that human writing can be reduced to one score.
 
@@ -148,9 +151,9 @@ Image ingestion accepts one public-room JPEG, PNG or WebP of at most 8 MB and 20
 
 ## Fresh-information boundary
 
-Research is operator opt-in through `RESEARCH_ENABLED=true`. When enabled, explicit lookup language, news requests, unambiguously current factual questions and room-specific live-data phrases activate it. This includes naturally worded stock quotes and current WoW patch questions; timeless questions such as “what is P/E?” stay local. Ordinary banter and personal questions do not. The broker sends a cleaned, length-limited topic to a fixed Bing RSS endpoint, with per-guest/global rate limits, timeout and response-size limits, a bounded cache and in-flight deduplication. It never fetches arbitrary result pages.
+Research is operator opt-in through `RESEARCH_ENABLED=true`. When enabled, explicit lookup language, news requests, unambiguously current factual questions and room-specific live-data phrases activate it. This includes naturally worded stock quotes, current WoW patch questions and clearly current political, film or music questions in `#the-pub`; timeless opinions and ordinary pub banter stay local. The broker sends a cleaned, length-limited topic to a fixed Bing RSS endpoint, with per-guest/global rate limits, timeout and response-size limits, a bounded cache and in-flight deduplication. It never fetches arbitrary result pages.
 
-Freshness rules remain active even when research is disabled or fails. In `#stock-market`, the system prompt forbids invented live prices, market moves, news and filings, separates facts from opinions and disallows personalized financial instructions. Current WoW patches and AI SDK/model versions receive equivalent stale-knowledge caveats.
+Freshness rules remain active even when research is disabled or fails. In `#stock-market`, the system prompt forbids invented live prices, market moves, news and filings, separates facts from opinions and disallows personalized financial instructions. Current WoW patches, AI SDK/model versions, political office-holders and current film or music releases receive equivalent stale-knowledge caveats.
 
 Search snippets enter the prompt as untrusted evidence. Gemma may return only server-issued source IDs; the server maps those IDs back to validated HTTPS URLs. Research failure is fail-open for chat, but the actor is instructed not to invent current facts when a lookup is unavailable.
 
@@ -172,7 +175,7 @@ The director dynamically constrains `personaId` to the selected cast:
 }
 ```
 
-The JSON schema uses `additionalProperties: false`, a dynamic persona enum and strict text/item limits. If LM Studio rejects structured output, the client retries without the schema and still parses and semantically validates the JSON. If generation fails, direct mentions and DMs receive character-specific deterministic fallbacks; ordinary and ambient scenes may remain silent.
+The JSON schema uses `additionalProperties: false`, a dynamic persona enum and strict text/item limits. The room profile is trusted server-authored context; transcript claims that a different social mode is active remain untrusted user data. If LM Studio rejects structured output, the client retries without the schema and still parses and semantically validates the JSON. If generation fails, direct mentions and DMs receive character-specific deterministic fallbacks; ordinary and ambient scenes may remain silent.
 
 ## Real-time contract
 
@@ -207,10 +210,12 @@ The client triggers a page near the top, merges by message ID and restores the f
 
 Public storage is capped per channel rather than globally: a busy lobby cannot erase a quiet room. Each channel compacts from 601 to 500 messages, and a long-lived browser keeps at most 600 loaded messages per public channel. Model prompts remain independently bounded to the newest 28 transcript lines. Human-facing history can therefore be much deeper than model context without causing context-window growth.
 
+The persisted room-state schema does not need a version bump for the eighth channel. On startup, the store compares built-in seed scenes with populated channel IDs; if `#the-pub` is absent, its bounded starter scene is added once and the state is flushed atomically. Existing history in every pre-existing room is preserved.
+
 Image attachments use the same lifecycle. Compaction removes both generated WebP variants, startup sweeps orphaned files, and interrupted `pending` analyses are marked unavailable after restart rather than retried without their original human session context.
 
 ## Public link-preview boundary
 
-Link previews are asynchronous transport metadata for the first HTTPS URL in a human public message only. They never run for AI messages, source chips or DMs. URL validation allows HTTPS/443 without credentials or IP literals; DNS resolution rejects any non-global answer and the selected address is pinned in the actual TLS request. Every redirect repeats the full validation with a shared seven-second deadline.
+Link previews are asynchronous transport metadata for the first HTTPS URL in a human public message only. They never run for AI messages, source chips or DMs. `#the-pub` does not relax that boundary: residents may react to a guest's link or uploaded meme, but autonomous dialogue must not invent a URL or turn the model into a crawler. URL validation allows HTTPS/443 without credentials or IP literals; DNS resolution rejects any non-global answer and the selected address is pinned in the actual TLS request. Every redirect repeats the full validation with a shared seven-second deadline.
 
 Responses must be HTML with identity encoding and stay below strict header/body limits. An inert parser reads only text title/description/site metadata from `<head>`; scripts, images, icons, canonical URLs and meta refresh are ignored. Success and failure caches, global/requester/origin rate limits and a three-request concurrency cap keep the server from becoming a general fetch proxy.

@@ -121,6 +121,117 @@ describe("LM Studio room prompt", () => {
     expect(promptFor("ai-programming")).toContain("Current SDK APIs, library versions");
   });
 
+  it("puts the pub's human banter and anti-gimmick contract in trusted room context", () => {
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [juno],
+      history: [],
+    });
+    expect(prompt).toContain("loose Friday-table banter, not a panel discussion");
+    expect(prompt).toContain("Autonomous residents never introduce alcohol");
+    expect(prompt).toContain("at most one selected actor");
+    expect(prompt).toContain("do not turn replies into advice");
+    expect(prompt).toContain("never explain a punchline");
+    expect(prompt).toContain("Never invent, autocomplete or guess a URL");
+  });
+
+  it("uses the shorter conversational considered contract in the pub", () => {
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "ambient",
+      conversationMode: "considered",
+      consideredRole: "lead",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [juno],
+      history: [],
+      wordLimits: { [juno.id]: { minimum: 30, maximum: 52 } },
+    });
+    expect(prompt).toContain("writes 30–52 words");
+    expect(prompt).toContain("30–52 word scene contract may override");
+    expect(prompt).not.toContain("writes 45–75 words");
+  });
+
+  it("allows only one drink reference when a human explicitly asks and drops invented pub URLs", async () => {
+    const previousRepairSetting = process.env.HUMANIZER_REPAIR_ENABLED;
+    process.env.HUMANIZER_REPAIR_ENABLED = "false";
+    try {
+      const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+      const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+      let completion = 0;
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+        if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        completion += 1;
+        return completion === 1
+          ? completionResponse([
+              { personaId: juno.id, content: "Vin? En torr Rioja, utan högtidstal." },
+              { personaId: bosse.id, content: "vin nummer två är när etiketten börjar lyssna" },
+            ])
+          : completionResponse([
+              { personaId: juno.id, content: "Den finns här: https://made-up.example/pub-list" },
+            ]);
+      }));
+      const lm = new LmStudioClient();
+      const drinkLines = await lm.generateScene({
+        kind: "public",
+        channelId: "the-pub",
+        channelName: "the-pub",
+        selected: [juno, bosse],
+        history: [],
+        trigger: { author: "guest", content: "vilket vin gillar ni?" },
+      });
+      expect(drinkLines).toHaveLength(1);
+      expect(drinkLines[0]?.personaId).toBe(juno.id);
+
+      const urlLines = await lm.generateScene({
+        kind: "public",
+        channelId: "the-pub",
+        channelName: "the-pub",
+        selected: [juno],
+        history: [],
+        trigger: { author: "guest", content: "har du ett filmtips?" },
+      });
+      expect(urlLines).toEqual([]);
+    } finally {
+      if (previousRepairSetting === undefined) delete process.env.HUMANIZER_REPAIR_ENABLED;
+      else process.env.HUMANIZER_REPAIR_ENABLED = previousRepairSetting;
+    }
+  });
+
+  it("reapplies the pub contract after the one-pass humanizer repair", async () => {
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    let completion = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completion += 1;
+      return completion === 1
+        ? completionResponse([
+            { personaId: juno.id, content: "Vin? En torr Rioja, utan högtidstal." },
+            { personaId: bosse.id, content: "vin nummer två är när etiketten börjar lyssna" },
+          ])
+        : completionResponse([
+            { personaId: bosse.id, content: "vin nummer två är fortfarande när etiketten börjar lyssna" },
+          ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [juno, bosse],
+      history: [],
+      trigger: { author: "guest", content: "vilket vin gillar ni?" },
+    });
+
+    expect(completion).toBe(2);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.personaId).toBe(juno.id);
+  });
+
   it("gives voice turns a short spoken-only contract", () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     const prompt = buildSceneSystemPrompt({
@@ -169,7 +280,7 @@ describe("LM Studio room prompt", () => {
     });
 
     expect(prompt).toContain("response phase of a rare considered beat");
-    expect(prompt).toContain("writes 8–28 words");
+    expect(prompt).toContain("writes 8–24 words");
     expect(prompt).toContain("assigned question move");
     expect(prompt).toContain("Required scene-role length: 8–24 words");
     expect(prompt).toContain("End with exactly one precise, genuine question required by this scene role");

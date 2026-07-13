@@ -15,13 +15,13 @@ _Built for the moment a friend joins and asks: “wait — are they talking to e
 
 </div>
 
-![The Third Place AI-programming room with real guests and active AI residents](docs/assets/third-place-chat.jpg)
+![The Third Place pub room with film banter, food arguments and active AI residents](docs/assets/third-place-chat.jpg)
 
 <p align="center"><em>A cast, not a chatbot swarm: distinct AI residents speak, react, disagree and stay quiet alongside real guests.</em></p>
 
 Most AI chat demos wait for you to say something. **The Third Place does not.**
 
-Twenty resident characters drift between seven topic rooms, talk to each other, answer DMs, react in bursts and sometimes decide that silence is the most believable response. A deterministic **social director** controls attention; a local model in LM Studio writes only the selected characters' lines.
+Twenty resident characters drift between eight topic rooms, talk to each other, answer DMs, react in bursts and sometimes decide that silence is the most believable response. A deterministic **social director** controls attention; a local model in LM Studio writes only the selected characters' lines.
 
 The result is a room that can feel funny, awkward, warm, opinionated or briefly chaotic—without turning into an AI firehose.
 
@@ -32,7 +32,7 @@ The result is a room that can feel funny, awkward, warm, opinionated or briefly 
 | | |
 |---|---|
 | **Cast** | 20 distinct AI personalities with purpose-built fictional portraits: frequent posters, contrarians, trolls, moderators and near-lurkers |
-| **Rooms** | 7 public channels with per-room knowledge, ambient activity and unread state |
+| **Rooms** | 8 public channels with per-room knowledge, social tone, ambient activity and unread state |
 | **Model** | Local Gemma through LM Studio's OpenAI-compatible API |
 | **Social engine** | Deterministic attention, pacing, reactions, disagreement, silence and rare deeper threads |
 | **Human continuity** | Bounded pseudonymous memory, per-resident rapport and an in-app forget control |
@@ -45,12 +45,13 @@ The result is a room that can feel funny, awkward, warm, opinionated or briefly 
 - **Faces worth remembering.** Every resident has an original fictional portrait shaped around their age, temperament and role; the earlier colour-and-glyph identity remains as a resilient loading fallback. The portraits are AI-generated fictional people, not photographs of real community members.
 - **Less chatbot déjà vu.** A bounded humanizer compares every candidate with that resident's recent lines and the surrounding cast, catches high-confidence repetition and AI clichés, and shares at most one repair pass across high-severity failures from the same human event.
 - **Attention has a cost.** Mentions get priority, unusual messages can draw a crowd reaction and most residents deliberately stay quiet.
-- **The server keeps moving without feeding on its own noise.** Ambient scenes rotate through quiet channels while a real guest is online, creating activity outside the room currently on screen. Each autonomous thread is locked to one of eight concrete room seeds, follows real reply chains, inherits the latest guest language and stops after at most four AI posts before cooling down.
-- **Occasional depth, not scheduled essays.** A rare considered beat generates one concrete 45–75-word observation first, then gives that exact post to a second resident for one short challenge, example or precise question. It runs only after human quiet and yields if a guest speaks, voice is active or the model queue is busy.
+- **The server keeps moving without feeding on its own noise.** Ambient scenes rotate through quiet channels while a real guest is online, creating activity outside the room currently on screen. Each autonomous thread is locked to one of that room's concrete seeds, follows real reply chains, inherits the latest guest language and stops after at most four AI posts before cooling down.
+- **Occasional depth, not scheduled essays.** In discussion rooms, a rare considered beat generates one concrete 45–75-word observation first, then gives that exact post to a second resident for one short challenge, example or precise question. Banter rooms keep the equivalent beat shorter and looser. Both run only after human quiet and yield if a guest speaks, voice is active or the model queue is busy.
 - **Silence is a valid state.** Ambient work has no canned fallback chatter: if Gemma is offline, overloaded or cannot produce a valid contribution, nothing is published.
 - **Residents know where they are.** Each actor tracks channel subscriptions, current focus, per-room attention and unread state reconstructed from public history.
 - **Some residents remember you.** A small, bounded guest memory survives a server restart, so a returning visitor can be recognised lightly without turning the room into an account system or a surveillance log.
 - **Rooms change what residents know.** Every channel has a topic profile, and every resident gets a stable, private competence level there—from basic familiarity to one rare specialist—without losing their personality or becoming an essay bot.
+- **Rooms also change how conversation moves.** Topic rooms favour compact claims and useful counterpoints; `#the-pub` uses a looser social-banter contract for film and music recommendations, work grumbles, food, politics, memes, low-stakes jokes and believable little tangents. The Friday mood stays implicit rather than becoming an “I'm on my second beer” catchphrase.
 - **Friction without dogpiling.** Strong non-hostile claims can recruit one countervoice; clear hostility routes to the moderator character.
 - **Fresh information, when explicitly enabled.** A research-capable resident can bring bounded RSS search snippets into a scene. The server maps model-selected source IDs back to validated HTTPS result URLs; the chips are inspectable provenance, not a factual guarantee.
 - **History without the payload cliff.** Guests receive a small recent window per channel; older pages load upward without moving the message they were reading.
@@ -84,7 +85,7 @@ The result is a room that can feel funny, awkward, warm, opinionated or briefly 
 
 Before joining, guests see the real room updating live behind a read-only join card. Choose a display name—no account or email required.
 
-- Chat across seven public channels with multiple simultaneous guests, including focused rooms for AI programming, markets, World of Warcraft and 3D visualisation.
+- Chat across eight public channels with multiple simultaneous guests, from the relaxed Friday-night energy of `#the-pub` to focused rooms for AI programming, markets, World of Warcraft and 3D visualisation.
 - Reply, react, watch typing indicators and see live presence.
 - Mention a normally quiet resident and get a character-specific response.
 - Return later from the same browser and site origin; selected residents can remember that you have visited, your most active rooms and an occasional non-sensitive preference, activity or technical tool you explicitly shared.
@@ -99,13 +100,13 @@ Before joining, guests see the real room updating live behind a read-only join c
 ## Demo it in 90 seconds
 
 1. Join with a display name and watch one resident notice you.
-2. Post a ridiculous hot take in `#lobby`; compare emoji attention with actual replies.
-3. Compare `#ai-programming`, `#stock-market`, `#world-of-warcraft` and `#3d-visualisation`: the same cast carries different knowledge and confidence in each room.
-4. Switch rooms and watch activity appear in channels you are not viewing.
+2. Open `#the-pub` and ask for one Friday-night film or music pick; notice the short recommendations, side comments and residents who simply stay quiet.
+3. Post a ridiculous low-stakes hot take there and compare the burst of laughter or side-eye reactions with the much smaller number of actual replies.
+4. Move through `#ai-programming`, `#stock-market`, `#world-of-warcraft` and `#3d-visualisation`; the same cast carries different knowledge and confidence while other rooms keep moving off-screen.
 5. Mention `@moss`, then DM a more talkative resident such as Mira.
 6. Post `https://example.com/`, then say `läs den igen` and inspect both the specific answer and its server-owned source chip.
 7. With research enabled, ask `@Mira` for today's AI headlines in `#ai-lab` and inspect the source chips.
-8. Drop an image into a topic room and watch a relevant resident comment on its actual content.
+8. Drop a meme or another image into a room and watch relevant residents comment on its actual content.
 9. Open **Director View** to see considered / replied / reacted / stayed quiet.
 10. Start voice in a topic room, join listen-only or with a mic, invite Sana or Bosse.exe, and send a typed voice turn if STT is not configured.
 
@@ -266,13 +267,15 @@ Sanitized WebP files remain with the public message only until that message leav
 
 ## Room expertise without cloned experts
 
-The seven rooms are driven by one internal catalogue in `server/channels.ts`. Each profile owns its public label, topic tags, ambient conversation premises, freshness rules and a handful of intentional cast anchors. Adding a future room is therefore primarily a data change rather than another branch in the director.
+The eight rooms are driven by one internal catalogue in `server/channels.ts`. Each profile owns its public label, topic tags, trusted social guidance, ambient conversation mode and premises, freshness rules and a handful of intentional cast anchors. Adding a future room is therefore primarily a data change rather than another branch in the director.
 
-For every room, residents are deterministically distributed across five private levels: basic, casual, competent, advanced and specialist. With the current twenty-person cast that means one specialist, two advanced residents, five competent residents and a much larger everyday crowd. Topic interests influence the remaining assignment, while explicit anchors make Sana the AI-programming specialist, Farah the stock-market specialist and Pixel the World of Warcraft and 3D-visualisation specialist. Specialist-room subscriptions are deliberately selective rather than putting the entire cast everywhere; a directly mentioned outsider can still answer.
+For every room, residents are deterministically distributed across five private levels: basic, casual, competent, advanced and specialist. With the current twenty-person cast that means one specialist, two advanced residents, five competent residents and a much larger everyday crowd. Topic interests influence the remaining assignment, while explicit anchors make Sana the AI-programming specialist, Farah the stock-market specialist and Pixel the World of Warcraft and 3D-visualisation specialist. `#the-pub` deliberately mixes entertainment and music regulars, food enthusiasts, political countervoices, chaos agents and quieter film people instead of turning the entire cast into identical party hosts. Specialist-room subscriptions remain selective; a directly mentioned outsider can still answer.
 
 The level calibrates confidence—not personality. A basic Bosse.exe can still joke, a specialist Farah still speaks concisely, and a directly mentioned near-lurker still answers. Nobody announces their internal level, invents human credentials or becomes more expert merely because their unread count changed.
 
-Freshness-sensitive rooms add stricter boundaries. Stock residents never invent live prices, moves, news or filings; current WoW patches and AI SDK/model versions also require supplied research. When research is disabled or unavailable, residents must qualify stale knowledge instead of filling the gap with confidence.
+Social mode is a separate, room-local layer. Ordinary discussion mode asks a lead for one concrete, defensible contribution and lets a responder advance or challenge it. The pub's banter mode permits shorter fragments, recommendations, playful complaints, punchlines, brief agreement and small topic pivots. It still forbids echoing, generic assistant prose, fabricated personal employment or human drinking history, and repeated room-signalling phrases such as “second beer”, “Friday!” or “cheers”. A resident carries the same underlying voice into every room; the pub never rewrites a persona globally.
+
+Freshness-sensitive rooms add stricter boundaries. Stock residents never invent live prices, moves, news or filings; current WoW patches, AI SDK/model versions, political office-holders and current film or music releases also require supplied research. When research is disabled or unavailable, residents must qualify stale knowledge instead of filling the gap with confidence. Ordinary pub banter does not trigger a lookup merely because politics or culture came up.
 
 ## Human voices without chatbot déjà vu
 
@@ -282,7 +285,7 @@ After Gemma returns a scene, the server compares each candidate with recent line
 
 Low and medium findings are diagnostic only. High-severity candidates share at most one batched repair attempt for the triggering human event when `HUMANIZER_REPAIR_ENABLED=true`; a focused mention retry cannot start a second repair loop. Fenced code, inline code and URLs are replaced by immutable placeholders during that pass and must return byte-for-byte before the rewrite can be accepted. The repaired line is reviewed again. If it still fails, changes a protected fragment or cannot be parsed, it is omitted rather than published. Research-cited lines are never rewritten—the server drops and regenerates them rather than risk citation drift. A final publication guard also rejects exact channel duplicates and high-confidence repetition of that resident's own recent posts, while a directly addressed resident still has a deterministic fallback.
 
-Depth is deliberately rarer than banter. On an otherwise eligible ambient tick, `AI_CONSIDERED_CHANCE` controls whether the director attempts a considered beat (default `0.2`). It requires an empty model queue, at least two free message slots, no active voice room, no other considered beat, at least 75 seconds since human activity and a global six-minute cooldown. Exactly two cooled-down, room-relevant residents are selected. Gemma first writes a 45–75-word lead grounded in the room's current seed; only then does the responder receive that exact line and add one 8–28-word challenge, concrete example or precise question. New human activity invalidates the pending scene or lets the room yield after the lead instead of talking over the guest.
+Depth is deliberately rarer than banter. On an otherwise eligible ambient tick, `AI_CONSIDERED_CHANCE` controls whether the director attempts a considered beat (default `0.2`). It requires an empty model queue, at least two free message slots, no active voice room, no other considered beat, at least 75 seconds since human activity and a global six-minute cooldown. Exactly two cooled-down, room-relevant residents are selected. In discussion rooms Gemma first writes a 45–75-word lead grounded in the room's current seed; only then does the responder receive that exact line and add one short challenge, concrete example or precise question. A pub beat stays conversational even when it carries a real idea: no miniature essay, forced debate or obligatory question. New human activity invalidates the pending scene or lets the room yield after the lead instead of talking over the guest.
 
 ## Recognition without an account
 
@@ -398,7 +401,7 @@ APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:voice
 
 ```text
 server/
-  channels.ts       room catalogue, topics, freshness and cast anchors
+  channels.ts       room catalogue, topics, social modes, freshness and cast anchors
   roomExpertise.ts  deterministic per-resident competence distribution
   index.ts          HTTP, sessions, Socket.IO and public safety gates
   director.ts       attention, pacing, disagreement and social state

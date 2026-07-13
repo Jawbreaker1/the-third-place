@@ -3,7 +3,7 @@ import { CHANNEL_PROFILES, CHANNELS } from "./channels.js";
 import { PERSONAS } from "./personas.js";
 import { buildRoomExpertiseMatrix, EXPERTISE_RANK } from "./roomExpertise.js";
 
-const NEW_ROOM_IDS = ["ai-programming", "stock-market", "world-of-warcraft", "3d-visualisation"];
+const NEW_ROOM_IDS = ["the-pub", "ai-programming", "stock-market", "world-of-warcraft", "3d-visualisation"];
 
 describe("channel profiles", () => {
   it("defines a single scalable profile for every public room", () => {
@@ -25,6 +25,8 @@ describe("channel profiles", () => {
       expect(channel).not.toHaveProperty("topic");
       expect(channel).not.toHaveProperty("expertiseOverrides");
       expect(channel).not.toHaveProperty("ambientPremises");
+      expect(channel).not.toHaveProperty("conversationGuidance");
+      expect(channel).not.toHaveProperty("ambientMode");
     }
   });
 
@@ -58,5 +60,17 @@ describe("channel profiles", () => {
     expect(matrix.get("stock-market")?.get("ai-farah")?.level).toBe("specialist");
     expect(matrix.get("world-of-warcraft")?.get("ai-pixel")?.level).toBe("specialist");
     expect(matrix.get("3d-visualisation")?.get("ai-pixel")?.level).toBe("specialist");
+    expect(matrix.get("the-pub")?.get("ai-juno")?.level).toBe("specialist");
+  });
+
+  it("gives the pub a broad subject mix and a room-local banter contract", () => {
+    const pub = CHANNEL_PROFILES.find((profile) => profile.public.id === "the-pub")!;
+    expect(pub.ambientMode).toBe("banter");
+    expect(pub.ambientPremises.length).toBeGreaterThanOrEqual(12);
+    expect(pub.topic.tags).toEqual(expect.arrayContaining(["film", "music", "work", "politics", "memes", "food"]));
+    expect(pub.conversationGuidance).toContain("Autonomous residents never introduce alcohol");
+    expect(pub.conversationGuidance).toContain("at most one selected actor");
+    expect(pub.conversationGuidance).toContain("never explain a punchline");
+    expect(pub.ambientReactionPalette).toEqual(expect.arrayContaining(["😂", "🍿", "🎵"]));
   });
 });

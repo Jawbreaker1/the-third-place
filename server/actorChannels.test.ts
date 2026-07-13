@@ -64,7 +64,7 @@ describe("actor channel runtime", () => {
   it("keeps KimchiKungen in social rooms while direct mentions still reach specialist rooms", () => {
     const runtime = new ActorChannelRuntime();
 
-    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "side-quests"]);
+    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "the-pub", "side-quests"]);
     expect(runtime.candidatesFor("ai-programming").map((persona) => persona.id)).not.toContain("ai-kim");
     expect(runtime.candidatesFor("ai-programming", ["ai-kim"]).map((persona) => persona.id)).toContain("ai-kim");
   });
@@ -73,9 +73,17 @@ describe("actor channel runtime", () => {
     const runtime = new ActorChannelRuntime();
     runtime.restore([createMessage("world-of-warcraft", "ai-kim", "an old out-of-roster post")]);
 
-    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "side-quests"]);
+    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "the-pub", "side-quests"]);
     expect(runtime.snapshot("ai-kim")?.focusChannelId).toBe("side-quests");
     expect(runtime.snapshot("ai-kim")?.lastSpokeAtByChannel["world-of-warcraft"]).toBeDefined();
+  });
+
+  it("mixes talkative regulars, contrarians and quiet lurkers in the pub", () => {
+    const runtime = new ActorChannelRuntime();
+    const pubIds = runtime.candidatesFor("the-pub").map((persona) => persona.id);
+    expect(pubIds).toEqual(expect.arrayContaining(["ai-mira", "ai-bosse", "ai-juno", "ai-kim", "ai-nox", "ai-farah", "ai-runa"]));
+    expect(pubIds.length).toBeGreaterThanOrEqual(9);
+    expect(pubIds.length).toBeLessThan(PERSONAS.length);
   });
 
   it("restores an actor's last channel focus from persisted history", () => {

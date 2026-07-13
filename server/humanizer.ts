@@ -10,6 +10,7 @@ export type HumanizerReasonCode =
   | "ai_meta_language"
   | "overly_polished"
   | "list_like_reply"
+  | "room_contract"
   | "style_contract";
 
 export interface HumanizerSimilarity {

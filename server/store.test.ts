@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { writeFile } from "node:fs/promises";
 import { createMessage, RoomStore } from "./store.js";
 import { CHANNELS } from "./channels.js";
 
-const tempStore = () => new RoomStore(`/tmp/third-place-store-${Date.now()}-${Math.random()}.json`);
+const tempStorePath = () => `/tmp/third-place-store-${Date.now()}-${Math.random()}.json`;
+const tempStore = () => new RoomStore(tempStorePath());
 
 describe("room history", () => {
   it("seeds every configured channel so newly added rooms do not open empty", async () => {
@@ -11,6 +13,23 @@ describe("room history", () => {
     for (const channel of CHANNELS) {
       expect(store.getRecent(channel.id, 10).length).toBeGreaterThanOrEqual(2);
     }
+  });
+
+  it("migrates an existing seven-room history by adding the pub exactly once", async () => {
+    const filePath = tempStorePath();
+    const existing = createMessage("lobby", "human-returning", "keep this old history");
+    await writeFile(filePath, JSON.stringify({ version: 1, messages: [existing] }), "utf8");
+
+    const migrated = new RoomStore(filePath);
+    await migrated.load();
+    const firstPubIds = migrated.getRecent("the-pub", 50).map((message) => message.id);
+    expect(firstPubIds.length).toBeGreaterThanOrEqual(2);
+    expect(migrated.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+
+    const reloaded = new RoomStore(filePath);
+    await reloaded.load();
+    expect(reloaded.getRecent("the-pub", 50).map((message) => message.id)).toEqual(firstPubIds);
+    expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
   });
 
   it("returns stable chronological pages before a composite cursor", async () => {

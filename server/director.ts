@@ -10,7 +10,7 @@ import type {
   VisualObservation,
 } from "../shared/types.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
-import { CHANNELS, getChannelProfile } from "./channels.js";
+import { CHANNELS, getChannelProfile, type AmbientMode } from "./channels.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import { type GeneratedLine, type TranscriptLine, LmStudioClient } from "./lmStudio.js";
 import { createMessage, RoomStore } from "./store.js";
@@ -268,15 +268,22 @@ export function selectAmbientLead(
   candidates: readonly Persona[],
   affinity: (personaId: string) => number,
   rng: () => number,
+  mode: AmbientMode = "discussion",
 ): Persona | undefined {
   const scored = [...candidates]
     .map((persona) => ({
       persona,
-      score:
-        affinity(persona.id) * 0.5 +
-        persona.style.complexityAppetite * 0.22 +
-        persona.conscientiousness * 0.1 +
-        persona.talkativeness * 0.08,
+      score: mode === "banter"
+        ? affinity(persona.id) * 0.42 +
+          persona.talkativeness * 0.22 +
+          persona.mischief * 0.12 +
+          persona.curiosity * 0.1 +
+          persona.warmth * 0.06 +
+          persona.style.complexityAppetite * 0.08
+        : affinity(persona.id) * 0.5 +
+          persona.style.complexityAppetite * 0.22 +
+          persona.conscientiousness * 0.1 +
+          persona.talkativeness * 0.08,
     }))
     .sort((a, b) => b.score - a.score);
   const topScore = scored[0]?.score;
@@ -296,14 +303,24 @@ export function ambientSceneWordLimits(
   lead: Persona,
   responder?: Persona,
   continuation = false,
+  mode: AmbientMode = "discussion",
 ): Record<string, { minimum: number; maximum: number }> {
-  const leadMaximum = Math.min(continuation ? 36 : 42, lead.style.hardMaxWords);
+  const leadMaximum = Math.min(
+    mode === "banter" ? (continuation ? 24 : 28) : (continuation ? 36 : 42),
+    lead.style.hardMaxWords,
+  );
   const limits: Record<string, { minimum: number; maximum: number }> = {
-    [lead.id]: { minimum: Math.min(continuation ? 12 : 16, leadMaximum), maximum: leadMaximum },
+    [lead.id]: {
+      minimum: Math.min(mode === "banter" ? (continuation ? 4 : 7) : (continuation ? 12 : 16), leadMaximum),
+      maximum: leadMaximum,
+    },
   };
   if (responder) {
-    const responseMaximum = Math.min(28, responder.style.hardMaxWords);
-    limits[responder.id] = { minimum: Math.min(8, responseMaximum), maximum: responseMaximum };
+    const responseMaximum = Math.min(mode === "banter" ? 22 : 28, responder.style.hardMaxWords);
+    limits[responder.id] = {
+      minimum: Math.min(mode === "banter" ? 3 : 8, responseMaximum),
+      maximum: responseMaximum,
+    };
   }
   return limits;
 }
@@ -314,10 +331,21 @@ export function ambientConversationPremise(
   responder?: Persona,
   continuation = false,
   debateBeat = false,
+  mode: AmbientMode = "discussion",
 ): string {
-  const wordLimits = ambientSceneWordLimits(lead, responder, continuation);
+  const wordLimits = ambientSceneWordLimits(lead, responder, continuation, mode);
   const leadLimit = wordLimits[lead.id]!;
   const responseLimit = responder ? wordLimits[responder.id]! : undefined;
+  if (mode === "banter") {
+    const opening = continuation
+      ? `Continue only the live thread built from this exact seed: “${seed}”. Follow the latest line's recognizable association instead of restarting the setup.`
+      : `Start a fresh social thread from this exact seed: “${seed}”. Ignore unrelated older drift.`;
+    const leadRole = `${lead.name} contributes one concrete social hook in ${leadLimit.minimum}–${leadLimit.maximum} words: a specific take, recommendation, complaint, detail or joke setup.`;
+    const responseRole = responder
+      ? `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words with one distinct move: a countertake, adjacent recommendation, punchline, groan or genuine specific question.`
+      : "";
+    return `${opening} ${leadRole} ${responseRole} Do not recap, broadly agree, offer advice or an assistant-style overview, explain a punchline, introduce alcohol, perform the room's Friday mood or invite the whole room to answer. Exactly the selected residents speak in order; short fragments and silence remain valid.`.replace(/\s+/g, " ").trim();
+  }
   const opening = continuation
     ? `Continue only the unresolved thread built from this exact seed: “${seed}”. Do not switch topics or extend an unrelated metaphor from older history.`
     : `Start a fresh room-relevant thread from this exact seed: “${seed}”. Ignore unrelated drift in older history.`;
@@ -444,29 +472,52 @@ export function selectConsideredConversation(
   return { lead, responder, responseRole };
 }
 
-const consideredResponseDirection = (plan: ConsideredConversationPlan): string => ({
-  challenge: `${plan.responder.name} replies in 8–28 words by challenging one hidden assumption, while briefly acknowledging the strongest part. Do not restate the post.`,
-  example: `${plan.responder.name} replies in 8–28 words with one concrete example or counterexample that was not already mentioned. Do not merely agree or summarize.`,
-  question: `${plan.responder.name} replies in 8–24 words with one precise question about the unresolved tension. Do not paraphrase the post.`,
+const consideredResponseDirection = (plan: ConsideredConversationPlan, mode: AmbientMode = "discussion"): string => ({
+  challenge: mode === "banter"
+    ? `${plan.responder.name} replies in 6–24 words with one compact countertake or precise objection. Do not restate the post.`
+    : `${plan.responder.name} replies in 8–28 words by challenging one hidden assumption, while briefly acknowledging the strongest part. Do not restate the post.`,
+  example: mode === "banter"
+    ? `${plan.responder.name} replies in 6–24 words with one concrete alternative, example or punchline that was not already mentioned.`
+    : `${plan.responder.name} replies in 8–28 words with one concrete example or counterexample that was not already mentioned. Do not merely agree or summarize.`,
+  question: mode === "banter"
+    ? `${plan.responder.name} replies in 6–22 words with one genuine, specific question about the unresolved detail. Do not paraphrase the post.`
+    : `${plan.responder.name} replies in 8–24 words with one precise question about the unresolved tension. Do not paraphrase the post.`,
 })[plan.responseRole];
 
 const consideredSeedAnchor = (seed?: string): string => seed
   ? `Ground the conversation in this exact room-specific question: “${seed}”. Do not drift into a different topic or an extended metaphor.`
   : "";
 
-export function consideredConversationLeadPremise(plan: ConsideredConversationPlan, seed?: string): string {
+export function consideredConversationLeadPremise(
+  plan: ConsideredConversationPlan,
+  seed?: string,
+  mode: AmbientMode = "discussion",
+): string {
+  if (mode === "banter") {
+    return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens with one unusually substantive but still conversational 30–52-word recommendation, gripe, story-shaped observation or opinion. Anchor it in a concrete title, detail, ritual or trade-off. No essay framing, advice service, room-performance commentary or alcohol. Only ${plan.lead.name} speaks in this generation.`.trim();
+  }
   return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens with one substantive 45–75-word post grounded in this room's subject. Include a specific observation, causal mechanism, real tension or defensible claim; avoid generic inspiration, meta-commentary and an empty “what do you think?” ending. Only ${plan.lead.name} speaks in this generation.`.trim();
 }
 
-export function consideredConversationResponsePremise(plan: ConsideredConversationPlan): string {
-  return `Respond directly to ${plan.lead.name}'s latest transcript line. ${consideredResponseDirection(plan)} Only ${plan.responder.name} speaks in this generation; do not open a new topic.`;
+export function consideredConversationResponsePremise(
+  plan: ConsideredConversationPlan,
+  mode: AmbientMode = "discussion",
+): string {
+  return `Respond directly to ${plan.lead.name}'s latest transcript line. ${consideredResponseDirection(plan, mode)} Only ${plan.responder.name} speaks in this generation; do not open a new topic.`;
 }
 
-export function consideredConversationPremise(plan: ConsideredConversationPlan, seed?: string): string {
+export function consideredConversationPremise(
+  plan: ConsideredConversationPlan,
+  seed?: string,
+  mode: AmbientMode = "discussion",
+): string {
   const anchor = seed
     ? consideredSeedAnchor(seed)
     : "";
-  return `${anchor} ${plan.lead.name} starts a rare considered conversation with one substantive 45–75-word post grounded in this room's subject. Include a specific observation, causal mechanism, real tension or defensible claim; avoid generic inspiration, meta-commentary and an empty “what do you think?” ending. ${consideredResponseDirection(plan)} Exactly these two residents speak, in this order; nobody piles on.`.trim();
+  if (mode === "banter") {
+    return `${anchor} ${plan.lead.name} starts a rare deeper table-talk beat in 30–52 words, anchored in one concrete title, detail, ritual, complaint or trade-off rather than an essay. ${consideredResponseDirection(plan, mode)} Exactly these two residents speak, in this order; nobody piles on or performs the room's mood.`.trim();
+  }
+  return `${anchor} ${plan.lead.name} starts a rare considered conversation with one substantive 45–75-word post grounded in this room's subject. Include a specific observation, causal mechanism, real tension or defensible claim; avoid generic inspiration, meta-commentary and an empty “what do you think?” ending. ${consideredResponseDirection(plan, mode)} Exactly these two residents speak, in this order; nobody piles on.`.trim();
 }
 
 export interface PublicCandidateGuardInput {
@@ -1206,6 +1257,19 @@ export class SocialDirector {
     plan: ConsideredConversationPlan,
     thread: AmbientThreadState,
   ): Promise<void> {
+    const ambientMode = getChannelProfile(channel.id)?.ambientMode ?? "discussion";
+    const leadWordLimit = ambientMode === "banter"
+      ? { minimum: 30, maximum: 52 }
+      : { minimum: 45, maximum: 75 };
+    const responseWordLimit = {
+      minimum: Math.min(ambientMode === "banter" ? 6 : 8, plan.responder.style.hardMaxWords),
+      maximum: Math.min(
+        ambientMode === "banter"
+          ? plan.responseRole === "question" ? 22 : 24
+          : plan.responseRole === "question" ? 24 : 28,
+        plan.responder.style.hardMaxWords,
+      ),
+    };
     this.consideredConversationInFlight = true;
     this.lastConsideredConversationAt = this.now();
     this.setTyping(channel.id, plan.lead.id, true);
@@ -1223,9 +1287,9 @@ export class SocialDirector {
             channelName: channel.name,
             selected: [plan.lead],
             history,
-            premise: consideredConversationLeadPremise(plan, thread.seed),
+            premise: consideredConversationLeadPremise(plan, thread.seed, ambientMode),
             mustReplyIds: [plan.lead.id],
-            wordLimits: { [plan.lead.id]: { minimum: 45, maximum: 75 } },
+            wordLimits: { [plan.lead.id]: leadWordLimit },
             languageHint: thread.languageHint,
             actorChannelNotes: this.actorChannels.promptNotes([plan.lead], channel.id),
             actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.lead], channel.id),
@@ -1252,17 +1316,9 @@ export class SocialDirector {
                   createdAt: new Date(this.now()).toISOString(),
                 },
               ],
-              premise: consideredConversationResponsePremise(plan),
+              premise: consideredConversationResponsePremise(plan, ambientMode),
               mustReplyIds: [plan.responder.id],
-              wordLimits: {
-                [plan.responder.id]: {
-                  minimum: Math.min(8, plan.responder.style.hardMaxWords),
-                  maximum: Math.min(
-                    plan.responseRole === "question" ? 24 : 28,
-                    plan.responder.style.hardMaxWords,
-                  ),
-                },
-              },
+              wordLimits: { [plan.responder.id]: responseWordLimit },
               languageHint: thread.languageHint,
               actorChannelNotes: this.actorChannels.promptNotes([plan.responder], channel.id),
               actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.responder], channel.id),
@@ -1364,6 +1420,8 @@ export class SocialDirector {
             now - (this.lastSpoke.get(persona.id) ?? 0) > persona.cooldownMs,
         );
       if (available.length < 1) return;
+      const profile = getChannelProfile(channel.id);
+      const ambientMode = profile?.ambientMode ?? "discussion";
       const startConsidered = available.length >= 2 && shouldStartConsideredConversation({
         now,
         lastStartedAt: this.lastConsideredConversationAt,
@@ -1394,10 +1452,11 @@ export class SocialDirector {
         available,
         (personaId) => this.actorChannels.affinity(personaId, channel.id),
         this.rng,
+        ambientMode,
       );
       if (!first) return;
       const possibleSeconds = available.filter((persona) => persona.id !== first.id);
-      const debateBeat = this.rng() < 0.24;
+      const debateBeat = this.rng() < (ambientMode === "banter" ? 0.1 : 0.24);
       const dissenters = possibleSeconds.filter((persona) =>
         (first.disagreement ?? 0) >= 0.65
           ? (persona.disagreement ?? 0) < 0.65
@@ -1415,8 +1474,9 @@ export class SocialDirector {
         selected[1],
         thread.messageCount > 0,
         debateBeat && selected.length > 1,
+        ambientMode,
       );
-      const wordLimits = ambientSceneWordLimits(first, selected[1], thread.messageCount > 0);
+      const wordLimits = ambientSceneWordLimits(first, selected[1], thread.messageCount > 0, ambientMode);
       for (const persona of selected.slice(0, 2)) this.setTyping(channel.id, persona.id, true);
       let lines: GeneratedLine[] = [];
       try {
@@ -1471,7 +1531,7 @@ export class SocialDirector {
               const reaction = this.store.togglePublicReaction(
                 channel.id,
                 posted.id,
-                choose(["👀", "😂", "🤔", "✨"], this.rng),
+                choose(profile?.ambientReactionPalette ?? ["👀", "😂", "🤔", "✨"], this.rng),
                 reactor.id,
                 true,
               );

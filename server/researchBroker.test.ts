@@ -35,6 +35,10 @@ describe("research broker", () => {
     expect(broker.shouldResearch("Vad är P/E?", "stock-market")).toBe(false);
     expect(broker.shouldResearch("Vilken patch kör WoW nu?", "world-of-warcraft")).toBe(true);
     expect(broker.shouldResearch("Vilken Blender-version stöder den renderern?", "3d-visualisation")).toBe(true);
+    expect(broker.shouldResearch("Vad säger regeringen om det här?", "the-pub")).toBe(true);
+    expect(broker.shouldResearch("Vilken ny film har premiär?", "the-pub")).toBe(true);
+    expect(broker.shouldResearch("Politiska slogans är mest tomma ord", "the-pub")).toBe(false);
+    expect(broker.shouldResearch("Con Air är bättre än National Treasure", "the-pub")).toBe(false);
   });
 
   it("stays fully local unless the operator explicitly enables research", () => {

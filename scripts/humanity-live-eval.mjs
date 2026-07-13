@@ -24,6 +24,9 @@ const actorChannels = new ActorChannelRuntime();
 const words = (value) => value.match(/[\p{L}\p{N}]+/gu)?.length ?? 0;
 const emojiCount = (value) => value.match(/\p{Extended_Pictographic}/gu)?.length ?? 0;
 const hasFoodMotif = (value) => /\b(?:mat(?:en)?|food|kimchi|ferment\w*|bakteri\w*|måltid\w*|snacks?|frukost|leftovers?|hot sauce|chili|smak\w*|textur\w*|kök(?:et)?|recept\w*)\b/iu.test(value);
+const hasFermentationMotif = (value) => hasFoodMotif(value) || /\b(?:bubbl\w*|burk(?:en)?|mjölksyr\w*|saltlag\w*)\b/iu.test(value);
+const hasPubGimmick = (value) => /\b(?:fredagsfeeling|fredagsstämning|nu lever (?:kanalen|chatten)|andra ölen|skål på den|pubstämning|beer|wine|öl(?:en|et|er|arna)?|vin(?:et|er|erna)?)\b/iu.test(value);
+const hasUrl = (value) => /https?:\/\//iu.test(value);
 const now = new Date().toISOString();
 const seedHistory = [
   { author: "Sana", kind: "ai", content: "TURN är reservvägen när direkt P2P inte tar sig igenom NAT.", createdAt: now },
@@ -181,8 +184,48 @@ if (!health.connected) {
     actorExpertiseNotes: actorChannels.expertiseNotes(ambientSelected, "3d-visualisation"),
   });
 
+  const pubAmbientSelected = [byId("ai-juno"), byId("ai-bosse")];
+  const pubAmbientSeed = "Put one beloved film on trial for one concrete choice: its ending, performance, pacing or soundtrack. The reply defends that exact choice or names one better alternative; no review summary.";
+  const pubAmbient = await lm.generateScene({
+    kind: "ambient",
+    channelId: "the-pub",
+    channelName: "the-pub",
+    selected: pubAmbientSelected,
+    history: [],
+    mustReplyIds: pubAmbientSelected.map((persona) => persona.id),
+    wordLimits: ambientSceneWordLimits(pubAmbientSelected[0], pubAmbientSelected[1], false, "banter"),
+    languageHint: "Swedish",
+    premise: ambientConversationPremise(pubAmbientSeed, pubAmbientSelected[0], pubAmbientSelected[1], false, false, "banter"),
+    actorChannelNotes: actorChannels.promptNotes(pubAmbientSelected, "the-pub"),
+    actorExpertiseNotes: actorChannels.expertiseNotes(pubAmbientSelected, "the-pub"),
+  });
+
+  const pubHumanSelected = [byId("ai-mira"), byId("ai-nox")];
+  const pubHuman = await lm.generateScene({
+    kind: "public",
+    channelId: "the-pub",
+    channelName: "the-pub",
+    selected: pubHumanSelected,
+    history: pubAmbient.map((line) => ({
+      author: byId(line.personaId).name,
+      kind: "ai",
+      content: line.content,
+      createdAt: new Date().toISOString(),
+    })),
+    trigger: {
+      author: "guest",
+      content: "Con Air är bättre än National Treasure, och chips slår pommes. Jag är beredd att försvara båda.",
+      messageId: "pub-human-control",
+    },
+    mustReplyIds: pubHumanSelected.map((persona) => persona.id),
+    languageHint: "Swedish",
+    premise: "Svara som bordssnack, inte rådgivning: en person väljer en konkret sida och den andra gör en distinkt invändning eller torr utvikning. Ingen behöver sammanfatta båda påståendena.",
+    actorChannelNotes: actorChannels.promptNotes(pubHumanSelected, "the-pub"),
+    actorExpertiseNotes: actorChannels.expertiseNotes(pubHumanSelected, "the-pub"),
+  });
+
   const issues = [];
-  for (const [label, lines] of [["first", first], ["second", second], ["considered", considered], ["ambientSubstance", ambientSubstance]]) {
+  for (const [label, lines] of [["first", first], ["second", second], ["considered", considered], ["ambientSubstance", ambientSubstance], ["pubAmbient", pubAmbient], ["pubHuman", pubHuman]]) {
     if (lines.length !== 2) issues.push(`${label}: expected 2 lines, got ${lines.length}`);
     for (const line of lines) {
       const assessment = assessCandidate({ personaId: line.personaId, text: line.content });
@@ -208,7 +251,7 @@ if (!health.connected) {
   if (kimFoodReferences > 1) issues.push(`kim: ${kimFoodReferences}/${kimPrompts.length} unrelated replies used a food motif`);
   if (kimEmojis > 2) issues.push(`kim: ${kimEmojis} emoji across ${kimPrompts.length} unrelated replies`);
   if (kimQuestionEndings > 2) issues.push(`kim: ${kimQuestionEndings}/${kimPrompts.length} unrelated replies ended as questions`);
-  if (!kimFood[0] || !hasFoodMotif(kimFood[0].content)) issues.push("kim control: direct fermentation answer lost the genuine interest");
+  if (!kimFood[0] || !hasFermentationMotif(kimFood[0].content)) issues.push("kim control: direct fermentation answer lost the genuine interest");
   const ambientCombined = ambientSubstance.map((line) => line.content).join(" ");
   if (!/(?:ljus|lighting|material|render|skugg|reflektion|highlight|yta)/iu.test(ambientCombined)) {
     issues.push("ambient substance: 3D exchange lost its concrete lighting/material anchor");
@@ -216,11 +259,28 @@ if (!health.connected) {
   if (ambientSubstance.some((line) => words(line.content) < 8)) {
     issues.push("ambient substance: one contribution was too thin to advance the issue");
   }
+  const pubLines = [...pubAmbient, ...pubHuman];
+  const pubGimmicks = pubLines.filter((line) => hasPubGimmick(line.content)).length;
+  const pubUrls = pubLines.filter((line) => hasUrl(line.content)).length;
+  const pubQuestionEndings = pubLines.filter((line) => /\?\s*$/u.test(line.content)).length;
+  if (pubGimmicks > 0) issues.push(`pub: ${pubGimmicks} line(s) performed alcohol/Friday atmosphere instead of the topic`);
+  if (pubUrls > 0) issues.push(`pub: ${pubUrls} line(s) invented or repeated an unsupplied URL`);
+  if (pubQuestionEndings > 2) issues.push(`pub: ${pubQuestionEndings}/${pubLines.length} lines ended as questions`);
+  for (const line of pubAmbient) {
+    const limit = ambientSceneWordLimits(pubAmbientSelected[0], pubAmbientSelected[1], false, "banter")[line.personaId];
+    const count = words(line.content);
+    if (limit && (count < limit.minimum || count > limit.maximum)) {
+      issues.push(`pub ambient/${line.personaId}: ${count} words, expected ${limit.minimum}–${limit.maximum}`);
+    }
+  }
+  if (!/(?:film|Con Air|National Treasure|Nicolas Cage|chips|pommes|soundtrack|slut|scen|skådespel)/iu.test(pubLines.map((line) => line.content).join(" "))) {
+    issues.push("pub: scene lost every concrete film/food anchor");
+  }
 
   const report = {
     model: health.id,
     latencyMs: health.latencyMs,
-    scenes: { first, second, considered, ambientSubstance, kimNonFood, kimFood },
+    scenes: { first, second, considered, ambientSubstance, pubAmbient, pubHuman, kimNonFood, kimFood },
     consideredWordCounts: { lead: leadWords, response: responseWords },
     kimMetrics: {
       prompts: kimPrompts.length,
@@ -228,6 +288,12 @@ if (!health.connected) {
       unrelatedFoodReferences: kimFoodReferences,
       emoji: kimEmojis,
       questionEndings: kimQuestionEndings,
+    },
+    pubMetrics: {
+      lines: pubLines.length,
+      atmosphereGimmicks: pubGimmicks,
+      unsuppliedUrls: pubUrls,
+      questionEndings: pubQuestionEndings,
     },
     passed: issues.length === 0,
     issues,
@@ -244,6 +310,7 @@ if (!health.connected) {
     }
     console.log(`\nConsidered words: ${leadWords} + ${responseWords}`);
     console.log(`Kim non-food metrics: ${kimFoodReferences} food motifs, ${kimEmojis} emoji, ${kimQuestionEndings} question endings / ${kimPrompts.length}`);
+    console.log(`Pub metrics: ${pubGimmicks} atmosphere gimmicks, ${pubUrls} unsupplied URLs, ${pubQuestionEndings} question endings / ${pubLines.length}`);
     console.log(report.passed ? "Result: PASS" : `Result: WARN\n- ${issues.join("\n- ")}`);
   }
   if (strict && issues.length > 0) process.exitCode = 1;

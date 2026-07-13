@@ -29,6 +29,7 @@ const FRESHNESS = /\b(senaste|aktuell(?:t|a)?|just nu|idag|den här veckan|curre
 const QUESTION = /[?]|\b(vad|vem|vilka|hur|var|när|what|who|which|how|where|when)\b/i;
 const PERSONAL_CHAT = /\b(du|dig|din|ditt|dina|you|your|yours)\b/i;
 const ROOM_FRESHNESS: Partial<Record<string, RegExp>> = {
+  "the-pub": /\b(regering(?:en)?|riksdag(?:en)?|minister|partiledare|president|val(?:et)?|opinionsmätning|polls?|ny(?:a|tt)? (?:film|album|låt|serie)|premiär(?:en)?|topplista|charts?|turné|tour dates?)\b/i,
   "stock-market": /\b(aktie(?:n|r|kurs|kursen)?|börskurs(?:en)?|kursen|handlas|marknadsvärde|market cap|stock price|share price|trading at|quote)\b/i,
   "world-of-warcraft": /\b(patch(?:en)?|hotfix|season|säsong|meta|tier list|current expansion|senaste expansion)\b/i,
   "ai-programming": /\b(sdk-version|api-version|library version|biblioteksversion|modellversion|model version|senaste version)\b/i,

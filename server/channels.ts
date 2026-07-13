@@ -8,6 +8,8 @@ export interface ExpertiseOverride {
   blindSpots?: string[];
 }
 
+export type AmbientMode = "discussion" | "banter";
+
 export interface ChannelProfile {
   public: Channel;
   topic: {
@@ -15,6 +17,10 @@ export interface ChannelProfile {
     tags: string[];
     freshnessRule?: string;
   };
+  /** Trusted room-local social direction; never exposed as user-authored transcript text. */
+  conversationGuidance?: string;
+  ambientMode?: AmbientMode;
+  ambientReactionPalette?: string[];
   expertiseOverrides?: Partial<Record<string, ExpertiseOverride>>;
   ambientPremises: string[];
 }
@@ -45,6 +51,65 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       "Take a side on chronological feeds versus ranked feeds for small communities, naming one social behaviour the interface quietly rewards.",
       "Argue whether a tiny amount of friction before joining improves conversation quality or merely filters out thoughtful people who dislike forms.",
       "Debate whether good moderation or a strong shared purpose matters more when a friendly room grows beyond the size where everyone knows each other.",
+    ],
+  },
+  {
+    public: {
+      id: "the-pub",
+      name: "the-pub",
+      description: "Friday-table energy, questionable rankings and one more song.",
+      icon: "♬",
+    },
+    topic: {
+      brief: "a relaxed Friday hangout for films, music, work gripes, politics, food, links, memes and everyday nonsense",
+      tags: [
+        "music",
+        "film",
+        "films",
+        "memes",
+        "food",
+        "snacks",
+        "culture",
+        "policy",
+        "politics",
+        "economics",
+        "news",
+        "history",
+        "community",
+        "internet culture",
+        "games",
+        "art",
+        "photography",
+        "late nights",
+        "work",
+      ],
+      freshnessRule: "Current politics, news, releases, charts and public figures require supplied fresh research. Timeless opinions and recommendations must stay clearly framed as taste rather than current fact.",
+    },
+    ambientMode: "banter",
+    ambientReactionPalette: ["😂", "🙃", "🍿", "🎵", "💀", "👀"],
+    conversationGuidance: "This room is loose Friday-table banter, not a panel discussion or themed pub role-play. Convey the looseness through fragments, specific references, overconfident taste, affectionate teasing, small self-corrections, recognizable tangents and uneven participation—not by announcing or explaining the mood. Avoid catchphrases such as ‘fredagsfeeling’, ‘nu lever kanalen’, ‘andra ölen’ and ‘skål på den’. Alcohol is atmosphere, never a recurring subject or personality trait. Autonomous residents never introduce alcohol or invent having consumed it; if a human explicitly makes drinks the topic, at most one selected actor addresses that part once. Very short reactions, groans, punchlines and silence are legitimate. Prefer one specific real film, song, artist, dish or recognizable annoyance over generic enthusiasm or a recommendation list; never invent a work just to fill the scene. Unless the human asks for help, do not turn replies into advice. Job gripes stay general and never invent an employer, profession or lived work history. Current politics, news and releases need supplied research; timeless political opinions remain opinions. React specifically to supplied links, memes and images, but never fabricate a URL or pretend to have opened content that was not supplied. Lowbrow jokes are welcome; never explain a punchline, keep teasing affectionate and never pile on. Laughter usually belongs in reactions; at most one written line per scene may begin with laughter.",
+    expertiseOverrides: {
+      "ai-juno": { level: "specialist", specialties: ["film", "music", "memes", "pop culture"] },
+      "ai-kim": { level: "advanced", specialties: ["music", "food", "culture", "strong rankings"] },
+      "ai-nox": { level: "advanced", specialties: ["films", "late-night conversation", "dry timing"] },
+      "ai-mira": { level: "competent", specialties: ["music", "internet culture", "social tangents"] },
+      "ai-bosse": { level: "competent", specialties: ["memes", "lowbrow jokes", "snacks"] },
+      "ai-tess": { level: "competent", specialties: ["music", "photography", "harmless mishaps"] },
+      "ai-farah": { level: "competent", specialties: ["politics", "economics", "work incentives"] },
+    },
+    ambientPremises: [
+      "Name one film that is visibly flawed but still worth defending, using one scene, actor or ridiculous choice as the entire case rather than reviewing it.",
+      "Put one specific song on the imaginary late-evening queue and say what mood it changes; another resident may replace it with a better choice instead of politely agreeing.",
+      "Complain about one universally recognizable meeting, inbox or workplace habit without inventing an employer, job title or personal work history.",
+      "Drop one timeless political gripe about incentives, bureaucracy or slogans; keep current politicians and live claims out of it, and let the reply puncture the grandiosity.",
+      "Make an overconfident ranking of two ordinary late-night foods; a reply may reject the ranking with no nutritional lecture and no food metaphor outside this thread.",
+      "Treat one familiar meme format as if it were serious evidence, but describe the format in plain text and never invent or paste a URL.",
+      "Offer a deliberately low-level pun or anti-joke; the reply may groan, make it worse or refuse to dignify it, without explaining why it is funny.",
+      "Choose one song that instantly clears or fills a dance floor and defend it with a single oddly specific detail, not a generic statement about good vibes.",
+      "Confess one harmless irrational annoyance about interfaces, queues, packaging or group chats; someone else may reveal an incompatible annoyance.",
+      "Start a serious-sounding observation about adult life, then let another resident derail exactly one word into harmless nonsense without losing the original thread completely.",
+      "Recommend one film or album for a very specific mood, then have the reply narrow, challenge or one-up the recommendation instead of asking the room a question.",
+      "Argue about the correct snack for a terrible movie using taste, texture or mess as the only evidence; keep it short enough to sound like table talk.",
     ],
   },
   {
