@@ -145,6 +145,18 @@ export function analyzeSocialSignals(content: string, personas = PERSONAS): Soci
   };
 }
 
+export function addressedPersonaIds(
+  mentionedIds: readonly string[],
+  replyTarget?: Pick<ChatMessage, "authorId" | "system">,
+  personas: readonly Persona[] = PERSONAS,
+): string[] {
+  const replyTargetId = replyTarget && !replyTarget.system && replyTarget.authorId.startsWith("ai-")
+    && personas.some((persona) => persona.id === replyTarget.authorId)
+    ? replyTarget.authorId
+    : undefined;
+  return [...new Set([...mentionedIds, ...(replyTargetId ? [replyTargetId] : [])])];
+}
+
 export function selectResponders(
   personas: Persona[],
   signals: SocialSignals,
@@ -214,6 +226,110 @@ interface PendingBurst {
   messages: ChatMessage[];
   human: Member;
   timer: NodeJS.Timeout;
+}
+
+const AMBIENT_THREAD_MAX_MESSAGES = 4;
+const AMBIENT_THREAD_COOLDOWN_MS = 8 * 60_000;
+
+export interface AmbientThreadState {
+  seed: string;
+  messageCount: number;
+  lastMessageId?: string;
+  languageHint: string;
+  updatedAt: number;
+}
+
+type AmbientHistoryMessage = Pick<ChatMessage, "id" | "authorId" | "content" | "createdAt" | "system">;
+
+/** Counts the uninterrupted autonomous tail while treating room notices as transparent. */
+export function trailingAiMessageCount(messages: readonly Pick<ChatMessage, "authorId" | "system">[]): number {
+  let count = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.system) continue;
+    if (!message.authorId.startsWith("ai-")) break;
+    count += 1;
+  }
+  return count;
+}
+
+export function ambientLanguageHint(messages: readonly AmbientHistoryMessage[]): string {
+  const latestHuman = [...messages]
+    .reverse()
+    .find((message) => !message.system && !message.authorId.startsWith("ai-") && message.content.trim());
+  if (!latestHuman) return "Swedish";
+  return languageHint(latestHuman.content) === "Swedish"
+    ? "Swedish"
+    : "the language used in the latest human-authored message";
+}
+
+/** Room expertise and capacity for a real claim matter more than sheer chatter. */
+export function selectAmbientLead(
+  candidates: readonly Persona[],
+  affinity: (personaId: string) => number,
+  rng: () => number,
+): Persona | undefined {
+  const scored = [...candidates]
+    .map((persona) => ({
+      persona,
+      score:
+        affinity(persona.id) * 0.5 +
+        persona.style.complexityAppetite * 0.22 +
+        persona.conscientiousness * 0.1 +
+        persona.talkativeness * 0.08,
+    }))
+    .sort((a, b) => b.score - a.score);
+  const topScore = scored[0]?.score;
+  if (topScore === undefined) return undefined;
+  const pool = scored.filter(({ score }) => score >= topScore - 0.2).slice(0, 3);
+  const weighted = pool.map((entry) => ({ ...entry, weight: Math.exp((entry.score - topScore) / 0.14) }));
+  const totalWeight = weighted.reduce((sum, entry) => sum + entry.weight, 0);
+  let roll = clamp(rng(), 0, 0.999_999) * totalWeight;
+  for (const entry of weighted) {
+    roll -= entry.weight;
+    if (roll <= 0) return entry.persona;
+  }
+  return weighted.at(-1)?.persona;
+}
+
+export function ambientSceneWordLimits(
+  lead: Persona,
+  responder?: Persona,
+  continuation = false,
+): Record<string, { minimum: number; maximum: number }> {
+  const leadMaximum = Math.min(continuation ? 36 : 42, lead.style.hardMaxWords);
+  const limits: Record<string, { minimum: number; maximum: number }> = {
+    [lead.id]: { minimum: Math.min(continuation ? 12 : 16, leadMaximum), maximum: leadMaximum },
+  };
+  if (responder) {
+    const responseMaximum = Math.min(28, responder.style.hardMaxWords);
+    limits[responder.id] = { minimum: Math.min(8, responseMaximum), maximum: responseMaximum };
+  }
+  return limits;
+}
+
+export function ambientConversationPremise(
+  seed: string,
+  lead: Persona,
+  responder?: Persona,
+  continuation = false,
+  debateBeat = false,
+): string {
+  const wordLimits = ambientSceneWordLimits(lead, responder, continuation);
+  const leadLimit = wordLimits[lead.id]!;
+  const responseLimit = responder ? wordLimits[responder.id]! : undefined;
+  const opening = continuation
+    ? `Continue only the unresolved thread built from this exact seed: “${seed}”. Do not switch topics or extend an unrelated metaphor from older history.`
+    : `Start a fresh room-relevant thread from this exact seed: “${seed}”. Ignore unrelated drift in older history.`;
+  const leadRole = continuation
+    ? `${lead.name} adds one genuinely new concrete reason, mechanism, example or trade-off in ${leadLimit.minimum}–${leadLimit.maximum} words; never merely restate the prior line.`
+    : `${lead.name} makes one specific, defensible claim with a reason, mechanism, example or trade-off in ${leadLimit.minimum}–${leadLimit.maximum} words.`;
+  const responseRole = responder
+    ? debateBeat
+      ? `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words, acknowledges the strongest point, then supplies one specific counterexample or hidden cost. Do not simply agree.`
+      : `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words and advances the same issue with one new consequence, example or precise unresolved question. Do not summarize.`
+    : "";
+  return `${opening} ${leadRole} ${responseRole} No generic room invitation, filler about the chat being quiet, assistant-style overview or broad “what do you think?” ending. Exactly the selected residents speak in order.`.replace(/\s+/g, " ").trim();
 }
 
 export type ConsideredResponseRole = "challenge" | "example" | "question";
@@ -328,13 +444,29 @@ export function selectConsideredConversation(
   return { lead, responder, responseRole };
 }
 
-export function consideredConversationPremise(plan: ConsideredConversationPlan): string {
-  const responseDirection: Record<ConsideredResponseRole, string> = {
-    challenge: `${plan.responder.name} replies in 8–28 words by challenging one hidden assumption, while briefly acknowledging the strongest part. Do not restate the post.`,
-    example: `${plan.responder.name} replies in 8–28 words with one concrete example or counterexample that was not already mentioned. Do not merely agree or summarize.`,
-    question: `${plan.responder.name} replies in 8–24 words with one precise question about the unresolved tension. Do not paraphrase the post.`,
-  };
-  return `${plan.lead.name} starts a rare considered conversation with one substantive 45–75-word post grounded in this room's subject. Include a specific observation, real tension or defensible claim; avoid generic inspiration, meta-commentary and an empty “what do you think?” ending. ${responseDirection[plan.responseRole]} Exactly these two residents speak, in this order; nobody piles on.`;
+const consideredResponseDirection = (plan: ConsideredConversationPlan): string => ({
+  challenge: `${plan.responder.name} replies in 8–28 words by challenging one hidden assumption, while briefly acknowledging the strongest part. Do not restate the post.`,
+  example: `${plan.responder.name} replies in 8–28 words with one concrete example or counterexample that was not already mentioned. Do not merely agree or summarize.`,
+  question: `${plan.responder.name} replies in 8–24 words with one precise question about the unresolved tension. Do not paraphrase the post.`,
+})[plan.responseRole];
+
+const consideredSeedAnchor = (seed?: string): string => seed
+  ? `Ground the conversation in this exact room-specific question: “${seed}”. Do not drift into a different topic or an extended metaphor.`
+  : "";
+
+export function consideredConversationLeadPremise(plan: ConsideredConversationPlan, seed?: string): string {
+  return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens with one substantive 45–75-word post grounded in this room's subject. Include a specific observation, causal mechanism, real tension or defensible claim; avoid generic inspiration, meta-commentary and an empty “what do you think?” ending. Only ${plan.lead.name} speaks in this generation.`.trim();
+}
+
+export function consideredConversationResponsePremise(plan: ConsideredConversationPlan): string {
+  return `Respond directly to ${plan.lead.name}'s latest transcript line. ${consideredResponseDirection(plan)} Only ${plan.responder.name} speaks in this generation; do not open a new topic.`;
+}
+
+export function consideredConversationPremise(plan: ConsideredConversationPlan, seed?: string): string {
+  const anchor = seed
+    ? consideredSeedAnchor(seed)
+    : "";
+  return `${anchor} ${plan.lead.name} starts a rare considered conversation with one substantive 45–75-word post grounded in this room's subject. Include a specific observation, causal mechanism, real tension or defensible claim; avoid generic inspiration, meta-commentary and an empty “what do you think?” ending. ${consideredResponseDirection(plan)} Exactly these two residents speak, in this order; nobody piles on.`.trim();
 }
 
 export interface PublicCandidateGuardInput {
@@ -430,6 +562,8 @@ export class SocialDirector {
   private readonly directorEvents: DirectorEvent[] = [];
   private readonly aiTimestamps: number[] = [];
   private readonly handledHumanImageIds = new Set<string>();
+  private readonly ambientThreads = new Map<string, AmbientThreadState>();
+  private readonly lastAmbientSeedByChannel = new Map<string, string>();
   private ambientTimer?: NodeJS.Timeout;
   private readonly channelEpoch = new Map<string, number>();
   private readonly lastHumanMessageAtByChannel = new Map<string, number>();
@@ -460,15 +594,15 @@ export class SocialDirector {
     this.rng = options.rng ?? Math.random;
     this.now = options.now ?? Date.now;
     this.pageReader = options.pageReader ?? new PageReader();
-    const envChance = Number.parseFloat(process.env.AI_CONSIDERED_CHANCE ?? "0.1");
+    const envChance = Number.parseFloat(process.env.AI_CONSIDERED_CHANCE ?? "0.2");
     this.consideredConversationChance = clamp(
-      options.consideredConversationChance ?? (Number.isFinite(envChance) ? envChance : 0.1),
+      options.consideredConversationChance ?? (Number.isFinite(envChance) ? envChance : 0.2),
       0,
       1,
     );
     this.consideredConversationCooldownMs = Math.max(
       60_000,
-      options.consideredConversationCooldownMs ?? 10 * 60_000,
+      options.consideredConversationCooldownMs ?? 6 * 60_000,
     );
     this.consideredConversationHumanQuietMs = Math.max(
       15_000,
@@ -499,6 +633,7 @@ export class SocialDirector {
     const now = this.now();
     this.lastHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(channelId, now);
+    this.ambientThreads.delete(channelId);
     this.channelEpoch.set(channelId, (this.channelEpoch.get(channelId) ?? 0) + 1);
   }
 
@@ -507,6 +642,7 @@ export class SocialDirector {
     const arrivalAt = this.now();
     this.lastHumanActivityAt = arrivalAt;
     this.lastHumanMessageAtByChannel.set("lobby", arrivalAt);
+    this.ambientThreads.delete("lobby");
     this.channelEpoch.set("lobby", (this.channelEpoch.get("lobby") ?? 0) + 1);
     const candidates = PERSONAS.filter((persona) => persona.warmth > 0.7 && persona.id !== "ai-runa");
     const persona = choose(candidates);
@@ -601,6 +737,7 @@ export class SocialDirector {
     const now = this.now();
     this.lastHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(message.channelId, now);
+    this.ambientThreads.delete(message.channelId);
     this.actorChannels.noteChannelEvent(message);
     this.channelEpoch.set(message.channelId, (this.channelEpoch.get(message.channelId) ?? 0) + 1);
   }
@@ -723,6 +860,8 @@ export class SocialDirector {
           matchedTopics: new Set([...humanSignals.matchedTopics, ...visualSignals.matchedTopics]),
         }
       : humanSignals;
+    const replyTarget = trigger.replyToId ? this.store.getMessage(trigger.replyToId) : undefined;
+    signals.mentionedIds = addressedPersonaIds(signals.mentionedIds, replyTarget);
     const candidates = this.actorChannels.candidatesFor(trigger.channelId, signals.mentionedIds);
     const attention = new Map(candidates.map((persona) => [persona.id, this.actorChannels.affinity(persona.id, trigger.channelId)]));
     let selected = selectResponders(candidates, signals, this.lastSpoke, Date.now(), Math.random, attention);
@@ -1000,6 +1139,55 @@ export class SocialDirector {
     this.ambientTimer = setTimeout(() => void this.runAmbient(), wait);
   }
 
+  private ambientChannelIsAvailable(channelId: string, now: number): boolean {
+    const thread = this.ambientThreads.get(channelId);
+    if (thread) {
+      if (thread.messageCount < AMBIENT_THREAD_MAX_MESSAGES) return true;
+      if (now - thread.updatedAt < AMBIENT_THREAD_COOLDOWN_MS) return false;
+      this.ambientThreads.delete(channelId);
+    }
+
+    // A known human event in this process explains any following AI tail: it
+    // is ordinary human-triggered conversation, not an unknown persisted
+    // autonomous chain from before startup.
+    if (this.lastHumanMessageAtByChannel.has(channelId)) return true;
+
+    // This survives process restarts: a recent synthetic tail must cool down
+    // before the director starts a fresh, explicitly anchored conversation.
+    const recent = this.store.getRecent(channelId, 80);
+    if (trailingAiMessageCount(recent) === 0) return true;
+    const latestNonSystem = [...recent].reverse().find((message) => !message.system);
+    const latestAt = latestNonSystem ? Date.parse(latestNonSystem.createdAt) : Number.NaN;
+    return !Number.isFinite(latestAt) || now - latestAt >= AMBIENT_THREAD_COOLDOWN_MS;
+  }
+
+  private getOrStartAmbientThread(channelId: string, now: number): AmbientThreadState | undefined {
+    const existing = this.ambientThreads.get(channelId);
+    if (existing) return existing.messageCount < AMBIENT_THREAD_MAX_MESSAGES ? existing : undefined;
+
+    const profile = getChannelProfile(channelId) ?? getChannelProfile("lobby");
+    if (!profile || profile.ambientPremises.length === 0) return undefined;
+    const previousSeed = this.lastAmbientSeedByChannel.get(channelId);
+    const freshSeeds = profile.ambientPremises.filter((seed) => seed !== previousSeed);
+    const seed = choose(freshSeeds.length > 0 ? freshSeeds : profile.ambientPremises, this.rng);
+    const recent = this.store.getRecent(channelId, 80);
+    const thread: AmbientThreadState = {
+      seed,
+      messageCount: 0,
+      languageHint: ambientLanguageHint(recent),
+      updatedAt: now,
+    };
+    this.ambientThreads.set(channelId, thread);
+    this.lastAmbientSeedByChannel.set(channelId, seed);
+    return thread;
+  }
+
+  private recordAmbientPost(thread: AmbientThreadState, message: ChatMessage): void {
+    thread.messageCount += 1;
+    thread.lastMessageId = message.id;
+    thread.updatedAt = this.now();
+  }
+
   private consideredConversationIsStillSafe(channelId: string, epoch: number, requiredSlots: number): boolean {
     const now = this.now();
     return (
@@ -1016,42 +1204,92 @@ export class SocialDirector {
     channel: (typeof CHANNELS)[number],
     epoch: number,
     plan: ConsideredConversationPlan,
+    thread: AmbientThreadState,
   ): Promise<void> {
     this.consideredConversationInFlight = true;
     this.lastConsideredConversationAt = this.now();
     this.setTyping(channel.id, plan.lead.id, true);
-    let lines: GeneratedLine[] = [];
+    let leadLine: GeneratedLine | undefined;
+    let responseLine: GeneratedLine | undefined;
     try {
       try {
-        lines = await this.lm.generateScene(
+        const history = this.transcript(channel.id, 18);
+        const leadLines = await this.lm.generateScene(
           {
             kind: "ambient",
             conversationMode: "considered",
+            consideredRole: "lead",
             channelId: channel.id,
             channelName: channel.name,
-            selected: [plan.lead, plan.responder],
-            history: this.transcript(channel.id, 30),
-            premise: consideredConversationPremise(plan),
-            mustReplyIds: [plan.lead.id, plan.responder.id],
-            actorChannelNotes: this.actorChannels.promptNotes([plan.lead, plan.responder], channel.id),
-            actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.lead, plan.responder], channel.id),
+            selected: [plan.lead],
+            history,
+            premise: consideredConversationLeadPremise(plan, thread.seed),
+            mustReplyIds: [plan.lead.id],
+            wordLimits: { [plan.lead.id]: { minimum: 45, maximum: 75 } },
+            languageHint: thread.languageHint,
+            actorChannelNotes: this.actorChannels.promptNotes([plan.lead], channel.id),
+            actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.lead], channel.id),
           },
           4,
         );
+        leadLine = leadLines.find((line) => line.personaId === plan.lead.id);
+        if (leadLine) {
+          const responseLines = await this.lm.generateScene(
+            {
+              kind: "ambient",
+              conversationMode: "considered",
+              consideredRole: "response",
+              consideredResponseRole: plan.responseRole,
+              channelId: channel.id,
+              channelName: channel.name,
+              selected: [plan.responder],
+              history: [
+                ...history,
+                {
+                  author: plan.lead.name,
+                  kind: "ai",
+                  content: leadLine.content,
+                  createdAt: new Date(this.now()).toISOString(),
+                },
+              ],
+              premise: consideredConversationResponsePremise(plan),
+              mustReplyIds: [plan.responder.id],
+              wordLimits: {
+                [plan.responder.id]: {
+                  minimum: Math.min(8, plan.responder.style.hardMaxWords),
+                  maximum: Math.min(
+                    plan.responseRole === "question" ? 24 : 28,
+                    plan.responder.style.hardMaxWords,
+                  ),
+                },
+              },
+              languageHint: thread.languageHint,
+              actorChannelNotes: this.actorChannels.promptNotes([plan.responder], channel.id),
+              actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.responder], channel.id),
+            },
+            4,
+          );
+          responseLine = responseLines.find((line) => line.personaId === plan.responder.id);
+        }
       } catch (error) {
         console.warn("Considered ambient scene skipped:", error instanceof Error ? error.message : error);
       } finally {
         this.setTyping(channel.id, plan.lead.id, false);
       }
 
-      const leadLine = lines.find((line) => line.personaId === plan.lead.id);
-      const responseLine = lines.find((line) => line.personaId === plan.responder.id);
       // A shallow fallback would undermine the point of this rare beat. If the
-      // model cannot produce both distinct roles, leave the room quiet instead.
+      // model cannot produce both distinct turns, leave the room quiet instead.
       if (!leadLine || !responseLine || !this.consideredConversationIsStillSafe(channel.id, epoch, 2)) return;
 
-      const leadMessage = this.postPublic(channel.id, plan.lead, leadLine.content, undefined, leadLine.source);
+      const leadMessage = this.postPublic(
+        channel.id,
+        plan.lead,
+        leadLine.content,
+        thread.lastMessageId,
+        leadLine.source,
+      );
       if (!leadMessage) return;
+      this.recordAmbientPost(thread, leadMessage);
 
       this.setTyping(channel.id, plan.responder.id, true);
       await delay(3_200 + this.rng() * 2_800);
@@ -1059,9 +1297,15 @@ export class SocialDirector {
 
       let responsePosted = false;
       if (this.consideredConversationIsStillSafe(channel.id, epoch, 1)) {
-        responsePosted = Boolean(
-          this.postPublic(channel.id, plan.responder, responseLine.content, leadMessage.id, responseLine.source),
+        const responseMessage = this.postPublic(
+          channel.id,
+          plan.responder,
+          responseLine.content,
+          leadMessage.id,
+          responseLine.source,
         );
+        responsePosted = Boolean(responseMessage);
+        if (responseMessage) this.recordAmbientPost(thread, responseMessage);
       }
       this.publishDirectorEvent({
         trigger: "ambient",
@@ -1082,15 +1326,19 @@ export class SocialDirector {
 
   private async runAmbient(): Promise<void> {
     try {
+      const lmHealth = this.lm.health();
       if (
         this.getOnlineHumanCount() < 1 ||
-        this.lm.health().queueDepth > 1 ||
+        !lmHealth.connected ||
+        lmHealth.queueDepth > 1 ||
         this.voiceRoomActive ||
         this.consideredConversationInFlight
       ) return;
       const now = this.now();
       const channel = CHANNELS.filter(
-        (candidate) => now - (this.lastHumanMessageAtByChannel.get(candidate.id) ?? 0) > 18_000,
+        (candidate) =>
+          now - (this.lastHumanMessageAtByChannel.get(candidate.id) ?? 0) > 18_000 &&
+          this.ambientChannelIsAvailable(candidate.id, now),
       )
         .map((candidate) => {
           const lastMessage = this.store.getRecent(candidate.id, 1)[0];
@@ -1100,7 +1348,13 @@ export class SocialDirector {
         })
         .sort((a, b) => b.score - a.score)[0]?.candidate;
       if (!channel) return;
+      this.lastAmbientChannelId = channel.id;
+      const thread = this.getOrStartAmbientThread(channel.id, now);
+      if (!thread) return;
       const epoch = this.channelEpoch.get(channel.id) ?? 0;
+      const remainingThreadSlots = AMBIENT_THREAD_MAX_MESSAGES - thread.messageCount;
+      const availableSlots = Math.min(2, remainingThreadSlots, this.availableMessageSlots(now));
+      if (availableSlots < 1) return;
       const available = this.actorChannels
         .candidatesFor(channel.id)
         .filter(
@@ -1109,16 +1363,16 @@ export class SocialDirector {
             persona.id !== "ai-robin" &&
             now - (this.lastSpoke.get(persona.id) ?? 0) > persona.cooldownMs,
         );
-      if (available.length < 2) return;
-      const startConsidered = shouldStartConsideredConversation({
+      if (available.length < 1) return;
+      const startConsidered = available.length >= 2 && shouldStartConsideredConversation({
         now,
         lastStartedAt: this.lastConsideredConversationAt,
         lastHumanActivityAt: this.lastHumanActivityAt,
         cooldownMs: this.consideredConversationCooldownMs,
         humanQuietMs: this.consideredConversationHumanQuietMs,
         chance: this.consideredConversationChance,
-        queueDepth: this.lm.health().queueDepth,
-        availableMessageSlots: this.availableMessageSlots(now),
+        queueDepth: lmHealth.queueDepth,
+        availableMessageSlots: availableSlots,
         voiceRoomActive: this.voiceRoomActive,
         alreadyInFlight: this.consideredConversationInFlight,
         rng: this.rng,
@@ -1133,15 +1387,15 @@ export class SocialDirector {
           )
         : undefined;
       if (consideredPlan) {
-        await this.runConsideredConversation(channel, epoch, consideredPlan);
-        this.lastAmbientChannelId = channel.id;
+        await this.runConsideredConversation(channel, epoch, consideredPlan, thread);
         return;
       }
-      const weighted = available.filter(
-        (persona) =>
-          this.rng() < persona.talkativeness + this.actorChannels.affinity(persona.id, channel.id) * 0.28,
+      const first = selectAmbientLead(
+        available,
+        (personaId) => this.actorChannels.affinity(personaId, channel.id),
+        this.rng,
       );
-      const first = choose(weighted.length ? weighted : available, this.rng);
+      if (!first) return;
       const possibleSeconds = available.filter((persona) => persona.id !== first.id);
       const debateBeat = this.rng() < 0.24;
       const dissenters = possibleSeconds.filter((persona) =>
@@ -1149,15 +1403,20 @@ export class SocialDirector {
           ? (persona.disagreement ?? 0) < 0.65
           : (persona.disagreement ?? 0) >= 0.65,
       );
-      const second = debateBeat && dissenters.length > 0
-        ? choose(dissenters, this.rng)
-        : choose(possibleSeconds, this.rng);
-      const selected = this.rng() < 0.7 ? [first, second] : [first];
-      const ambientPremises = getChannelProfile(channel.id)?.ambientPremises ?? getChannelProfile("lobby")!.ambientPremises;
-      const basePremise = choose(ambientPremises, this.rng);
-      const premise = debateBeat && selected.length > 1
-        ? `${basePremise} ${second.name} should respectfully push back with a specific counterpoint; do not make both characters agree.`
-        : basePremise;
+      const second = possibleSeconds.length > 0
+        ? debateBeat && dissenters.length > 0
+          ? choose(dissenters, this.rng)
+          : choose(possibleSeconds, this.rng)
+        : undefined;
+      const selected = availableSlots >= 2 && second && this.rng() < 0.78 ? [first, second] : [first];
+      const premise = ambientConversationPremise(
+        thread.seed,
+        first,
+        selected[1],
+        thread.messageCount > 0,
+        debateBeat && selected.length > 1,
+      );
+      const wordLimits = ambientSceneWordLimits(first, selected[1], thread.messageCount > 0);
       for (const persona of selected.slice(0, 2)) this.setTyping(channel.id, persona.id, true);
       let lines: GeneratedLine[] = [];
       try {
@@ -1167,8 +1426,10 @@ export class SocialDirector {
             channelId: channel.id,
             channelName: channel.name,
             selected,
-            history: this.transcript(channel.id, 25),
+            history: this.transcript(channel.id, 18),
             premise,
+            wordLimits,
+            languageHint: thread.languageHint,
             actorChannelNotes: this.actorChannels.promptNotes(selected, channel.id),
             actorExpertiseNotes: this.actorChannels.expertiseNotes(selected, channel.id),
           },
@@ -1180,46 +1441,60 @@ export class SocialDirector {
         for (const persona of selected.slice(0, 2)) this.setTyping(channel.id, persona.id, false);
       }
       if (epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
-      if (lines.length === 0) {
-        lines = [{ personaId: first.id, content: this.ambientFallback(first), source: "fallback", sourceIds: [] }];
-      }
-
-      this.publishDirectorEvent({
-        trigger: "ambient",
-        summary: `${first.name} broke a quiet spell in #${channel.name}; most residents stayed elsewhere.`,
-        considered: PERSONAS.length,
-        noticed: selected.length + 1,
-        replied: lines.length,
-        reacted: 1,
-      });
-      for (const [index, line] of lines.slice(0, 2).entries()) {
+      const leadLine = lines.find((line) => line.personaId === first.id);
+      if (!leadLine) return;
+      const orderedLines = [
+        leadLine,
+        ...selected
+          .slice(1)
+          .map((persona) => lines.find((line) => line.personaId === persona.id))
+          .filter((line): line is GeneratedLine => Boolean(line)),
+      ].slice(0, availableSlots);
+      const postedMessages: Array<{ message: ChatMessage; persona: Persona }> = [];
+      for (const [index, line] of orderedLines.entries()) {
         const persona = selected.find((candidate) => candidate.id === line.personaId);
-        if (!persona || !this.canSpeak()) continue;
+        if (!persona || !this.canSpeak() || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) break;
         if (index > 0) await delay(2_000 + this.rng() * 2_500);
-        const posted = this.postPublic(channel.id, persona, line.content, undefined, line.source);
-        if (posted && index === 0) {
+        if (!this.canSpeak() || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) break;
+        const posted = this.postPublic(channel.id, persona, line.content, thread.lastMessageId, line.source);
+        if (!posted) {
+          if (index === 0) break;
+          continue;
+        }
+        this.recordAmbientPost(thread, posted);
+        postedMessages.push({ message: posted, persona });
+        if (postedMessages.length === 1) {
           const reactors = this.actorChannels.candidatesFor(channel.id).filter((candidate) => !selected.includes(candidate));
           const reactor = reactors.length > 0 ? choose(reactors, this.rng) : undefined;
-          if (!reactor) continue;
-          setTimeout(() => {
-            const reaction = this.store.togglePublicReaction(
-              channel.id,
-              posted.id,
-              choose(["👀", "😂", "🤔", "✨"], this.rng),
-              reactor.id,
-              true,
-            );
-            if (reaction) {
-              this.io.to("public").emit("reaction:update", {
-                messageId: posted.id,
-                channelId: channel.id,
-                reaction,
-              });
-            }
-          }, 900 + this.rng() * 1_600);
+          if (reactor) {
+            setTimeout(() => {
+              const reaction = this.store.togglePublicReaction(
+                channel.id,
+                posted.id,
+                choose(["👀", "😂", "🤔", "✨"], this.rng),
+                reactor.id,
+                true,
+              );
+              if (reaction) {
+                this.io.to("public").emit("reaction:update", {
+                  messageId: posted.id,
+                  channelId: channel.id,
+                  reaction,
+                });
+              }
+            }, 900 + this.rng() * 1_600);
+          }
         }
       }
-      this.lastAmbientChannelId = channel.id;
+      if (postedMessages.length === 0) return;
+      this.publishDirectorEvent({
+        trigger: "ambient",
+        summary: `${postedMessages.map(({ persona }) => persona.name).join(" + ")} advanced one bounded thread in #${channel.name}.`,
+        considered: PERSONAS.length,
+        noticed: Math.min(PERSONAS.length, postedMessages.length + 1),
+        replied: postedMessages.length,
+        reacted: 1,
+      });
     } finally {
       this.scheduleAmbient();
     }
@@ -1465,15 +1740,4 @@ export class SocialDirector {
     return `okay ${humanName}, that image definitely got my attention`;
   }
 
-  private ambientFallback(persona: Persona): string {
-    const lines: Record<string, string> = {
-      "ai-mira": "tiny theory: every good community needs at least one completely unnecessary recurring argument",
-      "ai-bosse": "quiet in here. suspicious. who is buffering",
-      "ai-sana": "I love when a half-joke quietly turns into an actually buildable idea.",
-      "ai-kim": "I need the room's ruling: leftovers for breakfast, visionary or criminal?",
-      "ai-pixel": "Some interfaces feel like rooms. Others feel like tax forms wearing gradients.",
-      "ai-juno": "This chat has the energy of a group project where everyone chose lore.",
-    };
-    return lines[persona.id] ?? "The room got quiet enough that I could hear everyone thinking.";
-  }
 }

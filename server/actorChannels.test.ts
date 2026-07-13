@@ -44,6 +44,40 @@ describe("actor channel runtime", () => {
     expect(runtime.candidatesFor("stock-market", [outsider!.id]).map((persona) => persona.id)).toContain(outsider!.id);
   });
 
+  it("keeps specialist-room rosters selective without leaving a room empty", () => {
+    const runtime = new ActorChannelRuntime();
+    const specialistChannels = [
+      "ai-lab",
+      "ai-programming",
+      "stock-market",
+      "world-of-warcraft",
+      "3d-visualisation",
+    ];
+
+    for (const channelId of specialistChannels) {
+      const candidates = runtime.candidatesFor(channelId);
+      expect(candidates.length).toBeGreaterThanOrEqual(4);
+      expect(candidates.length).toBeLessThan(PERSONAS.length);
+    }
+  });
+
+  it("keeps KimchiKungen in social rooms while direct mentions still reach specialist rooms", () => {
+    const runtime = new ActorChannelRuntime();
+
+    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "side-quests"]);
+    expect(runtime.candidatesFor("ai-programming").map((persona) => persona.id)).not.toContain("ai-kim");
+    expect(runtime.candidatesFor("ai-programming", ["ai-kim"]).map((persona) => persona.id)).toContain("ai-kim");
+  });
+
+  it("does not restore an obsolete focus from a room the actor no longer subscribes to", () => {
+    const runtime = new ActorChannelRuntime();
+    runtime.restore([createMessage("world-of-warcraft", "ai-kim", "an old out-of-roster post")]);
+
+    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "side-quests"]);
+    expect(runtime.snapshot("ai-kim")?.focusChannelId).toBe("side-quests");
+    expect(runtime.snapshot("ai-kim")?.lastSpokeAtByChannel["world-of-warcraft"]).toBeDefined();
+  });
+
   it("restores an actor's last channel focus from persisted history", () => {
     const runtime = new ActorChannelRuntime();
     runtime.restore([createMessage("side-quests", "ai-pixel", "tiny art quest")]);

@@ -23,6 +23,7 @@ interface ActorChannelState {
 const clamp = (value: number, min = 0, max = 1) => Math.max(min, Math.min(max, value));
 
 const expertiseAffinityBonus = [0.02, 0.08, 0.14, 0.2, 0.26] as const;
+const SUBSCRIPTION_AFFINITY_THRESHOLD = 0.4;
 
 const deriveAffinity = (persona: Persona, channelId: string, expertise: ActorRoomExpertise): number => {
   const explicit = persona.channelAffinity?.[channelId];
@@ -54,7 +55,9 @@ export class ActorChannelRuntime {
       )[0]?.id ?? "lobby";
       this.states.set(persona.id, {
         personaId: persona.id,
-        subscribedChannels: CHANNELS.filter((channel) => (affinities[channel.id] ?? 0) >= 0.28).map(
+        subscribedChannels: CHANNELS.filter(
+          (channel) => (affinities[channel.id] ?? 0) >= SUBSCRIPTION_AFFINITY_THRESHOLD,
+        ).map(
           (channel) => channel.id,
         ),
         focusChannelId,
@@ -73,7 +76,19 @@ export class ActorChannelRuntime {
     ).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     for (const message of recentPerChannel) {
       this.noteChannelEvent(message);
-      if (message.authorId.startsWith("ai-")) this.markSpoke(message.authorId, message.channelId, message.id);
+      if (!message.authorId.startsWith("ai-")) continue;
+      const state = this.states.get(message.authorId);
+      if (!state) continue;
+      if (state.subscribedChannels.includes(message.channelId)) {
+        this.markSpoke(message.authorId, message.channelId, message.id);
+      } else {
+        // Keep historical metadata without resurrecting an obsolete focus in a
+        // room this actor no longer subscribes to after a roster change.
+        state.lastSpokeAtByChannel[message.channelId] = Date.now();
+        state.lastReadMessageByChannel[message.channelId] = message.id;
+        state.lastReadAtByChannel[message.channelId] = Date.now();
+        state.unreadByChannel[message.channelId] = 0;
+      }
     }
   }
 
