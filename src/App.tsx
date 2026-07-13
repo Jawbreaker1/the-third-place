@@ -30,6 +30,11 @@ import type {
   VoiceTranscriptEntry,
 } from "../shared/types";
 import { VoicePeerMesh } from "./voicePeer";
+import {
+  createBrowserVoicePlaybackController,
+  type VoiceAiSpeechPayload,
+  type VoicePlaybackController,
+} from "./voicePlayback";
 
 const REACTIONS = ["👍", "👀", "😂", "💀", "🤔", "💛", "🔥", "✨"];
 const CLIENT_CHANNEL_MESSAGE_LIMIT = 600;
@@ -38,7 +43,6 @@ type ConnectionState = "preview" | "connecting" | "live" | "reconnecting" | "off
 type Panel = "rooms" | "people" | null;
 type VoiceJoinState = "idle" | "requesting-permission" | "joining" | "connected" | "reconnecting" | "leaving" | "error";
 type VoiceRecordingState = "idle" | "recording" | "uploading" | "error";
-type VoiceAiSpeech = { roomId: string; memberId: string; text: string; audioUrl?: string };
 type ImageDraft = {
   id: string;
   channelId: string;
@@ -213,6 +217,63 @@ const MessageText = ({ content, members }: { content: string; members: Member[] 
   );
 };
 
+type RemoteVoiceAudioProps = {
+  memberId: string;
+  stream?: MediaStream;
+  muted: boolean;
+  onAttach: (memberId: string, node: HTMLAudioElement | null) => void;
+  onPlaybackState: (memberId: string, blocked: boolean) => void;
+};
+
+const RemoteVoiceAudio = ({ memberId, stream, muted, onAttach, onPlaybackState }: RemoteVoiceAudioProps) => {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    const node = audioRef.current;
+    if (!node) return;
+    onAttach(memberId, node);
+    return () => {
+      node.srcObject = null;
+      onAttach(memberId, null);
+    };
+  }, [memberId, onAttach]);
+
+  useEffect(() => {
+    const node = audioRef.current;
+    if (!node) return;
+    let current = true;
+    node.srcObject = stream ?? null;
+    if (!stream) {
+      onPlaybackState(memberId, false);
+      return;
+    }
+    void node.play().then(
+      () => { if (current) onPlaybackState(memberId, false); },
+      () => { if (current) onPlaybackState(memberId, true); },
+    );
+    return () => {
+      current = false;
+      if (node.srcObject === stream) node.srcObject = null;
+    };
+  }, [memberId, onPlaybackState, stream]);
+
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.muted = muted;
+  }, [muted]);
+
+  return (
+    <audio
+      className="remote-audio"
+      autoPlay
+      playsInline
+      muted={muted}
+      ref={audioRef}
+      onPlaying={() => onPlaybackState(memberId, false)}
+      onError={() => onPlaybackState(memberId, true)}
+    />
+  );
+};
+
 export default function App() {
   const [preview, setPreview] = useState<PublicPreview | null>(null);
   const [me, setMe] = useState<Member | null>(null);
@@ -258,7 +319,8 @@ export default function App() {
   const [voiceRecording, setVoiceRecording] = useState<VoiceRecordingState>("idle");
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceCreateOpen, setVoiceCreateOpen] = useState(false);
-  const [voiceAudioBlocked, setVoiceAudioBlocked] = useState(false);
+  const [voiceAiAudioBlocked, setVoiceAiAudioBlocked] = useState(false);
+  const [voiceRemoteAudioBlocked, setVoiceRemoteAudioBlocked] = useState(false);
   const [voiceBrowserSpeech, setVoiceBrowserSpeech] = useState(false);
   const [voiceTranscripts, setVoiceTranscripts] = useState<Record<string, VoiceTranscriptEntry[]>>({});
   const [voiceTypedTurn, setVoiceTypedTurn] = useState("");
@@ -285,7 +347,8 @@ export default function App() {
   const voiceJoinGeneration = useRef(0);
   const voiceRemoteStreams = useRef(new Map<string, MediaStream>());
   const voiceRemoteAudio = useRef(new Map<string, HTMLAudioElement>());
-  const voiceAiAudio = useRef(new Set<HTMLAudioElement>());
+  const voiceRemoteAudioBlockedMembers = useRef(new Set<string>());
+  const voicePlaybackRef = useRef<VoicePlaybackController | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceChunksRef = useRef<Blob[]>([]);
   const voiceTurnBytesRef = useRef(0);
@@ -298,6 +361,35 @@ export default function App() {
   const voiceVadFrameRef = useRef<number | undefined>(undefined);
   const voiceVadSpeakingRef = useRef(false);
   const voiceVadLastEmitRef = useRef(0);
+  const voiceAudioBlocked = voiceAiAudioBlocked || voiceRemoteAudioBlocked;
+
+  const getVoicePlayback = useCallback((): VoicePlaybackController => {
+    voicePlaybackRef.current ??= createBrowserVoicePlaybackController({
+      onAutoplayBlocked: setVoiceAiAudioBlocked,
+      onModeChanged: (mode) => setVoiceBrowserSpeech(mode === "browser"),
+      onUnavailable: (_speech, reason) => {
+        if (reason === "browser fallback disabled") {
+          setVoiceError("AI speech audio is unavailable on this server; the transcript is still shown.");
+        }
+      },
+    });
+    return voicePlaybackRef.current;
+  }, []);
+
+  const setRemoteAudioPlaybackState = useCallback((memberId: string, blocked: boolean) => {
+    if (blocked) voiceRemoteAudioBlockedMembers.current.add(memberId);
+    else voiceRemoteAudioBlockedMembers.current.delete(memberId);
+    setVoiceRemoteAudioBlocked(voiceRemoteAudioBlockedMembers.current.size > 0);
+  }, []);
+
+  const attachRemoteVoiceAudio = useCallback((memberId: string, node: HTMLAudioElement | null) => {
+    if (node) voiceRemoteAudio.current.set(memberId, node);
+    else {
+      voiceRemoteAudio.current.delete(memberId);
+      voiceRemoteAudioBlockedMembers.current.delete(memberId);
+      setVoiceRemoteAudioBlocked(voiceRemoteAudioBlockedMembers.current.size > 0);
+    }
+  }, []);
 
   const revokeDraftPreview = useCallback((draft?: ImageDraft) => {
     if (!draft?.previewUrl || !imageObjectUrls.current.has(draft.previewUrl)) return;
@@ -354,6 +446,9 @@ export default function App() {
     let quietSince = performance.now();
     const emitSpeaking = (speaking: boolean, now: number) => {
       if (voiceVadSpeakingRef.current === speaking || now - voiceVadLastEmitRef.current < 250) return;
+      // This VAD drives human presence only. Speaker/remote echo can reach the
+      // microphone even with AEC, so it must not barge into AI playback. The
+      // explicit push-to-talk and typed-turn paths below own local AI barge-in.
       voiceVadSpeakingRef.current = speaking;
       voiceVadLastEmitRef.current = now;
       if (!joinedVoiceRoomRef.current) return;
@@ -411,15 +506,12 @@ export default function App() {
     localVoiceStreamRef.current = null;
     for (const audio of voiceRemoteAudio.current.values()) audio.srcObject = null;
     voiceRemoteAudio.current.clear();
+    voiceRemoteAudioBlockedMembers.current.clear();
     voiceRemoteStreams.current.clear();
-    for (const audio of voiceAiAudio.current) {
-      audio.onerror = null;
-      audio.onended = null;
-      audio.pause();
-      audio.src = "";
-    }
-    voiceAiAudio.current.clear();
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    voicePlaybackRef.current?.reset();
+    setVoiceAiAudioBlocked(false);
+    setVoiceRemoteAudioBlocked(false);
+    setVoiceBrowserSpeech(false);
     setRemoteStreamRevision((value) => value + 1);
     voiceMutedRef.current = true;
     voiceRecordingRef.current = false;
@@ -487,46 +579,10 @@ export default function App() {
     return stream;
   }, [startVoiceVad]);
 
-  const speakWithBrowserVoice = useCallback((speech: VoiceAiSpeech) => {
-    if (speech.roomId !== joinedVoiceRoomRef.current || voiceDeafenedRef.current || !speech.text || !("speechSynthesis" in window)) return;
-    setVoiceBrowserSpeech(true);
-    window.speechSynthesis.speak(new SpeechSynthesisUtterance(speech.text));
-  }, []);
-
-  const playVoiceAiSpeech = useCallback((speech: VoiceAiSpeech) => {
+  const playVoiceAiSpeech = useCallback((speech: VoiceAiSpeechPayload) => {
     if (speech.roomId !== joinedVoiceRoomRef.current || voiceDeafenedRef.current) return;
-    if (speech.audioUrl) {
-      try {
-        const url = new URL(speech.audioUrl, window.location.origin);
-        if (url.origin !== window.location.origin) throw new Error("cross-origin voice audio");
-        const audio = new Audio(url.toString());
-        let fellBack = false;
-        const fallBack = () => {
-          if (fellBack) return;
-          fellBack = true;
-          voiceAiAudio.current.delete(audio);
-          audio.onerror = null;
-          audio.pause();
-          audio.src = "";
-          speakWithBrowserVoice(speech);
-        };
-        voiceAiAudio.current.add(audio);
-        audio.onended = () => voiceAiAudio.current.delete(audio);
-        audio.onerror = fallBack;
-        void audio.play().catch((error: unknown) => {
-          if (error instanceof DOMException && error.name === "NotAllowedError") {
-            setVoiceAudioBlocked(true);
-            return;
-          }
-          fallBack();
-        });
-        return;
-      } catch {
-        // Fall through to the clearly disclosed browser voice.
-      }
-    }
-    speakWithBrowserVoice(speech);
-  }, [speakWithBrowserVoice]);
+    getVoicePlayback().enqueue(speech);
+  }, [getVoicePlayback]);
 
   const applySnapshot = useCallback((snapshot: RoomSnapshot) => {
     shouldStickToBottom.current = true;
@@ -644,14 +700,9 @@ export default function App() {
     socket.on("voice:ai-speech", playVoiceAiSpeech);
     socket.on("voice:ai-stop", (payload: { roomId: string }) => {
       if (payload.roomId !== joinedVoiceRoomRef.current) return;
-      for (const audio of voiceAiAudio.current) {
-        audio.onerror = null;
-        audio.onended = null;
-        audio.pause();
-        audio.src = "";
-      }
-      voiceAiAudio.current.clear();
-      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      voicePlaybackRef.current?.stop();
+      setVoiceAiAudioBlocked(false);
+      setVoiceBrowserSpeech(false);
     });
     socket.on("voice:bot:state", (payload: { roomId: string; memberId: string; botState: VoiceRoomView["participants"][number]["botState"]; speaking?: boolean }) => {
       setVoiceRooms((current) => current.map((room) => room.id !== payload.roomId ? room : {
@@ -1205,11 +1256,34 @@ export default function App() {
     setVoiceDeafened(next);
     voiceDeafenedRef.current = next;
     for (const audio of voiceRemoteAudio.current.values()) audio.muted = next;
-    for (const audio of voiceAiAudio.current) audio.muted = next;
-    if (next && "speechSynthesis" in window) window.speechSynthesis.cancel();
+    getVoicePlayback().setDeafened(next);
+    if (next) {
+      voiceRemoteAudioBlockedMembers.current.clear();
+      setVoiceAiAudioBlocked(false);
+      setVoiceRemoteAudioBlocked(false);
+      setVoiceBrowserSpeech(false);
+    }
     if (joinedVoiceRoomRef.current) {
       socketRef.current?.emit("voice:self-state", { roomId: joinedVoiceRoomRef.current, muted: voiceMuted, deafened: next });
     }
+  };
+
+  const enableVoiceSound = async () => {
+    if (voiceDeafenedRef.current) return;
+    const remoteEntries = [...voiceRemoteAudio.current.entries()];
+    const remoteRetry = Promise.allSettled(remoteEntries.map(async ([, audio]) => {
+      audio.muted = false;
+      await audio.play();
+    }));
+    const [remoteResults] = await Promise.all([remoteRetry, getVoicePlayback().retryBlocked()]);
+    voiceRemoteAudioBlockedMembers.current.clear();
+    remoteResults.forEach((result, index) => {
+      if (result.status === "rejected") {
+        const memberId = remoteEntries[index]?.[0];
+        if (memberId) voiceRemoteAudioBlockedMembers.current.add(memberId);
+      }
+    });
+    setVoiceRemoteAudioBlocked(voiceRemoteAudioBlockedMembers.current.size > 0);
   };
 
   const uploadVoiceTurn = useCallback(async (roomId: string, blob: Blob, mimeType: string) => {
@@ -1254,6 +1328,11 @@ export default function App() {
       setVoiceError(describeMicrophoneError(error));
       return;
     }
+    // Push-to-talk is a human barge-in: do not make them wait for the current
+    // bot clip (or any queued bot clip) before their turn can begin.
+    voicePlaybackRef.current?.bargeIn();
+    setVoiceAiAudioBlocked(false);
+    setVoiceBrowserSpeech(false);
     const mimeType = [
       "audio/webm;codecs=opus",
       "audio/ogg;codecs=opus",
@@ -1312,6 +1391,9 @@ export default function App() {
     const roomId = joinedVoiceRoomRef.current;
     const text = voiceTypedTurn.trim();
     if (!roomId || !text || !socketRef.current) return;
+    voicePlaybackRef.current?.bargeIn();
+    setVoiceAiAudioBlocked(false);
+    setVoiceBrowserSpeech(false);
     socketRef.current.emit("voice:text-turn", { roomId, text }, (result: ActionResult) => {
       if (!result.ok) {
         setVoiceError(result.error);
@@ -1576,8 +1658,8 @@ export default function App() {
 
                 <div className="voice-stage-scroll">
                   {voiceError && <div className="voice-error" role="alert"><Icon name="info" size={16} /><span>{voiceError}</span><button type="button" onClick={() => setVoiceError(null)}><Icon name="close" size={14} /></button></div>}
-                  {voiceAudioBlocked && <div className="voice-audio-banner"><Icon name="speaker" size={16} /><span>Audio is ready but the browser paused playback.</span><button type="button" onClick={() => { for (const audio of [...voiceRemoteAudio.current.values(), ...voiceAiAudio.current]) void audio.play(); setVoiceAudioBlocked(false); }}>Enable sound</button></div>}
-                  {voiceBrowserSpeech && <div className="voice-browser-disclosure"><Icon name="info" size={13} /> AI speech is using your browser's synthetic voice because local TTS is unavailable.</div>}
+                  {voiceAudioBlocked && <div className="voice-audio-banner"><Icon name="speaker" size={16} /><span>Audio is ready but the browser paused playback.</span><button type="button" onClick={() => void enableVoiceSound()}>Enable sound</button></div>}
+                  {voiceBrowserSpeech && <div className="voice-browser-disclosure"><Icon name="info" size={13} /> AI speech is using this browser's disclosed fallback voice.</div>}
 
                   <div className={`voice-grid voice-grid-${Math.min(voiceRoomInView.participants.length, 4)}`}>
                     {voiceRoomInView.participants.map((participant) => {
@@ -1594,20 +1676,12 @@ export default function App() {
                           </span>
                           {participant.kind === "ai" && voiceRoomInView.hostMemberId === me?.id && <button type="button" className="voice-remove-bot" onClick={() => removeVoiceBot(participant.memberId)} aria-label={`Remove ${participant.name} from voice`}><Icon name="close" size={13} /></button>}
                           {participant.kind === "human" && !isMe && (
-                            <audio
-                              className="remote-audio"
-                              autoPlay
-                              playsInline
-                              ref={(node) => {
-                                if (!node) {
-                                  voiceRemoteAudio.current.delete(participant.memberId);
-                                  return;
-                                }
-                                voiceRemoteAudio.current.set(participant.memberId, node);
-                                node.srcObject = voiceRemoteStreams.current.get(participant.memberId) ?? null;
-                                node.muted = voiceDeafened;
-                                if (node.srcObject) void node.play().catch(() => setVoiceAudioBlocked(true));
-                              }}
+                            <RemoteVoiceAudio
+                              memberId={participant.memberId}
+                              stream={voiceRemoteStreams.current.get(participant.memberId)}
+                              muted={voiceDeafened}
+                              onAttach={attachRemoteVoiceAudio}
+                              onPlaybackState={setRemoteAudioPlaybackState}
                             />
                           )}
                         </article>

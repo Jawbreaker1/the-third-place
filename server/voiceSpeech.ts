@@ -131,6 +131,8 @@ export interface VoiceSpeechServiceOptions {
   normalizer?: AudioNormalizerLike;
   audioStore?: TtsAudioStore;
   now?: () => number;
+  /** Provider voice IDs that callers can supply on each synthesis request. */
+  ttsVoices?: readonly string[];
 }
 
 interface ProviderConfig {
@@ -145,6 +147,7 @@ interface SttProviderConfig extends ProviderConfig {}
 interface TtsProviderConfig extends ProviderConfig {
   defaultVoice?: string;
   defaultFormat: TtsFormat;
+  allowedVoices: ReadonlySet<string>;
 }
 
 interface ProcessFailureOptions {
@@ -218,6 +221,13 @@ const parseTtsFormat = (raw: string | undefined, fallback: TtsFormat = "mp3"): T
     : fallback;
 };
 
+const isLoopbackHostname = (hostname: string): boolean => {
+  const normalized = hostname.toLocaleLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized.endsWith(".localhost") || normalized === "::1") return true;
+  const octets = normalized.split(".");
+  return octets.length === 4 && octets.every((octet) => /^\d{1,3}$/.test(octet)) && Number(octets[0]) === 127;
+};
+
 const validateConfiguredBaseUrl = (raw: string): URL => {
   if (raw.length > 2_048 || /[\u0000-\u001f\u007f]/.test(raw)) {
     throw new VoiceSpeechError("Speech provider URL is invalid.", 500, "INVALID_PROVIDER_URL");
@@ -237,6 +247,13 @@ const validateConfiguredBaseUrl = (raw: string): URL => {
     !url.hostname
   ) {
     throw new VoiceSpeechError("Speech provider URL must be a trusted HTTP(S) base URL.", 500, "INVALID_PROVIDER_URL");
+  }
+  if (url.protocol === "http:" && !isLoopbackHostname(url.hostname)) {
+    throw new VoiceSpeechError(
+      "Plain HTTP speech providers must use a loopback hostname; use HTTPS for remote providers.",
+      500,
+      "INSECURE_PROVIDER_URL",
+    );
   }
   url.pathname = url.pathname.replace(/\/+$/, "");
   return url;
@@ -683,6 +700,9 @@ class OpenAiCompatibleTtsProvider {
     const text = sanitizeText(input.text, TTS_TEXT_MAX_CHARS);
     if (!text) throw new VoiceSpeechError("Speech text was empty.", 400, "EMPTY_SPEECH_TEXT");
     const voice = sanitizeIdentifier(input.voice ?? this.config.defaultVoice ?? "", "TTS voice", 80);
+    if (!this.config.allowedVoices.has(voice)) {
+      throw new VoiceSpeechError("That TTS voice is not configured for this server.", 400, "UNCONFIGURED_TTS_VOICE");
+    }
     const format = parseTtsFormat(input.format, this.config.defaultFormat);
     if (input.speed !== undefined && !Number.isFinite(input.speed)) {
       throw new VoiceSpeechError("TTS speed is invalid.", 400, "INVALID_TTS_SPEED");
@@ -825,11 +845,19 @@ export class VoiceSpeechService {
     const baseSttConfig = providerConfig("STT", env);
     const baseTtsConfig = providerConfig("TTS", env);
     this.sttConfig = baseSttConfig;
-    this.ttsConfig = baseTtsConfig
+    const defaultTtsVoice = env.TTS_VOICE?.trim()
+      ? sanitizeIdentifier(env.TTS_VOICE.trim(), "TTS voice", 80)
+      : undefined;
+    const perCallTtsVoices = new Set(
+      (options.ttsVoices ?? []).map((voice) => sanitizeIdentifier(voice, "TTS voice", 80)),
+    );
+    if (defaultTtsVoice) perCallTtsVoices.add(defaultTtsVoice);
+    this.ttsConfig = baseTtsConfig && perCallTtsVoices.size > 0
       ? {
           ...baseTtsConfig,
-          ...(env.TTS_VOICE?.trim() ? { defaultVoice: env.TTS_VOICE.trim() } : {}),
-          defaultFormat: parseTtsFormat(env.TTS_FORMAT),
+          ...(defaultTtsVoice ? { defaultVoice: defaultTtsVoice } : {}),
+          defaultFormat: parseTtsFormat(env.TTS_FORMAT, baseTtsConfig.model === "piper-sv" ? "wav" : "mp3"),
+          allowedVoices: perCallTtsVoices,
         }
       : undefined;
     this.normalizer = options.normalizer ?? new AudioNormalizer({
@@ -856,7 +884,9 @@ export class VoiceSpeechService {
         available: Boolean(this.tts),
         provider: this.tts ? "openai-compatible" : "disabled",
         ...(this.ttsConfig ? { model: this.ttsConfig.model } : {}),
-        formats: ["mp3", "opus", "aac", "wav", "flac", "pcm"],
+        formats: this.ttsConfig?.model === "piper-sv"
+          ? ["wav"]
+          : ["mp3", "opus", "aac", "wav", "flac", "pcm"],
         ...(this.ttsConfig?.defaultVoice ? { defaultVoice: this.ttsConfig.defaultVoice } : {}),
       },
       normalizer: {

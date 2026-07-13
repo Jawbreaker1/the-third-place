@@ -1,5 +1,29 @@
 # Third-party notices
 
+## Optional Piper TTS runtime and Swedish voices
+
+`npm run setup:tts` optionally downloads `piper-tts==1.4.2` into the ignored,
+isolated `.venv-tts` directory. Piper is licensed under GPL-3.0-or-later. It is
+run as an independent loopback HTTP sidecar and is not linked into or
+redistributed with the Node application. Source and license information:
+https://github.com/OHF-Voice/piper1-gpl
+
+The setup also pins `onnxruntime==1.24.4`, `pathvalidate==3.3.1` and
+`numpy==2.4.4` as a verified compatibility set. Other transitive Python
+dependencies are resolved at installation time and are not yet protected by a
+cross-platform hash lock.
+
+The setup script also downloads Lisa and NST Swedish ONNX voice assets from
+`rhasspy/piper-voices` at immutable revision
+`e21c7de8d4eab79b902f0d61e662b3f21664b8d2`. The upstream repository declares
+MIT metadata. NST's model card names a CC0 dataset. Lisa's model card documents
+its Norwegian talesyntese fine-tune provenance but does not state an explicit
+dataset/model license. The assets are not committed or bundled; review their
+downloaded `MODEL_CARD` files before redistribution. Exact URLs, byte sizes and
+SHA-256 digests are documented in `docs/local-piper-tts.md`.
+
+---
+
 The inline SVG icon geometry in `src/App.tsx` is based on icons from
 [Lucide](https://lucide.dev/). Lucide is distributed under the ISC License;
 some Lucide icons are derived from the Feather project under the MIT License.

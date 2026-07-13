@@ -59,6 +59,72 @@ describe("VoiceDirector", () => {
     expect(generated).toBe(1);
   });
 
+  it("synthesizes with the resident's stable provider voice and publishes safe fallback controls", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-tts", memberId: "human-tts", name: "Alex" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-tts", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-tts", "Sana, säg något kort.");
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+
+    const syntheses: Array<Record<string, unknown>> = [];
+    const payloads: Array<Record<string, unknown>> = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        generateScene: async () => [{ personaId: "ai-sana", content: "Absolut, jag hör dig.", source: "lm", sourceIds: [] }],
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: true, provider: "openai-compatible", inputMimeTypes: [] },
+          tts: { available: true, provider: "openai-compatible", formats: ["wav"], defaultVoice: "lisa-warm" },
+          normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
+          browserFallbackAllowed: false,
+        }),
+        synthesize: async (input) => {
+          syntheses.push(input as unknown as Record<string, unknown>);
+          return {
+            id: "audio-id",
+            roomId: created.room.id,
+            mimeType: "audio/wav",
+            bytes: 128,
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          };
+        },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: (payload) => payloads.push(payload as unknown as Record<string, unknown>),
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await settle();
+
+    expect(syntheses).toHaveLength(1);
+    expect(syntheses[0]).toMatchObject({
+      roomId: created.room.id,
+      text: "Absolut, jag hör dig.",
+      voice: "lisa-warm",
+      speed: 0.98,
+    });
+    expect(payloads).toEqual([expect.objectContaining({
+      memberId: "ai-sana",
+      audioUrl: `/api/voice/audio/audio-id?roomId=${created.room.id}`,
+      mimeType: "audio/wav",
+      browserFallbackAllowed: false,
+      language: "sv-SE",
+      browserRate: 0.97,
+      browserPitch: 1,
+    })]);
+  });
+
   it("uses prior rapport for a voice reply and only strengthens that persona relationship", async () => {
     const runtime = new VoiceRoomRuntime(["lobby"]);
     const created = runtime.createRoom("lobby", { socketId: "socket-memory", memberId: "human-memory", name: "Kim" });

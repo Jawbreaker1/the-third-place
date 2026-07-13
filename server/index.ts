@@ -36,6 +36,7 @@ import { HUMAN_MEMORY_DEFAULTS, HumanMemoryStore } from "./humanMemory.js";
 import { LmStudioClient } from "./lmStudio.js";
 import { CHANNELS } from "./channels.js";
 import { PERSONAS, memberView } from "./personas.js";
+import { configuredPersonaProviderVoices } from "./personaVoices.js";
 import { ResearchBroker } from "./researchBroker.js";
 import { createMessage, type HistoryPosition, RoomStore } from "./store.js";
 import { VoiceDirector } from "./voiceDirector.js";
@@ -379,7 +380,7 @@ const actorChannels = new ActorChannelRuntime();
 const researchBroker = new ResearchBroker();
 const linkPreviewBroker = new LinkPreviewBroker();
 const imageStore = new ImageStore();
-const voiceSpeech = new VoiceSpeechService();
+const voiceSpeech = new VoiceSpeechService({ ttsVoices: configuredPersonaProviderVoices() });
 const voiceSpeechCapabilities = await voiceSpeech.capabilities();
 const voiceRooms = new VoiceRoomRuntime(
   CHANNELS.map((channel) => channel.id),

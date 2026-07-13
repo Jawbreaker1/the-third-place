@@ -4,6 +4,7 @@ import { CHANNELS } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
 import type { LmStudioClient, TranscriptLine } from "./lmStudio.js";
 import { PERSONAS, type Persona } from "./personas.js";
+import { voiceProfileForPersona } from "./personaVoices.js";
 import type { VoiceRoomRuntime } from "./voiceRooms.js";
 import type { VoiceSpeechService } from "./voiceSpeech.js";
 
@@ -14,6 +15,10 @@ export interface VoiceAiSpeechPayload {
   utteranceId: string;
   audioUrl?: string;
   mimeType?: string;
+  browserFallbackAllowed: boolean;
+  language?: string;
+  browserRate?: number;
+  browserPitch?: number;
 }
 
 export interface VoiceDirectorEvents {
@@ -182,13 +187,25 @@ export class VoiceDirector {
     if (!spoken) spoken = sanitizeSpokenLine(fallbackLine(persona, entry.speakerName));
     if (!spoken || !this.isCurrent(room.id, epoch, persona.id)) return;
 
+    const voiceProfile = voiceProfileForPersona(persona.id);
+    if (!voiceProfile) {
+      console.warn(`Voice profile missing for ${persona.id}; server synthesis is disabled for this turn.`);
+    }
     let audio: { id: string; mimeType: string } | undefined;
+    let browserFallbackAllowed = false;
     const speechAbort = new AbortController();
     this.speechAbortByRoom.set(room.id, speechAbort);
     try {
       const capabilities = await this.options.speech.capabilities();
-      if (capabilities.tts.available) {
-        const stored = await this.options.speech.synthesize({ roomId: room.id, text: spoken, signal: speechAbort.signal });
+      browserFallbackAllowed = capabilities.browserFallbackAllowed;
+      if (capabilities.tts.available && voiceProfile) {
+        const stored = await this.options.speech.synthesize({
+          roomId: room.id,
+          text: spoken,
+          voice: voiceProfile.providerVoice,
+          speed: voiceProfile.speed,
+          signal: speechAbort.signal,
+        });
         audio = { id: stored.id, mimeType: stored.mimeType };
       }
     } catch (error) {
@@ -217,6 +234,12 @@ export class VoiceDirector {
       memberId: persona.id,
       text: spoken,
       utteranceId: appended.entry.id,
+      browserFallbackAllowed,
+      ...(voiceProfile ? {
+        language: voiceProfile.language,
+        browserRate: voiceProfile.browserRate,
+        browserPitch: voiceProfile.browserPitch,
+      } : {}),
       ...(audio ? { audioUrl: `/api/voice/audio/${encodeURIComponent(audio.id)}?roomId=${encodeURIComponent(room.id)}`, mimeType: audio.mimeType } : {}),
     });
 

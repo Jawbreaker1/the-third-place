@@ -130,10 +130,28 @@ try {
   assert.ok(humanTranscript.heardByPersonaIds.includes("ai-sana"));
   assert.equal(aiTranscript.trigger.eligible, false);
   assert.equal(aiTranscript.text, aiSpeech.text);
+  let ttsAudioUrl;
+  if (process.env.EXPECT_TTS === "true") {
+    assert.equal(typeof aiSpeech.audioUrl, "string", "TTS smoke expected a room-scoped server audio URL");
+    ttsAudioUrl = new URL(aiSpeech.audioUrl, baseUrl);
+    const anonymousAudioResponse = await fetch(ttsAudioUrl);
+    assert.equal(anonymousAudioResponse.status, 401, "anonymous clients must not fetch room audio");
+    const audioResponse = await fetch(ttsAudioUrl, { headers: { Cookie: cookieB } });
+    assert.equal(audioResponse.status, 200);
+    assert.equal(audioResponse.headers.get("content-type"), "audio/wav");
+    assert.equal(audioResponse.headers.get("cache-control"), "private, no-store");
+    const audio = Buffer.from(await audioResponse.arrayBuffer());
+    assert.equal(audio.subarray(0, 4).toString("ascii"), "RIFF");
+    assert.equal(audio.subarray(8, 12).toString("ascii"), "WAVE");
+  }
 
   const bLeft = await emitAck(b.socket, "voice:room:leave", { roomId });
   assert.equal(bLeft.closed, false);
   assert.ok(!bLeft.room.participants.some((participant) => participant.memberId === b.snapshot.me.id));
+  if (ttsAudioUrl) {
+    const leftMemberAudioResponse = await fetch(ttsAudioUrl, { headers: { Cookie: cookieB } });
+    assert.equal(leftMemberAudioResponse.status, 403, "a member who left must lose room-audio access");
+  }
 
   const roomGonePromise = waitForEvent(
     b.socket,

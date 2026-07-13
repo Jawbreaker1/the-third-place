@@ -13,3 +13,7 @@ dist-server/
 data/
 coverage/
 *.log
+.venv-tts/
+.cache/piper-tts/
+__pycache__/
+*.py[cod]

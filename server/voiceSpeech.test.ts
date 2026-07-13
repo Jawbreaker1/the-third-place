@@ -132,7 +132,7 @@ describe("OpenAI-compatible speech providers", () => {
       }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
     };
     const service = new VoiceSpeechService({
-      env: { STT_BASE_URL: "http://speech.test/v1", STT_MODEL: "whisper-test", STT_API_KEY: "test-secret" },
+      env: { STT_BASE_URL: "https://speech.test/v1", STT_MODEL: "whisper-test", STT_API_KEY: "test-secret" },
       fetchImpl: mockedFetch as typeof fetch,
       normalizer: fakeNormalizer,
     });
@@ -168,7 +168,7 @@ describe("OpenAI-compatible speech providers", () => {
     let now = Date.UTC(2026, 6, 13);
     const service = new VoiceSpeechService({
       env: {
-        TTS_BASE_URL: "http://speech.test/v1",
+        TTS_BASE_URL: "https://speech.test/v1",
         TTS_MODEL: "tts-test",
         TTS_VOICE: "mira-voice",
         TTS_FORMAT: "mp3",
@@ -209,7 +209,7 @@ describe("OpenAI-compatible speech providers", () => {
       });
     };
     const service = new VoiceSpeechService({
-      env: { TTS_BASE_URL: "http://speech.test/v1", TTS_MODEL: "tts-test", TTS_VOICE: "voice" },
+      env: { TTS_BASE_URL: "https://speech.test/v1", TTS_MODEL: "tts-test", TTS_VOICE: "voice" },
       fetchImpl: mockedFetch as typeof fetch,
       normalizer: fakeNormalizer,
     });
@@ -228,6 +228,40 @@ describe("OpenAI-compatible speech providers", () => {
       env: { TTS_BASE_URL: "file:///tmp/speech", TTS_MODEL: "tts" },
       normalizer: fakeNormalizer,
     })).toThrowError(VoiceSpeechError);
+    expect(() => new VoiceSpeechService({
+      env: { TTS_BASE_URL: "http://speech.example/v1", TTS_MODEL: "tts", TTS_VOICE: "voice" },
+      normalizer: fakeNormalizer,
+    })).toThrowError(expect.objectContaining({ code: "INSECURE_PROVIDER_URL" }));
+  });
+
+  it("only advertises TTS when a usable default or per-call voice is configured", async () => {
+    const env = { TTS_BASE_URL: "http://127.0.0.1:8179/v1", TTS_MODEL: "piper-sv", TTS_FORMAT: "wav" };
+    const missingVoice = new VoiceSpeechService({ env, normalizer: fakeNormalizer });
+    expect((await missingVoice.capabilities()).tts).toMatchObject({ available: false, provider: "disabled" });
+    await expectVoiceError(missingVoice.synthesize({ roomId: "room-1", text: "hej", voice: "lisa" }), "TTS_DISABLED");
+
+    let requestedVoice = "";
+    const withPerCallVoice = new VoiceSpeechService({
+      env,
+      ttsVoices: ["lisa-warm"],
+      normalizer: fakeNormalizer,
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        const request = new Request(input, init);
+        requestedVoice = (JSON.parse(await request.text()) as { voice: string }).voice;
+        return new Response("wav", { headers: { "Content-Type": "audio/wav" } });
+      }) as typeof fetch,
+    });
+    expect((await withPerCallVoice.capabilities()).tts).toMatchObject({
+      available: true,
+      provider: "openai-compatible",
+      model: "piper-sv",
+    });
+    await withPerCallVoice.synthesize({ roomId: "room-1", text: "hej", voice: "lisa-warm", format: "wav" });
+    expect(requestedVoice).toBe("lisa-warm");
+    await expectVoiceError(
+      withPerCallVoice.synthesize({ roomId: "room-1", text: "hej", voice: "nst-deep", format: "wav" }),
+      "UNCONFIGURED_TTS_VOICE",
+    );
   });
 });
 

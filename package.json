@@ -6,6 +6,7 @@
   "description": "A living AI community powered by a local LM Studio model and a deterministic social director.",
   "scripts": {
     "dev": "concurrently -k -n api,web -c yellow,cyan \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
+    "dev:voice": "concurrently -k -n tts,app -c magenta,cyan \"npm run start:tts\" \"npm run dev\"",
     "build": "tsc -p tsconfig.server.json && vite build",
     "start": "NODE_ENV=production node dist-server/server/index.js",
     "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.server.json --noEmit",
@@ -13,6 +14,10 @@
     "lm:check": "node scripts/lm-check.mjs",
     "smoke:e2e": "node scripts/e2e-smoke.mjs",
     "smoke:voice": "node scripts/voice-smoke.mjs",
+    "setup:tts": "node scripts/setup-piper-tts.mjs",
+    "prestart:tts": "npm run setup:tts",
+    "start:tts": "node scripts/start-piper-tts.mjs",
+    "test:tts-sidecar": "node --test scripts/piper-tts-setup.node-test.mjs && python3 -m unittest scripts.tts.test_piper_sidecar",
     "smoke:image": "node scripts/image-smoke.mjs",
     "smoke:research": "node scripts/research-smoke.mjs",
     "smoke:history-links": "node scripts/history-link-smoke.mjs",
