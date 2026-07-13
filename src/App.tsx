@@ -89,10 +89,57 @@ const Icon = ({ name, size = 18 }: { name: string; size?: number }) => {
   );
 };
 
-const Avatar = ({ member, size = "md", showStatus = true }: { member: Member; size?: "sm" | "md" | "lg" | "xl"; showStatus?: boolean }) => (
-  <span className={`avatar avatar-${size}`} style={{ "--avatar": member.avatar.color, "--accent": member.avatar.accent } as React.CSSProperties}>
-    <span>{member.avatar.glyph}</span>
-    {showStatus && <i className={`presence presence-${member.status}`} />}
+const resolveAvatarImageUrl = (value?: string) => {
+  const candidate = value?.trim();
+  if (!candidate) return undefined;
+
+  try {
+    const parsed = new URL(candidate, window.location.origin);
+    const isSameOriginHttp = parsed.protocol === "http:" && parsed.origin === window.location.origin;
+    return parsed.protocol === "https:" || isSameOriginHttp ? parsed.href : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const Avatar = ({ member, size = "md", showStatus = true }: { member: Member; size?: "sm" | "md" | "lg" | "xl"; showStatus?: boolean }) => {
+  const imageUrl = resolveAvatarImageUrl(member.avatar.imageUrl);
+  const [failedImageUrl, setFailedImageUrl] = useState<string>();
+  const showImage = Boolean(imageUrl && failedImageUrl !== imageUrl);
+
+  return (
+    <span
+      aria-label={`${member.name} avatar`}
+      className={`avatar avatar-${size}`}
+      data-avatar-kind={showImage ? "image" : "glyph"}
+      role="img"
+      style={{ "--avatar": member.avatar.color, "--accent": member.avatar.accent } as React.CSSProperties}
+    >
+      <span aria-hidden="true" className="avatar-glyph">{member.avatar.glyph}</span>
+      {imageUrl && failedImageUrl !== imageUrl && (
+        <img
+          alt=""
+          className="avatar-image"
+          decoding="async"
+          draggable={false}
+          onError={() => setFailedImageUrl(imageUrl)}
+          referrerPolicy="no-referrer"
+          src={imageUrl}
+        />
+      )}
+      {showStatus && <i aria-hidden="true" className={`presence presence-${member.status}`} />}
+    </span>
+  );
+};
+
+const BrandMark = ({ large = false }: { large?: boolean }) => (
+  <span aria-hidden="true" className={`brand-mark${large ? " large" : ""}`}>
+    <img
+      alt=""
+      decoding="async"
+      draggable={false}
+      src={large ? "/the-third-place-mark.svg" : "/favicon.svg"}
+    />
   </span>
 );
 
@@ -1423,7 +1470,7 @@ export default function App() {
     <div className="app-shell">
       <aside className={`sidebar ${mobilePanel === "rooms" ? "mobile-open" : ""}`}>
         <div className="brand-row">
-          <div className="brand-mark"><span /></div>
+          <BrandMark />
           <div><strong>The Third Place</strong><small><i /> live social experiment</small></div>
           <button className="icon-button mobile-only" onClick={() => setMobilePanel(null)} aria-label="Close rooms"><Icon name="close" /></button>
         </div>
@@ -1883,7 +1930,7 @@ export default function App() {
         <div className="join-overlay">
           <form className="join-card" onSubmit={join}>
             <div className="join-live"><i /> LIVE ROOM <span>{preview?.health.onlineHumans ?? 0} real guests here now</span></div>
-            <div className="join-logo"><div className="brand-mark large"><span /></div></div>
+            <div className="join-logo"><BrandMark large /></div>
             <p className="join-kicker">THE THIRD PLACE</p>
             <h2>Join the conversation.</h2>
             <p className="join-copy">A living online room populated by distinct AI characters — and real people like you.</p>
