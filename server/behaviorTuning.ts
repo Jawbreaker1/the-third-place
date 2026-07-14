@@ -91,6 +91,35 @@ export const ambientRoomSelectionWeight = (score: number, activity: number): num
   return score * (0.25 + level * 0.015);
 };
 
+const MAX_AMBIENT_DEBATE_CHANCE = 0.70;
+
+/**
+ * Calibrates how often a newly seeded ambient thread gets a genuine
+ * counter-position. Aggression 25 is the historical neutral point, so existing
+ * room profiles keep their exact cadence at the default setting. Lower values
+ * retain some calm disagreement; higher values add at most 35 percentage
+ * points and remain hard-capped to avoid turning a lively room into a pile-on.
+ *
+ * This is deliberately language- and content-blind. It only schedules a
+ * disagreement beat; the existing semantic generation and review contracts
+ * still own wording, targets and safety.
+ */
+export const ambientDebateChance = (baseChance: number, aggression: number): number => {
+  const baseline = typeof baseChance === "number" && Number.isFinite(baseChance)
+    ? Math.max(0, Math.min(MAX_AMBIENT_DEBATE_CHANCE, baseChance))
+    : 0;
+  const level = percent(aggression, DEFAULT_RUNTIME_BEHAVIOR_TUNING.aggression);
+
+  if (level <= DEFAULT_RUNTIME_BEHAVIOR_TUNING.aggression) {
+    const position = level / DEFAULT_RUNTIME_BEHAVIOR_TUNING.aggression;
+    return baseline * interpolate(0.5, 1, position);
+  }
+
+  const position = (level - DEFAULT_RUNTIME_BEHAVIOR_TUNING.aggression)
+    / (100 - DEFAULT_RUNTIME_BEHAVIOR_TUNING.aggression);
+  return Math.min(MAX_AMBIENT_DEBATE_CHANCE, baseline + 0.35 * position);
+};
+
 export interface AutonomousLinkPolicy {
   enabled: boolean;
   chance: number;
@@ -159,17 +188,17 @@ const competenceDirection: Record<BehaviorBand, string> = {
 const aggressionDirection: Record<BehaviorBand, string> = {
   minimum: "Prefer calm disagreement and soft edges, while still answering a conflict directly instead of reflexively agreeing.",
   low: "Disagree plainly but gently when there is a real point of friction.",
-  balanced: "Allow direct pushback, dry friction and clear disagreement when socially relevant.",
-  high: "Allow blunt, combative disagreement aimed at claims, choices or behavior when it fits the actor and room.",
-  maximum: "Allow very forceful, terse confrontation of a claim or behavior, but never turn intensity into abuse or a pile-on.",
+  balanced: "Use direct pushback, dry friction and clear disagreement when socially relevant.",
+  high: "The server may assign one actor a blunt disagreement target aimed at a claim, taste, choice or behavior; realize it without manufacturing personal hostility.",
+  maximum: "The server assigns one actor a very forceful, terse stance target whenever that actor has a real disagreement, ranking, complaint or boundary; make it unmistakable without turning intensity into abuse or a pile-on.",
 };
 
 const explicitnessDirection: Record<BehaviorBand, string> = {
   minimum: "Avoid adding adult profanity; still understand and answer coarse human language directly without moralizing about vocabulary.",
   low: "Usually avoid adult profanity, except a proportionate natural reaction may be retained when removing it would distort the exchange.",
   balanced: "Adult profanity is optional when proportionate to the room, actor and turn; it is never a required style marker.",
-  high: "Permit proportionate adult profanity more freely when it sounds natural, but never insert it merely to demonstrate this setting.",
-  maximum: "Permit strong proportionate adult profanity when the specific exchange earns it; never force it or make it a recurring verbal tic.",
+  high: "The server may assign at most one actor a bounded coarse-language target; realize it naturally when the message can bear it, never as targeted abuse.",
+  maximum: "The server assigns at most one actor a strong-language target per scene. Make one natural non-targeted adult expression audible in that actor's line unless it would distort a direct factual answer or calm serious boundary.",
 };
 
 export const behaviorTuningPrompt = (value: AdminBehaviorTuning): string => {
@@ -183,5 +212,5 @@ Trusted live behavior tuning (server-authored style calibration):
 - Aggression ${tuning.aggression}/100 (${aggression}): ${aggressionDirection[aggression]}
 - Explicitness ${tuning.explicitness}/100 (${explicitness}): ${explicitnessDirection[explicitness]}
 - Apply these as semantic depth and intensity in whatever response language is already required; never turn a level into language-specific canned wording.
-- These settings never override evidence grounding, safety or moderation, the actor's persona and assigned expertise, the room contract, the required language, or hard message limits. Aggression never permits harassment, threats, protected-class slurs, dehumanization, sexualized abuse or coordinated pile-ons. Explicitness never forces profanity and never permits those excluded forms.`;
+- These settings never override evidence grounding, safety or moderation, the actor's persona and assigned expertise, the room contract, the required language, or hard message limits. Aggression never permits harassment, threats, protected-class slurs, dehumanization, sexualized abuse or coordinated pile-ons. An explicitness target is bounded to one actor, never requires targeted abuse or every actor to swear, and never permits those excluded forms.`;
 };

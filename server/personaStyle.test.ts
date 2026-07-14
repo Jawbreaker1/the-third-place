@@ -211,6 +211,24 @@ describe("persona style fingerprints", () => {
     expect(note.match(/Turn policy \/ surface texture:/gu)).toHaveLength(1);
   });
 
+  it("lets a trusted room override replace a clean persona turn with one bounded strong-language target", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const key = "the-pub:maximum-explicitness";
+    const ordinary = buildPersonaStylePromptNote(mira, { turnKey: key });
+    const targeted = buildPersonaStylePromptNote(mira, {
+      turnKey: key,
+      surfaceTextureOverride: "strong-profanity",
+      stanceIntensity: "forceful",
+      explicitnessTarget: "strong",
+    });
+
+    expect(targeted).toContain("one natural, non-targeted strong adult profanity");
+    expect(targeted).toContain("scene's one strong-language target");
+    expect(targeted).toContain("make it forceful, terse and unmistakable");
+    expect(targeted).not.toContain("Keep this message's surface clean");
+    expect(ordinary).not.toContain("scene's one strong-language target");
+  });
+
   it("lets an explicit scene role require one question while keeping the emoji budget deterministic", () => {
     const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
     const key = "considered-response-question";

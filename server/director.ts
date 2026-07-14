@@ -55,6 +55,7 @@ import {
 } from "./semanticRouter.js";
 import { refreshLocalDateTime, resolveLocalDateTime, type LocalDateTimeResult } from "./timeResolver.js";
 import {
+  ambientDebateChance,
   ambientRoomSelectionWeight,
   autonomousActivityLimits,
   autonomousLinkPolicy,
@@ -2753,7 +2754,11 @@ export class SocialDirector {
     if (!seed) return undefined;
     const recent = this.store.getRecent(channelId, 80);
     const languageTag = this.lastTrustedLanguageByChannel.get(channelId);
-    const debateChance = profile.ambientMode === "banter" ? 0.08 : profile.ambientMode === "casual" ? 0.14 : 0.28;
+    const baseDebateChance = profile.ambientMode === "banter" ? 0.08 : profile.ambientMode === "casual" ? 0.14 : 0.28;
+    const debateChance = ambientDebateChance(
+      baseDebateChance,
+      this.channelBehaviorTuning(channelId).aggression,
+    );
     const thread: AmbientThreadState = {
       seed,
       messageCount: 0,

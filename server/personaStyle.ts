@@ -20,6 +20,14 @@ export const PERSONA_SURFACE_TEXTURES = [
 
 export type PersonaSurfaceTexture = (typeof PERSONA_SURFACE_TEXTURES)[number];
 
+/** Server-assigned scene targets extend, but never silently alter, a persona's ordinary palette. */
+export const TURN_SURFACE_TEXTURES = [
+  ...PERSONA_SURFACE_TEXTURES,
+  "strong-profanity",
+] as const;
+
+export type TurnSurfaceTexture = (typeof TURN_SURFACE_TEXTURES)[number];
+
 export interface PersonaStyleFingerprint {
   /** The normal range, not a target that every message must fill. */
   typicalWords: readonly [number, number];
@@ -63,7 +71,7 @@ export interface PersonaStyleTurnPolicy {
   /** True only on turns where one context-supported feeling may be more visible than usual. */
   visibleAffect: boolean;
   /** At most one language-appropriate surface move is exposed for this turn. */
-  surfaceTexture?: PersonaSurfaceTexture;
+  surfaceTexture?: TurnSurfaceTexture;
   ending: "statement" | "question-allowed" | "question-required";
 }
 
@@ -112,20 +120,41 @@ const complexityNote = (appetite: number): string => {
   return "May occasionally introduce a nuanced or second-order thought, but never turn it into an essay.";
 };
 
-const surfaceTextureNotes: Record<PersonaSurfaceTexture, string> = {
+const surfaceTextureNotes: Record<TurnSurfaceTexture, string> = {
   fragment: "A clipped fragment is permitted when context makes the omitted grammar obvious.",
   "self-correction": "A brief in-line self-correction or changed thought is permitted; do not explain the correction.",
   "stretched-emphasis": "One naturally stretchable written sound may be lengthened for emphasis when that is normal in the required language and script.",
   "rough-orthography": "Slightly loose everyday chat orthography, casing or punctuation is permitted while the meaning stays immediately clear.",
   "harmless-typo": "One believable harmless typo in ordinary prose is permitted, without obscuring meaning.",
   "mild-profanity": "One mild, non-targeted adult profanity may appear as spontaneous emphasis when it fits the actor, room and moment; it is never required.",
+  "strong-profanity": "Use one natural, non-targeted strong adult profanity or comparably coarse expression as spontaneous emphasis in this message. This is a bounded scene target, not a catchphrase; omit it only when it would distort a direct factual answer or a calm serious boundary.",
 };
 
-const voiceSurfaceTextures = new Set<PersonaSurfaceTexture>([
+const voiceSurfaceTextures = new Set<TurnSurfaceTexture>([
   "fragment",
   "self-correction",
   "mild-profanity",
+  "strong-profanity",
 ]);
+
+export const PERSONA_STANCE_INTENSITIES = [
+  "restrained",
+  "gentle",
+  "ordinary",
+  "blunt",
+  "forceful",
+] as const;
+
+export type PersonaStanceIntensity = (typeof PERSONA_STANCE_INTENSITIES)[number];
+
+export const PERSONA_EXPLICITNESS_TARGETS = [
+  "clean",
+  "persona",
+  "coarse",
+  "strong",
+] as const;
+
+export type PersonaExplicitnessTarget = (typeof PERSONA_EXPLICITNESS_TARGETS)[number];
 
 export interface PersonaStylePromptOptions {
   medium?: "text" | "voice";
@@ -133,6 +162,12 @@ export interface PersonaStylePromptOptions {
   turnKey?: string;
   /** Explicit scene roles may narrow the deterministic ending budget. */
   endingOverride?: PersonaStyleTurnPolicy["ending"];
+  /** A trusted live room policy may replace the persona's ordinary texture lottery for this turn. */
+  surfaceTextureOverride?: TurnSurfaceTexture | null;
+  /** Trusted per-scene intensity, assigned to at most one actor unless deliberately restrained. */
+  stanceIntensity?: PersonaStanceIntensity;
+  /** Whether this turn is clean, persona-led, or carries a bounded coarse-language target. */
+  explicitnessTarget?: PersonaExplicitnessTarget;
 }
 
 const hashUnit = (value: string): number => {
@@ -154,6 +189,7 @@ export const derivePersonaStyleTurnPolicy = (
   turnKey: string,
   medium: "text" | "voice" = "text",
   endingOverride?: PersonaStyleTurnPolicy["ending"],
+  surfaceTextureOverride?: TurnSurfaceTexture | null,
 ): PersonaStyleTurnPolicy => {
   const key = `${turnKey}\u0000${persona.id}`;
   const palette = persona.style.emojiPalette ?? [];
@@ -184,11 +220,13 @@ export const derivePersonaStyleTurnPolicy = (
   );
   const textureAllowed = eligibleTextures.length > 0 &&
     hashUnit(`${key}\u0000surface-texture`) < persona.style.surfaceTextureRate;
-  const surfaceTexture = textureAllowed
-    ? eligibleTextures[
-        Math.floor(hashUnit(`${key}\u0000surface-texture-choice`) * eligibleTextures.length)
-      ]
-    : undefined;
+  const surfaceTexture = surfaceTextureOverride !== undefined
+    ? surfaceTextureOverride ?? undefined
+    : textureAllowed
+      ? eligibleTextures[
+          Math.floor(hashUnit(`${key}\u0000surface-texture-choice`) * eligibleTextures.length)
+        ]
+      : undefined;
 
   return {
     ...(emoji ? { emoji } : {}),
@@ -219,7 +257,39 @@ const disagreementNoteForTurn = (
   return disagreementNotes[style.disagreementMode];
 };
 
-const turnPolicyNote = (policy: PersonaStyleTurnPolicy): string => {
+const stanceIntensityNote = (intensity: PersonaStanceIntensity): string => {
+  switch (intensity) {
+    case "restrained":
+      return "Keep any real disagreement calm and softly edged, without evading the point.";
+    case "gentle":
+      return "State a real objection plainly but gently; do not manufacture friction.";
+    case "blunt":
+      return "When this message contains a real disagreement, ranking, complaint or boundary, make it blunt and concise instead of cushioning it with obligatory agreement. Target the claim, taste, choice or behavior—not the person.";
+    case "forceful":
+      return "When this message contains a real disagreement, ranking, complaint or boundary, make it forceful, terse and unmistakable. Do not invent hostility, attack the speaker, threaten, slur or recruit a pile-on.";
+    default:
+      return "Use the actor's ordinary directness; neither manufacture nor soften a real disagreement.";
+  }
+};
+
+const explicitnessTargetNote = (target: PersonaExplicitnessTarget): string => {
+  switch (target) {
+    case "clean":
+      return "This turn is intentionally clean; understand coarse language but do not add profanity.";
+    case "coarse":
+      return "This actor carries the scene's one coarse-language target. Realize it naturally when the message can bear it; never direct it as abuse.";
+    case "strong":
+      return "This actor carries the scene's one strong-language target. Make that intensity audible when natural; factual accuracy, serious boundaries and safety still take precedence.";
+    default:
+      return "Follow the persona's ordinary language distribution; profanity is neither required nor globally forbidden.";
+  }
+};
+
+const turnPolicyNote = (
+  policy: PersonaStyleTurnPolicy,
+  stanceIntensity: PersonaStanceIntensity = "ordinary",
+  explicitnessTarget: PersonaExplicitnessTarget = "persona",
+): string => {
   const emoji = policy.emoji
     ? `One ${policy.emoji} is permitted if it genuinely adds tone; using none is better than forcing it.`
     : "Use no emoji in this message.";
@@ -234,13 +304,18 @@ const turnPolicyNote = (policy: PersonaStyleTurnPolicy): string => {
   const affect = policy.visibleAffect
     ? "If the immediate context genuinely supports a feeling, it may show briefly through word choice or rhythm; do not invent or clinically label an emotion."
     : "Do not manufacture an emotional beat for this message; the actor's ordinary personality may still remain visible.";
+  const hasActiveExplicitnessTarget = explicitnessTarget === "coarse" || explicitnessTarget === "strong";
   const texture = policy.surfaceTexture
-    ? `${surfaceTextureNotes[policy.surfaceTexture]} Use it only if it is natural in the required language and script; otherwise keep the line clean.`
+    ? hasActiveExplicitnessTarget
+      ? `${surfaceTextureNotes[policy.surfaceTexture]} Express the assigned intensity naturally in the required language and script; never replace it with targeted abuse.`
+      : `${surfaceTextureNotes[policy.surfaceTexture]} Use it only if it is natural in the required language and script; otherwise keep the line clean.`
     : "Keep this message's surface clean; do not add a deliberate typo, stretch, self-correction, rough spelling or profanity tic.";
   return `- Turn policy / emoji: ${emoji}
 - Turn policy / habit: ${habit}
 - Turn policy / visible affect: ${affect}
 - Turn policy / surface texture: ${texture}
+- Turn policy / stance intensity: ${stanceIntensityNote(stanceIntensity)}
+- Turn policy / explicitness target: ${explicitnessTargetNote(explicitnessTarget)}
 - Turn policy / ending: ${ending}`;
 };
 
@@ -268,11 +343,12 @@ export const buildPersonaStylePromptNote = (
   const habits = style.conversationHabits.map((habit) => `“${habit}”`).join("; ");
   const derivedPolicy = options.turnKey
     ? derivePersonaStyleTurnPolicy(
-        persona,
-        options.turnKey,
-        options.medium ?? "text",
-        options.endingOverride,
-      )
+      persona,
+      options.turnKey,
+      options.medium ?? "text",
+      options.endingOverride,
+      options.surfaceTextureOverride,
+    )
     : undefined;
   const policy = derivedPolicy;
   const avoid = style.avoidPhrases
@@ -284,10 +360,10 @@ export const buildPersonaStylePromptNote = (
 - Casing/punctuation: ${casingNotes[style.casing]} ${punctuationNotes[style.punctuation]}
 - Emoji: ${policy ? "Follow this turn's explicit emoji budget below; do not infer a broader allowance from the persona." : emojiNote(style)}
 - Thought density: ${complexityNote(style.complexityAppetite)}
-- Affect and informal texture: ${policy ? "Follow this turn's explicit affect and surface budget below; these are permissions, not boxes to tick." : surfaceDistributionNote(style)}
+- Affect and informal texture: ${policy ? "Follow this turn's explicit affect, surface and intensity contract below. Ordinary persona texture remains optional; a coarse/strong explicitness target is active only when explicitly assigned." : surfaceDistributionNote(style)}
 - Corrections: ${correctionNoteForTurn(style, policy)}
 - Disagreement: ${disagreementNoteForTurn(style, policy)}
-${policy ? turnPolicyNote(policy) : `- Optional habits to rotate, at most one per message: ${habits}.`}
+${policy ? turnPolicyNote(policy, options.stanceIntensity, options.explicitnessTarget) : `- Optional habits to rotate, at most one per message: ${habits}.`}
 - Avoid generic service-assistant validation, recap and transition language in any language. Persona-specific crutches to avoid: ${avoid}.
 - Surface texture belongs only in ordinary prose. Never alter or misspell names, handles, code, URLs, source identifiers, numbers, quoted literals or technical tokens.
 - Do not perform every trait every time, announce the style, reuse the same opening, or turn a habit into a catchphrase.`;

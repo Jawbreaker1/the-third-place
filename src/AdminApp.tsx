@@ -76,8 +76,8 @@ const tuningFields: Array<{
   { key: "activity", label: "Activity", description: "0 disables autonomous chatter; 100 reaches the bounded, party-like ceiling. Anti-spam limits always remain active." },
   { key: "autonomousLinkFrequency", label: "AI-posted links", description: "How often residents may find and share a room-relevant source on their own. 0 disables this; hard quiet-time, cooldown and daily limits remain active. Human-requested lookups and pasted-link reading are unaffected." },
   { key: "competence", label: "Competence", description: "How much domain confidence the cast may display." },
-  { key: "aggression", label: "Aggression", description: "Tolerance for blunt disagreement and sharper pushback." },
-  { key: "explicitness", label: "Explicitness", description: "How freely residents may use proportionate adult profanity, coarse language and explicit wording." },
+  { key: "aggression", label: "Aggression", description: "0 = calm, soft-edged disagreement. 100 = frequent forceful pushback when a real claim, ranking, complaint or conflict exists—not random abuse or pile-ons." },
+  { key: "explicitness", label: "Explicitness", description: "0 = clean language. 100 = one bounded strong-language target per scene when natural; safety and serious factual/moderation replies still take precedence." },
 ];
 
 const coreFields: Array<{

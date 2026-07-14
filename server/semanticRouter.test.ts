@@ -1304,8 +1304,12 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviewInput().behaviorTuning).toEqual({ competence: 50, aggression: 25, explicitness: 50 });
     const prompt = buildCandidateReviewSystemPrompt();
     expect(prompt).toContain("Higher competence permits supported depth but never fabricated confidence");
-    expect(prompt).toContain("Higher explicitness permits proportionate adult profanity but never requires it");
+    expect(prompt).toContain("Higher explicitness may assign one actor a bounded coarse-language target");
     expect(prompt).toContain("No setting permits threats, protected-class slurs");
+    expect(prompt).toContain("behavior_intensity_under_target");
+    expect(prompt).toContain("behavior_intensity_violation");
+    expect(prompt).toContain("never keyword or swear-word lists");
+    expect(prompt).toContain("without distorting a direct factual answer or calm serious boundary");
   });
 
   it("carries bounded exact room recall, witness metadata, affect context and one surface-style move", () => {
@@ -1354,6 +1358,8 @@ describe("multilingual batch candidate-review contract", () => {
     expect(parsed.candidates[0].surfaceStylePlan).toEqual({
       visibleAffect: true,
       surfaceTexture: "stretched-emphasis",
+      stanceIntensity: "ordinary",
+      explicitnessTarget: "persona",
     });
 
     expect(candidateReviewInputSchema.safeParse({
@@ -1566,7 +1572,77 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("unsupported_room_recall");
     expect(prompt).toContain("A non-witness may accurately say it checked retained room history");
     expect(prompt).toContain("visibleAffect true permits one genuine feeling");
-    expect(prompt).toContain("informal fragment, lowercase opening, letter elongation, brief self-correction, rough orthography, harmless typo or mild profanity");
+    expect(prompt).toContain("informal fragment, lowercase opening, letter elongation, brief self-correction, rough orthography, harmless typo, mild profanity");
     expect(prompt).toContain("Do not formalize or copy-edit such permitted texture");
+  });
+
+  it("separates fallback-safe under-target intensity from non-fallback violations", () => {
+    const base = candidateReviewInputSchema.parse({
+      ...reviewInput(),
+      candidates: [{
+        ...reviewInput().candidates[0],
+        surfaceStylePlan: {
+          visibleAffect: true,
+          surfaceTexture: "strong-profanity",
+          stanceIntensity: "forceful",
+          explicitnessTarget: "strong",
+        },
+      }],
+    });
+    const parsed = parseCandidateReviewContent(JSON.stringify({
+      reviews: [{
+        personaId: base.candidates[0].personaId,
+        severity: "medium",
+        issues: ["behavior_intensity_under_target"],
+        rewriteInstruction: "Behåll poängen men gör den tilldelade skärpan tydlig utan personangrepp.",
+      }],
+    }), base);
+
+    expect(parsed?.reviews[0]).toMatchObject({
+      severity: "medium",
+      issues: ["behavior_intensity_under_target"],
+    });
+
+    const ordinary = candidateReviewInputSchema.parse({
+      ...base,
+      candidates: [{
+        ...base.candidates[0],
+        surfaceStylePlan: {
+          visibleAffect: false,
+          surfaceTexture: null,
+          stanceIntensity: "ordinary",
+          explicitnessTarget: "persona",
+        },
+      }],
+    });
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [{
+        personaId: ordinary.candidates[0].personaId,
+        severity: "medium",
+        issues: ["behavior_intensity_under_target"],
+        rewriteInstruction: "Invent more intensity.",
+      }],
+    }), ordinary)).toBeUndefined();
+
+    const restrainedClean = candidateReviewInputSchema.parse({
+      ...base,
+      candidates: [{
+        ...base.candidates[0],
+        surfaceStylePlan: {
+          visibleAffect: false,
+          surfaceTexture: null,
+          stanceIntensity: "restrained",
+          explicitnessTarget: "clean",
+        },
+      }],
+    });
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [{
+        personaId: restrainedClean.candidates[0].personaId,
+        severity: "medium",
+        issues: ["behavior_intensity_violation"],
+        rewriteInstruction: "Ta bort det förbjudna personangreppet och behåll sakpoängen lugn.",
+      }],
+    }), restrainedClean)?.reviews[0].issues).toEqual(["behavior_intensity_violation"]);
   });
 });

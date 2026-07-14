@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
-import { buildSceneSystemPrompt, LmStudioClient, sanitizeObservationText, type SceneRequest } from "./lmStudio.js";
+import {
+  buildSceneSystemPrompt,
+  deriveSceneBehaviorStylePlan,
+  LmStudioClient,
+  sanitizeObservationText,
+  type SceneRequest,
+} from "./lmStudio.js";
 import { PERSONAS } from "./personas.js";
 import { turnAnalysisInputSchema, type NormalizedTurnAnalysisInput } from "./semanticRouter.js";
 import { resolveLocalDateTime } from "./timeResolver.js";
@@ -876,6 +882,8 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(firstReview.candidates[0].surfaceStylePlan).toEqual({
       visibleAffect: expect.any(Boolean),
       surfaceTexture: expect.toSatisfy((value: unknown) => value === null || typeof value === "string"),
+      stanceIntensity: "gentle",
+      explicitnessTarget: "persona",
     });
     expect(secondReview.candidates[0].surfaceStylePlan).toEqual(firstReview.candidates[0].surfaceStylePlan);
   });
@@ -1489,8 +1497,215 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(bodies).toHaveLength(4);
     expect(JSON.stringify(bodies[2])).toContain("Empieza con tu objeción concreta");
     expect(bodies[2].messages[0].content).toContain("stableVoice turn policy may deliberately permit");
-    expect(bodies[2].messages[0].content).toContain("stretched emphasis, self-correction, loose orthography, harmless typo or mild profanity");
+    expect(bodies[2].messages[0].content).toContain("stretched emphasis, self-correction, loose orthography, harmless typo or bounded non-targeted profanity");
     expect(bodies[2].messages[0].content).toContain("instead of polishing every line into formal prose");
+  });
+
+  it("repairs a sanitized maximum-intensity Pub line through semantic review without word lists", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: mira.id, content: "Den filmen är faktiskt ganska dålig." }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "medium",
+          issues: ["behavior_intensity_under_target"],
+          rewriteInstruction: "Behåll filmomdömet men realisera den tilldelade skärpan naturligt utan personangrepp.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{ personaId: mira.id, content: "Den filmen är fan helt usel." }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const client = new LmStudioClient({
+      behaviorTuningProvider: () => ({
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 50,
+        aggression: 100,
+        explicitness: 100,
+      }),
+    });
+    const lines = await client.generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira],
+      history: [],
+      trigger: { author: "guest", content: "den filmen var ändå rätt överskattad" },
+      mustReplyIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["Den filmen är fan helt usel."]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[0].messages[0].content).toContain("scene's one strong-language target");
+    expect(bodies[1].messages[1].content).toContain('"explicitnessTarget":"strong"');
+    expect(JSON.stringify(bodies[2])).toContain("realisera den tilldelade skärpan");
+  });
+
+  it("preserves an otherwise safe Pub line when only its intensity repair cannot run", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: mira.id, content: "Den filmen är ganska överskattad." }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "medium",
+            issues: ["behavior_intensity_under_target"],
+            rewriteInstruction: "Gör den tilldelade skärpan tydlig utan personangrepp.",
+          }]);
+    }));
+
+    const client = new LmStudioClient({
+      behaviorTuningProvider: () => ({
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 50,
+        aggression: 100,
+        explicitness: 100,
+      }),
+    });
+    const lines = await client.generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira],
+      history: [],
+      trigger: { author: "guest", content: "den filmen är rätt överskattad" },
+      mustReplyIds: [mira.id],
+      humanizerBudget: { repairsRemaining: 0 },
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["Den filmen är ganska överskattad."]);
+    expect(call).toBe(2);
+  });
+
+  it("never falls back to an intensity violation when its repair cannot run", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: mira.id, content: "Vad fan håller du på med?" }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "medium",
+            issues: ["behavior_intensity_violation"],
+            rewriteInstruction: "Ta bort det riktade angreppet och svara lugnt på sakfrågan.",
+          }]);
+    }));
+
+    const lines = await new LmStudioClient({
+      behaviorTuningProvider: () => ({
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 50,
+        aggression: 0,
+        explicitness: 0,
+      }),
+    }).generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira],
+      history: [],
+      trigger: { author: "guest", content: "den filmen är rätt överskattad" },
+      mustReplyIds: [mira.id],
+      humanizerBudget: { repairsRemaining: 0 },
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(call).toBe(2);
+  });
+
+  it("keeps a concise factual answer clean at maximum when semantic review applies the factual exception", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: sana.id, content: "Fyra." }])
+        : candidateReviewCompletion([{
+            personaId: sana.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+          }]);
+    }));
+
+    const lines = await new LmStudioClient({
+      behaviorTuningProvider: () => ({
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 100,
+        aggression: 100,
+        explicitness: 100,
+      }),
+    }).generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [sana],
+      history: [],
+      trigger: { author: "guest", content: "Vad är två plus två?" },
+      mustReplyIds: [sana.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        socialTrusted: true,
+        claimStrength: 0.05,
+        interactionTrusted: true,
+        interactionKind: "ordinary",
+        reactionNeed: "none",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["Fyra."]);
+    expect(call).toBe(2);
   });
 
   it("fails closed for every scene when review output is invalid", async () => {
@@ -3570,13 +3785,159 @@ describe("LM Studio conflict register and publication safety", () => {
     const forceful = promptFor(100, 100, 100);
     expect(forceful).toContain("Competence 100/100 (maximum)");
     expect(forceful).toContain("deepest concise domain reasoning");
-    expect(forceful).toContain("very forceful, terse confrontation of a claim or behavior");
-    expect(forceful).toContain("Permit strong proportionate adult profanity");
+    expect(forceful).toContain("very forceful, terse stance target");
+    expect(forceful).toContain("strong-language target per scene");
+    expect(forceful).toContain("one natural, non-targeted strong adult profanity");
+    expect(forceful).not.toContain("Keep this message's surface clean");
     expect(forceful).toContain("whatever response language is already required");
     expect(forceful).toContain("never turn a level into language-specific canned wording");
     expect(forceful).toContain("never override evidence grounding, safety or moderation");
     expect(forceful).toContain("Aggression never permits harassment, threats, protected-class slurs");
-    expect(forceful).toContain("Explicitness never forces profanity");
+    expect(forceful).toContain("never requires targeted abuse or every actor to swear");
+
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const twoActorPrompt = buildSceneSystemPrompt({
+      kind: "ambient",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira, bosse],
+      history: [],
+      behaviorTuning: {
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 50,
+        aggression: 100,
+        explicitness: 100,
+      },
+    });
+    expect(twoActorPrompt.match(/carries the scene's one strong-language target/gu)).toHaveLength(1);
+    expect(twoActorPrompt.match(/This turn is intentionally clean/gu)).toHaveLength(1);
+  });
+
+  it("turns room behavior values into one bounded, deterministic target actor", () => {
+    const actors = ["ai-mira", "ai-bosse"];
+    const minimum = deriveSceneBehaviorStylePlan(
+      { activity: 50, autonomousLinkFrequency: 60, competence: 50, aggression: 0, explicitness: 0 },
+      "the-pub:minimum",
+      actors,
+    );
+    const maximum = deriveSceneBehaviorStylePlan(
+      { activity: 50, autonomousLinkFrequency: 60, competence: 50, aggression: 100, explicitness: 100 },
+      "the-pub:maximum",
+      actors,
+    );
+
+    expect(minimum).toEqual({
+      targetActorId: "ai-mira",
+      stanceIntensity: "restrained",
+      explicitnessTarget: "clean",
+    });
+    expect(maximum).toEqual({
+      targetActorId: "ai-mira",
+      stanceIntensity: "forceful",
+      explicitnessTarget: "strong",
+    });
+    expect(deriveSceneBehaviorStylePlan(
+      { activity: 50, autonomousLinkFrequency: 60, competence: 50, aggression: 100, explicitness: 100 },
+      "the-pub:maximum",
+      actors,
+    )).toEqual(maximum);
+
+    const highAt70 = Array.from({ length: 1_000 }, (_, index) =>
+      deriveSceneBehaviorStylePlan(
+        { activity: 50, autonomousLinkFrequency: 60, competence: 50, aggression: 70, explicitness: 70 },
+        `the-pub:high:${index}`,
+        actors,
+      ).explicitnessTarget
+    ).filter((target) => target === "coarse").length;
+    const highAt90 = Array.from({ length: 1_000 }, (_, index) =>
+      deriveSceneBehaviorStylePlan(
+        { activity: 50, autonomousLinkFrequency: 60, competence: 50, aggression: 90, explicitness: 90 },
+        `the-pub:high:${index}`,
+        actors,
+      ).explicitnessTarget
+    ).filter((target) => target === "coarse").length;
+    expect(highAt70).toBeGreaterThan(300);
+    expect(highAt70).toBeLessThan(500);
+    expect(highAt90).toBeGreaterThan(highAt70 + 150);
+    expect(highAt90).toBeLessThan(750);
+
+    const factualPrompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [PERSONAS.find((persona) => persona.id === "ai-mira")!],
+      history: [],
+      evidenceOutcome: "succeeded",
+      behaviorTuning: {
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 50,
+        aggression: 100,
+        explicitness: 100,
+      },
+    });
+    expect(factualPrompt).toContain("Follow the persona's ordinary language distribution");
+    expect(factualPrompt).not.toContain("Turn policy / explicitness target: This actor carries the scene's one strong-language target");
+
+    const moderationPrompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [PERSONAS.find((persona) => persona.id === "ai-mira")!],
+      history: [],
+      behaviorTuning: {
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 50,
+        aggression: 100,
+        explicitness: 100,
+      },
+      semanticContext: {
+        languageTag: "sv",
+        moderationTrusted: true,
+        moderationRisk: "high",
+        moderationAction: "deescalate",
+        moderationCategories: ["harassment"],
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+    expect(moderationPrompt).toContain("Follow the persona's ordinary language distribution");
+    expect(moderationPrompt).not.toContain("Turn policy / stance intensity: When this message contains a real disagreement");
+    expect(moderationPrompt).not.toContain("Turn policy / explicitness target: This actor carries the scene's one strong-language target");
+
+    const lowClaimOpinionPrompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [PERSONAS.find((persona) => persona.id === "ai-mira")!],
+      history: [],
+      trigger: { author: "guest", content: "Vilken film är mest överskattad?" },
+      behaviorTuning: {
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 50,
+        aggression: 100,
+        explicitness: 100,
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        socialTrusted: true,
+        claimStrength: 0.05,
+        interactionTrusted: true,
+        interactionKind: "ordinary",
+        reactionNeed: "none",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+    expect(lowClaimOpinionPrompt).toContain("Turn policy / stance intensity: When this message contains a real disagreement");
+    expect(lowClaimOpinionPrompt).toContain("Turn policy / explicitness target: This actor carries the scene's one strong-language target");
   });
 
   it("reads live room tuning automatically for public, DM, ambient and voice scenes", async () => {
