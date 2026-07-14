@@ -178,6 +178,21 @@ const cases = [
       value.capabilities.discussed.includes("read_url"),
   },
   {
+    id: "sv-retained-room-recall",
+    text: "Kommer ni ihåg Per från tidigare?",
+    capabilities: [],
+    historyRecallAvailable: true,
+    check: (value) => value.historyRecall?.need !== "none" &&
+      value.historyRecall?.query?.toLocaleLowerCase().includes("per"),
+  },
+  {
+    id: "ja-retained-room-recall",
+    text: "前に来たペルのことを覚えていますか？",
+    capabilities: [],
+    historyRecallAvailable: true,
+    check: (value) => value.historyRecall?.need !== "none" && value.historyRecall?.query?.includes("ペル"),
+  },
+  {
     id: "ja-memory-revision",
     kind: "memory",
     text: "もうRustは好きじゃない。今はGoのほうが好きです。",
@@ -251,6 +266,7 @@ for (const [index, test] of cases.entries()) {
       personaCandidates: personas,
       urlCandidates: test.urlCandidates ?? [],
       availableCapabilities: test.capabilities,
+      historyRecallAvailable: test.historyRecallAvailable ?? false,
     });
   const passed = result.source === "lm" && test.check(result);
   if (!passed) failed += 1;
@@ -265,6 +281,7 @@ for (const [index, test] of cases.entries()) {
     failureReason: result.failureReason,
     evidence: result.evidence,
     capabilities: result.capabilities,
+    historyRecall: result.historyRecall,
     memoryItems: result.items,
     moderation: result.moderation,
     interaction: result.interaction,

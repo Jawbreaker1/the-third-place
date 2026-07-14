@@ -22,7 +22,12 @@ import {
   type ConversationRegister,
 } from "./channels.js";
 import { PERSONAS, type Persona } from "./personas.js";
-import { type GeneratedLine, type TranscriptLine, LmStudioClient } from "./lmStudio.js";
+import {
+  type GeneratedLine,
+  type RoomRecallEvidence,
+  type TranscriptLine,
+  LmStudioClient,
+} from "./lmStudio.js";
 import { createMessage, RoomStore } from "./store.js";
 import {
   ResearchBroker,
@@ -54,6 +59,7 @@ import {
   type BehaviorTuningProvider,
 } from "./behaviorTuning.js";
 import type { AdminBehaviorTuning } from "../shared/adminTypes.js";
+import { recallChannelHistory } from "./channelRecall.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -1175,9 +1181,14 @@ const semanticSceneContext = (analysis: TurnAnalysis) => {
     intentTrusted: trusted.intentTrusted,
     replyExpected: trusted.replyExpected,
     socialTrusted: trusted.socialTrusted,
+    warmth: trusted.social.warmth,
     hostility: trusted.social.hostility,
     playfulness: trusted.social.playfulness,
+    absurdity: trusted.social.absurdity,
+    urgency: trusted.social.urgency,
+    energy: trusted.social.energy,
     pileOnRisk: trusted.social.pileOnRisk,
+    claimStrength: trusted.social.claimStrength,
     interactionTrusted: trusted.interactionTrusted,
     interactionKind: trusted.interaction.kind,
     targetScope: trusted.interaction.targetScope,
@@ -1489,7 +1500,10 @@ export class SocialDirector {
     return {
       id: message.id,
       authorId: message.authorId,
-      authorName: boundedUntrustedText(member?.name ?? (message.system ? "room" : "guest"), 80),
+      authorName: boundedUntrustedText(
+        member?.name ?? message.authorSnapshot?.name ?? (message.system ? "room" : "guest"),
+        80,
+      ),
       // Raw human/AI chat text only. Image observations and OCR are excluded so
       // they can never create tool, moderation, address or memory decisions.
       content: boundedUntrustedText(message.content, 1_200),
@@ -1547,6 +1561,7 @@ export class SocialDirector {
         })),
         urlCandidates: semanticUrlCandidates(input.candidateSet),
         availableCapabilities,
+        historyRecallAvailable: input.medium === "public",
       });
     } catch (error) {
       console.warn("Turn analysis failed closed:", error instanceof Error ? error.message : error);
@@ -1979,9 +1994,41 @@ export class SocialDirector {
     const candidates = this.actorChannels.candidatesFor(trigger.channelId, signals.mentionedIds);
     const attention = new Map(candidates.map((persona) => [persona.id, this.actorChannels.affinity(persona.id, trigger.channelId)]));
     const trustedTurn = projectTrustedTurnAnalysis(analysis);
+    const recallResult = trustedTurn.historyRecallTrusted && trustedTurn.historyRecall.query
+      ? recallChannelHistory({
+          messages: this.store.getAllMessages(),
+          query: trustedTurn.historyRecall.query,
+          trigger: {
+            id: trigger.id,
+            channelId: trigger.channelId,
+            createdAt: trigger.createdAt,
+          },
+          // These rows already reach the scene normally. Recall is reserved for
+          // genuinely older context instead of duplicating the active window.
+          recentMessageIds: this.store.getRecent(trigger.channelId, 28).map((message) => message.id),
+          allowedPersonaIds: PERSONAS.map((persona) => persona.id),
+        })
+      : undefined;
+    const roomRecall: RoomRecallEvidence | undefined = recallResult
+      ? {
+          witnessPersonaIds: recallResult.witnessPersonaIds.slice(0, 8),
+          transcript: this.transcriptMessages(recallResult.messages),
+        }
+      : undefined;
+    const roomRecallFor = (actors: readonly Persona[]): RoomRecallEvidence | undefined => {
+      if (!roomRecall) return undefined;
+      const actorIds = new Set(actors.map((persona) => persona.id));
+      return {
+        witnessPersonaIds: roomRecall.witnessPersonaIds.filter((id) => actorIds.has(id)),
+        transcript: roomRecall.transcript,
+      };
+    };
     const responseExpected = trustedTurn.intentTrusted && trustedTurn.replyExpected === "expected";
+    const historyResponseRequired = trustedTurn.historyRecallTrusted && (
+      trustedTurn.historyRecall.need === "required" || trustedTurn.isQuestion
+    );
     let selected = selectResponders(candidates, signals, this.lastSpoke, this.now(), this.rng, attention);
-    if (responseExpected && selected.length === 0) {
+    if ((responseExpected || historyResponseRequired) && selected.length === 0) {
       const accountable = [...candidates]
         .filter((persona) => persona.id !== "ai-runa")
         .sort((a, b) =>
@@ -2053,11 +2100,38 @@ export class SocialDirector {
       evidenceResponder = evidenceSelection.responder;
       if (autoSharedLinkAttempt && evidenceResponder) selected = [evidenceResponder];
     }
+    let recallResponder: Persona | undefined;
+    if (roomRecall && !evidenceRequested) {
+      const witnesses = new Set(roomRecall.witnessPersonaIds);
+      recallResponder = signals.mentionedIds.length > 0
+        ? selected.find((persona) => signals.mentionedIds.includes(persona.id) && witnesses.has(persona.id))
+        : selected.find((persona) => witnesses.has(persona.id));
+      if (
+        !recallResponder &&
+        signals.mentionedIds.length === 0 &&
+        (responseExpected || historyResponseRequired)
+      ) {
+        recallResponder = [...candidates]
+          .filter((persona) => witnesses.has(persona.id))
+          .sort((a, b) =>
+            (attention.get(b.id) ?? 0) + b.conscientiousness * 0.3 + b.curiosity * 0.2 -
+            ((attention.get(a.id) ?? 0) + a.conscientiousness * 0.3 + a.curiosity * 0.2),
+          )[0];
+        if (recallResponder && !selected.some((persona) => persona.id === recallResponder!.id)) {
+          selected = [recallResponder, ...selected].slice(0, 3);
+        }
+      }
+    }
     selected = [...new Map(selected.map((persona) => [persona.id, persona])).values()].slice(0, 3);
+    const recallAnswerer = historyResponseRequired
+      ? recallResponder ?? selected[0]
+      : recallResponder;
     const requestOwner = responseExpected
       ? evidenceRequested && evidenceResponder
         ? evidenceResponder
-        : selected[0]
+        : signals.mentionedIds.length === 0 && recallResponder
+          ? recallResponder
+          : selected[0]
       : undefined;
     const requestOwnerIds = requestOwner ? [requestOwner.id] : [];
     const relationshipNotes = this.relationshipNotes(selected, human);
@@ -2090,6 +2164,7 @@ export class SocialDirector {
         ...signals.mentionedIds.filter((id) => selected.some((persona) => persona.id === id)),
         ...conductIds,
         ...(evidenceRequested && evidenceResponder ? [evidenceResponder.id] : []),
+        ...(historyResponseRequired && recallAnswerer ? [recallAnswerer.id] : []),
         ...requestOwnerIds,
         ...(signals.claimStrength > 0.28 && signals.reactionNeed !== "required"
           ? selected.filter((persona) => (persona.disagreement ?? 0) >= 0.65).slice(0, 1).map((persona) => persona.id)
@@ -2146,6 +2221,13 @@ export class SocialDirector {
           : "",
         semanticFlagsPremise(analysis),
         evidencePremise,
+        roomRecall
+          ? recallResponder
+            ? `${recallResponder.name} is the server-observed witness designated to answer from the exact retained public-room excerpt. Give one compact concrete supported detail when the human asks about the past; use no historical detail beyond that excerpt.`
+            : "The selected residents may read the exact retained public-room excerpt. Give one compact concrete supported detail when the human asks about the past. They must not claim personal memory unless their ID is listed as a witness, and must add no historical detail beyond the excerpt."
+          : trustedTurn.historyRecallTrusted
+            ? "The latest turn depends on older room history, but no matching retained public excerpt was found. Do not invent a memory or historical detail; say only what the available context supports."
+            : "",
         signals.claimStrength > 0.28 && signals.reactionNeed !== "required" && dissenter
           ? `${dissenter.name} should make one specific respectful disagreement, acknowledge any valid part, and avoid a pile-on. Other actors must add a different angle rather than echoing the challenge.`
           : "",
@@ -2160,6 +2242,7 @@ export class SocialDirector {
           channelName: CHANNELS.find((channel) => channel.id === trigger.channelId)?.name ?? trigger.channelId,
           selected,
           history: this.transcript(trigger.channelId, 26),
+          roomRecall: roomRecallFor(selected),
           trigger: { author: human.name, content: combined, messageId: trigger.id, createdAt: trigger.createdAt },
           mustReplyIds: requiredIds,
           requestOwnerIds,
@@ -2209,6 +2292,7 @@ export class SocialDirector {
             channelName: CHANNELS.find((channel) => channel.id === trigger.channelId)?.name ?? trigger.channelId,
             selected: [persona],
             history: this.transcript(trigger.channelId, 22),
+            roomRecall: roomRecallFor([persona]),
             trigger: { author: human.name, content: combined, messageId: trigger.id, createdAt: trigger.createdAt },
             mustReplyIds: [persona.id],
             requestOwnerIds: [],
@@ -2233,6 +2317,12 @@ export class SocialDirector {
                   ? `${persona.name} is the one designated resident who must give a direct, character-consistent social reaction; silence, subject-changing, and generic civility language do not satisfy this turn.`
                 : evidenceRequested && evidenceResponder?.id === persona.id
                   ? `${persona.name} is the one resident responsible for answering the evidence request concisely.`
+                  : recallAnswerer?.id === persona.id
+                    ? roomRecall
+                      ? roomRecall.witnessPersonaIds.includes(persona.id)
+                        ? `${persona.name} is the server-observed witness responsible for answering from recalledRoomEvidence without inventing any extra historical detail.`
+                        : `${persona.name} must answer by reading recalledRoomEvidence, without claiming personal memory or inventing any extra historical detail.`
+                      : `${persona.name} must answer honestly that no matching retained room evidence is available, without inventing a memory or historical detail.`
                   : "Answer the triggering message in your assigned conversational role without inventing a linked-page request.",
             ].filter(Boolean).join(" "),
           },

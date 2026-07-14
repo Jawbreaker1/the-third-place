@@ -382,6 +382,102 @@ describe("multilingual mechanical safety boundaries", () => {
 });
 
 describe("LM Studio multilingual batch candidate review", () => {
+  it("passes recalled history, the full affect vector and a deterministic surface-style plan to review", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length % 2 === 1
+        ? completionResponse([{ personaId: mira.id, content: "Jaaa, den där gitarrhistorien minns jag." }])
+        : candidateReviewCompletion([
+            { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+          ]);
+    }));
+
+    const scene: SceneRequest = {
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      roomRecall: {
+        witnessPersonaIds: [mira.id, sana.id],
+        transcript: [{
+          author: "Per",
+          kind: "human",
+          content: "Jag kör gitarr genom ett gammalt trasigt filter.",
+          createdAt: "2026-07-14T09:55:00.000Z",
+        }],
+      },
+      trigger: {
+        author: "Jaw_B",
+        content: "Kommer ni ihåg Per?",
+        messageId: "remember-per-1",
+        createdAt: "2026-07-14T10:04:50.000Z",
+      },
+      mustReplyIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        socialTrusted: true,
+        warmth: 0.82,
+        hostility: 0.27,
+        playfulness: 0.64,
+        absurdity: 0.31,
+        urgency: 0.46,
+        energy: 0.73,
+        pileOnRisk: 0.19,
+        claimStrength: 0.58,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    };
+    const lm = new LmStudioClient({
+      now: () => Date.parse("2026-07-14T10:05:00.000Z"),
+      communityTimeZone: "Europe/Stockholm",
+    });
+
+    await expect(lm.generateScene(scene)).resolves.toHaveLength(1);
+    await expect(lm.generateScene(scene)).resolves.toHaveLength(1);
+
+    expect(bodies).toHaveLength(4);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    const secondReview = JSON.parse(bodies[3].messages[1].content);
+    expect(firstReview.roomRecall).toEqual({
+      witnessPersonaIds: [mira.id, sana.id],
+      timeline: [{
+        author: "Per",
+        kind: "human",
+        content: "Jag kör gitarr genom ett gammalt trasigt filter.",
+        createdAt: "2026-07-14T09:55:00.000Z",
+        ageSeconds: 600,
+        sincePreviousSeconds: null,
+      }],
+    });
+    expect(firstReview.semanticContext).toMatchObject({
+      socialTrusted: true,
+      warmth: 0.82,
+      hostility: 0.27,
+      playfulness: 0.64,
+      absurdity: 0.31,
+      urgency: 0.46,
+      energy: 0.73,
+      pileOnRisk: 0.19,
+      claimStrength: 0.58,
+    });
+    expect(firstReview.candidates[0].surfaceStylePlan).toEqual({
+      visibleAffect: expect.any(Boolean),
+      surfaceTexture: expect.toSatisfy((value: unknown) => value === null || typeof value === "string"),
+    });
+    expect(secondReview.candidates[0].surfaceStylePlan).toEqual(firstReview.candidates[0].surfaceStylePlan);
+  });
+
   it("keeps free-form ambient language guidance out of the BCP-47 review field", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
@@ -567,6 +663,88 @@ describe("LM Studio multilingual batch candidate review", () => {
 
     expect(lines).toEqual([]);
     expect(call).toBe(2);
+  });
+
+  it("blocks unsupported personal room recall and retries an explicit owner with the full scene", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const unsupported = "Ja, jag minns när Per visade sin röda gitarr här.";
+    const grounded = "Jag kollade gamla historiken nu — Per skrev om ett trasigt filter, inte om gitarrens färg.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) return completionResponse([{ personaId: mira.id, content: unsupported }]);
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["unsupported_room_recall"],
+          rewriteInstruction: "Do not claim personal presence and use only the retained excerpt.",
+        }]);
+      }
+      if (bodies.length === 3) return completionResponse([{ personaId: mira.id, content: grounded }]);
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient({
+      now: () => Date.parse("2026-07-14T10:05:00.000Z"),
+      communityTimeZone: "Europe/Stockholm",
+    }).generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      roomRecall: {
+        // Sana witnessed the retained episode; Mira did not.
+        witnessPersonaIds: [sana.id],
+        transcript: [{
+          author: "Per",
+          kind: "human",
+          content: "Jag kör gitarr genom ett gammalt trasigt filter.",
+          createdAt: "2026-07-14T09:55:00.000Z",
+        }],
+      },
+      trigger: {
+        author: "Jaw_B",
+        content: "Mira, kommer du ihåg vad Per sa?",
+        messageId: "remember-per-owner-1",
+        createdAt: "2026-07-14T10:04:50.000Z",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([grounded]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies.some((body) => body.messages[0].content.includes("one-pass copy editor"))).toBe(false);
+    const retryScene = JSON.parse(bodies[2].messages[1].content);
+    expect(retryScene.premise).toContain("one bounded full-scene retry");
+    expect(retryScene.explicitRequestOwnerIds).toEqual([mira.id]);
+    expect(retryScene.recalledRoomEvidence).toMatchObject({
+      witnessPersonaIds: [sana.id],
+      transcript: [expect.objectContaining({
+        author: "Per",
+        content: "Jag kör gitarr genom ett gammalt trasigt filter.",
+        ageSeconds: 600,
+      })],
+    });
   });
 
   it("drops a German false evidence denial without sending it to style repair", async () => {
@@ -784,6 +962,9 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(lines.map((line) => line.content)).toEqual(["Yo empezaría por el fallo pequeño; ahí está la pista."]);
     expect(bodies).toHaveLength(4);
     expect(JSON.stringify(bodies[2])).toContain("Empieza con tu objeción concreta");
+    expect(bodies[2].messages[0].content).toContain("stableVoice turn policy may deliberately permit");
+    expect(bodies[2].messages[0].content).toContain("stretched emphasis, self-correction, loose orthography, harmless typo or mild profanity");
+    expect(bodies[2].messages[0].content).toContain("instead of polishing every line into formal prose");
   });
 
   it("fails closed for every scene when review output is invalid", async () => {
@@ -834,6 +1015,62 @@ describe("LM Studio multilingual batch candidate review", () => {
 });
 
 describe("LM Studio room prompt", () => {
+  it("serializes an exact bounded recalled-room excerpt with witnesses and elapsed timing", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const witnessIds = PERSONAS.slice(0, 10).map((persona) => persona.id);
+    const recalledTranscript = Array.from({ length: 10 }, (_, index) => ({
+      author: index === 9 ? "Per" : `Guest ${index}`,
+      kind: index % 3 === 0 ? "ai" as const : "human" as const,
+      content: index === 9 ? "Jag kör gitarr genom ett gammalt trasigt filter." : `older exact row ${index}`,
+      createdAt: new Date(Date.parse("2026-07-14T09:50:00.000Z") + index * 60_000).toISOString(),
+    }));
+    let completionBody: { messages: Array<{ role: string; content: string }> } | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionBody = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      return completionResponse([{ personaId: mira.id, content: "Jaaa, Per nämnde faktiskt det trasiga filtret." }]);
+    }));
+
+    await new LmStudioClient({
+      now: () => Date.parse("2026-07-14T10:05:00.000Z"),
+      communityTimeZone: "Europe/Stockholm",
+    }).generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      roomRecall: {
+        witnessPersonaIds: witnessIds,
+        transcript: recalledTranscript,
+      },
+      trigger: {
+        author: "Jaw_B",
+        content: "Kommer ni ihåg Per?",
+        createdAt: "2026-07-14T10:04:50.000Z",
+      },
+      mustReplyIds: [mira.id],
+    });
+
+    const system = completionBody?.messages.find((message) => message.role === "system")?.content ?? "";
+    const user = JSON.parse(completionBody?.messages.find((message) => message.role === "user")?.content ?? "{}");
+    expect(system).toContain("recalledRoomEvidence contains exact, retained public-channel excerpts");
+    expect(system).toContain("Only IDs in witnessPersonaIds may say they personally remember");
+    expect(user.recalledRoomEvidence.witnessPersonaIds).toEqual(witnessIds.slice(0, 8));
+    expect(user.recalledRoomEvidence.transcript).toHaveLength(8);
+    expect(user.recalledRoomEvidence.transcript).toEqual(
+      recalledTranscript.slice(-8).map((line, index) => ({
+        ...line,
+        ageSeconds: 780 - index * 60,
+        ...(index === 0 ? {} : { sincePreviousSeconds: 60 }),
+      })),
+    );
+    expect(user.recalledRoomEvidence.transcript.map((line: { content: string }) => line.content))
+      .not.toContain("older exact row 0");
+    expect(user.recalledRoomEvidence.transcript.map((line: { content: string }) => line.content))
+      .not.toContain("older exact row 1");
+  });
+
   it("turns a trusted expected request into a do-it-now contract without naming a language or artifact", () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;

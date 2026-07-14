@@ -140,6 +140,8 @@ describe("multilingual semantic router contract", () => {
     expect(format.json_schema.schema.required).toEqual(expect.arrayContaining(["rl", "rlx", "b"]));
     expect(properties.s.required).toEqual(expect.arrayContaining(["p", "u", "o"]));
     expect(properties.b.properties.r.enum).toEqual(["none", "optional", "required"]);
+    expect(properties.h.properties.n.enum).toEqual(["none", "helpful", "required"]);
+    expect(format.json_schema.schema.required).toContain("h");
 
     const noNetworkTools = input({ availableCapabilities: ["local_datetime"] });
     const restricted = buildTurnAnalysisResponseFormat(noNetworkTools) as any;
@@ -156,6 +158,31 @@ describe("multilingual semantic router contract", () => {
       evidence: { action: "local_datetime", timeZone: "Asia/Tokyo" },
       personas: { requestedReplyIds: ["ai-mira"] },
     });
+  });
+
+  it("gates retained public-room recall semantically and fails closed outside that medium", () => {
+    const recallOutput = {
+      ...modelOutput(),
+      historyRecall: { need: "required", query: "Per", confidence: 0.96 },
+    };
+    const enabledInput = input({ historyRecallAvailable: true });
+    const parsed = parseTurnAnalysisContent(JSON.stringify(recallOutput), enabledInput);
+    expect(parsed?.historyRecall).toEqual({ need: "required", query: "Per", confidence: 0.96 });
+    expect(projectTrustedTurnAnalysis(parsed)).toMatchObject({
+      historyRecallTrusted: true,
+      historyRecall: { need: "required", query: "Per" },
+    });
+    expect(buildTurnAnalysisUserData(enabledInput)).toMatchObject({ historyRecallAvailable: true });
+    expect(parseTurnAnalysisContent(JSON.stringify(recallOutput), input())).toBeUndefined();
+
+    recallOutput.historyRecall.confidence = 0.79;
+    expect(projectTrustedTurnAnalysis(
+      parseTurnAnalysisContent(JSON.stringify(recallOutput), enabledInput),
+    )).toMatchObject({
+      historyRecallTrusted: false,
+      historyRecall: { need: "none", query: null },
+    });
+    expect(buildTurnAnalysisSystemPrompt()).toContain("A name, repeated word, quotation or ordinary follow-up alone is not a recall request");
   });
 
   it("canonicalizes harmless model casing and aliases instead of dropping the whole turn", () => {
@@ -180,8 +207,9 @@ describe("multilingual semantic router contract", () => {
       m: { r: "none", a: "none", c: [], x: 0.99 },
       e: { a: "local_datetime", x: 0.99, q: null, u: null, m: null, z: "Asia/Tokyo", k: "current_time", l: "東京" },
       c: { d: ["local_datetime"], r: "execute", a: false, i: false, l: false, x: 0.95 },
+      h: { n: "required", q: "Per", x: 0.94 },
       y: [],
-    }), input());
+    }), input({ historyRecallAvailable: true }));
     expect(parsed).toMatchObject({
       source: "lm",
       language: { tag: "en" },
@@ -197,12 +225,14 @@ describe("multilingual semantic router contract", () => {
       },
       evidence: { need: "required", action: "local_datetime", timeZone: "Asia/Tokyo" },
       personas: { requestedReplyIds: ["ai-mira"] },
+      historyRecall: { need: "required", query: "Per" },
     });
     expect(projectTrustedTurnAnalysis(parsed)).toMatchObject({
       languageTag: "sv",
       social: { playfulness: 0.2, urgency: 0.35, pileOnRisk: 0.85 },
       interactionTrusted: true,
       interaction: { kind: "directed_insult", reactionNeed: "required" },
+      historyRecallTrusted: true,
     });
   });
 
@@ -333,6 +363,8 @@ describe("multilingual semantic router contract", () => {
       asksForList: false,
       asksAboutAiIdentity: false,
       asksAboutAcoustics: false,
+      historyRecallTrusted: false,
+      historyRecall: { need: "none", query: null },
     });
   });
 
@@ -428,11 +460,33 @@ describe("multilingual semantic router contract", () => {
     expect(parseTurnAnalysisContent(JSON.stringify(compact), input())?.capabilities.discussed).toEqual([]);
   });
 
+  it("normalizes a contradictory no-reaction bit after a directed-act classification", () => {
+    const compact = {
+      l: "en",
+      lx: 0.99,
+      rl: "sv",
+      rlx: 0.96,
+      i: { k: "social", q: false, r: "none", x: 0.95 },
+      p: { a: [], r: [], v: [], x: 0, y: 0 },
+      s: { w: 0, h: 0.9, p: 0, a: 0, u: 0, e: 0.5, o: 0.1, c: 0, x: 0.95 },
+      b: { k: "directed_insult", t: "room", r: "none", c: 0.9, m: 0, x: 0.92 },
+      m: { r: "low", a: "none", c: [], x: 0.9 },
+      e: { a: "none", x: 0.99, q: null, u: null, m: null, z: null, k: null, l: null },
+      c: { d: [], r: "none", a: false, i: false, l: false, x: 0.99 },
+      h: { n: "none", q: null, x: 0.99 },
+      y: [],
+    };
+    expect(parseTurnAnalysisContent(JSON.stringify(compact), input({ historyRecallAvailable: true }))?.interaction)
+      .toMatchObject({ kind: "directed_insult", reactionNeed: "required" });
+  });
+
   it("instructs one multilingual pass without keyword-list routing", () => {
     const prompt = buildTurnAnalysisSystemPrompt();
     expect(prompt).toContain("single multilingual semantic router");
     expect(prompt).toContain("Never rely on a fixed vocabulary");
     expect(prompt).toContain("Never use length, vocabulary lists or a hard-coded language pair");
+    expect(prompt).toContain("keep l as the expression's actual language but keep rl as the established response language");
+    expect(prompt).toContain("A genuine non-rhetorical question addressed to the room normally has reply expectation expected");
     expect(prompt).toContain("reactionNeed is separate from i.r");
     expect(prompt).toContain("classify the pragmatic act in context, never a token");
     expect(prompt).toContain("Quoted, reported, negated, rejected, corrected or reclaimed language");
@@ -440,6 +494,7 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("valid IANA time-zone name");
     expect(prompt).toContain("Never output, reconstruct or copy a URL");
     expect(prompt).toContain("quoted/reporting speech from endorsement");
+    expect(prompt).toContain("A reporter explicitly asking to flag or report a message/person uses intent moderation_report and action report");
     expect(prompt).toContain("Always return y []");
   });
 });
@@ -542,6 +597,7 @@ const reviewInput = (): NormalizedCandidateReviewInput => candidateReviewInputSc
     surfaceActorId: null,
     recentTimeline: [],
   },
+  roomRecall: null,
   evidence: {
     outcome: "succeeded",
     kind: "page",
@@ -554,6 +610,7 @@ const reviewInput = (): NormalizedCandidateReviewInput => candidateReviewInputSc
       actorName: "Mira",
       content: "Oui — la page contredit précisément cette citation.",
       sourceIds: ["S1"],
+      surfaceStylePlan: { visibleAffect: true, surfaceTexture: "stretched-emphasis" },
       recentOwnTexts: [],
       peerTexts: [],
     },
@@ -562,6 +619,7 @@ const reviewInput = (): NormalizedCandidateReviewInput => candidateReviewInputSc
       actorName: "Sana",
       content: "Le passage parle d'un échec temporaire, pas d'une incapacité permanente.",
       sourceIds: ["S1"],
+      surfaceStylePlan: { visibleAffect: false, surfaceTexture: null },
       recentOwnTexts: [],
       peerTexts: [],
     },
@@ -599,6 +657,7 @@ const explicitRequestReviewInput = (options: {
       sourceIds: [],
       mustReply: options.mustReply ?? true,
       mustFulfillRequest: options.mustFulfillRequest ?? true,
+      surfaceStylePlan: { visibleAffect: true, surfaceTexture: "fragment" },
       recentOwnTexts: [],
       peerTexts: [],
     }],
@@ -614,6 +673,74 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("No setting permits threats, protected-class slurs");
   });
 
+  it("carries bounded exact room recall, witness metadata, affect context and one surface-style move", () => {
+    const base = reviewInput();
+    const timelineRow = {
+      author: "Per",
+      kind: "human" as const,
+      content: "Jag var här tidigare och nämnde keramik.",
+      createdAt: "2026-07-14T09:00:00.000Z",
+      ageSeconds: 10_800,
+      sincePreviousSeconds: null,
+    };
+    const parsed = candidateReviewInputSchema.parse({
+      ...base,
+      semanticContext: {
+        ...base.semanticContext,
+        warmth: 0.8,
+        absurdity: 0.2,
+        urgency: 0.1,
+        energy: 0.7,
+        claimStrength: 0.6,
+      },
+      roomRecall: {
+        witnessPersonaIds: ["ai-sana"],
+        timeline: [timelineRow],
+      },
+    });
+
+    expect(parsed.roomRecall).toEqual({
+      witnessPersonaIds: ["ai-sana"],
+      timeline: [timelineRow],
+    });
+    expect(parsed.semanticContext).toMatchObject({
+      warmth: 0.8,
+      absurdity: 0.2,
+      urgency: 0.1,
+      energy: 0.7,
+      claimStrength: 0.6,
+    });
+    expect(parsed.candidates[0].surfaceStylePlan).toEqual({
+      visibleAffect: true,
+      surfaceTexture: "stretched-emphasis",
+    });
+
+    expect(candidateReviewInputSchema.safeParse({
+      ...base,
+      roomRecall: {
+        witnessPersonaIds: [],
+        timeline: Array.from({ length: 9 }, (_, index) => ({
+          ...timelineRow,
+          createdAt: `2026-07-14T09:00:0${index}.000Z`,
+        })),
+      },
+    }).success).toBe(false);
+    expect(candidateReviewInputSchema.safeParse({
+      ...base,
+      candidates: [{
+        ...base.candidates[0],
+        surfaceStylePlan: { visibleAffect: true, surfaceTexture: "random-chat-tic" },
+      }],
+    }).success).toBe(false);
+    expect(candidateReviewInputSchema.safeParse({
+      ...base,
+      roomRecall: {
+        witnessPersonaIds: ["ai-mira", "ai-mira"],
+        timeline: [timelineRow],
+      },
+    }).success).toBe(false);
+  });
+
   it("builds a strict dynamic batch schema", () => {
     const format = buildCandidateReviewResponseFormat(reviewInput()) as any;
     const reviews = format.json_schema.schema.properties.reviews;
@@ -622,6 +749,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviews.maxItems).toBe(2);
     expect(reviews.items.properties.personaId.enum).toEqual(["ai-mira", "ai-sana"]);
     expect(reviews.items.properties.issues.items.enum).toContain("unsupported_acoustic_assertion");
+    expect(reviews.items.properties.issues.items.enum).toContain("unsupported_room_recall");
     expect(reviews.items.properties.issues.items.enum).toContain("incorrect_temporal_claim");
     expect(reviews.items.properties.issues.items.enum).toContain("gratuitous_time_reference");
     expect(reviews.items.properties.issues.items.enum).toContain("unfulfilled_explicit_request");
@@ -655,6 +783,43 @@ describe("multilingual batch candidate-review contract", () => {
     expect(parseCandidateReviewContent(JSON.stringify(valid), reviewInput())).toEqual(valid);
     valid.reviews[0] = { ...valid.reviews[0], issues: ["made_up_issue"] };
     expect(parseCandidateReviewContent(JSON.stringify(valid), reviewInput())).toBeUndefined();
+  });
+
+  it("accepts unsupported old-room memory as a factual publication issue", () => {
+    const base = reviewInput();
+    const recalled = candidateReviewInputSchema.parse({
+      ...base,
+      roomRecall: {
+        witnessPersonaIds: ["ai-sana"],
+        timeline: [{
+          author: "Per",
+          kind: "human",
+          content: "Jag var här en sväng.",
+          createdAt: "2026-07-14T09:00:00.000Z",
+          ageSeconds: 10_800,
+          sincePreviousSeconds: null,
+        }],
+      },
+    });
+    const blocked = {
+      reviews: [
+        {
+          personaId: "ai-mira",
+          severity: "high",
+          issues: ["unsupported_room_recall"],
+          rewriteInstruction: "Säg att du såg det i den sparade rumshistoriken i stället för att påstå personlig närvaro.",
+        },
+        { personaId: "ai-sana", severity: "none", issues: [], rewriteInstruction: null },
+      ],
+    };
+
+    expect(parseCandidateReviewContent(JSON.stringify(blocked), recalled)).toEqual(blocked);
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [
+        { ...blocked.reviews[0], severity: "medium" },
+        blocked.reviews[1],
+      ],
+    }), recalled)).toBeUndefined();
   });
 
   it("accepts an unfulfilled explicit request only as a high-severity gated blocker", () => {
@@ -746,5 +911,12 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("mustReply alone may instead represent moderation, evidence, dissent or another social role");
     expect(prompt).toContain("a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment");
     expect(prompt).toContain("Relatedness alone is not fulfilment");
+    expect(prompt).toContain("roomRecall.witnessPersonaIds");
+    expect(prompt).toContain("exact roomRecall timeline is evidence of what appeared");
+    expect(prompt).toContain("unsupported_room_recall");
+    expect(prompt).toContain("A non-witness may accurately say it checked retained room history");
+    expect(prompt).toContain("visibleAffect true permits one genuine feeling");
+    expect(prompt).toContain("informal fragment, lowercase opening, letter elongation, brief self-correction, rough orthography, harmless typo or mild profanity");
+    expect(prompt).toContain("Do not formalize or copy-edit such permitted texture");
   });
 });

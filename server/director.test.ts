@@ -806,6 +806,359 @@ describe("social director", () => {
     }
   });
 
+  it("keeps a departed human's frozen display name in semantic-router context", async () => {
+    const departed = {
+      id: "guest-departed-dimitra",
+      name: "Δήμητρα",
+      kind: "human" as const,
+      status: "offline" as const,
+      avatar: { color: "#345", accent: "#789", glyph: "Δ" },
+    };
+    const current = {
+      id: "guest-current-router",
+      name: "Current guest",
+      kind: "human" as const,
+      status: "online" as const,
+      avatar: { color: "#123", accent: "#456", glyph: "C" },
+    };
+    const older = createMessage(
+      "lobby",
+      departed.id,
+      "Θα επιστρέψω αργότερα.",
+      { authorSnapshot: departed },
+    );
+    const latest = createMessage("lobby", current.id, "Μια καινούργια ερώτηση.");
+    const analyzeTurn = vi.fn(async () => classifiedTurn({
+      language: { tag: "el", confidence: 0.99 },
+    }));
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-departed-router-name-unused.json"),
+      { analyzeTurn, rememberDeliveredLine: vi.fn() } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {
+        getRelation: vi.fn(() => undefined),
+        updateRelation: vi.fn(),
+        promptNote: vi.fn(() => undefined),
+        noteClassifiedMemoryFact: vi.fn(),
+      } as never,
+      () => [current, ...PERSONAS],
+      () => 1,
+    );
+
+    await (director as unknown as {
+      analyzeHumanTurn: (input: {
+        medium: "public";
+        turnId: string;
+        channelId: string;
+        latest: typeof latest;
+        burst: Array<typeof latest>;
+        recent: Array<typeof latest>;
+        personas: typeof PERSONAS;
+        candidateSet: { requestedAt: string; candidates: never[] };
+        allowSearch: boolean;
+      }) => Promise<TurnAnalysis>;
+    }).analyzeHumanTurn({
+      medium: "public",
+      turnId: `public:${latest.id}`,
+      channelId: "lobby",
+      latest,
+      burst: [latest],
+      recent: [older],
+      personas: PERSONAS,
+      candidateSet: { requestedAt: latest.createdAt, candidates: [] },
+      allowSearch: true,
+    });
+    director.stop();
+
+    expect(analyzeTurn).toHaveBeenCalledTimes(1);
+    expect(analyzeTurn.mock.calls[0]?.[0].recentMessages).toContainEqual(expect.objectContaining({
+      id: older.id,
+      authorId: departed.id,
+      authorName: "Δήμητρα",
+      content: older.content,
+    }));
+    expect(analyzeTurn.mock.calls[0]?.[0].recentMessages).not.toContainEqual(expect.objectContaining({
+      id: older.id,
+      authorName: "guest",
+    }));
+  });
+
+  it("recalls an exact older public episode and appoints a real witness to answer", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-14T14:00:00.000Z");
+    vi.setSystemTime(now);
+    try {
+      const human = {
+        id: "guest-room-recall",
+        name: "Nikos",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "N" },
+      };
+      const departed = {
+        id: "guest-periklis",
+        name: "Περικλής",
+        kind: "human" as const,
+        status: "offline" as const,
+        avatar: { color: "#345", accent: "#678", glyph: "Π" },
+      };
+      const fillerAuthor = {
+        id: "guest-archive-filler",
+        name: "Archive guest",
+        kind: "human" as const,
+        status: "offline" as const,
+        avatar: { color: "#222", accent: "#444", glyph: "A" },
+      };
+      const store = new RoomStore("/tmp/director-grounded-room-recall-unused.json");
+      const at = (message: ReturnType<typeof createMessage>, time: number) => {
+        message.createdAt = new Date(time).toISOString();
+        store.addPublicMessage(message);
+        return message;
+      };
+      const oldHuman = at(createMessage(
+        "lobby",
+        departed.id,
+        "Γεια, είμαι ο Περικλής και δοκιμάζω το παλιό αρχείο.",
+        { authorSnapshot: departed },
+      ), now - 2 * 60 * 60_000);
+      const oldWitness = at(createMessage(
+        "lobby",
+        "ai-mira",
+        "Χάρηκα, Περικλή — θα το θυμάμαι ως δοκιμή αρχείου.",
+        { replyToId: oldHuman.id },
+      ), now - 2 * 60 * 60_000 + 60_000);
+      for (let index = 0; index < 34; index += 1) {
+        at(createMessage(
+          "lobby",
+          fillerAuthor.id,
+          `unrelated archive row ${index}`,
+          { authorSnapshot: fillerAuthor },
+        ), now - 60 * 60_000 + index * 1_000);
+      }
+      const trigger = at(createMessage(
+        "lobby",
+        human.id,
+        "Θυμάστε τον Περικλή από πριν;",
+      ), now);
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        language: { tag: "el", confidence: 0.99 },
+        historyRecall: {
+          need: "required",
+          query: "Περικλής",
+          confidence: 0.99,
+        },
+      }));
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        mustReplyIds: string[];
+        requestOwnerIds: string[];
+        history: Array<{ author: string; content: string }>;
+        roomRecall?: {
+          witnessPersonaIds: string[];
+          transcript: Array<{ author: string; kind: string; content: string; createdAt: string }>;
+        };
+        premise?: string;
+      }) => [{
+        personaId: request.requestOwnerIds[0] ?? request.selected[0]!.id,
+        content: "Ναι, ήμουν εδώ όταν μπήκε ο Περικλής.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeTurn, generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: trigger.createdAt, candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof trigger>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([trigger], human);
+      await vi.advanceTimersByTimeAsync(12_000);
+      await pending;
+      director.stop();
+
+      expect(analyzeTurn).toHaveBeenCalledTimes(1);
+      expect(analyzeTurn.mock.calls[0]?.[0].recentMessages).not.toContainEqual(expect.objectContaining({
+        id: oldHuman.id,
+      }));
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const scene = generateScene.mock.calls[0]![0];
+      expect(scene.history).toHaveLength(26);
+      expect(scene.history.some((line) => line.content === oldHuman.content)).toBe(false);
+      expect(scene.roomRecall?.transcript).toEqual([
+        {
+          author: "Περικλής",
+          kind: "human",
+          content: oldHuman.content,
+          createdAt: oldHuman.createdAt,
+        },
+        {
+          author: "Mira",
+          kind: "ai",
+          content: oldWitness.content,
+          createdAt: oldWitness.createdAt,
+        },
+      ]);
+      expect(scene.roomRecall?.transcript.length).toBeLessThanOrEqual(8);
+      expect(scene.roomRecall?.witnessPersonaIds).toEqual(["ai-mira"]);
+      expect(scene.selected.map((persona) => persona.id)).toContain("ai-mira");
+      expect(scene.requestOwnerIds).toEqual(["ai-mira"]);
+      expect(scene.mustReplyIds).toContain("ai-mira");
+      expect(scene.premise).toContain("Mira is the server-observed witness");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not expose room recall when the semantic gate is weak or says none", async () => {
+    vi.useFakeTimers();
+    const baseNow = Date.parse("2026-07-14T15:00:00.000Z");
+    vi.setSystemTime(baseNow);
+    try {
+      const cases: Array<{
+        label: string;
+        historyRecall: NonNullable<TurnAnalysis["historyRecall"]>;
+        intent?: TurnAnalysis["intent"];
+      }> = [
+        {
+          label: "low-confidence",
+          historyRecall: { need: "required", query: "記憶対象", confidence: 0.79 },
+        },
+        {
+          label: "none",
+          historyRecall: { need: "none", query: null, confidence: 0.99 },
+        },
+        {
+          label: "trusted-no-source",
+          historyRecall: { need: "required", query: "存在しない名前", confidence: 0.99 },
+          intent: { kind: "statement", isQuestion: false, replyExpected: "none", confidence: 0.99 },
+        },
+      ];
+
+      for (const [caseIndex, testCase] of cases.entries()) {
+        const now = baseNow + caseIndex * 10 * 60_000;
+        const human = {
+          id: `guest-recall-gate-${caseIndex}`,
+          name: "Guest",
+          kind: "human" as const,
+          status: "online" as const,
+          avatar: { color: "#123", accent: "#456", glyph: "G" },
+        };
+        const oldHuman = {
+          id: `guest-old-recall-gate-${caseIndex}`,
+          name: "記憶対象",
+          kind: "human" as const,
+          status: "offline" as const,
+          avatar: { color: "#234", accent: "#567", glyph: "記" },
+        };
+        const filler = {
+          id: `guest-filler-recall-gate-${caseIndex}`,
+          name: "Filler",
+          kind: "human" as const,
+          status: "offline" as const,
+          avatar: { color: "#222", accent: "#333", glyph: "F" },
+        };
+        const store = new RoomStore(`/tmp/director-room-recall-${testCase.label}-unused.json`);
+        const addAt = (message: ReturnType<typeof createMessage>, time: number) => {
+          message.createdAt = new Date(time).toISOString();
+          store.addPublicMessage(message);
+          return message;
+        };
+        const old = addAt(createMessage(
+          "lobby",
+          oldHuman.id,
+          "記憶対象 が以前ここにいました。",
+          { authorSnapshot: oldHuman },
+        ), now - 2 * 60 * 60_000);
+        addAt(createMessage("lobby", "ai-mira", "前の会話への短い返事。", { replyToId: old.id }), now - 2 * 60 * 60_000 + 1_000);
+        for (let index = 0; index < 30; index += 1) {
+          addAt(createMessage(
+            "lobby",
+            filler.id,
+            `unrelated row ${index}`,
+            { authorSnapshot: filler },
+          ), now - 60 * 60_000 + index * 1_000);
+        }
+        const trigger = addAt(createMessage("lobby", human.id, "記憶対象について覚えていますか？"), now);
+        const analyzeTurn = vi.fn(async () => classifiedTurn({
+          language: { tag: "ja", confidence: 0.99 },
+          ...(testCase.intent ? { intent: testCase.intent } : {}),
+          historyRecall: testCase.historyRecall,
+        }));
+        const generateScene = vi.fn(async (request: {
+          selected: Array<(typeof PERSONAS)[number]>;
+          mustReplyIds: string[];
+          roomRecall?: unknown;
+          premise?: string;
+        }) => [{
+          personaId: request.selected[0]!.id,
+          content: "短い返事です。",
+          source: "lm" as const,
+          sourceIds: [],
+        }]);
+        const director = new SocialDirector(
+          { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+          store,
+          { analyzeTurn, generateScene, rememberDeliveredLine: vi.fn() } as never,
+          new ActorChannelRuntime(),
+          {} as never,
+          {
+            getRelation: vi.fn(() => undefined),
+            updateRelation: vi.fn(),
+            promptNote: vi.fn(() => undefined),
+            noteClassifiedMemoryFact: vi.fn(),
+          } as never,
+          () => [human, ...PERSONAS],
+          () => 1,
+          {
+            now: () => now,
+            rng: () => 0.99,
+            pageReader: {
+              collectCandidates: vi.fn(() => ({ requestedAt: trigger.createdAt, candidates: [] })),
+            } as never,
+          },
+        );
+
+        const pending = (director as unknown as {
+          handleHumanBurst: (messages: Array<typeof trigger>, member: typeof human) => Promise<void>;
+        }).handleHumanBurst([trigger], human);
+        await vi.advanceTimersByTimeAsync(12_000);
+        await pending;
+        director.stop();
+
+        expect(generateScene, testCase.label).toHaveBeenCalledTimes(1);
+        const scene = generateScene.mock.calls[0]![0];
+        expect(scene.roomRecall, testCase.label).toBeUndefined();
+        expect(scene.premise ?? "", testCase.label).not.toContain("retained public-room excerpt");
+        if (testCase.label === "trusted-no-source") {
+          expect(scene.mustReplyIds.length).toBeGreaterThan(0);
+          expect(scene.premise).toContain("no matching retained public excerpt was found");
+        }
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("carries a required conflict reaction through the public scene contract", async () => {
     vi.useFakeTimers();
     const random = vi.spyOn(Math, "random").mockReturnValue(0.1);
@@ -896,9 +1249,14 @@ describe("social director", () => {
         intentTrusted: true,
         replyExpected: "none",
         socialTrusted: true,
+        warmth: 0,
         hostility: 0.88,
         playfulness: 0.04,
+        absurdity: 0,
+        urgency: 0,
+        energy: 0.62,
         pileOnRisk: 0.91,
+        claimStrength: 0,
         interactionTrusted: true,
         interactionKind: "directed_insult",
         targetScope: "room",

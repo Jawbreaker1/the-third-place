@@ -9,6 +9,17 @@ export type PersonaDisagreementMode =
   | "blunt-challenge"
   | "playful-provocation";
 
+export const PERSONA_SURFACE_TEXTURES = [
+  "fragment",
+  "self-correction",
+  "stretched-emphasis",
+  "rough-orthography",
+  "harmless-typo",
+  "mild-profanity",
+] as const;
+
+export type PersonaSurfaceTexture = (typeof PERSONA_SURFACE_TEXTURES)[number];
+
 export interface PersonaStyleFingerprint {
   /** The normal range, not a target that every message must fill. */
   typicalWords: readonly [number, number];
@@ -22,6 +33,12 @@ export interface PersonaStyleFingerprint {
   emojiPalette?: readonly string[];
   /** 0 = one plain reaction, 1 = occasionally sustain a nuanced multi-part thought. */
   complexityAppetite: number;
+  /** Approximate share of turns where an emotion already present in the moment may visibly leak through. */
+  visibleAffectRate: number;
+  /** Approximate share of text turns allowed one deliberately informal surface move. Must stay below 0.5. */
+  surfaceTextureRate: number;
+  /** Persona-specific moves to rotate between. The policy exposes at most one on any turn. */
+  surfaceTexturePalette: readonly PersonaSurfaceTexture[];
   correctionMode: PersonaCorrectionMode;
   disagreementMode: PersonaDisagreementMode;
   /** Options to rotate between, never mandatory tics. */
@@ -43,6 +60,10 @@ export interface PersonaStyleTurnPolicy {
   emoji?: string;
   /** A single optional habit is exposed to the model; the other habits stay hidden. */
   habit?: string;
+  /** True only on turns where one context-supported feeling may be more visible than usual. */
+  visibleAffect: boolean;
+  /** At most one language-appropriate surface move is exposed for this turn. */
+  surfaceTexture?: PersonaSurfaceTexture;
   ending: "statement" | "question-allowed" | "question-required";
 }
 
@@ -90,6 +111,21 @@ const complexityNote = (appetite: number): string => {
   if (appetite < 0.8) return "Can carry a specific claim plus one supporting reason, while staying chat-sized.";
   return "May occasionally introduce a nuanced or second-order thought, but never turn it into an essay.";
 };
+
+const surfaceTextureNotes: Record<PersonaSurfaceTexture, string> = {
+  fragment: "A clipped fragment is permitted when context makes the omitted grammar obvious.",
+  "self-correction": "A brief in-line self-correction or changed thought is permitted; do not explain the correction.",
+  "stretched-emphasis": "One naturally stretchable written sound may be lengthened for emphasis when that is normal in the required language and script.",
+  "rough-orthography": "Slightly loose everyday chat orthography, casing or punctuation is permitted while the meaning stays immediately clear.",
+  "harmless-typo": "One believable harmless typo in ordinary prose is permitted, without obscuring meaning.",
+  "mild-profanity": "One mild, non-targeted adult profanity may appear as spontaneous emphasis when it fits the actor, room and moment; it is never required.",
+};
+
+const voiceSurfaceTextures = new Set<PersonaSurfaceTexture>([
+  "fragment",
+  "self-correction",
+  "mild-profanity",
+]);
 
 export interface PersonaStylePromptOptions {
   medium?: "text" | "voice";
@@ -142,10 +178,23 @@ export const derivePersonaStyleTurnPolicy = (
         Math.floor(hashUnit(`${key}\u0000habit-choice`) * eligibleHabits.length)
       ]?.habit
     : undefined;
+  const visibleAffect = hashUnit(`${key}\u0000visible-affect`) < persona.style.visibleAffectRate;
+  const eligibleTextures = persona.style.surfaceTexturePalette.filter((texture) =>
+    medium !== "voice" || voiceSurfaceTextures.has(texture),
+  );
+  const textureAllowed = eligibleTextures.length > 0 &&
+    hashUnit(`${key}\u0000surface-texture`) < persona.style.surfaceTextureRate;
+  const surfaceTexture = textureAllowed
+    ? eligibleTextures[
+        Math.floor(hashUnit(`${key}\u0000surface-texture-choice`) * eligibleTextures.length)
+      ]
+    : undefined;
 
   return {
     ...(emoji ? { emoji } : {}),
     ...(habit ? { habit } : {}),
+    visibleAffect,
+    ...(surfaceTexture ? { surfaceTexture } : {}),
     ending,
   };
 };
@@ -182,9 +231,28 @@ const turnPolicyNote = (policy: PersonaStyleTurnPolicy): string => {
     : policy.ending === "question-allowed"
       ? "A genuine question is permitted but not required; never add one merely to keep the chat moving."
       : "End with a statement, fragment or observation; do not ask a question in this message.";
+  const affect = policy.visibleAffect
+    ? "If the immediate context genuinely supports a feeling, it may show briefly through word choice or rhythm; do not invent or clinically label an emotion."
+    : "Do not manufacture an emotional beat for this message; the actor's ordinary personality may still remain visible.";
+  const texture = policy.surfaceTexture
+    ? `${surfaceTextureNotes[policy.surfaceTexture]} Use it only if it is natural in the required language and script; otherwise keep the line clean.`
+    : "Keep this message's surface clean; do not add a deliberate typo, stretch, self-correction, rough spelling or profanity tic.";
   return `- Turn policy / emoji: ${emoji}
 - Turn policy / habit: ${habit}
+- Turn policy / visible affect: ${affect}
+- Turn policy / surface texture: ${texture}
 - Turn policy / ending: ${ending}`;
+};
+
+const surfaceDistributionNote = (style: PersonaStyleFingerprint): string => {
+  const affectFrequency = style.visibleAffectRate <= 0
+    ? "Visible affect is not a planned feature of this voice."
+    : `Visible affect is occasional, roughly one eligible turn in ${Math.max(2, Math.round(1 / style.visibleAffectRate))}.`;
+  const textureFrequency = style.surfaceTextureRate <= 0
+    ? "Deliberate chat texture is not a planned feature of this voice."
+    : `Deliberate chat texture is rarer, roughly one eligible text turn in ${Math.max(2, Math.round(1 / style.surfaceTextureRate))}, and never more than one move per message.`;
+  const palette = style.surfaceTexturePalette.map((texture) => surfaceTextureNotes[texture]).join(" ");
+  return `${affectFrequency} ${textureFrequency} Possible moves: ${palette}`;
 };
 
 /**
@@ -216,10 +284,12 @@ export const buildPersonaStylePromptNote = (
 - Casing/punctuation: ${casingNotes[style.casing]} ${punctuationNotes[style.punctuation]}
 - Emoji: ${policy ? "Follow this turn's explicit emoji budget below; do not infer a broader allowance from the persona." : emojiNote(style)}
 - Thought density: ${complexityNote(style.complexityAppetite)}
+- Affect and informal texture: ${policy ? "Follow this turn's explicit affect and surface budget below; these are permissions, not boxes to tick." : surfaceDistributionNote(style)}
 - Corrections: ${correctionNoteForTurn(style, policy)}
 - Disagreement: ${disagreementNoteForTurn(style, policy)}
 ${policy ? turnPolicyNote(policy) : `- Optional habits to rotate, at most one per message: ${habits}.`}
 - Avoid generic service-assistant validation, recap and transition language in any language. Persona-specific crutches to avoid: ${avoid}.
+- Surface texture belongs only in ordinary prose. Never alter or misspell names, handles, code, URLs, source identifiers, numbers, quoted literals or technical tokens.
 - Do not perform every trait every time, announce the style, reuse the same opening, or turn a habit into a catchphrase.`;
 };
 
@@ -239,6 +309,9 @@ export const personaStyleSignature = (style: PersonaStyleFingerprint): string =>
     style.punctuation,
     style.emojiRate,
     style.complexityAppetite,
+    style.visibleAffectRate,
+    style.surfaceTextureRate,
+    style.surfaceTexturePalette.join("|"),
     style.correctionMode,
     style.disagreementMode,
     style.conversationHabits.join("|"),

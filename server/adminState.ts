@@ -202,7 +202,23 @@ const stablePalette = (id: string): [string, string] => {
 const runtimePersonaFromConfig = (config: AdminPersonaConfig, base?: Persona): Persona => {
   const [color, accent] = stablePalette(config.id);
   const talk = unitFromPercent(config.core.talkativeness);
+  const warmth = unitFromPercent(config.core.warmth);
+  const curiosity = unitFromPercent(config.core.curiosity);
+  const mischief = unitFromPercent(config.core.mischief);
+  const conscientiousness = unitFromPercent(config.core.conscientiousness);
   const disagreement = unitFromPercent(config.core.disagreement);
+  const customVisibleAffectRate = Math.max(0.1, Math.min(0.68, 0.1 + warmth * 0.38 + mischief * 0.2));
+  const customSurfaceTextureRate = Math.max(
+    0.04,
+    Math.min(0.4, 0.04 + mischief * 0.22 + (1 - conscientiousness) * 0.12),
+  );
+  const customSurfaceTexturePalette: Array<Persona["style"]["surfaceTexturePalette"][number]> = [
+    "fragment",
+    "self-correction",
+  ];
+  if (mischief >= 0.55) customSurfaceTexturePalette.push("stretched-emphasis", "rough-orthography");
+  if (conscientiousness <= 0.45) customSurfaceTexturePalette.push("harmless-typo");
+  if (mischief >= 0.7) customSurfaceTexturePalette.push("mild-profanity");
   const persona: Persona = base ? structuredClone(base) : {
     id: config.id,
     name: config.name,
@@ -216,10 +232,10 @@ const runtimePersonaFromConfig = (config: AdminPersonaConfig, base?: Persona): P
     interests: ["community", "conversation"],
     expertiseDomains: ["community-social", "casual-culture"],
     talkativeness: talk,
-    warmth: unitFromPercent(config.core.warmth),
-    curiosity: unitFromPercent(config.core.curiosity),
-    mischief: unitFromPercent(config.core.mischief),
-    conscientiousness: unitFromPercent(config.core.conscientiousness),
+    warmth,
+    curiosity,
+    mischief,
+    conscientiousness,
     mentionResponse: 0.98,
     cooldownMs: Math.round(12_000 + (1 - talk) * 100_000),
     latency: [1_200, 5_500],
@@ -232,7 +248,10 @@ const runtimePersonaFromConfig = (config: AdminPersonaConfig, base?: Persona): P
       casing: "sentence",
       punctuation: "plain",
       emojiRate: 0.02,
-      complexityAppetite: unitFromPercent(config.core.curiosity),
+      complexityAppetite: curiosity,
+      visibleAffectRate: customVisibleAffectRate,
+      surfaceTextureRate: customSurfaceTextureRate,
+      surfaceTexturePalette: customSurfaceTexturePalette,
       correctionMode: config.core.conscientiousness >= 70 ? "specific-fix" : "soft-question",
       disagreementMode: disagreement >= 0.7 ? "blunt-challenge" : "curious-pushback",
       conversationHabits: ["make one specific point", "respond to the live thread rather than recapping it"],
@@ -249,10 +268,10 @@ const runtimePersonaFromConfig = (config: AdminPersonaConfig, base?: Persona): P
     ...(config.avatarImageUrl ? { imageUrl: config.avatarImageUrl } : { imageUrl: undefined }),
   };
   persona.talkativeness = talk;
-  persona.warmth = unitFromPercent(config.core.warmth);
-  persona.curiosity = unitFromPercent(config.core.curiosity);
-  persona.mischief = unitFromPercent(config.core.mischief);
-  persona.conscientiousness = unitFromPercent(config.core.conscientiousness);
+  persona.warmth = warmth;
+  persona.curiosity = curiosity;
+  persona.mischief = mischief;
+  persona.conscientiousness = conscientiousness;
   persona.disagreement = disagreement;
   persona.canResearch = config.canResearch;
   persona.channelAffinity = Object.fromEntries(

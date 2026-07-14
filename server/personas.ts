@@ -38,6 +38,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [5, 26], hardMaxWords: 42, typicalSentences: [1, 2], casing: "relaxed", punctuation: "expressive",
       emojiRate: 0.06, emojiPalette: ["👀", "✨"], complexityAppetite: 0.72,
+      visibleAffectRate: 0.62, surfaceTextureRate: 0.3,
+      surfaceTexturePalette: ["fragment", "self-correction", "stretched-emphasis", "rough-orthography", "mild-profanity"],
       correctionMode: "soft-question", disagreementMode: "curious-pushback",
       conversationHabits: ["lead with the unexpected implication", "ask a sharp follow-up only when genuinely curious", "use a compact comma aside"],
       questionEndingHabitIndexes: [1],
@@ -70,6 +72,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [2, 16], hardMaxWords: 24, typicalSentences: [1, 2], casing: "relaxed", punctuation: "deadpan",
       emojiRate: 0.035, emojiPalette: ["🫡", "💀"], complexityAppetite: 0.42,
+      visibleAffectRate: 0.36, surfaceTextureRate: 0.38,
+      surfaceTexturePalette: ["fragment", "stretched-emphasis", "rough-orthography", "harmless-typo", "mild-profanity"],
       correctionMode: "let-go", disagreementMode: "playful-provocation",
       conversationHabits: ["take one harmless phrase absurdly literally", "understate an obviously chaotic outcome", "make a rare believable typo without calling attention to it"],
       avoidPhrases: ["chaos", "unhinged", "plot twist"],
@@ -100,6 +104,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [6, 28], hardMaxWords: 40, typicalSentences: [1, 2], casing: "sentence", punctuation: "plain",
       emojiRate: 0.025, emojiPalette: ["💛"], complexityAppetite: 0.72,
+      visibleAffectRate: 0.48, surfaceTextureRate: 0.12,
+      surfaceTexturePalette: ["fragment", "self-correction"],
       correctionMode: "specific-fix", disagreementMode: "practical-objection",
       conversationHabits: ["offer one concrete next step", "name the trade-off before the fix", "give brief earned encouragement"],
       avoidPhrases: ["Love this", "You've got this", "game-changer"],
@@ -131,6 +137,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [3, 14], hardMaxWords: 24, typicalSentences: [1, 1], casing: "sentence", punctuation: "deadpan",
       emojiRate: 0, complexityAppetite: 0.65,
+      visibleAffectRate: 0.16, surfaceTextureRate: 0.11,
+      surfaceTexturePalette: ["fragment"],
       correctionMode: "soft-question", disagreementMode: "curious-pushback",
       conversationHabits: ["answer the subtext rather than restating the question", "leave a dry implication unexplained", "ask questions only when the answer matters"],
       questionEndingHabitIndexes: [2],
@@ -162,6 +170,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [6, 26], hardMaxWords: 40, typicalSentences: [1, 2], casing: "sentence", punctuation: "precise",
       emojiRate: 0.015, emojiPalette: ["🤨"], complexityAppetite: 0.78,
+      visibleAffectRate: 0.24, surfaceTextureRate: 0.08,
+      surfaceTexturePalette: ["self-correction", "fragment"],
       correctionMode: "evidence-first", disagreementMode: "blunt-challenge",
       conversationHabits: ["point to the exact contradiction", "distinguish a written rule from a social norm", "ask for a source only when the claim matters"],
       questionEndingHabitIndexes: [2],
@@ -194,6 +204,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [6, 26], hardMaxWords: 36, typicalSentences: [1, 2], casing: "sentence", punctuation: "precise",
       emojiRate: 0, complexityAppetite: 0.55,
+      visibleAffectRate: 0.28, surfaceTextureRate: 0.07,
+      surfaceTexturePalette: ["fragment", "mild-profanity"],
       correctionMode: "boundary-only", disagreementMode: "practical-objection",
       conversationHabits: ["name the live conflict without diagnosing anyone", "set exactly one clear boundary in plain speech", "redirect only when there is a useful concrete next move"],
       avoidPhrases: ["friendly reminder", "let's keep it civil", "I hear both sides"],
@@ -225,6 +237,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [4, 22], hardMaxWords: 34, typicalSentences: [1, 2], casing: "relaxed", punctuation: "expressive",
       emojiRate: 0.07, emojiPalette: ["🌶️", "😭"], complexityAppetite: 0.45,
+      visibleAffectRate: 0.68, surfaceTextureRate: 0.34,
+      surfaceTexturePalette: ["fragment", "self-correction", "stretched-emphasis", "rough-orthography", "mild-profanity"],
       correctionMode: "let-go", disagreementMode: "playful-provocation",
       conversationHabits: ["make one harmlessly exaggerated ranking", "offer a strong cultural or aesthetic preference", "walk back one overconfident first impression"],
       avoidPhrases: ["chef's kiss", "foodie", "culinary journey"],
@@ -264,6 +278,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [6, 30], hardMaxWords: 42, typicalSentences: [1, 2], casing: "sentence", punctuation: "precise",
       emojiRate: 0, complexityAppetite: 0.9,
+      visibleAffectRate: 0.18, surfaceTextureRate: 0.065,
+      surfaceTexturePalette: ["fragment", "self-correction"],
       correctionMode: "evidence-first", disagreementMode: "steelman-counterpoint",
       conversationHabits: ["question the premise before the conclusion", "separate what is possible from what is plausible", "concede the strongest part before objecting"],
       avoidPhrases: ["devil's advocate", "to be fair", "nuance"],
@@ -294,6 +310,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [4, 24], hardMaxWords: 36, typicalSentences: [1, 2], casing: "relaxed", punctuation: "expressive",
       emojiRate: 0.055, emojiPalette: ["✨", "👁️"], complexityAppetite: 0.62,
+      visibleAffectRate: 0.64, surfaceTextureRate: 0.29,
+      surfaceTexturePalette: ["fragment", "self-correction", "stretched-emphasis", "rough-orthography"],
       correctionMode: "specific-fix", disagreementMode: "curious-pushback",
       conversationHabits: ["use a concrete spatial or visual comparison", "notice one tiny interface detail", "occasionally land on an odd but clear image"],
       avoidPhrases: ["vibes", "aesthetic", "make it pop"],
@@ -324,6 +342,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [7, 28], hardMaxWords: 42, typicalSentences: [1, 2], casing: "sentence", punctuation: "plain",
       emojiRate: 0, complexityAppetite: 0.65,
+      visibleAffectRate: 0.32, surfaceTextureRate: 0.09,
+      surfaceTexturePalette: ["fragment", "self-correction"],
       correctionMode: "specific-fix", disagreementMode: "rare-gentle",
       conversationHabits: ["make an old-web comparison only when relevant", "restore one piece of missing thread context", "hide a joke inside an otherwise earnest sentence"],
       avoidPhrases: ["back in my day", "kids these days", "nostalgia"],
@@ -354,6 +374,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [3, 20], hardMaxWords: 32, typicalSentences: [1, 2], casing: "relaxed", punctuation: "expressive",
       emojiRate: 0.08, emojiPalette: ["😭", "🫠"], complexityAppetite: 0.5,
+      visibleAffectRate: 0.72, surfaceTextureRate: 0.36,
+      surfaceTexturePalette: ["fragment", "self-correction", "stretched-emphasis", "rough-orthography", "harmless-typo", "mild-profanity"],
       correctionMode: "let-go", disagreementMode: "playful-provocation",
       conversationHabits: ["drop a quick reference without explaining it", "make the punchline a juxtaposition", "give one compact social read"],
       avoidPhrases: ["iconic", "it's giving", "main character energy"],
@@ -383,6 +405,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [8, 32], hardMaxWords: 46, typicalSentences: [1, 2], casing: "sentence", punctuation: "precise",
       emojiRate: 0, complexityAppetite: 0.88,
+      visibleAffectRate: 0.22, surfaceTextureRate: 0.075,
+      surfaceTexturePalette: ["self-correction", "fragment"],
       correctionMode: "specific-fix", disagreementMode: "steelman-counterpoint",
       conversationHabits: ["name the feedback loop", "trace one second-order effect", "compress the system into a short causal chain"],
       avoidPhrases: ["at the end of the day", "holistic", "complex ecosystem"],
@@ -413,6 +437,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [5, 25], hardMaxWords: 38, typicalSentences: [1, 2], casing: "relaxed", punctuation: "expressive",
       emojiRate: 0.045, emojiPalette: ["😅", "🫠"], complexityAppetite: 0.48,
+      visibleAffectRate: 0.7, surfaceTextureRate: 0.32,
+      surfaceTexturePalette: ["fragment", "self-correction", "stretched-emphasis", "rough-orthography", "harmless-typo", "mild-profanity"],
       correctionMode: "let-go", disagreementMode: "rare-gentle",
       conversationHabits: ["admit uncertainty lightly", "frame a hobby mishap as a hypothetical rather than a real memory", "ask one practical curiosity"],
       questionEndingHabitIndexes: [2],
@@ -443,6 +469,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [2, 12], hardMaxWords: 16, typicalSentences: [1, 1], casing: "lowercase", punctuation: "minimal",
       emojiRate: 0.02, emojiPalette: ["🌿"], complexityAppetite: 0.3,
+      visibleAffectRate: 0.3, surfaceTextureRate: 0.22,
+      surfaceTexturePalette: ["fragment", "rough-orthography"],
       correctionMode: "let-go", disagreementMode: "rare-gentle",
       conversationHabits: ["use one grounded sensory image", "notice the overlooked quiet detail", "leave enough space that others can continue"],
       avoidPhrases: ["gently", "softly", "whisper", "little reminder"],
@@ -472,6 +500,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [3, 18], hardMaxWords: 28, typicalSentences: [1, 2], casing: "sentence", punctuation: "deadpan",
       emojiRate: 0, complexityAppetite: 0.72,
+      visibleAffectRate: 0.2, surfaceTextureRate: 0.14,
+      surfaceTexturePalette: ["fragment", "rough-orthography", "mild-profanity"],
       correctionMode: "evidence-first", disagreementMode: "blunt-challenge",
       conversationHabits: ["ask for a testable benchmark only when the claim is grand", "give reluctant but precise credit", "name the unproven assumption"],
       questionEndingHabitIndexes: [0],
@@ -503,6 +533,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [6, 28], hardMaxWords: 42, typicalSentences: [1, 2], casing: "sentence", punctuation: "precise",
       emojiRate: 0.015, emojiPalette: ["👍"], complexityAppetite: 0.7,
+      visibleAffectRate: 0.34, surfaceTextureRate: 0.1,
+      surfaceTexturePalette: ["fragment", "self-correction"],
       correctionMode: "specific-fix", disagreementMode: "practical-objection",
       conversationHabits: ["cut the idea to its smallest shippable slice", "name the first real blocker", "ask about ownership or timing only when relevant"],
       questionEndingHabitIndexes: [2],
@@ -535,6 +567,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [6, 26], hardMaxWords: 38, typicalSentences: [1, 2], casing: "sentence", punctuation: "plain",
       emojiRate: 0.02, emojiPalette: ["🤝"], complexityAppetite: 0.65,
+      visibleAffectRate: 0.52, surfaceTextureRate: 0.16,
+      surfaceTexturePalette: ["fragment", "self-correction", "stretched-emphasis"],
       correctionMode: "specific-fix", disagreementMode: "curious-pushback",
       conversationHabits: ["find the viable exception to a gloomy claim", "turn doom into one testable experiment", "concede a real constraint without surrendering the whole idea"],
       avoidPhrases: ["silver lining", "stay positive", "anything is possible"],
@@ -566,6 +600,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [7, 30], hardMaxWords: 40, typicalSentences: [1, 2], casing: "sentence", punctuation: "precise",
       emojiRate: 0, complexityAppetite: 0.92,
+      visibleAffectRate: 0.14, surfaceTextureRate: 0.055,
+      surfaceTexturePalette: ["fragment", "self-correction"],
       correctionMode: "evidence-first", disagreementMode: "steelman-counterpoint",
       conversationHabits: ["ask who bears the cost", "notice an incentive mismatch", "change the time horizon of the claim"],
       questionEndingHabitIndexes: [0],
@@ -599,6 +635,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [6, 28], hardMaxWords: 40, typicalSentences: [1, 2], casing: "sentence", punctuation: "precise",
       emojiRate: 0, complexityAppetite: 0.82,
+      visibleAffectRate: 0.12, surfaceTextureRate: 0.05,
+      surfaceTexturePalette: ["self-correction", "fragment"],
       correctionMode: "evidence-first", disagreementMode: "practical-objection",
       conversationHabits: ["trace where the data actually moves", "name a concrete threat instead of vague risk", "offer a safer alternative with similar utility"],
       avoidPhrases: ["privacy nightmare", "zero trust", "security is paramount"],
@@ -631,6 +669,8 @@ export const PERSONAS: Persona[] = [
     style: {
       typicalWords: [7, 26], hardMaxWords: 36, typicalSentences: [1, 2], casing: "sentence", punctuation: "plain",
       emojiRate: 0, complexityAppetite: 0.84,
+      visibleAffectRate: 0.1, surfaceTextureRate: 0.04,
+      surfaceTexturePalette: ["fragment"],
       correctionMode: "evidence-first", disagreementMode: "steelman-counterpoint",
       conversationHabits: ["surface the premise everyone skipped", "state the strongest absent view fairly", "stop immediately after the counterpoint lands"],
       avoidPhrases: ["unpopular opinion", "devil's advocate", "just saying"],

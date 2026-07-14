@@ -4,6 +4,7 @@ import {
   buildPersonaStylePromptNote,
   buildPersonaStylePromptNotes,
   derivePersonaStyleTurnPolicy,
+  PERSONA_SURFACE_TEXTURES,
   personaStyleSignature,
 } from "./personaStyle.js";
 
@@ -22,6 +23,15 @@ describe("persona style fingerprints", () => {
       expect(style.emojiRate, persona.id).toBeLessThanOrEqual(0.1);
       expect(style.complexityAppetite, persona.id).toBeGreaterThanOrEqual(0);
       expect(style.complexityAppetite, persona.id).toBeLessThanOrEqual(1);
+      expect(style.visibleAffectRate, persona.id).toBeGreaterThanOrEqual(0);
+      expect(style.visibleAffectRate, persona.id).toBeLessThanOrEqual(1);
+      expect(style.surfaceTextureRate, persona.id).toBeGreaterThanOrEqual(0);
+      expect(style.surfaceTextureRate, persona.id).toBeLessThan(0.5);
+      expect(style.surfaceTexturePalette.length, persona.id).toBeGreaterThan(0);
+      expect(new Set(style.surfaceTexturePalette).size, persona.id).toBe(style.surfaceTexturePalette.length);
+      for (const texture of style.surfaceTexturePalette) {
+        expect(PERSONA_SURFACE_TEXTURES, persona.id).toContain(texture);
+      }
       expect(style.conversationHabits, persona.id).toHaveLength(3);
       expect(new Set(style.conversationHabits).size, persona.id).toBe(style.conversationHabits.length);
       for (const index of style.questionEndingHabitIndexes ?? []) {
@@ -51,6 +61,14 @@ describe("persona style fingerprints", () => {
     expect(Math.max(...PERSONAS.map((persona) => persona.style.complexityAppetite))).toBeGreaterThanOrEqual(0.9);
     expect(Math.max(...PERSONAS.map((persona) => persona.style.hardMaxWords))).toBeGreaterThanOrEqual(44);
     expect(Math.min(...PERSONAS.map((persona) => persona.style.hardMaxWords))).toBeLessThanOrEqual(18);
+    expect(unique(PERSONAS.map((persona) => persona.style.visibleAffectRate))).toBe(PERSONAS.length);
+    expect(unique(PERSONAS.map((persona) => persona.style.surfaceTextureRate))).toBe(PERSONAS.length);
+    expect(new Set(PERSONAS.flatMap((persona) => persona.style.surfaceTexturePalette))).toEqual(
+      new Set(PERSONA_SURFACE_TEXTURES),
+    );
+    expect(Math.max(...PERSONAS.map((persona) => persona.style.visibleAffectRate))).toBeGreaterThanOrEqual(0.7);
+    expect(Math.min(...PERSONAS.map((persona) => persona.style.visibleAffectRate))).toBeLessThanOrEqual(0.1);
+    expect(Math.max(...PERSONAS.map((persona) => persona.style.surfaceTextureRate))).toBeLessThan(0.5);
   });
 
   it("renders compact anti-assistant prompt notes without making traits mandatory", () => {
@@ -62,7 +80,8 @@ describe("persona style fingerprints", () => {
     expect(note).toContain("at most one per message");
     expect(note).toContain("“here's the thing”");
     expect(note).toContain("generic service-assistant validation");
-    expect(note.length).toBeLessThan(2_400);
+    expect(note).toContain("Never alter or misspell names, handles, code, URLs");
+    expect(note.length).toBeLessThan(3_000);
   });
 
   it("uses the same identity in voice while honoring the tighter spoken ceiling", () => {
@@ -90,14 +109,38 @@ describe("persona style fingerprints", () => {
     expect(policies.filter((policy) => policy.emoji).length).toBeLessThan(50);
     expect(policies.filter((policy) => policy.habit).length).toBeGreaterThan(70);
     expect(policies.filter((policy) => policy.habit).length).toBeLessThan(170);
+    expect(policies.filter((policy) => policy.visibleAffect).length).toBeGreaterThan(200);
+    expect(policies.filter((policy) => policy.visibleAffect).length).toBeLessThan(300);
+    expect(policies.filter((policy) => policy.surfaceTexture).length).toBeGreaterThan(80);
+    expect(policies.filter((policy) => policy.surfaceTexture).length).toBeLessThan(160);
+    expect(policies.filter((policy) => !policy.surfaceTexture).length).toBeGreaterThan(policies.length / 2);
     expect(policies.filter((policy) => policy.ending === "question-allowed").length).toBeGreaterThan(70);
     expect(policies.filter((policy) => policy.ending === "question-allowed").length).toBeLessThan(170);
     for (const policy of policies) {
       if (policy.habit) expect(mira.style.conversationHabits).toContain(policy.habit);
       if (policy.emoji) expect(mira.style.emojiPalette).toContain(policy.emoji);
+      if (policy.surfaceTexture) expect(mira.style.surfaceTexturePalette).toContain(policy.surfaceTexture);
       if (policy.ending === "statement" && policy.habit) {
         const index = mira.style.conversationHabits.indexOf(policy.habit);
         expect(mira.style.questionEndingHabitIndexes ?? []).not.toContain(index);
+      }
+    }
+  });
+
+  it("realizes each persona's affect and texture rates while leaving most turns clean", () => {
+    const samples = 2_000;
+    for (const persona of PERSONAS) {
+      const policies = Array.from({ length: samples }, (_, index) =>
+        derivePersonaStyleTurnPolicy(persona, `distribution:${persona.id}:${index}`),
+      );
+      const affectRate = policies.filter((policy) => policy.visibleAffect).length / samples;
+      const textureRate = policies.filter((policy) => policy.surfaceTexture).length / samples;
+
+      expect(Math.abs(affectRate - persona.style.visibleAffectRate), persona.id).toBeLessThan(0.06);
+      expect(Math.abs(textureRate - persona.style.surfaceTextureRate), persona.id).toBeLessThan(0.06);
+      expect(policies.filter((policy) => !policy.surfaceTexture).length, persona.id).toBeGreaterThan(samples / 2);
+      for (const policy of policies) {
+        if (policy.surfaceTexture) expect(persona.style.surfaceTexturePalette).toContain(policy.surfaceTexture);
       }
     }
   });
@@ -129,6 +172,43 @@ describe("persona style fingerprints", () => {
     expect(derivePersonaStyleTurnPolicy(mira, key, "voice").emoji).toBeUndefined();
     expect(buildPersonaStylePromptNote(mira, { medium: "voice", turnKey: key }))
       .toContain("Turn policy / emoji: Use no emoji");
+  });
+
+  it("filters written-only texture moves out of voice while retaining spoken-safe variation", () => {
+    const writtenOnly = new Set(["stretched-emphasis", "rough-orthography", "harmless-typo"]);
+    let sawWrittenOnlyTextMove = false;
+    let sawSpokenTexture = false;
+
+    for (const persona of PERSONAS) {
+      for (let index = 0; index < 2_000; index += 1) {
+        const key = `voice-texture:${persona.id}:${index}`;
+        const textPolicy = derivePersonaStyleTurnPolicy(persona, key, "text");
+        const voicePolicy = derivePersonaStyleTurnPolicy(persona, key, "voice");
+        if (textPolicy.surfaceTexture && writtenOnly.has(textPolicy.surfaceTexture)) sawWrittenOnlyTextMove = true;
+        if (voicePolicy.surfaceTexture) {
+          sawSpokenTexture = true;
+          expect(writtenOnly.has(voicePolicy.surfaceTexture), persona.id).toBe(false);
+        }
+      }
+    }
+
+    expect(sawWrittenOnlyTextMove).toBe(true);
+    expect(sawSpokenTexture).toBe(true);
+  });
+
+  it("exposes at most one optional language-appropriate texture without lexical examples", () => {
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const key = Array.from({ length: 10_000 }, (_, index) => `profanity-policy:${index}`)
+      .find((candidate) => derivePersonaStyleTurnPolicy(juno, candidate).surfaceTexture === "mild-profanity")!;
+    const policy = derivePersonaStyleTurnPolicy(juno, key);
+    const note = buildPersonaStylePromptNote(juno, { turnKey: key });
+
+    expect(policy.surfaceTexture).toBe("mild-profanity");
+    expect(note).toContain("One mild, non-targeted adult profanity may appear");
+    expect(note).toContain("it is never required");
+    expect(note).toContain("natural in the required language and script");
+    expect(note).toContain("Never alter or misspell names, handles, code, URLs");
+    expect(note.match(/Turn policy \/ surface texture:/gu)).toHaveLength(1);
   });
 
   it("lets an explicit scene role require one question while keeping the emoji budget deterministic", () => {
