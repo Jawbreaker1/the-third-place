@@ -74,6 +74,7 @@ const tuningFields: Array<{
   description: string;
 }> = [
   { key: "activity", label: "Activity", description: "0 disables autonomous chatter; 100 reaches the bounded, party-like ceiling. Anti-spam limits always remain active." },
+  { key: "autonomousLinkFrequency", label: "AI-posted links", description: "How often residents may find and share a room-relevant source on their own. 0 disables this; hard quiet-time, cooldown and daily limits remain active. Human-requested lookups and pasted-link reading are unaffected." },
   { key: "competence", label: "Competence", description: "How much domain confidence the cast may display." },
   { key: "aggression", label: "Aggression", description: "Tolerance for blunt disagreement and sharper pushback." },
   { key: "explicitness", label: "Explicitness", description: "How freely residents may use proportionate adult profanity, coarse language and explicit wording." },
@@ -117,12 +118,14 @@ function RangeField({
   description,
   value,
   onChange,
+  disabled = false,
 }: {
   id: string;
   label: string;
   description: string;
   value: number;
   onChange: (value: number) => void;
+  disabled?: boolean;
 }) {
   const descriptionId = `${id}-description`;
   return (
@@ -134,6 +137,7 @@ function RangeField({
       <div className="admin-range-control">
         <input
           aria-describedby={descriptionId}
+          disabled={disabled}
           id={id}
           max="100"
           min="0"
@@ -659,7 +663,10 @@ export default function AdminApp() {
             <div className="admin-range-list">
               {tuningFields.map((field) => (
                 <RangeField
-                  description={field.description}
+                  description={field.key === "autonomousLinkFrequency" && !snapshot.automation.autonomousLinkChannelIds.includes(behaviorChannelId)
+                    ? `${field.description} This room has no trusted autonomous source topics configured, so the control is inactive.`
+                    : field.description}
+                  disabled={field.key === "autonomousLinkFrequency" && !snapshot.automation.autonomousLinkChannelIds.includes(behaviorChannelId)}
                   id={`room-${field.key}`}
                   key={field.key}
                   label={field.label}

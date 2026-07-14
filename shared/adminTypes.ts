@@ -1,9 +1,16 @@
 export type AdminPresence = "online" | "idle" | "dnd" | "offline";
 
-export type AdminTuningKey = "activity" | "competence" | "aggression" | "explicitness";
+export type AdminTuningKey =
+  | "activity"
+  | "autonomousLinkFrequency"
+  | "competence"
+  | "aggression"
+  | "explicitness";
 
 export interface AdminBehaviorTuning {
   activity: number;
+  /** Frequency of AI-initiated, room-profiled research links. Human lookups are unaffected. */
+  autonomousLinkFrequency: number;
   competence: number;
   aggression: number;
   explicitness: number;
@@ -83,6 +90,10 @@ export interface AdminStateSnapshot {
   behavior: {
     global: AdminBehaviorTuning;
     channels: Record<string, AdminBehaviorTuning>;
+  };
+  automation: {
+    /** Rooms with trusted server-authored subjects for autonomous source posts. */
+    autonomousLinkChannelIds: string[];
   };
   personas: AdminPersonaConfig[];
   channels: AdminChannelConfig[];

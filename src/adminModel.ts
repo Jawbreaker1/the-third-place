@@ -13,6 +13,7 @@ import type {
 
 export const DEFAULT_ADMIN_TUNING: AdminBehaviorTuning = {
   activity: 50,
+  autonomousLinkFrequency: 60,
   competence: 50,
   aggression: 25,
   explicitness: 50,
@@ -107,6 +108,10 @@ export function normalizeAdminTuning(
   const input = asRecord(value);
   return {
     activity: clampAdminPercent(input.activity, fallback.activity),
+    autonomousLinkFrequency: clampAdminPercent(
+      input.autonomousLinkFrequency,
+      fallback.autonomousLinkFrequency,
+    ),
     competence: clampAdminPercent(input.competence, fallback.competence),
     aggression: clampAdminPercent(input.aggression, fallback.aggression),
     explicitness: clampAdminPercent(input.explicitness, fallback.explicitness),
@@ -227,6 +232,9 @@ export function normalizeAdminState(value: unknown): AdminStateSnapshot {
   const personas = asArray(root.personas).map(normalizePersona);
   return {
     behavior: { global, channels: channelTunings },
+    automation: {
+      autonomousLinkChannelIds: stringArray(asRecord(root.automation).autonomousLinkChannelIds),
+    },
     personas,
     channels: asArray(root.channels).map(normalizeChannel),
     humans: asArray(root.humans).map(normalizeHuman),

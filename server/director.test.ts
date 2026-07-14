@@ -18,6 +18,8 @@ import {
   conductResponderIds,
   ensureEvidenceResponder,
   evidenceFailureFallback,
+  autonomousResearchResultIsFresh,
+  canonicalAutonomousResearchUrl,
   linkPreviewFromResearch,
   normalizeGeneratedMessageContent,
   pageEvidenceAnswerContract,
@@ -44,6 +46,7 @@ import { createFailClosedTurnAnalysis, type TurnAnalysis } from "./semanticRoute
 import {
   ambientRoomSelectionWeight,
   autonomousActivityLimits,
+  autonomousLinkPolicy,
   resolveBehaviorTuning,
   scaleAmbientDelay,
 } from "./behaviorTuning.js";
@@ -2570,6 +2573,51 @@ describe("social director", () => {
     expect(shouldStartAutonomousResearch({ ...base, rng: () => 0.1 })).toBe(false);
   });
 
+  it("maps autonomous-link frequency onto a bounded cadence with the former cadence at 50", () => {
+    expect(autonomousLinkPolicy(0)).toMatchObject({ enabled: false, chance: 0, dailyCap: 0 });
+    expect(autonomousLinkPolicy(50)).toEqual({
+      enabled: true,
+      chance: 0.07,
+      globalCooldownMs: 30 * 60_000,
+      channelCooldownMs: 2 * 60 * 60_000,
+      humanQuietMs: 3 * 60_000,
+      dailyCap: 6,
+    });
+    const raisedDefault = autonomousLinkPolicy(60);
+    expect(raisedDefault.chance).toBeGreaterThan(0.07);
+    expect(raisedDefault.dailyCap).toBe(8);
+    expect(raisedDefault.globalCooldownMs).toBeGreaterThanOrEqual(12 * 60_000);
+    expect(raisedDefault.channelCooldownMs).toBeGreaterThanOrEqual(40 * 60_000);
+    const maximum = autonomousLinkPolicy(100);
+    expect(maximum).toMatchObject({ enabled: true, chance: 0.22, dailyCap: 16 });
+    expect(maximum.humanQuietMs).toBe(75_000);
+  });
+
+  it("enforces configured autonomous-source freshness without language heuristics", () => {
+    const now = Date.parse("2026-07-14T12:00:00.000Z");
+    const currentSeed: AutonomousResearchSeed = {
+      id: "fresh-release",
+      query: "one configured current release subject",
+      mode: "news",
+      maxAgeDays: 14,
+      discussionAngle: "Discuss one concrete choice in the supplied release.",
+    };
+    expect(autonomousResearchResultIsFresh(currentSeed, "2026-07-08T12:00:00.000Z", now)).toBe(true);
+    expect(autonomousResearchResultIsFresh(currentSeed, "2026-05-14T12:00:00.000Z", now)).toBe(false);
+    expect(autonomousResearchResultIsFresh(currentSeed, undefined, now)).toBe(false);
+    expect(autonomousResearchResultIsFresh(currentSeed, "2026-07-14T12:06:00.000Z", now)).toBe(false);
+    const evergreen = { ...currentSeed, maxAgeDays: undefined };
+    expect(autonomousResearchResultIsFresh(evergreen, undefined, now)).toBe(true);
+    expect(autonomousResearchResultIsFresh(evergreen, "2026-07-14T12:06:00.000Z", now)).toBe(false);
+  });
+
+  it("canonicalizes autonomous source URLs for cross-room repeat protection", () => {
+    expect(canonicalAutonomousResearchUrl("https://EXAMPLE.com/story?b=2&a=1#comments"))
+      .toBe("https://example.com/story?a=1&b=2");
+    expect(canonicalAutonomousResearchUrl("http://example.com/story")).toBeUndefined();
+    expect(canonicalAutonomousResearchUrl("not a url")).toBeUndefined();
+  });
+
   it("keeps autonomous research disabled unless both environment switches explicitly opt in", () => {
     const previousResearch = process.env.RESEARCH_ENABLED;
     const previousAutonomous = process.env.AUTONOMOUS_RESEARCH_ENABLED;
@@ -2725,16 +2773,20 @@ describe("social director", () => {
     }
   });
 
-  it("publishes a rare autonomous source only after the exact result survives the safe page reader", async () => {
+  it("publishes only the semantically selected safe source when two candidates were read", async () => {
     vi.useFakeTimers();
     try {
       const now = Date.parse("2026-07-14T12:00:00.000Z");
+      const offTopicUrl = "https://example.com/windows/recent-files";
       const sourceUrl = "https://example.com/research/concrete-item";
       const searchPacket = {
         kind: "search" as const,
         query: "recent practical agent testing",
         retrievedAt: new Date(now).toISOString(),
-        results: [{ id: "S1", title: "Search result", url: sourceUrl, snippet: "Search summary" }],
+        results: [
+          { id: "S1", title: "Windows Recent Files", url: offTopicUrl, snippet: "Search summary" },
+          { id: "S2", title: "Search result", url: sourceUrl, snippet: "Search summary" },
+        ],
       };
       const pagePacket = {
         kind: "page" as const,
@@ -2747,9 +2799,21 @@ describe("social director", () => {
           snippet: "The benchmark resets a failed tool step and measures whether the agent can recover without corrupting later state.",
         }],
       };
+      const offTopicPagePacket = {
+        ...pagePacket,
+        results: [{
+          id: "S1",
+          title: "Windows Recent Files",
+          url: offTopicUrl,
+          snippet: "How an operating system displays recently opened files.",
+        }],
+      };
       const store = new RoomStore("/tmp/director-autonomous-source-unused.json");
       const research = { research: vi.fn(async () => searchPacket) };
-      const pageReader = { read: vi.fn(async () => pagePacket) };
+      const pageReader = {
+        read: vi.fn(async (request: { url: URL }) =>
+          request.url.toString() === offTopicUrl ? offTopicPagePacket : pagePacket),
+      };
       const actorChannels = new ActorChannelRuntime();
       const lm = {
         health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
@@ -2758,13 +2822,13 @@ describe("social director", () => {
             personaId: request.selected[0]!.id,
             content: "Det intressanta är återställningen efter verktygsfelet, inte den snygga sluttexten.",
             source: "lm" as const,
-            sourceIds: ["S1"],
+            sourceIds: ["S2"],
           },
           {
             personaId: request.selected[1]!.id,
             content: "Ja, men mäter den också om nästa steg är rätt av rätt anledning?",
             source: "lm" as const,
-            sourceIds: ["S1"],
+            sourceIds: ["S2"],
           },
         ]),
         rememberDeliveredLine: vi.fn(),
@@ -2778,7 +2842,12 @@ describe("social director", () => {
         {} as never,
         () => PERSONAS,
         () => 1,
-        { now: () => now, rng: () => 0, pageReader: pageReader as never },
+        {
+          now: () => now,
+          rng: () => 0,
+          pageReader: pageReader as never,
+          autonomousResearchEnabled: true,
+        },
       );
       const channel = { id: "ai-programming", name: "ai-programming", description: "", icon: "⌘" };
       const available = actorChannels
@@ -2813,12 +2882,26 @@ describe("social director", () => {
       expect(research.research).toHaveBeenCalledWith(expect.objectContaining({
         requesterId: "ambient-research:ai-programming",
       }));
+      expect(pageReader.read).toHaveBeenCalledTimes(2);
       expect(pageReader.read).toHaveBeenCalledWith(
         expect.objectContaining({ url: new URL(sourceUrl), retry: false, initiator: "automatic" }),
         "ambient-research:ai-programming",
       );
       expect(lm.generateScene).toHaveBeenCalledWith(
-        expect.objectContaining({ urlPublicationPolicy: "server_card", research: pagePacket }),
+        expect.objectContaining({
+          urlPublicationPolicy: "server_card",
+          research: expect.objectContaining({
+            query: "recent practical agent testing",
+            results: [
+              expect.objectContaining({ id: "S1", url: offTopicUrl }),
+              expect.objectContaining({ id: "S2", url: sourceUrl }),
+            ],
+          }),
+          autonomousResearchContext: expect.objectContaining({
+            seedId: "agent-recovery",
+            roomTopic: expect.stringContaining("software development"),
+          }),
+        }),
         4,
       );
       const messages = store.getRecent("ai-programming", 10);
@@ -2833,7 +2916,7 @@ describe("social director", () => {
         messageCount: 2,
         research: {
           kind: "page",
-          results: [{ id: "S1", url: sourceUrl }],
+          results: [{ id: "S2", url: sourceUrl }],
         },
       });
     } finally {
@@ -3131,6 +3214,7 @@ describe("social director", () => {
     let queueDepth = 0;
     const runtime = new ActorChannelRuntime();
     const actor = runtime.candidatesFor("lobby").find((persona) => persona.id !== "ai-runa")!;
+    let autonomousLinkFrequency = 60;
     const director = new SocialDirector(
       { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
       new RoomStore("/tmp/director-autonomous-gates-unused.json"),
@@ -3140,7 +3224,17 @@ describe("social director", () => {
       {} as never,
       () => PERSONAS,
       () => 1,
-      { now: () => now },
+      {
+        now: () => now,
+        autonomousResearchEnabled: true,
+        behaviorTuningProvider: () => ({
+          activity: 50,
+          autonomousLinkFrequency,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
     );
     const internals = director as unknown as {
       autonomousResearchIsStillSafe: (
@@ -3171,6 +3265,8 @@ describe("social director", () => {
     expect(safe()).toBe(false);
     internals.lastSpoke.delete(actor.id);
     expect(internals.autonomousResearchIsStillSafe("lobby", 0, [{ ...actor, id: "ai-not-in-room" }], 1)).toBe(false);
+    autonomousLinkFrequency = 0;
+    expect(safe()).toBe(false);
     director.stop();
     expect(safe()).toBe(false);
   });
@@ -3211,7 +3307,12 @@ describe("social director", () => {
         {} as never,
         () => PERSONAS,
         () => 1,
-        { now: () => now, rng: () => 0, pageReader: { read } as never },
+        {
+          now: () => now,
+          rng: () => 0,
+          pageReader: { read } as never,
+          autonomousResearchEnabled: true,
+        },
       );
       const channel = { id: "ai-programming", name: "ai-programming", description: "", icon: "⌘" };
       const available = PERSONAS.filter((persona) => persona.id !== "ai-runa" && persona.id !== "ai-robin");
@@ -3335,8 +3436,8 @@ describe("social director", () => {
   });
 
   it("merges global and room tuning as one complete live override with global inheritance", () => {
-    const global = { activity: 40, competence: 60, aggression: 20, explicitness: 30 };
-    const lobby = { activity: 90, competence: 80, aggression: 70, explicitness: 65 };
+    const global = { activity: 40, autonomousLinkFrequency: 45, competence: 60, aggression: 20, explicitness: 30 };
+    const lobby = { activity: 90, autonomousLinkFrequency: 80, competence: 80, aggression: 70, explicitness: 65 };
     const provider = (channelId?: string) => channelId === undefined ? global : channelId === "lobby" ? lobby : undefined;
     expect(resolveBehaviorTuning(provider, "lobby")).toEqual({ global, effective: lobby });
     expect(resolveBehaviorTuning(provider, "the-pub")).toEqual({ global, effective: global });

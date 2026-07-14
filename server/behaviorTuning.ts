@@ -9,6 +9,7 @@ export type BehaviorTuningProvider = (channelId?: string) => AdminBehaviorTuning
 
 export const DEFAULT_RUNTIME_BEHAVIOR_TUNING: AdminBehaviorTuning = {
   activity: 50,
+  autonomousLinkFrequency: 60,
   competence: 50,
   aggression: 25,
   explicitness: 50,
@@ -24,6 +25,7 @@ export const normalizeBehaviorTuning = (
   fallback: AdminBehaviorTuning = DEFAULT_RUNTIME_BEHAVIOR_TUNING,
 ): AdminBehaviorTuning => ({
   activity: percent(value?.activity, fallback.activity),
+  autonomousLinkFrequency: percent(value?.autonomousLinkFrequency, fallback.autonomousLinkFrequency),
   competence: percent(value?.competence, fallback.competence),
   aggression: percent(value?.aggression, fallback.aggression),
   explicitness: percent(value?.explicitness, fallback.explicitness),
@@ -87,6 +89,58 @@ export const ambientRoomSelectionWeight = (score: number, activity: number): num
   // Fifty is deliberately neutral. Low-but-nonzero rooms remain possible;
   // high-activity rooms are preferred without becoming a permanent monopoly.
   return score * (0.25 + level * 0.015);
+};
+
+export interface AutonomousLinkPolicy {
+  enabled: boolean;
+  chance: number;
+  globalCooldownMs: number;
+  channelCooldownMs: number;
+  humanQuietMs: number;
+  dailyCap: number;
+}
+
+const interpolate = (minimum: number, maximum: number, position: number): number =>
+  minimum + (maximum - minimum) * position;
+
+/**
+ * Maps the admin's simple 0–100 control onto bounded transport policy. The
+ * scheduler remains topic- and language-blind: source subjects still come
+ * exclusively from trusted room profiles, while these limits only decide how
+ * often an eligible sourced thread may begin.
+ */
+export const autonomousLinkPolicy = (frequency: number): AutonomousLinkPolicy => {
+  const level = percent(frequency, DEFAULT_RUNTIME_BEHAVIOR_TUNING.autonomousLinkFrequency);
+  if (level === 0) {
+    return {
+      enabled: false,
+      chance: 0,
+      globalCooldownMs: 40 * 60_000,
+      channelCooldownMs: 3 * 60 * 60_000,
+      humanQuietMs: 3 * 60_000,
+      dailyCap: 0,
+    };
+  }
+  const belowBaseline = level < 50;
+  const position = belowBaseline ? (level - 1) / 49 : (level - 50) / 50;
+  return {
+    enabled: true,
+    chance: belowBaseline
+      ? interpolate(0.015, 0.07, position)
+      : interpolate(0.07, 0.22, position),
+    globalCooldownMs: Math.round((belowBaseline
+      ? interpolate(60, 30, position)
+      : interpolate(30, 12, position)) * 60_000),
+    channelCooldownMs: Math.round((belowBaseline
+      ? interpolate(240, 120, position)
+      : interpolate(120, 40, position)) * 60_000),
+    humanQuietMs: Math.round((belowBaseline
+      ? interpolate(300, 180, position)
+      : interpolate(180, 75, position)) * 1_000),
+    dailyCap: Math.round(belowBaseline
+      ? interpolate(2, 6, position)
+      : interpolate(6, 16, position)),
+  };
 };
 
 type BehaviorBand = "minimum" | "low" | "balanced" | "high" | "maximum";

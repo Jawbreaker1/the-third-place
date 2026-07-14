@@ -4,7 +4,6 @@ import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import type {
   AdminBanRecord,
-  AdminBehaviorPatch,
   AdminBehaviorTuning,
   AdminChannelConfig,
   AdminHumanMember,
@@ -29,6 +28,7 @@ import { participantIdentityKey } from "./participantIdentity.js";
 const percent = z.number().int().min(0).max(100);
 const tuningSchema = z.object({
   activity: percent,
+  autonomousLinkFrequency: percent,
   competence: percent,
   aggression: percent,
   explicitness: percent,
@@ -82,7 +82,7 @@ export const adminChannelSchema: z.ZodType<AdminChannelConfig> = z.object({
   description: cleanText(1, 180),
   icon: cleanText(1, 8),
   topic: cleanText(4, 500),
-  guidance: cleanText(4, 1_500),
+  guidance: cleanText(4, 2_000),
   register: registerSchema,
   mode: modeSchema,
   seeds: z.array(cleanText(8, 700)).min(1).max(40).superRefine((values, context) => {
@@ -91,9 +91,13 @@ export const adminChannelSchema: z.ZodType<AdminChannelConfig> = z.object({
   }),
 }).strict();
 
-export const adminBehaviorPatchSchema: z.ZodType<AdminBehaviorPatch> = z.discriminatedUnion("scope", [
-  z.object({ scope: z.literal("global"), tuning: tuningSchema }).strict(),
-  z.object({ scope: z.literal("channel"), channelId: catalogId, tuning: tuningSchema.nullable() }).strict(),
+// The new field is optional only at the HTTP compatibility boundary so an
+// already-open older Admin page does not erase a live value on save. State on
+// disk and snapshots remain complete and strict.
+const tuningPatchSchema = tuningSchema.partial({ autonomousLinkFrequency: true });
+export const adminBehaviorPatchSchema = z.discriminatedUnion("scope", [
+  z.object({ scope: z.literal("global"), tuning: tuningPatchSchema }).strict(),
+  z.object({ scope: z.literal("channel"), channelId: catalogId, tuning: tuningPatchSchema.nullable() }).strict(),
 ]);
 
 const banSchema: z.ZodType<AdminBanRecord> = z.object({
@@ -104,7 +108,7 @@ const banSchema: z.ZodType<AdminBanRecord> = z.object({
 }).strict();
 
 const persistedSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   revision: z.number().int().min(0),
   behavior: z.object({
     global: tuningSchema,
@@ -132,14 +136,73 @@ const persistedSchema = z.object({
 
 type PersistedAdminState = z.infer<typeof persistedSchema>;
 
+const migratePersistedState = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const record = raw as Record<string, unknown>;
+  if (record.version !== 1) return raw;
+  const behavior = record.behavior;
+  if (!behavior || typeof behavior !== "object" || Array.isArray(behavior)) return raw;
+  const behaviorRecord = behavior as Record<string, unknown>;
+  const global = behaviorRecord.global;
+  if (!global || typeof global !== "object" || Array.isArray(global)) return raw;
+  const migratedGlobal = {
+    ...(global as Record<string, unknown>),
+    autonomousLinkFrequency: DEFAULT_RUNTIME_BEHAVIOR_TUNING.autonomousLinkFrequency,
+  };
+  const channels = behaviorRecord.channels;
+  const migratedChannels = channels && typeof channels === "object" && !Array.isArray(channels)
+    ? Object.fromEntries(Object.entries(channels as Record<string, unknown>).map(([channelId, tuning]) => [
+        channelId,
+        tuning && typeof tuning === "object" && !Array.isArray(tuning)
+          ? { ...(tuning as Record<string, unknown>), autonomousLinkFrequency: migratedGlobal.autonomousLinkFrequency }
+          : tuning,
+      ]))
+    : channels;
+  const channelOverrides = record.channelOverrides;
+  const currentPub = CHANNEL_PROFILES.find((profile) => profile.public.id === "the-pub");
+  const migratedChannelOverrides = channelOverrides && typeof channelOverrides === "object" && !Array.isArray(channelOverrides)
+    ? Object.fromEntries(Object.entries(channelOverrides as Record<string, unknown>).map(([channelId, config]) => {
+        if (
+          channelId !== "the-pub" ||
+          !config ||
+          typeof config !== "object" ||
+          Array.isArray(config) ||
+          !currentPub
+        ) return [channelId, config];
+        const pub = config as Record<string, unknown>;
+        return [channelId, {
+          ...pub,
+          ...(pub.topic === LEGACY_V1_PUB_TOPIC ? { topic: currentPub.topic.brief } : {}),
+          ...(pub.guidance === LEGACY_V1_PUB_GUIDANCE
+            ? { guidance: currentPub.conversationGuidance }
+            : {}),
+        }];
+      }))
+    : channelOverrides;
+  return {
+    ...record,
+    version: 2,
+    channelOverrides: migratedChannelOverrides,
+    behavior: {
+      ...behaviorRecord,
+      global: migratedGlobal,
+      channels: migratedChannels,
+    },
+  };
+};
+
 const DEFAULT_TUNING: AdminBehaviorTuning = { ...DEFAULT_RUNTIME_BEHAVIOR_TUNING };
+const LEGACY_V1_PUB_TOPIC =
+  "a relaxed Friday hangout for films, music, work gripes, politics, food, links, memes and everyday nonsense";
+const LEGACY_V1_PUB_GUIDANCE =
+  "This room is loose Friday-table banter, not a panel discussion or themed pub role-play. Convey the looseness through fragments, specific references, overconfident taste, affectionate teasing, small self-corrections, recognizable tangents and uneven participation—not by announcing or explaining the mood. Avoid recurring catchphrases that merely label the room, the day or its vibe in any language. Alcohol is atmosphere, never a recurring subject or personality trait. Autonomous residents never introduce alcohol or invent having consumed it; if a human explicitly makes drinks the topic, at most one selected actor addresses that part once. Very short reactions, groans, punchlines and silence are legitimate. Prefer one specific real film, song, artist, dish or recognizable annoyance over generic enthusiasm or a recommendation list; never invent a work just to fill the scene. Unless the human asks for help, do not turn replies into advice. Job gripes stay general and never invent an employer, profession or lived work history. Current politics, news and releases need supplied research; timeless political opinions remain opinions. React specifically to supplied links, memes and images, but never fabricate a URL or pretend to have opened content that was not supplied. Lowbrow jokes are welcome; never explain a punchline, keep teasing affectionate and never pile on. Laughter usually belongs in reactions; at most one written line per scene may begin with laughter.";
 const BUILTIN_PERSONAS = PERSONAS.map((persona) => structuredClone(persona));
 const BUILTIN_CHANNEL_PROFILES = CHANNEL_PROFILES.map((profile) => structuredClone(profile));
 const BUILTIN_PERSONA_IDS = new Set(BUILTIN_PERSONAS.map((persona) => persona.id));
 const BUILTIN_CHANNEL_IDS = new Set(BUILTIN_CHANNEL_PROFILES.map((profile) => profile.public.id));
 
 const emptyState = (): PersistedAdminState => ({
-  version: 1,
+  version: 2,
   revision: 0,
   behavior: { global: { ...DEFAULT_TUNING }, channels: {} },
   personaOverrides: {},
@@ -395,7 +458,7 @@ export class AdminStateStore {
   async load(): Promise<void> {
     let loaded = emptyState();
     try {
-      loaded = persistedSchema.parse(JSON.parse(await readFile(this.path, "utf8")));
+      loaded = persistedSchema.parse(migratePersistedState(JSON.parse(await readFile(this.path, "utf8"))));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -416,6 +479,11 @@ export class AdminStateStore {
         channels: Object.fromEntries(Object.entries(this.state.behavior.channels)
           .filter(([channelId]) => activeChannelIds.has(channelId))
           .map(([channelId, tuning]) => [channelId, { ...tuning }])),
+      },
+      automation: {
+        autonomousLinkChannelIds: catalog.profiles
+          .filter((profile) => (profile.autonomousResearchSeeds?.length ?? 0) > 0)
+          .map((profile) => profile.public.id),
       },
       personas: catalog.personaConfigs.map((persona) => structuredClone(persona)),
       channels: catalog.channelConfigs.map((channel) => structuredClone(channel)),
@@ -447,13 +515,26 @@ export class AdminStateStore {
   async updateBehavior(input: unknown): Promise<AdminStateSnapshot> {
     const patch = adminBehaviorPatchSchema.parse(input);
     return this.mutate((next) => {
-      if (patch.scope === "global") next.behavior.global = { ...patch.tuning };
+      if (patch.scope === "global") {
+        next.behavior.global = {
+          ...patch.tuning,
+          autonomousLinkFrequency:
+            patch.tuning.autonomousLinkFrequency ?? next.behavior.global.autonomousLinkFrequency,
+        };
+      }
       else {
         if (!this.materialize(next).channelConfigs.some((channel) => channel.id === patch.channelId)) {
           throw new AdminStateError(404, "CHANNEL_NOT_FOUND", "That channel is not active.");
         }
         if (patch.tuning === null) delete next.behavior.channels[patch.channelId];
-        else next.behavior.channels[patch.channelId] = { ...patch.tuning };
+        else {
+          const inherited = next.behavior.channels[patch.channelId] ?? next.behavior.global;
+          next.behavior.channels[patch.channelId] = {
+            ...patch.tuning,
+            autonomousLinkFrequency:
+              patch.tuning.autonomousLinkFrequency ?? inherited.autonomousLinkFrequency,
+          };
+        }
       }
     });
   }

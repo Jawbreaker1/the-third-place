@@ -57,6 +57,7 @@ import { refreshLocalDateTime, resolveLocalDateTime, type LocalDateTimeResult } 
 import {
   ambientRoomSelectionWeight,
   autonomousActivityLimits,
+  autonomousLinkPolicy,
   resolveBehaviorTuning,
   scaleAmbientDelay,
   type BehaviorTuningProvider,
@@ -724,6 +725,32 @@ export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boo
   return gate.rng() < clamp(gate.chance, 0, 1);
 }
 
+export function autonomousResearchResultIsFresh(
+  seed: AutonomousResearchSeed,
+  publishedAt: string | undefined,
+  now: number,
+): boolean {
+  const publishedAtMs = publishedAt ? Date.parse(publishedAt) : Number.NaN;
+  if (Number.isFinite(publishedAtMs) && publishedAtMs > now + 5 * 60_000) return false;
+  if (seed.maxAgeDays === undefined) return true;
+  if (!Number.isFinite(publishedAtMs)) return false;
+  if (!Number.isInteger(seed.maxAgeDays) || seed.maxAgeDays < 1) return false;
+  const maximumAgeMs = seed.maxAgeDays * 24 * 60 * 60_000;
+  return publishedAtMs <= now + 5 * 60_000 && now - publishedAtMs <= maximumAgeMs;
+}
+
+export function canonicalAutonomousResearchUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || !url.hostname) return undefined;
+    url.hash = "";
+    url.searchParams.sort();
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
 export function linkPreviewFromResearch(
   research: ResearchPacket,
   sourceId = "S1",
@@ -1258,10 +1285,10 @@ export class SocialDirector {
   private readonly welcomeTemporalCueCooldownMs: number;
   private readonly ambientTemporalCueCooldownMs: number;
   private readonly autonomousResearchEnabled: boolean;
-  private readonly autonomousResearchChance: number;
-  private readonly autonomousResearchGlobalCooldownMs: number;
-  private readonly autonomousResearchChannelCooldownMs: number;
-  private readonly autonomousResearchHumanQuietMs: number;
+  private readonly autonomousResearchChanceOverride?: number;
+  private readonly autonomousResearchGlobalCooldownMsOverride?: number;
+  private readonly autonomousResearchChannelCooldownMsOverride?: number;
+  private readonly autonomousResearchHumanQuietMsOverride?: number;
   private readonly autoSharedLinkDiscussionEnabled: boolean;
   private readonly pageReader: PageReader;
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
@@ -1303,19 +1330,18 @@ export class SocialDirector {
     this.ambientTemporalCueCooldownMs = Math.max(60_000, options.ambientTemporalCueCooldownMs ?? 20 * 60_000);
     this.autonomousResearchEnabled = options.autonomousResearchEnabled
       ?? (process.env.RESEARCH_ENABLED === "true" && process.env.AUTONOMOUS_RESEARCH_ENABLED === "true");
-    this.autonomousResearchChance = clamp(options.autonomousResearchChance ?? 0.07, 0, 1);
-    this.autonomousResearchGlobalCooldownMs = Math.max(
-      60_000,
-      options.autonomousResearchGlobalCooldownMs ?? 30 * 60_000,
-    );
-    this.autonomousResearchChannelCooldownMs = Math.max(
-      60_000,
-      options.autonomousResearchChannelCooldownMs ?? 2 * 60 * 60_000,
-    );
-    this.autonomousResearchHumanQuietMs = Math.max(
-      60_000,
-      options.autonomousResearchHumanQuietMs ?? 3 * 60_000,
-    );
+    this.autonomousResearchChanceOverride = options.autonomousResearchChance === undefined
+      ? undefined
+      : clamp(options.autonomousResearchChance, 0, 1);
+    this.autonomousResearchGlobalCooldownMsOverride = options.autonomousResearchGlobalCooldownMs === undefined
+      ? undefined
+      : Math.max(60_000, options.autonomousResearchGlobalCooldownMs);
+    this.autonomousResearchChannelCooldownMsOverride = options.autonomousResearchChannelCooldownMs === undefined
+      ? undefined
+      : Math.max(60_000, options.autonomousResearchChannelCooldownMs);
+    this.autonomousResearchHumanQuietMsOverride = options.autonomousResearchHumanQuietMs === undefined
+      ? undefined
+      : Math.max(15_000, options.autonomousResearchHumanQuietMs);
     this.autoSharedLinkDiscussionEnabled = options.autoSharedLinkDiscussionEnabled
       ?? process.env.AUTO_DISCUSS_SHARED_LINKS === "true";
   }
@@ -2648,6 +2674,29 @@ export class SocialDirector {
     return resolveBehaviorTuning(this.behaviorTuningProvider, channelId, globalTuning).effective;
   }
 
+  private autonomousResearchPolicy(channelId: string): {
+    enabled: boolean;
+    chance: number;
+    globalCooldownMs: number;
+    channelCooldownMs: number;
+    humanQuietMs: number;
+    dailyCap: number;
+  } {
+    const tuning = resolveBehaviorTuning(this.behaviorTuningProvider, channelId);
+    const globalPolicy = autonomousLinkPolicy(tuning.global.autonomousLinkFrequency);
+    const channelPolicy = autonomousLinkPolicy(tuning.effective.autonomousLinkFrequency);
+    return {
+      enabled: this.autonomousResearchEnabled && globalPolicy.enabled && channelPolicy.enabled,
+      chance: this.autonomousResearchChanceOverride ?? channelPolicy.chance,
+      globalCooldownMs:
+        this.autonomousResearchGlobalCooldownMsOverride ?? globalPolicy.globalCooldownMs,
+      channelCooldownMs:
+        this.autonomousResearchChannelCooldownMsOverride ?? channelPolicy.channelCooldownMs,
+      humanQuietMs: this.autonomousResearchHumanQuietMsOverride ?? channelPolicy.humanQuietMs,
+      dailyCap: globalPolicy.dailyCap,
+    };
+  }
+
   private ambientChannelIsAvailable(channelId: string, now: number): boolean {
     const backoffUntil = this.ambientBackoffUntilByChannel.get(channelId);
     if (backoffUntil !== undefined) {
@@ -2806,8 +2855,10 @@ export class SocialDirector {
     const now = this.now();
     const globalTuning = this.globalBehaviorTuning();
     const channelTuning = this.channelBehaviorTuning(channelId, globalTuning);
+    const researchPolicy = this.autonomousResearchPolicy(channelId);
     if (
       this.stopped ||
+      !researchPolicy.enabled ||
       globalTuning.activity === 0 ||
       channelTuning.activity === 0 ||
       this.voiceRoomActive ||
@@ -2815,7 +2866,7 @@ export class SocialDirector {
       this.lm.health().queueDepth !== 0 ||
       this.availableAutonomousMessageSlots(now, globalTuning.activity) < requiredSlots ||
       (this.lastHumanActivityAt !== undefined &&
-        now - this.lastHumanActivityAt < this.autonomousResearchHumanQuietMs)
+        now - this.lastHumanActivityAt < researchPolicy.humanQuietMs)
     ) return false;
     const availableIds = new Set(this.actorChannels.candidatesFor(channelId).map((persona) => persona.id));
     return actors.every((persona) =>
@@ -2977,12 +3028,12 @@ export class SocialDirector {
     }
   }
 
-  private recentPublishedUrls(channelId: string): Set<string> {
+  private recentPublishedUrlKeys(): Set<string> {
     return new Set(
-      this.store.getRecent(channelId, 160).flatMap((message) => [
+      CHANNELS.flatMap((channel) => this.store.getRecent(channel.id, 160)).flatMap((message) => [
         ...(message.sources ?? []).map((source) => source.url),
         ...(message.linkPreview ? [message.linkPreview.url] : []),
-      ]),
+      ]).flatMap((url) => canonicalAutonomousResearchUrl(url) ?? []),
     );
   }
 
@@ -3008,8 +3059,19 @@ export class SocialDirector {
       return undefined;
     });
     if (!search) return undefined;
-    const recentUrls = this.recentPublishedUrls(channelId);
-    for (const result of search.results.filter((candidate) => !recentUrls.has(candidate.url)).slice(0, 2)) {
+    const recentUrls = this.recentPublishedUrlKeys();
+    const safelyReadResults: ResearchPacket["results"] = [];
+    let retrievedAt: string | undefined;
+    for (const result of search.results
+      .filter((candidate) => {
+        const urlKey = canonicalAutonomousResearchUrl(candidate.url);
+        return Boolean(
+          urlKey &&
+          !recentUrls.has(urlKey) &&
+          autonomousResearchResultIsFresh(seed, candidate.publishedAt, this.now()),
+        );
+      })
+      .slice(0, 4)) {
       let url: URL;
       try {
         url = new URL(result.url);
@@ -3033,15 +3095,17 @@ export class SocialDirector {
       const publishedAt = Number.isFinite(publishedAtMs) && publishedAtMs <= this.now() + 5 * 60_000
         ? new Date(publishedAtMs).toISOString()
         : undefined;
-      return {
-        ...page,
-        results: [{
-          ...pageResult,
-          ...(publishedAt ? { publishedAt } : {}),
-        }],
-      };
+      retrievedAt ??= page.retrievedAt;
+      safelyReadResults.push({
+        ...pageResult,
+        id: `S${safelyReadResults.length + 1}`,
+        ...(publishedAt ? { publishedAt } : {}),
+      });
+      if (safelyReadResults.length >= 2) break;
     }
-    return undefined;
+    return safelyReadResults.length > 0 && retrievedAt
+      ? { kind: "page", query: seed.query, retrievedAt, results: safelyReadResults }
+      : undefined;
   }
 
   private async runAutonomousResearchConversation(
@@ -3086,10 +3150,10 @@ export class SocialDirector {
         selected: [lead, responder],
         history: this.ambientTranscript(channel.id, 18),
         premise: [
-          `A trusted server-side lookup and safe page read found one room-relevant source for this server-authored angle: “${seed.discussionAngle}”.`,
-          `${lead.name} shares one concrete, supported detail from S1 and immediately adds a personal take; a title-only reaction, vague hype or capability statement is invalid.`,
+          `A trusted server-side lookup and safe page read found candidate sources for this server-authored angle: “${seed.discussionAngle}”.`,
+          `${lead.name} chooses exactly one supplied source ID, shares one concrete supported detail from it and immediately adds a personal take; a title-only reaction, vague hype or capability statement is invalid.`,
           `${responder.name} answers that exact detail with one distinct consequence, objection or genuinely specific question instead of merely agreeing or opening another topic.`,
-          "Keep this to two natural peer messages. Do not announce that a search happened, explain tooling, or invite the whole room to answer.",
+          "Both lines must stay on the same chosen source. Keep this to two natural peer messages. Do not announce that a search happened, explain tooling, or invite the whole room to answer.",
         ].join(" "),
         mustReplyIds: [lead.id, responder.id],
         wordLimits: limits,
@@ -3103,6 +3167,11 @@ export class SocialDirector {
         actorChannelNotes: this.actorChannels.promptNotes([lead, responder], channel.id),
         actorExpertiseNotes: this.actorChannels.expertiseNotes([lead, responder], channel.id),
         research,
+        autonomousResearchContext: {
+          seedId: seed.id,
+          roomTopic: profile?.topic.brief ?? channel.description,
+          discussionAngle: seed.discussionAngle,
+        },
         evidenceOutcome: "succeeded",
         urlPublicationPolicy: "server_card",
         temporalPolicy: "ambient_silent",
@@ -3116,16 +3185,26 @@ export class SocialDirector {
 
     const leadLine = lines.find((line) => line.personaId === lead.id);
     const responseLine = lines.find((line) => line.personaId === responder.id);
+    const leadSourceIds = leadLine ? [...new Set(leadLine.sourceIds)] : [];
+    const selectedSourceId = leadSourceIds.length === 1 && research?.results.some((result) => result.id === leadSourceIds[0])
+      ? leadSourceIds[0]
+      : undefined;
     if (
       !research ||
       !leadLine ||
       !responseLine ||
+      !selectedSourceId ||
+      responseLine.sourceIds.some((sourceId) => sourceId !== selectedSourceId) ||
       !this.autonomousResearchIsStillSafe(channel.id, epoch, [lead, responder], 2)
     ) return false;
-    const preview = linkPreviewFromResearch(research);
+    const selectedResearch: ResearchPacket = {
+      ...research,
+      results: research.results.filter((result) => result.id === selectedSourceId),
+    };
+    const preview = linkPreviewFromResearch(selectedResearch, selectedSourceId);
     if (!preview) return false;
 
-    const leadSources = this.messageSources(research, sourceIdsForPageResponder(research, leadLine.sourceIds, true));
+    const leadSources = this.messageSources(selectedResearch, [selectedSourceId]);
     const leadMessage = this.postPublic(
       channel.id,
       lead,
@@ -3139,7 +3218,7 @@ export class SocialDirector {
     thread.seed = seed.discussionAngle;
     thread.debateBeat = true;
     thread.origin = "autonomous_research";
-    thread.research = boundedThreadResearch(research, this.now());
+    thread.research = boundedThreadResearch(selectedResearch, this.now());
     this.recordAmbientPost(thread, leadMessage);
 
     this.setTyping(channel.id, responder.id, true);
@@ -3147,8 +3226,8 @@ export class SocialDirector {
     this.setTyping(channel.id, responder.id, false);
     if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [responder], 1)) return true;
     const responseSources = this.messageSources(
-      research,
-      sourceIdsForPageResponder(research, responseLine.sourceIds, responseLine.sourceIds.includes("S1")),
+      selectedResearch,
+      responseLine.sourceIds,
     );
     const responseMessage = this.postPublic(
       channel.id,
@@ -3251,23 +3330,24 @@ export class SocialDirector {
         now - this.autonomousResearchAttemptTimestamps[0] >= 24 * 60 * 60_000
       ) this.autonomousResearchAttemptTimestamps.shift();
       const researchSeeds = profile?.autonomousResearchSeeds ?? [];
+      const researchPolicy = this.autonomousResearchPolicy(channel.id);
       const startAutonomousResearch = researchSeeds.length > 0 && available.some((persona) => persona.canResearch) && shouldStartAutonomousResearch({
-        enabled: this.autonomousResearchEnabled,
+        enabled: researchPolicy.enabled,
         now,
         lastGlobalAttemptAt: this.lastAutonomousResearchAt,
         lastChannelAttemptAt: this.lastAutonomousResearchAtByChannel.get(channel.id),
         lastHumanActivityAt: this.lastHumanActivityAt,
-        globalCooldownMs: this.autonomousResearchGlobalCooldownMs,
-        channelCooldownMs: this.autonomousResearchChannelCooldownMs,
-        humanQuietMs: this.autonomousResearchHumanQuietMs,
+        globalCooldownMs: researchPolicy.globalCooldownMs,
+        channelCooldownMs: researchPolicy.channelCooldownMs,
+        humanQuietMs: researchPolicy.humanQuietMs,
         queueDepth: lmHealth.queueDepth,
         availableMessageSlots: availableSlots,
         dailyAttempts: this.autonomousResearchAttemptTimestamps.length,
-        dailyCap: 6,
+        dailyCap: researchPolicy.dailyCap,
         voiceRoomActive: this.voiceRoomActive,
         freshThread: !hadLiveThread && thread.messageCount === 0,
         availableActors: available.length,
-        chance: this.autonomousResearchChance,
+        chance: researchPolicy.chance,
         rng: this.rng,
       });
       if (startAutonomousResearch) {

@@ -51,7 +51,7 @@ describe("channel profiles", () => {
       const seeds = profile.autonomousResearchSeeds ?? [];
       if (RESEARCH_ROOM_IDS.includes(profile.public.id)) {
         expect(seeds.length, profile.public.id).toBeGreaterThanOrEqual(3);
-        expect(seeds.length, profile.public.id).toBeLessThanOrEqual(5);
+        expect(seeds.length, profile.public.id).toBeLessThanOrEqual(8);
       }
       for (const seed of seeds) {
         expect(seed.id, profile.public.id).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u);
@@ -60,6 +60,12 @@ describe("channel profiles", () => {
         expect(seed.query.length, seed.id).toBeLessThanOrEqual(140);
         expect(seed.query, seed.id).not.toMatch(/https?:\/\//u);
         expect(["web", "news"], seed.id).toContain(seed.mode);
+        if (seed.mode === "news") expect(seed.maxAgeDays, seed.id).toBeDefined();
+        if (seed.maxAgeDays !== undefined) {
+          expect(Number.isInteger(seed.maxAgeDays), seed.id).toBe(true);
+          expect(seed.maxAgeDays, seed.id).toBeGreaterThanOrEqual(1);
+          expect(seed.maxAgeDays, seed.id).toBeLessThanOrEqual(365);
+        }
         expect(seed.discussionAngle.length, seed.id).toBeGreaterThanOrEqual(30);
         expect(seed.discussionAngle.length, seed.id).toBeLessThanOrEqual(280);
         allIds.push(seed.id);
@@ -68,6 +74,14 @@ describe("channel profiles", () => {
     }
     expect(new Set(allIds).size).toBe(allIds.length);
     expect(new Set(allQueries).size).toBe(allQueries.length);
+    const pubSeedIds = CHANNEL_PROFILES.find((profile) => profile.public.id === "the-pub")!
+      .autonomousResearchSeeds!.map((seed) => seed.id);
+    expect(pubSeedIds).toEqual(expect.arrayContaining([
+      "pub-new-music-releases",
+      "pub-film-festival-reaction",
+      "pub-limited-beer-release",
+      "pub-distinctive-pub",
+    ]));
   });
 
   it("keeps internal expertise and freshness rules out of public channel objects", () => {
@@ -186,9 +200,11 @@ describe("channel profiles", () => {
     const pub = CHANNEL_PROFILES.find((profile) => profile.public.id === "the-pub")!;
     expect(pub.ambientMode).toBe("banter");
     expect(pub.ambientPremises.length).toBeGreaterThanOrEqual(20);
-    expect(pub.topic.tags).toEqual(expect.arrayContaining(["film", "music", "work", "politics", "memes", "food"]));
-    expect(pub.conversationGuidance).toContain("Autonomous residents never introduce alcohol");
-    expect(pub.conversationGuidance).toContain("at most one selected actor");
+    expect(pub.topic.tags).toEqual(expect.arrayContaining(["film", "music", "work", "politics", "memes", "food", "beer", "pubs"]));
+    expect(pub.topic.brief).toContain("brewing craft");
+    expect(pub.topic.brief).toContain("pub history");
+    expect(pub.conversationGuidance).toContain("A rare supplied source may make brewing craft");
+    expect(pub.conversationGuidance).toContain("without inventing drinking, intoxication, a visit or a lifestyle");
     expect(pub.conversationGuidance).toContain("never explain a punchline");
     expect(pub.ambientReactionPalette).toEqual(expect.arrayContaining(["😂", "🍿", "🎵"]));
   });

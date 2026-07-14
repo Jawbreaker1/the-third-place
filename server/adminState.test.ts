@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdminChannelConfig, AdminPersonaConfig } from "../shared/adminTypes.js";
 import { CHANNEL_PROFILES, CHANNELS } from "./channels.js";
@@ -69,8 +69,15 @@ describe("persistent admin overlay state", () => {
     const store = makeStore();
     await store.load();
     const initial = store.snapshot();
-    expect(initial.behavior.global).toEqual({ activity: 50, competence: 50, aggression: 25, explicitness: 50 });
+    expect(initial.behavior.global).toEqual({
+      activity: 50,
+      autonomousLinkFrequency: 60,
+      competence: 50,
+      aggression: 25,
+      explicitness: 50,
+    });
     expect(initial.behavior.channels).toEqual({});
+    expect(initial.automation.autonomousLinkChannelIds).toContain("the-pub");
     expect(initial.channels.some((channel) => channel.id === "lobby")).toBe(true);
 
     await store.createChannel(customChannel());
@@ -116,6 +123,19 @@ describe("persistent admin overlay state", () => {
     const runtime = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-lab")!;
     expect(runtime.ambientPremises).toEqual(["A replacement seed must not inherit a semantic family from the old list."]);
     expect(runtime.ambientPremiseFamilies).toBeUndefined();
+  });
+
+  it("marks a room's link-frequency control unavailable when its trusted research topic is replaced", async () => {
+    const store = makeStore();
+    await store.load();
+    const current = store.snapshot().channels.find((channel) => channel.id === "ai-lab")!;
+    await store.updateChannel("ai-lab", {
+      ...current,
+      topic: "a completely replaced administrator-authored room topic",
+    });
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-lab")?.autonomousResearchSeeds)
+      .toBeUndefined();
+    expect(store.snapshot().automation.autonomousLinkChannelIds).not.toContain("ai-lab");
   });
 
   it("rolls runtime arrays back when atomic persistence fails", async () => {
@@ -223,7 +243,7 @@ describe("persistent admin overlay state", () => {
       tuning: { activity: 35, competence: 61, aggression: 19, explicitness: 42 },
     });
     expect(store.snapshot().behavior.channels).toEqual({
-      lobby: { activity: 35, competence: 61, aggression: 19, explicitness: 42 },
+      lobby: { activity: 35, autonomousLinkFrequency: 60, competence: 61, aggression: 19, explicitness: 42 },
     });
 
     await store.updateBehavior({ scope: "channel", channelId: "lobby", tuning: null });
@@ -232,7 +252,83 @@ describe("persistent admin overlay state", () => {
       tuning: { activity: 72, competence: 64, aggression: 31, explicitness: 58 },
     });
     expect(store.snapshot().behavior.channels).toEqual({});
-    expect(store.behaviorTuning("lobby")).toEqual({ activity: 72, competence: 64, aggression: 31, explicitness: 58 });
+    expect(store.behaviorTuning("lobby")).toEqual({
+      activity: 72,
+      autonomousLinkFrequency: 60,
+      competence: 64,
+      aggression: 31,
+      explicitness: 58,
+    });
+  });
+
+  it("migrates persisted v1 behavior and keeps autonomous-link settings live and inheritable", async () => {
+    const path = pathFor();
+    try {
+      const original = new AdminStateStore({ path });
+      await original.load();
+      const currentPub = original.snapshot().channels.find((channel) => channel.id === "the-pub")!;
+      await original.updateChannel("the-pub", { ...currentPub, icon: "P" });
+      await original.updateBehavior({
+        scope: "channel",
+        channelId: "the-pub",
+        tuning: { activity: 55, competence: 60, aggression: 30, explicitness: 65 },
+      });
+      const legacy = JSON.parse(await readFile(path, "utf8")) as {
+        version: number;
+        behavior: {
+          global: Record<string, unknown>;
+          channels: Record<string, Record<string, unknown>>;
+        };
+        channelOverrides: Record<string, Record<string, unknown>>;
+      };
+      legacy.version = 1;
+      legacy.channelOverrides["the-pub"]!.topic =
+        "a relaxed Friday hangout for films, music, work gripes, politics, food, links, memes and everyday nonsense";
+      delete legacy.behavior.global.autonomousLinkFrequency;
+      for (const tuning of Object.values(legacy.behavior.channels)) {
+        delete tuning.autonomousLinkFrequency;
+      }
+      await writeFile(path, JSON.stringify(legacy), "utf8");
+
+      const migrated = new AdminStateStore({ path });
+      await migrated.load();
+      expect(migrated.behaviorTuning().autonomousLinkFrequency).toBe(60);
+      expect(migrated.behaviorTuning("the-pub").autonomousLinkFrequency).toBe(60);
+      expect(migrated.snapshot().channels.find((channel) => channel.id === "the-pub")?.topic)
+        .toContain("brewing craft");
+      expect(migrated.snapshot().automation.autonomousLinkChannelIds).toContain("the-pub");
+
+      await migrated.updateBehavior({
+        scope: "global",
+        tuning: {
+          ...migrated.behaviorTuning(),
+          autonomousLinkFrequency: 75,
+        },
+      });
+      await migrated.updateBehavior({
+        scope: "global",
+        tuning: { activity: 58, competence: 57, aggression: 31, explicitness: 62 },
+      });
+      expect(migrated.behaviorTuning().autonomousLinkFrequency).toBe(75);
+      await migrated.updateBehavior({
+        scope: "channel",
+        channelId: "the-pub",
+        tuning: {
+          ...migrated.behaviorTuning("the-pub"),
+          autonomousLinkFrequency: 0,
+        },
+      });
+      await migrated.updateBehavior({
+        scope: "channel",
+        channelId: "the-pub",
+        tuning: { activity: 52, competence: 59, aggression: 32, explicitness: 64 },
+      });
+      expect(migrated.behaviorTuning("the-pub").autonomousLinkFrequency).toBe(0);
+      await migrated.updateBehavior({ scope: "channel", channelId: "the-pub", tuning: null });
+      expect(migrated.behaviorTuning("the-pub").autonomousLinkFrequency).toBe(75);
+    } finally {
+      await rm(path, { force: true });
+    }
   });
 
   it("reconciles and announces the live catalog only for catalog mutations", async () => {

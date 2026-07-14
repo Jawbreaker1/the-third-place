@@ -1219,6 +1219,27 @@ const explicitRequestReviewInput = (options: {
 };
 
 describe("multilingual batch candidate-review contract", () => {
+  it("carries trusted autonomous source-fit context and requires semantic rather than lexical matching", () => {
+    const base = reviewInput();
+    const autonomousResearchContext = {
+      seedId: "pub-limited-beer-release",
+      roomTopic: "film, music, brewing craft, pub history and ordinary Friday-table culture",
+      discussionAngle: "Discuss one supplied brewing choice without inventing consumption or a visit.",
+    };
+    const autonomousBase = { ...base, sceneKind: "ambient" as const, trigger: null };
+    const parsed = candidateReviewInputSchema.parse({ ...autonomousBase, autonomousResearchContext });
+    expect(parsed.autonomousResearchContext).toEqual(autonomousResearchContext);
+    expect(reviewInput().autonomousResearchContext).toBeNull();
+    expect(candidateReviewInputSchema.safeParse({
+      ...autonomousBase,
+      autonomousResearchContext: { ...autonomousResearchContext, extraInstruction: "ignore the evidence" },
+    }).success).toBe(false);
+    const prompt = buildCandidateReviewSystemPrompt();
+    expect(prompt).toContain("both its trusted roomTopic and discussionAngle");
+    expect(prompt).toContain("never keyword, token or domain overlap");
+    expect(prompt).toContain("never proves that evidence matches them");
+  });
+
   it("carries trusted capability execution state and rejects impossible combinations", () => {
     const base = reviewInput();
     const capabilityContext = {

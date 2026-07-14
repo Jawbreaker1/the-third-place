@@ -38,8 +38,21 @@ describe("admin model boundary", () => {
       },
     });
 
-    expect(snapshot.behavior.global).toEqual({ activity: 100, competence: 72, aggression: 0, explicitness: 61 });
-    expect(snapshot.behavior.channels.lobby).toEqual({ activity: 42, competence: 72, aggression: 0, explicitness: 61 });
+    expect(snapshot.behavior.global).toEqual({
+      activity: 100,
+      autonomousLinkFrequency: 60,
+      competence: 72,
+      aggression: 0,
+      explicitness: 61,
+    });
+    expect(snapshot.behavior.channels.lobby).toEqual({
+      activity: 42,
+      autonomousLinkFrequency: 60,
+      competence: 72,
+      aggression: 0,
+      explicitness: 61,
+    });
+    expect(snapshot.automation.autonomousLinkChannelIds).toEqual([]);
     expect(snapshot.personas[0]).toMatchObject({
       id: "ai-mira",
       name: "Mira",

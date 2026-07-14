@@ -153,6 +153,8 @@ describe("admin HTTP API", () => {
       },
     });
     expect(patched.status).toBe(200);
+    expect((patched.body as { state: { behavior: { channels: Record<string, { autonomousLinkFrequency: number }> } } })
+      .state.behavior.channels.lobby?.autonomousLinkFrequency).toBe(60);
 
     const channel = {
       id: "admin-test-room",

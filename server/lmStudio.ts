@@ -228,6 +228,12 @@ export interface SceneRequest {
     retrievedAt: string;
     results: Array<{ id: string; title: string; url: string; snippet: string; publishedAt?: string }>;
   };
+  /** Trusted profile context for semantic source-vs-room review of autonomous links. */
+  autonomousResearchContext?: {
+    seedId: string;
+    roomTopic: string;
+    discussionAngle: string;
+  };
   /** The server attaches the trusted URL as a card; model prose must contain no URL. */
   urlPublicationPolicy?: "allow_supplied" | "server_card";
   /** Trusted lookup state. Set `failed` when evidence was requested but no packet could be supplied. */
@@ -315,6 +321,7 @@ const NON_REPAIRABLE_CANDIDATE_ISSUES = new Set<CandidateReviewIssue>([
   "written_medium_illusion",
   "unsupported_acoustic_assertion",
   "unsupported_room_recall",
+  "pub_intoxicant_gimmick",
   "incorrect_temporal_claim",
   "unsafe_retaliation",
   "conflict_pile_on",
@@ -1566,6 +1573,7 @@ export class LmStudioClient {
         id: request.channelId?.slice(0, 128) ?? null,
         name: request.channelName.slice(0, 100),
         register: this.humanizerRegister(request) ?? null,
+        topic: getChannelProfile(request.channelId ?? "")?.topic.brief.slice(0, 500) ?? null,
       },
       behaviorTuning: {
         competence: request.behaviorTuning?.competence ?? DEFAULT_RUNTIME_BEHAVIOR_TUNING.competence,
@@ -1657,6 +1665,13 @@ export class LmStudioClient {
           snippet: result.snippet.slice(0, 6_000),
         })),
       },
+      autonomousResearchContext: request.autonomousResearchContext
+        ? {
+            seedId: request.autonomousResearchContext.seedId,
+            roomTopic: request.autonomousResearchContext.roomTopic,
+            discussionAngle: request.autonomousResearchContext.discussionAngle,
+          }
+        : null,
       capabilityContext: request.capabilityContext
         ? {
             available: request.capabilityContext.available,

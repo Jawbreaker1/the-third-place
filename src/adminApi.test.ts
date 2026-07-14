@@ -27,6 +27,27 @@ describe("admin behavior API", () => {
     }));
   });
 
+  it("serializes an explicit autonomous-link zero without dropping it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await patchAdminBehavior({
+      scope: "channel",
+      channelId: "the-pub",
+      tuning: {
+        activity: 50,
+        autonomousLinkFrequency: 0,
+        competence: 50,
+        aggression: 25,
+        explicitness: 50,
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/behavior", expect.objectContaining({
+      body: expect.stringContaining('"autonomousLinkFrequency":0'),
+    }));
+  });
+
   it("serializes explicit zero affinity without inventing missing room overrides", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
