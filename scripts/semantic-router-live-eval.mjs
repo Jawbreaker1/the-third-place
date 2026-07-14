@@ -39,6 +39,63 @@ const cases = [
     check: (value) => value.evidence.action === "web_search" && value.evidence.query?.toLocaleLowerCase().includes("telefónica"),
   },
   {
+    id: "sv-screenshot-current-tesla",
+    text: "Någon som har sett hur det står till med Tessla aktien idag?",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    capabilities: ["web_search", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
+      value.capabilities.discussed.includes("web_search"),
+  },
+  {
+    id: "sv-screenshot-avanza-followup",
+    text: "@mira kolla avanza!",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    mechanicalAddressedPersonaIds: ["ai-mira"],
+    recentMessages: [
+      { id: "sv-market-1", authorId: "live-eval-human", authorName: "EvalGuest", content: "Någon som har sett hur det står till med Tessla aktien idag?" },
+      { id: "sv-market-2", authorId: "ai-mira", authorName: "Mira", content: "Jag har ingen live-koppling till börsen, så jag kan tyvärr inte se exakt vad den står i just nu." },
+    ],
+    capabilities: ["web_search", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
+    id: "sv-screenshot-correct-limitation",
+    text: "inte app.. websida",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    recentMessages: [
+      { id: "sv-market-3", authorId: "live-eval-human", authorName: "EvalGuest", content: "Någon som har sett hur det står till med Tessla aktien idag?" },
+      { id: "sv-market-4", authorId: "ai-mira", authorName: "Mira", content: "Jag har ingen live-koppling till börsen, så jag kan tyvärr inte se exakt vad den står i just nu." },
+      { id: "sv-market-5", authorId: "live-eval-human", authorName: "EvalGuest", content: "@mira kolla avanza!" },
+      { id: "sv-market-6", authorId: "ai-mira", authorName: "Mira", content: "haha, jag har ju inte tillgång till deras app!" },
+    ],
+    capabilities: ["web_search", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
+      ["retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
+    id: "sv-screenshot-bare-domain-followup",
+    text: "jodå. gå till avanza.se bara",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    recentMessages: [
+      { id: "sv-market-7", authorId: "live-eval-human", authorName: "EvalGuest", content: "Någon som har sett hur det står till med Tessla aktien idag?" },
+      { id: "sv-market-8", authorId: "ai-mira", authorName: "Mira", content: "Jag har ingen live-koppling till börsen, så jag kan tyvärr inte se exakt vad den står i just nu." },
+      { id: "sv-market-9", authorId: "live-eval-human", authorName: "EvalGuest", content: "@mira kolla avanza!" },
+      { id: "sv-market-10", authorId: "ai-mira", authorName: "Mira", content: "haha, jag har ju inte tillgång till deras app!" },
+      { id: "sv-market-11", authorId: "live-eval-human", authorName: "EvalGuest", content: "inte app.. websida" },
+      { id: "sv-market-12", authorId: "ai-mira", authorName: "Mira", content: "oj, mitt fel. men jag når fortfarande inte ut på nätet för att kolla live-kurser." },
+    ],
+    capabilities: ["read_url", "web_search", "local_datetime"],
+    urlCandidates: [{ ref: "U1", source: "latest_message", context: "host=avanza.se; path=/; source=message" }],
+    check: (value) => value.evidence.action === "read_url" &&
+      value.evidence.urlRef === "U1" &&
+      value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
+      ["retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
     id: "fr-read-opaque-url",
     text: "Mira, peux-tu lire ce lien et me dire ce qui est important ?",
     capabilities: ["read_url", "web_search", "local_datetime"],
@@ -236,8 +293,26 @@ const cases = [
 ];
 
 const lm = new LmStudioClient();
+let modelHealth;
+for (let attempt = 0; attempt < 3; attempt += 1) {
+  modelHealth = await lm.probe();
+  if (modelHealth.connected) break;
+  await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+}
+if (!modelHealth.connected) {
+  throw new Error(`Semantic live eval requires a connected model (${modelHealth.label}).`);
+}
+const requestedCaseIds = new Set(process.argv.slice(2));
+const selectedCases = requestedCaseIds.size > 0
+  ? cases.filter((test) => requestedCaseIds.has(test.id))
+  : cases;
+if (requestedCaseIds.size > 0 && selectedCases.length !== requestedCaseIds.size) {
+  const found = new Set(selectedCases.map((test) => test.id));
+  const missing = [...requestedCaseIds].filter((id) => !found.has(id));
+  throw new Error(`Unknown semantic live-eval case(s): ${missing.join(", ")}`);
+}
 let failed = 0;
-for (const [index, test] of cases.entries()) {
+for (const [index, test] of selectedCases.entries()) {
   const started = performance.now();
   const turnId = `live-eval:${Date.now()}:${index}`;
   const result = test.kind === "memory"
@@ -255,7 +330,7 @@ for (const [index, test] of cases.entries()) {
     : await lm.analyzeTurn({
       turnId,
       medium: "public",
-      channel: { id: "lobby", name: "lobby", topic: "open multilingual community conversation" },
+      channel: test.channel ?? { id: "lobby", name: "lobby", topic: "open multilingual community conversation" },
       latestMessage: {
         id: `message-${index}`,
         authorId: "live-eval-human",
@@ -264,6 +339,7 @@ for (const [index, test] of cases.entries()) {
       },
       recentMessages: test.recentMessages ?? [],
       personaCandidates: personas,
+      mechanicalAddressedPersonaIds: test.mechanicalAddressedPersonaIds ?? [],
       urlCandidates: test.urlCandidates ?? [],
       availableCapabilities: test.capabilities,
       historyRecallAvailable: test.historyRecallAvailable ?? false,
@@ -279,6 +355,8 @@ for (const [index, test] of cases.entries()) {
     responseLanguage: result.responseLanguage?.tag,
     source: result.source,
     failureReason: result.failureReason,
+    intent: result.intent,
+    personas: result.personas,
     evidence: result.evidence,
     capabilities: result.capabilities,
     historyRecall: result.historyRecall,
@@ -290,8 +368,8 @@ for (const [index, test] of cases.entries()) {
 }
 
 if (failed > 0) {
-  process.stderr.write(`${failed}/${cases.length} semantic live-eval cases failed.\n`);
+  process.stderr.write(`${failed}/${selectedCases.length} semantic live-eval cases failed.\n`);
   process.exitCode = 1;
 } else {
-  process.stdout.write(`All ${cases.length} multilingual semantic live-eval cases passed.\n`);
+  process.stdout.write(`All ${selectedCases.length} multilingual semantic live-eval cases passed.\n`);
 }

@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { parse, type DefaultTreeAdapterTypes } from "parse5";
 import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
 
 export interface ResearchResult {
@@ -32,6 +33,10 @@ export interface ResearchRequest {
 export interface SiteResearchRequest extends ResearchRequest {
   url: URL;
 }
+
+type SearchScope = "generic" | "site";
+type HtmlNode = DefaultTreeAdapterTypes.Node;
+type HtmlElement = DefaultTreeAdapterTypes.Element;
 
 // This is a transport boundary, not an intent parser. The semantic router owns
 // the wording and mode; the broker only keeps the provider request bounded and
@@ -71,6 +76,7 @@ const xmlField = (item: string, field: string): string => {
 // Result links are rendered by the browser but never fetched by this server.
 // Be conservative anyway so this helper cannot accidentally become an SSRF primitive later.
 const safeSourceUrl = (raw: string): string | undefined => {
+  if (raw.length === 0 || raw.length > 4_096) return undefined;
   try {
     const parsed = new URL(raw);
     const host = parsed.hostname.toLocaleLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
@@ -108,6 +114,72 @@ const sourceUrl = (raw: string): string | undefined => {
   return safeSourceUrl(raw);
 };
 
+const duckDuckGoSourceUrl = (raw: string): string | undefined => {
+  try {
+    const parsed = new URL(raw, "https://html.duckduckgo.com");
+    const host = parsed.hostname.toLocaleLowerCase().replace(/\.$/u, "");
+    if (
+      (host === "duckduckgo.com" || host.endsWith(".duckduckgo.com")) &&
+      parsed.pathname === "/l/"
+    ) {
+      const target = parsed.searchParams.get("uddg");
+      return target ? safeSourceUrl(target) : undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return safeSourceUrl(raw);
+};
+
+const htmlChildren = (node: HtmlNode): readonly DefaultTreeAdapterTypes.ChildNode[] =>
+  "childNodes" in node ? node.childNodes : [];
+
+const isHtmlElement = (node: HtmlNode): node is HtmlElement => "attrs" in node;
+
+const htmlAttribute = (node: HtmlElement, name: string): string | undefined =>
+  node.attrs.find((attribute) => attribute.name === name)?.value;
+
+const htmlClasses = (node: HtmlElement): Set<string> =>
+  new Set((htmlAttribute(node, "class") ?? "").split(/\s+/u).filter(Boolean));
+
+const htmlElements = (
+  root: HtmlNode,
+  predicate: (element: HtmlElement) => boolean,
+  limit: number,
+): HtmlElement[] => {
+  const matches: HtmlElement[] = [];
+  const pending: HtmlNode[] = [...htmlChildren(root)].reverse();
+  let visited = 0;
+  while (pending.length > 0 && visited < 30_000 && matches.length < limit) {
+    const node = pending.pop()!;
+    visited += 1;
+    if (isHtmlElement(node) && predicate(node)) matches.push(node);
+    const children = htmlChildren(node);
+    for (let index = children.length - 1; index >= 0; index -= 1) pending.push(children[index]!);
+  }
+  return matches;
+};
+
+const htmlText = (root: HtmlNode): string => {
+  const parts: string[] = [];
+  const pending: HtmlNode[] = [root];
+  let visited = 0;
+  while (pending.length > 0 && visited < 4_000) {
+    const node = pending.pop()!;
+    visited += 1;
+    if (node.nodeName === "#text" && "value" in node) {
+      parts.push(node.value);
+      continue;
+    }
+    if (node.nodeName === "script" || node.nodeName === "style" || node.nodeName === "template") continue;
+    const children = htmlChildren(node);
+    for (let index = children.length - 1; index >= 0; index -= 1) pending.push(children[index]!);
+  }
+  return stripDangerousTextControls(parts.join(""))
+    .replace(/\s+/gu, " ")
+    .trim();
+};
+
 const readLimitedText = async (response: Response, maxBytes: number): Promise<string> => {
   if (!response.body) return "";
   const reader = response.body.getReader();
@@ -139,7 +211,7 @@ export class ResearchBroker {
     if (process.env.RESEARCH_ENABLED !== "true") return undefined;
     const query = boundedQuery(request.query);
     if (!query) return undefined;
-    return this.researchQuery(query, request.mode, request.requesterId ?? "anonymous");
+    return this.researchQuery(query, request.mode, request.requesterId ?? "anonymous", "generic");
   }
 
   async researchSite(request: SiteResearchRequest): Promise<ResearchPacket | undefined> {
@@ -149,7 +221,7 @@ export class ResearchBroker {
     const topic = boundedQuery(request.query);
     const host = url.hostname.toLocaleLowerCase().replace(/\.$/u, "");
     const query = `site:${host}${topic ? ` ${topic}` : ""}`.slice(0, 160);
-    const packet = await this.researchQuery(query, request.mode, request.requesterId ?? "anonymous");
+    const packet = await this.researchQuery(query, request.mode, request.requesterId ?? "anonymous", "site");
     if (!packet) return undefined;
     const results = packet.results
       .filter((result) => {
@@ -163,8 +235,13 @@ export class ResearchBroker {
     return results.length > 0 ? { ...packet, results } : undefined;
   }
 
-  private async researchQuery(query: string, mode: SearchMode, requesterId: string): Promise<ResearchPacket | undefined> {
-    const key = `${mode}:${unicodeCaselessKey(query)}`;
+  private async researchQuery(
+    query: string,
+    mode: SearchMode,
+    requesterId: string,
+    scope: SearchScope,
+  ): Promise<ResearchPacket | undefined> {
+    const key = `${scope}:${mode}:${unicodeCaselessKey(query)}`;
     this.pruneCache();
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
@@ -176,7 +253,7 @@ export class ResearchBroker {
     if (existing) return existing;
     if (!this.reserveRequest(requesterId)) return undefined;
 
-    const request = this.search(query, mode).finally(() => this.inFlight.delete(key));
+    const request = this.search(query, mode, scope).finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, request);
     const packet = await request;
     if (packet) {
@@ -215,10 +292,11 @@ export class ResearchBroker {
     }
   }
 
-  private async searchEndpoint(
+  private async searchBingRss(
     query: string,
     endpointMode: SearchMode,
     requestedMode: SearchMode,
+    resultLimit = 5,
   ): Promise<Array<Omit<ResearchResult, "id">>> {
     const endpoint =
       endpointMode === "news"
@@ -251,20 +329,60 @@ export class ResearchBroker {
         snippet,
         ...(requestedMode === "news" && xmlField(item, "pubDate") ? { publishedAt: xmlField(item, "pubDate") } : {}),
       });
+      if (parsedResults.length >= resultLimit) break;
+    }
+    return parsedResults;
+  }
+
+  private async searchDuckDuckGoHtml(query: string): Promise<Array<Omit<ResearchResult, "id">>> {
+    const endpoint = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const response = await this.fetchImpl(endpoint, {
+      headers: { Accept: "text/html", "User-Agent": "TheThirdPlace/0.2" },
+      signal: AbortSignal.timeout(8_000),
+      redirect: "error",
+    });
+    if (!response.ok) throw new Error(`Research provider returned ${response.status}`);
+    const contentType = response.headers.get("content-type")?.toLocaleLowerCase() ?? "";
+    if (!contentType.includes("text/html")) {
+      throw new Error("Research provider returned an unexpected content type");
+    }
+    const html = await readLimitedText(response, 350_000);
+    const document = parse(html);
+    const rawResults = htmlElements(document, (element) => {
+      const classes = htmlClasses(element);
+      return classes.has("result") && classes.has("web-result") && !classes.has("result--ad");
+    }, 10);
+    const seenUrls = new Set<string>();
+    const parsedResults: Array<Omit<ResearchResult, "id">> = [];
+    for (const result of rawResults) {
+      const titleLink = htmlElements(result, (element) => htmlClasses(element).has("result__a"), 1)[0];
+      const snippetElement = htmlElements(result, (element) => htmlClasses(element).has("result__snippet"), 1)[0];
+      const title = titleLink ? htmlText(titleLink).slice(0, 180) : "";
+      const url = titleLink ? duckDuckGoSourceUrl(htmlAttribute(titleLink, "href") ?? "") : undefined;
+      const snippet = snippetElement ? htmlText(snippetElement).slice(0, 650) : "";
+      if (!title || !url || !snippet || seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      parsedResults.push({ title, url, snippet });
       if (parsedResults.length >= 5) break;
     }
     return parsedResults;
   }
 
-  private async search(query: string, mode: SearchMode): Promise<ResearchPacket | undefined> {
-    let parsedResults = await this.searchEndpoint(query, mode, mode);
+  private async search(query: string, mode: SearchMode, scope: SearchScope): Promise<ResearchPacket | undefined> {
+    let parsedResults = mode === "web"
+      ? scope === "generic"
+        ? await this.searchDuckDuckGoHtml(query)
+        : await this.searchBingRss(query, "web", mode, 10)
+      : await this.searchBingRss(query, "news", mode);
     // Bing News can return a successful, well-formed but empty RSS feed for
     // otherwise useful multilingual queries. Retry only that semantic-empty
-    // case against the fixed Web RSS endpoint, preserving the exact bounded
-    // query and requested news result shape. Transport, media-type and body
-    // bound errors throw above and therefore never trigger this fallback.
+    // case against the scope's fixed Web provider, preserving the exact
+    // bounded query. Transport, media-type and body-bound errors throw above
+    // and therefore never trigger this fallback.
     if (mode === "news" && parsedResults.length === 0) {
-      parsedResults = await this.searchEndpoint(query, "web", mode);
+      parsedResults = scope === "generic"
+        ? await this.searchDuckDuckGoHtml(query)
+        : await this.searchBingRss(query, "web", mode, 10);
     }
     if (parsedResults.length === 0) return undefined;
     const results = parsedResults.map((result, index) => ({ id: `S${index + 1}`, ...result }));

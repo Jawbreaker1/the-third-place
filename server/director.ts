@@ -25,6 +25,7 @@ import { PERSONAS, type Persona } from "./personas.js";
 import {
   type GeneratedLine,
   type RoomRecallEvidence,
+  type SceneCapabilityContext,
   type TranscriptLine,
 } from "./lmStudio.js";
 import type { SocialModelClient } from "./switchableModel.js";
@@ -33,6 +34,7 @@ import {
   ResearchBroker,
   type ResearchPacket,
   type ResearchRequest,
+  type SearchMode,
 } from "./researchBroker.js";
 import {
   PageReader,
@@ -48,6 +50,7 @@ import {
   TURN_TRUST_THRESHOLDS,
   type MemoryAnalysis,
   type TurnAnalysis,
+  type TurnCapability,
   type TurnAnalysisInput,
 } from "./semanticRouter.js";
 import { refreshLocalDateTime, resolveLocalDateTime, type LocalDateTimeResult } from "./timeResolver.js";
@@ -111,7 +114,7 @@ export const normalizeGeneratedMessageContent = (value: string, maxLength = 500)
   return restored && restored.length <= maxLength ? restored : undefined;
 };
 
-export function analyzeSocialSignals(content: string, personas = PERSONAS): SocialSignals {
+export function analyzeSocialSignals(content: string, personas: readonly Persona[] = PERSONAS): SocialSignals {
   const mentionedIds = personas
     .filter((persona) => containsExactMention(content, persona.name))
     .map((persona) => persona.id);
@@ -1106,6 +1109,10 @@ export function evidenceFailureFallback(
 
 interface ClassifiedToolPlan {
   pageReadRequest?: PageReadRequest;
+  siteResearch?: {
+    goal: string;
+    mode: SearchMode;
+  };
   searchRequest?: ResearchRequest;
   localDateTime?: LocalDateTimeResult;
 }
@@ -1533,15 +1540,13 @@ export class SocialDirector {
     const uniqueRecent = [...new Map(recentPool.map((message) => [message.id, message])).values()]
       .slice(-12)
       .map((message) => this.classifierMessage(message));
-    const availableCapabilities: TurnAnalysisInput["availableCapabilities"] = ["local_datetime"];
-    if (process.env.LINK_READER_ENABLED !== "false" && input.candidateSet.candidates.length > 0) {
-      availableCapabilities.unshift("read_url");
-    }
-    if (input.allowSearch && process.env.RESEARCH_ENABLED === "true") {
-      availableCapabilities.push("web_search");
-    }
+    const availableCapabilities = this.availableTurnCapabilities(input.candidateSet, input.allowSearch);
     const latest = this.classifierMessage(input.latest);
     latest.content = boundedUntrustedText(input.latest.content, 4_000);
+    const exactMentionIds = analyzeSocialSignals(input.latest.content, input.personas).mentionedIds;
+    const mechanicalAddressedPersonaIds = input.medium === "dm" && input.personas.length === 1
+      ? [input.personas[0]!.id]
+      : addressedPersonaIds(exactMentionIds, input.replyTarget, input.personas);
     try {
       if (typeof this.lm.analyzeTurn !== "function") return createFailClosedTurnAnalysis("disabled");
       return await this.lm.analyzeTurn({
@@ -1559,6 +1564,7 @@ export class SocialDirector {
           name: boundedUntrustedText(persona.name, 80),
           interests: persona.interests.slice(0, 16).map((interest) => boundedUntrustedText(interest, 80)),
         })),
+        mechanicalAddressedPersonaIds,
         urlCandidates: semanticUrlCandidates(input.candidateSet),
         availableCapabilities,
         historyRecallAvailable: input.medium === "public",
@@ -1567,6 +1573,45 @@ export class SocialDirector {
       console.warn("Turn analysis failed closed:", error instanceof Error ? error.message : error);
       return createFailClosedTurnAnalysis("transport_error");
     }
+  }
+
+  private availableTurnCapabilities(
+    candidateSet: PageReadCandidateSet,
+    allowSearch: boolean,
+  ): TurnCapability[] {
+    const available: TurnCapability[] = ["local_datetime"];
+    if (process.env.LINK_READER_ENABLED !== "false" && candidateSet.candidates.length > 0) {
+      available.unshift("read_url");
+    }
+    if (allowSearch && process.env.RESEARCH_ENABLED === "true") available.push("web_search");
+    return available;
+  }
+
+  private sceneCapabilityContext(input: {
+    analysis: TurnAnalysis;
+    available: TurnCapability[];
+    toolPlan: ClassifiedToolPlan;
+    research?: ResearchPacket;
+  }): SceneCapabilityContext {
+    const trusted = projectTrustedTurnAnalysis(input.analysis);
+    const plannedAction: TurnCapability | null = input.toolPlan.pageReadRequest
+      ? "read_url"
+      : input.toolPlan.searchRequest
+        ? "web_search"
+        : input.toolPlan.localDateTime
+          ? "local_datetime"
+          : null;
+    return {
+      available: [...input.available],
+      requestKind: trusted.capabilityTrusted ? input.analysis.capabilities.requestKind : "none",
+      discussed: trusted.capabilityTrusted ? [...input.analysis.capabilities.discussed] : [],
+      plannedAction,
+      executionStatus: plannedAction === null
+        ? "not_requested"
+        : input.toolPlan.localDateTime || input.research
+          ? "succeeded"
+          : "failed_temporary",
+    };
   }
 
   private classifiedToolPlan(
@@ -1578,13 +1623,21 @@ export class SocialDirector {
     const trusted = projectTrustedTurnAnalysis(analysis);
     if (!trusted.evidenceTrusted) return {};
     if (analysis.evidence.action === "read_url" && analysis.evidence.urlRef) {
+      const resolvedIntent = analysis.evidence.goal ?? intent;
       const pageReadRequest = this.pageReader.resolveTarget({
         candidateSet,
         targetRef: analysis.evidence.urlRef,
-        intent,
+        intent: resolvedIntent,
         retry: trusted.capabilityTrusted && analysis.capabilities.requestKind === "retry",
       });
-      return pageReadRequest ? { pageReadRequest } : {};
+      return pageReadRequest
+        ? {
+            pageReadRequest,
+            ...(analysis.evidence.goal
+              ? { siteResearch: { goal: analysis.evidence.goal, mode: "web" as const } }
+              : {}),
+          }
+        : {};
     }
     if (
       analysis.evidence.action === "web_search" &&
@@ -1765,8 +1818,26 @@ export class SocialDirector {
     pageReadRequest: PageReadRequest | undefined,
     searchRequest: ResearchRequest | undefined,
     requesterId: string,
+    siteResearch?: ClassifiedToolPlan["siteResearch"],
   ): Promise<ResearchPacket | undefined> {
     if (pageReadRequest) {
+      const pageUrl = pageReadRequest.url;
+      const explicitRootUrl = pageUrl &&
+        pageReadRequest.initiator !== "automatic" &&
+        pageUrl.pathname === "/" &&
+        pageUrl.search === "";
+      if (explicitRootUrl && siteResearch) {
+        const sameSite = await this.researchBroker.researchSite({
+          url: pageUrl,
+          query: siteResearch.goal,
+          mode: siteResearch.mode,
+          requesterId,
+        }).catch((error) => {
+          console.warn("Bounded same-site lookup failed safely:", error instanceof Error ? error.message : error);
+          return undefined;
+        });
+        if (sameSite?.results.length) return sameSite;
+      }
       const page = await this.pageReader.read(pageReadRequest, requesterId).catch((error) => {
         console.warn("Exact linked-page read failed safely:", error instanceof Error ? error.message : error);
         return undefined;
@@ -1821,6 +1892,7 @@ export class SocialDirector {
       candidateSet,
       allowSearch: Boolean(persona.canResearch),
     });
+    const availableCapabilities = this.availableTurnCapabilities(candidateSet, Boolean(persona.canResearch));
     const trustedDmTurn = projectTrustedTurnAnalysis(analysis);
     const dmRequestOwnerIds = trustedDmTurn.intentTrusted && trustedDmTurn.replyExpected === "expected"
       ? [persona.id]
@@ -1835,13 +1907,16 @@ export class SocialDirector {
           toolPlan.pageReadRequest,
           toolPlan.searchRequest,
           human.id,
+          toolPlan.siteResearch,
         );
       }
       const evidencePremise = toolPlan.localDateTime
         ? `${persona.name} answers the requested current date/time from trustedTemporalContext.requestedClock; do not browse, estimate or cite a web source.`
         : toolPlan.pageReadRequest
           ? research
-            ? `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
+            ? research.kind === "search"
+              ? `${persona.name} ran the bounded same-site lookup resolved from the human's root-site request. Answer only from the supplied same-site results and cite only source IDs that support the answer.`
+              : `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
             : "This specific server-bound linked-page attempt returned no readable evidence. In the human's classified language, say only that this attempt failed; do not invent a cause or claim a permanent inability."
           : toolPlan.searchRequest
             ? research
@@ -1864,6 +1939,12 @@ export class SocialDirector {
           actorChannelNotes: this.actorChannels.promptNotes([persona]),
           research,
           evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          capabilityContext: this.sceneCapabilityContext({
+            analysis,
+            available: availableCapabilities,
+            toolPlan,
+            research,
+          }),
           urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
           requestedClock: toolPlan.localDateTime,
           temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
@@ -1959,6 +2040,7 @@ export class SocialDirector {
       candidateSet,
       allowSearch: true,
     });
+    const availableCapabilities = this.availableTurnCapabilities(candidateSet, true);
     if (!burstIsCurrent()) {
       this.schedulePersistentMemory(messages, human);
       return;
@@ -2013,6 +2095,10 @@ export class SocialDirector {
       ? {
           witnessPersonaIds: recallResult.witnessPersonaIds.slice(0, 8),
           transcript: this.transcriptMessages(recallResult.messages),
+          provenance: recallResult.rows.map((row) => ({
+            ...row,
+            generation: row.generation ?? null,
+          })),
         }
       : undefined;
     const roomRecallFor = (actors: readonly Persona[]): RoomRecallEvidence | undefined => {
@@ -2021,6 +2107,7 @@ export class SocialDirector {
       return {
         witnessPersonaIds: roomRecall.witnessPersonaIds.filter((id) => actorIds.has(id)),
         transcript: roomRecall.transcript,
+        provenance: roomRecall.provenance,
       };
     };
     const responseExpected = trustedTurn.intentTrusted && trustedTurn.replyExpected === "expected";
@@ -2180,6 +2267,7 @@ export class SocialDirector {
           toolPlan.pageReadRequest,
           toolPlan.searchRequest,
           human.id,
+          toolPlan.siteResearch,
         );
         if (autoSharedLinkAttempt && !research) {
           // Passive-link failures are intentionally silent. They never turn
@@ -2203,7 +2291,9 @@ export class SocialDirector {
           ? research
             ? autoSharedLinkAttempt
               ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound page that the human just shared and is solely responsible for one grounded response. ${sharedLinkDiscussionContract()} Attach S1 to the response.`
-              : `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound linked page and is solely responsible for answering from the supplied page evidence. ${pageEvidenceAnswerContract(research)} Attach S1 to every message that relies on the page.`
+              : research.kind === "search"
+                ? `${evidenceResponder?.name ?? "The designated resident"} ran the bounded same-site lookup resolved from the human's root-site request and is solely responsible for the answer. Attach only source IDs that support each claim; result rank alone is never an answer.`
+                : `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound linked page and is solely responsible for answering from the supplied page evidence. ${pageEvidenceAnswerContract(research)} Attach S1 to every message that relies on the page.`
             : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific server-bound linked-page attempt returned no readable evidence. It is a temporary result; nobody guesses contents or invents a cause.`
           : research
             ? `${evidenceResponder?.name ?? "The designated resident"} ran the classifier's standalone fresh-data query and is responsible for the sourced answer. Attach only source IDs that support each claim; result rank alone is never an answer.`
@@ -2254,6 +2344,12 @@ export class SocialDirector {
           visualObservation,
           research,
           evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          capabilityContext: this.sceneCapabilityContext({
+            analysis,
+            available: availableCapabilities,
+            toolPlan,
+            research,
+          }),
           urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
           requestedClock: toolPlan.localDateTime,
           temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
@@ -2304,6 +2400,12 @@ export class SocialDirector {
             visualObservation,
             research,
             evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+            capabilityContext: this.sceneCapabilityContext({
+              analysis,
+              available: availableCapabilities,
+              toolPlan,
+              research,
+            }),
             urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
             requestedClock: toolPlan.localDateTime,
             temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",

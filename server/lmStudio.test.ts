@@ -67,6 +67,7 @@ const turnAnalysisCompletion = (overrides: Record<string, unknown> = {}) => json
           need: "required",
           action: "read_url",
           confidence: 0.99,
+          goal: "Leer el enlace y resumir lo importante",
           query: null,
           urlRef: "latest:0",
           searchMode: null,
@@ -83,6 +84,37 @@ const turnAnalysisCompletion = (overrides: Record<string, unknown> = {}) => json
           confidence: 0.96,
         },
         ...overrides,
+      }),
+    },
+  }],
+});
+
+const evidencePlanVerifierCompletion = (plan: {
+  action: "read_url" | "web_search" | "local_datetime";
+  requestKind: "execute" | "retry" | "correct_limitation";
+  goal: string;
+  query?: string;
+  urlRef?: string;
+  searchMode?: "web" | "news";
+  timeZone?: string;
+  timeKind?: "current_time" | "current_date" | "current_datetime";
+  locationLabel?: string;
+}) => jsonResponse({
+  choices: [{
+    message: {
+      content: JSON.stringify({
+        v: "use_action",
+        a: plan.action,
+        r: plan.requestKind,
+        d: [plan.action],
+        x: 0.97,
+        g: plan.goal,
+        q: plan.query ?? null,
+        u: plan.urlRef ?? null,
+        m: plan.searchMode ?? null,
+        z: plan.timeZone ?? null,
+        k: plan.timeKind ?? null,
+        l: plan.locationLabel ?? null,
       }),
     },
   }],
@@ -354,6 +386,208 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     });
     expect(completionCalls).toBe(1);
   });
+
+  it("repairs a direct short follow-up with one bounded evidence-only verifier pass", async () => {
+    let completionCalls = 0;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      bodies.push(JSON.parse(String(init?.body)));
+      if (completionCalls === 1) {
+        return turnAnalysisCompletion({
+          language: { tag: "sv", confidence: 0.99 },
+          intent: { kind: "request", isQuestion: false, replyExpected: "expected", confidence: 0.96 },
+          personas: {
+            addressedIds: ["ai-mira"],
+            requestedReplyIds: ["ai-mira"],
+            relevantIds: ["ai-mira"],
+            addressConfidence: 0.99,
+            relevanceConfidence: 0.9,
+          },
+          evidence: {
+            need: "none",
+            action: "none",
+            confidence: 0.78,
+            goal: null,
+            query: null,
+            urlRef: null,
+            searchMode: null,
+            timeZone: null,
+            timeKind: null,
+            locationLabel: null,
+          },
+          capabilities: {
+            discussed: [],
+            requestKind: "none",
+            asksAboutAcoustics: false,
+            asksAboutAiIdentity: false,
+            asksForList: false,
+            confidence: 0.8,
+          },
+        });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "web_search",
+        requestKind: "retry",
+        goal: "Teslas aktuella aktiekurs på Avanza",
+        query: "Tesla aktiekurs Avanza idag",
+        searchMode: "web",
+      });
+    }));
+    const input = turnInput("short-market-followup");
+    input.latestMessage.content = "@mira kolla avanza!";
+    input.recentMessages = [
+      {
+        id: "market-question",
+        authorId: "human-jaw-b",
+        authorName: "Jaw_B",
+        content: "Någon som har sett hur det står till med Tessla aktien idag?",
+      },
+      {
+        id: "false-denial",
+        authorId: "ai-mira",
+        authorName: "Mira",
+        content: "Jag har ingen live-koppling till börsen.",
+      },
+    ];
+    input.urlCandidates = [];
+    input.availableCapabilities = ["web_search", "local_datetime"];
+
+    await expect(new LmStudioClient().analyzeTurn(input)).resolves.toMatchObject({
+      source: "lm",
+      evidence: {
+        action: "web_search",
+        goal: "Teslas aktuella aktiekurs på Avanza",
+        query: "Tesla aktiekurs Avanza idag",
+      },
+      capabilities: { discussed: ["web_search"], requestKind: "retry" },
+    });
+    expect(completionCalls).toBe(2);
+    expect(bodies[1]).toMatchObject({
+      temperature: 0,
+      max_tokens: 320,
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "multilingual_evidence_plan_verifier_v1", strict: true },
+      },
+    });
+    expect(bodies[1].messages[0].content).toContain("earlier claim that it cannot browse");
+    expect(bodies[1].messages[1].content).toContain("Tessla aktien idag");
+  });
+
+  it("turns a correction of a false capability limitation into the typed action only", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        return turnAnalysisCompletion({
+          language: { tag: "sv", confidence: 0.99 },
+          intent: { kind: "correction", isQuestion: false, replyExpected: "expected", confidence: 0.95 },
+          personas: {
+            addressedIds: [], requestedReplyIds: [], relevantIds: ["ai-mira"],
+            addressConfidence: 0, relevanceConfidence: 0.9,
+          },
+          evidence: {
+            need: "none", action: "none", confidence: 0.8, goal: null, query: null, urlRef: null,
+            searchMode: null, timeZone: null, timeKind: null, locationLabel: null,
+          },
+          capabilities: {
+            discussed: ["web_search"],
+            requestKind: "availability",
+            asksAboutAcoustics: false,
+            asksAboutAiIdentity: false,
+            asksForList: false,
+            confidence: 0.94,
+          },
+        });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "web_search",
+        requestKind: "correct_limitation",
+        goal: "Teslas aktuella aktiekurs via Avanzas webbsida",
+        query: "Tesla aktiekurs Avanza idag",
+        searchMode: "web",
+      });
+    }));
+    const input = turnInput("correct-web-limitation");
+    input.latestMessage.content = "inte app.. websida";
+    input.recentMessages = [{
+      id: "false-app-denial",
+      authorId: "ai-mira",
+      authorName: "Mira",
+      content: "haha, jag har ju inte tillgång till deras app!",
+    }];
+    input.urlCandidates = [];
+    input.availableCapabilities = ["web_search"];
+
+    await expect(new LmStudioClient().analyzeTurn(input)).resolves.toMatchObject({
+      source: "lm",
+      evidence: { action: "web_search", goal: "Teslas aktuella aktiekurs via Avanzas webbsida" },
+      capabilities: { requestKind: "correct_limitation" },
+      intent: { kind: "correction" },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("can recover only a safe evidence plan from invalid primary output with a latest URL ref", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        return jsonResponse({ choices: [{ message: { content: "{}" } }] });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "read_url",
+        requestKind: "correct_limitation",
+        goal: "Teslas aktuella aktiekurs på Avanza",
+        urlRef: "latest:0",
+      });
+    }));
+    const input = turnInput("bare-domain-recovery");
+    input.latestMessage.content = "jodå. gå till avanza.se bara";
+    input.recentMessages = [{
+      id: "false-network-denial",
+      authorId: "ai-mira",
+      authorName: "Mira",
+      content: "Jag når fortfarande inte ut på nätet för att kolla live-kurser.",
+    }];
+    input.urlCandidates = [{ ref: "latest:0", source: "latest_message", context: "host=avanza.se; path=/" }];
+
+    await expect(new LmStudioClient().analyzeTurn(input)).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      language: { tag: "und", confidence: 0 },
+      evidence: { action: "read_url", urlRef: "latest:0" },
+      capabilities: { discussed: ["read_url"], requestKind: "correct_limitation" },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("keeps invalid primary output fail-closed when the verifier is also invalid", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return jsonResponse({ choices: [{ message: { content: "{}" } }] });
+    }));
+    const input = turnInput("double-invalid-plan");
+    input.recentMessages = [{
+      id: "prior-resident-line",
+      authorId: "ai-mira",
+      authorName: "Mira",
+      content: "Jag kan inte öppna den.",
+    }];
+
+    await expect(new LmStudioClient().analyzeTurn(input)).resolves.toMatchObject({
+      source: "fallback",
+      failureReason: "invalid_output",
+      evidence: { action: "none" },
+    });
+    expect(completionCalls).toBe(2);
+  });
 });
 
 describe("multilingual mechanical safety boundaries", () => {
@@ -412,6 +646,14 @@ describe("LM Studio multilingual batch candidate review", () => {
           content: "Jag kör gitarr genom ett gammalt trasigt filter.",
           createdAt: "2026-07-14T09:55:00.000Z",
         }],
+        provenance: [{
+          messageId: "recalled-per-guitar-1",
+          authorId: "human-per",
+          role: "anchor",
+          anchorMatches: ["author_identity", "content"],
+          system: false,
+          generation: null,
+        }],
       },
       trigger: {
         author: "Jaw_B",
@@ -458,6 +700,12 @@ describe("LM Studio multilingual batch candidate review", () => {
         createdAt: "2026-07-14T09:55:00.000Z",
         ageSeconds: 600,
         sincePreviousSeconds: null,
+        messageId: "recalled-per-guitar-1",
+        authorId: "human-per",
+        role: "anchor",
+        anchorMatches: ["author_identity", "content"],
+        system: false,
+        generation: null,
       }],
     });
     expect(firstReview.semanticContext).toMatchObject({
@@ -712,6 +960,14 @@ describe("LM Studio multilingual batch candidate review", () => {
           content: "Jag kör gitarr genom ett gammalt trasigt filter.",
           createdAt: "2026-07-14T09:55:00.000Z",
         }],
+        provenance: [{
+          messageId: "recalled-per-owner-1",
+          authorId: "human-per",
+          role: "anchor",
+          anchorMatches: ["author_identity", "content"],
+          system: false,
+          generation: null,
+        }],
       },
       trigger: {
         author: "Jaw_B",
@@ -745,6 +1001,66 @@ describe("LM Studio multilingual batch candidate review", () => {
         ageSeconds: 600,
       })],
     });
+  });
+
+  it("does not launder an old AI context opinion into a recalled fact about a human", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{ personaId: bosse.id, content: "Han var väl okej. Lite för mycket välkomnande dock." }])
+        : candidateReviewCompletion([{
+            personaId: bosse.id,
+            severity: "high",
+            issues: ["unsupported_room_recall", "self_repetition"],
+            rewriteInstruction: "Använd ankarradernas observerade deltagande i stället för att upprepa den gamla AI-åsikten.",
+          }]);
+    }));
+
+    const lines = await new LmStudioClient({
+      now: () => Date.parse("2026-07-14T16:07:00.000Z"),
+      communityTimeZone: "Europe/Stockholm",
+    }).generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [bosse],
+      history: [],
+      roomRecall: {
+        witnessPersonaIds: [bosse.id],
+        transcript: [
+          { author: "system", kind: "system", content: "Per joined the room", createdAt: "2026-07-14T10:51:10.548Z" },
+          { author: "Bosse.exe", kind: "ai", content: "Han är väl okej, men för mycket välkomnande skapar bara brus.", createdAt: "2026-07-14T10:51:52.838Z" },
+          { author: "Per", kind: "human", content: "Men x30, är det verkligen gentilt av dig att fråga efter sådant?", createdAt: "2026-07-14T10:51:53.201Z" },
+        ],
+        provenance: [
+          { messageId: "per-join", authorId: "system", role: "anchor", anchorMatches: ["content"], system: true, generation: null },
+          { messageId: "bosse-old-opinion", authorId: bosse.id, role: "context", anchorMatches: [], system: false, generation: "lm" },
+          { messageId: "per-line", authorId: "human-per", role: "anchor", anchorMatches: ["author_identity"], system: false, generation: null },
+        ],
+      },
+      trigger: { author: "Jaw_B", content: "Kommer ni ihåg Per från förut?", createdAt: "2026-07-14T16:06:57.550Z" },
+      mustReplyIds: [bosse.id],
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(bodies).toHaveLength(2);
+    const review = JSON.parse(bodies[1].messages[1].content);
+    expect(review.roomRecall.timeline).toEqual(expect.arrayContaining([
+      expect.objectContaining({ messageId: "bosse-old-opinion", role: "context", generation: "lm" }),
+      expect.objectContaining({ messageId: "per-line", role: "anchor", anchorMatches: ["author_identity"] }),
+    ]));
+    expect(review.candidates[0].recentOwnTexts).toContain("Han är väl okej, men för mycket välkomnande skapar bara brus.");
   });
 
   it("drops a German false evidence denial without sending it to style repair", async () => {
@@ -787,6 +1103,62 @@ describe("LM Studio multilingual batch candidate review", () => {
 
     expect(lines).toEqual([]);
     expect(call).toBe(2);
+  });
+
+  it("blocks a permanent web denial from server capability truth even when no action was planned", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: "Jag har ingen internetåtkomst och kan aldrig kolla live-data." }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "high",
+            issues: ["permanent_web_denial"],
+            rewriteInstruction: "Påstå inte att serverns tillgängliga webbkapacitet saknas permanent.",
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "Hur går marknaden idag?" },
+      mustReplyIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      capabilityContext: {
+        available: ["web_search", "local_datetime"],
+        requestKind: "none",
+        discussed: [],
+        plannedAction: null,
+        executionStatus: "not_requested",
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].messages[0].content).toContain("trustedCapabilityContext is server-owned runtime truth");
+    expect(JSON.parse(bodies[0].messages[1].content).trustedCapabilityContext).toEqual({
+      available: ["web_search", "local_datetime"],
+      requestKind: "none",
+      discussed: [],
+      plannedAction: null,
+      executionStatus: "not_requested",
+    });
+    expect(JSON.parse(bodies[1].messages[1].content).capabilityContext)
+      .toEqual(JSON.parse(bodies[0].messages[1].content).trustedCapabilityContext);
+    expect(bodies.some((body) => body.messages[0].content.includes("one-pass copy editor"))).toBe(false);
   });
 
   it("drops a Norwegian written-medium illusion as grounding, not style", async () => {
@@ -1024,6 +1396,14 @@ describe("LM Studio room prompt", () => {
       content: index === 9 ? "Jag kör gitarr genom ett gammalt trasigt filter." : `older exact row ${index}`,
       createdAt: new Date(Date.parse("2026-07-14T09:50:00.000Z") + index * 60_000).toISOString(),
     }));
+    const recalledProvenance = recalledTranscript.map((_line, index) => ({
+      messageId: `recalled-bounded-${index}`,
+      authorId: index === 9 ? "human-per" : `history-author-${index}`,
+      role: index === 9 ? "anchor" as const : "context" as const,
+      anchorMatches: index === 9 ? ["author_identity" as const, "content" as const] : [],
+      system: false,
+      generation: index % 3 === 0 ? "lm" as const : null,
+    }));
     let completionBody: { messages: Array<{ role: string; content: string }> } | undefined;
     vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
       if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
@@ -1043,6 +1423,7 @@ describe("LM Studio room prompt", () => {
       roomRecall: {
         witnessPersonaIds: witnessIds,
         transcript: recalledTranscript,
+        provenance: recalledProvenance,
       },
       trigger: {
         author: "Jaw_B",
@@ -1061,6 +1442,7 @@ describe("LM Studio room prompt", () => {
     expect(user.recalledRoomEvidence.transcript).toEqual(
       recalledTranscript.slice(-8).map((line, index) => ({
         ...line,
+        ...recalledProvenance.slice(-8)[index],
         ageSeconds: 780 - index * 60,
         ...(index === 0 ? {} : { sincePreviousSeconds: 60 }),
       })),

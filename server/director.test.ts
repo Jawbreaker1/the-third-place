@@ -57,7 +57,7 @@ const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => 
   personas: { addressedIds: [], requestedReplyIds: [], relevantIds: [], addressConfidence: 0, relevanceConfidence: 0 },
   social: { warmth: 0.2, hostility: 0, playfulness: 0, absurdity: 0, urgency: 0, energy: 0.3, pileOnRisk: 0, claimStrength: 0, confidence: 0.99 },
   moderation: { risk: "none", action: "none", categories: [], confidence: 0.99 },
-  evidence: { need: "none", action: "none", confidence: 0.99, query: null, urlRef: null, searchMode: null, timeZone: null, timeKind: null, locationLabel: null },
+  evidence: { need: "none", action: "none", confidence: 0.99, goal: null, query: null, urlRef: null, searchMode: null, timeZone: null, timeKind: null, locationLabel: null },
   capabilities: {
     discussed: [],
     requestKind: "none",
@@ -175,6 +175,177 @@ describe("social director", () => {
     expect(evidenceFailureFallback(false, "bitte prüfe die aktuellen Kurse")).toBeUndefined();
   });
 
+  it("augments only explicit root-site reads with the resolved multilingual goal", async () => {
+    const human = {
+      id: "guest-root-site",
+      name: "Guest",
+      kind: "human" as const,
+      status: "online" as const,
+      avatar: { color: "#123", accent: "#456", glyph: "G" },
+    };
+    const rootUrl = new URL("https://markets.example/");
+    const articleUrl = new URL("https://markets.example/company/report");
+    const requestedAt = "2026-07-14T16:00:00.000Z";
+    const goal = "今日の会社株価を確認する";
+    const rootPacket = {
+      kind: "page" as const,
+      query: goal,
+      retrievedAt: requestedAt,
+      results: [{ id: "S1", title: "Root page", url: rootUrl.toString(), snippet: "General market overview." }],
+    };
+    const sameSitePacket = {
+      kind: "search" as const,
+      query: `site:markets.example ${goal}`,
+      retrievedAt: requestedAt,
+      results: [{ id: "S1", title: "Company quote", url: articleUrl.toString(), snippet: "A current company quote." }],
+    };
+    const read = vi.fn(async () => rootPacket);
+    const resolveTarget = vi.fn(({ intent }: { intent: string }) => ({
+      url: rootUrl,
+      requestedAt,
+      intent,
+      retry: false,
+      source: "message" as const,
+    }));
+    const researchSite = vi.fn()
+      .mockResolvedValueOnce(sameSitePacket)
+      .mockResolvedValueOnce(undefined);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-root-site-augmentation-unused.json"),
+      {} as never,
+      new ActorChannelRuntime(),
+      { research: vi.fn(), researchSite } as never,
+      {
+        getRelation: vi.fn(() => undefined),
+        updateRelation: vi.fn(),
+        promptNote: vi.fn(() => undefined),
+        noteClassifiedMemoryFact: vi.fn(),
+      } as never,
+      () => [human, ...PERSONAS],
+      () => 1,
+      {
+        pageReader: {
+          resolveTarget,
+          read,
+        } as never,
+      },
+    );
+    const candidateSet = {
+      requestedAt,
+      candidates: [{
+        id: "U1" as const,
+        raw: rootUrl.toString(),
+        url: rootUrl,
+        supported: true,
+        source: "message" as const,
+        messageId: "root-message",
+        authorId: human.id,
+        createdAt: requestedAt,
+      }],
+    };
+    const analysis = classifiedTurn({
+      evidence: {
+        need: "required",
+        action: "read_url",
+        confidence: 0.99,
+        goal,
+        query: null,
+        urlRef: "U1",
+        searchMode: null,
+        timeZone: null,
+        timeKind: null,
+        locationLabel: null,
+      },
+      capabilities: {
+        discussed: ["read_url"],
+        requestKind: "execute",
+        asksAboutAcoustics: false,
+        asksAboutAiIdentity: false,
+        asksForList: false,
+        confidence: 0.99,
+      },
+    });
+    const internal = director as unknown as {
+      classifiedToolPlan: (
+        turn: TurnAnalysis,
+        candidates: typeof candidateSet,
+        rawIntent: string,
+        requesterId: string,
+      ) => {
+        pageReadRequest?: {
+          url?: URL;
+          requestedAt: string;
+          intent: string;
+          retry: boolean;
+          source: "message" | "reply" | "recent";
+          initiator?: "explicit" | "automatic";
+        };
+        siteResearch?: { goal: string; mode: "web" | "news" };
+      };
+      resolveRequestedEvidence: (
+        page: {
+          url?: URL;
+          requestedAt: string;
+          intent: string;
+          retry: boolean;
+          source: "message" | "reply" | "recent";
+          initiator?: "explicit" | "automatic";
+        } | undefined,
+        search: undefined,
+        requesterId: string,
+        site?: { goal: string; mode: "web" | "news" },
+      ) => Promise<typeof sameSitePacket | typeof rootPacket | undefined>;
+    };
+
+    const plan = internal.classifiedToolPlan(analysis, candidateSet, "gå bara till sajten", human.id);
+    expect(resolveTarget).toHaveBeenCalledWith(expect.objectContaining({ intent: goal }));
+    await expect(internal.resolveRequestedEvidence(
+      plan.pageReadRequest,
+      undefined,
+      human.id,
+      plan.siteResearch,
+    )).resolves.toEqual(sameSitePacket);
+    expect(researchSite).toHaveBeenCalledWith({
+      url: rootUrl,
+      query: goal,
+      mode: "web",
+      requesterId: human.id,
+    });
+    expect(read).not.toHaveBeenCalled();
+
+    await expect(internal.resolveRequestedEvidence(
+      plan.pageReadRequest,
+      undefined,
+      human.id,
+      plan.siteResearch,
+    )).resolves.toEqual(rootPacket);
+    expect(researchSite).toHaveBeenCalledTimes(2);
+    expect(read).toHaveBeenCalledTimes(1);
+
+    researchSite.mockClear();
+    read.mockClear();
+    await expect(internal.resolveRequestedEvidence(
+      { ...plan.pageReadRequest!, url: articleUrl },
+      undefined,
+      human.id,
+      plan.siteResearch,
+    )).resolves.toEqual(rootPacket);
+    expect(researchSite).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledTimes(1);
+
+    read.mockClear();
+    await expect(internal.resolveRequestedEvidence(
+      { ...plan.pageReadRequest!, initiator: "automatic" },
+      undefined,
+      human.id,
+      plan.siteResearch,
+    )).resolves.toEqual(rootPacket);
+    expect(researchSite).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledTimes(1);
+    director.stop();
+  });
+
   it("wires DM evidence fallbacks to the actual message source metadata", async () => {
     vi.useFakeTimers();
     try {
@@ -212,6 +383,7 @@ describe("social director", () => {
               need: "required",
               action: "read_url",
               confidence: 0.99,
+              goal: "dagens marknadsutveckling",
               query: null,
               urlRef: "U1",
               searchMode: null,
@@ -449,6 +621,7 @@ describe("social director", () => {
           need: "required",
           action: "read_url",
           confidence: 0.99,
+          goal: "vad som står på den delade sidan",
           query: null,
           urlRef: "U1",
           searchMode: null,
@@ -574,6 +747,7 @@ describe("social director", () => {
           need: "optional",
           action: "read_url",
           confidence: 0.99,
+          goal: "vad som står på den delade sidan",
           query: null,
           urlRef: "U1",
           searchMode: null,
@@ -634,6 +808,7 @@ describe("social director", () => {
           need: "required",
           action: "local_datetime",
           confidence: 0.99,
+          goal: "aktuell tid i Sverige",
           query: null,
           urlRef: null,
           searchMode: null,
@@ -713,6 +888,7 @@ describe("social director", () => {
           need: "required",
           action: "local_datetime",
           confidence: 0.99,
+          goal: "aktuell tid i Sverige",
           query: null,
           urlRef: null,
           searchMode: null,
@@ -1459,6 +1635,7 @@ describe("social director", () => {
           need: "required",
           action: "web_search",
           confidence: 0.99,
+          goal: query,
           query,
           urlRef: null,
           searchMode: "web",

@@ -79,7 +79,153 @@ describe("source-bound channel recall", () => {
     ]));
     expect(recalled!.messages.every((candidate) => !recentMessageIds.includes(candidate.id))).toBe(true);
     expect(recalled!.matchedMessageIds).toEqual(expect.arrayContaining(["message-005", "message-006", "message-007"]));
+    expect(recalled!.anchorMessageIds).toEqual(recalled!.matchedMessageIds);
+    expect(recalled!.contextMessageIds).toContain("message-008");
+    expect(recalled!.rows.find((row) => row.messageId === "message-007")).toMatchObject({
+      authorId: "human-per",
+      role: "anchor",
+      anchorMatches: ["author_identity"],
+      system: false,
+      generation: null,
+    });
+    expect(recalled!.rows.find((row) => row.messageId === "message-008")).toMatchObject({
+      authorId: "ai-bosse",
+      role: "context",
+      anchorMatches: [],
+    });
     expect(recalled!.witnessPersonaIds).toEqual(["ai-bosse", "ai-mira"]);
+  });
+
+  it("keeps reply-preview echoes as context instead of laundering them into direct anchors", () => {
+    const joined = message(1, "Per joined the room", {
+      id: "per-joined",
+      authorId: "system",
+      system: true,
+    });
+    const welcome = message(2, "Nu välkomnar vi Per", {
+      id: "welcome-per",
+      authorId: "human-jaw",
+      authorName: "Jaw_B",
+    });
+    const prematureOpinion = message(3, "Han är väl okej, men för mycket välkomnande skapar bara brus.", {
+      id: "premature-opinion",
+      authorId: "ai-bosse",
+      replyToId: welcome.id,
+      replyPreview: {
+        authorId: welcome.authorId,
+        authorName: "Jaw_B",
+        content: welcome.content,
+      },
+    });
+    prematureOpinion.generation = "lm";
+    const perLine = message(4, "Men x30, är det verkligen gentilt av dig att fråga efter sådant?", {
+      id: "per-line",
+      authorId: "human-per",
+      authorName: "Per",
+      reactions: [{ emoji: "🤔", memberIds: ["ai-elio"] }],
+    });
+    const followUp = message(5, "x3r0 är då en riktig person... resten bottar", {
+      id: "follow-up",
+      authorId: "human-jaw",
+      authorName: "Jaw_B",
+    });
+    const filler = Array.from({ length: 32 }, (_, index) => message(
+      100 + index,
+      `senare orelaterad rad ${index}`,
+      { time: start + 10 * 60_000 + index * 1_000 },
+    ));
+    const latest = message(200, "Kommer ni ihåg Per från förut?", {
+      id: "remember-per",
+      authorId: "human-jaw",
+      authorName: "Jaw_B",
+      time: start + 60 * 60_000,
+    });
+    const messages = [joined, welcome, prematureOpinion, perLine, followUp, ...filler, latest];
+
+    const recalled = recallChannelHistory({
+      messages,
+      query: "Per",
+      trigger: latest,
+      recentMessageIds: [],
+      allowedPersonaIds: ["ai-bosse", "ai-elio"],
+    });
+
+    expect(recalled?.anchorMessageIds).toEqual(["per-joined", "welcome-per", "per-line"]);
+    expect(recalled?.matchedMessageIds).toEqual(recalled?.anchorMessageIds);
+    expect(recalled?.contextMessageIds).toEqual(["premature-opinion", "follow-up"]);
+    expect(recalled?.rows).toEqual([
+      {
+        messageId: "per-joined",
+        authorId: "system",
+        role: "anchor",
+        anchorMatches: ["content"],
+        system: true,
+        generation: null,
+      },
+      {
+        messageId: "welcome-per",
+        authorId: "human-jaw",
+        role: "anchor",
+        anchorMatches: ["content"],
+        system: false,
+        generation: null,
+      },
+      {
+        messageId: "premature-opinion",
+        authorId: "ai-bosse",
+        role: "context",
+        anchorMatches: [],
+        system: false,
+        generation: "lm",
+      },
+      {
+        messageId: "per-line",
+        authorId: "human-per",
+        role: "anchor",
+        anchorMatches: ["author_identity"],
+        system: false,
+        generation: null,
+      },
+      {
+        messageId: "follow-up",
+        authorId: "human-jaw",
+        role: "context",
+        anchorMatches: [],
+        system: false,
+        generation: null,
+      },
+    ]);
+  });
+
+  it("does not retrieve a row when the query appears only in its denormalized reply preview", () => {
+    const previewOnly = message(5, "Han var väl okej.", {
+      id: "preview-only",
+      authorId: "ai-bosse",
+      replyToId: "missing-welcome",
+      replyPreview: {
+        authorId: "human-jaw",
+        authorName: "Jaw_B",
+        content: "Nu välkomnar vi Per",
+      },
+    });
+    const messages = [
+      ...Array.from({ length: 24 }, (_, index) => message(index, `neutral archive row ${index}`)),
+      previewOnly,
+    ];
+    const latest = message(40, "Kommer ni ihåg Per?", {
+      id: "preview-trigger",
+      authorId: "human-jaw",
+      authorName: "Jaw_B",
+    });
+    messages.push(latest);
+
+    expect(recallChannelHistory({
+      messages,
+      query: "Per",
+      trigger: latest,
+      recentMessageIds: [],
+      allowedPersonaIds: ["ai-bosse"],
+    })).toBeUndefined();
   });
 
   it("tokenizes and retrieves across writing systems with Unicode case folding", () => {
@@ -215,6 +361,9 @@ describe("source-bound channel recall", () => {
 
     expect(first?.messages).toHaveLength(10);
     expect(second?.messages.map((candidate) => candidate.id)).toEqual(first?.messages.map((candidate) => candidate.id));
+    expect(second?.rows).toEqual(first?.rows);
+    expect(second?.anchorMessageIds).toEqual(first?.anchorMessageIds);
+    expect(second?.contextMessageIds).toEqual(first?.contextMessageIds);
     expect(first!.messages.map((candidate) => Date.parse(candidate.createdAt)))
       .toEqual([...first!.messages].map((candidate) => Date.parse(candidate.createdAt)).sort((left, right) => left - right));
     expect(first!.messages.every((candidate) => messages.includes(candidate))).toBe(true);

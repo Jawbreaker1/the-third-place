@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   buildCandidateReviewResponseFormat,
   buildCandidateReviewSystemPrompt,
+  buildEvidencePlanVerifierResponseFormat,
+  buildEvidencePlanVerifierSystemPrompt,
+  buildEvidencePlanVerifierUserData,
   buildMemoryAnalysisResponseFormat,
   buildMemoryAnalysisSystemPrompt,
   buildMemoryAnalysisUserData,
@@ -10,12 +13,16 @@ import {
   buildTurnAnalysisUserData,
   candidateReviewInputSchema,
   containsVisibleUrl,
+  createEvidencePlanVerifierInput,
   createFailClosedTurnAnalysis,
   memoryAnalysisInputSchema,
   parseCandidateReviewContent,
+  parseEvidencePlanVerifierContent,
   parseMemoryAnalysisContent,
   parseTurnAnalysisContent,
+  projectEvidencePlanVerification,
   projectTrustedTurnAnalysis,
+  shouldVerifyEvidencePlan,
   turnAnalysisInputSchema,
   type NormalizedTurnAnalysisInput,
   type NormalizedCandidateReviewInput,
@@ -70,6 +77,7 @@ const modelOutput = (): any => ({
     need: "required",
     action: "local_datetime",
     confidence: 0.99,
+    goal: "東京の現在時刻",
     query: null,
     urlRef: null,
     searchMode: null,
@@ -99,6 +107,17 @@ describe("multilingual semantic router contract", () => {
     expect(turnAnalysisInputSchema.safeParse({
       ...parsed,
       urlCandidates: [{ ref: "latest:0", source: "latest_message", url: "https://example.com" }],
+    }).success).toBe(false);
+  });
+
+  it("carries only server-resolved known mechanical address targets", () => {
+    const parsed = input({ mechanicalAddressedPersonaIds: ["ai-mira"] });
+    expect(buildTurnAnalysisUserData(parsed)).toMatchObject({
+      mechanicalAddressedPersonaIds: ["ai-mira"],
+    });
+    expect(turnAnalysisInputSchema.safeParse({
+      ...parsed,
+      mechanicalAddressedPersonaIds: ["ai-unknown"],
     }).success).toBe(false);
   });
 
@@ -137,6 +156,8 @@ describe("multilingual semantic router contract", () => {
     expect(properties.p.properties.a.items.enum).toEqual(["ai-mira", "ai-sana"]);
     expect(properties.e.properties.u.anyOf[0].enum).toEqual(["latest:0", "reply:0"]);
     expect(properties.e.properties.a.enum).toEqual(["none", "read_url", "web_search", "local_datetime"]);
+    expect(properties.e.properties.g.anyOf[0]).toMatchObject({ type: "string", maxLength: 240 });
+    expect(properties.e.required).toContain("g");
     expect(format.json_schema.schema.required).toEqual(expect.arrayContaining(["rl", "rlx", "b"]));
     expect(properties.s.required).toEqual(expect.arrayContaining(["p", "u", "o"]));
     expect(properties.b.properties.r.enum).toEqual(["none", "optional", "required"]);
@@ -157,6 +178,188 @@ describe("multilingual semantic router contract", () => {
       language: { tag: "ja" },
       evidence: { action: "local_datetime", timeZone: "Asia/Tokyo" },
       personas: { requestedReplyIds: ["ai-mira"] },
+    });
+  });
+
+  it("keeps evidence need, action and the resolved URL-free goal structurally consistent", () => {
+    const missingAction = modelOutput();
+    missingAction.evidence = {
+      need: "required",
+      action: "none",
+      confidence: 0.99,
+      goal: null,
+      query: null,
+      urlRef: null,
+      searchMode: null,
+      timeZone: null,
+      timeKind: null,
+      locationLabel: null,
+    };
+    missingAction.capabilities = {
+      ...missingAction.capabilities,
+      discussed: ["web_search"],
+      requestKind: "availability",
+    };
+    expect(parseTurnAnalysisContent(JSON.stringify(missingAction), input())).toBeUndefined();
+
+    const actionWithoutNeed = modelOutput();
+    actionWithoutNeed.evidence.need = "none";
+    expect(parseTurnAnalysisContent(JSON.stringify(actionWithoutNeed), input())).toBeUndefined();
+
+    const actionWithoutGoal = modelOutput();
+    actionWithoutGoal.evidence.goal = null;
+    expect(parseTurnAnalysisContent(JSON.stringify(actionWithoutGoal), input())).toBeUndefined();
+
+    const noneWithGoal = modelOutput();
+    noneWithGoal.evidence = {
+      need: "none",
+      action: "none",
+      confidence: 0.99,
+      goal: "ett påstått mål utan verktyg",
+      query: null,
+      urlRef: null,
+      searchMode: null,
+      timeZone: null,
+      timeKind: null,
+      locationLabel: null,
+    };
+    noneWithGoal.capabilities = {
+      ...noneWithGoal.capabilities,
+      discussed: ["web_search"],
+      requestKind: "availability",
+    };
+    expect(parseTurnAnalysisContent(JSON.stringify(noneWithGoal), input())).toBeUndefined();
+
+    const urlBearingGoal = modelOutput();
+    urlBearingGoal.evidence.goal = "läs https://example.com och sammanfatta";
+    expect(parseTurnAnalysisContent(JSON.stringify(urlBearingGoal), input())).toBeUndefined();
+  });
+
+  it("allows a pure availability question to discuss a capability without executing it", () => {
+    const availability = modelOutput();
+    availability.intent = { kind: "capability_question", isQuestion: true, replyExpected: "expected", confidence: 0.99 };
+    availability.evidence = {
+      need: "none",
+      action: "none",
+      confidence: 0.99,
+      goal: null,
+      query: null,
+      urlRef: null,
+      searchMode: null,
+      timeZone: null,
+      timeKind: null,
+      locationLabel: null,
+    };
+    availability.capabilities = {
+      ...availability.capabilities,
+      discussed: ["web_search"],
+      requestKind: "availability",
+      confidence: 0.99,
+    };
+
+    expect(parseTurnAnalysisContent(JSON.stringify(availability), input())).toMatchObject({
+      evidence: { need: "none", action: "none", goal: null },
+      capabilities: { discussed: ["web_search"], requestKind: "availability" },
+    });
+  });
+
+  it.each(["execute", "retry", "correct_limitation"] as const)(
+    "requires a trusted %s request to select one available discussed capability",
+    (requestKind) => {
+      const omitted = modelOutput();
+      omitted.evidence = {
+        need: "none",
+        action: "none",
+        confidence: 0.99,
+        goal: null,
+        query: null,
+        urlRef: null,
+        searchMode: null,
+        timeZone: null,
+        timeKind: null,
+        locationLabel: null,
+      };
+      omitted.capabilities = {
+        ...omitted.capabilities,
+        discussed: ["web_search"],
+        requestKind,
+        confidence: 0.99,
+      };
+      expect(parseTurnAnalysisContent(JSON.stringify(omitted), input())).toBeUndefined();
+
+      const routed = modelOutput();
+      routed.evidence = {
+        need: "required",
+        action: "web_search",
+        confidence: 0.99,
+        goal: "aktuellt marknadsläge för bolaget",
+        query: "bolaget aktuellt marknadsläge",
+        urlRef: null,
+        searchMode: "web",
+        timeZone: null,
+        timeKind: null,
+        locationLabel: null,
+      };
+      routed.capabilities = {
+        ...routed.capabilities,
+        discussed: ["web_search"],
+        requestKind,
+        confidence: 0.99,
+      };
+      expect(parseTurnAnalysisContent(JSON.stringify(routed), input())).toMatchObject({
+        evidence: {
+          action: "web_search",
+          goal: "aktuellt marknadsläge för bolaget",
+          query: "bolaget aktuellt marknadsläge",
+        },
+        capabilities: { requestKind },
+      });
+    },
+  );
+
+  it("rejects mismatched or untrusted tool plans but does not grant an unavailable discussed capability", () => {
+    const mismatched = modelOutput();
+    mismatched.capabilities = {
+      ...mismatched.capabilities,
+      discussed: ["web_search"],
+      requestKind: "execute",
+      confidence: 0.99,
+    };
+    expect(parseTurnAnalysisContent(JSON.stringify(mismatched), input())).toBeUndefined();
+
+    const lowEvidenceConfidence = modelOutput();
+    lowEvidenceConfidence.evidence.confidence = 0.7;
+    expect(parseTurnAnalysisContent(JSON.stringify(lowEvidenceConfidence), input())).toBeUndefined();
+
+    const unavailable = modelOutput();
+    unavailable.evidence = {
+      need: "none",
+      action: "none",
+      confidence: 0.99,
+      goal: null,
+      query: null,
+      urlRef: null,
+      searchMode: null,
+      timeZone: null,
+      timeKind: null,
+      locationLabel: null,
+    };
+    unavailable.capabilities = {
+      ...unavailable.capabilities,
+      discussed: ["web_search"],
+      requestKind: "execute",
+      confidence: 0.99,
+    };
+    expect(parseTurnAnalysisContent(
+      JSON.stringify(unavailable),
+      input({ availableCapabilities: ["local_datetime"] }),
+    )).toMatchObject({ evidence: { action: "none", goal: null } });
+
+    const uncertainExecution = structuredClone(unavailable);
+    uncertainExecution.capabilities.confidence = 0.7;
+    expect(parseTurnAnalysisContent(JSON.stringify(uncertainExecution), input())).toMatchObject({
+      evidence: { action: "none" },
+      capabilities: { requestKind: "execute", confidence: 0.7 },
     });
   });
 
@@ -205,7 +408,7 @@ describe("multilingual semantic router contract", () => {
       s: { w: 0.3, h: 0.8, p: 0.2, a: 0, u: 0.35, e: 0.7, o: 0.85, c: 0.2, x: 0.96 },
       b: { k: "directed_insult", t: "room", r: "required", c: 0.9, m: 0.1, x: 0.98 },
       m: { r: "none", a: "none", c: [], x: 0.99 },
-      e: { a: "local_datetime", x: 0.99, q: null, u: null, m: null, z: "Asia/Tokyo", k: "current_time", l: "東京" },
+      e: { a: "local_datetime", x: 0.99, g: "東京の現在時刻", q: null, u: null, m: null, z: "Asia/Tokyo", k: "current_time", l: "東京" },
       c: { d: ["local_datetime"], r: "execute", a: false, i: false, l: false, x: 0.95 },
       h: { n: "required", q: "Per", x: 0.94 },
       y: [],
@@ -247,7 +450,7 @@ describe("multilingual semantic router contract", () => {
       s: { w: 0.2, h: 0, p: 0, a: 0, u: 0, e: 0.3, o: 0, c: 0.1, x: 0.96 },
       b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 0.96 },
       m: { r: "none", a: "none", c: [], x: 0.99 },
-      e: { a: "web_search", x: 0.96, q: "cotización actual Telefónica", u: null, m: "web", z: null, k: null, l: null },
+      e: { a: "web_search", x: 0.96, g: "cotización actual de Telefónica", q: "cotización actual Telefónica", u: null, m: "web", z: null, k: null, l: null },
       c: { d: ["web_search"], r: "execute", a: false, i: false, l: false, x: 0.95 },
       y: [],
     }), input());
@@ -431,7 +634,7 @@ describe("multilingual semantic router contract", () => {
       s: { w: 0.2, h: 0, p: 0, a: 0, u: 0.8, e: 0.2, o: 0, c: 0, x: 0.96 },
       b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 0.96 },
       m: { r: "none", a: "none", c: [], x: 0.99 },
-      e: { a: "local_datetime", x: 0.99, q: null, u: null, m: null, z: "Europe/Stockholm", k: "current_time", l: "Sverige" },
+      e: { a: "local_datetime", x: 0.99, g: "aktuell tid i Sverige", q: null, u: null, m: null, z: "Europe/Stockholm", k: "current_time", l: "Sverige" },
       c: { d: ["local_datetime"], r: "execute", a: false, i: false, l: false, x: 0.99 },
       y: [{ k: "likes", v: "none", x: 0 }],
     };
@@ -453,7 +656,7 @@ describe("multilingual semantic router contract", () => {
       s: { w: 0.5, h: 0, p: 0.2, a: 0, u: 0, e: 0.3, o: 0, c: 0, x: 0.96 },
       b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 0.96 },
       m: { r: "none", a: "none", c: [], x: 0.99 },
-      e: { a: "none", x: 0.99, q: null, u: null, m: null, z: null, k: null, l: null },
+      e: { a: "none", x: 0.99, g: null, q: null, u: null, m: null, z: null, k: null, l: null },
       c: { d: ["read_url"], r: "none", a: false, i: false, l: false, x: 0.99 },
       y: [],
     };
@@ -471,7 +674,7 @@ describe("multilingual semantic router contract", () => {
       s: { w: 0, h: 0.9, p: 0, a: 0, u: 0, e: 0.5, o: 0.1, c: 0, x: 0.95 },
       b: { k: "directed_insult", t: "room", r: "none", c: 0.9, m: 0, x: 0.92 },
       m: { r: "low", a: "none", c: [], x: 0.9 },
-      e: { a: "none", x: 0.99, q: null, u: null, m: null, z: null, k: null, l: null },
+      e: { a: "none", x: 0.99, g: null, q: null, u: null, m: null, z: null, k: null, l: null },
       c: { d: [], r: "none", a: false, i: false, l: false, x: 0.99 },
       h: { n: "none", q: null, x: 0.99 },
       y: [],
@@ -493,9 +696,344 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("compact wire keys");
     expect(prompt).toContain("valid IANA time-zone name");
     expect(prompt).toContain("Never output, reconstruct or copy a URL");
+    expect(prompt).toContain("availableCapabilities is trusted server-owned runtime inventory");
+    expect(prompt).toContain("never let a prior resident denial override the inventory");
+    expect(prompt).toContain("g is a short standalone description of the exact information the guest wants");
+    expect(prompt).toContain("Preserve the guest's language and script");
+    expect(prompt).toContain("availability alone never executes a tool");
+    expect(prompt).toContain("select that available discussed capability as e.a");
     expect(prompt).toContain("quoted/reporting speech from endorsement");
     expect(prompt).toContain("A reporter explicitly asking to flag or report a message/person uses intent moderation_report and action report");
     expect(prompt).toContain("Always return y []");
+  });
+});
+
+describe("strict multilingual evidence-plan verifier contract", () => {
+  const primarySummary = (overrides: Record<string, any> = {}): any => ({
+    source: "lm",
+    failureReason: null,
+    intent: {
+      kind: "request",
+      replyExpected: "expected",
+      confidence: 0.96,
+      ...overrides.intent,
+    },
+    personas: {
+      addressedIds: ["ai-mira"],
+      requestedReplyIds: ["ai-mira"],
+      addressConfidence: 0.97,
+      ...overrides.personas,
+    },
+    evidence: {
+      action: "none",
+      confidence: 0.9,
+      ...overrides.evidence,
+    },
+    capabilities: {
+      discussed: [],
+      requestKind: "none",
+      confidence: 0.9,
+      ...overrides.capabilities,
+    },
+    ...Object.fromEntries(Object.entries(overrides).filter(([key]) =>
+      !["intent", "personas", "evidence", "capabilities"].includes(key))),
+  });
+
+  const priorMiraMessage = {
+    id: "ai-prior",
+    authorId: "ai-mira",
+    authorName: "Mira",
+    content: "Jag har ingen live-koppling till börsen.",
+    createdAt: "2026-07-14T15:46:08.000Z",
+  };
+
+  const stockTurn = (
+    content: string,
+    overrides: Partial<NormalizedTurnAnalysisInput> = {},
+  ): NormalizedTurnAnalysisInput => input({
+    turnId: "stock-follow-up",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets and businesses" },
+    latestMessage: {
+      id: "human-latest",
+      authorId: "human-1",
+      authorName: "Jaw_B",
+      content,
+      createdAt: "2026-07-14T15:46:20.000Z",
+    },
+    recentMessages: [priorMiraMessage],
+    urlCandidates: [],
+    ...overrides,
+  });
+
+  const keepNoneWire = (confidence = 0.98): object => ({
+    v: "keep_none",
+    a: "none",
+    r: "none",
+    d: [],
+    x: confidence,
+    g: null,
+    q: null,
+    u: null,
+    m: null,
+    z: null,
+    k: null,
+    l: null,
+  });
+
+  it("structurally selects only none/failure cases worth a bounded verifier call", () => {
+    const initialTesla = stockTurn("Någon som har sett hur det står till med Tesla-aktien idag?");
+    expect(shouldVerifyEvidencePlan(initialTesla, primarySummary({
+      evidence: { action: "web_search", confidence: 0.96 },
+      capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.96 },
+    }))).toBe(false);
+
+    const directRetry = stockTurn("@mira kolla avanza!");
+    expect(shouldVerifyEvidencePlan(directRetry, primarySummary())).toBe(true);
+    expect(shouldVerifyEvidencePlan(directRetry, primarySummary({
+      personas: { requestedReplyIds: [], addressedIds: ["ai-mira"], addressConfidence: 0.85 },
+    }))).toBe(true);
+    expect(shouldVerifyEvidencePlan(
+      stockTurn("@mira kolla avanza!", {
+        recentMessages: [],
+        mechanicalAddressedPersonaIds: ["ai-mira"],
+      }),
+      primarySummary({
+        personas: { requestedReplyIds: [], addressedIds: [], addressConfidence: 0 },
+      }),
+    )).toBe(true);
+
+    const correctedMedium = stockTurn("inte app.. websida", {
+      recentMessages: [{ ...priorMiraMessage, content: "Jag har inte tillgång till deras app." }],
+    });
+    expect(shouldVerifyEvidencePlan(correctedMedium, primarySummary({
+      intent: { replyExpected: "optional", confidence: 0.9 },
+      personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
+      capabilities: { discussed: ["web_search"], requestKind: "availability", confidence: 0.94 },
+    }))).toBe(true);
+
+    const suppliedDomain = stockTurn("jodå. gå till avanza.se bara", {
+      urlCandidates: [{ ref: "latest:avanza", source: "latest_message", context: "domain supplied in latest follow-up" }],
+    });
+    expect(shouldVerifyEvidencePlan(suppliedDomain, {
+      source: "fallback",
+      failureReason: "invalid_output",
+    })).toBe(true);
+
+    expect(shouldVerifyEvidencePlan(
+      directRetry,
+      primarySummary({
+        intent: { replyExpected: "optional", confidence: 0.9 },
+        personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
+      }),
+    )).toBe(false);
+    expect(shouldVerifyEvidencePlan(
+      stockTurn("@mira kolla avanza!", { availableCapabilities: [] }),
+      primarySummary(),
+    )).toBe(false);
+  });
+
+  it("does not inspect message vocabulary when applying the cheap eligibility gate", () => {
+    const metadata = primarySummary({
+      capabilities: { discussed: ["web_search"], requestKind: "availability", confidence: 0.95 },
+      intent: { replyExpected: "none", confidence: 0 },
+      personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
+    });
+    expect(shouldVerifyEvidencePlan(stockTurn("inte app.. websida"), metadata)).toBe(true);
+    expect(shouldVerifyEvidencePlan(stockTurn("完全に無関係な文字列"), metadata)).toBe(true);
+  });
+
+  it("resolves the Swedish screenshot chain into one complete opaque-reference plan", () => {
+    const turn = stockTurn("jodå. gå till avanza.se bara", {
+      recentMessages: [
+        {
+          id: "request",
+          authorId: "human-1",
+          authorName: "Jaw_B",
+          content: "Någon som har sett hur det står till med Tesla-aktien idag?",
+        },
+        priorMiraMessage,
+      ],
+      urlCandidates: [{ ref: "latest:avanza", source: "latest_message", context: "domain supplied in latest follow-up" }],
+    });
+    const verifierInput = createEvidencePlanVerifierInput(turn, {
+      source: "fallback",
+      failureReason: "invalid_output",
+    });
+    const parsed = parseEvidencePlanVerifierContent(JSON.stringify({
+      v: "use_action",
+      a: "read_url",
+      r: "correct_limitation",
+      d: ["read_url"],
+      x: 0.97,
+      g: "dagens läge för Tesla-aktien",
+      q: null,
+      u: "latest:avanza",
+      m: null,
+      z: null,
+      k: null,
+      l: null,
+    }), verifierInput);
+
+    expect(parsed).toMatchObject({
+      decision: "use_action",
+      evidence: {
+        action: "read_url",
+        goal: "dagens läge för Tesla-aktien",
+        urlRef: "latest:avanza",
+      },
+      capabilities: {
+        discussed: ["read_url"],
+        requestKind: "correct_limitation",
+      },
+    });
+    expect(projectEvidencePlanVerification(parsed)).toMatchObject({
+      evidenceTrusted: true,
+      capabilityTrusted: true,
+      evidence: { action: "read_url" },
+    });
+    expect(JSON.stringify(buildEvidencePlanVerifierUserData(verifierInput))).not.toContain("https://");
+  });
+
+  it("accepts language-preserving Japanese, Arabic and German semantic outcomes", () => {
+    const japanese = createEvidencePlanVerifierInput(input({
+      latestMessage: {
+        authorId: "human-1",
+        authorName: "Hana",
+        content: "ミラ、東京は今何時？",
+      },
+      recentMessages: [
+        { id: "ai-ja", authorId: "ai-mira", authorName: "Mira", content: "何を調べようか？" },
+      ],
+    }), primarySummary());
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({
+      v: "use_action",
+      a: "local_datetime",
+      r: "execute",
+      d: ["local_datetime"],
+      x: 0.98,
+      g: "東京の現在時刻",
+      q: null,
+      u: null,
+      m: null,
+      z: "Asia/Tokyo",
+      k: "current_time",
+      l: "東京",
+    }), japanese)).toMatchObject({ evidence: { goal: "東京の現在時刻", timeZone: "Asia/Tokyo" } });
+
+    const arabic = createEvidencePlanVerifierInput(stockTurn("ابحث عنها الآن"), primarySummary({
+      capabilities: { discussed: ["web_search"], requestKind: "retry", confidence: 0.95 },
+    }));
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({
+      v: "use_action",
+      a: "web_search",
+      r: "retry",
+      d: ["web_search"],
+      x: 0.96,
+      g: "السعر الحالي للسهم",
+      q: "السعر الحالي للسهم اليوم",
+      u: null,
+      m: "web",
+      z: null,
+      k: null,
+      l: null,
+    }), arabic)).toMatchObject({
+      evidence: { goal: "السعر الحالي للسهم", query: "السعر الحالي للسهم اليوم" },
+    });
+
+    const germanAvailability = createEvidencePlanVerifierInput(stockTurn("Kannst du das Web durchsuchen, aber bitte jetzt nicht?"), primarySummary({
+      capabilities: { discussed: ["web_search"], requestKind: "availability", confidence: 0.98 },
+    }));
+    expect(parseEvidencePlanVerifierContent(
+      JSON.stringify(keepNoneWire()),
+      germanAvailability,
+    )).toMatchObject({ decision: "keep_none", evidence: { action: "none", goal: null } });
+  });
+
+  it("keeps social, self-contained, passive-link and negated availability turns non-mutating", () => {
+    const selfContained = createEvidencePlanVerifierInput(
+      stockTurn("ミラ、なぞなぞを一つ作って"),
+      primarySummary(),
+    );
+    const passiveLink = createEvidencePlanVerifierInput(stockTurn("det här var intressant", {
+      urlCandidates: [{ ref: "latest:passive", source: "latest_message", context: "shared without a request" }],
+    }), primarySummary({
+      capabilities: { discussed: ["read_url"], requestKind: "availability", confidence: 0.95 },
+    }));
+    for (const verifierInput of [selfContained, passiveLink]) {
+      const projected = projectEvidencePlanVerification(parseEvidencePlanVerifierContent(
+        JSON.stringify(keepNoneWire()),
+        verifierInput,
+      ));
+      expect(projected).toMatchObject({
+        decision: "keep_none",
+        evidenceTrusted: false,
+        evidence: { action: "none" },
+      });
+    }
+  });
+
+  it("rejects incomplete, unavailable, low-confidence, mismatched and URL-leaking plans", () => {
+    const verifierInput = createEvidencePlanVerifierInput(stockTurn("kolla länken", {
+      availableCapabilities: ["read_url"],
+      urlCandidates: [{ ref: "latest:0", source: "latest_message", context: "host=example.com; path=/; source=message" }],
+    }), primarySummary());
+    const valid = {
+      v: "use_action",
+      a: "read_url",
+      r: "execute",
+      d: ["read_url"],
+      x: 0.95,
+      g: "sidans viktigaste uppgift",
+      q: null,
+      u: "latest:0",
+      m: null,
+      z: null,
+      k: null,
+      l: null,
+    };
+    expect(parseEvidencePlanVerifierContent(JSON.stringify(valid), verifierInput)).toBeDefined();
+    expect(parseEvidencePlanVerifierContent(
+      JSON.stringify({ ...valid, r: "none", g: "sidans viktigaste uppgift på example.com", m: "web" }),
+      verifierInput,
+    )).toMatchObject({
+      capabilities: { requestKind: "execute" },
+      evidence: { goal: "sidans viktigaste uppgift på example", searchMode: null },
+    });
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, a: "web_search", u: null, q: "test", m: "web", d: ["web_search"] }), verifierInput)).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, d: ["web_search"] }), verifierInput)).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, x: 0.7 }), verifierInput)).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, u: "latest:unknown" }), verifierInput)).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, g: "läs https://example.com" }), verifierInput)).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...keepNoneWire(), g: "något" }), verifierInput)).toBeUndefined();
+  });
+
+  it("publishes a compact dynamic schema and a semantic multilingual policy", () => {
+    const verifierInput = createEvidencePlanVerifierInput(stockTurn("kolla det här", {
+      availableCapabilities: ["read_url", "web_search"],
+      urlCandidates: [{ ref: "latest:0", source: "latest_message", context: "latest link" }],
+    }), primarySummary());
+    const format = buildEvidencePlanVerifierResponseFormat(verifierInput) as any;
+    const properties = format.json_schema.schema.properties;
+    expect(format.json_schema).toMatchObject({ strict: true });
+    expect(format.json_schema.schema.additionalProperties).toBe(false);
+    expect(properties.a.enum).toEqual(["none", "read_url", "web_search"]);
+    expect(properties.u.anyOf[0].enum).toEqual(["latest:0"]);
+    expect(properties.d.maxItems).toBe(1);
+    expect(format.json_schema.schema.required).toEqual([
+      "v", "a", "r", "d", "x", "g", "q", "u", "m", "z", "k", "l",
+    ]);
+
+    const prompt = buildEvidencePlanVerifierSystemPrompt();
+    expect(prompt).toContain("strict multilingual evidence-plan verifier");
+    expect(prompt).toContain("never use language-specific keywords");
+    expect(prompt).toContain("recentMessages only to resolve semantic ellipsis");
+    expect(prompt).toContain("short follow-up can replace only the mistaken part");
+    expect(prompt).toContain("never capability truth");
+    expect(prompt).toContain("Preserve the guest's language and script");
+    expect(prompt).toContain("self-contained question, social or creative request, passive link");
+    expect(prompt).toContain("pure capability-availability question");
+    expect(prompt).toContain("explicit instruction not to execute");
+    expect(prompt).toContain("Availability is not execution");
   });
 });
 
@@ -665,6 +1203,32 @@ const explicitRequestReviewInput = (options: {
 };
 
 describe("multilingual batch candidate-review contract", () => {
+  it("carries trusted capability execution state and rejects impossible combinations", () => {
+    const base = reviewInput();
+    const capabilityContext = {
+      available: ["read_url", "web_search"] as const,
+      requestKind: "correct_limitation" as const,
+      discussed: ["web_search"] as const,
+      plannedAction: "web_search" as const,
+      executionStatus: "failed_temporary" as const,
+    };
+    const parsed = candidateReviewInputSchema.parse({ ...base, capabilityContext });
+    expect(parsed.capabilityContext).toEqual(capabilityContext);
+
+    expect(candidateReviewInputSchema.safeParse({
+      ...base,
+      capabilityContext: { ...capabilityContext, plannedAction: "local_datetime" },
+    }).success).toBe(false);
+    expect(candidateReviewInputSchema.safeParse({
+      ...base,
+      capabilityContext: { ...capabilityContext, plannedAction: null },
+    }).success).toBe(false);
+    expect(candidateReviewInputSchema.safeParse({
+      ...base,
+      capabilityContext: { ...capabilityContext, executionStatus: "not_requested" },
+    }).success).toBe(false);
+  });
+
   it("treats live behavior tuning as bounded style metadata below safety and grounding", () => {
     expect(reviewInput().behaviorTuning).toEqual({ competence: 50, aggression: 25, explicitness: 50 });
     const prompt = buildCandidateReviewSystemPrompt();
@@ -676,12 +1240,18 @@ describe("multilingual batch candidate-review contract", () => {
   it("carries bounded exact room recall, witness metadata, affect context and one surface-style move", () => {
     const base = reviewInput();
     const timelineRow = {
+      messageId: "message-per-keramik",
+      authorId: "human-per",
       author: "Per",
       kind: "human" as const,
       content: "Jag var här tidigare och nämnde keramik.",
       createdAt: "2026-07-14T09:00:00.000Z",
       ageSeconds: 10_800,
       sincePreviousSeconds: null,
+      role: "anchor" as const,
+      anchorMatches: ["author_identity" as const],
+      system: false,
+      generation: null,
     };
     const parsed = candidateReviewInputSchema.parse({
       ...base,
@@ -792,12 +1362,18 @@ describe("multilingual batch candidate-review contract", () => {
       roomRecall: {
         witnessPersonaIds: ["ai-sana"],
         timeline: [{
+          messageId: "message-per-visit",
+          authorId: "human-per",
           author: "Per",
           kind: "human",
           content: "Jag var här en sväng.",
           createdAt: "2026-07-14T09:00:00.000Z",
           ageSeconds: 10_800,
           sincePreviousSeconds: null,
+          role: "anchor",
+          anchorMatches: ["author_identity"],
+          system: false,
+          generation: null,
         }],
       },
     });
@@ -912,7 +1488,10 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment");
     expect(prompt).toContain("Relatedness alone is not fulfilment");
     expect(prompt).toContain("roomRecall.witnessPersonaIds");
-    expect(prompt).toContain("exact roomRecall timeline is evidence of what appeared");
+    expect(prompt).toContain("A roomRecall anchor proves only that the row directly matched retrieval");
+    expect(prompt).toContain("A context row proves only that it appeared nearby");
+    expect(prompt).toContain("capabilityContext lists read_url or web_search");
+    expect(prompt).toContain("resident model having no personal tool is irrelevant");
     expect(prompt).toContain("unsupported_room_recall");
     expect(prompt).toContain("A non-witness may accurately say it checked retained room history");
     expect(prompt).toContain("visibleAffect true permits one genuine feeling");

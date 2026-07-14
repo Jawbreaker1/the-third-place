@@ -42,12 +42,33 @@ export interface ChannelRecallInput {
 export interface ChannelRecallResult {
   /** Exact retained source messages, in chronological order. */
   messages: ChatMessage[];
-  /** Source messages in the returned window that directly matched the query. */
+  /**
+   * Source messages in the returned window that directly matched the query.
+   * Kept as a backwards-compatible alias for `anchorMessageIds`.
+   */
   matchedMessageIds: string[];
+  /** Direct retrieval anchors. Surrounding episode context is never included. */
+  anchorMessageIds: string[];
+  /** Returned episode rows that did not directly match the retrieval query. */
+  contextMessageIds: string[];
+  /** Stable per-row provenance that callers can carry into later grounding. */
+  rows: ChannelRecallRowMetadata[];
   /** Allowed AI authors and reactors directly observed in the returned window. */
   witnessPersonaIds: string[];
   /** Deterministic retrieval score for diagnostics; it is never model evidence. */
   score: number;
+}
+
+export type ChannelRecallAnchorMatch = "author_identity" | "content";
+
+export interface ChannelRecallRowMetadata {
+  messageId: string;
+  authorId: string;
+  role: "anchor" | "context";
+  /** Empty for context rows; ordered deterministically for direct anchors. */
+  anchorMatches: ChannelRecallAnchorMatch[];
+  system: boolean;
+  generation: ChatMessage["generation"] | null;
 }
 
 interface SourceRecord {
@@ -63,6 +84,7 @@ interface IndexedRecord extends SourceRecord {
 
 interface ScoredRecord extends IndexedRecord {
   identityMatch: boolean;
+  contentMatch: boolean;
   score: number;
 }
 
@@ -102,12 +124,13 @@ const compareSource = (left: SourceRecord, right: SourceRecord): number =>
   left.time - right.time || left.message.createdAt.localeCompare(right.message.createdAt) ||
   left.message.id.localeCompare(right.message.id);
 
-const indexedText = (message: ChatMessage): string => [
-  message.content,
-  message.authorSnapshot?.name,
-  message.replyPreview?.authorName,
-  message.replyPreview?.content,
-].filter((value): value is string => Boolean(value)).join("\n").slice(0, MAX_DOCUMENT_CHARACTERS);
+/**
+ * Only a row's own content is direct retrieval evidence. A reply preview is a
+ * denormalized copy of another row and may help a later caller display context,
+ * but it must never turn the reply itself into a second retrieval anchor.
+ */
+const indexedContent = (message: ChatMessage): string =>
+  message.content.slice(0, MAX_DOCUMENT_CHARACTERS);
 
 const sourceHistory = (input: ChannelRecallInput, triggerTime: number, notBefore: number): {
   allBounded: SourceRecord[];
@@ -157,7 +180,7 @@ const scoredHistory = (records: readonly SourceRecord[], queryTokens: readonly s
   const querySet = new Set(queryTokens);
   const indexed: IndexedRecord[] = records.map((record) => ({
     ...record,
-    tokens: new Set(channelRecallTokens(indexedText(record.message))),
+    tokens: new Set(channelRecallTokens(indexedContent(record.message))),
     authorNameTokens: new Set(channelRecallTokens(record.message.authorSnapshot?.name ?? "", MAX_QUERY_TOKENS)),
   }));
   const frequencies = documentFrequency(indexed);
@@ -174,7 +197,8 @@ const scoredHistory = (records: readonly SourceRecord[], queryTokens: readonly s
     const identityMatch = record.authorNameTokens.size > 0 &&
       [...record.authorNameTokens].every((token) => querySet.has(token));
     const rareMatches = [...discriminative].filter((token) => record.tokens.has(token));
-    if (!identityMatch && rareMatches.length === 0) return [];
+    const contentMatch = rareMatches.length > 0;
+    if (!identityMatch && !contentMatch) return [];
     const commonMatches = queryTokens.filter((token) =>
       !discriminative.has(token) && (frequencies.get(token) ?? 0) > 0 && record.tokens.has(token)
     );
@@ -184,7 +208,7 @@ const scoredHistory = (records: readonly SourceRecord[], queryTokens: readonly s
     }, 0);
     const commonScore = commonMatches.reduce((total, token) =>
       total + inverseDocumentFrequency(indexed.length, frequencies.get(token) ?? indexed.length) * 0.1, 0);
-    return [{ ...record, identityMatch, score: rareScore + commonScore + (identityMatch ? 8 : 0) }];
+    return [{ ...record, identityMatch, contentMatch, score: rareScore + commonScore + (identityMatch ? 8 : 0) }];
   });
 };
 
@@ -304,14 +328,38 @@ export const recallChannelHistory = (input: ChannelRecallInput): ChannelRecallRe
   const scoredById = new Map(scored.map((record) => [record.message.id, record]));
   const window = bestBoundedWindow(episode, scoredById, seed.message.id, maxMessages);
   const messages = window.map((record) => record.message);
-  const matchedMessageIds = messages
+  const anchorMessageIds = messages
     .filter((message) => scoredById.has(message.id))
     .map((message) => message.id);
-  if (matchedMessageIds.length === 0) return undefined;
-  const windowScore = matchedMessageIds.reduce((total, id) => total + (scoredById.get(id)?.score ?? 0), 0);
+  if (anchorMessageIds.length === 0) return undefined;
+  const anchorIds = new Set(anchorMessageIds);
+  const contextMessageIds = messages
+    .filter((message) => !anchorIds.has(message.id))
+    .map((message) => message.id);
+  const rows: ChannelRecallRowMetadata[] = messages.map((message) => {
+    const scoredRecord = scoredById.get(message.id);
+    const anchorMatches: ChannelRecallAnchorMatch[] = scoredRecord
+      ? [
+          ...(scoredRecord.identityMatch ? ["author_identity" as const] : []),
+          ...(scoredRecord.contentMatch ? ["content" as const] : []),
+        ]
+      : [];
+    return {
+      messageId: message.id,
+      authorId: message.authorId,
+      role: scoredRecord ? "anchor" : "context",
+      anchorMatches,
+      system: message.system === true,
+      generation: message.generation ?? null,
+    };
+  });
+  const windowScore = anchorMessageIds.reduce((total, id) => total + (scoredById.get(id)?.score ?? 0), 0);
   return {
     messages,
-    matchedMessageIds,
+    matchedMessageIds: anchorMessageIds,
+    anchorMessageIds,
+    contextMessageIds,
+    rows,
     witnessPersonaIds: witnessesFor(messages, input.allowedPersonaIds),
     score: Number(windowScore.toFixed(6)),
   };
