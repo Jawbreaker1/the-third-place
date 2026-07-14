@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatMessage, Member } from "../shared/types";
-import { clearChannelNotice, messageAddressesMember, nextDmUnread, noteChannelMessage, type ChannelNotices } from "./unread";
+import { clearChannelNotice, firstUnreadDmMessageId, messageAddressesMember, nextDmUnread, noteChannelMessage, type ChannelNotices } from "./unread";
 
 const member: Member = {
   id: "human-johan",
@@ -79,7 +79,7 @@ describe("messageAddressesMember", () => {
 describe("channel notices", () => {
   it("marks ordinary off-channel traffic unread without a number", () => {
     expect(noteChannelMessage({}, message({ channelId: "the-pub" }), "lobby", member)).toEqual({
-      "the-pub": { unread: true, mentions: 0 },
+      "the-pub": { unread: true, mentions: 0, firstUnreadMessageId: "message-1" },
     });
   });
 
@@ -90,13 +90,31 @@ describe("channel notices", () => {
       replyToId: "human-message",
       replyPreview: { authorId: member.id, authorName: member.name, content: "min tanke" },
     });
-    expect(noteChannelMessage({}, addressed, "lobby", member)["the-pub"]).toEqual({ unread: true, mentions: 1 });
+    expect(noteChannelMessage({}, addressed, "lobby", member)["the-pub"]).toEqual({
+      unread: true,
+      mentions: 1,
+      firstUnreadMessageId: "message-1",
+    });
   });
 
   it("ignores active-channel and self-authored traffic", () => {
     const existing: ChannelNotices = { lobby: { unread: true, mentions: 1 } };
     expect(noteChannelMessage(existing, message(), "lobby", member)).toBe(existing);
     expect(noteChannelMessage(existing, message({ channelId: "the-pub", authorId: member.id }), "lobby", member)).toBe(existing);
+  });
+
+  it("keeps the first unread message as the channel entry anchor", () => {
+    const first = noteChannelMessage({}, message({ id: "first", channelId: "the-pub" }), "lobby", member);
+    const second = noteChannelMessage(first, message({ id: "second", channelId: "the-pub" }), "lobby", member);
+    expect(second["the-pub"]?.firstUnreadMessageId).toBe("first");
+  });
+
+  it("distinguishes an open channel at the bottom from one showing older history", () => {
+    expect(noteChannelMessage({}, message(), "lobby", member, true)).toEqual({});
+    expect(noteChannelMessage({}, message(), "lobby", member, false).lobby).toMatchObject({
+      unread: true,
+      firstUnreadMessageId: "message-1",
+    });
   });
 
   it("caps mention counts and clears the selected channel", () => {
@@ -112,6 +130,13 @@ describe("DM unread", () => {
     const incoming = message({ channelId: "dm-1", authorId: "ai-mira" });
     expect(nextDmUnread(2, incoming, "dm-1", "lobby", member.id)).toBe(3);
     expect(nextDmUnread(2, incoming, "dm-1", "dm-1", member.id)).toBe(0);
+    expect(nextDmUnread(2, incoming, "dm-1", "dm-1", member.id, false)).toBe(3);
     expect(nextDmUnread(2, { ...incoming, authorId: member.id }, "dm-1", "lobby", member.id)).toBe(2);
+  });
+
+  it("finds the first unread DM in the bounded thread", () => {
+    const messages = ["one", "two", "three"].map((id) => message({ id, channelId: "dm-1" }));
+    expect(firstUnreadDmMessageId({ id: "dm-1", peerId: "ai-mira", messages, unread: 2 })).toBe("two");
+    expect(firstUnreadDmMessageId({ id: "dm-1", peerId: "ai-mira", messages, unread: 0 })).toBeUndefined();
   });
 });

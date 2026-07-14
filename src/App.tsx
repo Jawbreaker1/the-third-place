@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { io, type Socket } from "socket.io-client";
 import type {
   ActionResult,
@@ -34,12 +34,13 @@ import { normalizeDisplayName, validDisplayName } from "../shared/displayName";
 import { unicodeCaselessKey } from "../shared/unicodeSafety";
 import { VoicePeerMesh } from "./voicePeer";
 import { VoiceActivityDetector, type VoiceActivityEvent } from "./voiceActivity";
+import { conversationEntryTarget, type ConversationViewport, type PendingConversationEntry } from "./chatScroll";
 import {
   createBrowserVoicePlaybackController,
   type VoiceAiSpeechPayload,
   type VoicePlaybackController,
 } from "./voicePlayback";
-import { clearChannelNotice, nextDmUnread, noteChannelMessage, type ChannelNotices } from "./unread";
+import { clearChannelNotice, firstUnreadDmMessageId, nextDmUnread, noteChannelMessage, type ChannelNotices } from "./unread";
 
 const REACTIONS = ["👍", "👀", "😂", "💀", "🤔", "💛", "🔥", "✨"];
 const CLIENT_CHANNEL_MESSAGE_LIMIT = 600;
@@ -333,6 +334,7 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [channelNotices, setChannelNotices] = useState<ChannelNotices>({});
+  const [unreadDividers, setUnreadDividers] = useState<Record<string, string | undefined>>({});
   const [historyPageInfo, setHistoryPageInfo] = useState<Record<string, { before?: string; hasMore: boolean }>>({});
   const [historyLoading, setHistoryLoading] = useState<Record<string, boolean>>({});
   const [historyError, setHistoryError] = useState<Record<string, string | undefined>>({});
@@ -365,7 +367,10 @@ export default function App() {
   const activeChannelRef = useRef("lobby");
   const typingTimer = useRef<number | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const shouldStickToBottom = useRef(true);
+  const viewportByConversation = useRef(new Map<string, ConversationViewport>());
+  const pendingConversationEntry = useRef<PendingConversationEntry | undefined>(undefined);
   const prependingHistoryChannels = useRef(new Set<string>());
   const historyRequestGeneration = useRef<Record<string, number>>({});
   const historyLoadingChannels = useRef(new Set<string>());
@@ -415,6 +420,34 @@ export default function App() {
       (participant) => participant.kind === "human" && participant.memberId !== me?.id && participant.speaking,
     ),
   );
+
+  const captureCurrentViewport = useCallback(() => {
+    const scroller = scrollRef.current;
+    if (!scroller) return;
+    const scrollerRect = scroller.getBoundingClientRect();
+    const rows = [...scroller.querySelectorAll<HTMLElement>("[data-message-id]")];
+    const firstVisible = rows.find((row) => row.getBoundingClientRect().bottom > scrollerRect.top + 1);
+    const messageId = firstVisible?.dataset.messageId;
+    if (!firstVisible || !messageId) return;
+    viewportByConversation.current.set(activeChannelRef.current, {
+      messageId,
+      offsetTop: firstVisible.getBoundingClientRect().top - scrollerRect.top,
+      atBottom: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 110,
+    });
+  }, []);
+
+  const queueConversationEntry = useCallback((channelId: string, firstUnreadMessageId?: string) => {
+    const target = conversationEntryTarget(
+      channelId,
+      firstUnreadMessageId,
+      viewportByConversation.current.get(channelId),
+    );
+    pendingConversationEntry.current = target;
+    shouldStickToBottom.current = target.kind === "bottom";
+    if (firstUnreadMessageId) {
+      setUnreadDividers((current) => ({ ...current, [channelId]: firstUnreadMessageId }));
+    }
+  }, []);
 
   const getVoicePlayback = useCallback((): VoicePlaybackController => {
     voicePlaybackRef.current ??= createBrowserVoicePlaybackController({
@@ -661,10 +694,27 @@ export default function App() {
 
     socket.on("room:snapshot", applySnapshot);
     socket.on("message:new", (message: ChatMessage) => {
+      const activeChannelId = activeChannelRef.current;
+      const activeChannelIsRead = message.channelId !== activeChannelId || shouldStickToBottom.current;
       setMessages((current) =>
         current.some((item) => item.id === message.id) ? current : boundPublicMessages([...current, message]),
       );
-      setChannelNotices((current) => noteChannelMessage(current, message, activeChannelRef.current, meRef.current));
+      setChannelNotices((current) => noteChannelMessage(
+        current,
+        message,
+        activeChannelId,
+        meRef.current,
+        activeChannelIsRead,
+      ));
+      if (
+        message.channelId === activeChannelId &&
+        !activeChannelIsRead &&
+        message.authorId !== meRef.current?.id
+      ) {
+        setUnreadDividers((current) => current[message.channelId]
+          ? current
+          : { ...current, [message.channelId]: message.id });
+      }
     });
     socket.on("reaction:update", (payload: ReactionPayload) => {
       setMessages((current) =>
@@ -776,6 +826,8 @@ export default function App() {
     socket.on("director:event", (event: DirectorEvent) => setDirectorEvents((current) => [...current.slice(-23), event]));
     socket.on("health:update", (nextHealth: ServerHealth) => setHealth(nextHealth));
     socket.on("dm:update", (payload: DmUpdatePayload) => {
+      const activeChannelId = activeChannelRef.current;
+      const activeThreadIsRead = payload.thread.id !== activeChannelId || shouldStickToBottom.current;
       setDmThreads((current) => {
         const previousUnread = current.find((thread) => thread.id === payload.thread.id)?.unread ?? 0;
         const nextThread = {
@@ -784,13 +836,24 @@ export default function App() {
             previousUnread,
             payload.message,
             payload.thread.id,
-            activeChannelRef.current,
+            activeChannelId,
             meRef.current?.id,
+            activeThreadIsRead,
           ),
         };
         const exists = current.some((thread) => thread.id === payload.thread.id);
         return exists ? current.map((thread) => (thread.id === payload.thread.id ? nextThread : thread)) : [...current, nextThread];
       });
+      if (
+        payload.message &&
+        payload.thread.id === activeChannelId &&
+        !activeThreadIsRead &&
+        payload.message.authorId !== meRef.current?.id
+      ) {
+        setUnreadDividers((current) => current[payload.thread.id]
+          ? current
+          : { ...current, [payload.thread.id]: payload.message!.id });
+      }
     });
     socket.on("toast", pushToast);
     socket.on("disconnect", (reason) => {
@@ -1051,7 +1114,11 @@ export default function App() {
     setHistoryError((current) => ({ ...current, [channelId]: undefined }));
 
     const scroller = scrollRef.current;
-    const anchor = scroller?.querySelector<HTMLElement>("[data-message-id]");
+    const scrollerTop = scroller?.getBoundingClientRect().top;
+    const anchor = scroller && scrollerTop !== undefined
+      ? [...scroller.querySelectorAll<HTMLElement>("[data-message-id]")]
+        .find((row) => row.getBoundingClientRect().bottom > scrollerTop + 1)
+      : undefined;
     const anchorId = anchor?.dataset.messageId;
     const anchorTop = anchor?.getBoundingClientRect().top;
     const oldScrollHeight = scroller?.scrollHeight ?? 0;
@@ -1108,11 +1175,34 @@ export default function App() {
     }
   }, [activeChannelId, activeThread, historyPageInfo, me, search]);
 
+  useLayoutEffect(() => {
+    const pending = pendingConversationEntry.current;
+    const scroller = scrollRef.current;
+    if (!pending || pending.channelId !== activeChannelId || !scroller || foldedSearch) return;
+
+    if (pending.kind === "message") {
+      const target = [...scroller.querySelectorAll<HTMLElement>("[data-message-id]")]
+        .find((row) => row.dataset.messageId === pending.messageId);
+      if (target) {
+        const scrollerTop = scroller.getBoundingClientRect().top;
+        scroller.scrollTop += target.getBoundingClientRect().top - scrollerTop - pending.offsetTop;
+      } else {
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+    } else {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+
+    shouldStickToBottom.current = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 110;
+    pendingConversationEntry.current = undefined;
+  }, [activeChannelId, activeMessages.length, foldedSearch]);
+
   useEffect(() => {
     if (prependingHistoryChannels.current.has(activeChannelId)) return;
+    if (foldedSearch) return;
     if (!shouldStickToBottom.current) return;
     requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }));
-  }, [activeMessages.length, activeChannelId]);
+  }, [activeMessages.length, activeChannelId, foldedSearch]);
 
   const join = async (event: FormEvent) => {
     event.preventDefault();
@@ -1678,6 +1768,24 @@ export default function App() {
     );
   };
 
+  const focusComposer = () => {
+    const input = composerInputRef.current;
+    if (voiceViewRoomId || !input || input.disabled) return;
+    input.focus({ preventScroll: true });
+  };
+
+  const beginReply = (message: ChatMessage) => {
+    setReplyTo(message);
+    // Keep this synchronous with the click so mobile Safari may open its
+    // keyboard under the same user activation. Do not reset the draft/caret.
+    focusComposer();
+  };
+
+  const cancelReply = () => {
+    focusComposer();
+    setReplyTo(null);
+  };
+
   const openDm = (peer: Member) => {
     if (!socketRef.current || !me || peer.id === me.id) return;
     socketRef.current.emit("dm:open", { peerId: peer.id }, (result: { ok: boolean; thread?: DmThread; error?: string }) => {
@@ -1685,6 +1793,9 @@ export default function App() {
         pushToast({ tone: "warning", title: "DM unavailable", message: result.error ?? "Try again in a moment." });
         return;
       }
+      captureCurrentViewport();
+      const currentThread = dmThreads.find((thread) => thread.id === result.thread!.id);
+      queueConversationEntry(result.thread.id, firstUnreadDmMessageId(currentThread));
       setDmThreads((current) =>
         current.some((thread) => thread.id === result.thread!.id)
           ? current.map((thread) => (thread.id === result.thread!.id ? result.thread! : thread))
@@ -1693,7 +1804,6 @@ export default function App() {
       activeChannelRef.current = result.thread.id;
       setVoiceViewRoomId(null);
       setVoiceCreateOpen(false);
-      shouldStickToBottom.current = true;
       setActiveChannelId(result.thread.id);
       setProfile(null);
       setMobilePanel(null);
@@ -1713,10 +1823,13 @@ export default function App() {
   };
 
   const selectChannel = (id: string) => {
+    captureCurrentViewport();
+    const firstUnreadMessageId = channelNotices[id]?.firstUnreadMessageId
+      ?? firstUnreadDmMessageId(dmThreads.find((thread) => thread.id === id));
+    queueConversationEntry(id, firstUnreadMessageId);
     setVoiceViewRoomId(null);
     setVoiceCreateOpen(false);
     activeChannelRef.current = id;
-    shouldStickToBottom.current = true;
     setActiveChannelId(id);
     setChannelNotices((current) => clearChannelNotice(current, id));
     setDmThreads((current) => current.map((thread) => (thread.id === id ? { ...thread, unread: 0 } : thread)));
@@ -1977,7 +2090,17 @@ export default function App() {
           ref={scrollRef}
           onScroll={(event) => {
             const element = event.currentTarget;
-            shouldStickToBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 110;
+            const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 110;
+            shouldStickToBottom.current = atBottom;
+            if (atBottom) {
+              setChannelNotices((current) => clearChannelNotice(current, activeChannelId));
+              setDmThreads((current) => current.map((thread) =>
+                thread.id === activeChannelId && thread.unread > 0 ? { ...thread, unread: 0 } : thread,
+              ));
+              setUnreadDividers((current) => current[activeChannelId]
+                ? { ...current, [activeChannelId]: undefined }
+                : current);
+            }
             if (element.scrollTop < 160 && !search.trim()) void loadOlderMessages();
           }}
         >
@@ -2002,6 +2125,7 @@ export default function App() {
             const author = memberMap.get(message.authorId) ?? message.authorSnapshot;
             const previous = activeMessages[index - 1];
             const startsDay = !previous || dayKey(previous.createdAt) !== dayKey(message.createdAt);
+            const startsUnread = unreadDividers[activeChannelId] === message.id;
             const grouped =
               previous &&
               !startsDay &&
@@ -2018,6 +2142,7 @@ export default function App() {
             if (message.system) return (
               <Fragment key={message.id}>
                 {startsDay && <div className="day-divider"><span>{formatDayLabel(message.createdAt)}</span></div>}
+                {startsUnread && <div className="unread-divider" role="separator" aria-label="New messages"><span>New</span></div>}
                 <div className="system-message" data-message-id={message.id} dir="auto"><span><Icon name="spark" size={12} /></span>{message.content}<time>{formatTime(message.createdAt)}</time></div>
               </Fragment>
             );
@@ -2025,6 +2150,7 @@ export default function App() {
             return (
               <Fragment key={message.id}>
               {startsDay && <div className="day-divider"><span>{formatDayLabel(message.createdAt)}</span></div>}
+              {startsUnread && <div className="unread-divider" role="separator" aria-label="New messages"><span>New</span></div>}
               <article
                 className={`message ${grouped ? "grouped" : ""} ${historicalMessageIds.current.has(message.id) ? "historical" : ""}`}
                 data-message-id={message.id}
@@ -2111,8 +2237,8 @@ export default function App() {
                 </div>
                 {me && !activeThread && (
                   <div className="message-actions">
-                    <button onClick={() => react(message, REACTIONS[Math.floor(Math.random() * REACTIONS.length)]!)} title="React"><Icon name="smile" size={16} /></button>
-                    <button onClick={() => setReplyTo(message)} title="Reply"><Icon name="reply" size={16} /></button>
+                    <button type="button" onClick={() => react(message, REACTIONS[Math.floor(Math.random() * REACTIONS.length)]!)} title="React"><Icon name="smile" size={16} /></button>
+                    <button type="button" onClick={() => beginReply(message)} title="Reply" aria-label={`Reply to ${author.name}`} aria-controls="message-composer-input"><Icon name="reply" size={16} /></button>
                     <div className="reaction-menu">{REACTIONS.slice(0, 5).map((emoji) => <button key={emoji} onClick={() => react(message, emoji)}>{emoji}</button>)}</div>
                     <button onClick={() => report(message)} title="Report"><Icon name="flag" size={15} /></button>
                   </div>
@@ -2129,7 +2255,7 @@ export default function App() {
             <span className="typing-dots"><i /><i /><i /></span>
             {typingMembers.length > 0 && <span><span dir="auto">{typingMembers.slice(0, 2).map((member) => member.name).join(" and ")}</span>{typingMembers.length > 2 ? ` +${typingMembers.length - 2}` : ""} {typingMembers.length === 1 ? "is" : "are"} composing</span>}
           </div>
-          {replyTo && <div className="replying-to"><span>Replying to <strong dir="auto">{memberMap.get(replyTo.authorId)?.name}</strong></span><button onClick={() => setReplyTo(null)}><Icon name="close" size={15} /></button></div>}
+          {replyTo && <div className="replying-to" id="replying-to-message"><span>Replying to <strong dir="auto">{memberMap.get(replyTo.authorId)?.name}</strong></span><button type="button" onClick={cancelReply} aria-label="Cancel reply"><Icon name="close" size={15} /></button></div>}
           {pendingImage && (
             <div className={`pending-image pending-image-${pendingImage.status}`} aria-live="polite">
               <div className="pending-image-visual">
@@ -2183,7 +2309,10 @@ export default function App() {
             <button type="button" className="attach-button" disabled={!canAttachImage || pendingImage?.status === "sending"} onClick={() => imageInputRef.current?.click()} aria-label="Attach an image" title={activeThread ? "Images are currently available in public rooms" : "Attach image"}><Icon name="image" size={17} /></button>
             <button type="button" className={`attach-button ${imageUrlOpen ? "active" : ""}`} disabled={!canAttachImage || pendingImage?.status === "sending"} onClick={() => setImageUrlOpen((value) => !value)} aria-label="Attach a direct image URL" title="Attach direct HTTPS image URL"><Icon name="link" size={16} /></button>
             <textarea
+              ref={composerInputRef}
+              id="message-composer-input"
               dir="auto"
+              aria-describedby={replyTo ? "replying-to-message" : undefined}
               value={composer}
               onChange={(event) => notifyTyping(event.target.value)}
               onPaste={handleComposerPaste}

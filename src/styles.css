@@ -980,6 +980,33 @@ textarea:focus-visible,
   content: "";
 }
 
+.unread-divider {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 7px 18px 9px;
+  color: var(--coral);
+  font-size: 9px;
+  font-weight: 820;
+  letter-spacing: 0.09em;
+  pointer-events: none;
+  text-transform: uppercase;
+}
+
+.unread-divider::before {
+  height: 1px;
+  flex: 1;
+  background: color-mix(in srgb, var(--coral) 66%, transparent);
+  content: "";
+}
+
+.unread-divider span {
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--coral) 32%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--coral) 8%, var(--panel));
+}
+
 .message {
   position: relative;
   display: grid;
