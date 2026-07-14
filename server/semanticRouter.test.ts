@@ -802,6 +802,20 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       }),
     )).toBe(true);
 
+    const roomDirectedFollowUp = stockTurn("Hallå?", {
+      recentMessages: [{
+        id: "weather-request",
+        authorId: "human-1",
+        authorName: "Jaw_B",
+        content: "Varmt i Göteborg idag! Nån som kan kolla upp vädret?",
+        createdAt: "2026-07-14T19:20:35.566Z",
+      }],
+    });
+    expect(shouldVerifyEvidencePlan(roomDirectedFollowUp, primarySummary({
+      intent: { kind: "question", replyExpected: "expected", confidence: 0.96 },
+      personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
+    }))).toBe(true);
+
     const correctedMedium = stockTurn("inte app.. websida", {
       recentMessages: [{ ...priorMiraMessage, content: "Jag har inte tillgång till deras app." }],
     });
@@ -1044,6 +1058,8 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(prompt).toContain("never use language-specific keywords");
     expect(prompt).toContain("recentMessages only to resolve semantic ellipsis");
     expect(prompt).toContain("short follow-up can replace only the mistaken part");
+    expect(prompt).toContain("room-directed nudge from the same speaker");
+    expect(prompt).toContain("use_action with retry");
     expect(prompt).toContain("never capability truth");
     expect(prompt).toContain("Preserve the guest's language and script");
     expect(prompt).toContain("self-contained question, social or creative request, passive link");

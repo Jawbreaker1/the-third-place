@@ -2088,6 +2088,12 @@ export class SocialDirector {
       // question intent or social dynamics. Exact @mentions/replies may still
       // use the scene model, but an ordinary public turn stays quiet instead of
       // recruiting a mostly random resident from punctuation alone.
+      console.warn("Semantic routing unavailable for public turn:", {
+        channelId: trigger.channelId,
+        turnId: trigger.id,
+        failureReason: analysis.failureReason,
+        queueDepth: this.lm.health().queueDepth,
+      });
       this.publishDirectorEvent({
         trigger: "message",
         summary: "Semantic routing was unavailable, so the room did not force a reply.",

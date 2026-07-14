@@ -947,11 +947,41 @@ export class LmStudioClient {
     return true;
   }
 
+  private dropQueuedStalePublicScenes(channelId: string, reason: string): void {
+    const retained: QueueItem[] = [];
+    for (const item of this.queue) {
+      if (
+        item.type === "scene" &&
+        item.request.kind === "public" &&
+        item.request.channelId === channelId
+      ) {
+        item.reject(new Error(reason));
+      } else {
+        retained.push(item);
+      }
+    }
+    this.queue = retained;
+  }
+
   private enqueueTurnAnalysis(input: NormalizedTurnAnalysisInput): Promise<TurnAnalysis> {
     if (!this.enabled) return Promise.resolve(createFailClosedTurnAnalysis("disabled"));
 
+    const stalePublicReason = "Stale public generation yielded to a newer same-channel turn";
+    if (input.medium === "public") {
+      this.dropQueuedStalePublicScenes(input.channel.id, stalePublicReason);
+    }
     if (this.activeScene?.request.kind === "ambient") {
       this.activeSceneAbort?.abort(new Error("Ambient generation yielded to semantic turn analysis"));
+    } else if (
+      input.medium === "public" &&
+      this.activeScene?.request.kind === "public" &&
+      this.activeScene.request.channelId === input.channel.id
+    ) {
+      // A newer public message advances the director's per-channel epoch, so
+      // the active scene can no longer be published. Abort that provably stale
+      // work immediately; otherwise it can occupy the single local model long
+      // enough for the newer turn router to hit its own hard deadline.
+      this.activeSceneAbort?.abort(new Error(stalePublicReason));
     }
     this.abortActiveMemoryAnalysis("Persistent memory yielded to semantic turn analysis");
     if (this.queue.length >= 8) {

@@ -302,8 +302,8 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       const lm = new LmStudioClient();
       const scene = lm.generateScene({
         kind: "public",
-        channelId: "lobby",
-        channelName: "lobby",
+        channelId: "ai-lab",
+        channelName: "ai-lab",
         selected: [sana],
         history: [],
       }, 0, controller.signal);
@@ -325,6 +325,95 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       if (previousModel === undefined) delete process.env.LM_STUDIO_MODEL;
       else process.env.LM_STUDIO_MODEL = previousModel;
     }
+  });
+
+  it("preempts a stale same-channel public scene so the newer turn router cannot time out behind it", async () => {
+    let startedScene: (() => void) | undefined;
+    const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        startedScene?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const lm = new LmStudioClient();
+    const staleScene = lm.generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+    }, 0);
+    await sceneStarted;
+
+    const newerTurn = lm.analyzeTurn(turnInput("same-channel-follow-up"));
+
+    await expect(staleScene).rejects.toThrow("newer same-channel turn");
+    await expect(newerTurn).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "read_url" },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("drops an already queued stale same-channel public scene without interrupting another room", async () => {
+    let startedScene: (() => void) | undefined;
+    const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        startedScene?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const unrelatedController = new AbortController();
+    const lm = new LmStudioClient();
+    const unrelatedScene = lm.generateScene({
+      kind: "public",
+      channelId: "ai-lab",
+      channelName: "ai-lab",
+      selected: [sana],
+      history: [],
+    }, 0, unrelatedController.signal);
+    await sceneStarted;
+    const staleQueuedScene = lm.generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+    }, 2);
+
+    const newerTurn = lm.analyzeTurn(turnInput("queued-same-channel-follow-up"));
+
+    await expect(staleQueuedScene).rejects.toThrow("newer same-channel turn");
+    expect(completionCalls).toBe(1);
+    unrelatedController.abort(new Error("unrelated room complete"));
+    await expect(unrelatedScene).rejects.toThrow("unrelated room complete");
+    await expect(newerTurn).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "read_url" },
+    });
+    expect(completionCalls).toBe(2);
   });
 
   it("preempts ambient generation so live semantic routing can run first", async () => {
