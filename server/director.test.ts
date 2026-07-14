@@ -21,6 +21,7 @@ import {
   linkPreviewFromResearch,
   normalizeGeneratedMessageContent,
   pageEvidenceAnswerContract,
+  selectAutoSharedLinkCandidate,
   selectAmbientLead,
   selectAmbientSeed,
   selectAutonomousResearchSeed,
@@ -29,6 +30,7 @@ import {
   socialSignalsFromTurnAnalysis,
   SocialDirector,
   shouldRejectPublicCandidate,
+  shouldStartAutoSharedLinkDiscussion,
   shouldStartAutonomousResearch,
   shouldSurfaceTemporalCue,
   shouldStartConsideredConversation,
@@ -68,6 +70,89 @@ const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => 
 });
 
 describe("social director", () => {
+  it("selects only the first supported URL visibly present in the exact latest human text", () => {
+    const humanId = "guest-link-scope";
+    const trigger = createMessage(
+      "lobby",
+      humanId,
+      "first https://first.example/story then https://second.example/story",
+    );
+    const candidate = (
+      id: `U${number}`,
+      raw: string,
+      overrides: Partial<{
+        source: "message" | "reply" | "recent";
+        messageId: string;
+        authorId: string;
+        supported: boolean;
+      }> = {},
+    ) => ({
+      id,
+      raw,
+      url: new URL(raw),
+      supported: true,
+      source: "message" as const,
+      messageId: trigger.id,
+      authorId: humanId,
+      createdAt: trigger.createdAt,
+      ...overrides,
+    });
+    const candidateSet = {
+      requestedAt: trigger.createdAt,
+      candidates: [
+        candidate("U1", "https://second.example/story"),
+        candidate("U2", "https://old.example/story", { source: "recent" }),
+        candidate("U3", "https://first.example/story"),
+        candidate("U4", "https://preview-only.example/story"),
+        candidate("U5", "https://first.example/story", { messageId: "another-message" }),
+      ],
+    };
+
+    expect(selectAutoSharedLinkCandidate(candidateSet, trigger, humanId)?.id).toBe("U3");
+    expect(selectAutoSharedLinkCandidate(candidateSet, trigger, "another-human")).toBeUndefined();
+    expect(selectAutoSharedLinkCandidate(candidateSet, {
+      ...trigger,
+      attachments: [{} as never],
+    }, humanId)).toBeUndefined();
+  });
+
+  it("enforces every automatic shared-link pacing and capacity boundary", () => {
+    const now = 2_000_000;
+    const base = {
+      enabled: true,
+      now,
+      alreadyInFlight: false,
+      globalAttemptsInWindow: 0,
+      modelConnected: true,
+      queueDepth: 0,
+      availableMessageSlots: 1,
+      voiceRoomActive: false,
+    };
+    expect(shouldStartAutoSharedLinkDiscussion(base)).toBe(true);
+    for (const override of [
+      { enabled: false },
+      { alreadyInFlight: true },
+      { globalAttemptsInWindow: 4 },
+      { modelConnected: false },
+      { queueDepth: 1 },
+      { availableMessageSlots: 0 },
+      { voiceRoomActive: true },
+      { lastRequesterAttemptAt: now - 59_999 },
+      { lastChannelAttemptAt: now - 59_999 },
+      { lastOriginAttemptAt: now - 59_999 },
+      { lastSuccessfulChannelUrlAt: now - 20 * 60_000 + 1 },
+    ]) {
+      expect(shouldStartAutoSharedLinkDiscussion({ ...base, ...override })).toBe(false);
+    }
+    expect(shouldStartAutoSharedLinkDiscussion({
+      ...base,
+      lastRequesterAttemptAt: now - 60_000,
+      lastChannelAttemptAt: now - 60_000,
+      lastOriginAttemptAt: now - 60_000,
+      lastSuccessfulChannelUrlAt: now - 20 * 60_000,
+    })).toBe(true);
+  });
+
   it("uses one source-agnostic evidence contract for every successful page read", () => {
     const packet = (title: string, url: string) => ({
       kind: "page" as const,
@@ -218,6 +303,307 @@ describe("social director", () => {
       expect(failed.reply.content).toBe("Jag fick inte fram just den sidan den här gången.");
       expect(failed.reply.sources).toEqual([]);
       expect(failed.reply.content).not.toContain("bold thing");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("turns one passive public link into one grounded reply and claims duplicate deliveries", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = Date.parse("2026-07-14T12:00:00.000Z");
+      const human = {
+        id: "guest-auto-link",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const sourceUrl = "https://example.com/shared#first";
+      const store = new RoomStore("/tmp/director-auto-link-success-unused.json");
+      const incoming = createMessage("lobby", human.id, `Den här dök upp ${sourceUrl}`);
+      store.addPublicMessage(incoming);
+      const packet = {
+        kind: "page" as const,
+        query: incoming.content,
+        retrievedAt: new Date(now).toISOString(),
+        results: [{
+          id: "S1",
+          title: "Concrete shared report",
+          url: sourceUrl,
+          snippet: "The report measures whether a recovered step preserves later state.",
+        }],
+      };
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        intent: { kind: "statement", isQuestion: false, replyExpected: "optional", confidence: 0.99 },
+      }));
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        mustReplyIds: string[];
+        research?: typeof packet;
+        premise?: string;
+        urlPublicationPolicy?: string;
+      }) => request.selected.map((persona, index) => ({
+        personaId: persona.id,
+        content: request.premise?.includes("actual request")
+          ? `Den explicita rollen ${index + 1} kommenterar hur testet återställer ett misslyckat steg.`
+          : "Det konkreta testet är att senare tillstånd måste överleva återhämtningen, inte bara nästa svar.",
+        source: "lm" as const,
+        sourceIds: [],
+      })));
+      const read = vi.fn(async () => packet);
+      let queueDepth = 0;
+      const pageReader = {
+        collectCandidates: vi.fn(({ messages }: { messages: typeof incoming[] }) => {
+          const latest = messages.at(-1)!;
+          const raw = latest.content.match(/https:\/\/\S+/u)?.[0] ?? sourceUrl;
+          return {
+            requestedAt: new Date(now).toISOString(),
+            candidates: [{
+              id: "U1" as const,
+              raw,
+              url: new URL(raw),
+              supported: true,
+              source: "message" as const,
+              messageId: latest.id,
+              authorId: latest.authorId,
+              createdAt: latest.createdAt,
+            }],
+          };
+        }),
+        resolveTarget: vi.fn(({ candidateSet, intent }: { candidateSet: { requestedAt: string }; intent: string }) => ({
+          url: new URL(sourceUrl),
+          requestedAt: candidateSet.requestedAt,
+          intent,
+          retry: false,
+          source: "message" as const,
+        })),
+        read,
+      };
+      const emit = vi.fn();
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth })),
+          analyzeTurn,
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: pageReader as never,
+          autoSharedLinkDiscussionEnabled: true,
+        },
+      );
+      const handle = (messages: typeof incoming[]) => (director as unknown as {
+        handleHumanBurst: (items: typeof incoming[], member: typeof human) => Promise<void>;
+      }).handleHumanBurst(messages, human);
+
+      const first = handle([incoming]);
+      await vi.runAllTimersAsync();
+      await first;
+      expect(read).toHaveBeenCalledWith(expect.objectContaining({ initiator: "automatic" }), human.id);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const scene = generateScene.mock.calls[0]![0];
+      expect(scene.selected).toHaveLength(1);
+      expect(scene.mustReplyIds).toEqual([scene.selected[0]?.id]);
+      expect(scene.research).toEqual(packet);
+      expect(scene.premise).toContain("one grounded response");
+      expect(scene.urlPublicationPolicy).toBe("server_card");
+      const reply = store.getRecent("lobby", 10).filter((message) => message.authorId !== human.id);
+      expect(reply).toHaveLength(1);
+      expect(reply[0]).toMatchObject({
+        replyToId: incoming.id,
+        sources: [{ title: "Concrete shared report", url: sourceUrl }],
+        linkPreview: { url: sourceUrl, title: "Concrete shared report" },
+      });
+      expect((director as unknown as {
+        ambientThreads: Map<string, AmbientThreadState>;
+      }).ambientThreads.get("lobby")?.research).toMatchObject({ kind: "page", results: [{ id: "S1", url: sourceUrl }] });
+
+      await handle([incoming]);
+      now += 61_000;
+      const sameCanonical = createMessage("lobby", human.id, "Igen https://example.com/shared#other");
+      store.addPublicMessage(sameCanonical);
+      await handle([sameCanonical]);
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(store.getRecent("lobby", 20).filter((message) => message.authorId !== human.id)).toHaveLength(1);
+
+      queueDepth = 2;
+      analyzeTurn.mockResolvedValueOnce(classifiedTurn({
+        intent: { kind: "request", isQuestion: false, replyExpected: "expected", confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "read_url",
+          confidence: 0.99,
+          query: null,
+          urlRef: "U1",
+          searchMode: null,
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+        capabilities: {
+          discussed: ["read_url"],
+          requestKind: "execute",
+          asksAboutAcoustics: false,
+          asksAboutAiIdentity: false,
+          asksForList: false,
+          confidence: 0.99,
+        },
+      }));
+      const explicit = createMessage(
+        "lobby",
+        human.id,
+        "@Mira @Sana läs https://example.com/explicit och säg vad som står",
+      );
+      store.addPublicMessage(explicit);
+      const explicitPending = handle([explicit]);
+      await vi.runAllTimersAsync();
+      await explicitPending;
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(read.mock.calls[1]?.[0]).not.toMatchObject({ initiator: "automatic" });
+      expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(generateScene.mock.calls[1]?.[0]).toMatchObject({
+        urlPublicationPolicy: "server_card",
+      });
+      const explicitScene = generateScene.mock.calls[1]![0];
+      expect(explicitScene.selected.map((persona) => persona.id)).toEqual(expect.arrayContaining(["ai-mira", "ai-sana"]));
+      expect(explicitScene.mustReplyIds).toEqual(expect.arrayContaining(["ai-mira", "ai-sana"]));
+      expect(store.getRecent("lobby", 20).filter((message) => message.authorId !== human.id))
+        .toHaveLength(1 + explicitScene.selected.length);
+      expect(emit.mock.calls.some(([event, payload]) =>
+        event === "typing:member" && payload?.active === true,
+      )).toBe(true);
+      director.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an unreadable automatic shared link completely silent", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-auto-link-failure",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const incoming = createMessage("lobby", human.id, "https://example.com/unreadable");
+      const store = new RoomStore("/tmp/director-auto-link-failure-unused.json");
+      store.addPublicMessage(incoming);
+      const emit = vi.fn();
+      const generateScene = vi.fn(async () => []);
+      const read = vi.fn(async () => undefined);
+      const search = vi.fn(async () => undefined);
+      const analyzeTurn = vi.fn(async () => createFailClosedTurnAnalysis("timeout"));
+      const pageReader = {
+        collectCandidates: vi.fn(() => ({
+          requestedAt: incoming.createdAt,
+          candidates: [{
+            id: "U1" as const,
+            raw: incoming.content,
+            url: new URL(incoming.content),
+            supported: true,
+            source: "message" as const,
+            messageId: incoming.id,
+            authorId: human.id,
+            createdAt: incoming.createdAt,
+          }],
+        })),
+        resolveTarget: vi.fn(() => ({
+          url: new URL(incoming.content),
+          requestedAt: incoming.createdAt,
+          intent: incoming.content,
+          retry: false,
+          source: "message" as const,
+        })),
+        read,
+      };
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          analyzeTurn,
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: search, researchSite: vi.fn(async () => undefined) } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        { pageReader: pageReader as never, autoSharedLinkDiscussionEnabled: true, rng: () => 0.99 },
+      );
+      await (director as unknown as {
+        handleHumanBurst: (items: typeof incoming[], member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      expect(read).toHaveBeenCalledWith(expect.objectContaining({ initiator: "automatic" }), human.id);
+      expect(search).not.toHaveBeenCalled();
+      expect(generateScene).not.toHaveBeenCalled();
+      expect(store.getRecent("lobby", 10)).toEqual([incoming]);
+      expect(emit.mock.calls.some(([event, payload]) =>
+        event === "typing:member" && payload?.active === true,
+      )).toBe(false);
+
+      analyzeTurn.mockResolvedValueOnce(classifiedTurn({
+        intent: { kind: "statement", isQuestion: false, replyExpected: "optional", confidence: 0.99 },
+        evidence: {
+          need: "optional",
+          action: "read_url",
+          confidence: 0.99,
+          query: null,
+          urlRef: "U1",
+          searchMode: null,
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+      }));
+      generateScene.mockImplementationOnce(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => [{
+        personaId: request.selected[0]!.id,
+        content: "Jag fick inte fram just den sidan den här gången.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const explicit = createMessage("lobby", human.id, "Läs https://example.com/unreadable om du kan");
+      store.addPublicMessage(explicit);
+      const explicitPending = (director as unknown as {
+        handleHumanBurst: (items: typeof incoming[], member: typeof human) => Promise<void>;
+      }).handleHumanBurst([explicit], human);
+      await vi.runAllTimersAsync();
+      await explicitPending;
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(read.mock.calls[1]?.[0]).not.toMatchObject({ initiator: "automatic" });
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(search).not.toHaveBeenCalled();
+      expect(store.getRecent("lobby", 10).at(-1)).toMatchObject({
+        content: "Jag fick inte fram just den sidan den här gången.",
+        replyToId: explicit.id,
+      });
+      director.stop();
     } finally {
       vi.useRealTimers();
     }
@@ -1796,7 +2182,7 @@ describe("social director", () => {
         requesterId: "ambient-research:ai-programming",
       }));
       expect(pageReader.read).toHaveBeenCalledWith(
-        expect.objectContaining({ url: new URL(sourceUrl), retry: false }),
+        expect.objectContaining({ url: new URL(sourceUrl), retry: false, initiator: "automatic" }),
         "ambient-research:ai-programming",
       );
       expect(lm.generateScene).toHaveBeenCalledWith(

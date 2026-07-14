@@ -78,6 +78,10 @@ export interface SocialSignals {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const choose = <T>(items: T[], rng = Math.random): T => items[Math.floor(rng() * items.length)] as T;
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+const AUTO_SHARED_LINK_WINDOW_MS = 60_000;
+const AUTO_SHARED_LINK_SUCCESS_COOLDOWN_MS = 20 * 60_000;
+const AUTO_SHARED_LINK_GLOBAL_LIMIT = 4;
+const AUTO_SHARED_LINK_STATE_LIMIT = 1_000;
 const boundedUntrustedText = (value: string, maxLength: number): string =>
   stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/g, " ")
@@ -596,9 +600,82 @@ export interface SocialDirectorOptions {
   autonomousResearchGlobalCooldownMs?: number;
   autonomousResearchChannelCooldownMs?: number;
   autonomousResearchHumanQuietMs?: number;
+  autoSharedLinkDiscussionEnabled?: boolean;
   pageReader?: PageReader;
   /** Live server-owned behavior settings; storage and authorization stay outside the director. */
   behaviorTuningProvider?: BehaviorTuningProvider;
+}
+
+export interface AutoSharedLinkDiscussionGate {
+  enabled: boolean;
+  now: number;
+  alreadyInFlight: boolean;
+  globalAttemptsInWindow: number;
+  lastRequesterAttemptAt?: number;
+  lastChannelAttemptAt?: number;
+  lastOriginAttemptAt?: number;
+  lastSuccessfulChannelUrlAt?: number;
+  modelConnected: boolean;
+  queueDepth: number;
+  availableMessageSlots: number;
+  voiceRoomActive: boolean;
+}
+
+/** A transport/pacing gate only; URL meaning and page contents never enter it. */
+export function shouldStartAutoSharedLinkDiscussion(gate: AutoSharedLinkDiscussionGate): boolean {
+  if (
+    !gate.enabled ||
+    gate.alreadyInFlight ||
+    !gate.modelConnected ||
+    gate.queueDepth !== 0 ||
+    gate.availableMessageSlots < 1 ||
+    gate.voiceRoomActive ||
+    gate.globalAttemptsInWindow >= AUTO_SHARED_LINK_GLOBAL_LIMIT
+  ) return false;
+  if (
+    gate.lastRequesterAttemptAt !== undefined &&
+    gate.now - gate.lastRequesterAttemptAt < AUTO_SHARED_LINK_WINDOW_MS
+  ) return false;
+  if (
+    gate.lastChannelAttemptAt !== undefined &&
+    gate.now - gate.lastChannelAttemptAt < AUTO_SHARED_LINK_WINDOW_MS
+  ) return false;
+  if (
+    gate.lastOriginAttemptAt !== undefined &&
+    gate.now - gate.lastOriginAttemptAt < AUTO_SHARED_LINK_WINDOW_MS
+  ) return false;
+  if (
+    gate.lastSuccessfulChannelUrlAt !== undefined &&
+    gate.now - gate.lastSuccessfulChannelUrlAt < AUTO_SHARED_LINK_SUCCESS_COOLDOWN_MS
+  ) return false;
+  return true;
+}
+
+/**
+ * Selects only the first supported URL actually visible in this exact latest
+ * human text. Preview/source metadata, prior burst messages, replies and recent
+ * history may all be present in the candidate set, but can never opt in here.
+ */
+export function selectAutoSharedLinkCandidate(
+  candidateSet: PageReadCandidateSet,
+  trigger: ChatMessage,
+  humanId: string,
+): PageReadCandidate | undefined {
+  if (trigger.authorId !== humanId || (trigger.attachments?.length ?? 0) > 0) return undefined;
+  return candidateSet.candidates
+    .flatMap((candidate) => {
+      if (
+        candidate.source !== "message" ||
+        candidate.messageId !== trigger.id ||
+        candidate.authorId !== humanId ||
+        !candidate.supported ||
+        !candidate.url ||
+        !candidate.raw
+      ) return [];
+      const visibleAt = trigger.content.indexOf(candidate.raw);
+      return visibleAt >= 0 ? [{ candidate, visibleAt }] : [];
+    })
+    .sort((a, b) => a.visibleAt - b.visibleAt)[0]?.candidate;
 }
 
 export interface AutonomousResearchGate {
@@ -1007,6 +1084,10 @@ export function pageEvidenceAnswerContract(_research?: ResearchPacket): string {
   return "Answer the human's actual request with at least one concrete detail supported by the supplied page. A generic acknowledgement, capability statement or title-only reaction is not an answer. When asked to compare or choose, identify the relevant supplied item and explain the choice only from supplied evidence.";
 }
 
+export function sharedLinkDiscussionContract(): string {
+  return "Make one concise, natural comment on the shared page with at least one concrete detail supported by S1 and one room-relevant reaction, implication or question. A title-only summary, generic acknowledgement, capability statement or tooling narration is not a response.";
+}
+
 export function evidenceFailureFallback(
   _pageRequested: boolean,
   _languageOrContent = "",
@@ -1021,6 +1102,10 @@ interface ClassifiedToolPlan {
   pageReadRequest?: PageReadRequest;
   searchRequest?: ResearchRequest;
   localDateTime?: LocalDateTimeResult;
+}
+
+interface AutoSharedLinkAttempt {
+  successfulChannelUrlKey: string;
 }
 
 const pageCandidateContext = (candidate: PageReadCandidate): string => {
@@ -1122,6 +1207,12 @@ export class SocialDirector {
   private readonly recentAutonomousResearchSeedsByChannel = new Map<string, string[]>();
   private readonly lastAutonomousResearchAtByChannel = new Map<string, number>();
   private readonly autonomousResearchAttemptTimestamps: number[] = [];
+  private readonly claimedAutoSharedLinkMessageIds = new Set<string>();
+  private readonly autoSharedLinkAttemptTimestamps: number[] = [];
+  private readonly lastAutoSharedLinkAttemptAtByRequester = new Map<string, number>();
+  private readonly lastAutoSharedLinkAttemptAtByChannel = new Map<string, number>();
+  private readonly lastAutoSharedLinkAttemptAtByOrigin = new Map<string, number>();
+  private readonly lastSuccessfulAutoSharedLinkAtByChannelUrl = new Map<string, number>();
   private ambientTimer?: NodeJS.Timeout;
   private readonly channelEpoch = new Map<string, number>();
   private catalogEpoch = 0;
@@ -1132,6 +1223,7 @@ export class SocialDirector {
   private stopped = false;
   private voiceRoomActive = false;
   private consideredConversationInFlight = false;
+  private autoSharedLinkDiscussionInFlight = false;
   private lastConsideredConversationAt?: number;
   private lastHumanActivityAt?: number;
   private lastWelcomeTemporalCueAt?: number;
@@ -1151,6 +1243,7 @@ export class SocialDirector {
   private readonly autonomousResearchGlobalCooldownMs: number;
   private readonly autonomousResearchChannelCooldownMs: number;
   private readonly autonomousResearchHumanQuietMs: number;
+  private readonly autoSharedLinkDiscussionEnabled: boolean;
   private readonly pageReader: PageReader;
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
   private lastAutonomousResearchAt?: number;
@@ -1204,6 +1297,8 @@ export class SocialDirector {
       60_000,
       options.autonomousResearchHumanQuietMs ?? 3 * 60_000,
     );
+    this.autoSharedLinkDiscussionEnabled = options.autoSharedLinkDiscussionEnabled
+      ?? process.env.AUTO_DISCUSS_SHARED_LINKS === "true";
   }
 
   start(): void {
@@ -1500,6 +1595,92 @@ export class SocialDirector {
     return {};
   }
 
+  private claimAutoSharedLinkMessage(messageId: string): boolean {
+    if (this.claimedAutoSharedLinkMessageIds.has(messageId)) return false;
+    this.claimedAutoSharedLinkMessageIds.add(messageId);
+    while (this.claimedAutoSharedLinkMessageIds.size > AUTO_SHARED_LINK_STATE_LIMIT) {
+      const oldest = this.claimedAutoSharedLinkMessageIds.values().next().value as string | undefined;
+      if (!oldest) break;
+      this.claimedAutoSharedLinkMessageIds.delete(oldest);
+    }
+    return true;
+  }
+
+  private pruneAutoSharedLinkState(now: number): void {
+    while (
+      this.autoSharedLinkAttemptTimestamps[0] !== undefined &&
+      now - this.autoSharedLinkAttemptTimestamps[0] >= AUTO_SHARED_LINK_WINDOW_MS
+    ) this.autoSharedLinkAttemptTimestamps.shift();
+    const prune = (values: Map<string, number>, maxAgeMs: number): void => {
+      for (const [key, timestamp] of values) {
+        if (now - timestamp >= maxAgeMs) values.delete(key);
+      }
+      while (values.size > AUTO_SHARED_LINK_STATE_LIMIT) {
+        const oldest = values.keys().next().value as string | undefined;
+        if (!oldest) break;
+        values.delete(oldest);
+      }
+    };
+    prune(this.lastAutoSharedLinkAttemptAtByRequester, AUTO_SHARED_LINK_WINDOW_MS);
+    prune(this.lastAutoSharedLinkAttemptAtByChannel, AUTO_SHARED_LINK_WINDOW_MS);
+    prune(this.lastAutoSharedLinkAttemptAtByOrigin, AUTO_SHARED_LINK_WINDOW_MS);
+    prune(this.lastSuccessfulAutoSharedLinkAtByChannelUrl, AUTO_SHARED_LINK_SUCCESS_COOLDOWN_MS);
+  }
+
+  private setBoundedAutoSharedLinkTimestamp(values: Map<string, number>, key: string, now: number): void {
+    values.delete(key);
+    values.set(key, now);
+    while (values.size > AUTO_SHARED_LINK_STATE_LIMIT) {
+      const oldest = values.keys().next().value as string | undefined;
+      if (!oldest) break;
+      values.delete(oldest);
+    }
+  }
+
+  private reserveAutoSharedLinkAttempt(input: {
+    requesterId: string;
+    channelId: string;
+    url: URL;
+  }): AutoSharedLinkAttempt | undefined {
+    const now = this.now();
+    this.pruneAutoSharedLinkState(now);
+    const canonical = new URL(input.url);
+    canonical.hash = "";
+    const canonicalUrl = canonical.toString();
+    const origin = input.url.origin;
+    const successfulChannelUrlKey = `${input.channelId}\u0000${canonicalUrl}`;
+    const health = this.lm.health();
+    if (!shouldStartAutoSharedLinkDiscussion({
+      enabled: this.autoSharedLinkDiscussionEnabled,
+      now,
+      alreadyInFlight: this.autoSharedLinkDiscussionInFlight,
+      globalAttemptsInWindow: this.autoSharedLinkAttemptTimestamps.length,
+      lastRequesterAttemptAt: this.lastAutoSharedLinkAttemptAtByRequester.get(input.requesterId),
+      lastChannelAttemptAt: this.lastAutoSharedLinkAttemptAtByChannel.get(input.channelId),
+      lastOriginAttemptAt: this.lastAutoSharedLinkAttemptAtByOrigin.get(origin),
+      lastSuccessfulChannelUrlAt: this.lastSuccessfulAutoSharedLinkAtByChannelUrl.get(successfulChannelUrlKey),
+      modelConnected: health.connected,
+      queueDepth: health.queueDepth,
+      availableMessageSlots: this.availableMessageSlots(now),
+      voiceRoomActive: this.voiceRoomActive,
+    })) return undefined;
+
+    this.autoSharedLinkDiscussionInFlight = true;
+    this.autoSharedLinkAttemptTimestamps.push(now);
+    this.setBoundedAutoSharedLinkTimestamp(this.lastAutoSharedLinkAttemptAtByRequester, input.requesterId, now);
+    this.setBoundedAutoSharedLinkTimestamp(this.lastAutoSharedLinkAttemptAtByChannel, input.channelId, now);
+    this.setBoundedAutoSharedLinkTimestamp(this.lastAutoSharedLinkAttemptAtByOrigin, origin, now);
+    return { successfulChannelUrlKey };
+  }
+
+  private recordSuccessfulAutoSharedLink(attempt: AutoSharedLinkAttempt): void {
+    this.setBoundedAutoSharedLinkTimestamp(
+      this.lastSuccessfulAutoSharedLinkAtByChannelUrl,
+      attempt.successfulChannelUrlKey,
+      this.now(),
+    );
+  }
+
   private applyClassifiedMemoryChanges(
     items: MemoryAnalysis["items"],
     humanId: string,
@@ -1663,6 +1844,7 @@ export class SocialDirector {
           actorChannelNotes: this.actorChannels.promptNotes([persona]),
           research,
           evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
           requestedClock: toolPlan.localDateTime,
           temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
           temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
@@ -1741,6 +1923,9 @@ export class SocialDirector {
       replyTargetFor: (candidate) => candidate.replyToId ? this.store.getMessage(candidate.replyToId) : undefined,
       now: this.now(),
     });
+    const structuralAutoCandidate = this.autoSharedLinkDiscussionEnabled
+      ? selectAutoSharedLinkCandidate(candidateSet, trigger, human.id)
+      : undefined;
     const initialCandidates = this.actorChannels.candidatesFor(trigger.channelId);
     const analysis = await this.analyzeHumanTurn({
       medium: "public",
@@ -1762,7 +1947,11 @@ export class SocialDirector {
     if (trustedLanguage) this.lastTrustedLanguageByChannel.set(trigger.channelId, trustedLanguage);
     const mechanicalSignals = analyzeSocialSignals(combined);
     const deterministicAddressedIds = addressedPersonaIds(mechanicalSignals.mentionedIds, replyTarget);
-    if (analysis.source !== "lm" && deterministicAddressedIds.length === 0) {
+    if (
+      analysis.source !== "lm" &&
+      deterministicAddressedIds.length === 0 &&
+      !structuralAutoCandidate
+    ) {
       // Without semantic routing we cannot safely infer relevance, moderation,
       // question intent or social dynamics. Exact @mentions/replies may still
       // use the scene model, but an ordinary public turn stays quiet instead of
@@ -1804,8 +1993,47 @@ export class SocialDirector {
       )[0];
       if (mostRelevant) selected = [mostRelevant];
     }
-    const toolPlan = this.classifiedToolPlan(analysis, candidateSet, combined, human.id);
-    const networkEvidenceRequested = Boolean(toolPlan.pageReadRequest || toolPlan.searchRequest);
+    const classifiedToolPlan = this.classifiedToolPlan(analysis, candidateSet, combined, human.id);
+    let toolPlan = classifiedToolPlan;
+    let autoSharedLinkAttempt: AutoSharedLinkAttempt | undefined;
+    if (
+      structuralAutoCandidate &&
+      !classifiedToolPlan.pageReadRequest &&
+      !classifiedToolPlan.searchRequest &&
+      !classifiedToolPlan.localDateTime
+    ) {
+      // A claimed passive link never falls through into an ungrounded normal
+      // scene, even when a duplicate delivery or hard pacing gate rejects it.
+      if (!this.claimAutoSharedLinkMessage(trigger.id)) {
+        this.schedulePersistentMemory(messages, human);
+        return;
+      }
+      const resolvedPageReadRequest = this.pageReader.resolveTarget({
+        candidateSet,
+        targetRef: structuralAutoCandidate.id,
+        intent: trigger.content,
+        retry: false,
+      });
+      const pageReadRequest = resolvedPageReadRequest
+        ? { ...resolvedPageReadRequest, initiator: "automatic" as const }
+        : undefined;
+      if (!pageReadRequest?.url) {
+        this.schedulePersistentMemory(messages, human);
+        return;
+      }
+      autoSharedLinkAttempt = this.reserveAutoSharedLinkAttempt({
+        requesterId: human.id,
+        channelId: trigger.channelId,
+        url: pageReadRequest.url,
+      });
+      if (!autoSharedLinkAttempt) {
+        this.schedulePersistentMemory(messages, human);
+        return;
+      }
+      toolPlan = { pageReadRequest };
+    }
+    try {
+      const networkEvidenceRequested = Boolean(toolPlan.pageReadRequest || toolPlan.searchRequest);
     const evidenceRequested = networkEvidenceRequested || Boolean(toolPlan.localDateTime);
     let evidenceResponder: Persona | undefined;
     if (evidenceRequested) {
@@ -1818,6 +2046,7 @@ export class SocialDirector {
       );
       selected = evidenceSelection.selected;
       evidenceResponder = evidenceSelection.responder;
+      if (autoSharedLinkAttempt && evidenceResponder) selected = [evidenceResponder];
     }
     selected = [...new Map(selected.map((persona) => [persona.id, persona])).values()].slice(0, 3);
     const requestOwner = responseExpected
@@ -1829,7 +2058,7 @@ export class SocialDirector {
     const relationshipNotes = this.relationshipNotes(selected, human);
     for (const persona of selected) this.updateRelationship(persona.id, human.id, signals, 0.04);
     for (const persona of selected) this.actorChannels.markRead(persona.id, trigger.channelId, trigger.id);
-    const reactionCount = this.scheduleCrowdReactions(trigger, signals, selected);
+    const reactionCount = autoSharedLinkAttempt ? 0 : this.scheduleCrowdReactions(trigger, signals, selected);
     let triggerType: DirectorEvent["trigger"] = signals.mentionedIds.length ? "mention" : "message";
 
     if (selected.length === 0) {
@@ -1844,7 +2073,10 @@ export class SocialDirector {
       this.schedulePersistentMemory(messages, human);
       return;
     }
-    for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, true);
+    let primaryTypingVisible = !autoSharedLinkAttempt;
+    if (primaryTypingVisible) {
+      for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, true);
+    }
     const generatedAt = this.now();
     const humanizerBudget = { repairsRemaining: 1 };
     const conductIds = conductResponderIds(selected, signals);
@@ -1869,10 +2101,29 @@ export class SocialDirector {
           toolPlan.searchRequest,
           human.id,
         );
+        if (autoSharedLinkAttempt && !research) {
+          // Passive-link failures are intentionally silent. They never turn
+          // into a search, a capability apology or an ungrounded normal reply.
+          this.schedulePersistentMemory(messages, human);
+          return;
+        }
+        if (
+          autoSharedLinkAttempt &&
+          (!burstIsCurrent() || this.voiceRoomActive || !this.canSpeak())
+        ) {
+          this.schedulePersistentMemory(messages, human);
+          return;
+        }
+        if (autoSharedLinkAttempt) {
+          for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, true);
+          primaryTypingVisible = true;
+        }
         if (research) triggerType = "research";
         evidencePremise = toolPlan.pageReadRequest
           ? research
-            ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound linked page and is solely responsible for answering from the supplied page evidence. ${pageEvidenceAnswerContract(research)} Attach S1 to every message that relies on the page.`
+            ? autoSharedLinkAttempt
+              ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound page that the human just shared and is solely responsible for one grounded response. ${sharedLinkDiscussionContract()} Attach S1 to the response.`
+              : `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound linked page and is solely responsible for answering from the supplied page evidence. ${pageEvidenceAnswerContract(research)} Attach S1 to every message that relies on the page.`
             : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific server-bound linked-page attempt returned no readable evidence. It is a temporary result; nobody guesses contents or invents a cause.`
           : research
             ? `${evidenceResponder?.name ?? "The designated resident"} ran the classifier's standalone fresh-data query and is responsible for the sourced answer. Attach only source IDs that support each claim; result rank alone is never an answer.`
@@ -1915,6 +2166,7 @@ export class SocialDirector {
           visualObservation,
           research,
           evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
           requestedClock: toolPlan.localDateTime,
           temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
           temporalSurfaceActorId: toolPlan.localDateTime ? evidenceResponder?.id : undefined,
@@ -1925,7 +2177,9 @@ export class SocialDirector {
     } catch (error) {
       console.warn("Public scene failed:", error instanceof Error ? error.message : error);
     } finally {
-      for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, false);
+      if (primaryTypingVisible) {
+        for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, false);
+      }
     }
 
     if (!burstIsCurrent()) {
@@ -1961,6 +2215,7 @@ export class SocialDirector {
             visualObservation,
             research,
             evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+            urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
             requestedClock: toolPlan.localDateTime,
             temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
             temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
@@ -2037,7 +2292,11 @@ export class SocialDirector {
       const persona = selected.find((candidate) => candidate.id === line.personaId);
       if (!persona) continue;
       await delay(index === 0 ? 350 : 1_200 + Math.random() * 1_600);
-      if (!burstIsCurrent() || !this.canSpeak()) break;
+      if (
+        !burstIsCurrent() ||
+        !this.canSpeak() ||
+        (autoSharedLinkAttempt && this.voiceRoomActive)
+      ) break;
       const publishedSourceIds = sourceIdsForPageResponder(
         research,
         line.sourceIds,
@@ -2072,6 +2331,9 @@ export class SocialDirector {
         }
       }
     }
+    if (autoSharedLinkAttempt && research?.kind === "page" && publishedResponses.length > 0) {
+      this.recordSuccessfulAutoSharedLink(autoSharedLinkAttempt);
+    }
     if (burstIsCurrent()) {
       this.rememberHumanTopicForAmbientContinuation({
         trigger,
@@ -2082,6 +2344,9 @@ export class SocialDirector {
       });
     }
     this.schedulePersistentMemory(messages, human);
+    } finally {
+      if (autoSharedLinkAttempt) this.autoSharedLinkDiscussionInFlight = false;
+    }
   }
 
   private scheduleCrowdReactions(message: ChatMessage, signals: SocialSignals, responders: Persona[]): number {
@@ -2535,6 +2800,7 @@ export class SocialDirector {
         intent: seed.discussionAngle,
         retry: false,
         source: "message",
+        initiator: "automatic",
       }, requesterId).catch((error) => {
         console.warn("Autonomous source read failed safely:", error instanceof Error ? error.message : error);
         return undefined;

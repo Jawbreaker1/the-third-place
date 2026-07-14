@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ChatMessage } from "../shared/types.js";
 import {
   collectPageReadCandidates,
@@ -341,6 +341,97 @@ describe("page reader broker", () => {
       title: "Structured source",
       url: "https://structured.example/overview",
     });
+  });
+
+  it("partitions automatic cache and in-flight reads from explicit reads", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-14T12:00:00.000Z"));
+    try {
+      let releaseFetches!: () => void;
+      const fetchGate = new Promise<void>((resolve) => {
+        releaseFetches = resolve;
+      });
+      const observedPolicies: Array<{ sameOriginRedirectsOnly?: boolean }> = [];
+      const reader = new PageReader(async (rawUrl, fetchPolicy) => {
+        observedPolicies.push(fetchPolicy);
+        await fetchGate;
+        return {
+          finalUrl: new URL(String(rawUrl)),
+          mediaType: "text/html",
+          contentType: "text/html",
+          body: Buffer.from(`<article><h1>Shared report</h1><p>${"One bounded fact from the shared report. ".repeat(8)}</p></article>`),
+        };
+      });
+      const request = classifiedRequest({ content: "https://news.example/shared", requesterId: "guest-1" })!;
+
+      const explicit = reader.read(request, "guest-1");
+      const automatic = reader.read({ ...request, initiator: "automatic" }, "guest-1");
+      expect(observedPolicies).toHaveLength(2);
+      expect(observedPolicies[0]?.sameOriginRedirectsOnly).toBeUndefined();
+      expect(observedPolicies[1]?.sameOriginRedirectsOnly).toBe(true);
+
+      releaseFetches();
+      const [explicitPacket, automaticPacket] = await Promise.all([explicit, automatic]);
+      expect(explicitPacket?.results[0]?.title).toBe("Shared report");
+      expect(automaticPacket?.results[0]?.title).toBe("Shared report");
+
+      // Clear the one-minute transport quota while remaining well inside the
+      // successful evidence cache's twenty-minute TTL. A missing cache can no
+      // longer look green merely because reserve() refused another fetch.
+      vi.setSystemTime(new Date(Date.now() + 61_000));
+      const explicitCached = await reader.read({ ...request, initiator: "explicit" }, "guest-1");
+      const automaticCached = await reader.read({ ...request, initiator: "automatic" }, "guest-1");
+      expect(explicitCached?.results[0]?.title).toBe("Shared report");
+      expect(automaticCached?.results[0]?.title).toBe("Shared report");
+      expect(observedPolicies).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("enforces automatic redirect confinement inside provider adapters", async () => {
+    const observedPolicies: Array<{ sameOriginRedirectsOnly?: boolean }> = [];
+    const provider: PageProviderAdapter = {
+      id: "fetching-structured-source",
+      supports: (url) => url.hostname === "structured.example",
+      read: async ({ fetcher, requestedUrl }) => {
+        const result = await fetcher(requestedUrl, {
+          timeoutMs: 1_000,
+          maxRedirects: 1,
+          maxBodyBytes: 1_024,
+          acceptedMediaTypes: ["text/plain"],
+          acceptHeader: "text/plain",
+          userAgent: "provider-test",
+        });
+        return result
+          ? {
+              retrievedAt: "2026-07-14T12:00:00.000Z",
+              result: {
+                id: "S1",
+                title: "Structured source",
+                url: requestedUrl.toString(),
+                snippet: result.body.toString(),
+              },
+            }
+          : undefined;
+      },
+    };
+    const reader = new PageReader(
+      async (rawUrl, fetchPolicy) => {
+        observedPolicies.push(fetchPolicy);
+        return {
+          finalUrl: new URL(String(rawUrl)),
+          mediaType: "text/plain",
+          contentType: "text/plain",
+          body: Buffer.from("Bounded provider evidence"),
+        };
+      },
+      new PageProviderRegistry([provider]),
+    );
+    const request = classifiedRequest({ content: "https://structured.example/overview", requesterId: "guest-1" })!;
+    await reader.read({ ...request, initiator: "automatic" }, "guest-1");
+    expect(observedPolicies).toHaveLength(1);
+    expect(observedPolicies[0]?.sameOriginRedirectsOnly).toBe(true);
   });
 
   it("uses typed retry metadata to bypass only a cached transient failure", async () => {

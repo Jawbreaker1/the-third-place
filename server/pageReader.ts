@@ -26,6 +26,8 @@ interface ParsedNode {
   value?: string;
 }
 
+export type PageReadInitiator = "explicit" | "automatic";
+
 export interface PageReadRequest {
   url?: URL;
   rejection?: "unsupported-url";
@@ -33,6 +35,8 @@ export interface PageReadRequest {
   intent: string;
   retry: boolean;
   source: "message" | "reply" | "recent";
+  /** Defaults to explicit so existing human-requested reads retain their behavior. */
+  initiator?: PageReadInitiator;
 }
 
 export type PageReadCandidateId = `U${number}`;
@@ -539,7 +543,8 @@ export class PageReader {
   async read(request: PageReadRequest, requesterId: string): Promise<ResearchPacket | undefined> {
     if (process.env.LINK_READER_ENABLED === "false" || !request.url) return undefined;
     const requestedUrl = request.url;
-    const key = `${requesterId}\u0000${requestedUrl.toString()}`;
+    const initiator = request.initiator ?? "explicit";
+    const key = `${initiator}\u0000${requesterId}\u0000${requestedUrl.toString()}`;
     this.prune();
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
@@ -551,9 +556,12 @@ export class PageReader {
     if (this.activeRequests >= 2 || !this.reserve(requesterId, requestedUrl.origin)) return undefined;
     this.activeRequests += 1;
     const provider = this.providers.supporting(requestedUrl);
+    const fetcher: PageProviderFetcher = initiator === "automatic"
+      ? (rawUrl, policy) => this.fetcher(rawUrl, { ...policy, sameOriginRedirectsOnly: true })
+      : this.fetcher;
     const evidenceRequest: Promise<PageProviderEvidence | undefined> = provider
-      ? provider.read({ fetcher: this.fetcher, requestedUrl })
-      : this.fetcher(requestedUrl, readerPolicy).then((result) => {
+      ? provider.read({ fetcher, requestedUrl })
+      : fetcher(requestedUrl, readerPolicy).then((result) => {
         if (!result) return undefined;
         const extracted = extractReadablePage(result.body, result.mediaType, result.finalUrl, result.contentType);
         if (!extracted) return undefined;

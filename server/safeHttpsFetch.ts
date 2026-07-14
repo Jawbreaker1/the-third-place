@@ -15,6 +15,8 @@ export interface SafeHttpsFetchPolicy {
   acceptedMediaTypes: readonly string[];
   acceptHeader: string;
   userAgent: string;
+  /** Reject redirects whose destination has a different origin from the requested URL. */
+  sameOriginRedirectsOnly?: boolean;
   /** Stop after this short case-insensitive ASCII delimiter has arrived. */
   stopAfterAsciiSequence?: string;
 }
@@ -82,6 +84,7 @@ const normalizedPolicy = (policy: SafeHttpsFetchPolicy): SafeHttpsFetchPolicy =>
   acceptedMediaTypes: [...new Set(policy.acceptedMediaTypes.map((value) => value.trim().toLocaleLowerCase()).filter(Boolean))],
   acceptHeader: policy.acceptHeader.slice(0, 512),
   userAgent: policy.userAgent.slice(0, 160),
+  ...(policy.sameOriginRedirectsOnly === true ? { sameOriginRedirectsOnly: true } : {}),
   ...(policy.stopAfterAsciiSequence && /^[\x20-\x7e]{1,64}$/u.test(policy.stopAfterAsciiSequence)
     ? { stopAfterAsciiSequence: policy.stopAfterAsciiSequence.toLocaleLowerCase() }
     : {}),
@@ -369,6 +372,7 @@ export const fetchPublicHttps = async (
     }
     const validated = validatePublicHttpsUrl(redirected.toString());
     if (!validated) return undefined;
+    if (policy.sameOriginRedirectsOnly && validated.origin !== startUrl.origin) return undefined;
     current = validated;
   }
   return undefined;

@@ -165,6 +165,40 @@ describe("safe HTTPS fetch", () => {
     expect(result?.finalUrl.toString()).toBe("https://second.example/final");
   });
 
+  it("optionally confines redirects to the originally requested origin", async () => {
+    const crossOriginRequests: string[] = [];
+    const crossOriginResult = await fetchPublicHttps(
+      "https://first.example/start",
+      { ...policy, sameOriginRedirectsOnly: true },
+      {
+        lookupImpl: publicLookup,
+        requestHop: async (url) => {
+          crossOriginRequests.push(url.toString());
+          return { redirect: "https://second.example/final" };
+        },
+      },
+    );
+    expect(crossOriginResult).toBeUndefined();
+    expect(crossOriginRequests).toEqual(["https://first.example/start"]);
+
+    const sameOriginRequests: string[] = [];
+    const sameOriginResult = await fetchPublicHttps(
+      "https://first.example/start",
+      { ...policy, sameOriginRedirectsOnly: true },
+      {
+        lookupImpl: publicLookup,
+        requestHop: async (url) => {
+          sameOriginRequests.push(url.toString());
+          return url.pathname === "/start"
+            ? { redirect: "/final" }
+            : { body: Buffer.from("ok"), mediaType: "text/plain", contentType: "text/plain" };
+        },
+      },
+    );
+    expect(sameOriginRequests).toEqual(["https://first.example/start", "https://first.example/final"]);
+    expect(sameOriginResult?.finalUrl.toString()).toBe("https://first.example/final");
+  });
+
   it("re-resolves the same hostname after a redirect and blocks a DNS rebinding answer", async () => {
     let lookups = 0;
     let requests = 0;
