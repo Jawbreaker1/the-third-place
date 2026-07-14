@@ -24,6 +24,7 @@ import {
   socialSignalsFromTurnAnalysis,
   SocialDirector,
   shouldRejectPublicCandidate,
+  shouldSurfaceTemporalCue,
   shouldStartConsideredConversation,
   sourceIdsForPageResponder,
   trailingAiMessageCount,
@@ -241,8 +242,15 @@ describe("social director", () => {
           locationLabel: "Sverige",
         },
       }));
-      const generateScene = vi.fn(async (request: { premise?: string }) => {
-        expect(request.premise).toContain("00:20:30");
+      const generateScene = vi.fn(async (request: {
+        premise?: string;
+        requestedClock?: { formatted: string; timeZone: string };
+        temporalPolicy?: string;
+      }) => {
+        expect(request.premise).not.toContain("Trusted server clock result");
+        expect(request.requestedClock?.formatted).toContain("00:20:30");
+        expect(request.requestedClock?.timeZone).toBe("Europe/Stockholm");
+        expect(request.temporalPolicy).toBe("direct_answer");
         return [{ personaId: persona.id, content: "Klockan är 00:20 i Sverige.", source: "lm" as const, sourceIds: [] }];
       });
       const research = vi.fn(async () => undefined);
@@ -944,6 +952,31 @@ describe("social director", () => {
     }), [], analyzeSocialSignals("Mon colis est arrivé aujourd’hui"));
     expect(strong.claimStrength).toBeGreaterThan(0.28);
     expect(weak.claimStrength).toBeLessThan(0.28);
+  });
+
+  it("gates optional temporal cues by chance and cooldown without reading message vocabulary", () => {
+    const now = 2_000_000;
+    expect(shouldSurfaceTemporalCue({
+      now,
+      cooldownMs: 600_000,
+      chance: 0.32,
+      rng: () => 0.31,
+    })).toBe(true);
+    expect(shouldSurfaceTemporalCue({
+      now,
+      cooldownMs: 600_000,
+      chance: 0.32,
+      rng: () => 0.32,
+    })).toBe(false);
+    let rolls = 0;
+    expect(shouldSurfaceTemporalCue({
+      now,
+      lastSurfacedAt: now - 599_999,
+      cooldownMs: 600_000,
+      chance: 1,
+      rng: () => { rolls += 1; return 0; },
+    })).toBe(false);
+    expect(rolls).toBe(0);
   });
 
   it("opens a considered beat only on the rare roll after quiet and cooldown", () => {

@@ -639,10 +639,13 @@ describe("VoiceDirector", () => {
 
     let analyzerInput: TurnAnalysisInput | undefined;
     let scenePremise = "";
+    let requestedClock: { formatted: string; timeZone: string } | undefined;
+    let temporalPolicy: string | undefined;
     const speeches: Array<Record<string, unknown>> = [];
+    let now = Date.parse("2026-07-14T12:00:00.000Z");
     const director = new VoiceDirector({
       runtime,
-      now: () => Date.parse("2026-07-14T12:00:00.000Z"),
+      now: () => now,
       lm: {
         analyzeTurn: async (input) => {
           analyzerInput = input;
@@ -663,6 +666,9 @@ describe("VoiceDirector", () => {
         },
         generateScene: async (request) => {
           scenePremise = request.premise ?? "";
+          requestedClock = request.requestedClock;
+          temporalPolicy = request.temporalPolicy;
+          now += 90_000;
           return [];
         },
       },
@@ -688,9 +694,12 @@ describe("VoiceDirector", () => {
     await settle();
 
     expect(analyzerInput?.availableCapabilities).toEqual(["local_datetime"]);
-    expect(scenePremise).toContain("Trusted server clock result");
+    expect(scenePremise).toContain("trustedTemporalContext.requestedClock");
+    expect(requestedClock?.timeZone).toBe("Europe/Stockholm");
+    expect(requestedClock?.formatted).toContain("14:00:00");
+    expect(temporalPolicy).toBe("direct_answer");
     expect(speeches[0]).toMatchObject({ language: "fr-FR" });
-    expect(String(speeches[0]?.text)).toContain("14:00:00");
+    expect(String(speeches[0]?.text)).toContain("14:01:30");
   });
 
   it("aborts the previous room generation when a newer human utterance arrives", async () => {

@@ -15,7 +15,7 @@ import {
 } from "./semanticRouter.js";
 import type { VoiceRoomRuntime } from "./voiceRooms.js";
 import { ttsLanguageIsSupported, type VoiceSpeechService } from "./voiceSpeech.js";
-import { resolveLocalDateTime } from "./timeResolver.js";
+import { refreshLocalDateTime, resolveLocalDateTime } from "./timeResolver.js";
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 
 export interface VoiceAiSpeechPayload {
@@ -325,7 +325,7 @@ export class VoiceDirector {
           ? `asksAboutAcoustics=${trusted.asksAboutAcoustics}`
           : "",
         localDateTime
-          ? `${localDateTime.promptFact} Answer from this server clock fact without estimating.`
+          ? "The latest utterance explicitly requests current date/time; answer from trustedTemporalContext.requestedClock without estimating."
           : "",
       ].filter(Boolean);
       const semanticPremise = trustedSemanticFacts.length > 0
@@ -338,7 +338,7 @@ export class VoiceDirector {
           channelName: CHANNELS.find((channel) => channel.id === room.channelId)?.name ?? room.channelId,
           selected: [persona],
           history: transcriptFor(this.options.runtime.getTranscript(room.id), persona.id),
-          trigger: { author: entry.speakerName, content: entry.text, messageId: entry.id },
+          trigger: { author: entry.speakerName, content: entry.text, messageId: entry.id, createdAt: entry.endedAt },
           mustReplyIds: [persona.id],
           languageHint: routedLanguageHint(utteranceLanguage),
           semanticContext: {
@@ -360,6 +360,9 @@ export class VoiceDirector {
             })),
           },
           ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
+          requestedClock: localDateTime,
+          temporalPolicy: localDateTime ? "direct_answer" : "reactive_only",
+          temporalSurfaceActorId: localDateTime ? persona.id : undefined,
           premise: `${persona.name} has joined an active multi-participant voice call. Answer the newest complete human utterance once, conversationally. The reply will be spoken aloud; do not narrate actions or produce another speaker. ${semanticPremise}`,
         },
         0,
@@ -373,7 +376,12 @@ export class VoiceDirector {
     } finally {
       if (this.generationAbortByRoom.get(room.id) === generationAbort) this.generationAbortByRoom.delete(room.id);
     }
-    if (!spoken && localDateTime) spoken = sanitizeSpokenLine(localDateTime.fallbackText, utteranceLanguage);
+    if (!spoken && localDateTime) {
+      spoken = sanitizeSpokenLine(
+        refreshLocalDateTime(localDateTime, new Date(this.now())).fallbackText,
+        utteranceLanguage,
+      );
+    }
     if (!spoken || !this.isCurrent(room.id, epoch, persona.id)) {
       if (this.isCurrent(room.id, epoch, persona.id)) this.setBotState(room.id, persona.id, "listening");
       return;

@@ -43,7 +43,7 @@ import {
   type TurnAnalysis,
   type TurnAnalysisInput,
 } from "./semanticRouter.js";
-import { resolveLocalDateTime, type LocalDateTimeResult } from "./timeResolver.js";
+import { refreshLocalDateTime, resolveLocalDateTime, type LocalDateTimeResult } from "./timeResolver.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -456,7 +456,25 @@ export interface SocialDirectorOptions {
   consideredConversationChance?: number;
   consideredConversationCooldownMs?: number;
   consideredConversationHumanQuietMs?: number;
+  welcomeTemporalCueChance?: number;
+  ambientTemporalCueChance?: number;
+  welcomeTemporalCueCooldownMs?: number;
+  ambientTemporalCueCooldownMs?: number;
   pageReader?: PageReader;
+}
+
+export interface TemporalCueGate {
+  now: number;
+  lastSurfacedAt?: number;
+  cooldownMs: number;
+  chance: number;
+  rng: () => number;
+}
+
+/** Language-neutral gate: policy decides whether the model may surface time, never text matching. */
+export function shouldSurfaceTemporalCue(gate: TemporalCueGate): boolean {
+  if (gate.lastSurfacedAt !== undefined && gate.now - gate.lastSurfacedAt < gate.cooldownMs) return false;
+  return gate.rng() < clamp(gate.chance, 0, 1);
 }
 
 /**
@@ -816,11 +834,17 @@ export class SocialDirector {
   private consideredConversationInFlight = false;
   private lastConsideredConversationAt?: number;
   private lastHumanActivityAt?: number;
+  private lastWelcomeTemporalCueAt?: number;
+  private lastAmbientTemporalCueAt?: number;
   private readonly rng: () => number;
   private readonly now: () => number;
   private readonly consideredConversationChance: number;
   private readonly consideredConversationCooldownMs: number;
   private readonly consideredConversationHumanQuietMs: number;
+  private readonly welcomeTemporalCueChance: number;
+  private readonly ambientTemporalCueChance: number;
+  private readonly welcomeTemporalCueCooldownMs: number;
+  private readonly ambientTemporalCueCooldownMs: number;
   private readonly pageReader: PageReader;
 
   constructor(
@@ -851,6 +875,10 @@ export class SocialDirector {
       15_000,
       options.consideredConversationHumanQuietMs ?? 75_000,
     );
+    this.welcomeTemporalCueChance = clamp(options.welcomeTemporalCueChance ?? 0.32, 0, 1);
+    this.ambientTemporalCueChance = clamp(options.ambientTemporalCueChance ?? 0.08, 0, 1);
+    this.welcomeTemporalCueCooldownMs = Math.max(60_000, options.welcomeTemporalCueCooldownMs ?? 15 * 60_000);
+    this.ambientTemporalCueCooldownMs = Math.max(60_000, options.ambientTemporalCueCooldownMs ?? 20 * 60_000);
   }
 
   start(): void {
@@ -889,6 +917,14 @@ export class SocialDirector {
     this.channelEpoch.set("lobby", (this.channelEpoch.get("lobby") ?? 0) + 1);
     const candidates = PERSONAS.filter((persona) => persona.warmth > 0.7 && persona.id !== "ai-runa");
     const persona = choose(candidates);
+    const temporalWelcome = shouldSurfaceTemporalCue({
+      now: arrivalAt,
+      lastSurfacedAt: this.lastWelcomeTemporalCueAt,
+      cooldownMs: this.welcomeTemporalCueCooldownMs,
+      chance: this.welcomeTemporalCueChance,
+      rng: this.rng,
+    });
+    if (temporalWelcome) this.lastWelcomeTemporalCueAt = arrivalAt;
     this.publishDirectorEvent({
       trigger: "join",
       summary: `${persona.name} noticed ${human.name} ${returning ? "return" : "arrive"}; the rest kept talking.`,
@@ -915,6 +951,7 @@ export class SocialDirector {
             content: returning
               ? `${human.name} returned after a genuinely separate visit.`
               : `${human.name} just joined the community.`,
+            createdAt: new Date(arrivalAt).toISOString(),
           },
           premise: returning
             ? `Give ${human.name} one light, character-specific welcome back. Recognition may be subtle. Use at most one remembered detail only if it fits naturally; never recite memory or make them the center of a parade.`
@@ -924,6 +961,8 @@ export class SocialDirector {
           relationshipNotes: this.relationshipNotes([persona], human),
           actorChannelNotes: this.actorChannels.promptNotes([persona], "lobby"),
           actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], "lobby"),
+          temporalPolicy: temporalWelcome ? "welcome_optional" : "reactive_only",
+          temporalSurfaceActorId: temporalWelcome ? persona.id : undefined,
         },
         1,
       );
@@ -1236,7 +1275,7 @@ export class SocialDirector {
         );
       }
       const evidencePremise = toolPlan.localDateTime
-        ? `${toolPlan.localDateTime.promptFact} Answer the requested current date/time from this trusted server clock fact; do not browse, estimate or cite a web source.`
+        ? `${persona.name} answers the requested current date/time from trustedTemporalContext.requestedClock; do not browse, estimate or cite a web source.`
         : toolPlan.pageReadRequest
           ? research
             ? `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
@@ -1253,7 +1292,7 @@ export class SocialDirector {
           channelName: `private chat with ${human.name}`,
           selected: [persona],
           history: this.dmTranscript(message.channelId),
-          trigger: { author: human.name, content: message.content, messageId: message.id },
+          trigger: { author: human.name, content: message.content, messageId: message.id, createdAt: message.createdAt },
           mustReplyIds: [persona.id],
           relationshipNotes,
           languageHint: classifiedLanguage(analysis),
@@ -1261,6 +1300,9 @@ export class SocialDirector {
           actorChannelNotes: this.actorChannels.promptNotes([persona]),
           research,
           evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          requestedClock: toolPlan.localDateTime,
+          temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
+          temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
           premise: [semanticFlagsPremise(analysis), evidencePremise].filter(Boolean).join(" ") || undefined,
         },
         0,
@@ -1277,7 +1319,9 @@ export class SocialDirector {
       ? normalizeGeneratedMessageContent(line.content)
       : undefined;
     const replyText = generatedReply
-      ?? toolPlan.localDateTime?.fallbackText;
+      ?? (toolPlan.localDateTime
+        ? refreshLocalDateTime(toolPlan.localDateTime, new Date(this.now())).fallbackText
+        : undefined);
     if (!replyText) return;
     const replySourceIds = generatedReply
       ? sourceIdsForPageResponder(
@@ -1436,8 +1480,7 @@ export class SocialDirector {
             ? `${evidenceResponder?.name ?? "The designated resident"} ran the classifier's standalone fresh-data query and is responsible for the sourced answer. Attach only source IDs that support each claim; result rank alone is never an answer.`
             : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific fresh lookup returned no usable source. Treat it as temporary and invent no current facts.`;
       } else if (toolPlan.localDateTime) {
-        triggerType = "research";
-        evidencePremise = `${toolPlan.localDateTime.promptFact} ${evidenceResponder?.name ?? "The designated resident"} alone answers the requested current date/time from this trusted server clock fact. Do not browse, estimate or cite a web source.`;
+        evidencePremise = `${evidenceResponder?.name ?? "The designated resident"} alone answers the requested current date/time from trustedTemporalContext.requestedClock. Do not browse, estimate or cite a web source.`;
       }
       const dissenter = selected.find((persona) => (persona.disagreement ?? 0) >= 0.65);
       const premise = [
@@ -1463,7 +1506,7 @@ export class SocialDirector {
           channelName: CHANNELS.find((channel) => channel.id === trigger.channelId)?.name ?? trigger.channelId,
           selected,
           history: this.transcript(trigger.channelId, 26),
-          trigger: { author: human.name, content: combined, messageId: trigger.id },
+          trigger: { author: human.name, content: combined, messageId: trigger.id, createdAt: trigger.createdAt },
           mustReplyIds: requiredIds,
           relationshipNotes,
           languageHint: classifiedLanguage(analysis),
@@ -1473,6 +1516,9 @@ export class SocialDirector {
           visualObservation,
           research,
           evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          requestedClock: toolPlan.localDateTime,
+          temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
+          temporalSurfaceActorId: toolPlan.localDateTime ? evidenceResponder?.id : undefined,
           premise: premise || undefined,
         },
         signals.mentionedIds.length ? 0 : 2,
@@ -1497,7 +1543,7 @@ export class SocialDirector {
             channelName: CHANNELS.find((channel) => channel.id === trigger.channelId)?.name ?? trigger.channelId,
             selected: [persona],
             history: this.transcript(trigger.channelId, 22),
-            trigger: { author: human.name, content: trigger.content, messageId: trigger.id },
+            trigger: { author: human.name, content: trigger.content, messageId: trigger.id, createdAt: trigger.createdAt },
             mustReplyIds: [persona.id],
             relationshipNotes: { [persona.id]: relationshipNotes[persona.id]! },
             languageHint: classifiedLanguage(analysis),
@@ -1507,6 +1553,9 @@ export class SocialDirector {
             visualObservation,
             research,
             evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+            requestedClock: toolPlan.localDateTime,
+            temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
+            temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
             premise: [
               semanticFlagsPremise(analysis),
               evidencePremise,
@@ -1534,7 +1583,7 @@ export class SocialDirector {
         : [];
     }
     const safeEvidenceFallback = toolPlan.localDateTime
-      ? { content: toolPlan.localDateTime.fallbackText, sourceIds: [] }
+      ? { content: refreshLocalDateTime(toolPlan.localDateTime, new Date(this.now())).fallbackText, sourceIds: [] }
       : undefined;
     if (
       safeEvidenceFallback &&
@@ -1723,6 +1772,23 @@ export class SocialDirector {
     );
   }
 
+  private ambientTemporalCue(actorId: string): {
+    temporalPolicy: "ambient_silent" | "ambient_optional";
+    temporalSurfaceActorId?: string;
+  } {
+    const now = this.now();
+    const allowed = shouldSurfaceTemporalCue({
+      now,
+      lastSurfacedAt: this.lastAmbientTemporalCueAt,
+      cooldownMs: this.ambientTemporalCueCooldownMs,
+      chance: this.ambientTemporalCueChance,
+      rng: this.rng,
+    });
+    if (!allowed) return { temporalPolicy: "ambient_silent" };
+    this.lastAmbientTemporalCueAt = now;
+    return { temporalPolicy: "ambient_optional", temporalSurfaceActorId: actorId };
+  }
+
   private async runConsideredConversation(
     channel: (typeof CHANNELS)[number],
     epoch: number,
@@ -1735,6 +1801,7 @@ export class SocialDirector {
     const consideredLimits = consideredConversationWordLimits(plan, register);
     const leadWordLimit = consideredLimits.lead;
     const responseWordLimit = consideredLimits.response;
+    const temporalCue = this.ambientTemporalCue(plan.lead.id);
     this.consideredConversationInFlight = true;
     this.lastConsideredConversationAt = this.now();
     this.setTyping(channel.id, plan.lead.id, true);
@@ -1764,6 +1831,7 @@ export class SocialDirector {
             } : undefined,
             actorChannelNotes: this.actorChannels.promptNotes([plan.lead], channel.id),
             actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.lead], channel.id),
+            ...temporalCue,
           },
           4,
         );
@@ -1799,6 +1867,7 @@ export class SocialDirector {
               } : undefined,
               actorChannelNotes: this.actorChannels.promptNotes([plan.responder], channel.id),
               actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.responder], channel.id),
+              temporalPolicy: "ambient_silent",
             },
             4,
           );
@@ -1945,6 +2014,7 @@ export class SocialDirector {
           : choose(possibleSeconds, this.rng)
         : undefined;
       const selected = availableSlots >= 2 && second && this.rng() < 0.78 ? [first, second] : [first];
+      const temporalCue = this.ambientTemporalCue(first.id);
       const premise = ambientConversationPremise(
         thread.seed,
         first,
@@ -1975,6 +2045,7 @@ export class SocialDirector {
             } : undefined,
             actorChannelNotes: this.actorChannels.promptNotes(selected, channel.id),
             actorExpertiseNotes: this.actorChannels.expertiseNotes(selected, channel.id),
+            ...temporalCue,
           },
           4,
         );

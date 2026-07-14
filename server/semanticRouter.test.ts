@@ -93,6 +93,20 @@ describe("multilingual semantic router contract", () => {
     }).success).toBe(false);
   });
 
+  it("supplies a trusted community zone for unqualified clock requests without claiming the guest's zone", () => {
+    const parsed = input({
+      communityClock: { timeZone: "Europe/Stockholm", locationLabel: "The Third Place" },
+    });
+    expect(buildTurnAnalysisUserData(parsed)).toMatchObject({
+      communityClock: { timeZone: "Europe/Stockholm", locationLabel: "The Third Place" },
+    });
+    expect(turnAnalysisInputSchema.safeParse({
+      ...parsed,
+      communityClock: { timeZone: "Sweden/Somewhere", locationLabel: "here" },
+    }).success).toBe(false);
+    expect(buildTurnAnalysisSystemPrompt()).toContain("Never treat communityClock as the guest's personal zone");
+  });
+
   it("canonicalizes registered BCP-47 transport hints without an ICU language allowlist", () => {
     const hinted = input({ transportLanguageHint: "zh-Hant-TW" });
     expect(buildTurnAnalysisUserData(hinted)).toMatchObject({ transportLanguageHint: "zh-Hant-TW" });
@@ -383,7 +397,12 @@ describe("dedicated multilingual persistent-memory contract", () => {
 const reviewInput = (): NormalizedCandidateReviewInput => candidateReviewInputSchema.parse({
   sceneKind: "public",
   room: { id: "lobby", name: "lobby", register: "everyday" },
-  trigger: { author: "Léa", content: "Il a dit « je ne peux jamais lire le web », mais c'était faux." },
+  trigger: {
+    author: "Léa",
+    content: "Il a dit « je ne peux jamais lire le web », mais c'était faux.",
+    createdAt: "2026-07-14T11:59:55.000Z",
+    ageSeconds: 5,
+  },
   premise: null,
   semanticContext: {
     languageTag: "fr",
@@ -392,6 +411,22 @@ const reviewInput = (): NormalizedCandidateReviewInput => candidateReviewInputSc
     asksAboutAcoustics: false,
   },
   voiceFacts: null,
+  temporalContext: {
+    sceneClock: {
+      timeZone: "Europe/Stockholm",
+      locationLabel: "Europe/Stockholm",
+      instant: "2026-07-14T12:00:00.000Z",
+      localDate: "2026-07-14",
+      localTime: "14:00:00",
+      utcOffset: "GMT+02:00",
+      weekday: "Tuesday",
+      daypart: "afternoon",
+    },
+    requestedClock: null,
+    surfacePolicy: "reactive_only",
+    surfaceActorId: null,
+    recentTimeline: [],
+  },
   evidence: {
     outcome: "succeeded",
     kind: "page",
@@ -427,6 +462,8 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviews.maxItems).toBe(2);
     expect(reviews.items.properties.personaId.enum).toEqual(["ai-mira", "ai-sana"]);
     expect(reviews.items.properties.issues.items.enum).toContain("unsupported_acoustic_assertion");
+    expect(reviews.items.properties.issues.items.enum).toContain("incorrect_temporal_claim");
+    expect(reviews.items.properties.issues.items.enum).toContain("gratuitous_time_reference");
   });
 
   it("accepts quoted multilingual discussion as clean and rejects missing or duplicate persona reviews", () => {
@@ -465,5 +502,6 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("quoted, negated, hypothetical, sarcastic or corrected claim");
     expect(prompt).toContain("Do not use Swedish or English keyword lists");
     expect(prompt).toContain("Return exactly one review per supplied persona ID");
+    expect(prompt).toContain("quoted/negated time phrase");
   });
 });

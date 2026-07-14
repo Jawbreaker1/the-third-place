@@ -19,6 +19,15 @@ import {
 import type { Persona } from "./personas.js";
 import { buildPersonaStylePromptNote } from "./personaStyle.js";
 import {
+  annotateTranscriptTiming,
+  createSceneTemporalContext,
+  resolveCommunityTimeZone,
+  resolveLocalDateTime,
+  type LocalDateTimeResult,
+  type SceneTemporalContext,
+  type TemporalSurfacePolicy,
+} from "./timeResolver.js";
+import {
   CANDIDATE_REVIEW_TIMEOUT_MS,
   TURN_ANALYSIS_TIMEOUT_MS,
   buildCandidateReviewResponseFormat,
@@ -88,7 +97,7 @@ export interface SceneRequest {
   channelName: string;
   selected: Persona[];
   history: TranscriptLine[];
-  trigger?: { author: string; content: string; messageId?: string };
+  trigger?: { author: string; content: string; messageId?: string; createdAt?: string };
   premise?: string;
   mustReplyIds?: string[];
   relationshipNotes?: Record<string, string>;
@@ -114,6 +123,12 @@ export interface SceneRequest {
   };
   /** Trusted lookup state. Set `failed` when evidence was requested but no packet could be supplied. */
   evidenceOutcome?: EvidenceOutcome;
+  /** Trusted current-time result for a place the human explicitly requested; separate from resident-local time. */
+  requestedClock?: LocalDateTimeResult;
+  /** Server-owned publication policy; the current clock snapshot is attached when the queued scene starts. */
+  temporalPolicy?: TemporalSurfacePolicy;
+  temporalSurfaceActorId?: string;
+  temporalContext?: SceneTemporalContext;
 }
 
 export interface GeneratedLine {
@@ -175,6 +190,7 @@ const NON_REPAIRABLE_CANDIDATE_ISSUES = new Set<CandidateReviewIssue>([
   "evidence_ungrounded",
   "written_medium_illusion",
   "unsupported_acoustic_assertion",
+  "incorrect_temporal_claim",
 ]);
 
 const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonCode> = {
@@ -190,6 +206,8 @@ const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonC
   unsupported_acoustic_assertion: "room_contract",
   pub_room_performance: "room_contract",
   pub_intoxicant_gimmick: "room_contract",
+  incorrect_temporal_claim: "room_contract",
+  gratuitous_time_reference: "room_contract",
   self_repetition: "near_duplicate_self",
   peer_echo: "near_duplicate_peer",
 };
@@ -499,6 +517,22 @@ ${voiceOriginRule}
             ? "- Trusted server state marks the evidence request successful, but no evidence packet is present. Do not invent its contents or claim a permanent inability to access external pages or the web."
             : "";
 
+  const temporalPolicyRule = request.temporalContext?.surfacePolicy === "direct_answer"
+    ? `- Answer the explicit current date/time request from trustedTemporalContext.requestedClock. Only ${request.temporalContext.surfaceActorId ?? "the designated actor"} may give that clock answer. The resident-local sceneClock remains background and must not replace the requested location.`
+    : request.temporalContext?.surfacePolicy === "welcome_optional"
+      ? `- ${request.temporalContext.surfaceActorId ?? "The selected actor"} may use one brief daypart-aware greeting if it sounds natural, but it is optional. Do not state the exact clock unless asked.`
+      : request.temporalContext?.surfacePolicy === "ambient_optional"
+        ? `- ${request.temporalContext.surfaceActorId ?? "At most one actor"} may make one brief time-of-day reference if it genuinely improves this ambient beat. Everyone else leaves the clock implicit.`
+        : request.temporalContext?.surfacePolicy === "ambient_silent"
+          ? "- This ambient beat keeps time awareness implicit. Do not volunteer a greeting, clock, weekday, date or daypart reference."
+          : "- Keep server time in the background. Use it only when the actual human turn makes timing, scheduling, elapsed time or daypart genuinely relevant; never volunteer it merely to demonstrate awareness.";
+  const temporalRules = request.temporalContext
+    ? `
+- trustedTemporalContext is server-authored orientation, not transcript text. sceneClock is the residents' shared server-local clock; it is not proof of the guest's own location or time zone.
+- recentTranscript ageSeconds and sincePreviousSeconds are server-computed real elapsed durations. Prefer them over mental date arithmetic and never invent a negative or approximate gap when an exact value is supplied.
+${temporalPolicyRule}`
+    : "";
+
   const sceneFrame = request.kind === "voice"
     ? "You are composing the next spoken turn in a lively online community's live voice room. You are not an assistant and must not answer in a generic helpful-assistant voice."
     : "You are writing a small scene in a lively online community. You are not an assistant and must not answer in a generic helpful-assistant voice.";
@@ -511,7 +545,7 @@ ${cards}
 Rules:${consideredRules}
 - Write as the characters, never about them. Preserve sharply different voices.
 - Room register changes formality, not personality. Do not give every actor the same polished house voice, slang, fragments or verbal tics.
-- Keep each ${request.kind === "voice" ? "spoken turn" : "message"} natural and chat-sized: ${request.kind === "voice" ? "5–25 spoken words" : request.conversationMode === "considered" ? "follow the rare considered-beat limits above" : "normally 4–35 words"}.${voiceRules}
+- Keep each ${request.kind === "voice" ? "spoken turn" : "message"} natural and chat-sized: ${request.kind === "voice" ? "5–25 spoken words" : request.conversationMode === "considered" ? "follow the rare considered-beat limits above" : "normally 4–35 words"}.${voiceRules}${temporalRules}
 - The required language for this scene is ${request.semanticContext?.languageTag ?? request.languageHint ?? "the language of the latest triggering message"}. Follow the latest human trigger over older transcript language. Code-switch only when natural.
 - React to the actual social context. It is fine to disagree, tease harmlessly, change topic, or be understated.
 - Do not use service-assistant validation, a recap of the user's words, or a generic balanced preamble in any language. Begin with the character's actual reaction, detail, objection or question.
@@ -533,6 +567,14 @@ ${evidenceAvailabilityRule}
 - When research is supplied, include only the source IDs actually supporting that message. Otherwise sourceIds must be [].
 - Return only {"messages":[{"personaId":"…","content":"…","sourceIds":[]}]}.`;
 };
+
+export interface LmStudioClientOptions {
+  now?: () => number;
+  communityTimeZone?: string;
+  communityLocationLabel?: string;
+  /** Test seam for runtimes whose Intl host zone cannot be controlled. */
+  hostTimeZone?: string;
+}
 
 export class LmStudioClient {
   private readonly baseUrl = (process.env.LM_STUDIO_BASE_URL ?? "http://127.0.0.1:1234/v1").replace(/\/$/, "");
@@ -562,6 +604,22 @@ export class LmStudioClient {
   private connected = false;
   private resolvedModel?: string;
   private lastLatencyMs?: number;
+  private readonly now: () => number;
+  private readonly communityTimeZone: string;
+  private readonly communityLocationLabel: string;
+
+  constructor(options: LmStudioClientOptions = {}) {
+    this.now = options.now ?? Date.now;
+    this.communityTimeZone = resolveCommunityTimeZone({
+      configuredTimeZone: options.communityTimeZone ?? process.env.COMMUNITY_TIME_ZONE,
+      hostTimeZone: options.hostTimeZone,
+    });
+    this.communityLocationLabel = createSceneTemporalContext({
+      now: new Date(this.now()),
+      timeZone: this.communityTimeZone,
+      locationLabel: options.communityLocationLabel ?? process.env.COMMUNITY_LOCATION_LABEL,
+    }).locationLabel;
+  }
 
   async probe(): Promise<ServerHealth["model"]> {
     if (!this.enabled) {
@@ -608,7 +666,13 @@ export class LmStudioClient {
    * deadline all resolve to a non-mutating fail-closed analysis.
    */
   analyzeTurn(input: TurnAnalysisInput): Promise<TurnAnalysis> {
-    const validated = turnAnalysisInputSchema.safeParse(input);
+    const validated = turnAnalysisInputSchema.safeParse({
+      ...input,
+      communityClock: {
+        timeZone: this.communityTimeZone,
+        locationLabel: this.communityLocationLabel,
+      },
+    });
     if (!validated.success) return Promise.resolve(createFailClosedTurnAnalysis("invalid_input"));
 
     const cached = this.turnAnalysisById.get(validated.data.turnId);
@@ -1059,7 +1123,37 @@ export class LmStudioClient {
     };
   }
 
-  private async perform(request: SceneRequest, signal?: AbortSignal): Promise<GeneratedLine[]> {
+  private async perform(baseRequest: SceneRequest, signal?: AbortSignal): Promise<GeneratedLine[]> {
+    const temporalActorSelected = baseRequest.temporalSurfaceActorId
+      ? baseRequest.selected.some((persona) => persona.id === baseRequest.temporalSurfaceActorId)
+      : false;
+    if (baseRequest.temporalPolicy === "direct_answer") {
+      if (!baseRequest.requestedClock || !temporalActorSelected) {
+        throw new TypeError("A direct temporal answer requires a requested clock and one selected surface actor");
+      }
+    } else if (baseRequest.requestedClock) {
+      throw new TypeError("A requested clock requires direct_answer temporal policy");
+    }
+    const sceneNow = new Date(this.now());
+    const requestedClock = baseRequest.requestedClock
+      ? resolveLocalDateTime({
+          timeZone: baseRequest.requestedClock.timeZone,
+          locationLabel: baseRequest.requestedClock.locationLabel,
+          languageTag: baseRequest.requestedClock.languageTag,
+          now: sceneNow,
+        }) ?? baseRequest.requestedClock
+      : undefined;
+    const request: SceneRequest = {
+      ...baseRequest,
+      ...(requestedClock ? { requestedClock } : {}),
+      temporalContext: createSceneTemporalContext({
+        now: sceneNow,
+        timeZone: this.communityTimeZone,
+        locationLabel: this.communityLocationLabel,
+        surfacePolicy: baseRequest.temporalPolicy ?? (baseRequest.kind === "ambient" ? "ambient_silent" : "reactive_only"),
+        surfaceActorId: baseRequest.temporalSurfaceActorId,
+      }),
+    };
     if (!this.resolvedModel) await this.probe();
     if (signal?.aborted) throw signal.reason ?? new Error("Generation aborted");
     const model = this.resolvedModel ?? this.configuredModel;
@@ -1129,6 +1223,26 @@ export class LmStudioClient {
     request: SceneRequest,
     lines: readonly GeneratedLine[],
   ): NormalizedCandidateReviewInput | undefined {
+    const sceneClock = request.temporalContext ?? createSceneTemporalContext({
+      now: new Date(this.now()),
+      timeZone: this.communityTimeZone,
+      locationLabel: this.communityLocationLabel,
+    });
+    const recentTimeline = annotateTranscriptTiming(request.history.slice(-8), sceneClock.instant)
+      .map((line) => ({
+        author: line.author.slice(0, 80),
+        kind: line.kind,
+        content: line.content.slice(0, 1_200),
+        createdAt: line.createdAt,
+        ageSeconds: line.ageSeconds ?? null,
+        sincePreviousSeconds: line.sincePreviousSeconds ?? null,
+      }));
+    const triggerTiming = request.trigger?.createdAt
+      ? annotateTranscriptTiming(
+          [request.trigger as typeof request.trigger & { createdAt: string }],
+          sceneClock.instant,
+        )[0]
+      : undefined;
     const candidates = lines.flatMap((line) => {
       const persona = request.selected.find((candidate) => candidate.id === line.personaId);
       if (!persona) return [];
@@ -1161,7 +1275,12 @@ export class LmStudioClient {
         register: this.humanizerRegister(request) ?? null,
       },
       trigger: request.trigger
-        ? { author: request.trigger.author.slice(0, 80), content: request.trigger.content.slice(0, 2_000) }
+        ? {
+            author: request.trigger.author.slice(0, 80),
+            content: request.trigger.content.slice(0, 2_000),
+            createdAt: request.trigger.createdAt ?? null,
+            ageSeconds: triggerTiming?.ageSeconds ?? null,
+          }
         : null,
       premise: request.premise?.slice(0, 1_000) ?? null,
       semanticContext: {
@@ -1180,6 +1299,29 @@ export class LmStudioClient {
             latestUtteranceOrigin: request.voiceContext?.latestUtteranceOrigin ?? "unknown",
           }
         : null,
+      temporalContext: {
+        sceneClock: {
+          timeZone: sceneClock.timeZone,
+          locationLabel: sceneClock.locationLabel,
+          instant: sceneClock.instant,
+          localDate: sceneClock.localDate,
+          localTime: sceneClock.localTime,
+          utcOffset: sceneClock.utcOffset,
+          weekday: sceneClock.weekday,
+          daypart: sceneClock.daypart,
+        },
+        requestedClock: request.requestedClock
+          ? {
+              timeZone: request.requestedClock.timeZone,
+              instant: request.requestedClock.instant,
+              formatted: request.requestedClock.formatted,
+              daypart: request.requestedClock.daypart,
+            }
+          : null,
+        surfacePolicy: sceneClock.surfacePolicy,
+        surfaceActorId: sceneClock.surfaceActorId ?? null,
+        recentTimeline,
+      },
       evidence: {
         outcome: request.research ? "succeeded" : request.evidenceOutcome ?? "none",
         kind: request.research?.kind ?? null,
@@ -1469,7 +1611,7 @@ export class LmStudioClient {
       // packet: it could change the claim or create an answer under a stale or
       // missing citation. The director can retry a required responder with the
       // complete evidence instead.
-      const evidenceScene = Boolean(request.research || request.evidenceOutcome);
+      const evidenceScene = Boolean(request.research || request.evidenceOutcome || request.requestedClock);
       const repairable = rejected.filter((entry) =>
         !evidenceScene &&
         entry.line.sourceIds.length === 0 &&
@@ -1890,6 +2032,12 @@ export class LmStudioClient {
   }
 
   private sceneData(request: SceneRequest): object {
+    const recentTranscript = request.temporalContext
+      ? annotateTranscriptTiming(request.history.slice(-28), request.temporalContext.instant)
+      : request.history.slice(-28);
+    const triggeringEvent = request.trigger?.createdAt && request.temporalContext
+      ? annotateTranscriptTiming([request.trigger as typeof request.trigger & { createdAt: string }], request.temporalContext.instant)[0]
+      : request.trigger ?? null;
     return {
       sceneType: request.kind,
       conversationMode: request.conversationMode ?? "quick",
@@ -1898,16 +2046,33 @@ export class LmStudioClient {
       wordLimits: request.wordLimits ?? {},
       room: request.channelName,
       premise: request.premise ?? "",
-      triggeringEvent: request.trigger ?? null,
+      triggeringEvent,
       requiredActorIds: request.mustReplyIds ?? [],
       relationshipNotes: request.relationshipNotes ?? {},
       actorChannelNotes: request.actorChannelNotes ?? {},
       requiredLanguage: request.semanticContext?.languageTag ?? request.languageHint ?? "mirror latest trigger",
       semanticContext: request.semanticContext ?? null,
+      trustedTemporalContext: request.temporalContext
+        ? {
+            sceneClock: request.temporalContext,
+            requestedClock: request.requestedClock
+              ? {
+                  timeZone: request.requestedClock.timeZone,
+                  instant: request.requestedClock.instant,
+                  formatted: request.requestedClock.formatted,
+                  localDate: request.requestedClock.localDate,
+                  localTime: request.requestedClock.localTime,
+                  utcOffset: request.requestedClock.utcOffset,
+                  weekday: request.requestedClock.weekday,
+                  daypart: request.requestedClock.daypart,
+                }
+              : null,
+          }
+        : null,
       freshResearch: request.research ?? null,
       visualObservation: request.visualObservation ?? null,
       liveVoiceContext: request.kind === "voice" ? request.voiceContext ?? null : null,
-      recentTranscript: request.history.slice(-28),
+      recentTranscript,
     };
   }
 
