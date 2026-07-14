@@ -14,6 +14,8 @@ interface DispatchOptions {
   referer?: string;
   cookie?: string;
   body?: unknown;
+  sourceAddress?: string;
+  xForwardedFor?: string;
 }
 
 interface DispatchResult {
@@ -26,6 +28,10 @@ interface DispatchResult {
 const dispatch = async (app: Express, options: DispatchOptions): Promise<DispatchResult> =>
   await new Promise((resolve, reject) => {
     const socket = new Socket();
+    Object.defineProperty(socket, "remoteAddress", {
+      configurable: true,
+      value: options.sourceAddress ?? "127.0.0.1",
+    });
     const request = new IncomingMessage(socket);
     request.method = options.method;
     request.url = options.path;
@@ -34,6 +40,7 @@ const dispatch = async (app: Express, options: DispatchOptions): Promise<Dispatc
       ...(options.origin ? { origin: options.origin } : {}),
       ...(options.referer ? { referer: options.referer } : {}),
       ...(options.cookie ? { cookie: options.cookie } : {}),
+      ...(options.xForwardedFor ? { "x-forwarded-for": options.xForwardedFor } : {}),
       ...(options.body !== undefined ? { "content-type": "application/json" } : {}),
     };
     (request as IncomingMessage & { body?: unknown }).body = options.body;
@@ -305,5 +312,40 @@ describe("admin HTTP API", () => {
     expect(wrong.status).toBe(401);
     expect(wrong.headers["set-cookie"]).toBeUndefined();
     expect(wrong.body).toMatchObject({ ok: false, authenticated: false });
+  });
+
+  it("does not let one login source lock out a different source", async () => {
+    const state = new AdminStateStore({ persist: async () => undefined });
+    await state.load();
+    const auth = new AdminAuthManager({
+      password: "correct horse battery staple",
+      loginMaxAttempts: 2,
+      loginWindowMs: 60_000,
+      randomToken: () => "s".repeat(43),
+    });
+    const app = express();
+    app.use("/api/admin", createAdminRouter({
+      auth,
+      state,
+      configuredOrigins: ["https://admin.example"],
+      getHumans: () => [],
+      kickHuman: () => undefined,
+      banHuman: () => undefined,
+    }));
+    const login = (password: string, sourceAddress: string, xForwardedFor?: string) => dispatch(app, {
+      method: "POST",
+      path: "/api/admin/session",
+      origin: "https://admin.example",
+      sourceAddress,
+      ...(xForwardedFor ? { xForwardedFor } : {}),
+      body: { password },
+    });
+
+    expect((await login("wrong-one", "203.0.113.20", "198.51.100.1")).status).toBe(401);
+    expect((await login("wrong-two", "203.0.113.20", "198.51.100.2")).status).toBe(401);
+    // Without an explicitly trusted Express proxy, a caller cannot rotate an
+    // untrusted forwarding header to escape the socket source's own budget.
+    expect((await login("correct horse battery staple", "203.0.113.20", "198.51.100.3")).status).toBe(429);
+    expect((await login("correct horse battery staple", "203.0.113.21")).status).toBe(201);
   });
 });

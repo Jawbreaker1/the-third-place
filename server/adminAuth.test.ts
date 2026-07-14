@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ADMIN_LOGIN_SOURCE_CAPACITY,
   ADMIN_SESSION_MAX_TTL_MS,
   ADMIN_PASSWORD_MIN_CHARACTERS,
   AdminAuthManager,
@@ -62,7 +63,7 @@ describe("admin authentication", () => {
     expect(replacement.validate(second.token)).toBeUndefined();
   });
 
-  it("rate limits login globally without retaining an IP address", () => {
+  it("rate limits each source independently without retaining its raw identity", () => {
     let now = 10_000;
     const auth = new AdminAuthManager({
       password: "long-enough-secret",
@@ -70,12 +71,32 @@ describe("admin authentication", () => {
       loginMaxAttempts: 2,
       loginWindowMs: 60_000,
     });
-    expect(auth.login("wrong")).toMatchObject({ ok: false, code: "INVALID_CREDENTIALS" });
-    expect(auth.login("wrong-again")).toMatchObject({ ok: false, code: "INVALID_CREDENTIALS" });
-    expect(auth.login("long-enough-secret")).toEqual({ ok: false, code: "RATE_LIMITED" });
-    expect(JSON.stringify(auth)).not.toMatch(/127\.0\.0\.1|::1|ip/iu);
+    expect(auth.login("wrong", "203.0.113.10")).toMatchObject({ ok: false, code: "INVALID_CREDENTIALS" });
+    expect(auth.login("wrong-again", "203.0.113.10")).toMatchObject({ ok: false, code: "INVALID_CREDENTIALS" });
+    expect(auth.login("long-enough-secret", "203.0.113.10")).toEqual({ ok: false, code: "RATE_LIMITED" });
+    expect(auth.login("long-enough-secret", "203.0.113.11").ok).toBe(true);
+    expect(JSON.stringify(auth)).not.toContain("203.0.113.10");
+    expect(JSON.stringify(auth)).not.toContain("203.0.113.11");
     now += 60_001;
-    expect(auth.login("long-enough-secret").ok).toBe(true);
+    expect(auth.login("long-enough-secret", "203.0.113.10").ok).toBe(true);
+  });
+
+  it("keeps the per-source limiter strictly bounded with opaque fixed-size keys", () => {
+    expect(ADMIN_LOGIN_SOURCE_CAPACITY).toBe(512);
+    const auth = new AdminAuthManager({
+      password: "long-enough-secret",
+      loginMaxAttempts: 1,
+      loginSourceCapacity: 3,
+    });
+    for (let index = 0; index < 50; index += 1) {
+      expect(auth.login("wrong", `untrusted-source-${index}`).ok).toBe(false);
+    }
+    const buckets = (auth as unknown as {
+      loginAttemptsBySource: Map<string, { attempts: number[]; lastSeenAt: number }>;
+    }).loginAttemptsBySource;
+    expect(buckets.size).toBe(3);
+    for (const sourceHash of buckets.keys()) expect(sourceHash).toMatch(/^[a-f0-9]{64}$/u);
+    expect(JSON.stringify([...buckets])).not.toContain("untrusted-source-");
   });
 
   it("sets an isolated Strict HttpOnly cookie and adds Secure only for HTTPS", () => {

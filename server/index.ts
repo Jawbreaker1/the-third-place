@@ -425,6 +425,7 @@ const voiceSpeechCapabilities = await voiceSpeech.capabilities();
 const exposedTtsVoiceIds = voiceSpeechCapabilities.tts.available ? allowedTtsVoiceIds : [];
 const exposedTtsLanguages = [...(voiceSpeechCapabilities.tts.supportedLanguages ?? [])];
 adminState = new AdminStateStore({
+  configuredVoiceIds: allowedTtsVoiceIds,
   voiceOptions: {
     languages: exposedTtsLanguages,
     voices: exposedTtsVoiceIds.map((id) => ({

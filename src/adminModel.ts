@@ -27,6 +27,46 @@ export const DEFAULT_PERSONA_CORE: AdminPersonaCore = {
   disagreement: 35,
 };
 
+export interface PersonaVoiceChoice {
+  id: string;
+  label: string;
+  unavailable: boolean;
+}
+
+const voiceSupportsLanguage = (voice: AdminVoiceOption, language: string): boolean =>
+  language === "*" ||
+  voice.languages.length === 0 ||
+  voice.languages.includes(language) ||
+  voice.languages.some((tag) => language.startsWith(`${tag}-`) || tag.startsWith(`${language}-`));
+
+/**
+ * Keeps a persisted mapping visible even when its provider is offline or its
+ * current language inventory no longer includes the mapped language. The
+ * disabled fallback prevents an unrelated persona edit from appearing to drop
+ * the saved value while still preventing it from being newly selected.
+ */
+export function personaVoiceChoices(
+  voices: readonly AdminVoiceOption[],
+  language: string,
+  selectedVoiceId?: string,
+): PersonaVoiceChoice[] {
+  const compatible = voices
+    .filter((voice) => voiceSupportsLanguage(voice, language))
+    .map((voice) => ({ id: voice.id, label: voice.label, unavailable: false }));
+  const selected = selectedVoiceId?.trim();
+  if (!selected || compatible.some((voice) => voice.id === selected)) return compatible;
+
+  const configured = voices.find((voice) => voice.id === selected);
+  return [
+    ...compatible,
+    {
+      id: selected,
+      label: `${configured?.label ?? selected} (unavailable)`,
+      unavailable: true,
+    },
+  ];
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 

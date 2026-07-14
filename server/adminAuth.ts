@@ -1,8 +1,9 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const ADMIN_SESSION_COOKIE = "atrium_admin";
 export const ADMIN_SESSION_MAX_TTL_MS = 12 * 60 * 60_000;
 export const ADMIN_PASSWORD_MIN_CHARACTERS = 12;
+export const ADMIN_LOGIN_SOURCE_CAPACITY = 512;
 
 const passwordDigest = (value: string): Buffer => createHash("sha256").update(value, "utf8").digest();
 const tokenDigest = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
@@ -14,6 +15,7 @@ export interface AdminAuthOptions {
   sessionTtlMs?: number;
   loginWindowMs?: number;
   loginMaxAttempts?: number;
+  loginSourceCapacity?: number;
 }
 
 export type AdminLoginResult =
@@ -24,6 +26,11 @@ interface StoredAdminSession {
   tokenHash: string;
   createdAt: number;
   expiresAt: number;
+}
+
+interface LoginAttemptBucket {
+  attempts: number[];
+  lastSeenAt: number;
 }
 
 /**
@@ -39,9 +46,12 @@ export class AdminAuthManager {
   private readonly sessionTtlMs: number;
   private readonly loginWindowMs: number;
   private readonly loginMaxAttempts: number;
+  private readonly loginSourceCapacity: number;
+  private readonly loginSourceHashKey = randomBytes(32);
   private readonly sessions = new Map<string, StoredAdminSession>();
-  // Deliberately global and bounded: admin login throttling stores no IPs.
-  private loginAttempts: number[] = [];
+  // Per-source throttling prevents one caller from consuming everybody's
+  // budget. Only process-keyed HMAC digests are retained, never raw source IDs.
+  private readonly loginAttemptsBySource = new Map<string, LoginAttemptBucket>();
 
   constructor(options: AdminAuthOptions = {}) {
     const password = options.password ?? "";
@@ -62,18 +72,39 @@ export class AdminAuthManager {
     this.sessionTtlMs = Math.max(60_000, Math.min(options.sessionTtlMs ?? ADMIN_SESSION_MAX_TTL_MS, ADMIN_SESSION_MAX_TTL_MS));
     this.loginWindowMs = Math.max(10_000, Math.min(options.loginWindowMs ?? 10 * 60_000, 60 * 60_000));
     this.loginMaxAttempts = Math.max(1, Math.min(options.loginMaxAttempts ?? 6, 20));
+    this.loginSourceCapacity = Math.max(1, Math.min(options.loginSourceCapacity ?? ADMIN_LOGIN_SOURCE_CAPACITY, 4_096));
   }
 
   isConfigured(): boolean {
     return this.configured;
   }
 
-  login(candidate: string): AdminLoginResult {
+  login(candidate: string, sourceIdentity = "unknown"): AdminLoginResult {
     const now = this.now();
     this.prune(now);
     if (!this.configured) return { ok: false, code: "NOT_CONFIGURED" };
-    if (this.loginAttempts.length >= this.loginMaxAttempts) return { ok: false, code: "RATE_LIMITED" };
-    this.loginAttempts.push(now);
+    const sourceHash = createHmac("sha256", this.loginSourceHashKey)
+      .update(sourceIdentity || "unknown", "utf8")
+      .digest("hex");
+    let bucket = this.loginAttemptsBySource.get(sourceHash);
+    if (!bucket) {
+      if (this.loginAttemptsBySource.size >= this.loginSourceCapacity) {
+        let oldestHash: string | undefined;
+        let oldestSeenAt = Number.POSITIVE_INFINITY;
+        for (const [hash, candidateBucket] of this.loginAttemptsBySource) {
+          if (candidateBucket.lastSeenAt < oldestSeenAt) {
+            oldestHash = hash;
+            oldestSeenAt = candidateBucket.lastSeenAt;
+          }
+        }
+        if (oldestHash) this.loginAttemptsBySource.delete(oldestHash);
+      }
+      bucket = { attempts: [], lastSeenAt: now };
+      this.loginAttemptsBySource.set(sourceHash, bucket);
+    }
+    bucket.lastSeenAt = now;
+    if (bucket.attempts.length >= this.loginMaxAttempts) return { ok: false, code: "RATE_LIMITED" };
+    bucket.attempts.push(now);
 
     const supplied = passwordDigest(candidate);
     if (!timingSafeEqual(supplied, this.configuredPasswordDigest)) {
@@ -101,7 +132,12 @@ export class AdminAuthManager {
   }
 
   prune(now = this.now()): void {
-    this.loginAttempts = this.loginAttempts.filter((timestamp) => now - timestamp < this.loginWindowMs).slice(-this.loginMaxAttempts);
+    for (const [sourceHash, bucket] of this.loginAttemptsBySource) {
+      bucket.attempts = bucket.attempts
+        .filter((timestamp) => now - timestamp < this.loginWindowMs)
+        .slice(-this.loginMaxAttempts);
+      if (bucket.attempts.length === 0) this.loginAttemptsBySource.delete(sourceHash);
+    }
     for (const [hash, session] of this.sessions) {
       if (session.expiresAt <= now) this.sessions.delete(hash);
     }

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { activePersonaRoomAffinities, isAdminPath, normalizeAdminState } from "./adminModel";
+import {
+  activePersonaRoomAffinities,
+  isAdminPath,
+  normalizeAdminState,
+  personaVoiceChoices,
+} from "./adminModel";
 
 describe("admin model boundary", () => {
   it("normalizes a wrapped compatible snapshot and clamps all percentage values", () => {
@@ -74,5 +79,23 @@ describe("admin model boundary", () => {
       {},
       [{ id: "lobby" }, { id: "the-pub" }],
     )).toEqual({});
+  });
+
+  it("retains an unavailable or incompatible persisted voice as a disabled choice", () => {
+    const voices = [
+      { id: "lisa-warm", label: "Lisa warm", languages: ["sv"] },
+      { id: "alloy", label: "Alloy", languages: ["en"] },
+    ];
+
+    expect(personaVoiceChoices(voices, "sv-SE", "alloy")).toEqual([
+      { id: "lisa-warm", label: "Lisa warm", unavailable: false },
+      { id: "alloy", label: "Alloy (unavailable)", unavailable: true },
+    ]);
+    expect(personaVoiceChoices([], "sv", "saved-provider-voice")).toEqual([
+      { id: "saved-provider-voice", label: "saved-provider-voice (unavailable)", unavailable: true },
+    ]);
+    expect(personaVoiceChoices(voices, "en-US", "alloy")).toEqual([
+      { id: "alloy", label: "Alloy", unavailable: false },
+    ]);
   });
 });

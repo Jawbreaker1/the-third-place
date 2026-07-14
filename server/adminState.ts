@@ -341,6 +341,8 @@ export interface AdminCatalogHooks {
 export interface AdminStateStoreOptions {
   path?: string;
   voiceOptions?: AdminVoiceOptions;
+  /** Server-configured voice IDs remain valid even while the provider is temporarily unavailable. */
+  configuredVoiceIds?: readonly string[];
   persist?: (state: unknown) => Promise<void>;
 }
 
@@ -348,6 +350,7 @@ export class AdminStateStore {
   readonly path: string;
   private state: PersistedAdminState = emptyState();
   private readonly voiceOptions: AdminVoiceOptions;
+  private readonly configuredVoiceIds: ReadonlySet<string>;
   private hooks: AdminCatalogHooks = {};
   private writeQueue: Promise<void> = Promise.resolve();
   private readonly customPersist?: (state: unknown) => Promise<void>;
@@ -355,6 +358,9 @@ export class AdminStateStore {
   constructor(options: AdminStateStoreOptions = {}) {
     this.path = resolve(options.path ?? process.env.ADMIN_STATE_PATH ?? "data/admin-state.json");
     this.voiceOptions = structuredClone(options.voiceOptions ?? { languages: [], voices: [] });
+    this.configuredVoiceIds = new Set(
+      options.configuredVoiceIds ?? this.voiceOptions.voices.map((voice) => voice.id),
+    );
     this.customPersist = options.persist;
   }
 
@@ -534,12 +540,11 @@ export class AdminStateStore {
 
   private parsePersona(input: unknown): AdminPersonaConfig {
     const config = adminPersonaSchema.parse(input);
-    const allowedVoices = new Set(this.voiceOptions.voices.map((voice) => voice.id));
     const voices: Record<string, string> = {};
     for (const [rawLanguage, voiceId] of Object.entries(config.voices)) {
       const language = rawLanguage === "*" ? "*" : canonicalRegisteredLanguageTag(rawLanguage);
       if (!language) throw new AdminStateError(400, "INVALID_LANGUAGE", `Voice language ${rawLanguage} is not a registered BCP-47 tag.`);
-      if (!allowedVoices.has(voiceId)) throw new AdminStateError(400, "INVALID_VOICE", `Voice ${voiceId} is not configured on this server.`);
+      if (!this.configuredVoiceIds.has(voiceId)) throw new AdminStateError(400, "INVALID_VOICE", `Voice ${voiceId} is not configured on this server.`);
       voices[language] = voiceId;
     }
     return { ...config, voices };

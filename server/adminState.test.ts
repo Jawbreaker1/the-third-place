@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdminChannelConfig, AdminPersonaConfig } from "../shared/adminTypes.js";
 import { CHANNEL_PROFILES, CHANNELS } from "./channels.js";
@@ -267,6 +268,36 @@ describe("persistent admin overlay state", () => {
     await expect(store.createPersona({ ...customPersona(["lobby"]), voices: { en: "provider-secret-voice" } }))
       .rejects.toMatchObject({ code: "INVALID_VOICE" });
     await expect(store.deleteChannel("lobby")).rejects.toMatchObject({ code: "LOBBY_REQUIRED", status: 409 });
+  });
+
+  it("loads persisted configured voice mappings while the live TTS provider is unavailable", async () => {
+    const path = pathFor();
+    try {
+      const online = new AdminStateStore({
+        path,
+        configuredVoiceIds: ["lisa-warm", "alloy"],
+        voiceOptions: {
+          languages: ["sv", "en"],
+          voices: [
+            { id: "lisa-warm", label: "Lisa warm", languages: ["sv"] },
+            { id: "alloy", label: "Alloy", languages: ["en"] },
+          ],
+        },
+      });
+      await online.load();
+      await online.createPersona(customPersona(["lobby"]));
+
+      const restartedWhileOffline = new AdminStateStore({
+        path,
+        configuredVoiceIds: ["lisa-warm", "alloy"],
+        voiceOptions: { languages: [], voices: [] },
+      });
+      await expect(restartedWhileOffline.load()).resolves.toBeUndefined();
+      expect(restartedWhileOffline.snapshot().personas.find((persona) => persona.id === "ai-test-resident")?.voices)
+        .toEqual({ sv: "lisa-warm", en: "alloy" });
+    } finally {
+      await rm(path, { force: true });
+    }
   });
 
   it("persists bans by member/name identity without storing network addresses or deleting catalog/history state", async () => {

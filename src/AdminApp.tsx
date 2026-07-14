@@ -34,6 +34,7 @@ import {
   createChannelDraft,
   createPersonaDraft,
   DEFAULT_ADMIN_TUNING,
+  personaVoiceChoices,
 } from "./adminModel";
 
 type AdminSection = "overview" | "residents" | "rooms" | "humans";
@@ -722,8 +723,11 @@ export default function AdminApp() {
               <p className="admin-fieldset-note">Map a BCP-47 language tag to one configured provider voice. Empty mappings inherit the server default.</p>
               <div className="admin-voice-map">
                 {personaVoiceLanguages.map((language) => {
-                  const compatibleVoices = snapshot.voiceOptions.voices.filter((voice) =>
-                    language === "*" || voice.languages.length === 0 || voice.languages.includes(language) || voice.languages.some((tag) => language.startsWith(`${tag}-`) || tag.startsWith(`${language}-`)),
+                  const selectedVoiceId = personaDraft.voices[language] ?? "";
+                  const voiceChoices = personaVoiceChoices(
+                    snapshot.voiceOptions.voices,
+                    language,
+                    selectedVoiceId,
                   );
                   return (
                     <div className="admin-voice-row" key={language}>
@@ -731,10 +735,12 @@ export default function AdminApp() {
                       <select
                         id={`voice-${language}`}
                         onChange={(event) => setPersonaDraft({ ...personaDraft, voices: { ...personaDraft.voices, [language]: event.target.value } })}
-                        value={personaDraft.voices[language] ?? ""}
+                        value={selectedVoiceId}
                       >
                         <option value="">Server default</option>
-                        {compatibleVoices.map((voice) => <option key={voice.id} value={voice.id}>{voice.label}</option>)}
+                        {voiceChoices.map((voice) => (
+                          <option disabled={voice.unavailable} key={voice.id} value={voice.id}>{voice.label}</option>
+                        ))}
                       </select>
                     </div>
                   );

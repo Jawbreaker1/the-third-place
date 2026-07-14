@@ -68,7 +68,11 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
       response.status(400).json({ ok: false, authenticated: false, error: "Enter the configured admin password." });
       return;
     }
-    const result = dependencies.auth.login(parsed.data.password);
+    // Express derives request.ip from the socket unless the operator has
+    // explicitly configured a trusted proxy. The raw value crosses this route
+    // boundary once and is immediately HMACed by AdminAuthManager.
+    const sourceIdentity = request.ip || request.socket.remoteAddress || "unknown";
+    const result = dependencies.auth.login(parsed.data.password, sourceIdentity);
     if (!result.ok) {
       const status = result.code === "NOT_CONFIGURED" ? 503 : result.code === "RATE_LIMITED" ? 429 : 401;
       const error = result.code === "NOT_CONFIGURED"
