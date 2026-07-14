@@ -38,6 +38,14 @@ export interface VoiceDirectorEvents {
   aiStop(payload: { roomId: string }): void;
 }
 
+export interface VoiceChannelRecentMessage {
+  id: string;
+  authorId: string;
+  authorName: string;
+  content: string;
+  createdAt: string;
+}
+
 export interface VoiceDirectorOptions {
   runtime: VoiceRoomRuntime;
   lm: Pick<LmStudioClient, "analyzeTurn" | "generateScene"> & Partial<Pick<LmStudioClient, "rememberDeliveredLine">>;
@@ -50,6 +58,10 @@ export interface VoiceDirectorOptions {
   floorSilenceMs?: number;
   /** True while a human clip in this room is queued, uploading or being transcribed. */
   hasPendingHumanIngest?: (roomId: string) => boolean;
+  /** Last trusted response language in the public channel, used only to seed a new voice session. */
+  establishedChannelLanguage?: (channelId: string) => string | undefined;
+  /** Bounded public-channel context lets the semantic router understand the conversation a voice room continues. */
+  recentChannelMessages?: (channelId: string) => readonly VoiceChannelRecentMessage[];
 }
 
 export const mentionsPersona = containsExactMention;
@@ -81,14 +93,66 @@ const transcriptFor = (entries: VoiceTranscriptEntry[], personaId: string): Tran
       utteranceOrigin: entry.utteranceOrigin,
     }));
 
+const MAX_ROUTER_RECENT_MESSAGES = 8;
+const VOICE_LANGUAGE_SWITCH_CONFIDENCE = 0.9;
+type VoiceRouterRecentMessage = NonNullable<TurnAnalysisInput["recentMessages"]>[number];
+interface VoiceChannelContextSnapshot {
+  establishedLanguage?: string;
+  recentMessages: readonly VoiceChannelRecentMessage[];
+}
+
+const boundedRecentMessage = (message: VoiceChannelRecentMessage): VoiceRouterRecentMessage => ({
+  id: message.id.slice(0, 128),
+  authorId: message.authorId.slice(0, 128),
+  authorName: message.authorName.slice(0, 80),
+  content: message.content.slice(0, 1_200),
+  createdAt: message.createdAt,
+});
+
+const messageTimestamp = (message: VoiceRouterRecentMessage): number | undefined => {
+  const timestamp = message.createdAt ? Date.parse(message.createdAt) : Number.NaN;
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+};
+
+const compareRecentMessages = (left: VoiceRouterRecentMessage, right: VoiceRouterRecentMessage): number => {
+  const timestampDelta = (messageTimestamp(left) ?? 0) - (messageTimestamp(right) ?? 0);
+  if (timestampDelta !== 0) return timestampDelta;
+  const leftId = left.id ?? "";
+  const rightId = right.id ?? "";
+  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+};
+
 const analysisInputFor = (
   entry: VoiceTranscriptEntry,
   room: VoiceRoomView,
   transcript: VoiceTranscriptEntry[],
   invited: Persona[],
+  recentChannelMessages: readonly VoiceChannelRecentMessage[] = [],
 ): TurnAnalysisInput => {
   const channel = getChannelProfile(room.channelId);
   const transportLanguageHint = canonicalRegisteredLanguageTag(entry.language);
+  const latestTimestamp = Date.parse(entry.endedAt);
+  const recentVoiceMessages: VoiceRouterRecentMessage[] = transcript
+    .filter((candidate) => candidate.id !== entry.id)
+    .slice(-MAX_ROUTER_RECENT_MESSAGES)
+    .map((candidate) => ({
+      id: candidate.id,
+      authorId: candidate.speakerId,
+      authorName: candidate.speakerName.slice(0, 80),
+      content: candidate.text.slice(0, 1_200),
+      createdAt: candidate.endedAt,
+    }));
+  const recentMessages = [
+    ...recentChannelMessages.map(boundedRecentMessage),
+    ...recentVoiceMessages,
+  ]
+    .filter((candidate) => candidate.id !== entry.id)
+    .filter((candidate) => {
+      const timestamp = messageTimestamp(candidate);
+      return timestamp !== undefined && (!Number.isFinite(latestTimestamp) || timestamp <= latestTimestamp);
+    })
+    .sort(compareRecentMessages)
+    .slice(-MAX_ROUTER_RECENT_MESSAGES);
   return {
     turnId: `voice:${entry.id}`.slice(0, 128),
     medium: "voice",
@@ -104,16 +168,7 @@ const analysisInputFor = (
       content: entry.text.slice(0, 4_000),
       createdAt: entry.endedAt,
     },
-    recentMessages: transcript
-      .filter((candidate) => candidate.id !== entry.id)
-      .slice(-8)
-      .map((candidate) => ({
-        id: candidate.id,
-        authorId: candidate.speakerId,
-        authorName: candidate.speakerName.slice(0, 80),
-        content: candidate.text.slice(0, 1_200),
-        createdAt: candidate.endedAt,
-      })),
+    recentMessages,
     personaCandidates: invited.map((persona) => ({
       id: persona.id,
       name: persona.name,
@@ -127,17 +182,38 @@ const analysisInputFor = (
   };
 };
 
-export const routedLanguage = (analysis: TurnAnalysis | undefined, transcriptLanguage?: string): string | undefined => {
-  const transcribed = canonicalRegisteredLanguageTag(transcriptLanguage);
-  const classified = canonicalRegisteredLanguageTag(projectTrustedTurnAnalysis(analysis).languageTag);
-  const contextualResponseLanguage = analysis?.source === "lm" && analysis.responseLanguage
-    ? classified
+const primaryLanguage = (language: string): string => language.split("-", 1)[0]!.toLocaleLowerCase();
+
+export const routedLanguage = (
+  analysis: TurnAnalysis | undefined,
+  _transcriptLanguage?: string,
+  establishedLanguage?: string,
+): string | undefined => {
+  const established = canonicalRegisteredLanguageTag(establishedLanguage);
+  const trustedResponseLanguage = analysis?.source === "lm" && analysis.responseLanguage
+    ? canonicalRegisteredLanguageTag(projectTrustedTurnAnalysis(analysis).languageTag)
     : undefined;
-  // The provider tag describes the latest utterance. Compact router v2 adds a
-  // distinct natural response language; prefer that trusted contextual result
-  // so a short outburst does not flip an established call. Older descriptive
-  // results have no such field, so the canonical STT tag still wins there.
-  return contextualResponseLanguage ?? transcribed ?? classified;
+  const highConfidenceLatestLanguage = analysis?.source === "lm" &&
+    analysis.language.confidence >= VOICE_LANGUAGE_SWITCH_CONFIDENCE
+    ? canonicalRegisteredLanguageTag(analysis.language.tag)
+    : undefined;
+  const highConfidenceResponseLanguage = analysis?.source === "lm" &&
+    analysis.responseLanguage &&
+    analysis.responseLanguage.confidence >= VOICE_LANGUAGE_SWITCH_CONFIDENCE
+    ? canonicalRegisteredLanguageTag(analysis.responseLanguage.tag)
+    : undefined;
+
+  if (established) {
+    const switchesPrimaryLanguage = highConfidenceLatestLanguage &&
+      highConfidenceResponseLanguage &&
+      primaryLanguage(highConfidenceLatestLanguage) === primaryLanguage(highConfidenceResponseLanguage) &&
+      primaryLanguage(highConfidenceResponseLanguage) !== primaryLanguage(established);
+    return switchesPrimaryLanguage ? highConfidenceResponseLanguage : established;
+  }
+
+  // STT exposes no confidence, so its per-clip language tag remains analysis
+  // metadata and never becomes a hard response-language route by itself.
+  return trustedResponseLanguage ?? highConfidenceLatestLanguage;
 };
 
 const routedLanguageHint = (language: string | undefined): string =>
@@ -151,6 +227,7 @@ export const ttsModelSupportsLanguage = (
 
 export class VoiceDirector {
   private readonly epochByRoom = new Map<string, number>();
+  private readonly establishedLanguageByRoom = new Map<string, string>();
   private readonly lastSpokeAtByPersona = new Map<string, number>();
   private readonly speechAbortByRoom = new Map<string, AbortController>();
   private readonly generationAbortByRoom = new Map<string, AbortController>();
@@ -163,14 +240,15 @@ export class VoiceDirector {
 
   onHumanFinal(entry: VoiceTranscriptEntry): void {
     if (entry.speakerKind !== "human" || !entry.final || !entry.trigger.eligible || entry.trigger.source !== "human-final") return;
+    const channelContext = this.snapshotChannelContext(entry);
     const epoch = this.invalidateRoom(entry.roomId);
     this.resetBotsToListening(entry.roomId);
     const floorSilenceMs = Math.max(0, this.options.floorSilenceMs ?? 0);
     if (floorSilenceMs === 0) {
-      void this.respond(entry, epoch);
+      void this.respond(entry, epoch, channelContext);
       return;
     }
-    this.scheduleFloorResponse(entry, epoch, floorSilenceMs);
+    this.scheduleFloorResponse(entry, epoch, floorSilenceMs, channelContext);
   }
 
   /** Human speech owns the floor immediately, before STT has finished. */
@@ -222,6 +300,37 @@ export class VoiceDirector {
     this.speechAbortByRoom.get(roomId)?.abort(new Error("Voice room closed"));
     this.speechAbortByRoom.delete(roomId);
     this.epochByRoom.delete(roomId);
+    this.establishedLanguageByRoom.delete(roomId);
+  }
+
+  private establishedLanguage(
+    room: VoiceRoomView,
+    transcript: readonly VoiceTranscriptEntry[],
+    channelLanguage: string | undefined,
+  ): string | undefined {
+    const existing = this.establishedLanguageByRoom.get(room.id);
+    if (existing) return existing;
+    const priorAiLanguage = [...transcript]
+      .reverse()
+      .find((candidate) => candidate.speakerKind === "ai" && candidate.utteranceOrigin === "ai-tts" && candidate.language)
+      ?.language;
+    return canonicalRegisteredLanguageTag(priorAiLanguage) ??
+      canonicalRegisteredLanguageTag(channelLanguage);
+  }
+
+  private snapshotChannelContext(entry: VoiceTranscriptEntry): VoiceChannelContextSnapshot {
+    const room = this.options.runtime.getRoom(entry.roomId);
+    if (!room) return { recentMessages: [] };
+    const establishedLanguage = canonicalRegisteredLanguageTag(
+      this.options.establishedChannelLanguage?.(room.channelId),
+    );
+    const recentMessages = (this.options.recentChannelMessages?.(room.channelId) ?? []).map((message) => ({
+      ...message,
+    }));
+    return {
+      ...(establishedLanguage ? { establishedLanguage } : {}),
+      recentMessages,
+    };
   }
 
   private isCurrent(roomId: string, epoch: number, personaId: string): boolean {
@@ -286,24 +395,33 @@ export class VoiceDirector {
     }
   }
 
-  private scheduleFloorResponse(entry: VoiceTranscriptEntry, epoch: number, delayMs: number): void {
+  private scheduleFloorResponse(
+    entry: VoiceTranscriptEntry,
+    epoch: number,
+    delayMs: number,
+    channelContext: VoiceChannelContextSnapshot,
+  ): void {
     const timer = setTimeout(() => {
       if (this.pendingResponseTimerByRoom.get(entry.roomId) !== timer) return;
       const humanStillSpeaking = this.options.runtime.getRoom(entry.roomId)?.participants.some(
         (participant) => participant.kind === "human" && participant.speaking,
       ) ?? false;
       if (humanStillSpeaking || this.options.hasPendingHumanIngest?.(entry.roomId)) {
-        this.scheduleFloorResponse(entry, epoch, 250);
+        this.scheduleFloorResponse(entry, epoch, 250, channelContext);
         return;
       }
       this.pendingResponseTimerByRoom.delete(entry.roomId);
-      if (this.epochByRoom.get(entry.roomId) === epoch) void this.respond(entry, epoch);
+      if (this.epochByRoom.get(entry.roomId) === epoch) void this.respond(entry, epoch, channelContext);
     }, delayMs);
     timer.unref();
     this.pendingResponseTimerByRoom.set(entry.roomId, timer);
   }
 
-  private async respond(entry: VoiceTranscriptEntry, epoch: number): Promise<void> {
+  private async respond(
+    entry: VoiceTranscriptEntry,
+    epoch: number,
+    channelContext: VoiceChannelContextSnapshot,
+  ): Promise<void> {
     const room = this.options.runtime.getRoom(entry.roomId);
     if (!room) return;
     const invited = this.invitedPersonas(entry);
@@ -311,13 +429,23 @@ export class VoiceDirector {
     const transcript = this.options.runtime.getTranscript(room.id);
     let analysis: TurnAnalysis | undefined;
     try {
-      analysis = await this.options.lm.analyzeTurn(analysisInputFor(entry, room, transcript, invited));
+      analysis = await this.options.lm.analyzeTurn(analysisInputFor(
+        entry,
+        room,
+        transcript,
+        invited,
+        channelContext.recentMessages,
+      ));
     } catch (error) {
       console.warn("Voice semantic analysis unavailable; using neutral routing:", error instanceof Error ? error.message : error);
     }
     if (this.epochByRoom.get(room.id) !== epoch) return;
     const trusted = projectTrustedTurnAnalysis(analysis);
-    const utteranceLanguage = routedLanguage(analysis, entry.language);
+    const utteranceLanguage = routedLanguage(
+      analysis,
+      entry.language,
+      this.establishedLanguage(room, transcript, channelContext.establishedLanguage),
+    );
     const localDateTime = analysis?.source === "lm" &&
       trusted.evidenceTrusted &&
       analysis.evidence.action === "local_datetime" &&
@@ -477,6 +605,7 @@ export class VoiceDirector {
       ...(utteranceLanguage ? { language: utteranceLanguage } : {}),
     });
     if (!appended.ok) return;
+    if (utteranceLanguage) this.establishedLanguageByRoom.set(room.id, utteranceLanguage);
     this.options.humanMemory?.updateRelation(entry.speakerId, persona.id, {
       familiarity: Math.min(1, (previousRelation?.familiarity ?? 0) + 0.05),
     });

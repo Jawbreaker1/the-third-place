@@ -579,6 +579,19 @@ const voiceDirector = new VoiceDirector({
   speech: voiceSpeech,
   actorChannels,
   humanMemory,
+  establishedChannelLanguage: (channelId) => director.trustedLanguageForChannel(channelId),
+  recentChannelMessages: (channelId) => store.getRecent(channelId, 6)
+    .filter((message) => !message.system && Boolean(message.content.trim()))
+    .map((message) => ({
+      id: message.id,
+      authorId: message.authorId,
+      authorName:
+        getMembers().find((member) => member.id === message.authorId)?.name ??
+        message.authorSnapshot?.name ??
+        "someone",
+      content: message.content,
+      createdAt: message.createdAt,
+    })),
   floorSilenceMs: 650,
   hasPendingHumanIngest: (roomId) => (pendingVoiceIngestsByRoom.get(roomId) ?? 0) > 0,
   events: {

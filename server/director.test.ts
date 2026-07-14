@@ -915,6 +915,7 @@ describe("social director", () => {
       });
       expect(request.premise).toContain("One designated resident must react directly");
       expect(store.getRecent("lobby", 1)[0]?.authorId).toBe(request.selected[0]?.id);
+      expect(director.trustedLanguageForChannel("lobby")).toBe("sv");
     } finally {
       random.mockRestore();
       vi.useRealTimers();

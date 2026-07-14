@@ -38,6 +38,134 @@ const routedAnalysis = (
 };
 const analyzeSwedish = async (_input: TurnAnalysisInput): Promise<TurnAnalysis> => routedAnalysis();
 
+const languageAnalysis = (
+  latestTag: string,
+  latestConfidence: number,
+  responseTag?: string,
+  responseConfidence = latestConfidence,
+): TurnAnalysis => ({
+  ...routedAnalysis(latestTag),
+  language: { tag: latestTag, confidence: latestConfidence },
+  ...(responseTag ? { responseLanguage: { tag: responseTag, confidence: responseConfidence } } : {}),
+}) as TurnAnalysis;
+
+interface LanguageTurnOptions {
+  analysis: TurnAnalysis;
+  utterance: string;
+  utteranceOrigin?: "microphone-stt" | "typed-voice-fallback";
+  transcriptLanguage?: string;
+  establishedChannelLanguage?: string;
+  priorAiLanguage?: string;
+  recentChannelMessages?: Array<{
+    id: string;
+    authorId: string;
+    authorName: string;
+    content: string;
+    createdAt: string;
+  }>;
+  reply?: string;
+  onAnalyze?: () => void;
+}
+
+const runLanguageTurn = async (options: LanguageTurnOptions) => {
+  const runtime = new VoiceRoomRuntime(["lobby"]);
+  const created = runtime.createRoom("lobby", {
+    socketId: "socket-language-anchor",
+    memberId: "human-language-anchor",
+    name: "Alex",
+  });
+  if (!created.ok) throw new Error(created.error);
+  const invited = runtime.inviteBot(created.room.id, "socket-language-anchor", { personaId: "ai-sana", name: "Sana" });
+  if (!invited.ok) throw new Error(invited.error);
+  runtime.setBotState(created.room.id, "ai-sana", "listening");
+  if (options.priorAiLanguage) {
+    const prior = runtime.appendFinalTranscript(created.room.id, "ai-sana", "Ett tidigare svar i röstsamtalet.", {
+      utteranceOrigin: "ai-tts",
+      language: options.priorAiLanguage,
+    });
+    if (!prior.ok) throw new Error(prior.error);
+  }
+  const human = runtime.appendFinalTranscript(created.room.id, "human-language-anchor", options.utterance, {
+    utteranceOrigin: options.utteranceOrigin ?? "microphone-stt",
+    ...(options.transcriptLanguage ? { language: options.transcriptLanguage } : {}),
+  });
+  if (!human.ok) throw new Error(human.error);
+
+  let analysisInput: TurnAnalysisInput | undefined;
+  let sceneLanguage: string | undefined;
+  const syntheses: Array<Record<string, unknown>> = [];
+  const payloads: Array<Record<string, unknown>> = [];
+  const director = new VoiceDirector({
+    runtime,
+    lm: {
+      analyzeTurn: async (input) => {
+        analysisInput = input;
+        options.onAnalyze?.();
+        return options.analysis;
+      },
+      generateScene: async (request) => {
+        sceneLanguage = request.semanticContext?.languageTag;
+        return [{
+          personaId: "ai-sana",
+          content: options.reply ?? "Ett kort och naturligt svar.",
+          source: "lm",
+          sourceIds: [],
+        }];
+      },
+    },
+    speech: {
+      capabilities: async () => ({
+        stt: { available: true, provider: "openai-compatible", inputMimeTypes: [] },
+        tts: {
+          available: true,
+          provider: "openai-compatible",
+          model: "generic-multilingual",
+          formats: ["mp3"],
+          defaultVoice: "provider-default",
+          supportedLanguages: ["sv", "en", "ja"],
+        },
+        normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
+        browserFallbackAllowed: false,
+      }),
+      synthesize: async (input) => {
+        syntheses.push(input as unknown as Record<string, unknown>);
+        return {
+          id: "anchored-audio",
+          roomId: created.room.id,
+          mimeType: "audio/mpeg",
+          bytes: 64,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        };
+      },
+    },
+    actorChannels: new ActorChannelRuntime(),
+    ...(options.establishedChannelLanguage
+      ? { establishedChannelLanguage: () => options.establishedChannelLanguage }
+      : {}),
+    ...(options.recentChannelMessages
+      ? { recentChannelMessages: () => options.recentChannelMessages! }
+      : {}),
+    events: {
+      roomChanged: () => undefined,
+      transcriptFinal: () => undefined,
+      aiSpeech: (payload) => payloads.push(payload as unknown as Record<string, unknown>),
+      aiStop: () => undefined,
+    },
+  });
+
+  director.onHumanFinal(human.entry);
+  await settle();
+  return {
+    analysisInput,
+    director,
+    payloads,
+    roomId: created.room.id,
+    runtime,
+    sceneLanguage,
+    syntheses,
+  };
+};
+
 const installCustomPersona = (id: string, name: string): (() => void) => {
   const template = structuredClone(PERSONAS.find((persona) => persona.id === "ai-sana")!);
   PERSONAS.push({ ...template, id, name, prompt: `${name} answers directly and naturally.` });
@@ -48,14 +176,195 @@ const installCustomPersona = (id: string, name: string): (() => void) => {
 };
 
 describe("VoiceDirector", () => {
-  it("prefers router v2's contextual response language but keeps STT ahead of legacy guesses", () => {
-    const legacy = routedAnalysis("ja-JP");
-    expect(routedLanguage(legacy, "zh-Hant-TW")).toBe("zh-Hant-TW");
-    const contextual = {
-      ...legacy,
-      responseLanguage: { tag: "sv-SE", confidence: 0.99 },
-    } as TurnAnalysis;
-    expect(routedLanguage(contextual, "en-US")).toBe("sv-SE");
+  it.each([
+    {
+      name: "keeps an anchor when only raw STT points elsewhere",
+      analysis: createFailClosedTurnAnalysis("model_unavailable"),
+      stt: "en-US",
+      established: "sv-SE",
+      expected: "sv-SE",
+    },
+    {
+      name: "keeps an anchor for a high-confidence legacy classification",
+      analysis: languageAnalysis("en-US", 0.99),
+      stt: "en-US",
+      established: "sv-SE",
+      expected: "sv-SE",
+    },
+    {
+      name: "keeps an anchor when the contextual response preserves it",
+      analysis: languageAnalysis("en-US", 0.99, "sv-SE", 0.99),
+      stt: "en-US",
+      established: "sv-SE",
+      expected: "sv-SE",
+    },
+    {
+      name: "keeps an anchor when latest-message confidence is below the switch threshold",
+      analysis: languageAnalysis("en-US", 0.89, "en-GB", 0.99),
+      stt: "en-US",
+      established: "sv-SE",
+      expected: "sv-SE",
+    },
+    {
+      name: "keeps the established locale when the primary language is unchanged",
+      analysis: languageAnalysis("sv", 0.99, "sv", 0.99),
+      stt: "sv",
+      established: "sv-SE",
+      expected: "sv-SE",
+    },
+    {
+      name: "accepts a clear v2 switch when latest and response primary languages agree",
+      analysis: languageAnalysis("en-US", 0.9, "en-GB", 0.9),
+      stt: "fr-FR",
+      established: "sv-SE",
+      expected: "en-GB",
+    },
+    {
+      name: "uses a trusted contextual response when no anchor exists",
+      analysis: languageAnalysis("en-US", 0.8, "sv-SE", 0.8),
+      stt: "en-US",
+      established: undefined,
+      expected: "sv-SE",
+    },
+    {
+      name: "uses a high-confidence semantic latest language when no v2 response is trusted",
+      analysis: languageAnalysis("ja-JP", 0.95, "en-US", 0.69),
+      stt: "zh-Hant-TW",
+      established: undefined,
+      expected: "ja-JP",
+    },
+    {
+      name: "does not route from unscored STT alone",
+      analysis: createFailClosedTurnAnalysis("model_unavailable"),
+      stt: "en-US",
+      established: undefined,
+      expected: undefined,
+    },
+  ])("$name", ({ analysis, stt, established, expected }) => {
+    expect(routedLanguage(analysis, stt, established)).toBe(expected);
+  });
+
+  it("anchors a first short mistagged microphone turn to its channel and supplies bounded public context", async () => {
+    const recentChannelMessages = Array.from({ length: 12 }, (_, index) => ({
+      id: `public-${index}`,
+      authorId: index % 2 === 0 ? "human-public" : "ai-sana",
+      authorName: index === 11 ? "S".repeat(100) : index % 2 === 0 ? "Alex" : "Sana",
+      content: index === 11 ? `svensk kanaltext ${"x".repeat(1_300)}` : `svensk kanaltext ${index}`,
+      createdAt: new Date(Date.UTC(2026, 0, 1, 12, index)).toISOString(),
+    }));
+    recentChannelMessages.push({
+      id: "public-from-the-future",
+      authorId: "human-future",
+      authorName: "Future",
+      content: "This arrived after the voice turn and must not affect it.",
+      createdAt: "9999-01-01T00:00:00.000Z",
+    });
+    const turn: LanguageTurnOptions = {
+      analysis: languageAnalysis("sr", 0.4, "sr", 0.4),
+      utterance: "hej",
+      transcriptLanguage: "sr",
+      establishedChannelLanguage: "sv-SE",
+      recentChannelMessages,
+    };
+    turn.onAnalyze = () => {
+      // Simulate the public channel changing while semantic analysis is in flight.
+      // This voice turn must keep the channel snapshot taken when it became final.
+      turn.establishedChannelLanguage = "en-US";
+    };
+    const result = await runLanguageTurn(turn);
+
+    expect(result.analysisInput?.transportLanguageHint).toBe("sr");
+    expect(result.analysisInput?.recentMessages.map((message) => message.id)).toEqual(
+      Array.from({ length: 8 }, (_, index) => `public-${index + 4}`),
+    );
+    expect(result.analysisInput?.recentMessages.at(-1)).toMatchObject({
+      authorName: "S".repeat(80),
+      content: expect.stringMatching(/^svensk kanaltext /u),
+    });
+    expect(result.analysisInput?.recentMessages.at(-1)?.content).toHaveLength(1_200);
+    expect(result.sceneLanguage).toBe("sv-SE");
+    expect(result.syntheses).toEqual([expect.objectContaining({ language: "sv-SE" })]);
+    expect(result.payloads).toEqual([expect.objectContaining({ language: "sv-SE" })]);
+    expect(result.runtime.getTranscript(result.roomId).at(-1)).toMatchObject({
+      speakerKind: "ai",
+      language: "sv-SE",
+    });
+  });
+
+  it("inherits a prior AI response language for a typed voice fallback", async () => {
+    const result = await runLanguageTurn({
+      analysis: createFailClosedTurnAnalysis("model_unavailable"),
+      utterance: "Okej?",
+      utteranceOrigin: "typed-voice-fallback",
+      priorAiLanguage: "sv-SE",
+    });
+
+    expect(result.analysisInput?.transportLanguageHint).toBeUndefined();
+    expect(result.sceneLanguage).toBe("sv-SE");
+    expect(result.syntheses).toEqual([expect.objectContaining({ language: "sv-SE" })]);
+    expect(result.payloads).toEqual([expect.objectContaining({ language: "sv-SE" })]);
+    expect(result.runtime.getTranscript(result.roomId).at(-1)?.language).toBe("sv-SE");
+  });
+
+  it("lets a clear high-confidence v2 language switch replace the voice-session anchor", async () => {
+    const turn = {
+      analysis: languageAnalysis("en-US", 0.98, "en-GB", 0.97),
+      utterance: "Let's continue this discussion in English.",
+      transcriptLanguage: "en-US",
+      priorAiLanguage: "sv-SE",
+      reply: "Yes, let's continue in English.",
+    };
+    const result = await runLanguageTurn(turn);
+
+    expect(result.sceneLanguage).toBe("en-GB");
+    expect(result.syntheses).toEqual([expect.objectContaining({ language: "en-GB" })]);
+    expect(result.payloads).toEqual([expect.objectContaining({ language: "en-GB" })]);
+    expect(result.runtime.getTranscript(result.roomId).at(-1)?.language).toBe("en-GB");
+
+    turn.analysis = createFailClosedTurnAnalysis("model_unavailable");
+    const followUp = result.runtime.appendFinalTranscript(
+      result.roomId,
+      "human-language-anchor",
+      "Okay?",
+      { utteranceOrigin: "typed-voice-fallback" },
+    );
+    expect(followUp.ok).toBe(true);
+    if (!followUp.ok) return;
+    result.director.onHumanFinal(followUp.entry);
+    await settle();
+
+    expect(result.syntheses.at(-1)).toMatchObject({ language: "en-GB" });
+    expect(result.payloads.at(-1)).toMatchObject({ language: "en-GB" });
+    expect(result.runtime.getTranscript(result.roomId).at(-1)?.language).toBe("en-GB");
+  });
+
+  it("does not commit a language switch when its AI reply is not delivered", async () => {
+    const turn: LanguageTurnOptions = {
+      analysis: languageAnalysis("en-US", 0.99, "en-GB", 0.99),
+      utterance: "Let's switch to English.",
+      transcriptLanguage: "en-US",
+      priorAiLanguage: "sv-SE",
+      reply: "",
+    };
+    const result = await runLanguageTurn(turn);
+    expect(result.payloads).toHaveLength(0);
+
+    turn.analysis = createFailClosedTurnAnalysis("model_unavailable");
+    turn.reply = "Vi fortsätter på svenska.";
+    const followUp = result.runtime.appendFinalTranscript(
+      result.roomId,
+      "human-language-anchor",
+      "Okej?",
+      { utteranceOrigin: "typed-voice-fallback" },
+    );
+    expect(followUp.ok).toBe(true);
+    if (!followUp.ok) return;
+    result.director.onHumanFinal(followUp.entry);
+    await settle();
+
+    expect(result.syntheses.at(-1)).toMatchObject({ language: "sv-SE" });
+    expect(result.payloads.at(-1)).toMatchObject({ language: "sv-SE" });
+    expect(result.runtime.getTranscript(result.roomId).at(-1)?.language).toBe("sv-SE");
   });
 
   it("turns one final human utterance into one bounded AI turn without recursion", async () => {
@@ -529,7 +838,7 @@ describe("VoiceDirector", () => {
       .toBe("listening");
   });
 
-  it("prefers a canonical STT language over a semantic router language guess", async () => {
+  it("keeps a canonical STT language as router metadata while routing from high-confidence semantics", async () => {
     const runtime = new VoiceRoomRuntime(["lobby"]);
     const created = runtime.createRoom("lobby", { socketId: "socket-stt-language", memberId: "human-stt-language", name: "陳明" });
     expect(created.ok).toBe(true);
@@ -582,11 +891,11 @@ describe("VoiceDirector", () => {
     director.onHumanFinal(human.entry);
     await settle();
 
-    expect(languageHint).toBe("zh-Hant-TW");
-    expect(semanticLanguage).toBe("zh-Hant-TW");
+    expect(languageHint).toBe("ja-JP");
+    expect(semanticLanguage).toBe("ja-JP");
     expect(analysisInput?.transportLanguageHint).toBe("zh-Hant-TW");
-    expect(speeches).toEqual([expect.objectContaining({ language: "zh-Hant-TW" })]);
-    expect(runtime.getTranscript(created.room.id).at(-1)?.language).toBe("zh-Hant-TW");
+    expect(speeches).toEqual([expect.objectContaining({ language: "ja-JP" })]);
+    expect(runtime.getTranscript(created.room.id).at(-1)?.language).toBe("ja-JP");
   });
 
   it("uses a generic provider's configured default voice, never a Piper persona alias", async () => {

@@ -210,6 +210,141 @@ const sanitizeIdentifier = (value: string, label: string, maxLength = 160): stri
 
 const sanitizeLanguage = canonicalRegisteredLanguageTag;
 
+/**
+ * OpenAI Whisper's verbose JSON reports the detected language as one of the
+ * fixed English names from its tokenizer, while other compatible providers
+ * may already return an ISO/BCP-47 tag. Keep that provider-specific wire
+ * vocabulary here; the general IANA canonicalizer intentionally does not
+ * accept language names or perform language detection.
+ *
+ * Source: openai/whisper `LANGUAGES` and `TO_LANGUAGE_CODE`.
+ */
+const WHISPER_LANGUAGE_NAME_TO_TAG: ReadonlyMap<string, string> = new Map([
+  ["english", "en"],
+  ["chinese", "zh"],
+  ["german", "de"],
+  ["spanish", "es"],
+  ["russian", "ru"],
+  ["korean", "ko"],
+  ["french", "fr"],
+  ["japanese", "ja"],
+  ["portuguese", "pt"],
+  ["turkish", "tr"],
+  ["polish", "pl"],
+  ["catalan", "ca"],
+  ["dutch", "nl"],
+  ["arabic", "ar"],
+  ["swedish", "sv"],
+  ["italian", "it"],
+  ["indonesian", "id"],
+  ["hindi", "hi"],
+  ["finnish", "fi"],
+  ["vietnamese", "vi"],
+  ["hebrew", "he"],
+  ["ukrainian", "uk"],
+  ["greek", "el"],
+  ["malay", "ms"],
+  ["czech", "cs"],
+  ["romanian", "ro"],
+  ["danish", "da"],
+  ["hungarian", "hu"],
+  ["tamil", "ta"],
+  ["norwegian", "no"],
+  ["thai", "th"],
+  ["urdu", "ur"],
+  ["croatian", "hr"],
+  ["bulgarian", "bg"],
+  ["lithuanian", "lt"],
+  ["latin", "la"],
+  ["maori", "mi"],
+  ["malayalam", "ml"],
+  ["welsh", "cy"],
+  ["slovak", "sk"],
+  ["telugu", "te"],
+  ["persian", "fa"],
+  ["latvian", "lv"],
+  ["bengali", "bn"],
+  ["serbian", "sr"],
+  ["azerbaijani", "az"],
+  ["slovenian", "sl"],
+  ["kannada", "kn"],
+  ["estonian", "et"],
+  ["macedonian", "mk"],
+  ["breton", "br"],
+  ["basque", "eu"],
+  ["icelandic", "is"],
+  ["armenian", "hy"],
+  ["nepali", "ne"],
+  ["mongolian", "mn"],
+  ["bosnian", "bs"],
+  ["kazakh", "kk"],
+  ["albanian", "sq"],
+  ["swahili", "sw"],
+  ["galician", "gl"],
+  ["marathi", "mr"],
+  ["punjabi", "pa"],
+  ["sinhala", "si"],
+  ["khmer", "km"],
+  ["shona", "sn"],
+  ["yoruba", "yo"],
+  ["somali", "so"],
+  ["afrikaans", "af"],
+  ["occitan", "oc"],
+  ["georgian", "ka"],
+  ["belarusian", "be"],
+  ["tajik", "tg"],
+  ["sindhi", "sd"],
+  ["gujarati", "gu"],
+  ["amharic", "am"],
+  ["yiddish", "yi"],
+  ["lao", "lo"],
+  ["uzbek", "uz"],
+  ["faroese", "fo"],
+  ["haitian creole", "ht"],
+  ["pashto", "ps"],
+  ["turkmen", "tk"],
+  ["nynorsk", "nn"],
+  ["maltese", "mt"],
+  ["sanskrit", "sa"],
+  ["luxembourgish", "lb"],
+  ["myanmar", "my"],
+  ["tibetan", "bo"],
+  ["tagalog", "tl"],
+  ["malagasy", "mg"],
+  ["assamese", "as"],
+  ["tatar", "tt"],
+  ["hawaiian", "haw"],
+  ["lingala", "ln"],
+  ["hausa", "ha"],
+  ["bashkir", "ba"],
+  ["javanese", "jw"],
+  ["sundanese", "su"],
+  ["cantonese", "yue"],
+  ["burmese", "my"],
+  ["valencian", "ca"],
+  ["flemish", "nl"],
+  ["haitian", "ht"],
+  ["letzeburgesch", "lb"],
+  ["pushto", "ps"],
+  ["panjabi", "pa"],
+  ["moldavian", "ro"],
+  ["moldovan", "ro"],
+  ["sinhalese", "si"],
+  ["castilian", "es"],
+  ["mandarin", "zh"],
+]);
+
+const normalizeSttProviderLanguage = (raw: unknown): string | undefined => {
+  if (typeof raw !== "string") return undefined;
+  const canonicalTag = sanitizeLanguage(raw);
+  if (canonicalTag) return canonicalTag;
+  const providerName = raw.trim().toLowerCase();
+  if (!providerName || providerName.length > 32) return undefined;
+  const whisperTag = WHISPER_LANGUAGE_NAME_TO_TAG.get(providerName);
+  if (whisperTag) return sanitizeLanguage(whisperTag);
+  return undefined;
+};
+
 export const ttsLanguageIsSupported = (
   supportedLanguages: readonly string[] | undefined,
   language: string | undefined,
@@ -694,11 +829,7 @@ class OpenAiCompatibleSttProvider {
     }
     const text = sanitizeText((payload as { text: string }).text, TRANSCRIPT_MAX_CHARS);
     if (!text) throw new VoiceSpeechError("No speech was detected.", 422, "NO_SPEECH");
-    const returnedLanguage = sanitizeLanguage(
-      typeof (payload as { language?: unknown }).language === "string"
-        ? (payload as { language: string }).language
-        : undefined,
-    );
+    const returnedLanguage = normalizeSttProviderLanguage((payload as { language?: unknown }).language);
     const rawSegments = Array.isArray((payload as { segments?: unknown }).segments)
       ? (payload as { segments: unknown[] }).segments
       : [];

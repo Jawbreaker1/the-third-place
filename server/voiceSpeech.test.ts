@@ -159,6 +159,39 @@ describe("OpenAI-compatible speech providers", () => {
     expect(seenMultipart).toContain("zh-Hant-TW");
   });
 
+  it("normalizes exact Whisper language names without weakening BCP-47 validation", async () => {
+    let providerLanguage: unknown;
+    const mockedFetch = async (): Promise<Response> => new Response(JSON.stringify({
+      text: "OK",
+      language: providerLanguage,
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    const service = new VoiceSpeechService({
+      env: { STT_BASE_URL: "https://speech.test/v1", STT_MODEL: "whisper-test" },
+      fetchImpl: mockedFetch as typeof fetch,
+      normalizer: fakeNormalizer,
+    });
+
+    for (const [raw, expected] of [
+      ["english", "en"],
+      ["Japanese", "ja"],
+      [" arabic ", "ar"],
+      ["welsh", "cy"],
+      ["lao", "lo"],
+      ["zh-Hant-TW-u-ca-chinese", "zh-Hant-TW"],
+      ["sl-Latn-SI-rozaj-biske-1994-x-abcd", "sl-Latn-SI-rozaj-biske-1994"],
+    ] as const) {
+      providerLanguage = raw;
+      expect((await service.transcribe({ audio: Buffer.from("audio"), mimeType: "audio/webm" })).language)
+        .toBe(expected);
+    }
+
+    for (const raw of [undefined, null, "und", "not a whisper language", "x".repeat(100), 42]) {
+      providerLanguage = raw;
+      const result = await service.transcribe({ audio: Buffer.from("audio"), mimeType: "audio/webm" });
+      expect(result).toEqual({ text: "OK" });
+    }
+  });
+
   it("posts sanitized TTS JSON and stores audio behind room-scoped expiring lookup", async () => {
     let requestPayload: Record<string, unknown> = {};
     const mockedFetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {

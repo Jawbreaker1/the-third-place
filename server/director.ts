@@ -1344,6 +1344,11 @@ export class SocialDirector {
     this.voiceRoomActive = active;
   }
 
+  /** Last high-confidence contextual response language observed in this public channel. */
+  trustedLanguageForChannel(channelId: string): string | undefined {
+    return this.lastTrustedLanguageByChannel.get(channelId);
+  }
+
   noteHumanVoiceActivity(channelId: string): void {
     const now = this.now();
     this.lastHumanActivityAt = now;
