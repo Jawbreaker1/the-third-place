@@ -299,7 +299,13 @@ describe("social director", () => {
     };
 
     const plan = internal.classifiedToolPlan(analysis, candidateSet, "gå bara till sajten", human.id);
-    expect(resolveTarget).toHaveBeenCalledWith(expect.objectContaining({ intent: goal }));
+    expect(resolveTarget).toHaveBeenCalledWith(expect.objectContaining({ intent: goal, retry: false }));
+    resolveTarget.mockClear();
+    internal.classifiedToolPlan({
+      ...analysis,
+      capabilities: { ...analysis.capabilities, requestKind: "correct_limitation" },
+    }, candidateSet, "gå bara till sajten", human.id);
+    expect(resolveTarget).toHaveBeenCalledWith(expect.objectContaining({ intent: goal, retry: true }));
     await expect(internal.resolveRequestedEvidence(
       plan.pageReadRequest,
       undefined,
@@ -1557,7 +1563,7 @@ describe("social director", () => {
     }
   });
 
-  it("stays silent after the central request-owner attempt returns empty instead of publishing canned chatter", async () => {
+  it("gives an empty central request-owner attempt one focused semantic retry", async () => {
     vi.useFakeTimers();
     const random = vi.spyOn(Math, "random").mockReturnValue(0.1);
     try {
@@ -1572,7 +1578,18 @@ describe("social director", () => {
       const incoming = createMessage("lobby", human.id, "@Bosse.exe, vet du?");
       store.addPublicMessage(incoming);
       await store.flush();
-      const generateScene = vi.fn(async () => []);
+      let sceneAttempt = 0;
+      const generateScene = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => {
+        sceneAttempt += 1;
+        return sceneAttempt === 1
+          ? []
+          : [{
+              personaId: request.selected[0]!.id,
+              content: "Jag vet faktiskt inte säkert.",
+              source: "lm" as const,
+              sourceIds: [],
+            }];
+      });
       const director = new SocialDirector(
         { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
         store,
@@ -1599,11 +1616,90 @@ describe("social director", () => {
       await pending;
       director.stop();
 
-      expect(generateScene).toHaveBeenCalledTimes(1);
-      expect(store.getRecent("lobby", 5)).toEqual([incoming]);
+      expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(generateScene.mock.calls[1]?.[0].selected).toHaveLength(1);
+      expect(store.getRecent("lobby", 5)).toHaveLength(2);
+      expect(store.getRecent("lobby", 1)[0]).toMatchObject({
+        content: "Jag vet faktiskt inte säkert.",
+        replyToId: incoming.id,
+        generation: "lm",
+      });
       expect(store.getRecent("lobby", 5).some((message) => message.content.includes("bold thing"))).toBe(false);
     } finally {
       random.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reserves one bounded reply for an explicit human request when ambient traffic filled the normal pace", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-14T18:30:00.000Z");
+    try {
+      const human = {
+        id: "guest-priority-reply",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const store = new RoomStore("/tmp/director-priority-human-reply-unused.json");
+      const incoming = createMessage("lobby", human.id, "Kan någon svara på min fråga?");
+      store.addPublicMessage(incoming);
+      const generateScene = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => [{
+        personaId: request.selected[0]!.id,
+        content: "Ja, jag tar den.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn({
+            intent: { kind: "request", isQuestion: true, replyExpected: "expected", confidence: 0.99 },
+          })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+      const internal = director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+        aiTimestamps: number[];
+        priorityHumanReplyTimestamps: number[];
+      };
+      internal.aiTimestamps.push(now, now, now);
+
+      const pending = internal.handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(store.getRecent("lobby", 1)[0]).toMatchObject({
+        content: "Ja, jag tar den.",
+        replyToId: incoming.id,
+        generation: "lm",
+      });
+      expect(internal.priorityHumanReplyTimestamps).toEqual([now]);
+      expect(internal.aiTimestamps).toHaveLength(4);
+    } finally {
       vi.useRealTimers();
     }
   });

@@ -96,6 +96,28 @@ const cases = [
       ["retry", "correct_limitation"].includes(value.capabilities.requestKind),
   },
   {
+    id: "sv-lobby-site-question",
+    text: "Har ni kollat en site som heter aiai3d.io? ✨ ✨",
+    capabilities: ["read_url", "web_search", "local_datetime"],
+    urlCandidates: [{ ref: "U1", source: "latest_message", context: "host=aiai3d.io; path=/; source=message" }],
+    check: (value) => value.evidence.action === "read_url" &&
+      value.evidence.urlRef === "U1" &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
+    id: "sv-lobby-explicit-url-retry",
+    text: "Jaså? Kollade du https://aiai3d.io",
+    recentMessages: [
+      { id: "sv-site-1", authorId: "live-eval-human", authorName: "EvalGuest", content: "Har ni kollat en site som heter aiai3d.io? ✨ ✨" },
+      { id: "sv-site-2", authorId: "ai-mira", authorName: "Mira", content: "Jag fick inte upp nåt från länken, verkar som att det strulade tillfälligt." },
+    ],
+    capabilities: ["read_url", "web_search", "local_datetime"],
+    urlCandidates: [{ ref: "U1", source: "latest_message", context: "host=aiai3d.io; path=/; source=message" }],
+    check: (value) => value.evidence.action === "read_url" &&
+      value.evidence.urlRef === "U1" &&
+      ["retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
     id: "fr-read-opaque-url",
     text: "Mira, peux-tu lire ce lien et me dire ce qui est important ?",
     capabilities: ["read_url", "web_search", "local_datetime"],

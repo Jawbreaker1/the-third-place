@@ -312,6 +312,34 @@ const pageTitle = (document: ParsedNode, root: ParsedNode): string | undefined =
     undefined;
 };
 
+const pageDescription = (document: ParsedNode): string | undefined => {
+  const preferred = ["og:description", "description", "twitter:description"];
+  for (const key of preferred) {
+    const node = findFirst(document, (candidate) => {
+      if (candidate.tagName !== "meta") return false;
+      const attrs = attrsOf(candidate);
+      return (attrs.property ?? attrs.name ?? "").toLowerCase() === key && Boolean(attrs.content);
+    });
+    const description = node ? sanitizePageText(attrsOf(node).content ?? "", MAX_ARTICLE_TEXT) : "";
+    if (description.length >= MIN_ARTICLE_TEXT) return description;
+  }
+  return undefined;
+};
+
+const metadataPageFromHead = (raw: string, finalUrl: URL): ExtractedPage | undefined => {
+  // This is an HTML structure boundary, never a natural-language classifier.
+  const closingHead = /<\/head\s*>/iu.exec(raw);
+  if (!closingHead) return undefined;
+  const headDocument = parseWithinBudget(raw.slice(0, closingHead.index + closingHead[0].length));
+  if (!headDocument) return undefined;
+  const text = pageDescription(headDocument);
+  if (!text) return undefined;
+  return {
+    title: pageTitle(headDocument, headDocument) ?? finalUrl.hostname,
+    text,
+  };
+};
+
 const boundedBlocks = (blocks: readonly string[], maxLength = MAX_ARTICLE_TEXT): string => {
   const accepted: string[] = [];
   let length = 0;
@@ -364,17 +392,19 @@ export const extractReadablePage = (
   }
   if (mediaType !== "text/html" && mediaType !== "application/xhtml+xml") return undefined;
   const document = parseWithinBudget(raw);
-  if (!document) return undefined;
+  if (!document) return metadataPageFromHead(raw, finalUrl);
   const bodyNode = findFirst(document, (node) => node.tagName === "body");
-  if (!bodyNode) return undefined;
-  const root = bestSemanticRoot(bodyNode) ?? bodyNode;
+  const root = bodyNode ? (bestSemanticRoot(bodyNode) ?? bodyNode) : document;
   let blocks = collectBlocks(root);
   if (blocks.join(" ").length < MIN_ARTICLE_TEXT) {
     const fallback = sanitizePageText(visibleText(root), MAX_ARTICLE_TEXT);
     blocks = fallback ? [fallback] : [];
   }
-  const text = boundedBlocks(blocks);
-  if (text.length < MIN_ARTICLE_TEXT) return undefined;
+  const extractedText = boundedBlocks(blocks);
+  const text = extractedText.length >= MIN_ARTICLE_TEXT
+    ? extractedText
+    : pageDescription(document);
+  if (!text) return undefined;
   return {
     title: pageTitle(document, root) ?? finalUrl.hostname,
     text,
@@ -513,6 +543,7 @@ const readerPolicy: SafeHttpsFetchPolicy = {
   acceptedMediaTypes: ["text/html", "application/xhtml+xml", "text/plain"],
   acceptHeader: "text/html,application/xhtml+xml,text/plain;q=0.8",
   userAgent: "TheThirdPlace-PageReader/1.0",
+  oversizedHtmlHeadFallback: true,
 };
 
 export class PageReader {
@@ -557,7 +588,11 @@ export class PageReader {
     this.activeRequests += 1;
     const provider = this.providers.supporting(requestedUrl);
     const fetcher: PageProviderFetcher = initiator === "automatic"
-      ? (rawUrl, policy) => this.fetcher(rawUrl, { ...policy, sameOriginRedirectsOnly: true })
+      ? (rawUrl, policy) => this.fetcher(rawUrl, {
+          ...policy,
+          sameOriginRedirectsOnly: true,
+          allowCanonicalWwwRedirect: true,
+        })
       : this.fetcher;
     const evidenceRequest: Promise<PageProviderEvidence | undefined> = provider
       ? provider.read({ fetcher, requestedUrl })

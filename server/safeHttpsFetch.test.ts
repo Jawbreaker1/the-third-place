@@ -119,11 +119,23 @@ describe("safe HTTPS fetch", () => {
     expect(Date.now() - startedAt).toBeLessThan(250);
   });
 
-  it("matches media types exactly and rejects compressed or oversized bodies", () => {
+  it("matches media types exactly and permits oversized HTML only behind a bounded head stop", () => {
     expect(responseCanBeRead(200, "text/html; charset=utf-8", "identity", 100, policy)).toBe(true);
     expect(responseCanBeRead(200, "application/not-text/html", "", 100, policy)).toBe(false);
     expect(responseCanBeRead(200, "text/html", "gzip", 100, policy)).toBe(false);
     expect(responseCanBeRead(200, "text/html", "", 1_025, policy)).toBe(false);
+    expect(responseCanBeRead(200, "text/html", "", 4_000_000, {
+      ...policy,
+      oversizedHtmlHeadFallback: true,
+    })).toBe(true);
+    expect(responseCanBeRead(200, "text/plain", "", 4_000_000, {
+      ...policy,
+      oversizedHtmlHeadFallback: true,
+    })).toBe(false);
+    expect(responseCanBeRead(200, "text/html", "", 4_000_000, {
+      ...policy,
+      stopAfterAsciiSequence: "</head>",
+    })).toBe(true);
     expect(responseCanBeRead(404, "text/html", "", 100, policy)).toBe(false);
   });
 
@@ -197,6 +209,40 @@ describe("safe HTTPS fetch", () => {
     );
     expect(sameOriginRequests).toEqual(["https://first.example/start", "https://first.example/final"]);
     expect(sameOriginResult?.finalUrl.toString()).toBe("https://first.example/final");
+  });
+
+  it("can narrowly permit a canonical www redirect without allowing other subdomains", async () => {
+    const canonicalRequests: string[] = [];
+    const canonical = await fetchPublicHttps(
+      "https://example.com/start",
+      { ...policy, sameOriginRedirectsOnly: true, allowCanonicalWwwRedirect: true },
+      {
+        lookupImpl: publicLookup,
+        requestHop: async (url) => {
+          canonicalRequests.push(url.toString());
+          return url.hostname === "example.com"
+            ? { redirect: "https://www.example.com/final" }
+            : { body: Buffer.from("ok"), mediaType: "text/plain", contentType: "text/plain" };
+        },
+      },
+    );
+    expect(canonical?.finalUrl.toString()).toBe("https://www.example.com/final");
+    expect(canonicalRequests).toEqual(["https://example.com/start", "https://www.example.com/final"]);
+
+    const arbitraryRequests: string[] = [];
+    const arbitrary = await fetchPublicHttps(
+      "https://example.com/start",
+      { ...policy, sameOriginRedirectsOnly: true, allowCanonicalWwwRedirect: true },
+      {
+        lookupImpl: publicLookup,
+        requestHop: async (url) => {
+          arbitraryRequests.push(url.toString());
+          return { redirect: "https://news.example.com/final" };
+        },
+      },
+    );
+    expect(arbitrary).toBeUndefined();
+    expect(arbitraryRequests).toEqual(["https://example.com/start"]);
   });
 
   it("re-resolves the same hostname after a redirect and blocks a DNS rebinding answer", async () => {

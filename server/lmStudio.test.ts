@@ -359,7 +359,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionCalls).toBe(2);
   });
 
-  it("rejects URL leakage from model fields without a second call", async () => {
+  it("rejects URL leakage even when the bounded typed verifier is also invalid", async () => {
     let completionCalls = 0;
     vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
       if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
@@ -384,7 +384,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       failureReason: "invalid_output",
       evidence: { action: "none" },
     });
-    expect(completionCalls).toBe(1);
+    expect(completionCalls).toBe(2);
   });
 
   it("repairs a direct short follow-up with one bounded evidence-only verifier pass", async () => {
@@ -562,6 +562,35 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       language: { tag: "und", confidence: 0 },
       evidence: { action: "read_url", urlRef: "latest:0" },
       capabilities: { discussed: ["read_url"], requestKind: "correct_limitation" },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("uses the typed verifier for an invalid first-turn classification with a latest URL ref", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        return jsonResponse({ choices: [{ message: { content: "{}" } }] });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "read_url",
+        requestKind: "execute",
+        goal: "vad webbplatsen erbjuder",
+        urlRef: "latest:0",
+      });
+    }));
+    const input = turnInput("first-turn-url-recovery");
+    input.latestMessage.content = "Har ni kollat den här webbplatsen?";
+    input.recentMessages = [];
+    input.urlCandidates = [{ ref: "latest:0", source: "latest_message", context: "host=example.com; path=/" }];
+
+    await expect(new LmStudioClient().analyzeTurn(input)).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "read_url", goal: "vad webbplatsen erbjuder", urlRef: "latest:0" },
+      capabilities: { discussed: ["read_url"], requestKind: "execute" },
     });
     expect(completionCalls).toBe(2);
   });

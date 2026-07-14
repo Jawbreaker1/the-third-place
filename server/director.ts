@@ -1217,6 +1217,7 @@ export class SocialDirector {
   private readonly pendingBursts = new Map<string, PendingBurst>();
   private readonly directorEvents: DirectorEvent[] = [];
   private readonly aiTimestamps: number[] = [];
+  private readonly priorityHumanReplyTimestamps: number[] = [];
   private readonly handledHumanImageIds = new Set<string>();
   private readonly ambientThreads = new Map<string, AmbientThreadState>();
   private readonly ambientBackoffUntilByChannel = new Map<string, number>();
@@ -1628,7 +1629,10 @@ export class SocialDirector {
         candidateSet,
         targetRef: analysis.evidence.urlRef,
         intent: resolvedIntent,
-        retry: trusted.capabilityTrusted && analysis.capabilities.requestKind === "retry",
+        retry: trusted.capabilityTrusted && (
+          analysis.capabilities.requestKind === "retry" ||
+          analysis.capabilities.requestKind === "correct_limitation"
+        ),
       });
       return pageReadRequest
         ? {
@@ -2373,7 +2377,7 @@ export class SocialDirector {
 
     const required = new Set(requiredIds);
     for (const requiredId of requiredIds.filter(
-      (id) => !requestOwnerIds.includes(id) && !lines.some((line) => line.personaId === id),
+      (id) => !lines.some((line) => line.personaId === id),
     )) {
       if (!burstIsCurrent()) break;
       const persona = selected.find((candidate) => candidate.id === requiredId);
@@ -2413,7 +2417,9 @@ export class SocialDirector {
             premise: [
               semanticFlagsPremise(analysis),
               evidencePremise,
-              signals.mentionedIds.includes(persona.id)
+              requestOwnerIds.includes(persona.id)
+                ? `${persona.name} owns the human's explicit request. Complete that request directly now; do not merely acknowledge, offer, defer, change subject or stay silent.`
+                : signals.mentionedIds.includes(persona.id)
                 ? `${persona.name} was directly addressed and must answer in their own concise voice.`
                 : conductIds.includes(persona.id)
                   ? `${persona.name} is the one designated resident who must give a direct, character-consistent social reaction; silence, subject-changing, and generic civility language do not satisfy this turn.`
@@ -2484,14 +2490,21 @@ export class SocialDirector {
     });
 
     const publishedResponses: ChatMessage[] = [];
+    let priorityReplyPublished = false;
     for (const [index, line] of lines.slice(0, selected.length).entries()) {
       if (!burstIsCurrent()) break;
       const persona = selected.find((candidate) => candidate.id === line.personaId);
       if (!persona) continue;
       await delay(index === 0 ? 350 : 1_200 + Math.random() * 1_600);
+      const ordinarySlotAvailable = this.canSpeak();
+      const prioritySlotAvailable = !ordinarySlotAvailable &&
+        !priorityReplyPublished &&
+        !autoSharedLinkAttempt &&
+        required.has(persona.id) &&
+        this.canUsePriorityHumanReply();
       if (
         !burstIsCurrent() ||
-        !this.canSpeak() ||
+        (!ordinarySlotAvailable && !prioritySlotAvailable) ||
         (autoSharedLinkAttempt && this.voiceRoomActive)
       ) break;
       const publishedSourceIds = sourceIdsForPageResponder(
@@ -2512,7 +2525,13 @@ export class SocialDirector {
         this.messageSources(research, publishedSourceIds),
         publishedSourceIds[0] && research ? linkPreviewFromResearch(research, publishedSourceIds[0]) : undefined,
       );
-      if (posted) publishedResponses.push(posted);
+      if (posted) {
+        publishedResponses.push(posted);
+        if (prioritySlotAvailable) {
+          this.recordPriorityHumanReply();
+          priorityReplyPublished = true;
+        }
+      }
       if (!posted && required.has(persona.id)) {
         const fallback = evidenceResponder?.id === persona.id ? safeEvidenceFallback : undefined;
         if (fallback) {
@@ -2524,7 +2543,13 @@ export class SocialDirector {
             "fallback",
             this.messageSources(research, fallback.sourceIds),
           );
-          if (fallbackMessage) publishedResponses.push(fallbackMessage);
+          if (fallbackMessage) {
+            publishedResponses.push(fallbackMessage);
+            if (prioritySlotAvailable) {
+              this.recordPriorityHumanReply();
+              priorityReplyPublished = true;
+            }
+          }
         }
       }
     }
@@ -3530,6 +3555,21 @@ export class SocialDirector {
 
   private canSpeak(): boolean {
     return this.availableMessageSlots() >= 1;
+  }
+
+  private canUsePriorityHumanReply(now = this.now()): boolean {
+    while (
+      this.priorityHumanReplyTimestamps.length > 0 &&
+      now - this.priorityHumanReplyTimestamps[0]! > 60_000
+    ) {
+      this.priorityHumanReplyTimestamps.shift();
+    }
+    const last = this.priorityHumanReplyTimestamps.at(-1);
+    return this.priorityHumanReplyTimestamps.length < 4 && (last === undefined || now - last >= 2_500);
+  }
+
+  private recordPriorityHumanReply(now = this.now()): void {
+    this.priorityHumanReplyTimestamps.push(now);
   }
 
   private canSpeakAutonomously(channelId: string): boolean {

@@ -17,8 +17,16 @@ export interface SafeHttpsFetchPolicy {
   userAgent: string;
   /** Reject redirects whose destination has a different origin from the requested URL. */
   sameOriginRedirectsOnly?: boolean;
+  /** Permit only the bare-host <-> www-host variant while redirect confinement is active. */
+  allowCanonicalWwwRedirect?: boolean;
   /** Stop after this short case-insensitive ASCII delimiter has arrived. */
   stopAfterAsciiSequence?: string;
+  /**
+   * If an HTML response is larger than maxBodyBytes, retain only its bounded
+   * head through </head>. This preserves useful public metadata without ever
+   * accepting or buffering the oversized document body.
+   */
+  oversizedHtmlHeadFallback?: boolean;
 }
 
 export interface SafeHttpsFetchResult {
@@ -85,9 +93,11 @@ const normalizedPolicy = (policy: SafeHttpsFetchPolicy): SafeHttpsFetchPolicy =>
   acceptHeader: policy.acceptHeader.slice(0, 512),
   userAgent: policy.userAgent.slice(0, 160),
   ...(policy.sameOriginRedirectsOnly === true ? { sameOriginRedirectsOnly: true } : {}),
+  ...(policy.allowCanonicalWwwRedirect === true ? { allowCanonicalWwwRedirect: true } : {}),
   ...(policy.stopAfterAsciiSequence && /^[\x20-\x7e]{1,64}$/u.test(policy.stopAfterAsciiSequence)
     ? { stopAfterAsciiSequence: policy.stopAfterAsciiSequence.toLocaleLowerCase() }
     : {}),
+  ...(policy.oversizedHtmlHeadFallback === true ? { oversizedHtmlHeadFallback: true } : {}),
 });
 
 export const scanAsciiSequence = (
@@ -161,6 +171,9 @@ export const extractPublicHttpsUrls = (content: string, limit = 3): URL[] => {
   return results;
 };
 
+const canonicalWwwHostname = (hostname: string): string =>
+  hostname.toLocaleLowerCase().startsWith("www.") ? hostname.slice(4).toLocaleLowerCase() : hostname.toLocaleLowerCase();
+
 export const resolvePublicAddress = async (
   hostname: string,
   deadline: number,
@@ -204,12 +217,21 @@ export const responseCanBeRead = (
 ): boolean => {
   const mediaType = responseMediaType(contentType);
   const encoding = contentEncoding.trim().toLocaleLowerCase();
+  const boundedEarlyStop = Boolean(policy.stopAfterAsciiSequence) || (
+    policy.oversizedHtmlHeadFallback === true &&
+    (mediaType === "text/html" || mediaType === "application/xhtml+xml")
+  );
+  const validLength = contentLength === undefined || (
+    Number.isFinite(contentLength) &&
+    contentLength >= 0 &&
+    (contentLength <= policy.maxBodyBytes || boundedEarlyStop)
+  );
   return (
     status >= 200 &&
     status < 300 &&
     policy.acceptedMediaTypes.includes(mediaType) &&
     (!encoding || encoding === "identity") &&
-    (contentLength === undefined || (Number.isFinite(contentLength) && contentLength >= 0 && contentLength <= policy.maxBodyBytes))
+    validLength
   );
 };
 
@@ -230,7 +252,7 @@ const requestPinnedHop = async (
     let hardDeadlineTimer: NodeJS.Timeout | undefined;
     let request: ReturnType<typeof httpsRequest> | undefined;
     let stopTail: Buffer = Buffer.alloc(0);
-    const stopSequence = policy.stopAfterAsciiSequence;
+    const configuredStopSequence = policy.stopAfterAsciiSequence;
     const finish = (value: PinnedHopResult): void => {
       if (settled) return;
       settled = true;
@@ -281,10 +303,17 @@ const requestPinnedHop = async (
           return;
         }
         const mediaType = responseMediaType(contentType);
+        const declaredOversized = parsedLength !== undefined &&
+          Number.isFinite(parsedLength) &&
+          parsedLength > policy.maxBodyBytes;
+        const metadataFallback = policy.oversizedHtmlHeadFallback === true &&
+          (mediaType === "text/html" || mediaType === "application/xhtml+xml");
+        const scanSequence = configuredStopSequence ?? (metadataFallback ? "</head>" : undefined);
         // A single bounded backing store prevents hostile one-byte HTTP chunks
         // from amplifying into hundreds of thousands of Buffer objects.
         const bodyBuffer = Buffer.allocUnsafe(policy.maxBodyBytes);
         let total = 0;
+        let metadataStopAt: number | undefined;
         const resetBodyTimer = (): void => {
           if (bodyTimer) clearTimeout(bodyTimer);
           bodyTimer = setTimeout(() => {
@@ -295,24 +324,35 @@ const requestPinnedHop = async (
         resetBodyTimer();
         response.on("data", (rawChunk: Buffer | string) => {
           const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
-          const processedBytes = total;
-          const nextTotal = total + chunk.length;
-          if (nextTotal > policy.maxBodyBytes || Date.now() >= deadline) {
+          if (Date.now() >= deadline) {
             response.destroy();
             finish({});
             return;
           }
-          chunk.copy(bodyBuffer, total);
-          total = nextTotal;
-          if (stopSequence) {
-            const scan = scanAsciiSequence(stopTail, chunk, stopSequence, processedBytes);
+          const processedBytes = total;
+          const available = Math.max(0, policy.maxBodyBytes - total);
+          const acceptedChunk = chunk.length <= available ? chunk : chunk.subarray(0, available);
+          acceptedChunk.copy(bodyBuffer, total);
+          total += acceptedChunk.length;
+          if (scanSequence && acceptedChunk.length > 0 && metadataStopAt === undefined) {
+            const scan = scanAsciiSequence(stopTail, acceptedChunk, scanSequence, processedBytes);
             stopTail = scan.tail;
             const stopAt = scan.stopAt;
             if (stopAt !== undefined && stopAt > 0 && stopAt <= total) {
-              response.destroy();
-              finish({ body: Buffer.from(bodyBuffer.subarray(0, stopAt)), mediaType, contentType });
-              return;
+              if (configuredStopSequence || declaredOversized) {
+                response.destroy();
+                finish({ body: Buffer.from(bodyBuffer.subarray(0, stopAt)), mediaType, contentType });
+                return;
+              }
+              metadataStopAt = stopAt;
             }
+          }
+          if (acceptedChunk.length < chunk.length) {
+            response.destroy();
+            finish(metadataFallback && metadataStopAt
+              ? { body: Buffer.from(bodyBuffer.subarray(0, metadataStopAt)), mediaType, contentType }
+              : {});
+            return;
           }
           resetBodyTimer();
         });
@@ -372,7 +412,11 @@ export const fetchPublicHttps = async (
     }
     const validated = validatePublicHttpsUrl(redirected.toString());
     if (!validated) return undefined;
-    if (policy.sameOriginRedirectsOnly && validated.origin !== startUrl.origin) return undefined;
+    if (policy.sameOriginRedirectsOnly && validated.origin !== startUrl.origin) {
+      const canonicalWwwRedirect = policy.allowCanonicalWwwRedirect === true &&
+        canonicalWwwHostname(validated.hostname) === canonicalWwwHostname(startUrl.hostname);
+      if (!canonicalWwwRedirect) return undefined;
+    }
     current = validated;
   }
   return undefined;

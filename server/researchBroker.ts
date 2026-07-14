@@ -38,6 +38,11 @@ type SearchScope = "generic" | "site";
 type HtmlNode = DefaultTreeAdapterTypes.Node;
 type HtmlElement = DefaultTreeAdapterTypes.Element;
 
+const canonicalWwwHost = (host: string): string => host.startsWith("www.") ? host.slice(4) : host;
+
+const isSameCanonicalSiteHost = (candidate: string, requested: string): boolean =>
+  candidate === requested || canonicalWwwHost(candidate) === canonicalWwwHost(requested);
+
 // This is a transport boundary, not an intent parser. The semantic router owns
 // the wording and mode; the broker only keeps the provider request bounded and
 // free of control characters.
@@ -226,7 +231,8 @@ export class ResearchBroker {
     const results = packet.results
       .filter((result) => {
         try {
-          return new URL(result.url).hostname.toLocaleLowerCase() === host;
+          const resultHost = new URL(result.url).hostname.toLocaleLowerCase().replace(/\.$/u, "");
+          return isSameCanonicalSiteHost(resultHost, host);
         } catch {
           return false;
         }

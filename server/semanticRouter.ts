@@ -1257,11 +1257,10 @@ export const shouldVerifyEvidencePlan = (
       (semanticallyContinuesPrecedingTurn && Boolean(precedingMessage && residentIds.has(precedingMessage.authorId)))
     );
 
-  const invalidLatestUrlFollowUp = summary.failureReason === "invalid_output" &&
-    input.recentMessages.length > 0 &&
+  const invalidLatestUrlTurn = summary.failureReason === "invalid_output" &&
     input.urlCandidates.some((candidate) => candidate.source === "latest_message");
 
-  return trustedCapabilityDiscussion || expectedDirectPersonaFollowUp || invalidLatestUrlFollowUp;
+  return trustedCapabilityDiscussion || expectedDirectPersonaFollowUp || invalidLatestUrlTurn;
 };
 
 const evidencePlanDecisionKinds = ["keep_none", "use_action"] as const;

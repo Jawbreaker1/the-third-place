@@ -8,6 +8,7 @@ import {
   resolvePageReadTarget,
 } from "./pageReader.js";
 import { PageProviderRegistry, type PageProviderAdapter } from "./pageProviders/index.js";
+import type { SafeHttpsFetchPolicy } from "./safeHttpsFetch.js";
 
 const message = (content: string, authorId = "guest-1", createdAt = new Date().toISOString()): ChatMessage => ({
   id: crypto.randomUUID(),
@@ -180,6 +181,31 @@ describe("language-agnostic page target binding", () => {
 });
 
 describe("inert article extraction", () => {
+  it("uses bounded head metadata when an oversized HTML body was intentionally not retained", () => {
+    const description = "A public platform for creating detailed architectural visualisations faster, with collaborative project workflows for property teams.";
+    const extracted = extractReadablePage(Buffer.from(`<!doctype html><html><head>
+      <title>Fallback document title</title>
+      <meta property="og:title" content="Public 3D visualisation platform">
+      <meta name="description" content="${description}">
+    </head>`), "text/html", new URL("https://large.example/"));
+    expect(extracted).toEqual({
+      title: "Public 3D visualisation platform",
+      text: description,
+    });
+  });
+
+  it("falls back to bounded head metadata when a sub-cap document exceeds the DOM parse budget", () => {
+    const description = "Independent daily reporting with breaking news, investigations and public-interest coverage from a national newsroom.";
+    const noisyBody = Array.from({ length: 4_100 }, (_, index) => `<div data-row="${index}">x</div>`).join("");
+    const html = `<!doctype html><html><head><title>Daily report</title><meta name="description" content="${description}"></head><body>${noisyBody}</body></html>`;
+    expect(Buffer.byteLength(html)).toBeLessThan(1024 * 1024);
+    expect(htmlWithinParseBudget(html)).toBe(false);
+    expect(extractReadablePage(html, "text/html", new URL("https://daily.example/"))).toEqual({
+      title: "Daily report",
+      text: description,
+    });
+  });
+
   it("keeps evidence text inert and strips active, hidden and noisy regions", () => {
     const extracted = extractReadablePage(Buffer.from(`<!doctype html><html><head>
       <title>Document title</title><meta property="og:title" content="Real article title">
@@ -292,6 +318,29 @@ describe("inert article extraction", () => {
 });
 
 describe("page reader broker", () => {
+  it("threads the oversized-HTML head policy through metadata extraction into one source", async () => {
+    let observedPolicy: SafeHttpsFetchPolicy | undefined;
+    const description = "A bounded public description with enough concrete detail to explain what this large website provides to its visitors.";
+    const reader = new PageReader(async (_rawUrl, policy) => {
+      observedPolicy = policy;
+      return {
+        finalUrl: new URL("https://www.large.example/?redirect_token=never-publish"),
+        mediaType: "text/html",
+        contentType: "text/html; charset=utf-8",
+        body: Buffer.from(`<html><head><meta property="og:title" content="Large public site"><meta name="description" content="${description}"></head>`),
+      };
+    });
+    const request = classifiedRequest({ content: "https://large.example/", requesterId: "guest-large" })!;
+    const packet = await reader.read(request, "guest-large");
+    expect(observedPolicy?.oversizedHtmlHeadFallback).toBe(true);
+    expect(packet?.results).toEqual([{
+      id: "S1",
+      title: "Large public site",
+      url: "https://large.example/",
+      snippet: description,
+    }]);
+  });
+
   it("returns one bounded server-owned source and never exposes a redirect target", async () => {
     const reader = new PageReader(async () => ({
       finalUrl: new URL("https://news.example/final?redirect_token=must-not-leak"),
@@ -351,7 +400,7 @@ describe("page reader broker", () => {
       const fetchGate = new Promise<void>((resolve) => {
         releaseFetches = resolve;
       });
-      const observedPolicies: Array<{ sameOriginRedirectsOnly?: boolean }> = [];
+      const observedPolicies: Array<{ sameOriginRedirectsOnly?: boolean; allowCanonicalWwwRedirect?: boolean }> = [];
       const reader = new PageReader(async (rawUrl, fetchPolicy) => {
         observedPolicies.push(fetchPolicy);
         await fetchGate;
@@ -369,6 +418,7 @@ describe("page reader broker", () => {
       expect(observedPolicies).toHaveLength(2);
       expect(observedPolicies[0]?.sameOriginRedirectsOnly).toBeUndefined();
       expect(observedPolicies[1]?.sameOriginRedirectsOnly).toBe(true);
+      expect(observedPolicies[1]?.allowCanonicalWwwRedirect).toBe(true);
 
       releaseFetches();
       const [explicitPacket, automaticPacket] = await Promise.all([explicit, automatic]);
@@ -390,7 +440,7 @@ describe("page reader broker", () => {
   });
 
   it("enforces automatic redirect confinement inside provider adapters", async () => {
-    const observedPolicies: Array<{ sameOriginRedirectsOnly?: boolean }> = [];
+    const observedPolicies: Array<{ sameOriginRedirectsOnly?: boolean; allowCanonicalWwwRedirect?: boolean }> = [];
     const provider: PageProviderAdapter = {
       id: "fetching-structured-source",
       supports: (url) => url.hostname === "structured.example",
@@ -432,6 +482,7 @@ describe("page reader broker", () => {
     await reader.read({ ...request, initiator: "automatic" }, "guest-1");
     expect(observedPolicies).toHaveLength(1);
     expect(observedPolicies[0]?.sameOriginRedirectsOnly).toBe(true);
+    expect(observedPolicies[0]?.allowCanonicalWwwRedirect).toBe(true);
   });
 
   it("uses typed retry metadata to bypass only a cached transient failure", async () => {

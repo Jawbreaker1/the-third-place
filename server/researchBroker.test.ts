@@ -311,6 +311,38 @@ describe("research broker", () => {
     expect(requested?.searchParams.get("format")).toBe("rss");
   });
 
+  it("accepts only the canonical www host variant for same-site results", async () => {
+    const rss = `<?xml version="1.0"?><rss><channel>
+      <item><title>Canonical www</title><link>https://www.aftonbladet.se/nyheter/real</link>
+        <description>Same public site through its canonical web host.</description></item>
+      <item><title>Numbered host</title><link>https://www2.aftonbladet.se/fake</link>
+        <description>Must not be treated as the canonical host.</description></item>
+      <item><title>Subdomain</title><link>https://news.aftonbladet.se/fake</link>
+        <description>Must not broaden to arbitrary subdomains.</description></item>
+      <item><title>Lookalike</title><link>https://aftonbladet.se.evil.example/fake</link>
+        <description>Must not accept a suffix lookalike.</description></item>
+      <item><title>Credentials</title><link>https://aftonbladet.se@evil.example/fake</link>
+        <description>Must not accept a credential-shaped lookalike.</description></item>
+      <item><title>Wrong port</title><link>https://aftonbladet.se:8443/fake</link>
+        <description>Must not accept a nonstandard port.</description></item>
+    </channel></rss>`;
+    const broker = new ResearchBroker((async () =>
+      new Response(rss, { status: 200, headers: { "content-type": "application/rss+xml" } })) as typeof fetch);
+
+    const packet = await broker.researchSite({
+      query: "nyheter idag",
+      mode: "web",
+      url: new URL("https://aftonbladet.se/"),
+      requesterId: "canonical-www",
+    });
+
+    expect(packet?.results).toEqual([expect.objectContaining({
+      id: "S1",
+      title: "Canonical www",
+      url: "https://www.aftonbladet.se/nyheter/real",
+    })]);
+  });
+
   it("scans the bounded RSS window before exact-host filtering for a root-site request", async () => {
     const unrelated = Array.from({ length: 6 }, (_, index) => `
       <item><title>General result ${index}</title><link>https://example${index}.com/tesla</link>

@@ -819,6 +819,22 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       failureReason: "invalid_output",
     })).toBe(true);
 
+    const firstTurnUrl = stockTurn("Har ni kollat den här sidan?", {
+      recentMessages: [],
+      urlCandidates: [{ ref: "latest:site", source: "latest_message", context: "host=example.com; path=/" }],
+    });
+    expect(shouldVerifyEvidencePlan(firstTurnUrl, {
+      source: "fallback",
+      failureReason: "invalid_output",
+    })).toBe(true);
+    expect(shouldVerifyEvidencePlan({
+      ...firstTurnUrl,
+      urlCandidates: [{ ref: "recent:site", source: "recent_same_author", context: "host=example.com; path=/" }],
+    }, {
+      source: "fallback",
+      failureReason: "invalid_output",
+    })).toBe(false);
+
     expect(shouldVerifyEvidencePlan(
       directRetry,
       primarySummary({
