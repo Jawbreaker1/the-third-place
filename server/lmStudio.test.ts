@@ -476,6 +476,42 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionCalls).toBe(2);
   });
 
+  it("recovers an invalid primary classification when an explicit deliverable requires a real searched destination", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        return jsonResponse({ choices: [{ message: { content: '{"invalid":"primary"}' } }] });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "web_search",
+        requestKind: "execute",
+        goal: "roliga memes att länka till",
+        query: "roliga memes",
+        searchMode: "web",
+      });
+    }));
+    const request = turnInput("meme-link-recovery");
+    request.channel = { id: "the-pub", name: "the-pub" };
+    request.latestMessage.content = "Någon som har en rolig Meme att länka till?";
+    request.recentMessages = [];
+    request.urlCandidates = [];
+    request.availableCapabilities = ["web_search", "local_datetime"];
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: {
+        action: "web_search",
+        goal: "roliga memes att länka till",
+        query: "roliga memes",
+      },
+      capabilities: { discussed: ["web_search"], requestKind: "execute" },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
   it("repairs a direct short follow-up with one bounded evidence-only verifier pass", async () => {
     let completionCalls = 0;
     const bodies: any[] = [];

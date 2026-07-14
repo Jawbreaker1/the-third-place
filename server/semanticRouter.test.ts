@@ -816,6 +816,14 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
     }))).toBe(true);
 
+    expect(shouldVerifyEvidencePlan(
+      stockTurn("Någon som har en rolig Meme att länka till?", { recentMessages: [] }),
+      primarySummary({
+        intent: { kind: "request", replyExpected: "expected", confidence: 0.96 },
+        personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
+      }),
+    )).toBe(true);
+
     const correctedMedium = stockTurn("inte app.. websida", {
       recentMessages: [{ ...priorMiraMessage, content: "Jag har inte tillgång till deras app." }],
     });
@@ -847,7 +855,14 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     }, {
       source: "fallback",
       failureReason: "invalid_output",
-    })).toBe(false);
+    })).toBe(true);
+    expect(shouldVerifyEvidencePlan(
+      stockTurn("Någon som har en rolig Meme att länka till?", {
+        recentMessages: [],
+        urlCandidates: [],
+      }),
+      { source: "fallback", failureReason: "invalid_output" },
+    )).toBe(true);
 
     expect(shouldVerifyEvidencePlan(
       directRetry,
@@ -1060,6 +1075,9 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(prompt).toContain("short follow-up can replace only the mistaken part");
     expect(prompt).toContain("room-directed nudge from the same speaker");
     expect(prompt).toContain("use_action with retry");
+    expect(prompt).toContain("real external destination");
+    expect(prompt).toContain("external deliverable regardless");
+    expect(prompt).toContain("classify evidence need afresh");
     expect(prompt).toContain("never capability truth");
     expect(prompt).toContain("Preserve the guest's language and script");
     expect(prompt).toContain("self-contained question, social or creative request, passive link");
