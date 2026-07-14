@@ -1,3 +1,5 @@
+import { normalizeSpokenLanguageTag, speechTimingUnits } from "../shared/spokenText";
+
 export interface VoiceAiSpeechPayload {
   roomId: string;
   memberId: string;
@@ -104,15 +106,18 @@ const finiteOr = (value: number | undefined, fallback: number): number =>
 const clamp = (value: number, minimum: number, maximum: number): number =>
   Math.max(minimum, Math.min(maximum, value));
 
-const terminalWatchdogMs = (speech: VoiceAiSpeechPayload, browser: boolean): number => {
-  const words = Math.max(1, speech.text.trim().split(/\s+/).length);
+export const terminalWatchdogMs = (speech: VoiceAiSpeechPayload, browser: boolean): number => {
+  const units = Math.max(1, speechTimingUnits(speech.text, speech.language));
   const rate = browser ? clamp(finiteOr(speech.browserRate, 1), 0.5, 2) : 1;
-  return clamp(Math.round(4_000 + (words * 700) / rate), 8_000, 30_000);
+  return clamp(Math.round(4_000 + (units * 700) / rate), 8_000, 30_000);
 };
 
-const normalizedLanguage = (value: string | undefined, fallback: string): string => {
-  const candidate = value?.trim();
-  return candidate && /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/iu.test(candidate) ? candidate : fallback;
+const normalizedLanguage = (value: string | undefined, fallback?: string): string => {
+  for (const candidate of [value, fallback]) {
+    const normalized = normalizeSpokenLanguageTag(candidate);
+    if (normalized) return normalized;
+  }
+  return "";
 };
 
 const stableHash = (value: string): number => {
@@ -308,7 +313,7 @@ export class VoicePlaybackController {
 
     synthesis.cancel();
     const utterance = createUtterance(speech.text);
-    const language = normalizedLanguage(speech.language, this.environment.defaultLanguage ?? "en-US");
+    const language = normalizedLanguage(speech.language, this.environment.defaultLanguage);
     utterance.lang = language;
     utterance.rate = clamp(finiteOr(speech.browserRate, 1), 0.5, 2);
     utterance.pitch = clamp(finiteOr(speech.browserPitch, 1), 0.5, 2);

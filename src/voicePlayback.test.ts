@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  terminalWatchdogMs,
   VoicePlaybackController,
   type VoiceAiSpeechPayload,
   type VoicePlaybackAudio,
@@ -248,6 +249,47 @@ describe("VoicePlaybackController", () => {
     expect(utterance.rate).toBe(1.17);
     expect(utterance.pitch).toBe(0.88);
     expect(utterance.voice?.lang).toBe("sv-SE");
+  });
+
+  it("accepts arbitrary BCP-47 language tags and never invents an English fallback", () => {
+    const synthesis = new FakeSynthesis([
+      { default: false, lang: "zh-Hant-TW", localService: true, name: "Traditional Chinese", voiceURI: "voice-zh" },
+    ]);
+    const tagged = environment({ playable: false, synthesis });
+    new VoicePlaybackController(tagged.value).enqueue(speech("tagged", { language: "zh-Hant-TW" }));
+    expect(synthesis.spoken[0]?.lang).toBe("zh-Hant-TW");
+    expect(synthesis.spoken[0]?.voice?.lang).toBe("zh-Hant-TW");
+
+    const untaggedSynthesis = new FakeSynthesis();
+    const untagged = environment({ playable: false, synthesis: untaggedSynthesis });
+    untagged.value.defaultLanguage = undefined;
+    new VoicePlaybackController(untagged.value).enqueue(speech("untagged", { language: undefined }));
+    expect(untaggedSynthesis.spoken[0]?.lang).toBe("");
+  });
+
+  it("treats und as absent and falls back to the browser's valid locale", () => {
+    const synthesis = new FakeSynthesis([
+      { default: true, lang: "th-TH", localService: true, name: "Thai", voiceURI: "voice-th" },
+    ]);
+    const fake = environment({ playable: false, synthesis });
+    fake.value.defaultLanguage = "th-TH";
+    new VoicePlaybackController(fake.value).enqueue(speech("und", { language: "und" }));
+    expect(synthesis.spoken[0]?.lang).toBe("th-TH");
+    expect(synthesis.spoken[0]?.voice?.lang).toBe("th-TH");
+  });
+
+  it("sizes watchdogs for unspaced CJK and Thai speech with Unicode segmentation", () => {
+    const oneLatinWord = terminalWatchdogMs(speech("latin", { text: "extraordinary" }), true);
+    const chinese = terminalWatchdogMs(speech("zh", {
+      text: "這是一段沒有空格但包含很多詞語的自然中文回答我們應該先測試再決定",
+      language: "zh-Hant-TW",
+    }), true);
+    const thai = terminalWatchdogMs(speech("th", {
+      text: "นี่คือคำตอบภาษาไทยที่เป็นธรรมชาติและไม่มีช่องว่างระหว่างทุกคำ",
+      language: "th-TH",
+    }), true);
+    expect(chinese).toBeGreaterThan(oneLatinWord);
+    expect(thai).toBeGreaterThan(oneLatinWord);
   });
 
   it("keeps blocked server audio active and retries it from a later user gesture", async () => {

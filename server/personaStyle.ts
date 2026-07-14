@@ -26,6 +26,8 @@ export interface PersonaStyleFingerprint {
   disagreementMode: PersonaDisagreementMode;
   /** Options to rotate between, never mandatory tics. */
   conversationHabits: readonly string[];
+  /** Explicit metadata; never infer this from words in a habit description. */
+  questionEndingHabitIndexes?: readonly number[];
   /** Persona-specific crutches in addition to the community-wide assistantisms. */
   avoidPhrases: readonly string[];
 }
@@ -43,17 +45,6 @@ export interface PersonaStyleTurnPolicy {
   habit?: string;
   ending: "statement" | "question-allowed" | "question-required";
 }
-
-export const GENERIC_ASSISTANT_PHRASES = [
-  "As an AI",
-  "Absolutely!",
-  "Great point",
-  "It's important to note",
-  "That being said",
-  "I completely agree",
-  "Let's dive in",
-  "in conclusion",
-] as const;
 
 const casingNotes: Record<PersonaCasing, string> = {
   sentence: "Normal sentence casing; fragments may still be fragments.",
@@ -142,14 +133,14 @@ export const derivePersonaStyleTurnPolicy = (
     : 0.18;
   const ending = endingOverride
     ?? (hashUnit(`${key}\u0000question-budget`) < questionRate ? "question-allowed" : "statement");
-  const eligibleHabits = ending === "statement"
-    ? persona.style.conversationHabits.filter((habit) => !/\b(?:ask|question)\b/iu.test(habit))
-    : persona.style.conversationHabits;
+  const eligibleHabits = persona.style.conversationHabits
+    .map((habit, index) => ({ habit, index }))
+    .filter(({ index }) => ending !== "statement" || !persona.style.questionEndingHabitIndexes?.includes(index));
   const habitAllowed = eligibleHabits.length > 0 && hashUnit(`${key}\u0000habit-budget`) < 0.3;
   const habit = habitAllowed
     ? eligibleHabits[
         Math.floor(hashUnit(`${key}\u0000habit-choice`) * eligibleHabits.length)
-      ]
+      ]?.habit
     : undefined;
 
   return {
@@ -216,7 +207,7 @@ export const buildPersonaStylePromptNote = (
       )
     : undefined;
   const policy = derivedPolicy;
-  const avoid = [...GENERIC_ASSISTANT_PHRASES, ...style.avoidPhrases]
+  const avoid = style.avoidPhrases
     .map((phrase) => `“${phrase}”`)
     .join(", ");
 
@@ -228,7 +219,7 @@ export const buildPersonaStylePromptNote = (
 - Corrections: ${correctionNoteForTurn(style, policy)}
 - Disagreement: ${disagreementNoteForTurn(style, policy)}
 ${policy ? turnPolicyNote(policy) : `- Optional habits to rotate, at most one per message: ${habits}.`}
-- Avoid these canned openings or crutches: ${avoid}.
+- Avoid generic service-assistant validation, recap and transition language in any language. Persona-specific crutches to avoid: ${avoid}.
 - Do not perform every trait every time, announce the style, reuse the same opening, or turn a habit into a catchphrase.`;
 };
 
@@ -251,4 +242,5 @@ export const personaStyleSignature = (style: PersonaStyleFingerprint): string =>
     style.correctionMode,
     style.disagreementMode,
     style.conversationHabits.join("|"),
+    style.questionEndingHabitIndexes?.join(",") ?? "",
   ].join(":");

@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { configDefaults } from "vitest/config";
 
 export default defineConfig({
   plugins: [react()],
@@ -16,5 +17,10 @@ export default defineConfig({
   },
   build: {
     sourcemap: true,
+  },
+  test: {
+    // Server builds contain compiled copies of source tests; never execute the
+    // stale artifacts as a second test suite.
+    exclude: [...configDefaults.exclude, "dist-server/**"],
   },
 });

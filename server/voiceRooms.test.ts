@@ -242,13 +242,16 @@ describe("voice room runtime", () => {
     if (!invited.ok) throw new Error(invited.error);
     expect(runtime.setBotState(created.room.id, "ai-sana", "listening").ok).toBe(true);
 
-    const humanFinal = runtime.appendFinalTranscript(created.room.id, "human-1", "  hello\u0000   Sana  ");
+    const humanFinal = runtime.appendFinalTranscript(created.room.id, "human-1", "  hello\u0000   Sana  ", {
+      language: "zh-Hant-TW-u-ca-chinese",
+    });
     expect(humanFinal).toMatchObject({
       ok: true,
       entry: {
         text: "hello Sana",
         final: true,
         utteranceOrigin: "microphone-stt",
+        language: "zh-Hant-TW",
         heardByPersonaIds: ["ai-sana"],
         trigger: { eligible: true, source: "human-final" },
       },
@@ -260,6 +263,12 @@ describe("voice room runtime", () => {
       ok: true,
       entry: { speakerKind: "human", utteranceOrigin: "typed-voice-fallback" },
     });
+    if (typedFinal.ok) expect(typedFinal.entry.language).toBeUndefined();
+    const undetermined = runtime.appendFinalTranscript(created.room.id, "human-1", "unknown language", {
+      language: "und",
+    });
+    expect(undetermined.ok).toBe(true);
+    if (undetermined.ok) expect(undetermined.entry.language).toBeUndefined();
     const aiFinal = runtime.appendFinalTranscript(created.room.id, "ai-sana", "I heard you.", {
       // Caller input can never relabel synthesized AI speech as a human fallback.
       utteranceOrigin: "typed-voice-fallback",

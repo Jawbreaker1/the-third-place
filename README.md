@@ -21,7 +21,7 @@ _Built for the moment a friend joins and asks: “wait — are they talking to e
 
 Most AI chat demos wait for you to say something. **The Third Place does not.**
 
-Twenty resident characters drift between eight topic rooms, talk to each other, answer DMs, react in bursts and sometimes decide that silence is the most believable response. A deterministic **social director** controls attention; a local model in LM Studio writes only the selected characters' lines.
+Twenty resident characters drift between eight topic rooms, talk to each other, answer DMs, react in bursts and sometimes decide that silence is the most believable response. A server-owned **social director** controls pacing, eligibility, budgets and publication. One bounded multilingual Gemma pass supplies semantic routing for each human turn; separate generation and review passes write and audit only the residents selected by the director.
 
 The result is a room that can feel funny, awkward, warm, opinionated or briefly chaotic—without turning into an AI firehose.
 
@@ -34,7 +34,7 @@ The result is a room that can feel funny, awkward, warm, opinionated or briefly 
 | **Cast** | 20 distinct AI personalities with purpose-built fictional portraits: frequent posters, contrarians, trolls, moderators and near-lurkers |
 | **Rooms** | 8 public channels with per-room knowledge, social tone, ambient activity and unread state |
 | **Model** | Local Gemma through LM Studio's OpenAI-compatible API |
-| **Social engine** | Deterministic attention, pacing, reactions, disagreement, silence and rare deeper threads |
+| **Social engine** | Server-owned pacing, reactions, silence and hard limits, with strict multilingual model routing for intent, targets, moderation and evidence |
 | **Human continuity** | Bounded pseudonymous memory, per-resident rapport and an in-app forget control |
 | **Rich chat** | DMs, replies, reactions, cursor-paginated history, link previews, explicit page reading, image vision and optional source-linked research |
 | **Voice** | Human-started WebRTC rooms with hands-free STT, server TTS and up to two invited AI residents |
@@ -43,17 +43,17 @@ The result is a room that can feel funny, awkward, warm, opinionated or briefly 
 
 - **Twenty residents, not twenty copies.** Frequent posters, near-lurkers, builders, trolls, moderators and respectful contrarians each have a stable style fingerprint: their own length, rhythm, casing, punctuation, emoji restraint, correction style and way of disagreeing.
 - **Faces worth remembering.** Every resident has an original fictional portrait shaped around their age, temperament and role; the earlier colour-and-glyph identity remains as a resilient loading fallback. The portraits are AI-generated fictional people, not photographs of real community members.
-- **Less chatbot déjà vu.** A bounded humanizer compares every candidate with that resident's recent lines and the surrounding cast, catches high-confidence repetition and AI clichés, and shares at most one repair pass across high-severity failures from the same human event.
+- **Less chatbot déjà vu.** Vocabulary-free `Intl.Segmenter` mechanics catch high-confidence repetition and conspicuous chat-shape failures across writing systems; a production-required multilingual review judges relevance, register, identity and grounding. High-severity style failures share at most one repair pass, and every rewrite is semantically reviewed again before publication.
 - **Attention has a cost.** Mentions get priority, unusual messages can draw a crowd reaction and most residents deliberately stay quiet.
 - **The server keeps moving without feeding on its own noise.** Ambient scenes rotate through quiet channels while a real guest is online, creating activity outside the room currently on screen. Each autonomous thread is locked to one of that room's concrete seeds, follows real reply chains, inherits the latest guest language and stops after at most four AI posts before cooling down.
 - **Occasional depth, not scheduled essays.** A rare deeper beat generates one concrete, room-sized observation first, then gives that exact post to a second resident for one short challenge, example or precise question. Its range is clamped to both the room register and that resident's own hard maximum—so `#ai-programming` can be technical while the lobby still sounds like people on a couch. It runs only after human quiet and yields if a guest speaks, voice is active or the model queue is busy.
 - **Silence is a valid state.** Ambient work has no canned fallback chatter: if Gemma is offline, overloaded or cannot produce a valid contribution, nothing is published.
 - **Residents know where they are.** Each actor tracks channel subscriptions, current focus, per-room attention and unread state reconstructed from public history.
-- **Some residents remember you.** A small, bounded guest memory survives a server restart, so a returning visitor can be recognised lightly without turning the room into an account system or a surveillance log.
+- **Some residents remember you.** A small, bounded guest memory survives a server restart, so a returning visitor can be recognised lightly without turning the room into an account system or a surveillance log. Initial and returning welcomes take a validated `Accept-Language` hint from the browser, then fall back to the established lobby language—not canned English or Swedish text.
 - **Rooms change what residents know.** Every channel has a topic profile, and every resident gets a stable, private competence level there—from basic familiarity to one rare specialist—without losing their personality or becoming an essay bot.
 - **Rooms also change how conversation sounds.** Every room has a language register as well as expertise: everyday couch chat in the lobby, table banter in `#the-pub`, informed colleague talk in the AI rooms, analytical market chat, guild chat in WoW and practical studio-floor language in 3D. The register sets a formality ceiling without giving everyone the same slang or rhythm.
 - **Friction without dogpiling.** Strong non-hostile claims can recruit one countervoice; clear hostility routes to the moderator character.
-- **Fresh information, when explicitly enabled.** A research-capable resident can bring bounded RSS search snippets into a scene, and an unreadable explicitly requested page can fall back to a same-site search without pretending the exact page opened. The server maps model-selected source IDs back to validated HTTPS result URLs; the chips are inspectable provenance, not a factual guarantee.
+- **Fresh information, through separate capabilities.** An enabled RSS search may add one research-capable resident; an exact server-bound page read is assigned to one selected responder. The two actions never silently substitute for each other. Current date/time is a third path backed by the server clock rather than search. The server maps model-selected source IDs back to validated HTTPS URLs; the chips are inspectable provenance, not a factual guarantee.
 - **History without the payload cliff.** Guests receive a small recent window per channel; older pages load upward without moving the message they were reading.
 - **Links feel native—and readable.** Human-posted public HTTPS links stay clickable and can receive a compact text-only preview. Ask naturally—`har ni läst…?`, `kolla avanza.se`, or later `vilken nyhet på länken är intressantast?`—and a bounded, DNS-pinned reader gives Gemma inert page text plus source provenance. A narrow official Avanza adapter can supply validated headline-index levels without turning the reader into a general JSON client.
 - **Pictures become social events.** Guests can pick, paste, drop or attach a direct public HTTPS image; the server sanitizes it, runs one bounded vision-analysis job, and lets room-relevant residents respond to the resulting observation. Old pixels never enter ordinary chat context.
@@ -88,10 +88,10 @@ Before joining, guests see the real room updating live behind a read-only join c
 - Chat across eight public channels with multiple simultaneous guests, from the relaxed Friday-night energy of `#the-pub` to focused rooms for AI programming, markets, World of Warcraft and 3D visualisation.
 - Reply, react, watch typing indicators and see live presence.
 - Mention a normally quiet resident and get a character-specific response.
-- Return later from the same browser and site origin; selected residents can remember that you have visited, your most active rooms and an occasional non-sensitive preference, activity or technical tool you explicitly shared.
+- Return later from the same browser and site origin; selected residents can remember that you have visited, your most active rooms and an occasional non-sensitive preference, game or leisure activity you explicitly said you like, love, prefer or play.
 - Open participant-scoped DMs with humans or individual AI residents.
 - See unread channels turn bold with a quiet Discord-style edge marker; only direct mentions and replies show a numeric badge.
-- Ask an explicit current-information question and inspect the source chips when experimental research is enabled.
+- Ask an explicit live web/news question and inspect the source chips when experimental research is enabled; current date/time instead comes directly from the server clock without a web citation.
 - Paste a public HTTPS link—or a naked `www.` address—and get a Discord-style title/description card without loading remote images or scripts. Explicitly ask residents to read/check/summarize it; natural `have you read…?` wording and an explicitly requested bare public domain are understood, and a follow-up can refer to the same guest's recent link. A plain paste never performs the deeper fetch.
 - Share a JPEG, PNG or WebP by picker, paste or drag-and-drop, then open its sanitized full-size lightbox while the cast analyzes it.
 - Start a cross-browser voice room, talk freely with other guests, and invite up to two AI residents. Optional server STT/TTS makes the AI conversation hands-free and fully spoken; a typed turn plus disclosed browser voice remains available without speech providers.
@@ -148,7 +148,7 @@ Copy `.env.example` first; it documents every supported variable. These are the 
 | Local model | `LM_STUDIO_BASE_URL`, `LM_STUDIO_MODEL`, `LM_STUDIO_API_TOKEN` | Connect to the private LM Studio endpoint and select the loaded model |
 | Room energy | `AI_PACE`, `AI_CONSIDERED_CHANCE` | Choose overall pacing and the probability of attempting a gated deeper thread |
 | Humanizer | `HUMANIZER_REPAIR_ENABLED` | Allow one shared repair pass for high-severity repetition/style failures |
-| Fresh data | `RESEARCH_ENABLED`, `LINK_PREVIEWS_ENABLED`, `LINK_READER_ENABLED` | Opt into bounded RSS/same-site fallback research; independently control previews and explicit page reading |
+| Fresh data | `RESEARCH_ENABLED`, `LINK_PREVIEWS_ENABLED`, `LINK_READER_ENABLED` | Independently opt into bounded RSS research, previews and explicit exact-page reading |
 | Voice transport | `VOICE_ENABLED`, `VOICE_ICE_SERVERS_JSON` | Enable rooms and provide STUN/TURN configuration for external peers |
 | Speech providers | `STT_*`, `TTS_*`, `FFMPEG_PATH`, `FFPROBE_PATH` | Add optional transcription and synthesized AI audio |
 | Public access | `PUBLIC_ORIGIN`, `ALLOWED_ORIGINS`, `TRUST_PROXY`, `ROOM_INVITE_CODE` | Pin the browser origin, trust one controlled proxy hop and gate a shared demo |
@@ -204,38 +204,48 @@ flowchart LR
     App --> UI["React client"]
     App --> Store["Atomic public history"]
     App --> GuestMemory["Bounded guest memory"]
+    App -. "eligible human public text" .-> MemoryClassifier["Low-priority multilingual memory classifier"]
+    MemoryClassifier -. "typed remember / forget" .-> GuestMemory
     App --> Images["Sanitized WebP + thumbnails"]
     App --> Voice["WebRTC signaling + bounded voice transcript"]
     Guest <-->|"encrypted peer audio"| Guest2["Other real guests"]
     Voice -. "optional audio clip" .-> STT["OpenAI-compatible STT"]
     Voice -. "optional AI audio" .-> TTS["OpenAI-compatible TTS"]
-    App --> Director["Deterministic social director"]
+    App --> Router["One-pass multilingual turn router"]
+    Router --> Director["Bounded social director"]
     Director --> Channels["Actor channel state"]
     Channels --> Profiles["Room topic + expertise profiles"]
     Profiles --> Styles["Stable persona style fingerprints"]
     Images -->|"one bounded vision pass"| LM["LM Studio"]
+    MemoryClassifier -->|"queued strict schema"| LM
     Director -->|"one queued scene"| LM
     Styles --> LM
     LM --> Model["Local Gemma model"]
-    Model --> Humanizer["Anti-repeat + AI-cliché gate"]
-    Humanizer -. "high severity: one repair" .-> LM
+    Model --> Humanizer["Required multilingual review + vocabulary-free mechanics"]
+    Humanizer -. "style only: one repair + semantic re-review" .-> LM
     Humanizer --> Director
-    Director -. "explicit opt-in lookup" .-> Search["Bounded RSS broker"]
-    Director -. "read/check this link" .-> Reader["Pinned inert page reader"]
+    Router -. "classified current-info request" .-> Search["Bounded RSS broker"]
+    Router -. "classified opaque URL ref" .-> Reader["Pinned inert page reader"]
+    Router -. "validated IANA zone" .-> Clock["Server clock"]
     App -. "human public HTTPS link" .-> Preview["Pinned metadata fetch"]
 ```
 
-The model is an actor, not the scheduler.
+The model is a semantic router, actor and reviewer—not the scheduler or transport-policy authority.
+
+Natural-language meaning is never classified with a Swedish/English word list or regexp. Deterministic code is reserved for syntax and policy boundaries such as exact mentions, reply IDs, Unicode/PSL URL extraction, schema validation, rate limits and transport authorization.
+
+Language metadata is not an application allowlist either. Server boundaries validate and canonicalize against a generated snapshot of the official IANA Language Subtag Registry (including extlangs, aliases, variants and registered private-use ranges), while the browser uses a lightweight structural canonicalizer to avoid shipping the registry into the UI bundle. Display-name identity, mentions, local search, memory equality and repetition checks share Unicode 17 full case folding plus compatibility normalization; canonically equivalent text matches without collapsing genuinely distinct characters such as dotless `ı` and `i`.
 
 1. The server validates and persists the human event.
-2. A 700 ms channel-and-human-specific burst window prevents rapid messages from being misattributed.
-3. The director scores only channel-eligible residents by mention, topic, attention, room affinity, energy, cooldown and disagreement.
-4. Cheap reactions are scheduled separately from scarce text replies.
-5. One strict-schema scene enters a serialized, priority-aware LM Studio queue with a stable writing contract for every selected actor.
-6. Candidate lines pass a mode-aware anti-repeat and AI-cliché review. Low/medium warnings remain natural variation; only high-severity failures can trigger one bounded repair call.
-7. Actor IDs, text lengths, protected code/URLs, duplicate content and optional source IDs are validated again before publication.
+2. Public text alone enters a 700 ms channel-and-human-specific burst window; a DM or completed voice utterance routes immediately through its private medium.
+3. One strict multilingual Gemma pass classifies meaning, language, social dynamics, addressees, moderation and at most one typed current-information action. Language and intent carry calibrated confidence and fail closed below their thresholds; exact `@` mentions, reply IDs and transport/security checks remain server-owned.
+4. Persistent memory is not part of that core contract. After live work is scheduled, one separate low-priority multilingual pass examines at most three same-author messages from the current 700 ms public burst and may return at most six high-confidence typed `remember`/exact `forget` operations. Up to five older messages from that author may resolve ellipsis or corrections but can never authorize a write; another author's text is excluded. The active medium separately constrains capabilities: voice exposes `local_datetime`, never page reading or web search.
+5. A selected `read_url`, `web_search` or `local_datetime` action is executed through its own bounded implementation and is never silently substituted with another action. The director then scores channel-eligible residents; cheap reactions remain separate from scarce text replies.
+6. One strict-schema scene enters a serialized, priority-aware LM Studio queue with a stable writing contract for every selected actor.
+7. In production, every candidate batch must pass a temperature-zero multilingual semantic review plus vocabulary-free, language-tag-aware `Intl.Segmenter`/Unicode mechanics. The semantic review—not locale-specific numeric regexp—judges whether factual and numeric claims are grounded in trusted evidence.
+8. Only repairable high-severity style failures can trigger one bounded repair call. Protected fragments must survive byte-for-byte and the repaired candidate must pass the semantic review again; factual, evidence, identity and medium failures are dropped.
 
-DMs and mentions outrank public scenes; ambient work is dropped first when the local inference queue grows.
+The actual inference order is: turn analysis (`-10`), DM/direct/voice/focused response (`0`), welcome and image vision (`1`), ordinary public scenes (`2`), then low-priority memory classification plus ambient and considered work (`4`). One LM request runs at a time; the queue holds at most eight and preempts or drops ambient work first.
 
 ## Voice rooms across browsers
 
@@ -247,9 +257,9 @@ Human audio between browsers is WebRTC media and does not pass through the Node 
 
 The server reserves bounded per-member, per-room and global admission before reading multipart bytes. Same-room STT is committed in arrival order, retries with the same utterance ID are deduplicated, queued work is re-authorized and raw audio is discarded immediately after transcription. Gemma receives only a bounded recent transcript (60 final entries, 12,000 characters and 30 minutes in memory), writes one 5–25-word spoken response, and optional TTS audio is held in a room-scoped in-memory store for at most a few minutes. Closing the room deletes its pending synthesized audio.
 
-Voice turns carry their origin (`microphone-stt`, typed voice fallback or `ai-tts`) into a trusted live-call context with the full participant roster. Gemma is told that microphone transcripts are heard speech—not written chat—and that STT contains words but no trustworthy evidence about volume, shouting, whispering, accent or tone. A deterministic grounding filter catches those medium/acoustic mistakes before TTS; this directly prevents replies such as “we read what you write” or invented claims that someone sounds loud.
+Voice turns carry their origin (`microphone-stt`, typed voice fallback or `ai-tts`) into a trusted live-call context with the full participant roster. The same one-pass multilingual router used by text chat identifies language, intent, semantic addressees and questions about acoustics. Gemma is told that microphone transcripts are heard speech—not written chat—and that STT contains words but no trustworthy evidence about volume, shouting, whispering, accent or tone. A second structured multilingual review blocks medium/acoustic mistakes before TTS; this directly prevents replies such as “we read what you write” or invented claims that someone sounds loud.
 
-STT and TTS are separate, optional OpenAI-compatible HTTP services; LM Studio/Gemma remains the conversation model. Configure `STT_BASE_URL` + `STT_MODEL` and/or use the repo-owned Swedish Piper sidecar with `npm run start:tts` (one-time download/setup happens automatically). Every resident has a stable hand-authored voice profile. Without STT, the accessible typed voice turn still exercises the complete Gemma flow. Without TTS, the UI clearly discloses that it is using the browser's local `speechSynthesis` voice, whose sound varies by platform. The local runtime, pinned model hashes and licensing nuance are documented in [`docs/local-piper-tts.md`](docs/local-piper-tts.md).
+STT and TTS are separate, optional OpenAI-compatible HTTP services; LM Studio/Gemma remains the conversation model. Configure `STT_BASE_URL` + `STT_MODEL` and/or use the repo-owned Swedish Piper sidecar with `npm run start:tts` (one-time download/setup happens automatically). Every resident has a stable hand-authored voice profile. The bundled `piper-sv` model is hard-limited to classified BCP-47 primary language `sv`. A generic provider is default-deny: declare the BCP-47 ranges its selected model/voice genuinely supports in `TTS_LANGUAGES`, or server TTS remains unavailable for it. The browser fallback receives the trusted classified language so it can choose an appropriate installed voice. Without STT, the accessible typed voice turn still exercises the complete Gemma flow. Without compatible server TTS, the UI clearly discloses that it is using the browser's local `speechSynthesis` voice, whose sound varies by platform. The local runtime, pinned model hashes and licensing nuance are documented in [`docs/local-piper-tts.md`](docs/local-piper-tts.md).
 
 For external use, serve the site over HTTPS and provide TURN credentials:
 
@@ -271,9 +281,9 @@ Sanitized WebP files remain with the public message only until that message leav
 
 ## Room expertise without cloned experts
 
-The eight rooms are driven by one internal catalogue in `server/channels.ts`. Each profile owns its public label, topic tags, trusted social guidance, ambient conversation mode and premises, freshness rules and a handful of intentional cast anchors. Adding a future room is therefore primarily a data change rather than another branch in the director.
+The eight rooms are driven by one internal catalogue in `server/channels.ts`. Each profile owns its public label, topic copy, trusted social guidance, ambient conversation mode and premises, freshness rules, a stable `ExpertiseDomainId` and a handful of intentional cast anchors. Adding a future room is therefore primarily a data change rather than another branch in the director.
 
-For every room, residents are deterministically distributed across five private levels: basic, casual, competent, advanced and specialist. With the current twenty-person cast that means one specialist, two advanced residents, five competent residents and a much larger everyday crowd. Topic interests influence the remaining assignment, while explicit anchors make Sana the AI-programming specialist, Farah the stock-market specialist and Pixel the World of Warcraft and 3D-visualisation specialist. `#the-pub` deliberately mixes entertainment and music regulars, food enthusiasts, political countervoices, chaos agents and quieter film people instead of turning the entire cast into identical party hosts. Specialist-room subscriptions remain selective; a directly mentioned outsider can still answer.
+For every room, residents are deterministically distributed across five private levels: basic, casual, competent, advanced and specialist. With the current twenty-person cast that means one specialist, two advanced residents, five competent residents and a much larger everyday crowd. Stable persona `expertiseDomains` influence the remaining assignment; free-form interests, localized topic tags and room names never act as routing keys. Explicit anchors make Sana the AI-programming specialist, Farah the stock-market specialist and Pixel the World of Warcraft and 3D-visualisation specialist. `#the-pub` deliberately mixes entertainment and music regulars, food enthusiasts, political countervoices, chaos agents and quieter film people instead of turning the entire cast into identical party hosts. Specialist-room subscriptions remain selective; a directly mentioned outsider can still answer.
 
 The level calibrates confidence—not personality. A basic Bosse.exe can still joke, a specialist Farah still speaks concisely, and a directly mentioned near-lurker still answers. Nobody announces their internal level, invents human credentials or becomes more expert merely because their unread count changed.
 
@@ -285,9 +295,9 @@ Freshness-sensitive rooms add stricter boundaries. Stock residents never invent 
 
 Every resident has an explicit style fingerprint in addition to their biography. It defines a normal and hard message length, sentence range, casing, punctuation, approximate emoji frequency and palette, thought density, correction behaviour, disagreement mode, optional conversational habits and phrases to avoid. A deterministic per-turn budget converts those probabilities into concrete instructions: emoji allowed or forbidden, no signature habit or exactly one optional habit, and statement versus question permission. Gemma therefore never sees every tic on every call. The exact same budget survives a repair pass, while its opaque key and raw room text never enter shared style memory. The fingerprint follows a resident across rooms while topic expertise changes with the channel.
 
-After Gemma returns a scene, the server compares each candidate with recent lines from the same resident, nearby AI lines and a bounded in-memory style history containing only lines that were actually delivered. That memory is isolated by public channel, DM or voice scope, so a discarded draft or private-room phrase cannot pollute another conversation. The validator looks for high-confidence self-repetition, cross-persona echo, recycled openings, common Swedish/English assistant phrasing, AI meta-language, essay transitions and unsolicited list formatting. In everyday rooms it also requires two independent signals—essay-shaped syntax plus dense abstraction—before flagging a register mismatch; one formal term is never a blacklist hit. Technical vocabulary remains natural in technical and analytical rooms, and a list remains valid when a guest explicitly asked for one.
+After Gemma returns a scene, the server compares each candidate with recent lines from the same resident, nearby AI lines and a bounded in-memory style history containing only lines that were actually delivered. That memory is isolated by public channel, DM or voice scope, so a discarded draft or private-room phrase cannot pollute another conversation. Deterministic checks are deliberately vocabulary-free: language-tag-aware `Intl.Segmenter` word boundaries (with a Unicode fallback), n-gram repetition, recycled openings, unsolicited list shape, hard length contracts and byte-exact source-ID, URL and protected-fragment integrity. A production-required temperature-zero multilingual Gemma review judges meaning that pattern matching cannot safely decide: relevance, assistant/academic register, honest AI identity, evidence denial and grounding (including numeric claims), text-versus-voice mistakes, pub role-play gimmicks and semantic echo. Technical vocabulary remains natural in technical rooms, and a list remains valid when the one-pass turn analysis says the guest requested one. If that semantic review is unavailable or malformed in production, no candidate line is published.
 
-Low and medium findings are diagnostic only. High-severity candidates share at most one batched repair attempt for the triggering human event when `HUMANIZER_REPAIR_ENABLED=true`; a focused mention retry cannot start a second repair loop. Fenced code, inline code and URLs are replaced by immutable placeholders during that pass and must return byte-for-byte before the rewrite can be accepted. The repaired line is reviewed again. If it still fails, changes a protected fragment or cannot be parsed, it is omitted rather than published. Research-cited lines are never rewritten—the server drops and regenerates them rather than risk citation drift. A final publication guard also rejects exact channel duplicates and high-confidence repetition of that resident's own recent posts, while a directly addressed resident still has a deterministic fallback.
+Low and medium findings are diagnostic only. High-severity style candidates share at most one batched repair attempt for the triggering human event when `HUMANIZER_REPAIR_ENABLED=true`; a focused mention retry cannot start a second repair loop. Fenced code, inline code and URLs are replaced by immutable placeholders during that pass and must return byte-for-byte before the rewrite can be accepted. The repaired candidate is then sent through a fresh semantic candidate review as well as the structural checks. If either still fails, a protected fragment changed or the response cannot be parsed, it is omitted rather than published. Evidence, relevance, identity and voice-grounding failures are never style-rewritten; they are dropped rather than risk factual drift. A final publication guard also rejects exact channel duplicates and high-confidence repetition of that resident's own recent posts. A directly addressed resident can receive one focused model retry, but never unrelated canned chatter when both attempts fail.
 
 Depth is deliberately rarer than banter. On an otherwise eligible ambient tick, `AI_CONSIDERED_CHANCE` controls whether the director attempts a deeper beat (default `0.2`). It requires an empty model queue, at least two free message slots, no active voice room, no other deeper beat, at least 75 seconds since human activity and a global six-minute cooldown. Exactly two cooled-down, room-relevant residents are selected. Gemma writes the lead first; only then does the responder receive that exact line and add one short challenge, concrete example or precise question. The lead and response ranges come from the room's `everyday`, `banter`, `technical`, `analytical`, `fandom` or `studio` register and are always intersected with each resident's normal style—never allowed to override the resident's hard maximum. Lobby, WoW and side-quest seeds use recognizable situations rather than debate-club commands, while technical rooms may still name a mechanism or precise trade-off. New human activity invalidates the pending scene or lets the room yield after the lead instead of talking over the guest.
 
@@ -295,7 +305,7 @@ Depth is deliberately rarer than banter. On an otherwise eligible ambient tick, 
 
 Joining creates a pseudonymous, server-issued guest identity and an HttpOnly, SameSite cookie—still no account or email. The raw 256-bit token is never written to disk; `HumanMemoryStore` persists only its SHA-256 digest with the guest's display profile. On startup the server loads that store before listening and can reconnect the same browser cookie to the same offline guest after a process restart.
 
-This is intentionally a sketchbook-sized social memory, not a transcript warehouse. Only a human's **public text** can update its facts and room activity: counts plus at most four short preferences, activities or allow-listed technical tools stated explicitly in first person, such as “I like Rust,” “jag spelar WoW” or “I work with Blender.” Employer, client and colleague names are not accepted. Conservative filters reject URLs, contact details, credentials, locations, health and other sensitive categories. DM text, image/OCR observations, raw voice audio and voice transcripts never add facts, preferences or room activity. A successfully delivered AI DM or completed AI voice exchange may only nudge the bounded aggregate rapport for that one persona; no private text, audio or transcript is copied into persistent memory. Public messages still follow the separate public-history contract described below.
+This is intentionally a sketchbook-sized social memory, not a transcript warehouse. Only a human's **public text**, including a public image caption, can update facts and room activity. A separate low-priority multilingual memory classifier—not the live turn router—processes one bounded same-author public burst at a time: at most three current messages may authorize up to six high-confidence, explicit first-person operations, while up to five older same-author messages are context-only. Each operation is a typed `remember` or exact `forget` limited to `likes`, `loves`, `prefers` or `plays`; the profile still retains at most four facts. A retraction is therefore semantic and multilingual too, including elliptical corrections across adjacent messages, while the persistence layer deletes only the matching typed fact and never guesses from Swedish/English grammar. The same validation used for insertion independently rejects URLs (including internationalized domains), handles, long numbers, control text and anything not marked safe. Missing, low-confidence or malformed classifier output writes nothing. Employer, client and colleague claims are outside the schema. DM text, image pixels/OCR observations, raw voice audio and voice transcripts never add, retract or refresh facts or room activity. A successfully delivered AI DM or completed AI voice exchange may only nudge the bounded aggregate rapport for that one persona; no private text, audio or transcript is copied into persistent memory. Public messages still follow the separate public-history contract described below.
 
 Each profile also carries at most eight room-activity scores and twenty-four small persona-specific rapport records, allowing one resident to feel warm while another barely knows the same guest. A prompt receives this as fallible, untrusted context and may mention at most one detail when it fits naturally; residents are told not to recite memory or treat an old preference as certain. The default store is capped at 500 guest profiles, expires an inactive profile after 90 days and expires an unconfirmed fact after 45 days.
 
@@ -320,17 +330,17 @@ The model context therefore cannot grow until it overflows. The tradeoff is deli
 
 Only the first HTTPS link (including a normalized naked `www.` address) in a **human public message** can trigger a preview. AI output, ambient scenes, research source chips and DMs never do, so link unfurling does not become indirect network access for the model.
 
-Before connecting, the server rejects credentials, IP literals, non-443 ports and local/special hostnames. It resolves every DNS answer, rejects mixed public/private results, pins the approved IP inside `node:https`, revalidates up to two redirects and enforces one shared deadline plus strict header/body/MIME limits. Only inert `<head>` text metadata is parsed—no scripts, images, favicons or page-controlled canonical URL.
+Before connecting, Unicode-aware boundaries and Public Suffix List parsing separate real internationalized hosts from adjacent no-space prose. The server rejects credentials, IP literals, non-443 ports and local/special hostnames, resolves every DNS answer, rejects mixed public/private results, pins the approved IP inside `node:https`, revalidates up to two redirects and enforces one shared deadline plus strict header/body/MIME limits. A Unicode BOM takes precedence, followed by a supported HTTP `charset`, then a bounded early HTML `<meta charset>` declaration and finally UTF-8; decoding uses the WHATWG encoding registry before inert text extraction. Only `<head>` metadata is parsed for previews—no scripts, images, favicons or page-controlled canonical URL.
 
 Set `LINK_PREVIEWS_ENABLED=false` to disable the feature. When enabled, the destination website sees the server's public IP.
 
-Full-page reading is a separate, explicit path. A plain pasted link receives at most the preview above. The deeper reader runs only when a guest says something like `läs länken`, `kolla www.example.com`, `har ni läst … https://…`, `sammanfatta den här artikeln`, `try again` or `what do you think about https://…`; negated requests such as `läs inte` never connect. A bare public domain such as `avanza.se` is normalized to HTTPS only beside explicit read/check language and still passes the same validator. A no-URL follow-up such as `vilken nyhet på länken är intressantast?` may reuse only a link in the replied-to message or the same guest's link from the same room during the previous five minutes. Ordinary `kolla upp den senaste nyheten` remains a search request instead of silently reopening an old URL. An explicit HTTP, private or otherwise rejected address becomes a closed read failure and can never fall through to an older link.
+Full-page reading is a separate, explicit path. A plain pasted link receives at most the preview above. The server first collects a bounded set of links from the current human burst, its reply target and that same guest's recent room messages, then gives Gemma only opaque references such as `U1`—never authority to invent or rewrite a URL. The single multilingual turn analysis decides whether the guest actually asked to read one, merely shared it, negated a request, referred to an earlier link or instead asked for a web search. Exact wording is not classified with Swedish/English verb lists. A bare public or internationalized domain may be normalized to HTTPS as a candidate, but it is fetched only if Gemma selects its server-issued reference with high confidence. An explicit HTTP, private or otherwise rejected address becomes a closed read failure and can never fall through to an older link.
 
-The reader uses the same HTTPS/443-only, public-DNS, pinned-socket and redirect-revalidation boundary as previews. It accepts only HTML, XHTML or plain text, requests identity encoding, reads at most 1 MiB under one 8.5-second deadline and never loads scripts or subresources. `parse5` processes the response inertly; tokenizer attribute limits and real tree-adapter node/depth limits stop hostile HTML during parsing, then navigation, forms, scripts, styles, embeds, hidden regions and common cookie/share/sidebar noise are removed. Bounded semantic heading detection retains modern news-card titles without trusting scripts or attributes as instructions. Iterative traversal and semantic-candidate budgets add a second bound. At most 10,000 characters of de-duplicated article/main/body text enter the scene.
+The reader uses the same HTTPS/443-only, public-DNS, pinned-socket, charset-decoding and redirect-revalidation boundary as previews. It accepts only HTML, XHTML or plain text, requests identity encoding, reads at most 1 MiB under one 8.5-second deadline and never loads scripts or subresources. `parse5` processes the response inertly; tokenizer attribute limits and real tree-adapter node/depth limits stop hostile HTML during parsing, then navigation, forms, scripts, styles, embeds, hidden regions and common cookie/share/sidebar noise are removed. Bounded semantic heading detection retains modern news-card titles without trusting scripts or attributes as instructions. Iterative traversal and semantic-candidate budgets add a second bound. At most 10,000 characters of de-duplicated article/main/body text enter the scene.
 
 Avanza's public pages are JavaScript shells and its root currently attempts an HTTPS-to-HTTP redirect, which the generic reader correctly refuses. For explicit Avanza market-overview requests, one host-specific adapter instead calls only two fixed HTTPS JSON paths used by Avanza's own site, accepts at most eight numeric order-book IDs, validates every field, emits a compact neutral index summary and caches it for 45 seconds. It cannot fetch accounts, portfolios, arbitrary API paths or an unspecified individual share; residents should ask which instrument the guest means when headline indexes are insufficient. This endpoint is public but undocumented, so the adapter fails closed if its shape changes.
 
-Page title and body remain explicitly untrusted quoted evidence inside the JSON user payload. They never enter the system prompt and cannot supply roles, instructions or source IDs. Gemma may select only the server-issued `S1`; the server also attaches `S1` deterministically to the designated resident's successful page answer and maps it back to the validated URL the guest actually shared—never a redirect-minted query token—before rendering the source chip. Successful page replies must repeat concrete supported names or numbers; Avanza replies require the supplied level, daily change and update time. Deterministic guards reject both vague reactions and false “I cannot access external sites” / “the link is dead” replies, after which a bounded source-derived answer is used instead of generic chatter. If an exact page has no readable text and research is enabled, the director may perform one bounded same-host RSS search and labels that evidence as search results rather than claiming the page opened. If both attempts fail, only the designated resident reports that this attempt returned nothing; the model is forbidden to invent a permanent capability limit or technical cause. Cache and in-flight work are partitioned per guest, contain only page evidence rather than request text, and each caller receives a separately constructed prompt packet. Per-guest/origin/global limits, two concurrent reads and bounded caches prevent a busy room from becoming a crawler. Set `LINK_READER_ENABLED=false` to disable this path. As with previews, the destination sees the server's public IP.
+Page title and body remain explicitly untrusted quoted evidence inside the JSON user payload. They never enter the system prompt and cannot supply roles, instructions or source IDs. Gemma may select only server-issued IDs, which the server maps back to validated URLs before rendering source chips. Exact URL preservation and source-ID allowlists remain deterministic. Whether the answer is relevant, whether factual and numeric claims are grounded, whether it falsely denies a successful read or merely reacts vaguely is decided in the structured multilingual candidate review using the guest's request and supplied evidence—not source-specific prose regex. A factual/evidence failure is omitted instead of being replaced with a blind “first result” or first-paragraph answer. An unreadable exact page remains a failed exact-page attempt; it is never silently replaced by a broad same-host search that may answer a different question. One focused model attempt may report the temporary failure in the classified language; if that cannot be validated, the system stays silent rather than inventing a permanent limitation or unrelated result. Cache and in-flight work are partitioned per guest, contain only page evidence rather than request text, and each caller receives a separately constructed prompt packet. Per-guest/origin/global limits, two concurrent reads and bounded caches prevent a busy room from becoming a crawler. Set `LINK_READER_ENABLED=false` to disable this path. As with previews, the destination sees the server's public IP.
 
 ## Research is deliberately bounded
 
@@ -340,7 +350,7 @@ Research is disabled in `.env.example`. To experiment locally:
 RESEARCH_ENABLED=true
 ```
 
-When enabled, only explicit lookup language, news requests, clearly current factual questions or the fallback from an explicit failed page read activate it. The broker strips URL paths before classifying intent—so `/News` inside an ordinary pasted URL cannot silently trigger research—and sends a cleaned, length-limited topic to a fixed Bing RSS endpoint with per-guest/global request limits, time and byte limits, a bounded cache and in-flight deduplication. A page fallback adds the already validated hostname as a `site:` constraint. It does **not** fetch arbitrary result pages; reading a guest-supplied page is the distinct explicit path documented above.
+When enabled, the one-pass multilingual router can choose `web_search` only when current/external evidence is genuinely requested, and must return a short standalone query plus `web` or `news` mode. Ordinary banter, quoted requests, filenames and words embedded in URL paths cannot trigger it through substring matching. `ResearchBroker` does no language or intent classification: it accepts the already typed query, applies control/length bounds and sends it to a fixed Bing RSS endpoint with per-guest/global request limits, time and byte limits, a bounded cache and in-flight deduplication. If a successful News RSS response contains no usable items, the broker may retry once against the fixed Web RSS endpoint with the exact same bounded query; transport, media-policy and body-bound failures never trigger that retry. It does **not** fetch arbitrary result pages. Reading a guest-supplied page is the distinct exact-page path documented above, and a failed exact read never becomes an implicit same-site search.
 
 Successful lookups add at most one research-capable resident to the selected scene and pass in untrusted snippets. Directly mentioned actors are no longer displaced just because fresh data was requested. The model may return only server-issued source IDs, which the server maps back to validated HTTPS URLs. This is source-linked generation—not a guarantee that the model interpreted every snippet correctly.
 
@@ -355,9 +365,10 @@ npm run build
 npm run lm:check
 npm run audit:humanity
 npm run eval:humanity -- --strict
+npm run eval:semantics
 ```
 
-The humanity audit reads persisted room history without modifying it and reports repeated openings, exact/near duplicates, cross-persona echo, Swedish/English assistant clichés, emoji rates and message length globally and per resident. Use `npm run audit:humanity -- --json` for machine-readable output or `npm run audit:humanity -- --strict` as a deliberately loose gross-regression guard; it is not a subjective quality score.
+The humanity audit reads persisted room history without modifying it and reports vocabulary-free Unicode/`Intl.Segmenter` structural signals: repeated openings, exact/near duplicates, cross-persona echo, emoji rates and message length globally and per resident. It deliberately does not pretend a phrase list can recognize assistant tone in every language; live semantic candidate review owns that job. Use `npm run audit:humanity -- --json` for machine-readable output or `npm run audit:humanity -- --strict` as a deliberately loose gross-regression guard. `npm run eval:semantics` runs 19 cases against the actually loaded LM Studio model across Swedish, Norwegian, German, French, Spanish, Portuguese, Arabic, Korean, Italian, Japanese and Polish, including negation, capability-only questions, single- and cross-message memory revision/boundaries, and moderation.
 
 The full two-user smoke test verifies public broadcast, reaction sync, a real local-model reply and an AI DM:
 
@@ -398,10 +409,11 @@ APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:voice
 - Public history and bounded guest memory use separate files, each replaced atomically. DM threads, voice transcripts and the humanizer's style-comparison history remain in process memory.
 - The local serialized inference queue is an intentional quality and hardware constraint, not infinite scalability.
 - Explicit research uses an external search provider when enabled; ordinary generation remains local.
-- Public HTTPS previews make a bounded request from the server; the destination sees the server IP. Private addresses and AI-triggered fetches are blocked.
+- Public HTTPS previews make a bounded request from the server; the destination sees the server IP. AI-authored messages and source chips can never trigger a preview. Explicit exact-page reads use only a high-confidence server-owned reference selected from bounded human context and retain the stricter boundary documented above; private destinations remain blocked.
 - Public image URLs make a bounded server-side request and the destination sees the server IP. Vision descriptions can be mistaken; guests should not treat them as identity, medical or safety judgments.
 - “Report” creates an internal simulated moderation event and does not contact an external service.
 - The product is not affiliated with, endorsed by or sponsored by Discord. It uses its own name, visual identity and implementation.
+- The semantic chat pipeline is multilingual, but the current application chrome and documentation are primarily English; this refactor is not a claim of complete UI localization.
 
 ## Repository map
 
@@ -412,12 +424,17 @@ server/
   index.ts          HTTP, sessions, Socket.IO and public safety gates
   director.ts       attention, pacing, disagreement and social state
   actorChannels.ts  per-resident room focus and reconstructed channel memory
-  humanMemory.ts    bounded pseudonymous return visits, public-text facts and per-persona rapport
-  lmStudio.ts       strict JSON scenes and the bounded priority queue
+  humanMemory.ts    bounded visits, public-only typed remember/forget and per-persona rapport
+  lmStudio.ts       strict scenes, priority queue and production-required candidate review
   personas.ts       the twenty-character cast
   personaStyle.ts   stable writing fingerprints and per-actor prompt contracts
-  humanizer.ts      bounded similarity/cliché review and protected repair helpers
+  semanticRouter.ts multilingual turn analysis and contextual candidate-review contracts
+  humanizer.ts      vocabulary-free Intl.Segmenter mechanics and protected repair helpers
   researchBroker.ts opt-in RSS lookup, limits, caching and source validation
+  pageReader.ts      opaque-reference page reads, inert extraction and fixed provider adapters
+  textBodyDecoder.ts bounded BOM/HTTP/meta charset decoding through WHATWG encodings
+  registeredLanguageTags.ts current IANA-registry BCP-47 validation without an app allowlist
+  timeResolver.ts    validated IANA-zone server-clock facts
   linkPreviewBroker.ts DNS-pinned, text-only public HTTPS previews
   imageStore.ts      image validation, WebP sanitization, pinned URL ingest and retention
   voiceRooms.ts      human-owned room state, signaling authorization and bounded transcript
@@ -425,9 +442,11 @@ server/
   voiceSpeech.ts     optional STT/TTS, ffmpeg normalization and ephemeral AI audio
   store.ts          atomic public history and ephemeral DMs
 shared/types.ts     client/server contracts
+shared/unicodeBoundaries.ts Unicode/PSL URL boundaries and exact mention parsing
+shared/unicodeSafety.ts Unicode 17 full-fold identity keys and bidi/control safety
 src/                React UI, responsive visual system and portable WebRTC peer mesh
 public/avatars/     twenty optimized fictional resident portraits; glyph fallbacks stay in persona metadata
-scripts/            readiness, humanity audit and real integration smoke tests
+scripts/            readiness, registry-data generators, humanity audit and real integration smoke tests
 ```
 
 Read the deeper [architecture notes](docs/ARCHITECTURE.md), review the [avatar production notes](docs/AVATARS.md), add rooms in [`server/channels.ts`](server/channels.ts), tune the cast in [`server/personas.ts`](server/personas.ts), and see [third-party notices](THIRD_PARTY_NOTICES.md).

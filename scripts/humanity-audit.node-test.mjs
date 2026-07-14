@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { auditState, renderHumanReport } from "./humanity-audit.mjs";
+import { auditState, renderHumanReport, segmentWordUnits } from "./humanity-audit.mjs";
 
 const message = (id, authorId, content, extra = {}) => ({
   id,
@@ -13,7 +13,7 @@ const message = (id, authorId, content, extra = {}) => ({
   ...extra,
 });
 
-test("audits only AI messages and identifies repetition, clichés, emoji and cross-persona echoes", () => {
+test("audits only AI messages and identifies language-neutral repetition, emoji and cross-persona echoes", () => {
   const exact = "Absolutely! Here's the thing: widgets are blue. ✨";
   const state = {
     version: 1,
@@ -41,10 +41,30 @@ test("audits only AI messages and identifies repetition, clichés, emoji and cro
   assert.ok(report.global.crossPersonaEcho.nearCount >= 1);
   assert.equal(report.global.repeatedOpenings["2"].top[0].phrase, "absolutely here's");
   assert.equal(report.global.repeatedOpenings["2"].top[0].count, 3);
-  assert.ok(report.global.assistantCliches.messageCount >= 5);
+  assert.equal("assistantCliches" in report.global, false);
   assert.equal(report.global.emoji.messagesWithEmoji, 4);
   assert.equal(report.personas.find((persona) => persona.personaId === "ai-alpha").messageCount, 3);
   assert.match(renderHumanReport(report), /Per persona\nai-alpha/u);
+});
+
+test("segments scripts without spaces into multilingual word units", () => {
+  const japanese = segmentWordUnits("日本語の文です");
+  const thai = segmentWordUnits("ภาษาไทยไม่มีช่องว่าง");
+
+  assert.ok(japanese.length > 1, "Japanese must not collapse to one whitespace token");
+  assert.ok(thai.length > 1, "Thai must not collapse to one whitespace token");
+
+  const report = auditState({
+    messages: [
+      message("20", "ai-alpha", "日本語の文です"),
+      message("21", "ai-beta", "日本語の文です"),
+      message("22", "ai-alpha", "ภาษาไทยไม่มีช่องว่าง"),
+      message("23", "ai-beta", "ภาษาไทยไม่มีช่องว่าง"),
+    ],
+  });
+
+  assert.equal(report.global.duplicatePairs.exact.count, 2);
+  assert.ok(report.global.medianWords > 1);
 });
 
 test("rejects malformed state instead of silently auditing the wrong shape", () => {
@@ -65,5 +85,4 @@ test("strict mode catches only an unmistakably repetitive regression", () => {
 
   assert.equal(report.strict.passed, false);
   assert.ok(report.strict.issues.some((issue) => issue.metric === "duplicatePairs.exact.pairsPerMessage"));
-  assert.ok(report.strict.issues.some((issue) => issue.metric === "assistantCliches.messageRate"));
 });

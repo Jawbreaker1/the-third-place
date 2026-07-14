@@ -61,6 +61,27 @@ describe("actor channel runtime", () => {
     }
   });
 
+  it("does not change subscriptions when free-form interests are translated or rewritten", () => {
+    const baseline = new ActorChannelRuntime();
+    const localized = new ActorChannelRuntime(
+      PERSONAS.map((persona, index) => ({
+        ...persona,
+        interests: index % 2 === 0 ? ["ゲーム", "音楽"] : ["ألعاب", "موسيقى"],
+      })),
+    );
+
+    for (const persona of PERSONAS) {
+      expect(localized.snapshot(persona.id)?.subscribedChannels).toEqual(
+        baseline.snapshot(persona.id)?.subscribedChannels,
+      );
+      for (const channel of CHANNELS) {
+        expect(localized.expertise(persona.id, channel.id)).toEqual(
+          baseline.expertise(persona.id, channel.id),
+        );
+      }
+    }
+  });
+
   it("keeps KimchiKungen in social rooms while direct mentions still reach specialist rooms", () => {
     const runtime = new ActorChannelRuntime();
 

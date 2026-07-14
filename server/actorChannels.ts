@@ -22,18 +22,31 @@ interface ActorChannelState {
 
 const clamp = (value: number, min = 0, max = 1) => Math.max(min, Math.min(max, value));
 
-const expertiseAffinityBonus = [0.02, 0.08, 0.14, 0.2, 0.26] as const;
+const expertiseAffinityBonus = [0.02, 0.07, 0.16, 0.24, 0.31] as const;
 const SUBSCRIPTION_AFFINITY_THRESHOLD = 0.4;
+
+const stableUnit = (value: string): number => {
+  let hash = 2166136261;
+  for (const character of value) {
+    hash ^= character.codePointAt(0) ?? 0;
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 0xffffffff;
+};
 
 const deriveAffinity = (persona: Persona, channelId: string, expertise: ActorRoomExpertise): number => {
   const explicit = persona.channelAffinity?.[channelId];
   if (explicit !== undefined) return explicit;
   if (persona.id === "ai-runa") return 0.82;
   if (channelId === "lobby") return 0.55 + persona.warmth * 0.16 + persona.mischief * 0.08;
-  const tags = new Set(getChannelProfile(channelId)?.topic.tags.map((topic) => topic.toLocaleLowerCase()) ?? []);
-  const matches = persona.interests.filter((interest) => tags.has(interest.toLocaleLowerCase())).length;
+  const stableVariation = (stableUnit(`${persona.id}:${channelId}`) - 0.5) * 0.1;
   return clamp(
-    0.18 + matches * 0.11 + persona.curiosity * 0.08 + expertiseAffinityBonus[EXPERTISE_RANK[expertise.level]],
+    0.17 +
+      persona.curiosity * 0.08 +
+      persona.talkativeness * 0.06 +
+      persona.warmth * 0.03 +
+      expertiseAffinityBonus[EXPERTISE_RANK[expertise.level]] +
+      stableVariation,
   );
 };
 

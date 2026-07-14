@@ -1,10 +1,12 @@
 import type { LinkPreview } from "../shared/types.js";
+import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { parseHtmlWithBudget } from "./boundedHtml.js";
 import {
   extractPublicHttpsUrls,
   fetchPublicHttps,
   validatePublicHttpsUrl,
 } from "./safeHttpsFetch.js";
+import { decodeTextBody } from "./textBodyDecoder.js";
 
 export { isPublicAddress, resolvePublicAddress } from "./safeHttpsFetch.js";
 export const validatePreviewUrl = validatePublicHttpsUrl;
@@ -36,9 +38,7 @@ const childEntries = (node: ParsedNode, depth: number): PreviewWalkEntry[] =>
 
 const sanitizeText = (value: string | undefined, limit: number): string | undefined => {
   if (!value) return undefined;
-  const cleaned = value
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
+  const cleaned = stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/gu, " ")
     .trim()
     .slice(0, limit);
@@ -80,7 +80,16 @@ const findHead = (node: ParsedNode): ParsedNode | undefined => {
   return undefined;
 };
 
-export const parseLinkMetadata = (html: string, finalUrl: URL, clickUrl: URL = finalUrl): LinkPreview | undefined => {
+export const parseLinkMetadata = (
+  body: Buffer | string,
+  finalUrl: URL,
+  clickUrl: URL = finalUrl,
+  contentType = "text/html",
+): LinkPreview | undefined => {
+  const html = Buffer.isBuffer(body)
+    ? decodeTextBody(body, { contentType, allowHtmlMeta: true, maxBytes: 384 * 1024 })
+    : body;
+  if (html === undefined || Buffer.byteLength(html, "utf8") > 384 * 1024) return undefined;
   const document = parseHtmlWithBudget(html, {
     maxInputBytes: 384 * 1024,
     maxNodes: MAX_PREVIEW_NODES,
@@ -101,15 +110,15 @@ export const parseLinkMetadata = (html: string, finalUrl: URL, clickUrl: URL = f
     visited += 1;
     if (current.node.tagName === "title" && !documentTitle) documentTitle = textContent(current.node);
     if (current.node.tagName === "meta") {
-      const attrs = Object.fromEntries((current.node.attrs ?? []).map((attribute) => [attribute.name.toLocaleLowerCase(), attribute.value]));
-      const key = (attrs.property || attrs.name || "").toLocaleLowerCase();
+      const attrs = Object.fromEntries((current.node.attrs ?? []).map((attribute) => [attribute.name.toLowerCase(), attribute.value]));
+      const key = (attrs.property || attrs.name || "").toLowerCase();
       if (key && attrs.content && !meta.has(key)) meta.set(key, attrs.content);
     }
     stack.push(...childEntries(current.node, current.depth + 1));
   }
   const title = sanitizeText(meta.get("og:title") ?? meta.get("twitter:title") ?? documentTitle, 160);
   if (!title) return undefined;
-  const displayHost = finalUrl.hostname.toLocaleLowerCase();
+  const displayHost = finalUrl.hostname.toLowerCase();
   const siteName = sanitizeText(meta.get("og:site_name"), 80) ?? displayHost;
   const description = sanitizeText(
     meta.get("og:description") ?? meta.get("description") ?? meta.get("twitter:description"),
@@ -159,7 +168,7 @@ export class LinkPreviewBroker {
     if (this.activeRequests >= 3 || !this.reserve(requesterId, url.origin)) return undefined;
     this.activeRequests += 1;
     const request = fetchPublicHttps(url, previewPolicy)
-      .then((result) => (result ? parseLinkMetadata(result.body.toString("utf8"), result.finalUrl, url) : undefined))
+      .then((result) => (result ? parseLinkMetadata(result.body, result.finalUrl, url, result.contentType) : undefined))
       .catch(() => undefined)
       .then((preview) => {
         this.cache.set(key, {

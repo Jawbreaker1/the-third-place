@@ -1,6 +1,13 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { Member } from "../shared/types.js";
+import { normalizeDisplayName, validDisplayName } from "../shared/displayName.js";
+import { containsVisibleUrlText } from "../shared/unicodeBoundaries.js";
+import {
+  hasUnsafeControlOrFormat,
+  stripDangerousTextControls,
+  unicodeCaselessKey,
+} from "../shared/unicodeSafety.js";
 
 export const HUMAN_MEMORY_DEFAULTS = {
   retentionMs: 90 * 24 * 60 * 60_000,
@@ -17,7 +24,29 @@ const MAX_COUNTER = 1_000_000;
 const TOKEN_HASH = /^[a-f\d]{64}$/u;
 const SAFE_ID = /^[\p{L}\p{N}_.:-]{1,100}$/u;
 
-export type HumanMemoryFactKind = "likes" | "loves" | "prefers" | "plays" | "works-with";
+/**
+ * Deliberately narrow: persistent memory stores only low-risk preferences and
+ * leisure activities. Employment and other biographical facts do not belong
+ * in this experimental memory store.
+ */
+export type HumanMemoryFactKind = "likes" | "loves" | "prefers" | "plays";
+
+export type MemoryCandidateSafety = "safe" | "sensitive" | "uncertain";
+
+/**
+ * Output accepted from the language-agnostic semantic classifier. The store
+ * never infers this shape from chat text itself; every field is independently
+ * checked before a fact is persisted.
+ */
+export interface MemoryCandidate {
+  kind: HumanMemoryFactKind;
+  value: string;
+  explicitFirstPerson: boolean;
+  confidence: number;
+  safety: MemoryCandidateSafety;
+}
+
+export type MemoryOperation = "remember" | "forget";
 
 export interface HumanMemoryFact {
   kind: HumanMemoryFactKind;
@@ -105,7 +134,19 @@ export interface HumanMemory {
   findByTokenHash(tokenHash: string): HumanMemoryProfile | undefined;
   noteVisit(humanId: string, at?: number): HumanVisitResult | undefined;
   noteSeen(humanId: string, at?: number): boolean;
-  notePublicMessage(humanId: string, channelId: string, content: string, at?: number): HumanMemoryFact | undefined;
+  notePublicMessage(humanId: string, channelId: string, content: string, at?: number): void;
+  noteClassifiedMemoryFact(
+    humanId: string,
+    channelId: string,
+    candidate: MemoryCandidate,
+    at?: number,
+  ): HumanMemoryFact | undefined;
+  forgetClassifiedMemoryFact(
+    humanId: string,
+    channelId: string,
+    candidate: MemoryCandidate,
+    at?: number,
+  ): boolean;
   getRelation(humanId: string, personaId: string): HumanPersonaRelation | undefined;
   updateRelation(
     humanId: string,
@@ -176,9 +217,7 @@ const clamp = (value: unknown, minimum: number, maximum: number, fallback: numbe
 
 const boundedString = (value: unknown, maximum: number): string | undefined => {
   if (typeof value !== "string") return undefined;
-  const normalized = value
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
+  const normalized = stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/gu, " ")
     .trim();
   return normalized && normalized.length <= maximum ? normalized : undefined;
@@ -198,12 +237,12 @@ const sanitizeMember = (raw: unknown): (Member & { kind: "human" }) | undefined 
   const value = asRecord(raw);
   if (!value) return undefined;
   const id = boundedString(value.id, 100);
-  const name = boundedString(value.name, 24);
+  const name = typeof value.name === "string" ? normalizeDisplayName(value.name) : "";
   const avatar = asRecord(value.avatar);
   const color = boundedString(avatar?.color, 32);
   const accent = boundedString(avatar?.accent, 32);
   const glyph = boundedString(avatar?.glyph, 8);
-  if (!id || !SAFE_ID.test(id) || !name || name.length < 2 || !color || !accent || !glyph) return undefined;
+  if (!id || !SAFE_ID.test(id) || !validDisplayName(name) || !color || !accent || !glyph) return undefined;
   const role = boundedString(value.role, 80);
   const bio = boundedString(value.bio, 240);
   return {
@@ -226,7 +265,6 @@ const factLabels: Record<HumanMemoryFactKind, string> = {
   loves: "love",
   prefers: "prefer",
   plays: "play",
-  "works-with": "works with",
 };
 
 const clientFactLabels: Record<HumanMemoryFactKind, string> = {
@@ -234,94 +272,59 @@ const clientFactLabels: Record<HumanMemoryFactKind, string> = {
   loves: "loves",
   prefers: "prefers",
   plays: "plays",
-  "works-with": "works with",
 };
 
-const factPatterns: Array<{ kind: HumanMemoryFactKind; expression: RegExp }> = [
-  { kind: "works-with", expression: /\b(?:jag\s+jobbar\s+med|i\s+work\s+with)\s+([^.!?;,\n]+)/iu },
-  { kind: "prefers", expression: /\b(?:jag\s+föredrar|i\s+prefer)\s+([^.!?;,\n]+)/iu },
-  { kind: "loves", expression: /\b(?:jag\s+älskar|i\s+love)\s+([^.!?;,\n]+)/iu },
-  { kind: "likes", expression: /\b(?:jag\s+gillar|i\s+like)\s+([^.!?;,\n]+)/iu },
-  { kind: "plays", expression: /\b(?:jag\s+spelar|i\s+play)\s+([^.!?;,\n]+)/iu },
-];
+const MEMORY_KINDS = new Set<HumanMemoryFactKind>(["likes", "loves", "prefers", "plays"]);
+const PREFERENCE_MEMORY_KINDS = new Set<HumanMemoryFactKind>(["likes", "loves", "prefers"]);
+const MEMORY_CONFIDENCE_THRESHOLD = 0.9;
 
-// `work with` is useful experimental context only for a complete value made of
-// clearly non-personal tools/domains. Employer, client, team and colleague names
-// cannot be smuggled in alongside a single technology keyword.
-const SAFE_WORK_TERM = "(?:ai|ml|machine learning|code|coding|software|hardware|data|robotics|accessibility|3d(?: rendering)?|rendering|blender|unreal|unity|typescript|javascript|rust|python|java|c\\+\\+|\\.net|react|node(?:\\.js)?|kubernetes|docker|cloud|web(?: development| design)?|frontend|backend|ux|ui|design|audio)";
-const SAFE_WORK_VALUE = new RegExp(
-  `^${SAFE_WORK_TERM}(?:(?:\\s*(?:,|&|/|\\+|and|och)\\s*)${SAFE_WORK_TERM})*$`,
-  "iu",
-);
+// These are syntax/shape guards, not language-dependent judgments. Sensitive
+// meaning is the classifier's responsibility and must independently be `safe`.
+const EMAIL_OR_HANDLE = /@/u;
+const LONG_NUMBER = /\p{Nd}(?:[\s().+\-]*\p{Nd}){4,}/u;
 
-// The filter is intentionally conservative: forgetting a harmless fact is preferable to retaining sensitive data.
-const forbiddenMemoryText = new RegExp(
-  [
-    "https?://",
-    "www\\.",
-    "@",
-    "\\b(?:password|passcode|lösenord|api[ -]?key|access[ -]?token|secret|credential|bank|credit[ -]?card|kreditkort|personnummer|ssn)\\b",
-    "\\b(?:ignore|forget|disregard).{0,24}(?:instruction|prompt|system|previous)\\b",
-    "\\b(?:instruction|instructions|instruktion|prompt injection|system prompt|developer message)\\b",
-    "\\b(?:politic(?:s|al)?|election|vote|voting|democrat|republican|labour|conservative|tory|green party|politik|politis|röstar|valet|socialdemokrat|moderat|vänsterparti|centerparti|sverigedemokrat|miljöparti|liberalerna|kristdemokrat)\\b",
-    "\\b(?:religion|religious|christian|muslim|islam|jewish|judaism|hindu|buddhis|church|mosque|faith|religiös|kyrka|moské|troende)\\b",
-    "\\b(?:health|diagnos(?:is|ed)?|disease|medication|medicine|therapy|depression|anxiety|sjukdom|medicin|diagnos|hälsa|terapi)\\b",
-    "\\b(?:email|e-mail|phone|telephone|contact|address|mailadress|telefon|mobilnummer|kontakt|adress)\\b",
-    "\\b(?:i live in|living in|living near|to live in|i am from|i'm from|located in|my location|jag bor i|att bo i|bor nära|jag kommer från|min plats|hemadress|location)\\b",
-    "\\b(?:sexuality|sexual orientation|gay|lesbian|bisexual|heterosexual|homosexual|race|ethnicity|ethnic|fackförbund|union membership|criminal record|lön|salary|employer|workplace|mitt jobb|min arbetsplats)\\b",
-    "\\b(?:my wife|my husband|my spouse|my partner|my kids?|my children|my son|my daughter|my family|my friend|min fru|min man|min partner|mina barn|min son|min dotter|min familj|min vän)\\b",
-    "\\b(?:alcohol|cocaine|heroin|cannabis|marijuana|alkohol|kokain|heroin|narkotika)\\b",
-    "\\b\\d{5,}\\b",
-  ].join("|"),
-  "iu",
-);
+const memoryValueKey = (value: string): string => unicodeCaselessKey(value);
 
-const cleanFactValue = (raw: string): string | undefined => {
-  let value = raw
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
-    .replace(/\s+/gu, " ")
-    .trim()
-    .replace(/[\])}'"”’]+$/gu, "")
-    .trim();
-  const conjunction = value.search(/\s+(?:but|because|although|except|men|för att|eftersom|fast)\s+/iu);
-  if (conjunction >= 0) value = value.slice(0, conjunction).trim();
-  const words = value.split(/\s+/u).slice(0, 8);
-  value = words.join(" ").slice(0, 64).trim();
+const cleanClassifiedFactValue = (raw: unknown): string | undefined => {
+  if (typeof raw !== "string" || hasUnsafeControlOrFormat(raw)) return undefined;
+  const value = raw.normalize("NFKC").replace(/\s+/gu, " ").trim();
   if (
-    value.length < 2 ||
+    value.length < 1 ||
+    value.length > 160 ||
     !/[\p{L}\p{N}]/u.test(value) ||
-    /^(?:not|inte|that|this|it|when|how|what|your|you|with|at|in|att|det(?:ta| här| där)?|när|hur|vad|din|ditt|du|med|på|i)\b/iu.test(value) ||
-    forbiddenMemoryText.test(value)
+    containsVisibleUrlText(value) ||
+    EMAIL_OR_HANDLE.test(value) ||
+    LONG_NUMBER.test(value)
   ) return undefined;
   return value;
 };
 
-/** Extracts at most one explicit, non-sensitive, first-person preference/activity. */
-export const extractSafeHumanMemoryFact = (
+const classifiedFact = (
   channelId: string,
-  content: string,
-  at = Date.now(),
+  candidate: MemoryCandidate,
+  at: number,
 ): HumanMemoryFact | undefined => {
   const safeChannelId = boundedString(channelId, 80);
-  if (!safeChannelId || !SAFE_ID.test(safeChannelId)) return undefined;
-  const text = content.slice(0, 500);
-  if (forbiddenMemoryText.test(text)) return undefined;
-
-  let selected: { kind: HumanMemoryFactKind; value: string; index: number } | undefined;
-  for (const pattern of factPatterns) {
-    const match = pattern.expression.exec(text);
-    const value = match?.[1] ? cleanFactValue(match[1]) : undefined;
-    if (value && (!selected || (match?.index ?? 0) < selected.index)) {
-      selected = { kind: pattern.kind, value, index: match?.index ?? 0 };
-    }
-  }
-  if (!selected) return undefined;
-  if (selected.kind === "works-with" && !SAFE_WORK_VALUE.test(selected.value)) return undefined;
+  const raw = asRecord(candidate);
+  const kind = raw?.kind;
+  const confidence = raw?.confidence;
+  const value = cleanClassifiedFactValue(raw?.value);
+  if (
+    !safeChannelId ||
+    !SAFE_ID.test(safeChannelId) ||
+    !MEMORY_KINDS.has(kind as HumanMemoryFactKind) ||
+    raw?.explicitFirstPerson !== true ||
+    raw?.safety !== "safe" ||
+    typeof confidence !== "number" ||
+    !Number.isFinite(confidence) ||
+    confidence < MEMORY_CONFIDENCE_THRESHOLD ||
+    confidence > 1 ||
+    !value
+  ) return undefined;
   const timestamp = Math.max(0, finiteNumber(at, Date.now()));
   return {
-    kind: selected.kind,
-    value: selected.value,
+    kind: kind as HumanMemoryFactKind,
+    value,
     channelId: safeChannelId,
     learnedAt: timestamp,
     lastConfirmedAt: timestamp,
@@ -329,16 +332,18 @@ export const extractSafeHumanMemoryFact = (
 };
 
 const safeFact = (raw: unknown, now: number): HumanMemoryFact | undefined => {
-  if (typeof raw === "string") return extractSafeHumanMemoryFact("lobby", raw, now);
+  // Old free-text facts are deliberately not re-interpreted during migration.
+  // Current structured facts remain portable, but must pass the same mechanical
+  // PII guards and the reduced preference/activity allowlist.
+  if (typeof raw === "string") return undefined;
   const value = asRecord(raw);
   const kind = value?.kind;
   const channelId = boundedString(value?.channelId, 80) ?? "lobby";
-  const factValue = typeof value?.value === "string" ? cleanFactValue(value.value) : undefined;
+  const factValue = cleanClassifiedFactValue(value?.value);
   if (
     !value ||
     !factValue ||
-    !["likes", "loves", "prefers", "plays", "works-with"].includes(String(kind)) ||
-    (kind === "works-with" && !SAFE_WORK_VALUE.test(factValue)) ||
+    !MEMORY_KINDS.has(kind as HumanMemoryFactKind) ||
     !SAFE_ID.test(channelId)
   ) return undefined;
   const learnedAt = Math.max(0, finiteNumber(value.learnedAt, now));
@@ -464,6 +469,11 @@ export class HumanMemoryStore implements HumanMemory {
           shouldRewrite = true;
           continue;
         }
+        const rawProfileRecord = asRecord(rawProfile);
+        const rawFactCount = Array.isArray(rawProfileRecord?.facts)
+          ? rawProfileRecord.facts.length
+          : 0;
+        if (rawFactCount !== profile.facts.length) shouldRewrite = true;
         const existingHumanId = this.humanIdByTokenHash.get(profile.tokenHash);
         const existing = this.profilesByHumanId.get(profile.member.id);
         if (existingHumanId || existing) {
@@ -586,11 +596,11 @@ export class HumanMemoryStore implements HumanMemory {
   notePublicMessage(
     humanId: string,
     channelId: string,
-    content: string,
+    _content: string,
     at = this.now(),
-  ): HumanMemoryFact | undefined {
+  ): void {
     const profile = this.profilesByHumanId.get(humanId);
-    if (!profile) return undefined;
+    if (!profile) return;
     const timestamp = Math.max(0, finiteNumber(at, this.now()));
     profile.lastSeenAt = Math.max(profile.lastSeenAt, timestamp);
     const safeChannelId = boundedString(channelId, 80);
@@ -606,26 +616,68 @@ export class HumanMemoryStore implements HumanMemory {
       profile.channelScores.sort((left, right) => right.lastActiveAt - left.lastActiveAt);
       profile.channelScores = profile.channelScores.slice(0, this.maxChannelScoresPerProfile);
     }
-
-    const fact = extractSafeHumanMemoryFact(channelId, content, timestamp);
-    if (fact) {
-      const key = `${fact.kind}\u241f${fact.value.toLocaleLowerCase("sv-SE")}`;
-      const existingIndex = profile.facts.findIndex(
-        (candidate) => `${candidate.kind}\u241f${candidate.value.toLocaleLowerCase("sv-SE")}` === key,
-      );
-      if (existingIndex >= 0) {
-        const existing = profile.facts.splice(existingIndex, 1)[0]!;
-        existing.lastConfirmedAt = timestamp;
-        existing.channelId = fact.channelId;
-        profile.facts.unshift(existing);
-      } else {
-        profile.facts.unshift(fact);
-      }
-      profile.facts = profile.facts.slice(0, this.maxFactsPerProfile);
-    }
     this.removeExpiredFacts(profile, timestamp);
     this.schedulePersist();
-    return fact ? cloneFact(fact) : undefined;
+  }
+
+  noteClassifiedMemoryFact(
+    humanId: string,
+    channelId: string,
+    candidate: MemoryCandidate,
+    at = this.now(),
+  ): HumanMemoryFact | undefined {
+    const profile = this.profilesByHumanId.get(humanId);
+    if (!profile) return undefined;
+    const timestamp = Math.max(0, finiteNumber(at, this.now()));
+    const fact = classifiedFact(channelId, candidate, timestamp);
+    if (!fact) return undefined;
+
+    const key = `${fact.kind}\u241f${memoryValueKey(fact.value)}`;
+    const existingIndex = profile.facts.findIndex(
+      (stored) => `${stored.kind}\u241f${memoryValueKey(stored.value)}` === key,
+    );
+    if (existingIndex >= 0) {
+      const existing = profile.facts.splice(existingIndex, 1)[0]!;
+      existing.lastConfirmedAt = timestamp;
+      existing.channelId = fact.channelId;
+      profile.facts.unshift(existing);
+    } else {
+      profile.facts.unshift(fact);
+    }
+    profile.facts = profile.facts.slice(0, this.maxFactsPerProfile);
+    profile.lastSeenAt = Math.max(profile.lastSeenAt, timestamp);
+    this.removeExpiredFacts(profile, timestamp);
+    this.schedulePersist();
+    return cloneFact(fact);
+  }
+
+  forgetClassifiedMemoryFact(
+    humanId: string,
+    channelId: string,
+    candidate: MemoryCandidate,
+    at = this.now(),
+  ): boolean {
+    const profile = this.profilesByHumanId.get(humanId);
+    if (!profile) return false;
+    // Apply the exact same confidence, first-person, safety, ID and PII guards
+    // as insertion. Preference strength is a semantic family: a correction of
+    // an exact value may retract likes/loves/prefers despite harmless classifier
+    // drift between those labels, but never a played activity or another value.
+    const fact = classifiedFact(channelId, candidate, at);
+    if (!fact) return false;
+    const normalizedValue = memoryValueKey(fact.value);
+    const before = profile.facts.length;
+    profile.facts = profile.facts.filter(
+      (stored) => {
+        if (memoryValueKey(stored.value) !== normalizedValue) return true;
+        if (stored.kind === fact.kind) return false;
+        return !(PREFERENCE_MEMORY_KINDS.has(stored.kind) && PREFERENCE_MEMORY_KINDS.has(fact.kind));
+      },
+    );
+    if (profile.facts.length === before) return false;
+    profile.lastSeenAt = Math.max(profile.lastSeenAt, Math.max(0, finiteNumber(at, this.now())));
+    this.schedulePersist();
+    return true;
   }
 
   getRelation(humanId: string, personaId: string): HumanPersonaRelation | undefined {

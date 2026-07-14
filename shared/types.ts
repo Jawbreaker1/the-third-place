@@ -353,6 +353,8 @@ export interface VoiceTranscriptEntry {
   speakerName: string;
   speakerKind: MemberKind;
   utteranceOrigin: VoiceUtteranceOrigin;
+  /** Canonical BCP-47 language reported by STT, when known; never `und`. */
+  language?: string;
   text: string;
   startedAt: string;
   endedAt: string;

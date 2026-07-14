@@ -29,6 +29,9 @@ import type {
   VoiceSignalForward,
   VoiceTranscriptEntry,
 } from "../shared/types";
+import { findExactMentionRanges, findUrlTextCandidates } from "../shared/unicodeBoundaries";
+import { normalizeDisplayName, validDisplayName } from "../shared/displayName";
+import { unicodeCaselessKey } from "../shared/unicodeSafety";
 import { VoicePeerMesh } from "./voicePeer";
 import { VoiceActivityDetector, type VoiceActivityEvent } from "./voiceActivity";
 import {
@@ -206,32 +209,43 @@ const boundPublicMessages = (items: ChatMessage[]) => {
 
 const MessageText = ({ content, members }: { content: string; members: Member[] }) => {
   const names = members.map((member) => member.name).sort((a, b) => b.length - a.length);
-  const escaped = names.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  const matcher = new RegExp(`(https?:\\/\\/[^\\s<>"']+${escaped.length ? `|@(?:${escaped.join("|")})` : ""})`, "gi");
-  const parts = content.split(matcher);
+  const urls = findUrlTextCandidates(content, { allowHttp: true, allowWww: false, limit: 100 });
+  const mentions = findExactMentionRanges(content, names, 100);
+  const ranges = [
+    ...urls.map((url) => ({ kind: "url" as const, value: url.value, start: url.start, end: url.end })),
+    ...mentions.map((mention) => ({ kind: "mention" as const, value: mention.value, start: mention.start, end: mention.end })),
+  ].sort((a, b) => a.start - b.start || b.end - a.end);
+  const parts: Array<{ kind: "text" | "url" | "mention"; value: string }> = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.start < cursor) continue;
+    if (range.start > cursor) parts.push({ kind: "text", value: content.slice(cursor, range.start) });
+    parts.push({ kind: range.kind, value: range.value });
+    cursor = range.end;
+  }
+  if (cursor < content.length) parts.push({ kind: "text", value: content.slice(cursor) });
   return (
     <>
-      {parts.map((part, index) =>
-        /^https?:\/\//i.test(part) ? (
-          <Fragment key={`${part}-${index}`}>
-            <a
-              className="inline-link"
-              href={part.replace(/[),.!?;:\]]+$/g, "")}
-              target="_blank"
-              rel="noopener noreferrer nofollow"
-              referrerPolicy="no-referrer"
-              aria-label={`Open external link in a new tab: ${part.replace(/[),.!?;:\]]+$/g, "")}`}
-            >
-              {part.replace(/[),.!?;:\]]+$/g, "")}
-            </a>
-            {part.slice(part.replace(/[),.!?;:\]]+$/g, "").length)}
-          </Fragment>
-        ) : part.startsWith("@") && names.some((name) => name.toLocaleLowerCase() === part.slice(1).toLocaleLowerCase()) ? (
-          <span className="mention" key={`${part}-${index}`}>{part}</span>
-        ) : (
-          <span key={`${part}-${index}`}>{part}</span>
-        ),
-      )}
+      {parts.map((part, partIndex) => {
+        if (part.kind === "url") {
+          return (
+            <bdi dir="ltr" key={`${part.value}-${partIndex}`}>
+              <a
+                aria-label={`Open external link in a new tab: ${part.value}`}
+                className="inline-link"
+                href={part.value}
+                referrerPolicy="no-referrer"
+                rel="noopener noreferrer nofollow"
+                target="_blank"
+              >
+                {part.value}
+              </a>
+            </bdi>
+          );
+        }
+        if (part.kind === "mention") return <bdi className="mention" dir="auto" key={`${part.value}-${partIndex}`}>{part.value}</bdi>;
+        return <span key={`${part.value}-${partIndex}`}>{part.value}</span>;
+      })}
     </>
   );
 };
@@ -860,11 +874,12 @@ export default function App() {
   const activeThread = dmThreads.find((thread) => thread.id === activeChannelId);
   const activeChannel = channels.find((channel) => channel.id === activeChannelId);
   const activePeer = activeThread ? memberMap.get(activeThread.peerId) : undefined;
+  const foldedSearch = useMemo(() => unicodeCaselessKey(search.trim()), [search]);
   const activeMessages = useMemo(() => {
     const source = activeThread ? activeThread.messages : messages.filter((message) => message.channelId === activeChannelId);
-    if (!search.trim()) return source;
-    return source.filter((message) => message.content.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
-  }, [activeChannelId, activeThread, messages, search]);
+    if (!foldedSearch) return source;
+    return source.filter((message) => unicodeCaselessKey(message.content).includes(foldedSearch));
+  }, [activeChannelId, activeThread, foldedSearch, messages]);
   const activeTitle = activeChannel?.name ?? activePeer?.name ?? "conversation";
   const activeDescription = activeChannel?.description ?? (activePeer?.kind === "ai" ? "Private chat with an AI resident" : "Private conversation");
   const typingMembers = (typing[activeChannelId] ?? []).map((id) => memberMap.get(id)).filter((member): member is Member => Boolean(member));
@@ -1743,7 +1758,7 @@ export default function App() {
                   onClick={() => selectChannel(channel.id)}
                   aria-label={`${channel.name}${mentions > 0 ? `, ${mentions} unread mention${mentions === 1 ? "" : "s"}` : hasUnread ? ", unread messages" : ""}`}
                 >
-                  <Icon name="hash" size={17} /><span>{channel.name}</span>
+                  <Icon name="hash" size={17} /><span dir="auto">{channel.name}</span>
                   {mentions > 0 && (
                     <i className="channel-unread" aria-hidden="true">{mentions > 9 ? "9+" : mentions}</i>
                   )}
@@ -1768,11 +1783,11 @@ export default function App() {
               return (
                 <div className={`voice-room-group ${voiceViewRoomId === room.id ? "active" : ""}`} key={room.id}>
                   <button className="voice-room-button" type="button" onClick={() => { setVoiceViewRoomId(room.id); setMobilePanel(null); }}>
-                    <Icon name="speaker" size={16} /><span>{channel?.name ?? "voice room"}</span>{speaking && <i className="voice-wave"><b /><b /><b /></i>}<small>{room.participants.length}</small>
+                    <Icon name="speaker" size={16} /><span dir="auto">{channel?.name ?? "voice room"}</span>{speaking && <i className="voice-wave"><b /><b /><b /></i>}<small>{room.participants.length}</small>
                   </button>
                   <div className="voice-room-members">
                     {room.participants.map((participant) => (
-                      <span className={participant.speaking || participant.botState === "speaking" ? "speaking" : ""} key={participant.memberId}>
+                      <span className={participant.speaking || participant.botState === "speaking" ? "speaking" : ""} dir="auto" key={participant.memberId}>
                         <i />{participant.name}{participant.kind === "ai" && <AiBadge />}{participant.muted && <Icon name="micOff" size={11} />}
                       </span>
                     ))}
@@ -1792,7 +1807,7 @@ export default function App() {
                 if (!peer) return null;
                 return (
                   <button key={thread.id} className={`dm-button ${activeChannelId === thread.id ? "active" : ""}`} onClick={() => selectChannel(thread.id)}>
-                    <Avatar member={peer} size="sm" /><span>{peer.name}</span>{peer.kind === "ai" && <AiBadge />}{thread.unread > 0 && <i className="channel-unread" aria-label={`${thread.unread} unread messages`}>{thread.unread > 9 ? "9+" : thread.unread}</i>}
+                    <Avatar member={peer} size="sm" /><span dir="auto">{peer.name}</span>{peer.kind === "ai" && <AiBadge />}{thread.unread > 0 && <i className="channel-unread" aria-label={`${thread.unread} unread messages`}>{thread.unread > 9 ? "9+" : thread.unread}</i>}
                   </button>
                 );
               })
@@ -1811,7 +1826,7 @@ export default function App() {
         )}
         <div className="sidebar-foot">
           {me ? (
-            <><Avatar member={me} size="sm" /><div><strong>{me.name}</strong><span>Guest · connected</span></div><span className="signal-bars"><i /><i /><i /></span></>
+            <><Avatar member={me} size="sm" /><div><strong dir="auto">{me.name}</strong><span>Guest · connected</span></div><span className="signal-bars"><i /><i /><i /></span></>
           ) : (
             <><span className="preview-eye"><Icon name="users" size={16} /></span><div><strong>Live preview</strong><span>Join to take part</span></div></>
           )}
@@ -1833,7 +1848,7 @@ export default function App() {
                 <header className="voice-stage-header">
                   <button type="button" className="icon-button mobile-only" onClick={() => setMobilePanel("rooms")} aria-label="Open rooms"><Icon name="menu" /></button>
                   <span className="voice-stage-icon"><Icon name="speaker" size={19} /></span>
-                  <div><strong>{channels.find((channel) => channel.id === voiceRoomInView.channelId)?.name ?? "Voice room"}</strong><span>{voiceRoomInView.participants.length} connected · started by {memberMap.get(voiceRoomInView.createdByMemberId)?.name ?? "a guest"}</span></div>
+                  <div><strong dir="auto">{channels.find((channel) => channel.id === voiceRoomInView.channelId)?.name ?? "Voice room"}</strong><span>{voiceRoomInView.participants.length} connected · started by <span dir="auto">{memberMap.get(voiceRoomInView.createdByMemberId)?.name ?? "a guest"}</span></span></div>
                   <button type="button" className="voice-back-chat" onClick={() => setVoiceViewRoomId(null)}><Icon name="message" size={15} /> Back to chat</button>
                 </header>
 
@@ -1850,7 +1865,7 @@ export default function App() {
                       return (
                         <article className={`voice-tile ${isSpeaking ? "speaking" : ""} ${participant.kind === "ai" ? "ai" : ""}`} key={participant.memberId}>
                           <div className="voice-avatar-wrap">{member ? <Avatar member={member} size="xl" showStatus={false} /> : <span className="voice-avatar-fallback">{participant.name.slice(0, 1)}</span>}<i className="voice-speaking-ring" /></div>
-                          <div className="voice-tile-name"><strong>{participant.name}{isMe ? " (you)" : ""}</strong>{participant.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div>
+                          <div className="voice-tile-name"><strong dir="auto">{participant.name}{isMe ? " (you)" : ""}</strong>{participant.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div>
                           <span className="voice-tile-state">
                             {participant.muted && <Icon name="micOff" size={13} />}
                             {participant.botState === "thinking" ? "thinking…" : participant.botState === "joining" || participant.botState === "invited" ? "joining…" : isSpeaking ? "speaking" : participant.muted ? "muted" : "listening"}
@@ -1874,14 +1889,14 @@ export default function App() {
                   {voiceRoomTranscripts.length > 0 && (
                     <div className="voice-transcript" aria-live="polite">
                       <p className="eyebrow">Recent spoken context</p>
-                      {voiceRoomTranscripts.slice(-4).map((entry) => <p key={entry.id}><strong>{entry.speakerName}</strong><span>{entry.text}</span></p>)}
+                      {voiceRoomTranscripts.slice(-4).map((entry) => <p key={entry.id}><strong dir="auto">{entry.speakerName}</strong><span dir="auto">{entry.text}</span></p>)}
                     </div>
                   )}
 
                   {joinedVoiceRoomId === voiceRoomInView.id && voiceRoomInView.hostMemberId === me?.id && availableVoiceBots.length > 0 && (
                     <div className="voice-invite-panel">
                       <div><strong>Invite an AI friend</strong><span>Up to {voiceCapabilities?.maxBots ?? 2} AI residents can join. They remain visibly labelled.</span></div>
-                      <div>{availableVoiceBots.slice(0, 8).map((bot) => <button type="button" key={bot.id} onClick={() => inviteVoiceBot(bot.id)}><Avatar member={bot} size="sm" /><span>{bot.name}</span><AiBadge /></button>)}</div>
+                      <div>{availableVoiceBots.slice(0, 8).map((bot) => <button type="button" key={bot.id} onClick={() => inviteVoiceBot(bot.id)}><Avatar member={bot} size="sm" /><span dir="auto">{bot.name}</span><AiBadge /></button>)}</div>
                     </div>
                   )}
 
@@ -1900,7 +1915,7 @@ export default function App() {
                         </div>
                       )}
                       <form className="voice-typed-turn" onSubmit={sendTypedVoiceTurn}>
-                        <Icon name="message" size={15} /><input value={voiceTypedTurn} onChange={(event) => setVoiceTypedTurn(event.target.value)} maxLength={500} placeholder="Typed fallback — treated as something said in this voice room" /><button type="submit" disabled={!voiceTypedTurn.trim()}>Send</button>
+                        <Icon name="message" size={15} /><input dir="auto" value={voiceTypedTurn} onChange={(event) => setVoiceTypedTurn(event.target.value)} maxLength={500} placeholder="Typed fallback — treated as something said in this voice room" /><button type="submit" disabled={!voiceTypedTurn.trim()}>Send</button>
                       </form>
                     </>
                   )}
@@ -1947,7 +1962,7 @@ export default function App() {
         <header className="chat-header">
           <button className="icon-button mobile-only" onClick={() => setMobilePanel("rooms")} aria-label="Open rooms"><Icon name="menu" /></button>
           <span className="channel-symbol">{activeThread ? <Icon name="lock" size={18} /> : <Icon name="hash" size={19} />}</span>
-          <div className="channel-heading"><strong>{activeTitle}</strong><span>{activeDescription}</span></div>
+          <div className="channel-heading"><strong dir="auto">{activeTitle}</strong><span dir="auto">{activeDescription}</span></div>
           <div className="header-actions">
             <span className={`connection-pill ${connection}`}><i />{connection === "live" ? "live" : connection}</span>
             <button className={`icon-button ${showDirector ? "active" : ""}`} onClick={() => setShowDirector((value) => !value)} title="Director view"><Icon name="pulse" /></button>
@@ -1978,8 +1993,8 @@ export default function App() {
           )}
           {(activeThread || !activeHistory.hasMore) && <div className="channel-intro">
             <div className="intro-icon">{activePeer ? <Avatar member={activePeer} size="xl" showStatus={false} /> : <Icon name="hash" size={28} />}</div>
-            <h1>{activePeer ? activePeer.name : `Welcome to #${activeTitle}`}</h1>
-            <p>{activeDescription}</p>
+            <h1 dir="auto">{activePeer ? activePeer.name : `Welcome to #${activeTitle}`}</h1>
+            <p dir="auto">{activeDescription}</p>
             {activePeer?.kind === "ai" && <div className="transparency-note"><AiBadge label="AI RESIDENT" /><span>This character is generated by a local language model and remembers this private thread only while the server is running.</span></div>}
           </div>}
           {activeMessages.length === 0 && <div className="empty-conversation"><Icon name="message" size={22} /><strong>Quiet, for once.</strong><span>Say something and see who notices.</span></div>}
@@ -2003,7 +2018,7 @@ export default function App() {
             if (message.system) return (
               <Fragment key={message.id}>
                 {startsDay && <div className="day-divider"><span>{formatDayLabel(message.createdAt)}</span></div>}
-                <div className="system-message" data-message-id={message.id}><span><Icon name="spark" size={12} /></span>{message.content}<time>{formatTime(message.createdAt)}</time></div>
+                <div className="system-message" data-message-id={message.id} dir="auto"><span><Icon name="spark" size={12} /></span>{message.content}<time>{formatTime(message.createdAt)}</time></div>
               </Fragment>
             );
             if (!author) return null;
@@ -2016,9 +2031,9 @@ export default function App() {
               >
                 {!grouped ? <Avatar member={author} size="md" /> : <time className="group-time">{formatTime(message.createdAt)}</time>}
                 <div className="message-body">
-                  {replyDisplay && <button className="reply-preview"><Icon name="reply" size={12} /><strong>{replyDisplay.authorName}</strong><span>{replyDisplay.content.slice(0, 92)}</span></button>}
-                  {!grouped && <div className="message-meta"><button onClick={() => setProfile(author)}>{author.name}</button>{author.kind === "ai" && <AiBadge />}<time>{formatTime(message.createdAt)}</time></div>}
-                  {message.content && <div className="message-content"><MessageText content={message.content} members={displayMembers} /></div>}
+                  {replyDisplay && <button className="reply-preview"><Icon name="reply" size={12} /><strong dir="auto">{replyDisplay.authorName}</strong><span dir="auto">{replyDisplay.content.slice(0, 92)}</span></button>}
+                  {!grouped && <div className="message-meta"><button dir="auto" onClick={() => setProfile(author)}>{author.name}</button>{author.kind === "ai" && <AiBadge />}<time>{formatTime(message.createdAt)}</time></div>}
+                  {message.content && <div className="message-content" dir="auto"><MessageText content={message.content} members={displayMembers} /></div>}
                   {message.attachments?.map((attachment) => {
                     const description = attachment.analysis.status === "ready"
                       ? attachment.analysis.observation.summary
@@ -2087,7 +2102,7 @@ export default function App() {
                     <div className="source-row">
                       <span><Icon name="search" size={11} /> looked up</span>
                       {message.sources.map((source) => (
-                        <a key={source.url} href={source.url} target="_blank" rel="noopener noreferrer nofollow" referrerPolicy="no-referrer" title={source.title}>
+                        <a dir="auto" key={source.url} href={source.url} target="_blank" rel="noopener noreferrer nofollow" referrerPolicy="no-referrer" title={source.title}>
                           {source.title}
                         </a>
                       ))}
@@ -2112,9 +2127,9 @@ export default function App() {
         <div className="composer-wrap">
           <div className={`typing-line ${typingMembers.length ? "visible" : ""}`}>
             <span className="typing-dots"><i /><i /><i /></span>
-            {typingMembers.length > 0 && <span>{typingMembers.slice(0, 2).map((member) => member.name).join(" and ")}{typingMembers.length > 2 ? ` +${typingMembers.length - 2}` : ""} {typingMembers.length === 1 ? "is" : "are"} composing</span>}
+            {typingMembers.length > 0 && <span><span dir="auto">{typingMembers.slice(0, 2).map((member) => member.name).join(" and ")}</span>{typingMembers.length > 2 ? ` +${typingMembers.length - 2}` : ""} {typingMembers.length === 1 ? "is" : "are"} composing</span>}
           </div>
-          {replyTo && <div className="replying-to"><span>Replying to <strong>{memberMap.get(replyTo.authorId)?.name}</strong></span><button onClick={() => setReplyTo(null)}><Icon name="close" size={15} /></button></div>}
+          {replyTo && <div className="replying-to"><span>Replying to <strong dir="auto">{memberMap.get(replyTo.authorId)?.name}</strong></span><button onClick={() => setReplyTo(null)}><Icon name="close" size={15} /></button></div>}
           {pendingImage && (
             <div className={`pending-image pending-image-${pendingImage.status}`} aria-live="polite">
               <div className="pending-image-visual">
@@ -2123,7 +2138,7 @@ export default function App() {
                   : <span><Icon name={pendingImage.source === "url" ? "link" : "image"} size={20} /></span>}
               </div>
               <div className="pending-image-copy">
-                <strong>{pendingImage.label}</strong>
+                <strong dir="auto">{pendingImage.label}</strong>
                 <span>
                   {pendingImage.status === "preparing" && "Preparing preview…"}
                   {pendingImage.status === "ready" && (pendingImage.source === "url" ? "Secure server fetch on send" : "Ready to share")}
@@ -2168,6 +2183,7 @@ export default function App() {
             <button type="button" className="attach-button" disabled={!canAttachImage || pendingImage?.status === "sending"} onClick={() => imageInputRef.current?.click()} aria-label="Attach an image" title={activeThread ? "Images are currently available in public rooms" : "Attach image"}><Icon name="image" size={17} /></button>
             <button type="button" className={`attach-button ${imageUrlOpen ? "active" : ""}`} disabled={!canAttachImage || pendingImage?.status === "sending"} onClick={() => setImageUrlOpen((value) => !value)} aria-label="Attach a direct image URL" title="Attach direct HTTPS image URL"><Icon name="link" size={16} /></button>
             <textarea
+              dir="auto"
               value={composer}
               onChange={(event) => notifyTyping(event.target.value)}
               onPaste={handleComposerPaste}
@@ -2222,10 +2238,10 @@ export default function App() {
             <p className="join-kicker">THE THIRD PLACE</p>
             <h2>Join the conversation.</h2>
             <p className="join-copy">A living online room populated by distinct AI characters — and real people like you.</p>
-            <label><span>Display name</span><input autoFocus value={joinName} onChange={(event) => setJoinName(event.target.value)} placeholder="What should everyone call you?" maxLength={24} /></label>
+            <label><span>Display name</span><input autoFocus dir="auto" value={joinName} onChange={(event) => setJoinName(event.target.value)} placeholder="What should everyone call you?" maxLength={24} /></label>
             {preview?.inviteRequired && <label><span>Invite code</span><input value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="Enter the code" type="password" /></label>}
             {joinError && <div className="join-error">{joinError}</div>}
-            <button className="join-button" type="submit" disabled={joining || joinName.trim().length < 2}>{joining ? <><span className="spinner" />Opening the door…</> : <>Enter the room <Icon name="chevron" size={17} /></>}</button>
+            <button className="join-button" type="submit" disabled={joining || !validDisplayName(normalizeDisplayName(joinName))}>{joining ? <><span className="spinner" />Opening the door…</> : <>Enter the room <Icon name="chevron" size={17} /></>}</button>
             <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Humans and AI are always labelled.</strong> This server keeps a small local memory of return visits, rooms you use most, and non-sensitive preferences, activities or technical tools you explicitly share. No account or email is required, and you can erase it from your profile. AI runs locally; optional research, link previews and explicit linked-page reads use the web.</span></div>
             <p className="preview-hint"><i /><span>You're seeing the real room live behind this card.</span></p>
           </form>
@@ -2247,7 +2263,7 @@ export default function App() {
               {[...directorEvents].reverse().map((event) => (
                 <article key={event.id}>
                 <div className={`event-glyph event-${event.trigger}`}><Icon name={event.trigger === "ambient" ? "spark" : event.trigger === "dm" ? "lock" : event.trigger === "research" ? "search" : "pulse"} size={15} /></div>
-                  <div className="event-body"><div><strong>{event.trigger}</strong><time>{formatRelative(event.createdAt)}</time></div><p>{event.summary}</p><div className="decision-grid"><span><b>{event.considered}</b> considered</span><span><b>{event.replied}</b> replied</span><span><b>{event.reacted}</b> reacted</span><span className="quiet"><b>{event.stayedQuiet}</b> quiet</span></div></div>
+                  <div className="event-body"><div><strong>{event.trigger}</strong><time>{formatRelative(event.createdAt)}</time></div><p dir="auto">{event.summary}</p><div className="decision-grid"><span><b>{event.considered}</b> considered</span><span><b>{event.replied}</b> replied</span><span><b>{event.reacted}</b> reacted</span><span className="quiet"><b>{event.stayedQuiet}</b> quiet</span></div></div>
                 </article>
               ))}
               {directorEvents.length === 0 && <div className="director-empty"><span className="typing-dots"><i /><i /><i /></span><p>Waiting for the first live decision.</p></div>}
@@ -2262,7 +2278,7 @@ export default function App() {
             <div className="profile-cover" style={{ "--profile": profile.avatar.color, "--accent": profile.avatar.accent } as React.CSSProperties} />
             <button className="profile-close" onClick={() => setProfile(null)}><Icon name="close" /></button>
             <Avatar member={profile} size="xl" />
-            <div className="profile-body"><div className="profile-name"><h2>{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div><p className="profile-role">{profile.role}</p><p className="profile-bio">{profile.bio}</p><div className="profile-facts"><span><small>STATUS</small><b><i className={`presence-${profile.status}`} />{profile.status}</b></span>{profile.activity && <span><small>CURRENTLY</small><b>{profile.activity}</b></span>}<span><small>MEMORY</small><b>{me && profile.id === me.id ? "Small local memory" : profile.kind === "ai" ? "Recent room context" : "Human guest"}</b></span></div>{me && profile.id === me.id && <button type="button" className="profile-forget" onClick={() => void forgetAiMemory()} disabled={forgettingMemory} aria-busy={forgettingMemory}>{forgettingMemory ? <><span className="button-spinner" aria-hidden="true" />Forgetting…</> : "Forget what AI remembers"}</button>}{me && profile.id !== me.id && profile.status !== "offline" && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message {profile.name}</button>}</div>
+            <div className="profile-body"><div className="profile-name"><h2 dir="auto">{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div><p className="profile-role" dir="auto">{profile.role}</p><p className="profile-bio" dir="auto">{profile.bio}</p><div className="profile-facts"><span><small>STATUS</small><b dir="auto"><i className={`presence-${profile.status}`} />{profile.status}</b></span>{profile.activity && <span><small>CURRENTLY</small><b dir="auto">{profile.activity}</b></span>}<span><small>MEMORY</small><b>{me && profile.id === me.id ? "Small local memory" : profile.kind === "ai" ? "Recent room context" : "Human guest"}</b></span></div>{me && profile.id === me.id && <button type="button" className="profile-forget" onClick={() => void forgetAiMemory()} disabled={forgettingMemory} aria-busy={forgettingMemory}>{forgettingMemory ? <><span className="button-spinner" aria-hidden="true" />Forgetting…</> : "Forget what AI remembers"}</button>}{me && profile.id !== me.id && profile.status !== "offline" && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message <span dir="auto">{profile.name}</span></button>}</div>
           </article>
         </div>
       )}
@@ -2278,8 +2294,8 @@ export default function App() {
               height={lightbox.attachment.height}
             />
             <figcaption>
-              <strong>{lightbox.authorName}</strong>
-              {lightbox.attachment.analysis.status === "ready" && <span>{lightbox.attachment.analysis.observation.summary}</span>}
+              <strong dir="auto">{lightbox.authorName}</strong>
+              {lightbox.attachment.analysis.status === "ready" && <span dir="auto">{lightbox.attachment.analysis.observation.summary}</span>}
               {lightbox.attachment.analysis.status === "pending" && <span>AI residents are still looking at this image…</span>}
             </figcaption>
           </figure>
@@ -2287,7 +2303,7 @@ export default function App() {
       )}
 
       {mobilePanel && <button className="mobile-scrim mobile-only" onClick={() => setMobilePanel(null)} aria-label="Close panel" />}
-      <div className="toast-stack">{toasts.map((toast) => <div className={`toast toast-${toast.tone}`} key={toast.id}><i /><div><strong>{toast.title}</strong><span>{toast.message}</span></div><button onClick={() => setToasts((current) => current.filter((item) => item.id !== toast.id))}><Icon name="close" size={14} /></button></div>)}</div>
+      <div className="toast-stack">{toasts.map((toast) => <div className={`toast toast-${toast.tone}`} key={toast.id}><i /><div><strong dir="auto">{toast.title}</strong><span dir="auto">{toast.message}</span></div><button onClick={() => setToasts((current) => current.filter((item) => item.id !== toast.id))}><Icon name="close" size={14} /></button></div>)}</div>
     </div>
   );
 }
@@ -2295,6 +2311,6 @@ export default function App() {
 function MemberGroup({ title, members, onSelect }: { title: string; members: Member[]; onSelect: (member: Member) => void }) {
   if (members.length === 0) return null;
   return (
-    <section className="member-group"><p className="eyebrow">{title} <span>{members.length}</span></p>{members.map((member) => <button className="member-row" key={member.id} onClick={() => onSelect(member)}><Avatar member={member} size="sm" /><span className="member-copy"><strong>{member.name}{member.kind === "ai" && <AiBadge />}</strong><small>{member.activity ?? member.role}</small></span></button>)}</section>
+    <section className="member-group"><p className="eyebrow">{title} <span>{members.length}</span></p>{members.map((member) => <button className="member-row" key={member.id} onClick={() => onSelect(member)}><Avatar member={member} size="sm" /><span className="member-copy"><strong dir="auto">{member.name}{member.kind === "ai" && <AiBadge />}</strong><small dir="auto">{member.activity ?? member.role}</small></span></button>)}</section>
   );
 }

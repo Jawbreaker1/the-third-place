@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { CHANNEL_PROFILES, CHANNELS, CONVERSATION_REGISTERS } from "./channels.js";
-import { PERSONAS } from "./personas.js";
+import {
+  CHANNEL_PROFILES,
+  CHANNELS,
+  CONVERSATION_REGISTERS,
+  type ChannelProfile,
+} from "./channels.js";
+import { PERSONAS, type Persona } from "./personas.js";
 import { buildRoomExpertiseMatrix, EXPERTISE_RANK } from "./roomExpertise.js";
 
 const NEW_ROOM_IDS = ["the-pub", "ai-programming", "stock-market", "world-of-warcraft", "3d-visualisation"];
@@ -66,6 +71,42 @@ describe("channel profiles", () => {
       ).sort();
     };
     expect(fingerprint(PERSONAS)).toEqual(fingerprint([...PERSONAS].reverse()));
+  });
+
+  it("keeps expertise routing independent of localized labels, topic copy, tags and interests", () => {
+    const fingerprint = (personas: Persona[], profiles: ChannelProfile[]) => {
+      const matrix = buildRoomExpertiseMatrix(personas, profiles);
+      return profiles.flatMap((profile) =>
+        personas.map((persona) =>
+          `${profile.public.id}:${persona.id}:${matrix.get(profile.public.id)?.get(persona.id)?.level}`,
+        ),
+      ).sort();
+    };
+    const localizedPersonas: Persona[] = PERSONAS.map((persona, index) => ({
+      ...persona,
+      name: index % 2 === 0 ? `住人${index}` : `مقيم${index}`,
+      role: index % 2 === 0 ? "常連のメンバー" : "عضو دائم",
+      bio: index % 2 === 0 ? "自由に翻訳された紹介文。" : "نص تعريفي محلي حر.",
+      prompt: index % 2 === 0 ? "この人物説明は日本語です。" : "وصف الشخصية بالعربية.",
+      interests: index % 2 === 0 ? ["音楽", "技術"] : ["الموسيقى", "التقنية"],
+    }));
+    const localizedProfiles: ChannelProfile[] = CHANNEL_PROFILES.map((profile, index) => ({
+      ...profile,
+      public: {
+        ...profile.public,
+        name: index % 2 === 0 ? `部屋${index}` : `غرفة-${index}`,
+        description: index % 2 === 0 ? "翻訳された部屋の説明" : "وصف الغرفة المحلي",
+      },
+      topic: {
+        ...profile.topic,
+        brief: index % 2 === 0 ? "表示用の自由な日本語トピック説明" : "وصف موضوع عربي محلي للعرض",
+        tags: index % 2 === 0 ? ["ゲーム", "会話", "音楽"] : ["ألعاب", "حوار", "موسيقى"],
+      },
+    }));
+
+    expect(fingerprint(localizedPersonas, localizedProfiles)).toEqual(
+      fingerprint(PERSONAS, CHANNEL_PROFILES),
+    );
   });
 
   it("anchors the intended room specialists", () => {

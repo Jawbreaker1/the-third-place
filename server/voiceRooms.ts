@@ -15,6 +15,8 @@ import type {
   VoiceTranscriptEntry,
   VoiceUtteranceOrigin,
 } from "../shared/types.js";
+import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
+import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 
 const MAX_HUMANS = 6;
 const MAX_BOTS = 2;
@@ -85,6 +87,8 @@ export interface VoiceTranscriptAppendOptions {
   endedAt?: number;
   /** Human callers may explicitly mark the typed fallback; AI origin is server-derived. */
   utteranceOrigin?: VoiceUtteranceOrigin;
+  /** Trusted STT output language. Invalid and undetermined values are omitted. */
+  language?: string;
 }
 
 interface InternalParticipant {
@@ -109,17 +113,13 @@ interface InternalRoom {
 const failure = (code: VoiceActionFailure["code"], error: string): VoiceActionFailure => ({ ok: false, code, error });
 
 const cleanName = (value: string): string =>
-  value
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+  stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 48);
 
 const cleanTranscript = (value: string): string =>
-  value
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+  stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, MAX_UTTERANCE_CHARACTERS);
@@ -468,6 +468,7 @@ export class VoiceRoomRuntime {
     const utteranceOrigin: VoiceUtteranceOrigin = isHuman
       ? options.utteranceOrigin === "typed-voice-fallback" ? "typed-voice-fallback" : "microphone-stt"
       : "ai-tts";
+    const language = canonicalRegisteredLanguageTag(options.language);
     const entry: VoiceTranscriptEntry = {
       id: randomUUID(),
       roomId: room.id,
@@ -476,6 +477,7 @@ export class VoiceRoomRuntime {
       speakerName: speaker.view.name,
       speakerKind: speaker.view.kind,
       utteranceOrigin,
+      ...(language ? { language } : {}),
       text: cleaned,
       startedAt: new Date(startedAt).toISOString(),
       endedAt: new Date(endedAt).toISOString(),

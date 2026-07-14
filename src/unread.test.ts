@@ -44,6 +44,23 @@ describe("messageAddressesMember", () => {
   it("does not count a username-looking URL path", () => {
     expect(messageAddressesMember(message({ content: "profil: https://example.com/@Johan" }), member)).toBe(false);
     expect(messageAddressesMember(message({ content: "profil: www.example.com/@Johan" }), member)).toBe(false);
+    expect(messageAddressesMember(message({ content: "見てhttps://例え.テスト/@Johan。" }), member)).toBe(false);
+  });
+
+  it("recognizes exact mentions beside no-space CJK and RTL prose", () => {
+    expect(messageAddressesMember(message({ content: "你好@Johan，你觉得呢" }), member)).toBe(true);
+    expect(messageAddressesMember(message({ content: "مرحبا@Johan؟" }), member)).toBe(true);
+    expect(messageAddressesMember(message({ content: "@Johan你好" }), member)).toBe(true);
+    expect(messageAddressesMember(message({ content: "@Johanمرحبا" }), member)).toBe(true);
+  });
+
+  it("still rejects longer ASCII and Unicode display-name collisions", () => {
+    expect(messageAddressesMember(message({ content: "@Johanna" }), member)).toBe(false);
+    expect(messageAddressesMember(message({ content: "@Johan_2" }), member)).toBe(false);
+    expect(messageAddressesMember(message({ content: "@Johan.exe" }), member)).toBe(false);
+    const cjkMember = { ...member, name: "小明" };
+    expect(messageAddressesMember(message({ content: "@小明白" }), cjkMember)).toBe(false);
+    expect(messageAddressesMember(message({ content: "你好@小明。" }), cjkMember)).toBe(true);
   });
 
   it("never counts the member's own message", () => {

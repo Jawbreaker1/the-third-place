@@ -47,6 +47,15 @@ describe("link preview broker", () => {
     expect(extractPreviewUrl("kolla www.fz.se).")?.toString()).toBe("https://www.fz.se/");
   });
 
+  it("extracts explicit IDNs beside no-space prose while rejecting ambiguous bare-domain prose", () => {
+    expect(extractPreviewUrl("看https://例子.中国/新闻。")?.toString()).toBe(
+      "https://xn--fsqu00a.xn--fiqs8s/%E6%96%B0%E9%97%BB",
+    );
+    expect(extractPreviewUrl("شاهدhttps://مثال.إختبار؟")?.hostname).toBe("xn--mgbh0fb.xn--kgbechtv");
+    expect(extractPreviewUrl("看例子.中国新闻")).toBeUndefined();
+    expect(extractPreviewUrl("user@example.com")).toBeUndefined();
+  });
+
   it("parses inert text metadata and ignores page-controlled canonical URLs", () => {
     const finalUrl = new URL("https://example.com/final");
     const preview = parseLinkMetadata(
@@ -67,6 +76,32 @@ describe("link preview broker", () => {
       description: "A short description",
       siteName: "Example News",
     });
+  });
+
+  it("strips dangerous controls and active markup from metadata while preserving natural RTL text", () => {
+    const preview = parseLinkMetadata(
+      `<html><head>
+        <meta property="og:title" content="خبر آمن‮txt">
+        <meta property="og:description" content="تفاصيل‪ موثوقة‬ هنا">
+        <script><meta property="og:title" content="Injected title"></script>
+        <noscript><title>Injected fallback</title></noscript>
+      </head></html>`,
+      new URL("https://xn--mgbh0fb.xn--kgbechtv/story"),
+    );
+    expect(preview).toMatchObject({
+      title: "خبر آمنtxt",
+      description: "تفاصيل موثوقة هنا",
+      displayHost: "xn--mgbh0fb.xn--kgbechtv",
+    });
+    expect(JSON.stringify(preview)).not.toContain("Injected");
+    expect(JSON.stringify(preview)).not.toContain("\u202e");
+  });
+
+  it("uses an early standards-based meta charset fallback for Windows-1251 metadata", () => {
+    const encoded = Buffer.from("3c68746d6c3e3c686561643e3c6d65746120687474702d65717569763d22436f6e74656e742d547970652220636f6e74656e743d22746578742f68746d6c3b20636861727365743d77696e646f77732d31323531223e3c6d6574612070726f70657274793d226f673a7469746c652220636f6e74656e743d22cdeee2eef1f2e820ece8f0e0223e3c2f686561643e3c2f68746d6c3e", "hex");
+    const preview = parseLinkMetadata(encoded, new URL("https://example.ru/news"));
+    expect(preview?.title).toBe("Новости мира");
+    expect(preview?.title).not.toContain("�");
   });
 
   it("aborts hostile HTML inside parse5's real tree builder", () => {

@@ -1,6 +1,5 @@
 import type { ChatMessage, Member } from "../shared/types";
-
-const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+import { containsExactMention } from "../shared/unicodeBoundaries";
 
 export type ChannelNotice = { unread: boolean; mentions: number };
 export type ChannelNotices = Record<string, ChannelNotice | undefined>;
@@ -9,16 +8,7 @@ export const messageAddressesMember = (message: ChatMessage, member: Member): bo
   if (message.authorId === member.id || message.system) return false;
   if (message.replyPreview?.authorId === member.id) return true;
 
-  const name = member.name.trim().normalize("NFKC");
-  if (!name || !message.content) return false;
-  const mention = new RegExp(
-    `(^|[^\\p{L}\\p{N}._%+\\-])@${escapeRegExp(name)}(?=$|[^\\p{L}\\p{N}_])`,
-    "iu",
-  );
-  const contentWithoutLinks = message.content
-    .normalize("NFKC")
-    .replace(/(?:https?:\/\/|www\.)[^\s<>"']+/giu, " ");
-  return mention.test(contentWithoutLinks);
+  return containsExactMention(message.content, member.name);
 };
 
 export const noteChannelMessage = (

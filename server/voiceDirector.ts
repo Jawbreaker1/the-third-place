@@ -1,12 +1,22 @@
-import type { VoiceRoomView, VoiceTranscriptEntry, VoiceUtteranceOrigin } from "../shared/types.js";
+import type { VoiceRoomView, VoiceTranscriptEntry } from "../shared/types.js";
+import { speechTimingUnits, truncateSpokenText } from "../shared/spokenText.js";
+import { containsExactMention } from "../shared/unicodeBoundaries.js";
+import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
-import { CHANNELS } from "./channels.js";
+import { CHANNELS, getChannelProfile } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
 import type { LmStudioClient, TranscriptLine } from "./lmStudio.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import { voiceProfileForPersona } from "./personaVoices.js";
+import {
+  projectTrustedTurnAnalysis,
+  type TurnAnalysis,
+  type TurnAnalysisInput,
+} from "./semanticRouter.js";
 import type { VoiceRoomRuntime } from "./voiceRooms.js";
-import type { VoiceSpeechService } from "./voiceSpeech.js";
+import { ttsLanguageIsSupported, type VoiceSpeechService } from "./voiceSpeech.js";
+import { resolveLocalDateTime } from "./timeResolver.js";
+import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 
 export interface VoiceAiSpeechPayload {
   roomId: string;
@@ -30,7 +40,7 @@ export interface VoiceDirectorEvents {
 
 export interface VoiceDirectorOptions {
   runtime: VoiceRoomRuntime;
-  lm: Pick<LmStudioClient, "generateScene"> & Partial<Pick<LmStudioClient, "rememberDeliveredLine">>;
+  lm: Pick<LmStudioClient, "analyzeTurn" | "generateScene"> & Partial<Pick<LmStudioClient, "rememberDeliveredLine">>;
   speech: Pick<VoiceSpeechService, "capabilities" | "synthesize">;
   actorChannels: ActorChannelRuntime;
   events: VoiceDirectorEvents;
@@ -42,78 +52,21 @@ export interface VoiceDirectorOptions {
   hasPendingHumanIngest?: (roomId: string) => boolean;
 }
 
-const languageHint = (content: string): string => {
-  const lower = ` ${content.toLocaleLowerCase()} `;
-  return /[åäö]/i.test(content) || [" jag ", " och ", " inte ", " vad ", " hur ", " är "].some((word) => lower.includes(word))
-    ? "Swedish"
-    : "the language of the latest human utterance";
-};
+export const mentionsPersona = containsExactMention;
 
-const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-export const mentionsPersona = (content: string, name: string): boolean =>
-  new RegExp(`(?:^|[^\\p{L}\\p{N}_])@?${escapeRegExp(name)}(?=$|[^\\p{L}\\p{N}_])`, "iu").test(content);
+const explicitlyMentionsPersona = mentionsPersona;
 
-const sanitizeSpokenLine = (value: string): string => {
-  const cleaned = value
+const sanitizeSpokenLine = (value: string, language?: string): string => {
+  const cleaned = stripDangerousTextControls(value
     .normalize("NFKC")
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/https?:\/\/\S+/giu, " ")
-    .replace(/\[[^\]]{0,100}\]|\([^)]*(?:laughs?|sighs?|pauses?|music|sound)[^)]*\)/giu, " ")
+    .replace(/\p{Ps}[^\p{Ps}\p{Pe}]{0,100}\p{Pe}/gu, " ")
     .replace(/[*_~`#>|]/g, " ")
-    .replace(/\p{Extended_Pictographic}/gu, " ")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/\p{Extended_Pictographic}/gu, " "))
     .replace(/\s+/g, " ")
     .trim();
-  const words = cleaned.split(" ").filter(Boolean).slice(0, 25);
-  return words.join(" ").slice(0, 240).trim();
-};
-
-export type VoiceGroundingIssue = "written-medium" | "unsupported-acoustics";
-
-const WRITTEN_MEDIUM_ILLUSION = [
-  /\b(?:på|i)\s+(?:text(?:en|et)?|chat(?:ten)?|meddelande(?:t)?|the\s+(?:text|chat|message))\b/iu,
-  /\b(?:läser|läste|read(?:ing)?)\b.{0,50}\b(?:vad|det|what|that)\b.{0,30}\b(?:du|ni|you)\b.{0,20}\b(?:skriver|skrev|skrivit|write|wrote|typed?)\b/iu,
-  /\b(?:du|ni|you)\b.{0,50}\b(?:skriver|skrev|skrivit|typed?|wrote|texted|posted|sent (?:a )?(?:text|message))\b/iu,
-  /\b(?:ditt|ert|your)\s+(?:skrivna\s+)?(?:meddelande|message|text|post)\b/iu,
-];
-
-const SAFE_ACOUSTIC_LIMITATION = [
-  /^(?!.*\b(?:men|but|however|dock)\b).{0,45}\b(?:kan\s+inte|går\s+inte|gar\s+inte|can't|cannot)\b.{0,55}\b(?:avgöra|determine|tell|höra|hora|hear)\b.{0,90}(?:transkrib\p{L}*|\borden\b|\bwords\b).{0,25}[.!?]?$/iu,
-  /^(?!.*\b(?:men|but|however|dock)\b).{0,45}(?:transkrib\p{L}*|\borden\b|\bwords\b).{0,80}\b(?:kan\s+inte|går\s+inte|gar\s+inte|can't|cannot)\b.{0,45}\b(?:avgöra|determine|tell|höra|hora|hear)\b.{0,25}[.!?]?$/iu,
-];
-const UNSUPPORTED_ACOUSTIC_ASSERTION = [
-  /\b(?:du|ni|you)\b.{0,45}\b(?:skriker|skrek|ropar|ropade|viskar|viskade|hörs|hors|høres|shout(?:ing|ed)?|yell(?:ing|ed)?|scream(?:ing|ed)?|whisper(?:ing|ed)?|loud|quiet)\b/iu,
-  /\b(?:det|that)\s+(?:låter|later|sounds?)\b.{0,65}\b(?:du|ni|you)\b.{0,30}\b(?:skriker|ropar|viskar|shout(?:ing)?|yell(?:ing)?|scream(?:ing)?|whisper(?:ing)?|arg|angry|upprörd|upprord|nervös|nervos|nervous)\b/iu,
-  /\b(?:hör|hor|heard|hear)\b.{0,35}\b(?:att|that)\b.{0,20}\b(?:du|ni|you)\b.{0,25}\b(?:skriker|ropar|viskar|shout(?:ing)?|yell(?:ing)?|scream(?:ing)?|whisper(?:ing)?)\b/iu,
-  /\b(?:din\s+röst|din\s+rost|stemmen\s+din|your\s+voice)\b.{0,35}\b(?:låter|later|høres|sounds?)?\b.{0,20}\b(?:arg|angry|frustrerad|frustrert|frustrated|upprörd|upprord|nervös|nervos|nervous|ledsen|sad|glad|happy|trött|trott|tired)\b/iu,
-  /\b(?:hör|hor|hører|heard|hear)\b.{0,35}\b(?:frustration(?:en)?|anger|ilska(?:n)?|nervositet|nervousness|sorg|sadness)\b.{0,35}\b(?:röst|rost|stemme|voice)?\b/iu,
-];
-
-/** Rejects medium-confusion and acoustic claims that cannot be grounded in STT words. */
-export const detectVoiceGroundingIssue = (
-  value: string,
-  origin: VoiceUtteranceOrigin,
-): VoiceGroundingIssue | undefined => {
-  const normalized = value.normalize("NFKC");
-  if (origin === "microphone-stt" && WRITTEN_MEDIUM_ILLUSION.some((pattern) => pattern.test(normalized))) {
-    return "written-medium";
-  }
-  const unsupportedAcousticClaim = UNSUPPORTED_ACOUSTIC_ASSERTION.some((pattern) => pattern.test(normalized));
-  const isSafeLimitationOnly = SAFE_ACOUSTIC_LIMITATION.some((pattern) => pattern.test(normalized));
-  if (origin !== "ai-tts" && unsupportedAcousticClaim && !isSafeLimitationOnly) {
-    return "unsupported-acoustics";
-  }
-  return undefined;
-};
-
-const asksAboutAcoustics = (value: string): boolean =>
-  /\b(?:skriker|skrek|ropar|viskar|shout(?:ing)?|yell(?:ing)?|scream(?:ing)?|whisper(?:ing)?|högt|hogt|loud|tyst|quiet|volym|volume|ton(?:fall)?|tone|accent|röst|rost|voice)\b/iu.test(value);
-
-const fallbackLine = (persona: Persona, humanName: string): string => {
-  if (persona.id === "ai-bosse") return `Okej ${humanName}, den där behöver du nästan utveckla innan jag gör det värre.`;
-  if (persona.mischief > 0.7) return `Jag hör dig, ${humanName}. Min första invändning är redan på väg.`;
-  if (persona.warmth > 0.8) return `Mm, jag hör dig ${humanName}. Säg lite mer om den sista delen.`;
-  return `Jag hör dig. Den sista delen är nog den intressanta — utveckla den.`;
+  return truncateSpokenText(cleaned, { language, maxWords: 25, maxGraphemes: 240 });
 };
 
 const transcriptFor = (entries: VoiceTranscriptEntry[], personaId: string): TranscriptLine[] =>
@@ -127,6 +80,69 @@ const transcriptFor = (entries: VoiceTranscriptEntry[], personaId: string): Tran
       createdAt: entry.endedAt,
       utteranceOrigin: entry.utteranceOrigin,
     }));
+
+const analysisInputFor = (
+  entry: VoiceTranscriptEntry,
+  room: VoiceRoomView,
+  transcript: VoiceTranscriptEntry[],
+  invited: Persona[],
+): TurnAnalysisInput => {
+  const channel = getChannelProfile(room.channelId);
+  const transportLanguageHint = canonicalRegisteredLanguageTag(entry.language);
+  return {
+    turnId: `voice:${entry.id}`.slice(0, 128),
+    medium: "voice",
+    channel: {
+      id: room.channelId,
+      name: channel?.public.name ?? room.channelId,
+      ...(channel?.topic.brief ? { topic: channel.topic.brief.slice(0, 500) } : {}),
+    },
+    latestMessage: {
+      id: entry.id,
+      authorId: entry.speakerId,
+      authorName: entry.speakerName.slice(0, 80),
+      content: entry.text.slice(0, 4_000),
+      createdAt: entry.endedAt,
+    },
+    recentMessages: transcript
+      .filter((candidate) => candidate.id !== entry.id)
+      .slice(-8)
+      .map((candidate) => ({
+        id: candidate.id,
+        authorId: candidate.speakerId,
+        authorName: candidate.speakerName.slice(0, 80),
+        content: candidate.text.slice(0, 1_200),
+        createdAt: candidate.endedAt,
+      })),
+    personaCandidates: invited.map((persona) => ({
+      id: persona.id,
+      name: persona.name,
+      interests: persona.interests.slice(0, 16),
+    })),
+    // Voice never fetches URLs or performs open web search. Server-clock facts
+    // are safe, bounded and useful in exactly the same languages as text chat.
+    availableCapabilities: ["local_datetime"],
+    urlCandidates: [],
+    ...(transportLanguageHint ? { transportLanguageHint } : {}),
+  };
+};
+
+const routedLanguage = (analysis: TurnAnalysis | undefined, transcriptLanguage?: string): string | undefined => {
+  const transcribed = canonicalRegisteredLanguageTag(transcriptLanguage);
+  const classified = canonicalRegisteredLanguageTag(projectTrustedTurnAnalysis(analysis).languageTag);
+  // Provider-reported STT language is trusted transport metadata. It wins over
+  // a semantic router guess; typed voice turns have no such transport hint.
+  return transcribed ?? classified;
+};
+
+const routedLanguageHint = (language: string | undefined): string =>
+  language ?? "infer and mirror the language of the latest human utterance directly";
+
+/** Server TTS is allowed only for provider-declared BCP-47 ranges. */
+export const ttsModelSupportsLanguage = (
+  supportedLanguages: readonly string[] | undefined,
+  language: string | undefined,
+): boolean => ttsLanguageIsSupported(supportedLanguages, language);
 
 export class VoiceDirector {
   private readonly epochByRoom = new Map<string, number>();
@@ -194,17 +210,32 @@ export class VoiceDirector {
     return this.epochByRoom.get(roomId) === epoch && this.options.runtime.isMemberInRoom(roomId, personaId);
   }
 
-  private selectPersona(entry: VoiceTranscriptEntry): Persona | undefined {
+  private invitedPersonas(entry: VoiceTranscriptEntry): Persona[] {
     const room = this.options.runtime.getRoom(entry.roomId);
-    if (!room) return undefined;
+    if (!room) return [];
     const eligibleIds = new Set(entry.heardByPersonaIds);
-    const invited = room.participants
+    return room.participants
       .filter((participant) => participant.kind === "ai" && eligibleIds.has(participant.memberId))
       .map((participant) => PERSONAS.find((persona) => persona.id === participant.memberId))
       .filter((persona): persona is Persona => Boolean(persona));
+  }
+
+  private selectPersona(
+    entry: VoiceTranscriptEntry,
+    room: VoiceRoomView,
+    invited: Persona[],
+    analysis: TurnAnalysis | undefined,
+  ): Persona | undefined {
     if (invited.length === 0) return undefined;
-    const mentioned = invited.find((persona) => mentionsPersona(entry.text, persona.name));
-    if (mentioned) return mentioned;
+    const explicitMention = invited.find((persona) => explicitlyMentionsPersona(entry.text, persona.name));
+    if (explicitMention) return explicitMention;
+    const inferredIds = projectTrustedTurnAnalysis(analysis).inferredAddressedIds;
+    if (inferredIds.length > 0) {
+      const inferredTarget = inferredIds
+        .map((id) => invited.find((persona) => persona.id === id))
+        .find((persona): persona is Persona => Boolean(persona));
+      if (inferredTarget) return inferredTarget;
+    }
     const channelId = room.channelId;
     return [...invited].sort((a, b) => {
       const score = (persona: Persona) => {
@@ -247,10 +278,34 @@ export class VoiceDirector {
   }
 
   private async respond(entry: VoiceTranscriptEntry, epoch: number): Promise<void> {
-    const persona = this.selectPersona(entry);
-    if (!persona) return;
     const room = this.options.runtime.getRoom(entry.roomId);
     if (!room) return;
+    const invited = this.invitedPersonas(entry);
+    if (invited.length === 0) return;
+    const transcript = this.options.runtime.getTranscript(room.id);
+    let analysis: TurnAnalysis | undefined;
+    try {
+      analysis = await this.options.lm.analyzeTurn(analysisInputFor(entry, room, transcript, invited));
+    } catch (error) {
+      console.warn("Voice semantic analysis unavailable; using neutral routing:", error instanceof Error ? error.message : error);
+    }
+    if (this.epochByRoom.get(room.id) !== epoch) return;
+    const trusted = projectTrustedTurnAnalysis(analysis);
+    const utteranceLanguage = routedLanguage(analysis, entry.language);
+    const localDateTime = analysis?.source === "lm" &&
+      trusted.evidenceTrusted &&
+      analysis.evidence.action === "local_datetime" &&
+      analysis.evidence.timeZone &&
+      analysis.evidence.locationLabel
+      ? resolveLocalDateTime({
+          timeZone: analysis.evidence.timeZone,
+          locationLabel: analysis.evidence.locationLabel,
+          languageTag: utteranceLanguage,
+          now: new Date(this.now()),
+        })
+      : undefined;
+    const persona = this.selectPersona(entry, room, invited, analysis);
+    if (!persona) return;
     this.setBotState(room.id, persona.id, "thinking");
 
     // Capture only the memory that predates this turn. Voice transcripts never
@@ -262,6 +317,20 @@ export class VoiceDirector {
     const generationAbort = new AbortController();
     this.generationAbortByRoom.set(room.id, generationAbort);
     try {
+      const trustedSemanticFacts = [
+        trusted.intentTrusted && analysis?.source === "lm"
+          ? `intent=${analysis.intent.kind}; replyExpected=${analysis.intent.replyExpected}`
+          : "",
+        trusted.capabilityTrusted
+          ? `asksAboutAcoustics=${trusted.asksAboutAcoustics}`
+          : "",
+        localDateTime
+          ? `${localDateTime.promptFact} Answer from this server clock fact without estimating.`
+          : "",
+      ].filter(Boolean);
+      const semanticPremise = trustedSemanticFacts.length > 0
+        ? `Trusted multilingual turn facts: ${trustedSemanticFacts.join(". ")}`
+        : "No sufficiently confident semantic classification is available for this turn. Infer meaning only from the newest utterance and make no assumptions from a fallback label.";
       const generated = await this.options.lm.generateScene(
         {
           kind: "voice",
@@ -271,7 +340,13 @@ export class VoiceDirector {
           history: transcriptFor(this.options.runtime.getTranscript(room.id), persona.id),
           trigger: { author: entry.speakerName, content: entry.text, messageId: entry.id },
           mustReplyIds: [persona.id],
-          languageHint: languageHint(entry.text),
+          languageHint: routedLanguageHint(utteranceLanguage),
+          semanticContext: {
+            ...(utteranceLanguage ? { languageTag: utteranceLanguage } : {}),
+            asksForList: trusted.asksForList,
+            asksAboutAiIdentity: trusted.asksAboutAiIdentity,
+            asksAboutAcoustics: trusted.asksAboutAcoustics,
+          },
           actorChannelNotes: this.options.actorChannels.promptNotes([persona], room.channelId),
           actorExpertiseNotes: this.options.actorChannels.expertiseNotes([persona], room.channelId),
           voiceContext: {
@@ -285,12 +360,12 @@ export class VoiceDirector {
             })),
           },
           ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
-          premise: `${persona.name} has joined an active multi-participant voice call. Answer the newest complete human utterance once, conversationally. The reply will be spoken aloud; do not narrate actions or produce another speaker.`,
+          premise: `${persona.name} has joined an active multi-participant voice call. Answer the newest complete human utterance once, conversationally. The reply will be spoken aloud; do not narrate actions or produce another speaker. ${semanticPremise}`,
         },
         0,
         generationAbort.signal,
       );
-      spoken = sanitizeSpokenLine(generated.find((line) => line.personaId === persona.id)?.content ?? "");
+      spoken = sanitizeSpokenLine(generated.find((line) => line.personaId === persona.id)?.content ?? "", utteranceLanguage);
     } catch (error) {
       if (!generationAbort.signal.aborted) {
         console.warn("Voice scene used fallback:", error instanceof Error ? error.message : error);
@@ -298,14 +373,11 @@ export class VoiceDirector {
     } finally {
       if (this.generationAbortByRoom.get(room.id) === generationAbort) this.generationAbortByRoom.delete(room.id);
     }
-    const groundingIssue = spoken ? detectVoiceGroundingIssue(spoken, entry.utteranceOrigin) : undefined;
-    if (groundingIssue) {
-      spoken = asksAboutAcoustics(entry.text) || groundingIssue === "unsupported-acoustics"
-        ? "Jag får orden via transkriberingen, inte en pålitlig volymnivå, så det kan jag faktiskt inte avgöra."
-        : fallbackLine(persona, entry.speakerName);
+    if (!spoken && localDateTime) spoken = sanitizeSpokenLine(localDateTime.fallbackText, utteranceLanguage);
+    if (!spoken || !this.isCurrent(room.id, epoch, persona.id)) {
+      if (this.isCurrent(room.id, epoch, persona.id)) this.setBotState(room.id, persona.id, "listening");
+      return;
     }
-    if (!spoken) spoken = sanitizeSpokenLine(fallbackLine(persona, entry.speakerName));
-    if (!spoken || !this.isCurrent(room.id, epoch, persona.id)) return;
 
     const voiceProfile = voiceProfileForPersona(persona.id);
     if (!voiceProfile) {
@@ -318,11 +390,20 @@ export class VoiceDirector {
     try {
       const capabilities = await this.options.speech.capabilities();
       browserFallbackAllowed = capabilities.browserFallbackAllowed;
-      if (capabilities.tts.available && voiceProfile) {
+      if (
+        capabilities.tts.available &&
+        voiceProfile &&
+        ttsModelSupportsLanguage(capabilities.tts.supportedLanguages, utteranceLanguage)
+      ) {
+        const providerVoice = capabilities.tts.model === "piper-sv"
+          ? voiceProfile.providerVoice
+          : capabilities.tts.defaultVoice;
+        if (!providerVoice) throw new Error("TTS provider has no configured voice for this turn");
         const stored = await this.options.speech.synthesize({
           roomId: room.id,
           text: spoken,
-          voice: voiceProfile.providerVoice,
+          language: utteranceLanguage,
+          voice: providerVoice,
           speed: voiceProfile.speed,
           signal: speechAbort.signal,
         });
@@ -335,7 +416,10 @@ export class VoiceDirector {
     }
     if (!this.isCurrent(room.id, epoch, persona.id)) return;
 
-    const appended = this.options.runtime.appendFinalTranscript(room.id, persona.id, spoken, { utteranceOrigin: "ai-tts" });
+    const appended = this.options.runtime.appendFinalTranscript(room.id, persona.id, spoken, {
+      utteranceOrigin: "ai-tts",
+      ...(utteranceLanguage ? { language: utteranceLanguage } : {}),
+    });
     if (!appended.ok) return;
     this.options.humanMemory?.updateRelation(entry.speakerId, persona.id, {
       familiarity: Math.min(1, (previousRelation?.familiarity ?? 0) + 0.05),
@@ -355,15 +439,21 @@ export class VoiceDirector {
       text: spoken,
       utteranceId: appended.entry.id,
       browserFallbackAllowed,
+      ...(utteranceLanguage ? { language: utteranceLanguage } : {}),
       ...(voiceProfile ? {
-        language: voiceProfile.language,
+        // Language belongs to this utterance, never to a persona profile. When
+        // classification is unavailable, omit it so the browser uses the
+        // human caller's own locale instead of a hard-coded language.
         browserRate: voiceProfile.browserRate,
         browserPitch: voiceProfile.browserPitch,
       } : {}),
       ...(audio ? { audioUrl: `/api/voice/audio/${encodeURIComponent(audio.id)}?roomId=${encodeURIComponent(room.id)}`, mimeType: audio.mimeType } : {}),
     });
 
-    const estimatedSpeakingMs = Math.max(1_200, Math.min(12_000, 550 + spoken.split(/\s+/).length * 310));
+    const estimatedSpeakingMs = Math.max(
+      1_200,
+      Math.min(12_000, 550 + speechTimingUnits(spoken, utteranceLanguage) * 310),
+    );
     const timer = setTimeout(() => {
       if (this.isCurrent(room.id, epoch, persona.id)) this.setBotState(room.id, persona.id, "listening");
     }, estimatedSpeakingMs);

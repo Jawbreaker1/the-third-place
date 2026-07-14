@@ -29,6 +29,8 @@ import type {
   VoiceRoomView,
   VoiceTranscriptEntry,
 } from "../shared/types.js";
+import { displayNameGlyph, normalizeDisplayName, validDisplayName } from "../shared/displayName.js";
+import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { SocialDirector } from "./director.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
@@ -41,6 +43,7 @@ import { configuredPersonaProviderVoices } from "./personaVoices.js";
 import { ResearchBroker } from "./researchBroker.js";
 import { createMessage, type HistoryPosition, RoomStore } from "./store.js";
 import { VoiceDirector } from "./voiceDirector.js";
+import { preferredRequestLanguage } from "./requestLanguage.js";
 import { VoiceIngestGate, VoiceIngestGateError, type VoiceIngestRelease } from "./voiceIngestGate.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
 import { VoiceSpeechError, VoiceSpeechService } from "./voiceSpeech.js";
@@ -137,15 +140,8 @@ const createHumanSession = (
   voiceBucket: new TokenBucket(12, 0.5),
 });
 
-const normalizeName = (raw: string): string =>
-  raw
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
 const joinSchema = z.object({
-  name: z.string().min(2).max(48),
+  name: z.string().min(1).max(128),
   inviteCode: z.string().max(100).optional(),
 });
 const messageSchema = z.object({
@@ -327,7 +323,7 @@ const parseCookies = (header?: string): Record<string, string> =>
       }),
   );
 const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
-const safeNameKey = (name: string) => name.toLocaleLowerCase().replace(/[\s._-]/g, "");
+const safeNameKey = (name: string) => unicodeCaselessKey(name).replace(/[\s._-]/gu, "");
 const randomAvatar = (): Member["avatar"] => {
   const palettes = [
     ["#ff7163", "#ffb866"],
@@ -390,7 +386,11 @@ const actorChannels = new ActorChannelRuntime();
 const researchBroker = new ResearchBroker();
 const linkPreviewBroker = new LinkPreviewBroker();
 const imageStore = new ImageStore();
-const voiceSpeech = new VoiceSpeechService({ ttsVoices: configuredPersonaProviderVoices() });
+const voiceSpeech = new VoiceSpeechService({
+  // Persona aliases belong to the bundled Piper provider. Generic providers
+  // use only their explicitly configured default voice.
+  ttsVoices: configuredPersonaProviderVoices(process.env.TTS_MODEL),
+});
 const voiceSpeechCapabilities = await voiceSpeech.capabilities();
 const voiceRooms = new VoiceRoomRuntime(
   CHANNELS.map((channel) => channel.id),
@@ -738,6 +738,7 @@ app.post("/api/voice/:roomId/turns", async (request, response) => {
     const transcript = await voiceSpeech.transcribe({ audio: form.audio, mimeType: form.mimeType, signal: speechAbort.signal });
     const appended = voiceRooms.appendFinalTranscript(roomId, session.member.id, transcript.text, {
       utteranceOrigin: "microphone-stt",
+      ...(transcript.language ? { language: transcript.language } : {}),
     });
     if (!appended.ok) throw new VoiceSpeechError(appended.error, 409, appended.code);
     if (completedKey) completedVoiceTurns.set(completedKey, { expiresAt: now + VOICE_TURN_DEDUP_TTL_MS, entry: appended.entry });
@@ -818,9 +819,7 @@ app.post("/api/channels/:channelId/image-messages", async (request, response) =>
   activeImageIngests += 1;
   try {
     const form = await parseImageMessageForm(request);
-    const content = form.content
-      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
-      .trim();
+    const content = stripDangerousTextControls(form.content).trim();
     if (content.length > 500) throw new ImageStoreError("Captions can be up to 500 characters.");
     if (form.replyToId && form.replyToId.length > 100) throw new ImageStoreError("That reply target is invalid.");
     if (form.imageUrl && form.imageUrl.length > 2_048) throw new ImageStoreError("That image URL is too long.");
@@ -958,7 +957,7 @@ app.post("/api/session", async (request, response) => {
   }
   const parsed = joinSchema.safeParse(request.body);
   if (!parsed.success) {
-    response.status(400).json({ ok: false, error: "Choose a display name between 2 and 24 characters." });
+    response.status(400).json({ ok: false, error: "Choose a display name between 1 and 24 graphemes." });
     return;
   }
   if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
@@ -966,9 +965,9 @@ app.post("/api/session", async (request, response) => {
     return;
   }
 
-  const name = normalizeName(parsed.data.name);
-  if (name.length < 2 || name.length > 24 || !/^[\p{L}\p{N}][\p{L}\p{N} ._-]*$/u.test(name)) {
-    response.status(400).json({ ok: false, error: "Use 2–24 letters, numbers, spaces, dots, dashes or underscores." });
+  const name = normalizeDisplayName(parsed.data.name);
+  if (!validDisplayName(name)) {
+    response.status(400).json({ ok: false, error: "Use 1–24 letters, numbers, spaces, dots, dashes or underscores." });
     return;
   }
   const reserved = new Set([
@@ -983,7 +982,7 @@ app.post("/api/session", async (request, response) => {
   const token = randomBytes(32).toString("base64url");
   const tokenHash = hashToken(token);
   const avatar = randomAvatar();
-  avatar.glyph = name.slice(0, 1).toLocaleUpperCase();
+  avatar.glyph = displayNameGlyph(name);
   const session = createHumanSession(tokenHash, {
     id: `human-${randomUUID()}`,
     name,
@@ -1054,7 +1053,10 @@ io.on("connection", (socket) => {
       );
       store.addPublicMessage(joinMessage);
       io.to("public").emit("message:new", joinMessage);
-      void director.welcome(session.member, { returning: visit?.returning ?? false });
+      void director.welcome(session.member, {
+        returning: visit?.returning ?? false,
+        languageHint: preferredRequestLanguage(socket.handshake.headers["accept-language"]),
+      });
     }
   }
 
@@ -1256,7 +1258,7 @@ io.on("connection", (socket) => {
       acknowledge?.({ ok: false, error: "Messages can be up to 500 characters." });
       return;
     }
-    const content = parsed.data.content.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").trim();
+    const content = stripDangerousTextControls(parsed.data.content).trim();
     if (!content) {
       acknowledge?.({ ok: false, error: "That message came through empty." });
       return;
@@ -1461,7 +1463,7 @@ healthInterval.unref();
 
 httpServer.listen(PORT, HOST, () => {
   console.log(`The Third Place is live on http://${HOST}:${PORT}`);
-  console.log(`LM Studio: ${lm.health().connected ? lm.health().id : "offline — deterministic fallbacks remain active"}`);
+  console.log(`LM Studio: ${lm.health().connected ? lm.health().id : "offline — model-driven replies are unavailable"}`);
 });
 
 const shutdown = async (signal: string) => {

@@ -8,9 +8,15 @@ import {
   HumanStyleMemory,
   protectTechnicalFragments,
   restoreTechnicalFragments,
+  segmentWords,
 } from "./humanizer.js";
 
 describe("humanizer similarity", () => {
+  it("segments languages without spaces into lexical units", () => {
+    expect(segmentWords("東京の現在時刻を教えてください", "ja").length).toBeGreaterThan(3);
+    expect(segmentWords("กรุณาบอกเวลาปัจจุบันที่กรุงเทพ", "th").length).toBeGreaterThan(3);
+  });
+
   it("catches lightly reformatted self repetition", () => {
     const result = assessCandidate({
       personaId: "ai-sana",
@@ -66,33 +72,37 @@ describe("humanizer similarity", () => {
     expect(close.characterNgrams).toBeGreaterThan(0.7);
     expect(close.combined).toBeGreaterThan(topical.combined + 0.45);
   });
+
+  it("finds repeats through Unicode full folding", () => {
+    const result = compareHumanizerSimilarity(
+      "Die Straße bleibt heute gesperrt.",
+      "DIE STRASSE BLEIBT HEUTE GESPERRT!",
+    );
+    expect(result.combined).toBeGreaterThan(0.9);
+  });
 });
 
-describe("humanizer tone checks", () => {
-  it("recognises Swedish and English assistant clichés", () => {
-    expect(assessCandidate({
-      personaId: "ai-a",
-      text: "Bra fråga! Här är tre viktiga saker som du bör känna till innan vi börjar.",
-    }).reasonCodes).toContain("assistant_cliche");
-
-    expect(assessCandidate({
-      personaId: "ai-b",
-      text: "Absolutely! Here are three important things that you should consider before starting.",
-    }).reasonCodes).toContain("assistant_cliche");
+describe("humanizer structural checks", () => {
+  it("does not pretend that a Swedish/English phrase list can classify assistant tone", () => {
+    for (const text of [
+      "Bra fråga! Här är tre viktiga saker som du bör känna till innan vi börjar.",
+      "Absolutely! Here are three important things that you should consider before starting.",
+      "Bien sûr ! Voici trois points importants avant de commencer.",
+      "Natürlich! Hier sind drei wichtige Punkte, die du beachten solltest.",
+    ]) {
+      expect(assessCandidate({ personaId: "ai-a", text }).reasonCodes).not.toContain("assistant_cliche");
+    }
   });
 
-  it("treats AI self-disclosure as a high-severity illusion break", () => {
+  it("leaves AI-identity meaning to the multilingual semantic reviewer", () => {
     const result = assessCandidate({
       personaId: "ai-a",
       text: "Som en AI-språkmodell har jag inga känslor, men jag kan analysera frågan.",
     });
-
-    expect(result.severity).toBe("high");
-    expect(result.acceptable).toBe(false);
-    expect(result.reasonCodes).toContain("ai_meta_language");
+    expect(result.reasonCodes).not.toContain("ai_meta_language");
   });
 
-  it("spots list-shaped and essay-shaped casual chat", () => {
+  it("spots list shape but leaves essay meaning to semantic review", () => {
     const list = assessCandidate({
       personaId: "ai-a",
       text: "Så här gör vi:\n1. Skapa rummet\n2. Starta mikrofonen\n3. Bjud in en bot",
@@ -100,40 +110,46 @@ describe("humanizer tone checks", () => {
     const essay = assessCandidate({
       personaId: "ai-a",
       mode: "voice",
-      text: "För det första behöver vi testa fördröjningen ordentligt med flera riktiga användare i samma rum. För det andra behöver vi mäta avbrott och eko under en vanlig konversation. Dessutom bör vi jämföra resultatet mellan Chrome och Firefox innan vi drar en säker slutsats om kvaliteten.",
+      text: "Fördröjningen behöver testas med flera riktiga användare i samma rum, med avbrott, med eko och med olika webbläsare; annars blir slutsatsen om kvaliteten för blank. Det är fortfarande en ganska lång och kompakt utläggning, med flera invändningar, flera villkor och väldigt lite luft; den låter mer som ett underlag än en spontan replik.",
     });
 
     expect(list.reasonCodes).toContain("list_like_reply");
-    expect(essay.reasonCodes).toContain("overly_polished");
+    expect(essay.reasonCodes).not.toContain("overly_polished");
   });
 
-  it("escalates only a combination of assistant-shaped warning signals", () => {
+  it("keeps list shape separate from language-dependent assistant meaning", () => {
     const result = assessCandidate({
       personaId: "ai-a",
       text: "Bra fråga! Här är det viktigaste:\n1. Börja enkelt\n2. Testa tidigt\n3. Sammanfatta resultatet",
     });
 
-    expect(result.reasonCodes).toEqual(expect.arrayContaining(["assistant_cliche", "list_like_reply"]));
-    expect(result.severity).toBe("high");
-    expect(result.acceptable).toBe(false);
+    expect(result.reasonCodes).toContain("list_like_reply");
+    expect(result.reasonCodes).not.toContain("assistant_cliche");
   });
 
-  it("rejects the reported academic lobby paragraph without making technical rooms less capable", () => {
+  it("recognizes Unicode decimal list markers without a Latin-digit assumption", () => {
+    const result = assessCandidate({
+      personaId: "ai-a",
+      text: "خطوات:\n١. افتح الغرفة\n٢. اختبر الصوت\n٣. أرسل النتيجة",
+    });
+    expect(result.reasonCodes).toContain("list_like_reply");
+  });
+
+  it("leaves academic-register meaning to semantic review while retaining structural diagnostics", () => {
     const text = "Spänningen ligger i att hög aktivitet ofta driver kortsiktig engagemangsmätning, medan de tysta stammisarna bygger den långsiktiga infrastrukturen. Om en plattform bara premierar dagligt brus riskerar man att förlora det institutionella minnet; utan de som dyker upp mer sällan men med tyngd, blir diskussionerna en serie isolerade händelser istället för en sammanhängande utveckling över tid.";
     const lobby = assessCandidate({ personaId: "ai-ibrahim", text, register: "everyday" });
     const programming = assessCandidate({ personaId: "ai-ibrahim", text, register: "technical" });
 
-    expect(lobby.reasonCodes).toContain("register_mismatch");
-    expect(lobby.severity).toBe("high");
-    expect(lobby.acceptable).toBe(false);
+    expect(lobby.reasonCodes).not.toContain("register_mismatch");
+    expect(lobby.acceptable).toBe(true);
     expect(programming.reasonCodes).not.toContain("register_mismatch");
     expect(conversationRegisterMismatch(text, "everyday").mismatch).toBe(true);
     expect(conversationRegisterMismatch(text, "analytical").mismatch).toBe(false);
     expect(analyzeConversationRegister(text).structureSignals.length).toBeGreaterThanOrEqual(2);
-    expect(analyzeConversationRegister(text).abstractionSignals.length).toBeGreaterThanOrEqual(1);
+    expect(analyzeConversationRegister(text).abstractionSignals).toEqual([]);
   });
 
-  it("asks the repair pass for everyday wording while preserving the actual thought", () => {
+  it("does not use an English academic-density heuristic as a repair trigger", () => {
     const result = assessCandidate({
       personaId: "ai-ibrahim",
       register: "everyday",
@@ -141,9 +157,8 @@ describe("humanizer tone checks", () => {
     });
     const instruction = buildHumanizerRepairInstruction(result);
 
-    expect(result.reasonCodes).toContain("register_mismatch");
-    expect(instruction).toContain("vardaglig chatt");
-    expect(instruction).toContain("Behåll tanken och intelligensen");
+    expect(result.reasonCodes).not.toContain("register_mismatch");
+    expect(instruction).toBeUndefined();
   });
 });
 
@@ -212,9 +227,9 @@ describe("humanizer false-positive guardrails", () => {
     expect(result.reasonCodes).not.toContain("ai_meta_language");
   });
 
-  it("allows honest identity answers only when the caller explicitly opts in", () => {
+  it("does not use language-specific identity regex in the deterministic layer", () => {
     const text = "Som en AI-karaktär bor jag här i kanalen, men jag tänker inte låtsas vara människa.";
-    expect(assessCandidate({ personaId: "ai-a", text }).reasonCodes).toContain("ai_meta_language");
+    expect(assessCandidate({ personaId: "ai-a", text }).reasonCodes).not.toContain("ai_meta_language");
     expect(assessCandidate({ personaId: "ai-a", text, allowAiIdentity: true }).reasonCodes).not.toContain("ai_meta_language");
     expect(assessCandidate({ personaId: "ai-a", text: "Jag kan inte känna igen loggan på den bilden." }).reasonCodes)
       .not.toContain("ai_meta_language");
@@ -259,6 +274,16 @@ describe("protected technical content", () => {
     expect(restoreTechnicalFragments(protectedText.text, protectedText.fragments)).toBe(original);
   });
 
+  it("keeps Unicode sentence punctuation outside protected URL fragments", () => {
+    const original = "見てhttps://example.com/guide。 ثم https://example.org/path؟";
+    const protectedText = protectTechnicalFragments(original);
+    expect(protectedText.fragments.map((fragment) => fragment.value)).toEqual([
+      "https://example.com/guide",
+      "https://example.org/path",
+    ]);
+    expect(restoreTechnicalFragments(protectedText.text, protectedText.fragments)).toBe(original);
+  });
+
   it("uses collision-safe sentinels when the input already contains a sentinel-like literal", () => {
     const original = "literal ⟦HUMANIZER_0_0⟧ and `npm test`";
     const protectedText = protectTechnicalFragments(original);
@@ -267,9 +292,11 @@ describe("protected technical content", () => {
   });
 
   it("builds a deterministic high-severity repair instruction with protected values", () => {
+    const text = "Samma konkreta råd med `fetch(url)` och https://example.com/docs, nästan ordagrant igen.";
     const assessment = assessCandidate({
       personaId: "ai-a",
-      text: "Som en AI kan jag föreslå `fetch(url)` och https://example.com/docs.",
+      text,
+      recentOwnTexts: [text, text],
     });
     const first = buildHumanizerRepairInstruction(assessment);
     const second = buildHumanizerRepairInstruction(assessment);

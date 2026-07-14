@@ -1,5 +1,17 @@
 # Third-party notices
 
+## Unicode Character Database case-fold data
+
+`shared/unicodeCaseFold.generated.ts` is generated from Unicode 17.0.0
+`CaseFolding.txt`, published by Unicode, Inc. The source version and date are
+embedded in the generated file. The Unicode Data Files and Software License is
+available at https://www.unicode.org/license.txt and permits use, copying,
+modification and distribution when the copyright and permission notice remain.
+
+Copyright © 1991–2025 Unicode, Inc. All rights reserved.
+
+---
+
 ## Optional Piper TTS runtime and Swedish voices
 
 `npm run setup:tts` optionally downloads `piper-tts==1.4.2` into the ignored,

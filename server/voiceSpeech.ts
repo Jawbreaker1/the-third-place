@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
+import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 
 export const VOICE_AUDIO_INPUT_MIME_TYPES = [
   "audio/webm",
@@ -37,6 +39,8 @@ export interface VoiceTranscriptionResult {
 export interface VoiceSynthesisInput {
   roomId: string;
   text: string;
+  /** Required for server TTS; unknown language must fall back to the browser. */
+  language?: string;
   voice?: string;
   format?: TtsFormat;
   speed?: number;
@@ -79,6 +83,8 @@ export interface VoiceSpeechCapabilities {
     model?: string;
     formats: TtsFormat[];
     defaultVoice?: string;
+    /** Explicit BCP-47 ranges; an empty list means server TTS is default-deny. */
+    supportedLanguages?: string[];
   };
   normalizer: {
     available: boolean;
@@ -148,6 +154,7 @@ interface TtsProviderConfig extends ProviderConfig {
   defaultVoice?: string;
   defaultFormat: TtsFormat;
   allowedVoices: ReadonlySet<string>;
+  supportedLanguages: readonly string[];
 }
 
 interface ProcessFailureOptions {
@@ -188,9 +195,7 @@ const clampInteger = (raw: string | undefined, fallback: number, min: number, ma
 const normalizeMimeType = (value: string): string => value.split(";", 1)[0]!.trim().toLocaleLowerCase();
 
 const sanitizeText = (value: string, maxLength: number): string =>
-  value
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+  stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, maxLength);
@@ -203,10 +208,31 @@ const sanitizeIdentifier = (value: string, label: string, maxLength = 160): stri
   return cleaned;
 };
 
-const sanitizeLanguage = (language: string | undefined): string | undefined => {
-  if (!language) return undefined;
-  const cleaned = language.trim();
-  return /^[a-z]{2,3}(?:-[A-Z]{2})?$/.test(cleaned) ? cleaned : undefined;
+const sanitizeLanguage = canonicalRegisteredLanguageTag;
+
+export const ttsLanguageIsSupported = (
+  supportedLanguages: readonly string[] | undefined,
+  language: string | undefined,
+): boolean => {
+  const target = sanitizeLanguage(language)?.toLocaleLowerCase();
+  if (!target || !supportedLanguages?.length) return false;
+  return supportedLanguages.some((raw) => {
+    const range = sanitizeLanguage(raw)?.toLocaleLowerCase();
+    return Boolean(range && (target === range || target.startsWith(`${range}-`)));
+  });
+};
+
+const configuredTtsLanguages = (raw: string | undefined, model: string): string[] => {
+  if (model.toLocaleLowerCase() === "piper-sv") return ["sv"];
+  const values = raw?.split(",").map((value) => value.trim()).filter(Boolean) ?? [];
+  if (values.length > 32) {
+    throw new VoiceSpeechError("TTS_LANGUAGES contains too many language ranges.", 500, "INVALID_TTS_LANGUAGES");
+  }
+  const normalized = values.map((value) => sanitizeLanguage(value));
+  if (normalized.some((value) => !value)) {
+    throw new VoiceSpeechError("TTS_LANGUAGES must contain valid BCP-47 ranges and never und.", 500, "INVALID_TTS_LANGUAGES");
+  }
+  return [...new Set(normalized as string[])];
 };
 
 const parseTtsFormat = (raw: string | undefined, fallback: TtsFormat = "mp3"): TtsFormat => {
@@ -624,7 +650,9 @@ class OpenAiCompatibleSttProvider {
   ): Promise<VoiceTranscriptionResult> {
     const form = new FormData();
     form.set("model", this.config.model);
-    form.set("response_format", "json");
+    // Verbose JSON is the OpenAI-compatible shape that can carry the detected
+    // language and segment timings. Plain JSON commonly contains text only.
+    form.set("response_format", "verbose_json");
     const language = sanitizeLanguage(options.language);
     const prompt = options.prompt ? sanitizeText(options.prompt, 400) : "";
     if (language) form.set("language", language);
@@ -666,7 +694,11 @@ class OpenAiCompatibleSttProvider {
     }
     const text = sanitizeText((payload as { text: string }).text, TRANSCRIPT_MAX_CHARS);
     if (!text) throw new VoiceSpeechError("No speech was detected.", 422, "NO_SPEECH");
-    const returnedLanguage = sanitizeText(String((payload as { language?: unknown }).language ?? ""), 32) || undefined;
+    const returnedLanguage = sanitizeLanguage(
+      typeof (payload as { language?: unknown }).language === "string"
+        ? (payload as { language: string }).language
+        : undefined,
+    );
     const rawSegments = Array.isArray((payload as { segments?: unknown }).segments)
       ? (payload as { segments: unknown[] }).segments
       : [];
@@ -699,6 +731,10 @@ class OpenAiCompatibleTtsProvider {
   async synthesize(input: Omit<VoiceSynthesisInput, "roomId" | "ttlMs">): Promise<{ body: Buffer; mimeType: string }> {
     const text = sanitizeText(input.text, TTS_TEXT_MAX_CHARS);
     if (!text) throw new VoiceSpeechError("Speech text was empty.", 400, "EMPTY_SPEECH_TEXT");
+    const language = sanitizeLanguage(input.language);
+    if (!ttsLanguageIsSupported(this.config.supportedLanguages, language)) {
+      throw new VoiceSpeechError("That language is not configured for server speech synthesis.", 400, "UNSUPPORTED_TTS_LANGUAGE");
+    }
     const voice = sanitizeIdentifier(input.voice ?? this.config.defaultVoice ?? "", "TTS voice", 80);
     if (!this.config.allowedVoices.has(voice)) {
       throw new VoiceSpeechError("That TTS voice is not configured for this server.", 400, "UNCONFIGURED_TTS_VOICE");
@@ -852,12 +888,16 @@ export class VoiceSpeechService {
       (options.ttsVoices ?? []).map((voice) => sanitizeIdentifier(voice, "TTS voice", 80)),
     );
     if (defaultTtsVoice) perCallTtsVoices.add(defaultTtsVoice);
-    this.ttsConfig = baseTtsConfig && perCallTtsVoices.size > 0
+    const supportedTtsLanguages = baseTtsConfig
+      ? configuredTtsLanguages(env.TTS_LANGUAGES, baseTtsConfig.model)
+      : [];
+    this.ttsConfig = baseTtsConfig && perCallTtsVoices.size > 0 && supportedTtsLanguages.length > 0
       ? {
           ...baseTtsConfig,
           ...(defaultTtsVoice ? { defaultVoice: defaultTtsVoice } : {}),
           defaultFormat: parseTtsFormat(env.TTS_FORMAT, baseTtsConfig.model === "piper-sv" ? "wav" : "mp3"),
           allowedVoices: perCallTtsVoices,
+          supportedLanguages: supportedTtsLanguages,
         }
       : undefined;
     this.normalizer = options.normalizer ?? new AudioNormalizer({
@@ -888,6 +928,7 @@ export class VoiceSpeechService {
           ? ["wav"]
           : ["mp3", "opus", "aac", "wav", "flac", "pcm"],
         ...(this.ttsConfig?.defaultVoice ? { defaultVoice: this.ttsConfig.defaultVoice } : {}),
+        supportedLanguages: [...(this.ttsConfig?.supportedLanguages ?? [])],
       },
       normalizer: {
         available: normalizerAvailable,

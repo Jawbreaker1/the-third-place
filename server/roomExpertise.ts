@@ -36,16 +36,8 @@ const stableUnit = (value: string): number => {
   return (hash >>> 0) / 0xffffffff;
 };
 
-const interestMatchScore = (persona: Persona, profile: ChannelProfile): number => {
-  const interests = persona.interests.map((interest) => interest.toLocaleLowerCase());
-  return profile.topic.tags.reduce((score, tag) => {
-    const normalized = tag.toLocaleLowerCase();
-    return score + (interests.some((interest) => interest === normalized || interest.includes(normalized) || normalized.includes(interest)) ? 1 : 0);
-  }, 0);
-};
-
 const rankingScore = (persona: Persona, profile: ChannelProfile): number =>
-  interestMatchScore(persona, profile) * 2.2 +
+  (persona.expertiseDomains.includes(profile.expertiseDomain) ? 2.2 : 0) +
   persona.curiosity * 0.7 +
   persona.conscientiousness * 0.45 +
   stableUnit(`${profile.public.id}:${persona.id}`) * 0.65;

@@ -2,6 +2,16 @@ import { io } from "socket.io-client";
 
 const baseUrl = process.env.APP_BASE_URL ?? "http://127.0.0.1:4000";
 const marker = Date.now().toString(36).slice(-5);
+const INTERNAL_PUBLICATION_MARKER =
+  /(?:⟦(?:HUMANIZER_\d+_\d+|[^⟦⟧\r\n]{1,96}_TECH_(?:\d+|n))⟧|\[S\d+\])/iu;
+
+const assertNoInternalPublicationMarker = (content, context) => {
+  if (typeof content !== "string" || content.length === 0) {
+    throw new Error(`${context} did not contain publishable text`);
+  }
+  const leaked = content.match(INTERNAL_PUBLICATION_MARKER)?.[0];
+  if (leaked) throw new Error(`${context} exposed an internally reserved marker: ${leaked}`);
+};
 
 const waitForEvent = (socket, event, predicate = () => true, timeoutMs = 120_000) =>
   new Promise((resolve, reject) => {
@@ -90,6 +100,7 @@ try {
     (message) => message.replyToId === humanMessage.id && message.authorId === "ai-nox" && message.generation === "lm",
     120_000,
   );
+  assertNoInternalPublicationMarker(aiReply.content, "Public AI reply");
 
   const openDm = await emitAck(a.socket, "dm:open", { peerId: "ai-mira" });
   const dmText = `Privat smoke-test ${marker}: ge mig en superkort hälsning.`;
@@ -101,6 +112,7 @@ try {
   );
   await emitAck(a.socket, "message:send", { channelId: openDm.thread.id, content: dmText });
   const dmUpdate = await dmReply;
+  assertNoInternalPublicationMarker(dmUpdate.message.content, "DM AI reply");
 
   const health = await fetch(`${baseUrl}/api/health`).then((response) => response.json());
   if (!health.model.connected) throw new Error("App completed the flow but reports LM Studio offline");

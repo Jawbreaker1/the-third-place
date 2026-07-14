@@ -2,6 +2,21 @@ import type { Channel } from "../shared/types.js";
 
 export type ExpertiseLevel = "basic" | "casual" | "competent" | "advanced" | "specialist";
 
+/**
+ * Stable internal identifiers for room competence. These identifiers are
+ * configuration keys, never display text and never inferred from a person's
+ * free-form interests, a room name or localized topic copy.
+ */
+export type ExpertiseDomainId =
+  | "community-social"
+  | "casual-culture"
+  | "ai-systems"
+  | "software-building"
+  | "financial-markets"
+  | "warcraft"
+  | "visualisation-3d"
+  | "hobbies";
+
 export interface ExpertiseOverride {
   level: ExpertiseLevel;
   specialties?: string[];
@@ -60,6 +75,8 @@ export const CONVERSATION_REGISTERS: Record<ConversationRegister, ConversationRe
 
 export interface ChannelProfile {
   public: Channel;
+  /** Stable routing metadata; changing or translating public copy must not change expertise. */
+  expertiseDomain: ExpertiseDomainId;
   topic: {
     brief: string;
     tags: string[];
@@ -82,6 +99,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       description: "The couch everyone somehow ended up on.",
       icon: "⌁",
     },
+    expertiseDomain: "community-social",
     topic: {
       brief: "casual online-community conversation, internet culture and whatever the room drifts into",
       tags: ["community", "internet culture", "memes", "music", "food", "weird ideas", "old web"],
@@ -112,6 +130,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       description: "Friday-table energy, questionable rankings and one more song.",
       icon: "♬",
     },
+    expertiseDomain: "casual-culture",
     topic: {
       brief: "a relaxed Friday hangout for films, music, work gripes, politics, food, links, memes and everyday nonsense",
       tags: [
@@ -140,7 +159,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     conversationRegister: "banter",
     ambientMode: "banter",
     ambientReactionPalette: ["😂", "🙃", "🍿", "🎵", "💀", "👀"],
-    conversationGuidance: "This room is loose Friday-table banter, not a panel discussion or themed pub role-play. Convey the looseness through fragments, specific references, overconfident taste, affectionate teasing, small self-corrections, recognizable tangents and uneven participation—not by announcing or explaining the mood. Avoid catchphrases such as ‘fredagsfeeling’, ‘nu lever kanalen’, ‘andra ölen’ and ‘skål på den’. Alcohol is atmosphere, never a recurring subject or personality trait. Autonomous residents never introduce alcohol or invent having consumed it; if a human explicitly makes drinks the topic, at most one selected actor addresses that part once. Very short reactions, groans, punchlines and silence are legitimate. Prefer one specific real film, song, artist, dish or recognizable annoyance over generic enthusiasm or a recommendation list; never invent a work just to fill the scene. Unless the human asks for help, do not turn replies into advice. Job gripes stay general and never invent an employer, profession or lived work history. Current politics, news and releases need supplied research; timeless political opinions remain opinions. React specifically to supplied links, memes and images, but never fabricate a URL or pretend to have opened content that was not supplied. Lowbrow jokes are welcome; never explain a punchline, keep teasing affectionate and never pile on. Laughter usually belongs in reactions; at most one written line per scene may begin with laughter.",
+    conversationGuidance: "This room is loose Friday-table banter, not a panel discussion or themed pub role-play. Convey the looseness through fragments, specific references, overconfident taste, affectionate teasing, small self-corrections, recognizable tangents and uneven participation—not by announcing or explaining the mood. Avoid recurring catchphrases that merely label the room, the day or its vibe in any language. Alcohol is atmosphere, never a recurring subject or personality trait. Autonomous residents never introduce alcohol or invent having consumed it; if a human explicitly makes drinks the topic, at most one selected actor addresses that part once. Very short reactions, groans, punchlines and silence are legitimate. Prefer one specific real film, song, artist, dish or recognizable annoyance over generic enthusiasm or a recommendation list; never invent a work just to fill the scene. Unless the human asks for help, do not turn replies into advice. Job gripes stay general and never invent an employer, profession or lived work history. Current politics, news and releases need supplied research; timeless political opinions remain opinions. React specifically to supplied links, memes and images, but never fabricate a URL or pretend to have opened content that was not supplied. Lowbrow jokes are welcome; never explain a punchline, keep teasing affectionate and never pile on. Laughter usually belongs in reactions; at most one written line per scene may begin with laughter.",
     expertiseOverrides: {
       "ai-juno": { level: "specialist", specialties: ["film", "music", "memes", "pop culture"] },
       "ai-kim": { level: "advanced", specialties: ["music", "food", "culture", "strong rankings"] },
@@ -172,6 +191,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       description: "Models, prompts, strange benchmarks and big opinions.",
       icon: "◇",
     },
+    expertiseDomain: "ai-systems",
     topic: {
       brief: "AI models, prompting, local inference, agents, evaluations and AI culture",
       tags: ["ai", "benchmarks", "privacy", "systems", "science", "open source", "engineering"],
@@ -201,6 +221,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       description: "Building with models: code, tools, failures and fixes.",
       icon: "⌘",
     },
+    expertiseDomain: "software-building",
     topic: {
       brief: "practical AI software development: application architecture, TypeScript, Python, APIs, tools, local inference, testing and deployment",
       tags: ["ai", "code", "engineering", "systems", "security", "hardware", "interfaces", "open source", "startups"],
@@ -232,6 +253,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       description: "Markets, businesses, risk and respectfully incompatible theses.",
       icon: "▥",
     },
+    expertiseDomain: "financial-markets",
     topic: {
       brief: "stock markets, company fundamentals, valuation, incentives, market history, risk and competing investment theses",
       tags: ["economics", "policy", "news", "history", "systems", "facts", "debate", "receipts"],
@@ -262,6 +284,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       description: "Azeroth lore, raids, classes and deeply serious transmog business.",
       icon: "⚔",
     },
+    expertiseDomain: "warcraft",
     topic: {
       brief: "World of Warcraft lore, classes, raids, dungeons, professions, UI, guild culture and expansion history",
       tags: ["games", "gaming", "history", "memes", "art", "interfaces", "music", "culture"],
@@ -293,6 +316,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       description: "Modelling, materials, lighting, rendering and beautifully expensive pixels.",
       icon: "⬡",
     },
+    expertiseDomain: "visualisation-3d",
     topic: {
       brief: "3D visualisation: modelling, sculpting, materials, lighting, cameras, rendering, animation, real-time scenes, CAD and production pipelines",
       tags: ["3d", "rendering", "lighting", "materials", "design", "games", "animation", "art", "interfaces", "hardware", "engineering", "photography", "diy", "code"],
@@ -324,6 +348,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       description: "Games, snacks, half-finished ideas and glorious detours.",
       icon: "↗",
     },
+    expertiseDomain: "hobbies",
     topic: {
       brief: "games, food, art, hobbies, music and delightfully unfinished personal projects",
       tags: ["games", "gaming", "food", "music", "film", "memes", "art", "crafts", "outdoors", "photography", "diy", "travel", "snacks"],

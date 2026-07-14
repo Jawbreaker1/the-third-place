@@ -1,9 +1,40 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
-import { detectVoiceGroundingIssue, mentionsPersona, VoiceDirector, sanitizeSpokenLine } from "./voiceDirector.js";
+import { createFailClosedTurnAnalysis, type TurnAnalysis, type TurnAnalysisInput } from "./semanticRouter.js";
+import { mentionsPersona, VoiceDirector, sanitizeSpokenLine, ttsModelSupportsLanguage } from "./voiceDirector.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
+const routedAnalysis = (
+  languageTag = "sv-SE",
+  options: { addressedIds?: string[]; addressConfidence?: number; asksAboutAcoustics?: boolean } = {},
+): TurnAnalysis => {
+  const fallback = createFailClosedTurnAnalysis("model_unavailable");
+  return {
+    ...fallback,
+    source: "lm",
+    failureReason: null,
+    language: { tag: languageTag, confidence: 0.99 },
+    intent: {
+      kind: options.asksAboutAcoustics ? "capability_question" : "question",
+      isQuestion: true,
+      replyExpected: "expected",
+      confidence: 0.95,
+    },
+    personas: {
+      ...fallback.personas,
+      addressedIds: options.addressedIds ?? [],
+      requestedReplyIds: options.addressedIds ?? [],
+      addressConfidence: options.addressConfidence ?? (options.addressedIds?.length ? 0.95 : 0),
+    },
+    capabilities: {
+      ...fallback.capabilities,
+      asksAboutAcoustics: options.asksAboutAcoustics ?? false,
+      confidence: 0.95,
+    },
+  } as TurnAnalysis;
+};
+const analyzeSwedish = async (_input: TurnAnalysisInput): Promise<TurnAnalysis> => routedAnalysis();
 
 describe("VoiceDirector", () => {
   it("turns one final human utterance into one bounded AI turn without recursion", async () => {
@@ -24,6 +55,7 @@ describe("VoiceDirector", () => {
     const director = new VoiceDirector({
       runtime,
       lm: {
+        analyzeTurn: analyzeSwedish,
         generateScene: async () => {
           generated += 1;
           return [{ personaId: "ai-sana", content: "**Bra grund.** Jag skulle testa den med fem användare först ✨ https://bad.invalid", source: "lm", sourceIds: [] }];
@@ -75,12 +107,20 @@ describe("VoiceDirector", () => {
     const director = new VoiceDirector({
       runtime,
       lm: {
+        analyzeTurn: analyzeSwedish,
         generateScene: async () => [{ personaId: "ai-sana", content: "Absolut, jag hör dig.", source: "lm", sourceIds: [] }],
       },
       speech: {
         capabilities: async () => ({
           stt: { available: true, provider: "openai-compatible", inputMimeTypes: [] },
-          tts: { available: true, provider: "openai-compatible", formats: ["wav"], defaultVoice: "lisa-warm" },
+          tts: {
+            available: true,
+            provider: "openai-compatible",
+            model: "piper-sv",
+            formats: ["wav"],
+            defaultVoice: "lisa-warm",
+            supportedLanguages: ["sv"],
+          },
           normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
           browserFallbackAllowed: false,
         }),
@@ -112,6 +152,7 @@ describe("VoiceDirector", () => {
       roomId: created.room.id,
       text: "Absolut, jag hör dig.",
       voice: "lisa-warm",
+      language: "sv-SE",
       speed: 0.98,
     });
     expect(payloads).toEqual([expect.objectContaining({
@@ -143,6 +184,10 @@ describe("VoiceDirector", () => {
     const director = new VoiceDirector({
       runtime,
       lm: {
+        analyzeTurn: async () => {
+          callOrder.push("analyze");
+          return routedAnalysis();
+        },
         generateScene: async (request) => {
           callOrder.push("generate");
           sceneRelationshipNotes = request.relationshipNotes;
@@ -194,10 +239,10 @@ describe("VoiceDirector", () => {
       personaId: "ai-sana",
       familiarity: 0.45,
     }]);
-    expect(callOrder).toEqual(["promptNote", "getRelation", "generate", "updateRelation"]);
+    expect(callOrder).toEqual(["analyze", "promptNote", "getRelation", "generate", "updateRelation"]);
   });
 
-  it("grounds Mira's exact text-versus-speech failure and supplies the complete live roster", async () => {
+  it("routes an acoustic question semantically and supplies trusted voice transport context", async () => {
     const runtime = new VoiceRoomRuntime(["lobby"]);
     const created = runtime.createRoom("lobby", { socketId: "socket-jaw", memberId: "human-jaw", name: "Jaw_B" });
     expect(created.ok).toBe(true);
@@ -211,16 +256,25 @@ describe("VoiceDirector", () => {
     expect(human.ok).toBe(true);
     if (!human.ok) return;
 
+    let analysisInput: TurnAnalysisInput | undefined;
     let seenVoiceContext: Parameters<ConstructorParameters<typeof VoiceDirector>[0]["lm"]["generateScene"]>[0]["voiceContext"];
+    let seenLanguageHint: string | undefined;
+    let seenPremise: string | undefined;
     const speeches: string[] = [];
     const director = new VoiceDirector({
       runtime,
       lm: {
+        analyzeTurn: async (input) => {
+          analysisInput = input;
+          return routedAnalysis("nb-NO", { asksAboutAcoustics: true });
+        },
         generateScene: async (request) => {
           seenVoiceContext = request.voiceContext;
+          seenLanguageHint = request.languageHint;
+          seenPremise = request.premise;
           return [{
             personaId: "ai-mira",
-            content: "Jo, det låter lite så på texten ändå.",
+            content: "Det kan jeg ikke avgjøre uten pålitelig lydinformasjon.",
             source: "lm",
             sourceIds: [],
           }];
@@ -247,6 +301,14 @@ describe("VoiceDirector", () => {
     director.onHumanFinal(human.entry);
     await settle();
 
+    expect(analysisInput).toMatchObject({
+      medium: "voice",
+      channel: { id: "lobby", name: "lobby" },
+      latestMessage: { authorId: "human-jaw", content: "Jeg skriker vel ikke?" },
+      availableCapabilities: ["local_datetime"],
+      urlCandidates: [],
+      personaCandidates: [{ id: "ai-mira", name: "Mira" }],
+    });
     expect(seenVoiceContext).toEqual({
       latestSpeakerId: "human-jaw",
       latestUtteranceOrigin: "microphone-stt",
@@ -257,41 +319,378 @@ describe("VoiceDirector", () => {
         { memberId: "ai-mira", name: "Mira", kind: "ai" },
       ],
     });
-    expect(speeches).toEqual([
-      "Jag får orden via transkriberingen, inte en pålitlig volymnivå, så det kan jag faktiskt inte avgöra.",
-    ]);
-    expect(speeches[0]).not.toMatch(/på texten|du skriver|du skriker/iu);
+    expect(seenLanguageHint).toBe("nb-NO");
+    expect(seenPremise).toContain("asksAboutAcoustics=true");
+    expect(speeches).toEqual(["Det kan jeg ikke avgjøre uten pålitelig lydinformasjon."]);
     expect(runtime.getTranscript(created.room.id).at(-1)).toMatchObject({
       speakerId: "ai-mira",
       utteranceOrigin: "ai-tts",
     });
   });
 
-  it("classifies written-medium illusions and unsupported acoustic claims deterministically", () => {
-    expect(detectVoiceGroundingIssue(
-      "Det är ju det här vi gör, vi läser vad du skriver.",
-      "microphone-stt",
-    )).toBe("written-medium");
-    expect(detectVoiceGroundingIssue("Jo, det låter lite så på texten ändå.", "microphone-stt"))
-      .toBe("written-medium");
-    expect(detectVoiceGroundingIssue("Du skriker faktiskt ganska högt.", "microphone-stt"))
-      .toBe("unsupported-acoustics");
-    expect(detectVoiceGroundingIssue(
-      "Jag kan inte avgöra om du skriker från transkriberingen.",
-      "microphone-stt",
-    )).toBeUndefined();
-    expect(detectVoiceGroundingIssue("Jag hör frustrationen i din röst.", "microphone-stt"))
-      .toBe("unsupported-acoustics");
-    expect(detectVoiceGroundingIssue(
-      "Jag kan inte avgöra om du skriker, men din röst låter arg.",
-      "microphone-stt",
-    )).toBe("unsupported-acoustics");
-    expect(detectVoiceGroundingIssue("Stemmen din høres frustrert ut.", "microphone-stt"))
-      .toBe("unsupported-acoustics");
-    expect(detectVoiceGroundingIssue("Du låter som att du har en bra plan.", "microphone-stt"))
-      .toBeUndefined();
-    expect(detectVoiceGroundingIssue("Du skrev faktiskt det där.", "typed-voice-fallback"))
-      .toBeUndefined();
+  it.each([
+    ["sv-SE", "Vad tycker du om idén?"],
+    ["nb-NO", "Hva synes du om ideen?"],
+    ["de-DE", "Was hältst du von der Idee?"],
+    ["fr-FR", "Que penses-tu de cette idée ?"],
+    ["es-ES", "¿Qué opinas de esta idea?"],
+  ])("uses one multilingual analysis plan for %s voice input", async (languageTag, utterance) => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: `socket-${languageTag}`, memberId: `human-${languageTag}`, name: "Alex" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, `socket-${languageTag}`, { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, `human-${languageTag}`, utterance);
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+
+    const analysisInputs: TurnAnalysisInput[] = [];
+    const languageHints: Array<string | undefined> = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        analyzeTurn: async (input) => {
+          analysisInputs.push(input);
+          return routedAnalysis(languageTag);
+        },
+        generateScene: async (request) => {
+          languageHints.push(request.languageHint);
+          return [{ personaId: "ai-sana", content: "En kort naturlig replik.", source: "lm", sourceIds: [] }];
+        },
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: () => undefined,
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await settle();
+
+    expect(analysisInputs).toHaveLength(1);
+    expect(analysisInputs[0]).toMatchObject({
+      medium: "voice",
+      latestMessage: { content: utterance },
+      availableCapabilities: ["local_datetime"],
+      urlCandidates: [],
+    });
+    expect(languageHints).toEqual([languageTag]);
+  });
+
+  it("uses high-confidence inferred targets while an explicit @mention wins deterministically", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-target", memberId: "human-target", name: "Alex" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-target", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    expect(runtime.inviteBot(created.room.id, "socket-target", { personaId: "ai-mira", name: "Mira" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    runtime.setBotState(created.room.id, "ai-mira", "listening");
+    const generatedBy: string[] = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        analyzeTurn: async () => routedAnalysis("de-DE", {
+          addressedIds: ["ai-mira"],
+          addressConfidence: 0.97,
+        }),
+        generateScene: async (request) => {
+          const selected = request.selected[0]!;
+          generatedBy.push(selected.id);
+          return [{ personaId: selected.id, content: "Klar, ich antworte kurz.", source: "lm", sourceIds: [] }];
+        },
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: () => undefined,
+        aiStop: () => undefined,
+      },
+    });
+
+    const inferred = runtime.appendFinalTranscript(created.room.id, "human-target", "Mira kann das bestimmt beantworten.");
+    expect(inferred.ok).toBe(true);
+    if (!inferred.ok) return;
+    director.onHumanFinal(inferred.entry);
+    await settle();
+    const explicit = runtime.appendFinalTranscript(created.room.id, "human-target", "@Sana, bitte du diesmal.");
+    expect(explicit.ok).toBe(true);
+    if (!explicit.ok) return;
+    director.onHumanFinal(explicit.entry);
+    await settle();
+
+    expect(generatedBy).toEqual(["ai-mira", "ai-sana"]);
+  });
+
+  it("uses a neutral language instruction and publishes no canned line when analysis or generation is unavailable", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-offline", memberId: "human-offline", name: "Alex" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-offline", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-offline", "Pouvez-vous répondre ?", {
+      language: "und",
+    });
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+
+    let languageHint: string | undefined;
+    let semanticLanguage: string | undefined;
+    let analysisInput: TurnAnalysisInput | undefined;
+    const speeches: string[] = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        analyzeTurn: async (input) => {
+          analysisInput = input;
+          return createFailClosedTurnAnalysis("model_unavailable");
+        },
+        generateScene: async (request) => {
+          languageHint = request.languageHint;
+          semanticLanguage = request.semanticContext?.languageTag;
+          return [];
+        },
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: (payload) => speeches.push(payload.text),
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await settle();
+
+    expect(languageHint).toBe("infer and mirror the language of the latest human utterance directly");
+    expect(semanticLanguage).toBeUndefined();
+    expect(analysisInput?.transportLanguageHint).toBeUndefined();
+    expect(speeches).toEqual([]);
+    expect(runtime.getTranscript(created.room.id)).toHaveLength(1);
+    expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState)
+      .toBe("listening");
+  });
+
+  it("prefers a canonical STT language over a semantic router language guess", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-stt-language", memberId: "human-stt-language", name: "陳明" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-stt-language", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-stt-language", "你覺得呢？", {
+      utteranceOrigin: "microphone-stt",
+      language: "zh-Hant-TW-u-ca-chinese",
+    });
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+    expect(human.entry.language).toBe("zh-Hant-TW");
+
+    let languageHint: string | undefined;
+    let semanticLanguage: string | undefined;
+    let analysisInput: TurnAnalysisInput | undefined;
+    const speeches: Array<Record<string, unknown>> = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        analyzeTurn: async (input) => {
+          analysisInput = input;
+          return routedAnalysis("ja-JP");
+        },
+        generateScene: async (request) => {
+          languageHint = request.languageHint;
+          semanticLanguage = request.semanticContext?.languageTag;
+          return [{ personaId: "ai-sana", content: "我覺得可以先小規模試試看。", source: "lm", sourceIds: [] }];
+        },
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: true, provider: "openai-compatible", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: (payload) => speeches.push(payload as unknown as Record<string, unknown>),
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await settle();
+
+    expect(languageHint).toBe("zh-Hant-TW");
+    expect(semanticLanguage).toBe("zh-Hant-TW");
+    expect(analysisInput?.transportLanguageHint).toBe("zh-Hant-TW");
+    expect(speeches).toEqual([expect.objectContaining({ language: "zh-Hant-TW" })]);
+    expect(runtime.getTranscript(created.room.id).at(-1)?.language).toBe("zh-Hant-TW");
+  });
+
+  it("uses a generic provider's configured default voice, never a Piper persona alias", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-generic-tts", memberId: "human-generic-tts", name: "直子" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-generic-tts", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-generic-tts", "どう思う？", { language: "ja-JP" });
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+    const syntheses: Array<Record<string, unknown>> = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        analyzeTurn: async () => routedAnalysis("ja-JP"),
+        generateScene: async () => [{ personaId: "ai-sana", content: "まず小さく試すのがいいと思う。", source: "lm", sourceIds: [] }],
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: true, provider: "openai-compatible", inputMimeTypes: [] },
+          tts: {
+            available: true,
+            provider: "openai-compatible",
+            model: "generic-multilingual",
+            formats: ["mp3"],
+            defaultVoice: "provider-default",
+            supportedLanguages: ["ja"],
+          },
+          normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async (input) => {
+          syntheses.push(input as unknown as Record<string, unknown>);
+          return {
+            id: "generic-audio",
+            roomId: created.room.id,
+            mimeType: "audio/mpeg",
+            bytes: 10,
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          };
+        },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: () => undefined,
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await settle();
+
+    expect(syntheses).toEqual([expect.objectContaining({
+      voice: "provider-default",
+      language: "ja-JP",
+    })]);
+    expect(syntheses[0]?.voice).not.toMatch(/^(?:lisa|nst)/u);
+  });
+
+  it("answers a multilingual current-time voice request from the server clock without web access", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-time", memberId: "human-time", name: "Léa" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-time", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-time", "Quelle heure est-il en Suède maintenant ?");
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+
+    let analyzerInput: TurnAnalysisInput | undefined;
+    let scenePremise = "";
+    const speeches: Array<Record<string, unknown>> = [];
+    const director = new VoiceDirector({
+      runtime,
+      now: () => Date.parse("2026-07-14T12:00:00.000Z"),
+      lm: {
+        analyzeTurn: async (input) => {
+          analyzerInput = input;
+          return {
+            ...routedAnalysis("fr-FR"),
+            evidence: {
+              need: "required",
+              action: "local_datetime",
+              confidence: 0.99,
+              query: null,
+              urlRef: null,
+              searchMode: null,
+              timeZone: "Europe/Stockholm",
+              timeKind: "current_time",
+              locationLabel: "Suède",
+            },
+          };
+        },
+        generateScene: async (request) => {
+          scenePremise = request.premise ?? "";
+          return [];
+        },
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: (payload) => speeches.push(payload as unknown as Record<string, unknown>),
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await settle();
+
+    expect(analyzerInput?.availableCapabilities).toEqual(["local_datetime"]);
+    expect(scenePremise).toContain("Trusted server clock result");
+    expect(speeches[0]).toMatchObject({ language: "fr-FR" });
+    expect(String(speeches[0]?.text)).toContain("14:00:00");
   });
 
   it("aborts the previous room generation when a newer human utterance arrives", async () => {
@@ -313,6 +712,7 @@ describe("VoiceDirector", () => {
     const director = new VoiceDirector({
       runtime,
       lm: {
+        analyzeTurn: analyzeSwedish,
         generateScene: async (_request, _priority, signal) => {
           generationCount += 1;
           if (generationCount === 1) {
@@ -376,6 +776,7 @@ describe("VoiceDirector", () => {
         floorSilenceMs: 650,
         hasPendingHumanIngest: () => ingestPending,
         lm: {
+          analyzeTurn: analyzeSwedish,
           generateScene: async (request) => {
             generations += 1;
             seenAuthors = request.history.map((line) => line.author);
@@ -435,12 +836,30 @@ describe("VoiceDirector", () => {
     const spoken = sanitizeSpokenLine(`# Rubrik\n[skrattar] ${words} 😀 https://example.com`);
     expect(spoken.split(/\s+/)).toHaveLength(25);
     expect(spoken).not.toMatch(/https?:|\[|#|😀/u);
+    expect(sanitizeSpokenLine("【笑う】これは自然な返答です", "ja-JP")).toBe("これは自然な返答です");
+    expect(sanitizeSpokenLine("（หัวเราะ）นี่คือคำตอบที่เป็นธรรมชาติ", "th-TH"))
+      .toBe("นี่คือคำตอบที่เป็นธรรมชาติ".normalize("NFKC"));
   });
 
   it("matches complete persona names instead of substrings", () => {
-    expect(mentionsPersona("Vale, vad tror du?", "Vale")).toBe(true);
+    expect(mentionsPersona("Vale, vad tror du?", "Vale")).toBe(false);
+    expect(mentionsPersona("@Vale, vad tror du?", "Vale")).toBe(true);
     expect(mentionsPersona("@Bosse.exe kom hit", "Bosse.exe")).toBe(true);
+    expect(mentionsPersona("@Sana你怎麼看？", "Sana")).toBe(true);
+    expect(mentionsPersona("ミラさん@Miraどう思う？", "Mira")).toBe(true);
+    expect(mentionsPersona("مرحباً@Sana، ما رأيك؟", "Sana")).toBe(true);
+    expect(mentionsPersona("https://example.test/@Sana", "Sana")).toBe(false);
     expect(mentionsPersona("Det svenska valet är snart", "Vale")).toBe(false);
     expect(mentionsPersona("That was beautiful", "Bea")).toBe(false);
+  });
+
+  it("uses only explicit provider language ranges and defaults closed", () => {
+    expect(ttsModelSupportsLanguage(["sv"], "sv-SE")).toBe(true);
+    expect(ttsModelSupportsLanguage(["sv-Latn"], "sv-Latn-SE")).toBe(true);
+    expect(ttsModelSupportsLanguage(["sv"], "fr-FR")).toBe(false);
+    expect(ttsModelSupportsLanguage(["ja"], "ja-JP")).toBe(true);
+    expect(ttsModelSupportsLanguage([], "ja-JP")).toBe(false);
+    expect(ttsModelSupportsLanguage(undefined, "ja-JP")).toBe(false);
+    expect(ttsModelSupportsLanguage(["ja"], "und")).toBe(false);
   });
 });

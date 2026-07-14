@@ -14,7 +14,7 @@ export const PIPER_PROVIDER_VOICES = [
 export type PiperProviderVoice = (typeof PIPER_PROVIDER_VOICES)[number];
 
 export interface PersonaVoiceProfile {
-  language: "sv-SE";
+  /** Voice alias understood only by the bundled `piper-sv` sidecar. */
   providerVoice: PiperProviderVoice;
   speed: number;
   browserRate: number;
@@ -27,7 +27,6 @@ const voiceProfile = (
   browserRate: number,
   browserPitch: number,
 ): PersonaVoiceProfile => Object.freeze({
-  language: "sv-SE",
   providerVoice,
   speed,
   browserRate,
@@ -64,5 +63,7 @@ export const PERSONA_VOICE_PROFILES: Readonly<Record<string, PersonaVoiceProfile
 export const voiceProfileForPersona = (personaId: string): PersonaVoiceProfile | undefined =>
   PERSONA_VOICE_PROFILES[personaId];
 
-export const configuredPersonaProviderVoices = (): PiperProviderVoice[] =>
-  [...new Set(Object.values(PERSONA_VOICE_PROFILES).map((profile) => profile.providerVoice))];
+export const configuredPersonaProviderVoices = (model: string | undefined): PiperProviderVoice[] =>
+  model?.trim().toLocaleLowerCase() === "piper-sv"
+    ? [...new Set(Object.values(PERSONA_VOICE_PROFILES).map((profile) => profile.providerVoice))]
+    : [];

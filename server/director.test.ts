@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { PERSONAS } from "./personas.js";
-import { RoomStore } from "./store.js";
+import { createMessage, RoomStore } from "./store.js";
 import {
   addressedPersonaIds,
+  ambientHistoryWithAnchor,
   ambientConversationPremise,
   ambientLanguageHint,
   ambientSceneWordLimits,
@@ -12,14 +13,15 @@ import {
   consideredConversationPremise,
   consideredConversationResponsePremise,
   consideredConversationWordLimits,
+  classifiedLanguage,
   ensureEvidenceResponder,
   evidenceFailureFallback,
-  groundedEvidenceFallback,
   normalizeGeneratedMessageContent,
   pageEvidenceAnswerContract,
   selectAmbientLead,
   selectConsideredConversation,
   selectResponders,
+  socialSignalsFromTurnAnalysis,
   SocialDirector,
   shouldRejectPublicCandidate,
   shouldStartConsideredConversation,
@@ -27,103 +29,50 @@ import {
   trailingAiMessageCount,
   type ConsideredConversationGate,
 } from "./director.js";
+import { createFailClosedTurnAnalysis, type TurnAnalysis } from "./semanticRouter.js";
+
+const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => ({
+  ...createFailClosedTurnAnalysis("disabled"),
+  source: "lm",
+  failureReason: null,
+  language: { tag: "sv", confidence: 0.99 },
+  intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.99 },
+  personas: { addressedIds: [], requestedReplyIds: [], relevantIds: [], addressConfidence: 0, relevanceConfidence: 0 },
+  social: { warmth: 0.2, hostility: 0, playfulness: 0, absurdity: 0, urgency: 0, energy: 0.3, pileOnRisk: 0, claimStrength: 0, confidence: 0.99 },
+  moderation: { risk: "none", action: "none", categories: [], confidence: 0.99 },
+  evidence: { need: "none", action: "none", confidence: 0.99, query: null, urlRef: null, searchMode: null, timeZone: null, timeKind: null, locationLabel: null },
+  capabilities: {
+    discussed: [],
+    requestKind: "none",
+    asksAboutAcoustics: false,
+    asksAboutAiIdentity: false,
+    asksForList: false,
+    confidence: 0.99,
+  },
+  ...overrides,
+});
 
 describe("social director", () => {
-  it("requires concrete host-aware answers from successful page reads", () => {
+  it("uses one source-agnostic evidence contract for every successful page read", () => {
     const packet = (title: string, url: string) => ({
       kind: "page" as const,
       query: "read it",
       retrievedAt: new Date().toISOString(),
       results: [{ id: "S1", title, url, snippet: "A concrete supported detail from the page." }],
     });
-    expect(pageEvidenceAnswerContract(packet("Avanza – Börsen idag", "https://www.avanza.se/"))).toContain("headline-index level");
-    expect(pageEvidenceAnswerContract(packet("Avanza article", "https://www.avanza.se/placera/redaktionellt/article")))
-      .not.toContain("headline-index level");
-    expect(pageEvidenceAnswerContract(packet("Avanza – Börsen idag", "https://example.com/spoof")))
-      .not.toContain("headline-index level");
-    expect(pageEvidenceAnswerContract(packet("News - WoW", "https://worldofwarcraft.blizzard.com/en-us/News")))
-      .toContain("exact supplied headline");
-    expect(pageEvidenceAnswerContract(packet("Example", "https://example.com/article")))
-      .toContain("at least one concrete supported detail");
+    const contracts = [
+      packet("Market", "https://www.avanza.se/"),
+      packet("ゲームニュース", "https://example.jp/news"),
+      packet("Actualités", "https://example.fr/article"),
+    ].map((value) => pageEvidenceAnswerContract(value));
+    expect(new Set(contracts).size).toBe(1);
+    expect(contracts[0]).toContain("human's actual request");
+    expect(contracts[0]).toContain("concrete detail");
   });
 
-  it("builds a Swedish Avanza fallback from only the first complete validated index row", () => {
-    const answer = groundedEvidenceFallback({
-      kind: "page",
-      query: "dagens kurser",
-      retrievedAt: new Date().toISOString(),
-      results: [{
-        id: "S1",
-        title: "Avanza – Börsen idag",
-        url: "https://www.avanza.se/",
-        snippet: "Avanzas publika marknadsöversikt. Detta är huvudindex.\nOMX Stockholm 30 (OMXS30): 3 167,16 indexpunkter, -0,33 % idag, uppdaterad 17:30.\nDow Jones U.S. Index (DJUS): 1 826,71 indexpunkter, -0,78 % idag, uppdaterad 22:04.",
-      }],
-    }, "vilka är dagens kurser?");
-    expect(answer).toEqual({
-      content: "Avanza visar OMX Stockholm 30 (OMXS30): 3 167,16 indexpunkter, -0,33 % idag (uppdaterad 17:30). Säg vilken aktie eller ticker du menar om du vill ha en enskild kurs.",
-      sourceIds: ["S1"],
-    });
-    expect(answer?.content).not.toContain("Dow Jones");
-  });
-
-  it("preserves punctuation in the first validated Avanza index label", () => {
-    const answer = groundedEvidenceFallback({
-      kind: "page",
-      query: "dagens kurser",
-      retrievedAt: new Date().toISOString(),
-      results: [{
-        id: "S1",
-        title: "Avanza – Börsen idag",
-        url: "https://www.avanza.se/",
-        snippet: "Avanzas publika marknadsöversikt.\nDow Jones U.S. Index (DJUS): 1 826,71 indexpunkter, -0,78 % idag, uppdaterad 22:04.",
-      }],
-    }, "dagens kurser?");
-    expect(answer?.content).toContain("Dow Jones U.S. Index (DJUS)");
-    expect(answer?.content).not.toContain("Avanza visar Index (DJUS)");
-  });
-
-  it("builds bounded page and search fallbacks with the server-owned source", () => {
-    const page = groundedEvidenceFallback({
-      kind: "page",
-      query: "read it",
-      retrievedAt: new Date().toISOString(),
-      results: [{
-        id: "S1",
-        title: "News - WoW",
-        url: "https://worldofwarcraft.blizzard.com/en-us/News",
-        snippet: "Stoneforged Sentinel arrives\n\nThe mount supports more than 300,000 customization combinations.\n\nA second unrelated block.",
-      }],
-    }, "which item is interesting?");
-    expect(page).toEqual({
-      content: "From “News - WoW”: Stoneforged Sentinel arrives",
-      sourceIds: ["S1"],
-    });
-    expect(page?.content.length).toBeLessThanOrEqual(360);
-
-    const search = groundedEvidenceFallback({
-      kind: "search",
-      query: "site:example.com update",
-      retrievedAt: new Date().toISOString(),
-      results: [{ id: "S1", title: "Official update", url: "https://example.com/update", snippet: "Details" }],
-    }, "vad hittade du?");
-    expect(search).toEqual({ content: "Första källträffen är “Official update”.", sourceIds: ["S1"] });
-    expect(groundedEvidenceFallback({
-      kind: "search",
-      query: "missing source",
-      retrievedAt: new Date().toISOString(),
-      results: [{ id: "S2", title: "Wrong source", url: "https://example.com", snippet: "Details" }],
-    })).toBeUndefined();
-  });
-
-  it("uses a temporary deterministic failure instead of generic social chatter", () => {
-    expect(evidenceFailureFallback(true, "kan ni läsa länken?")).toEqual({
-      content: "Jag fick inte fram något läsbart från just den länken den här gången.",
-      sourceIds: [],
-    });
-    expect(evidenceFailureFallback(false, "please check the latest prices")).toEqual({
-      content: "I didn't get a usable source result for that search this time.",
-      sourceIds: [],
-    });
+  it("does not guess a Swedish or English sentence when an evidence attempt fails", () => {
+    expect(evidenceFailureFallback(true, "kan ni läsa länken?")).toBeUndefined();
+    expect(evidenceFailureFallback(false, "bitte prüfe die aktuellen Kurse")).toBeUndefined();
   });
 
   it("wires DM evidence fallbacks to the actual message source metadata", async () => {
@@ -145,7 +94,7 @@ describe("social director", () => {
           id: "S1",
           title: "Avanza – Börsen idag",
           url: "https://www.avanza.se/",
-          snippet: "Avanzas publika marknadsöversikt.\nOMX Stockholm 30 (OMXS30): 3 167,16 indexpunkter, -0,33 % idag, uppdaterad 17:30.",
+          snippet: "OMX Stockholm 30 (OMXS30): level 3 167,16; change -0,33%; updated 17:30.\nAdditional supplied context.",
         }],
       };
       const runCase = async (evidence: typeof pagePacket | undefined) => {
@@ -158,31 +107,64 @@ describe("social director", () => {
           "@Linnea kolla dagens kurser på https://www.avanza.se",
         )!;
         const lm = {
-          generateScene: vi.fn(async () => evidence ? [] : [{
+          analyzeTurn: vi.fn(async () => classifiedTurn({
+            evidence: {
+              need: "required",
+              action: "read_url",
+              confidence: 0.99,
+              query: null,
+              urlRef: "U1",
+              searchMode: null,
+              timeZone: null,
+              timeKind: null,
+              locationLabel: null,
+            },
+          })),
+          generateScene: vi.fn(async () => evidence ? [{
             personaId: persona.id,
-            content: "okej, det där fick min uppmärksamhet",
+            content: "OMX Stockholm 30 (OMXS30) står på 3 167,16 i den hämtade översikten.",
+            source: "lm" as const,
+            sourceIds: ["S1"],
+          }] : [{
+            personaId: persona.id,
+            content: "Jag fick inte fram just den sidan den här gången.",
             source: "lm" as const,
             sourceIds: [],
           }]),
           rememberDeliveredLine: vi.fn(),
         };
         const pageReader = {
-          resolveRequest: vi.fn(() => ({
-            url: new URL("https://www.avanza.se/"),
+          collectCandidates: vi.fn(() => ({
             requestedAt: new Date().toISOString(),
-            intent: incoming.content,
+            candidates: [{
+              id: "U1",
+              url: new URL("https://www.avanza.se/"),
+              raw: "https://www.avanza.se",
+              supported: true,
+              source: "message" as const,
+              messageId: incoming.id,
+              authorId: human.id,
+              createdAt: incoming.createdAt,
+            }],
+          })),
+          resolveTarget: vi.fn(({ candidateSet, intent }: { candidateSet: { requestedAt: string }; intent: string }) => ({
+            url: new URL("https://www.avanza.se/"),
+            requestedAt: candidateSet.requestedAt,
+            intent,
+            retry: false,
             source: "message" as const,
           })),
           read: vi.fn(async () => evidence),
         };
         const researchBroker = {
-          shouldResearch: vi.fn(() => false),
-          researchUrlFallback: vi.fn(async () => undefined),
+          researchSite: vi.fn(async () => undefined),
+          research: vi.fn(async () => undefined),
         };
         const humanMemory = {
           getRelation: vi.fn(() => undefined),
           updateRelation: vi.fn(),
           promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
         };
         const director = new SocialDirector(
           { to: vi.fn(() => ({ emit })) } as never,
@@ -199,20 +181,450 @@ describe("social director", () => {
         await vi.runAllTimersAsync();
         await pending;
         director.stop();
-        return store.getDmMessages(thread.id).at(-1)!;
+        return {
+          reply: store.getDmMessages(thread.id).at(-1)!,
+          analyzerInput: lm.analyzeTurn.mock.calls[0]?.[0],
+        };
       };
 
       const sourced = await runCase(pagePacket);
-      expect(sourced.generation).toBe("fallback");
-      expect(sourced.content).toContain("OMX Stockholm 30 (OMXS30)");
-      expect(sourced.sources).toEqual([{ title: "Avanza – Börsen idag", url: "https://www.avanza.se/" }]);
+      expect(sourced.reply.generation).toBe("lm");
+      expect(sourced.reply.content).toContain("OMX Stockholm 30 (OMXS30)");
+      expect(sourced.reply.sources).toEqual([{ title: "Avanza – Börsen idag", url: "https://www.avanza.se/" }]);
+      expect(sourced.analyzerInput.urlCandidates).toEqual([{
+        ref: "U1",
+        source: "latest_message",
+        context: "host=www.avanza.se; path=/; source=message",
+      }]);
+      expect(JSON.stringify(sourced.analyzerInput.urlCandidates)).not.toContain("https://");
 
       const failed = await runCase(undefined);
-      expect(failed.generation).toBe("fallback");
-      expect(failed.content).toBe("Jag fick inte fram något läsbart från just den länken den här gången.");
-      expect(failed.sources).toEqual([]);
-      expect(failed.content).not.toContain("uppmärksamhet");
+      expect(failed.reply.generation).toBe("lm");
+      expect(failed.reply.content).toBe("Jag fick inte fram just den sidan den här gången.");
+      expect(failed.reply.sources).toEqual([]);
+      expect(failed.reply.content).not.toContain("bold thing");
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("answers a current-time request from the server clock and never sends it to search", async () => {
+    vi.useFakeTimers();
+    const fixedNow = Date.parse("2026-07-13T22:20:30.000Z");
+    try {
+      const human = {
+        id: "guest-clock",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+      const store = new RoomStore("/tmp/director-clock-test-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const incoming = store.addDmMessage(
+        thread.id,
+        human.id,
+        "Så ingen :( Som kan kolla upp vad klockan är i Sverige just nu?",
+      )!;
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        language: { tag: "sv", confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "local_datetime",
+          confidence: 0.99,
+          query: null,
+          urlRef: null,
+          searchMode: null,
+          timeZone: "Europe/Stockholm",
+          timeKind: "current_time",
+          locationLabel: "Sverige",
+        },
+      }));
+      const generateScene = vi.fn(async (request: { premise?: string }) => {
+        expect(request.premise).toContain("00:20:30");
+        return [{ personaId: persona.id, content: "Klockan är 00:20 i Sverige.", source: "lm" as const, sourceIds: [] }];
+      });
+      const research = vi.fn(async () => undefined);
+      const researchSite = vi.fn(async () => undefined);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeTurn, generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        { research, researchSite } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          pageReader: { collectCandidates: vi.fn(() => ({ requestedAt: new Date(fixedNow).toISOString(), candidates: [] })) } as never,
+          now: () => fixedNow,
+        },
+      );
+      const pending = director.onDirectMessage(incoming, human, persona);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(analyzeTurn).toHaveBeenCalledTimes(1);
+      expect(research).not.toHaveBeenCalled();
+      expect(researchSite).not.toHaveBeenCalled();
+      expect(store.getDmMessages(thread.id).at(-1)?.content).toBe("Klockan är 00:20 i Sverige.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs exactly one analysis for a public burst and lets explicit @ plus the clock tool win", async () => {
+    vi.useFakeTimers();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.1);
+    const fixedNow = Date.parse("2026-07-13T22:20:30.000Z");
+    try {
+      const human = {
+        id: "guest-public-clock",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+      const store = new RoomStore("/tmp/director-public-clock-test-unused.json");
+      const first = createMessage("lobby", human.id, "Jag gillar Rust. Tss, jag frågade ju här i kanalen.");
+      const latest = createMessage("lobby", human.id, "@Mira, vad är klockan i Sverige just nu?");
+      store.addPublicMessage(first);
+      store.addPublicMessage(latest);
+      await store.flush();
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        language: { tag: "sv", confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "local_datetime",
+          confidence: 0.99,
+          query: null,
+          urlRef: null,
+          searchMode: null,
+          timeZone: "Europe/Stockholm",
+          timeKind: "current_time",
+          locationLabel: "Sverige",
+        },
+      }));
+      const research = vi.fn(async () => undefined);
+      const analyzeMemoryTurn = vi.fn(async (request: {
+        content: string;
+        currentBurstMessages: Array<{ id: string; content: string }>;
+      }) => ({
+        source: "lm" as const,
+        failureReason: null,
+        items: request.currentBurstMessages.some((message) => message.content.includes("Rust"))
+          ? [{
+              operation: "remember" as const,
+              kind: "likes" as const,
+              value: "Rust",
+              explicitFirstPerson: true as const,
+              safety: "safe" as const,
+              confidence: 0.99,
+            }]
+          : [],
+      }));
+      const noteClassifiedMemoryFact = vi.fn();
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn,
+          analyzeMemoryTurn,
+          generateScene: vi.fn(async () => [{
+            personaId: persona.id,
+            content: "00:20 här i Sverige.",
+            source: "lm" as const,
+            sourceIds: [],
+          }]),
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research, researchSite: vi.fn(async () => undefined) } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact,
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          pageReader: { collectCandidates: vi.fn(() => ({ requestedAt: new Date(fixedNow).toISOString(), candidates: [] })) } as never,
+          now: () => fixedNow,
+          rng: () => 0.5,
+        },
+      );
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof latest>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([first, latest], human);
+      await vi.runAllTimersAsync();
+      await pending;
+      await vi.runAllTimersAsync();
+      director.stop();
+
+      expect(analyzeTurn).toHaveBeenCalledTimes(1);
+      expect(analyzeTurn.mock.calls[0]?.[0].latestMessage.content).toBe(latest.content);
+      expect(analyzeTurn.mock.calls[0]?.[0].recentMessages.some((message: { id?: string }) => message.id === first.id)).toBe(true);
+      expect(research).not.toHaveBeenCalled();
+      expect(analyzeMemoryTurn).toHaveBeenCalledTimes(1);
+      expect(analyzeMemoryTurn).toHaveBeenCalledWith(expect.objectContaining({
+        turnId: `memory:${latest.id}`,
+        content: latest.content,
+        currentBurstMessages: [
+          expect.objectContaining({ id: first.id, content: first.content }),
+          expect.objectContaining({ id: latest.id, content: latest.content }),
+        ],
+      }));
+      expect(noteClassifiedMemoryFact).toHaveBeenCalledWith(
+        human.id,
+        "lobby",
+        expect.objectContaining({ operation: "remember", kind: "likes", value: "Rust" }),
+        fixedNow,
+      );
+      const reply = store.getRecent("lobby", 1)[0];
+      expect(reply?.authorId).toBe(persona.id);
+      expect(reply?.content).toBe("00:20 här i Sverige.");
+    } finally {
+      random.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a Japanese elliptical memory burst together and excludes every other author", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-hana-memory",
+        name: "Hana",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "H" },
+      };
+      const otherHuman = {
+        id: "guest-other-memory",
+        name: "Ken",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#321", accent: "#654", glyph: "K" },
+      };
+      const store = new RoomStore("/tmp/director-memory-burst-test-unused.json");
+      const prior = createMessage("lobby", human.id, "チェスをしています。");
+      const intervening = createMessage("lobby", otherHuman.id, "私は囲碁が好きです。");
+      const first = createMessage("lobby", human.id, "もうしません。");
+      const latest = createMessage("lobby", human.id, "今は将棋です。");
+      for (const message of [prior, intervening, first, latest]) store.addPublicMessage(message);
+      await store.flush();
+
+      const analyzeMemoryTurn = vi.fn(async () => ({
+        source: "lm" as const,
+        failureReason: null,
+        items: [
+          {
+            operation: "forget" as const,
+            kind: "plays" as const,
+            value: "チェス",
+            explicitFirstPerson: true as const,
+            safety: "safe" as const,
+            confidence: 0.99,
+          },
+          {
+            operation: "remember" as const,
+            kind: "plays" as const,
+            value: "将棋",
+            explicitFirstPerson: true as const,
+            safety: "safe" as const,
+            confidence: 0.99,
+          },
+        ],
+      }));
+      const forgetClassifiedMemoryFact = vi.fn();
+      const noteClassifiedMemoryFact = vi.fn();
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeMemoryTurn, health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          forgetClassifiedMemoryFact,
+          noteClassifiedMemoryFact,
+        } as never,
+        () => [human, otherHuman, ...PERSONAS],
+        () => 2,
+      );
+
+      (director as unknown as {
+        schedulePersistentMemory: (messages: typeof first[], member: typeof human) => void;
+      }).schedulePersistentMemory([first, latest], human);
+      await vi.runAllTimersAsync();
+      await Promise.resolve();
+
+      expect(analyzeMemoryTurn).toHaveBeenCalledTimes(1);
+      expect(analyzeMemoryTurn).toHaveBeenCalledWith(expect.objectContaining({
+        turnId: `memory:${latest.id}`,
+        content: latest.content,
+        currentBurstMessages: [
+          expect.objectContaining({ id: first.id, content: "もうしません。" }),
+          expect.objectContaining({ id: latest.id, content: "今は将棋です。" }),
+        ],
+        recentSameAuthorMessages: [
+          expect.objectContaining({ id: prior.id, content: "チェスをしています。" }),
+        ],
+      }));
+      const request = analyzeMemoryTurn.mock.calls[0]?.[0];
+      expect(JSON.stringify(request)).not.toContain(intervening.content);
+      expect(forgetClassifiedMemoryFact).toHaveBeenCalledWith(
+        human.id,
+        "lobby",
+        expect.objectContaining({ value: "チェス" }),
+        expect.any(Number),
+      );
+      expect(noteClassifiedMemoryFact).toHaveBeenCalledWith(
+        human.id,
+        "lobby",
+        expect.objectContaining({ value: "将棋" }),
+        expect.any(Number),
+      );
+      director.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays silent instead of publishing generic Bosse chatter when both required generations are empty", async () => {
+    vi.useFakeTimers();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.1);
+    try {
+      const human = {
+        id: "guest-no-canned-line",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const store = new RoomStore("/tmp/director-no-canned-line-test.json");
+      const incoming = createMessage("lobby", human.id, "@Bosse.exe, vet du?");
+      store.addPublicMessage(incoming);
+      await store.flush();
+      const generateScene = vi.fn(async () => []);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeTurn: vi.fn(async () => classifiedTurn()), generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          pageReader: { collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })) } as never,
+          rng: () => 0.5,
+        },
+      );
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(store.getRecent("lobby", 5)).toEqual([incoming]);
+      expect(store.getRecent("lobby", 5).some((message) => message.content.includes("bold thing"))).toBe(false);
+    } finally {
+      random.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["nb", "Kan noen sjekke dagens strømpris?", "dagens strømpris Norge"],
+    ["de", "Kann jemand die heutigen DAX-Kurse prüfen?", "DAX Kurse heute"],
+    ["fr", "Quelqu’un peut vérifier les nouvelles règles aujourd’hui ?", "nouvelles règles aujourd'hui"],
+    ["es", "¿Podéis mirar las noticias de mercado de hoy?", "noticias del mercado hoy"],
+  ])("routes a %s lookup only from the classifier's standalone query", async (tag, content, query) => {
+    vi.useFakeTimers();
+    const previousResearch = process.env.RESEARCH_ENABLED;
+    process.env.RESEARCH_ENABLED = "true";
+    try {
+      const human = {
+        id: `guest-${tag}`,
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-linnea")!;
+      const store = new RoomStore(`/tmp/director-${tag}-routing-test-unused.json`);
+      const thread = store.openDm(human.id, persona.id);
+      const incoming = store.addDmMessage(thread.id, human.id, content)!;
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        language: { tag, confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "web_search",
+          confidence: 0.99,
+          query,
+          urlRef: null,
+          searchMode: "web",
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+      }));
+      const packet = {
+        kind: "search" as const,
+        query,
+        retrievedAt: new Date().toISOString(),
+        results: [{ id: "S1", title: "Relevant source", url: "https://example.com/result", snippet: "Relevant detail" }],
+      };
+      const research = vi.fn(async () => packet);
+      const generateScene = vi.fn(async (request: { languageHint?: string }) => {
+        expect(request.languageHint).toBe(tag);
+        return [{ personaId: persona.id, content: "Relevant answer", source: "lm" as const, sourceIds: ["S1"] }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeTurn, generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        { research, researchSite: vi.fn(async () => undefined) } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        { pageReader: { collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })) } as never },
+      );
+      const pending = director.onDirectMessage(incoming, human, persona);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(analyzeTurn).toHaveBeenCalledTimes(1);
+      expect(research).toHaveBeenCalledWith({ query, mode: "web", requesterId: human.id });
+      const analyzerInput = analyzeTurn.mock.calls[0]?.[0];
+      expect(analyzerInput.latestMessage.content).toBe(content);
+      expect(analyzerInput.availableCapabilities).toContain("web_search");
+    } finally {
+      if (previousResearch === undefined) delete process.env.RESEARCH_ENABLED;
+      else process.env.RESEARCH_ENABLED = previousResearch;
       vi.useRealTimers();
     }
   });
@@ -273,10 +685,33 @@ describe("social director", () => {
     expect(addressedPersonaIds([], { authorId: "ai-kim", system: true })).toEqual([]);
   });
 
-  it("recognises high-energy absurd messages", () => {
-    const signals = analyzeSocialSignals("HEAR ME OUT!!! what if the banana runs the server? 🤯🤯");
+  it("uses the multilingual turn analysis for absurdity and energy without punctuation inference", () => {
+    const baseline = analyzeSocialSignals("HEAR ME OUT!!! what if the banana runs the server? 🤯🤯");
+    expect(baseline.energy).toBe(0);
+    const signals = socialSignalsFromTurnAnalysis(classifiedTurn({
+      social: { ...classifiedTurn().social, absurdity: 0.91, energy: 0.88 },
+    }), [], baseline);
     expect(signals.absurdity).toBeGreaterThan(0.4);
     expect(signals.energy).toBeGreaterThan(0.5);
+  });
+
+  it("fails closed on uncertain semantic intent and language instead of forcing a locale or reply", () => {
+    const analysis = classifiedTurn({
+      language: { tag: "ja", confidence: 0.31 },
+      intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.42 },
+      personas: {
+        addressedIds: ["ai-mira"],
+        requestedReplyIds: ["ai-mira"],
+        relevantIds: [],
+        addressConfidence: 0.99,
+        relevanceConfidence: 0,
+      },
+    });
+    const signals = socialSignalsFromTurnAnalysis(analysis, [], analyzeSocialSignals("短い曖昧な発話"));
+    expect(classifiedLanguage(analysis)).toBeUndefined();
+    expect(signals.isQuestion).toBe(false);
+    expect(signals.mentionedIds).toEqual([]);
+    expect(classifiedLanguage(classifiedTurn({ language: { tag: "ja", confidence: 0.99 } }))).toBe("ja");
   });
 
   it("measures an uninterrupted autonomous tail without letting room notices reset it", () => {
@@ -310,7 +745,16 @@ describe("social director", () => {
       content: "en tidigare replik",
       createdAt: new Date(now - 30_000).toISOString(),
     };
-    expect(ambientLanguageHint([oldHuman, freshHuman, aiTail])).toBe("Swedish");
+    expect(ambientLanguageHint([oldHuman, freshHuman, aiTail])).toBe("the language used in the latest human-authored message");
+    const longAiTail = Array.from({ length: 24 }, (_, index) => ({
+      ...aiTail,
+      id: `ai-tail-${index}`,
+      createdAt: new Date(now - (24 - index) * 1_000).toISOString(),
+    }));
+    const bounded = ambientHistoryWithAnchor([oldHuman, freshHuman, ...longAiTail], 18);
+    expect(bounded).toHaveLength(18);
+    expect(bounded[0]?.id).toBe("fresh");
+    expect(bounded.slice(1).every((message) => message.authorId.startsWith("ai-"))).toBe(true);
   });
 
   it("chooses a room-relevant lead over the loudest generic resident", () => {
@@ -462,19 +906,44 @@ describe("social director", () => {
   it("does not confuse names with substrings", () => {
     expect(analyzeSocialSignals("det här är en beautiful idé").mentionedIds).not.toContain("ai-bea");
     expect(analyzeSocialSignals("vad tycker ni om valet?").mentionedIds).not.toContain("ai-vale");
-    expect(analyzeSocialSignals("Vale, vad tycker du?").mentionedIds).toContain("ai-vale");
+    expect(analyzeSocialSignals("Vale, vad tycker du?").mentionedIds).not.toContain("ai-vale");
+    expect(analyzeSocialSignals("@Vale, vad tycker du?").mentionedIds).toContain("ai-vale");
   });
 
-  it("routes a single clear attack to the moderator", () => {
-    const signals = analyzeSocialSignals("du är en idiot");
+  it("routes model-classified hostility to the moderator without a language word list", () => {
+    const analysis = classifiedTurn({
+      language: { tag: "de", confidence: 0.99 },
+      social: { ...classifiedTurn().social, hostility: 0.86 },
+      moderation: { risk: "medium", action: "deescalate", categories: ["harassment"], confidence: 0.96 },
+    });
+    const signals = socialSignalsFromTurnAnalysis(analysis, [], analyzeSocialSignals("Du bist wirklich unmöglich"));
     const selected = selectResponders(PERSONAS, signals, new Map(), Date.now(), () => 0.99);
     expect(signals.aggression).toBeGreaterThanOrEqual(0.4);
     expect(selected.map((persona) => persona.id)).toEqual(["ai-runa"]);
   });
 
-  it("treats a single absolute claim as dissent-worthy without substring false positives", () => {
-    expect(analyzeSocialSignals("Gemma är bäst").claimStrength).toBeGreaterThan(0.28);
-    expect(analyzeSocialSignals("min beställning kom idag").claimStrength).toBeLessThan(0.28);
+  it("keeps an explicit @ target when moderation also needs to join", () => {
+    const analysis = classifiedTurn({
+      social: { ...classifiedTurn().social, hostility: 0.86 },
+      moderation: { risk: "medium", action: "deescalate", categories: ["harassment"], confidence: 0.96 },
+    });
+    const baseline = analyzeSocialSignals("@Mira, det där var faktiskt över gränsen");
+    const signals = socialSignalsFromTurnAnalysis(analysis, baseline.mentionedIds, baseline);
+    const selected = selectResponders(PERSONAS, signals, new Map(), Date.now(), () => 0.99);
+    expect(selected.map((persona) => persona.id)).toEqual(["ai-mira", "ai-runa"]);
+  });
+
+  it("takes claim strength from meaning rather than Swedish or English substrings", () => {
+    const strong = socialSignalsFromTurnAnalysis(classifiedTurn({
+      language: { tag: "fr", confidence: 0.99 },
+      social: { ...classifiedTurn().social, claimStrength: 0.88 },
+    }), [], analyzeSocialSignals("Ce modèle est clairement le meilleur"));
+    const weak = socialSignalsFromTurnAnalysis(classifiedTurn({
+      language: { tag: "fr", confidence: 0.99 },
+      social: { ...classifiedTurn().social, claimStrength: 0.08 },
+    }), [], analyzeSocialSignals("Mon colis est arrivé aujourd’hui"));
+    expect(strong.claimStrength).toBeGreaterThan(0.28);
+    expect(weak.claimStrength).toBeLessThan(0.28);
   });
 
   it("opens a considered beat only on the rare roll after quiet and cooldown", () => {
@@ -626,6 +1095,31 @@ describe("social director", () => {
       history: exactPeerHistory,
     })).toBe(true);
 
+    expect(shouldRejectPublicCandidate({
+      channelId: "lobby",
+      personaId: "ai-sana",
+      content: "cafe\u0301 ＡＢＣ",
+      history: [{ channelId: "lobby", authorId: "ai-mira", content: "café ABC" }],
+    })).toBe(true);
+    expect(shouldRejectPublicCandidate({
+      channelId: "lobby",
+      personaId: "ai-sana",
+      content: "STRASSE",
+      history: [{ channelId: "lobby", authorId: "ai-mira", content: "Straße" }],
+    })).toBe(true);
+    expect(shouldRejectPublicCandidate({
+      channelId: "lobby",
+      personaId: "ai-sana",
+      content: "οσ",
+      history: [{ channelId: "lobby", authorId: "ai-mira", content: "ΟΣ" }],
+    })).toBe(true);
+    expect(shouldRejectPublicCandidate({
+      channelId: "lobby",
+      personaId: "ai-sana",
+      content: "की",
+      history: [{ channelId: "lobby", authorId: "ai-mira", content: "कि" }],
+    })).toBe(false);
+
     const ownHistory = [
       {
         channelId: "ai-programming",
@@ -695,6 +1189,8 @@ describe("social director", () => {
     expect(cleaned).not.toMatch(/\[S\d+\]/u);
     expect(cleaned).toContain("svar");
     expect(cleaned).toContain("mer");
+    expect(normalizeGeneratedMessageContent("東京です[S1]。次です")).toBe("東京です。次です");
+    expect(normalizeGeneratedMessageContent("هذا صحيح`[S2]`؟")).toBe("هذا صحيح؟");
     expect(normalizeGeneratedMessageContent("Läs https://example.com/[S1]/docs")).toContain("https://example.com/[S1]/docs");
   });
 

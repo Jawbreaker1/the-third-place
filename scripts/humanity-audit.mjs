@@ -9,42 +9,14 @@ const NEAR_DUPLICATE_THRESHOLD = 0.72;
 const MAX_EXAMPLES = 12;
 const OPENING_LENGTHS = [2, 3, 4];
 
-const ASSISTANT_CLICHES = [
-  { language: "en", label: "sure/certainly/absolutely opener", pattern: /^\s*(?:sure|certainly|absolutely)[!,.]?\s/iu },
-  { language: "en", label: "great question", pattern: /\b(?:great|good|excellent) question\b/iu },
-  { language: "en", label: "here's the thing/breakdown", pattern: /\bhere(?:'|’)?s (?:the thing|a (?:quick )?breakdown)\b/iu },
-  { language: "en", label: "let's dive/explore/break it down", pattern: /\blet(?:'|’)?s (?:dive (?:in|into)|explore|break (?:it|this) down)\b/iu },
-  { language: "en", label: "important/worth noting", pattern: /\b(?:it(?:'|’)?s (?:important|worthwhile)|worth) to (?:note|remember|mention)\b/iu },
-  { language: "en", label: "hope this helps", pattern: /\bhope (?:this|that) helps\b/iu },
-  { language: "en", label: "feel free to", pattern: /\bfeel free to\b/iu },
-  { language: "en", label: "happy to help", pattern: /\bhappy to help\b/iu },
-  { language: "en", label: "as an AI", pattern: /\bas an ai\b/iu },
-  { language: "en", label: "in conclusion", pattern: /\bin conclusion\b/iu },
-  { language: "en", label: "you've got this", pattern: /\byou(?:'|’)?ve got this\b/iu },
-  { language: "en", label: "game-changer", pattern: /\bgame[- ]changer\b/iu },
-  { language: "sv", label: "absolut/självklart opener", pattern: /^\s*(?:absolut|självklart)[!,.]?\s/iu },
-  { language: "sv", label: "bra fråga", pattern: /\b(?:bra|utmärkt) fråga\b/iu },
-  { language: "sv", label: "här kommer", pattern: /\bhär kommer (?:en|ett|några)\b/iu },
-  { language: "sv", label: "låt oss dyka/utforska/bryta ner", pattern: /\blåt oss (?:dyka (?:in|ner)|utforska|bryta ner)\b/iu },
-  { language: "sv", label: "viktigt/värt att notera", pattern: /\b(?:det är viktigt|värt) att (?:notera|komma ihåg|nämna)\b/iu },
-  { language: "sv", label: "hoppas det hjälper", pattern: /\bhoppas (?:det|detta|det här) hjälper\b/iu },
-  { language: "sv", label: "hör gärna av dig", pattern: /\bhör gärna av dig\b/iu },
-  { language: "sv", label: "jag hjälper gärna", pattern: /\bjag hjälper gärna\b/iu },
-  { language: "sv", label: "som en AI", pattern: /\bsom en ai\b/iu },
-  { language: "sv", label: "sammanfattningsvis", pattern: /\bsammanfattningsvis\b/iu },
-  { language: "sv", label: "du klarar det", pattern: /\bdu klarar det(?: här)?\b/iu },
-];
-
 const STRICT_THRESHOLDS = {
   globalMedianWords: 55,
-  globalAssistantClicheMessageRate: 0.25,
   globalEmojiMessageRate: 0.55,
   globalExactPairsPerMessage: 0.2,
   globalNearPairsPerMessage: 0.35,
   globalCrossPersonaEchoPairsPerMessage: 0.4,
   globalDominantTwoWordOpeningShare: 0.28,
   personaMinimumMessages: 12,
-  personaAssistantClicheMessageRate: 0.45,
   personaEmojiMessageRate: 0.98,
   personaExactPairsPerMessage: 0.5,
   personaNearPairsPerMessage: 0.75,
@@ -54,12 +26,27 @@ const STRICT_THRESHOLDS = {
 const round = (value, digits = 3) => Number(value.toFixed(digits));
 const rate = (numerator, denominator) => (denominator > 0 ? round(numerator / denominator) : 0);
 
-const words = (content) =>
-  String(content ?? "")
-    .normalize("NFKC")
-    .toLocaleLowerCase("sv-SE")
-    .replaceAll("’", "'")
-    .match(/[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)*/gu) ?? [];
+/**
+ * Unicode word units for structural metrics. Intl.Segmenter is essential here:
+ * counting runs separated by whitespace turns an entire Japanese or Thai
+ * message into one "word". The property-escape fallback is deliberately only
+ * a mechanical fallback for runtimes without Segmenter, never a language
+ * vocabulary or semantic classifier.
+ */
+export const segmentWordUnits = (content) => {
+  const text = String(content ?? "").normalize("NFKC").trim();
+  if (!text) return [];
+  try {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: "word" });
+    return [...segmenter.segment(text)]
+      .filter((segment) => segment.isWordLike)
+      .map((segment) => segment.segment.toLocaleLowerCase());
+  } catch {
+    return text.toLocaleLowerCase().match(/[\p{L}\p{M}\p{N}]+(?:['-][\p{L}\p{M}\p{N}]+)*/gu) ?? [];
+  }
+};
+
+const words = (content) => segmentWordUnits(content);
 
 const normalizeContent = (content) => words(content).join(" ");
 
@@ -81,12 +68,6 @@ const isAiMessage = (message) =>
   typeof message.authorId === "string" &&
   message.authorId.startsWith("ai-");
 
-const findCliches = (content) =>
-  ASSISTANT_CLICHES.filter(({ pattern }) => pattern.test(String(content ?? ""))).map(({ language, label }) => ({
-    language,
-    label,
-  }));
-
 const prepareMessage = (message, index) => {
   const content = typeof message.content === "string" ? message.content : "";
   const tokenList = words(content);
@@ -99,7 +80,6 @@ const prepareMessage = (message, index) => {
     words: tokenList,
     normalized: tokenList.join(" "),
     emojiCount: (content.match(/\p{Extended_Pictographic}/gu) ?? []).length,
-    clicheHits: findCliches(content),
     originalIndex: index,
   };
 };
@@ -122,7 +102,7 @@ const openingReport = (messages) => {
     const repeated = [...counts.entries()]
       .filter(([, entry]) => entry.count >= 2)
       .map(([phrase, entry]) => ({ phrase, count: entry.count, personaCount: entry.personaIds.size }))
-      .sort((left, right) => right.count - left.count || left.phrase.localeCompare(right.phrase, "sv"));
+      .sort((left, right) => right.count - left.count || left.phrase.localeCompare(right.phrase));
     result[String(length)] = {
       repeatedPhraseCount: repeated.length,
       dominantShare: rate(repeated[0]?.count ?? 0, messages.length),
@@ -132,34 +112,6 @@ const openingReport = (messages) => {
   return result;
 };
 
-const clicheReport = (messages) => {
-  const byPhrase = new Map();
-  const examples = [];
-  let messageCount = 0;
-  let hitCount = 0;
-  for (const message of messages) {
-    if (message.clicheHits.length === 0) continue;
-    messageCount += 1;
-    hitCount += message.clicheHits.length;
-    for (const hit of message.clicheHits) {
-      const key = `${hit.language}\u0000${hit.label}`;
-      const entry = byPhrase.get(key) ?? { ...hit, count: 0 };
-      entry.count += 1;
-      byPhrase.set(key, entry);
-    }
-    if (examples.length < MAX_EXAMPLES) {
-      examples.push({ id: message.id, personaId: message.personaId, hits: message.clicheHits, excerpt: excerpt(message.content) });
-    }
-  }
-  return {
-    messageCount,
-    messageRate: rate(messageCount, messages.length),
-    hitCount,
-    byPhrase: [...byPhrase.values()].sort((left, right) => right.count - left.count || left.label.localeCompare(right.label)),
-    examples,
-  };
-};
-
 const baseMessageReport = (messages) => {
   const emojiCount = messages.reduce((total, message) => total + message.emojiCount, 0);
   const messagesWithEmoji = messages.filter((message) => message.emojiCount > 0).length;
@@ -167,7 +119,6 @@ const baseMessageReport = (messages) => {
     messageCount: messages.length,
     medianWords: median(messages.map((message) => message.words.length)),
     repeatedOpenings: openingReport(messages),
-    assistantCliches: clicheReport(messages),
     emoji: {
       messagesWithEmoji,
       messageRate: rate(messagesWithEmoji, messages.length),
@@ -367,9 +318,6 @@ const strictEvaluation = (report, enabled) => {
   if (global.medianWords > STRICT_THRESHOLDS.globalMedianWords) {
     add("global", "medianWords", global.medianWords, STRICT_THRESHOLDS.globalMedianWords);
   }
-  if (global.assistantCliches.messageRate > STRICT_THRESHOLDS.globalAssistantClicheMessageRate) {
-    add("global", "assistantCliches.messageRate", global.assistantCliches.messageRate, STRICT_THRESHOLDS.globalAssistantClicheMessageRate);
-  }
   if (global.emoji.messageRate > STRICT_THRESHOLDS.globalEmojiMessageRate) {
     add("global", "emoji.messageRate", global.emoji.messageRate, STRICT_THRESHOLDS.globalEmojiMessageRate);
   }
@@ -397,9 +345,6 @@ const strictEvaluation = (report, enabled) => {
 
   for (const persona of report.personas) {
     if (persona.messageCount < STRICT_THRESHOLDS.personaMinimumMessages) continue;
-    if (persona.assistantCliches.messageRate > STRICT_THRESHOLDS.personaAssistantClicheMessageRate) {
-      add(persona.personaId, "assistantCliches.messageRate", persona.assistantCliches.messageRate, STRICT_THRESHOLDS.personaAssistantClicheMessageRate);
-    }
     if (persona.emoji.messageRate > STRICT_THRESHOLDS.personaEmojiMessageRate) {
       add(persona.personaId, "emoji.messageRate", persona.emoji.messageRate, STRICT_THRESHOLDS.personaEmojiMessageRate);
     }
@@ -495,23 +440,14 @@ export const renderHumanReport = (report) => {
     `Pair window: ${report.configuration.pairWindow} preceding AI messages; near threshold: ${percent(report.configuration.nearDuplicateThreshold)}`,
     "",
     "Global",
-    `  Messages / median words: ${report.global.messageCount} / ${report.global.medianWords}`,
+    `  Messages / median word units: ${report.global.messageCount} / ${report.global.medianWords}`,
     `  Emoji: ${percent(report.global.emoji.messageRate)} of messages (${report.global.emoji.emojiCount} total)`,
-    `  Assistant clichés (sv/en): ${report.global.assistantCliches.messageCount} messages (${percent(report.global.assistantCliches.messageRate)}), ${report.global.assistantCliches.hitCount} hits`,
     `  Duplicate pairs: ${report.global.duplicatePairs.exact.count} exact / ${report.global.duplicatePairs.near.count} near`,
     `  Cross-persona echo: ${report.global.crossPersonaEcho.count} pairs (${report.global.crossPersonaEcho.exactCount} exact / ${report.global.crossPersonaEcho.nearCount} near)`,
     "  Repeated openings:",
-    ...OPENING_LENGTHS.map((length) => `    ${length} words: ${describeOpening(report.global, length)}`),
+    ...OPENING_LENGTHS.map((length) => `    ${length} word units: ${describeOpening(report.global, length)}`),
   ];
 
-  if (report.global.assistantCliches.byPhrase.length > 0) {
-    lines.push(
-      `  Top clichés: ${report.global.assistantCliches.byPhrase
-        .slice(0, 5)
-        .map((entry) => `${entry.language}:${entry.label} ×${entry.count}`)
-        .join("; ")}`,
-    );
-  }
   if (report.global.duplicatePairs.exact.examples.length > 0) {
     lines.push("  Exact duplicate examples:");
     for (const example of report.global.duplicatePairs.exact.examples.slice(0, 3)) lines.push(`    - ${renderPairExample(example)}`);
@@ -525,10 +461,9 @@ export const renderHumanReport = (report) => {
   for (const persona of report.personas) {
     lines.push(
       `${persona.personaId}`,
-      `  Messages / median words: ${persona.messageCount} / ${persona.medianWords}`,
+      `  Messages / median word units: ${persona.messageCount} / ${persona.medianWords}`,
       `  Repeated openings: 2w ${describeOpening(persona, 2)}; 3w ${describeOpening(persona, 3)}; 4w ${describeOpening(persona, 4)}`,
       `  Duplicate pairs: ${persona.duplicatePairs.exact.count} exact / ${persona.duplicatePairs.near.count} near`,
-      `  Assistant clichés: ${persona.assistantCliches.messageCount} messages (${percent(persona.assistantCliches.messageRate)}), ${persona.assistantCliches.hitCount} hits`,
       `  Emoji: ${percent(persona.emoji.messageRate)} of messages (${persona.emoji.emojiCount} total)`,
       `  Cross-persona echo: ${persona.crossPersonaEcho.count} pairs (${persona.crossPersonaEcho.exactCount} exact / ${persona.crossPersonaEcho.nearCount} near)`,
     );

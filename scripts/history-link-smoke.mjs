@@ -73,6 +73,12 @@ try {
   const sentMessage = await sentMessagePromise;
   const preview = await previewPromise;
   if (preview.messageId !== sentMessage.id) throw new Error("Preview was attached to the wrong message");
+  if (preview.linkPreview.url !== "https://example.com/") {
+    throw new Error(`Preview republished an unexpected click URL: ${preview.linkPreview.url}`);
+  }
+  if (typeof preview.linkPreview.title !== "string" || preview.linkPreview.title.length === 0) {
+    throw new Error("Preview did not publish a bounded title");
+  }
 
   console.log(
     JSON.stringify(

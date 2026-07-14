@@ -4,7 +4,6 @@ import {
   buildPersonaStylePromptNote,
   buildPersonaStylePromptNotes,
   derivePersonaStyleTurnPolicy,
-  GENERIC_ASSISTANT_PHRASES,
   personaStyleSignature,
 } from "./personaStyle.js";
 
@@ -25,6 +24,11 @@ describe("persona style fingerprints", () => {
       expect(style.complexityAppetite, persona.id).toBeLessThanOrEqual(1);
       expect(style.conversationHabits, persona.id).toHaveLength(3);
       expect(new Set(style.conversationHabits).size, persona.id).toBe(style.conversationHabits.length);
+      for (const index of style.questionEndingHabitIndexes ?? []) {
+        expect(Number.isInteger(index), persona.id).toBe(true);
+        expect(index, persona.id).toBeGreaterThanOrEqual(0);
+        expect(index, persona.id).toBeLessThan(style.conversationHabits.length);
+      }
       expect(style.avoidPhrases.length, persona.id).toBeGreaterThanOrEqual(3);
       expect(style.avoidPhrases.length, persona.id).toBeLessThanOrEqual(4);
     }
@@ -57,7 +61,7 @@ describe("persona style fingerprints", () => {
     expect(note).toContain("Do not perform every trait every time");
     expect(note).toContain("at most one per message");
     expect(note).toContain("“here's the thing”");
-    for (const phrase of GENERIC_ASSISTANT_PHRASES) expect(note).toContain(`“${phrase}”`);
+    expect(note).toContain("generic service-assistant validation");
     expect(note.length).toBeLessThan(2_400);
   });
 
@@ -91,7 +95,10 @@ describe("persona style fingerprints", () => {
     for (const policy of policies) {
       if (policy.habit) expect(mira.style.conversationHabits).toContain(policy.habit);
       if (policy.emoji) expect(mira.style.emojiPalette).toContain(policy.emoji);
-      if (policy.ending === "statement") expect(policy.habit ?? "").not.toMatch(/\b(?:ask|question)\b/iu);
+      if (policy.ending === "statement" && policy.habit) {
+        const index = mira.style.conversationHabits.indexOf(policy.habit);
+        expect(mira.style.questionEndingHabitIndexes ?? []).not.toContain(index);
+      }
     }
   });
 
@@ -144,7 +151,7 @@ describe("persona style fingerprints", () => {
     expect(required.match(/The only signature habit permitted/gu)?.length ?? 0).toBeLessThanOrEqual(1);
   });
 
-  it("removes a question-shaped habit when a scene role requires a statement", () => {
+  it("uses explicit habit metadata instead of parsing English wording", () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     const key = Array.from({ length: 5_000 }, (_, index) => `question-habit-${index}`)
       .find((candidate) => derivePersonaStyleTurnPolicy(mira, candidate).habit?.includes("ask"))!;
@@ -153,7 +160,7 @@ describe("persona style fingerprints", () => {
     const note = buildPersonaStylePromptNote(mira, { turnKey: key, endingOverride: "statement" });
 
     expect(ordinary.habit).toContain("ask");
-    expect(statement.habit ?? "").not.toContain("ask");
+    expect(statement.habit).not.toBe(ordinary.habit);
     expect(note).toContain("do not ask a question in this message");
     expect(note).not.toContain("ask a sharp follow-up");
   });

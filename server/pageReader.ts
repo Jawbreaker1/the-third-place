@@ -1,13 +1,20 @@
 import type { ChatMessage } from "../shared/types.js";
+import { findUrlTextCandidates, hasRecognizedPublicSuffix } from "../shared/unicodeBoundaries.js";
+import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
 import { parseHtmlWithBudget } from "./boundedHtml.js";
-import { PERSONAS } from "./personas.js";
-import type { ResearchPacket, ResearchResult } from "./researchBroker.js";
+import {
+  defaultPageProviderRegistry,
+  type PageProviderEvidence,
+  type PageProviderFetcher,
+  type PageProviderRegistry,
+} from "./pageProviders/index.js";
+import type { ResearchPacket } from "./researchBroker.js";
+import { decodeTextBody } from "./textBodyDecoder.js";
 import {
   extractPublicHttpsUrls,
   fetchPublicHttps,
   hasStandaloneUrlBoundary,
   type SafeHttpsFetchPolicy,
-  type SafeHttpsFetchResult,
 } from "./safeHttpsFetch.js";
 
 interface ParsedNode {
@@ -24,23 +31,41 @@ export interface PageReadRequest {
   rejection?: "unsupported-url";
   requestedAt: string;
   intent: string;
+  retry: boolean;
   source: "message" | "reply" | "recent";
 }
 
-export interface ResolvePageReadRequestInput {
-  content: string;
+export type PageReadCandidateId = `U${number}`;
+
+export interface PageReadCandidate {
+  id: PageReadCandidateId;
+  raw: string;
+  url?: URL;
+  supported: boolean;
+  source: "message" | "reply" | "recent";
+  messageId: string;
+  authorId: string;
+  createdAt: string;
+}
+
+export interface PageReadCandidateSet {
+  requestedAt: string;
+  candidates: readonly PageReadCandidate[];
+}
+
+export interface CollectPageReadCandidatesInput {
+  messages: readonly ChatMessage[];
   requesterId: string;
   recentMessages?: readonly ChatMessage[];
-  replyTarget?: ChatMessage;
+  replyTargetFor?: (message: ChatMessage) => ChatMessage | undefined;
   now?: number;
 }
 
-export interface ResolvePageReadBurstInput {
-  messages: readonly ChatMessage[];
-  requesterId: string;
-  recentMessages: readonly ChatMessage[];
-  replyTargetFor?: (message: ChatMessage) => ChatMessage | undefined;
-  now?: number;
+export interface ResolvePageReadTargetInput {
+  candidateSet: PageReadCandidateSet;
+  targetRef: PageReadCandidateId | string;
+  intent: string;
+  retry?: boolean;
 }
 
 export interface ExtractedPage {
@@ -50,19 +75,8 @@ export interface ExtractedPage {
 
 interface CachedRead {
   expiresAt: number;
-  evidence?: PageEvidence;
+  evidence?: PageProviderEvidence;
 }
-
-interface PageEvidence {
-  retrievedAt: string;
-  result: ResearchResult;
-  cacheTtlMs?: number;
-}
-
-type PageFetcher = (
-  rawUrl: string | URL,
-  policy: SafeHttpsFetchPolicy,
-) => Promise<SafeHttpsFetchResult | undefined>;
 
 const MAX_RECENT_LINK_AGE_MS = 5 * 60_000;
 const MAX_ARTICLE_TEXT = 10_000;
@@ -74,51 +88,16 @@ const MAX_SEMANTIC_CANDIDATES = 64;
 const MAX_PAGE_INPUT_BYTES = 1024 * 1024;
 const MAX_PARSE_NODES = 20_000;
 const MAX_PARSE_DEPTH = 128;
-
-const NEGATED_READ_REQUEST =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:snälla|please)\s+)?(?:(?:läs|kolla(?:\s+(?:på|in))?|öppna|sammanfatta|summera|granska)(?:\s+[\p{L}-]{1,20}){0,6}\s+(?:inte|aldrig)|(?:do\s+not|don['’]?t|never)\s+(?:read|check(?:\s+out)?|open|summari[sz]e|review)|(?:(?:kan|kunde|vill)\s+(?:du|ni|någon)|skulle\s+(?:du|ni|någon)\s+(?:kunna\s+)?)\s+(?:inte|aldrig)\s+(?:läsa|kolla|öppna|sammanfatta|summera|granska)|(?:(?:can|could|would|will)\s+(?:you|someone)\s+)(?:not|never)\s+(?:read|check|open|summari[sz]e|review))(?=$|[^\p{L}\p{N}_])/iu;
-const NEGATED_RETRY_REQUEST =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:försök|prova)\s+(?:inte|aldrig)|(?:do\s+not|don['’]?t|never)\s+try)(?=$|[^\p{L}\p{N}_])/iu;
-const MENTION_NEGATED_READ_REQUEST =
-  /(?:^|[^\p{L}\p{N}_])@[^\s,;:]+\s+(?:(?:läs|kolla|öppna|sammanfatta|summera|granska|försök|prova)(?:\s+[\p{L}-]{1,20}){0,6}\s+(?:inte|aldrig)|(?:do\s+not|don['’]?t|never)\s+(?:read|check(?:\s+out)?|open|summari[sz]e|review|try))(?=$|[^\p{L}\p{N}_])/iu;
-const START_MODAL_READ_REQUEST =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*)|(?:[\p{L}\p{N}_-]{2,32}\s+(?=(?:kan|kunde|vill|skulle|can|could|would|will)\b)))?(?:(?:snälla|please)\s+)?(?:(?:(?:kan|kunde|vill)\s+(?:du|ni|någon)|skulle\s+(?:du|ni|någon)\s+(?:kunna\s+)?|går\s+det\s+att)\s+(?:läsa|kolla(?:\s+(?:på|in))?|öppna|sammanfatta|summera|granska|se)|(?:(?:can|could|would|will)\s+(?:you|someone)\s+)(?:read|check(?:\s+out)?|open|summari[sz]e|review|see))(?=$|[^\p{L}\p{N}_])/iu;
-const START_DIRECT_READ_REQUEST =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:snälla|please)\s+)?(?:(?:(?:läs|kolla(?:\s+(?:på|in))?|öppna|sammanfatta|summera|granska|read|check(?:\s+out)?|open|summari[sz]e|review)\s*[:;\-–—]?\s*(?:(?:[a-z][a-z0-9+.-]*:\/\/|www\.)[^\s<>"']+|länk(?:en)?|sida(?:n)?|sajt(?:en)?|artikel(?:n)?|den(?:\s+här)?|det(?:\s+här|\s+där)?|följande|vad\s+som\s+står|link|page|site|article|it|this|that|the\s+(?:linked\s+)?(?:link|page|site|article))|(?:kör\s+)?webfetch|visa\s+att\s+(?:ni|du)\s+kan\s+se))(?=$|[^\p{L}\p{N}_])/iu;
-const START_PAGE_QUESTION =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:vad\s+(?:står|handlar)|vad\s+tycker\s+(?:ni|du)|kan\s+(?:ni|du)\s+se\s+vad\s+som\s+står|(?:vad|vilken|vilket|vilka)\b[^\n]{0,80}\b(?:på|i|från)\s+(?:länk(?:en)?|webbsida(?:n)?|sajt(?:en)?|artikel(?:n)?|nyhetssida(?:n)?)|what\s+does|what\s+do\s+you\s+think|(?:what|which)\b[^\n]{0,80}\b(?:on|in|from)\s+(?:the\s+)?(?:link|webpage|site|article))(?=$|[^\p{L}\p{N}_])/iu;
-const START_SOCIAL_READ_REQUEST =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:har|hade)\s+(?:du|ni|någon)\s+(?:läst|sett|kollat(?:\s+på)?)|(?:have|has|did)\s+(?:you|anyone|someone)\s+(?:read|seen|see|checked(?:\s+out)?))(?=$|[^\p{L}\p{N}_])/iu;
-const START_RETRY_READ_REQUEST =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:(?:försök|prova)(?:\s+igen)?|try\s+again|give\s+it\s+a\s+try)(?=$|[^\p{L}\p{N}_])/iu;
-const FOLLOWUP_ACTION_REFERENCE =
-  /(?:^|[^\p{L}\p{N}_])(?:läs(?:a|er)?|öppna|sammanfatta|summera|granska|kolla(?:\s+(?:på|in))?|read|open|summari[sz]e|review|check(?:\s+out)?)\s+(?:(?:om|på)\s+)?(?:(?:(?:den(?:\s+här)?|det(?:\s+här|\s+där)?|this|that)\s+)?(?:länk(?:en)?|sida(?:n)?|sajt(?:en)?|artikel(?:n)?|link|page|site|article)(?:\s+igen)?(?=$|[^\p{L}\p{N}_])|(?:den(?:\s+här)?|det(?:\s+här|\s+där)?|it|this|that)(?:\s+igen)?(?=\s*(?:$|[?.!,;:\-–—])))/iu;
-const FOLLOWUP_CAPABILITY_REFERENCE =
-  /(?:^|[^\p{L}\p{N}_])(?:(?:kan\s+(?:ni|du)\s+(?:läsa|öppna|kolla|se))|(?:visa\s+att\s+(?:ni|du)\s+kan\s+se)|(?:(?:can|could|would|will)\s+(?:you|someone)\s+(?:read|open|check(?:\s+out)?|see)))\s+(?:(?:(?:den(?:\s+här)?|det(?:\s+här|\s+där)?|this|that)\s+)?(?:länk(?:en)?|sida(?:n)?|sajt(?:en)?|artikel(?:n)?|link|page|site|article)(?=$|[^\p{L}\p{N}_])|(?:den(?:\s+här)?|det(?:\s+här|\s+där)?|it|this|that)(?=\s*(?:$|[?.!,;:\-–—])))/iu;
-const FOLLOWUP_PAGE_QUESTION =
-  /(?:^|[^\p{L}\p{N}_])(?:(?:vad\s+(?:står|handlar)|vad\s+tycker\s+(?:ni|du))[^\n]{0,80}(?:länk(?:en)?|webbsida(?:n)?|sajt(?:en)?|artikel(?:n)?|nyhetssida(?:n)?)|(?:vad|vilken|vilket|vilka)\b[^\n]{0,80}\b(?:på|i|från)\s+(?:länk(?:en)?|webbsida(?:n)?|sajt(?:en)?|artikel(?:n)?|nyhetssida(?:n)?)|(?:what\s+does|what\s+do\s+you\s+think)[^\n]{0,80}(?:link|webpage|site|article)|(?:what|which)\b[^\n]{0,80}\b(?:on|in|from)\s+(?:the\s+)?(?:link|webpage|site|article))(?=$|[^\p{L}\p{N}_])/iu;
-const EXPLICIT_WEBFETCH = /^\s*(?:kör\s+)?webfetch(?=$|[^\p{L}\p{N}_])/iu;
-const BARE_PUBLIC_DOMAIN = /(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})(?::\d{1,5})?(?:\/[^\s<>"'`]*)?/iu;
+// Unicode labels are valid input to WHATWG URL and are canonicalized to
+// Punycode by the shared HTTPS validator. Limiting bare hosts to ASCII would
+// silently make link handling language-dependent even though explicit HTTPS
+// URLs already support internationalized domains.
+const BARE_PUBLIC_DOMAIN = /(?:[\p{L}\p{N}](?:[\p{L}\p{M}\p{N}-]{0,61}[\p{L}\p{M}\p{N}])?\.)+(?:[\p{L}\p{N}][\p{L}\p{M}\p{N}]{1,62}|xn--[a-z0-9-]{2,59})(?::\d{1,5})?(?:\/[^\s<>"'`]*)?/iu;
 const BARE_PUBLIC_DOMAIN_FULL = new RegExp(`^${BARE_PUBLIC_DOMAIN.source}$`, "iu");
-const BARE_DOMAIN_ABBREVIATION = /^(?:t\.ex|m\.fl)(?=$|[/?.,!;:])/iu;
-// Keep this deliberately narrower than a file-extension catalogue. Several
-// extension-looking suffixes (.cc, .md, .py, .rs, .sh, .zip, …) are real TLDs
-// and must remain valid public-domain candidates. Paths, ports and explicit
-// schemes are never classified as filenames either.
-const BARE_FILENAME_SUFFIX = /\.(?:css|csv|gif|go|html?|jpe?g|js|json|jsx|lock|mjs|pdf|png|toml|ts|tsx|txt|webp|xml|ya?ml)$/iu;
-const bareCandidateLooksLikeFilename = (raw: string): boolean =>
-  !/[/:?]/u.test(raw) && BARE_FILENAME_SUFFIX.test(raw);
-const LEADING_READ_ACTION =
-  /^\s*(?:(?:@[^\s,;:]+\s*[,;:]?\s+)|(?:[\p{L}\p{N}_-]{1,32}\s*[,;:]\s*))?(?:snälla\s+)?(?:läs(?!\s+mer\b)|kolla(?:\s+(?:på|in))?|öppna|sammanfatta|summera|granska|försök|prova)(?=$|[^\p{L}\p{N}_])/iu;
-const TRAILING_MENTION_READ_ACTION =
-  /(?:^|[^\p{L}\p{N}_])@[^\s,;:]+\s+(?:läs(?!\s+mer\b)|kolla|öppna|sammanfatta|summera|granska|försök|prova)(?:\s+(?:gärna|snälla|nu|igen))?\s*[!?.,;:]*\s*$/iu;
 const LINK_LIKE_CANDIDATE_GLOBAL = new RegExp(
   `(?:[a-z][a-z0-9+.-]*:\\/\\/|www\\.)[^\\s<>"'\u0060]*|${BARE_PUBLIC_DOMAIN.source}`,
   "giu",
 );
-const CORRECTION_PREFIX = /^\s*(?:(?:sorry|oops|oj|ursäkta)\b[\s,;:!.\-–—]*)?(?:(?:nej|no)\b[\s,;:!.\-–—]*(?:(?:fel\s+länk(?:en)?|wrong\s+link|jag\s+menade|i\s+meant)\b[\s,;:!.\-–—]*)?|(?:fel\s+länk(?:en)?|wrong\s+link|jag\s+menade|i\s+meant)\b[\s,;:!.\-–—]*)/iu;
-const BURST_CANCEL = /^(?:\s*nej\b|\s*no(?:\s*[,;:!.\-–—]|\s*$|\s+(?:wrong|stop|forget|cancel)\b)|\s*(?:glöm\s+det|forget\s+it|avbryt(?:\s+(?:den|det))?|cancel(?:\s+it)?|stopp?)\b)/iu;
-const PERSONA_NAMES = [...PERSONAS].map((persona) => persona.name.toLocaleLowerCase()).sort((a, b) => b.length - a.length);
 
 const BLOCKED_TAGS = new Set([
   "script",
@@ -142,24 +121,18 @@ const BLOCKED_TAGS = new Set([
   "dialog",
 ]);
 const CONTENT_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "pre", "figcaption"]);
-const NOISE_TOKEN = /(?:^|[-_\s])(?:cookie|consent|newsletter|share|sharing|social|related|sidebar|advert|ads|promo|modal|popup|paywall)(?:$|[-_\s])/iu;
-
 const attrsOf = (node: ParsedNode): Record<string, string> =>
-  Object.fromEntries((node.attrs ?? []).map((attribute) => [attribute.name.toLocaleLowerCase(), attribute.value]));
+  Object.fromEntries((node.attrs ?? []).map((attribute) => [attribute.name.toLowerCase(), attribute.value]));
 
 const isHiddenOrNoise = (node: ParsedNode): boolean => {
   const attrs = attrsOf(node);
-  if ("hidden" in attrs || "inert" in attrs || attrs["aria-hidden"]?.toLocaleLowerCase() === "true") return true;
+  if ("hidden" in attrs || "inert" in attrs || attrs["aria-hidden"]?.toLowerCase() === "true") return true;
   if (/\b(?:display\s*:\s*none|visibility\s*:\s*hidden)\b/iu.test(attrs.style ?? "")) return true;
-  const classTokens = (attrs.class ?? "").toLocaleLowerCase().split(/\s+/u);
-  if (classTokens.some((token) => token === "hidden" || token === "sr-only" || token === "visually-hidden")) return true;
-  return NOISE_TOKEN.test(`${attrs.id ?? ""} ${attrs.class ?? ""}`);
+  return false;
 };
 
 const sanitizePageText = (value: string, limit = Number.POSITIVE_INFINITY): string =>
-  value
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, " ")
+  stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/gu, " ")
     .trim()
     .slice(0, limit);
@@ -222,7 +195,7 @@ const collectBlocks = (root: ParsedNode): string[] => {
   const push = (raw: string, tagName = ""): void => {
     const cleaned = sanitizePageText(raw, 2_000);
     const minimum = tagName.startsWith("h") ? 2 : tagName === "li" ? 12 : 24;
-    const key = cleaned.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const key = unicodeCaselessKey(cleaned).replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim();
     if (cleaned.length < minimum || !key || seen.has(key)) return;
     seen.add(key);
     blocks.push(cleaned);
@@ -236,11 +209,9 @@ const collectBlocks = (root: ParsedNode): string[] => {
     const tagName = current.node.tagName ?? "";
     if ((tagName && BLOCKED_TAGS.has(tagName)) || isHiddenOrNoise(current.node)) continue;
     const attrs = attrsOf(current.node);
-    const semanticLabel = `${attrs.id ?? ""} ${attrs.class ?? ""}`.toLocaleLowerCase();
     const headlineLike =
-      attrs.role?.toLocaleLowerCase() === "heading" ||
-      /(?:^|\s)(?:headline|title)(?:\s|$)/iu.test((attrs.itemprop ?? "").toLocaleLowerCase()) ||
-      /(?:^|[-_\s])(?:headline|title)(?:$|[-_\s])/iu.test(semanticLabel);
+      attrs.role?.toLowerCase() === "heading" ||
+      /(?:^|\s)(?:headline|name)(?:\s|$)/iu.test((attrs.itemprop ?? "").toLowerCase());
     if (CONTENT_TAGS.has(tagName) || headlineLike) {
       push(visibleText(current.node), headlineLike ? "h4" : tagName);
       continue;
@@ -327,7 +298,7 @@ const pageTitle = (document: ParsedNode, root: ParsedNode): string | undefined =
   const openGraph = findFirst(document, (node) => {
     if (node.tagName !== "meta") return false;
     const attrs = attrsOf(node);
-    return (attrs.property ?? attrs.name ?? "").toLocaleLowerCase() === "og:title" && Boolean(attrs.content);
+    return (attrs.property ?? attrs.name ?? "").toLowerCase() === "og:title" && Boolean(attrs.content);
   });
   const openGraphTitle = openGraph ? attrsOf(openGraph).content : undefined;
   const heading = findFirst(root, (node) => node.tagName === "h1", true);
@@ -370,9 +341,17 @@ export const extractReadablePage = (
   body: Buffer | string,
   mediaType: string,
   finalUrl: URL,
+  contentType = mediaType,
 ): ExtractedPage | undefined => {
   if (Buffer.isBuffer(body) && body.length > MAX_PAGE_INPUT_BYTES) return undefined;
-  const raw = Buffer.isBuffer(body) ? body.toString("utf8") : body;
+  const raw = Buffer.isBuffer(body)
+    ? decodeTextBody(body, {
+        contentType,
+        allowHtmlMeta: mediaType === "text/html" || mediaType === "application/xhtml+xml",
+        maxBytes: MAX_PAGE_INPUT_BYTES,
+      })
+    : body;
+  if (raw === undefined) return undefined;
   if (!Buffer.isBuffer(body) && Buffer.byteLength(raw, "utf8") > MAX_PAGE_INPUT_BYTES) return undefined;
   if (mediaType === "text/plain") {
     const text = boundedBlocks(raw.split(/\n{2,}/u).map((block) => sanitizePageText(block)).filter(Boolean));
@@ -398,52 +377,6 @@ export const extractReadablePage = (
   };
 };
 
-const stripKnownPersona = (value: string): string | undefined => {
-  const trimmed = value.trimStart();
-  const lower = trimmed.toLocaleLowerCase();
-  const name = PERSONA_NAMES.find((candidate) => lower.startsWith(candidate) && /\s/u.test(trimmed[candidate.length] ?? ""));
-  return name ? trimmed.slice(name.length).trimStart() : undefined;
-};
-
-const requestLineVariants = (line: string): string[] => {
-  const corrected = line.replace(CORRECTION_PREFIX, "").trimStart();
-  const variants = [line, ...(corrected !== line.trimStart() ? [corrected] : [])];
-  for (const value of [...variants]) {
-    const withoutPersona = stripKnownPersona(value);
-    if (withoutPersona) variants.push(withoutPersona);
-  }
-  return [...new Set(variants.filter(Boolean))];
-};
-
-const hasNegatedReadRequest = (content: string): boolean =>
-  content.split(/\r?\n/u).some((line) => requestLineVariants(line).some((variant) =>
-    NEGATED_READ_REQUEST.test(variant) || NEGATED_RETRY_REQUEST.test(variant) || MENTION_NEGATED_READ_REQUEST.test(variant),
-  ));
-
-const isRetryReadRequest = (content: string): boolean =>
-  !hasNegatedReadRequest(content) && requestLineVariants(content).some((variant) => START_RETRY_READ_REQUEST.test(variant));
-
-const intentRequestsReading = (content: string): boolean => {
-  if (hasNegatedReadRequest(content)) return false;
-  return content
-    .split(/\r?\n/u)
-    .some((line) => requestLineVariants(line).some((variant) =>
-      START_MODAL_READ_REQUEST.test(variant) ||
-      START_DIRECT_READ_REQUEST.test(variant) ||
-      START_PAGE_QUESTION.test(variant) ||
-      START_SOCIAL_READ_REQUEST.test(variant) ||
-      START_RETRY_READ_REQUEST.test(variant) ||
-      EXPLICIT_WEBFETCH.test(variant),
-    ));
-};
-const intentReferencesRecentPage = (content: string): boolean =>
-  intentRequestsReading(content) &&
-  (FOLLOWUP_ACTION_REFERENCE.test(content) ||
-    FOLLOWUP_CAPABILITY_REFERENCE.test(content) ||
-    FOLLOWUP_PAGE_QUESTION.test(content) ||
-    isRetryReadRequest(content) ||
-    EXPLICIT_WEBFETCH.test(content));
-
 interface LinkCandidate {
   index: number;
   raw: string;
@@ -458,15 +391,28 @@ const linkCandidates = (content: string): LinkCandidate[] =>
     // supported form before the shared validator may normalize it.
     const standalone = hasStandaloneUrlBoundary(content, match.index ?? 0);
     const explicitForm = /^(?:[a-z][a-z0-9+.-]*:\/\/|www\.)/iu.test(raw);
-    if (!standalone) return [{ index: match.index ?? 0, raw }];
-    if (!explicitForm && (BARE_DOMAIN_ABBREVIATION.test(raw) || bareCandidateLooksLikeFilename(raw))) return [];
+    if (!standalone) return explicitForm ? [{ index: match.index ?? 0, raw }] : [];
     const supportedStart = /^(?:https:\/\/|www\.)/iu.test(raw) && standalone;
-    const bareDomain = BARE_PUBLIC_DOMAIN_FULL.test(raw) && !BARE_DOMAIN_ABBREVIATION.test(raw);
+    const bareDomain = BARE_PUBLIC_DOMAIN_FULL.test(raw);
     const url = supportedStart
       ? extractPublicHttpsUrls(raw, 1)[0]
       : bareDomain
         ? extractPublicHttpsUrls(`https://${raw}`, 1)[0]
         : undefined;
+    // A scheme-less dotted token inside prose is otherwise indistinguishable
+    // from a sentence boundary. Require a registry-backed suffix; explicit
+    // HTTPS remains available for reserved or newly delegated IDNs.
+    if (bareDomain) {
+      const rawAuthority = raw.split(/[/?#]/u, 1)[0] ?? "";
+      const structural = findUrlTextCandidates(`https://${raw}`, { allowHttp: false, allowWww: false, limit: 1 })[0];
+      const structuralAuthority = structural?.value.slice("https://".length).split(/[/?#]/u, 1)[0];
+      if (
+        !url ||
+        !hasRecognizedPublicSuffix(url.hostname) ||
+        !structuralAuthority ||
+        structuralAuthority !== rawAuthority
+      ) return [];
+    }
     return [{
       index: match.index ?? 0,
       raw,
@@ -474,93 +420,66 @@ const linkCandidates = (content: string): LinkCandidate[] =>
     }];
   });
 
-const candidateFromTrailingReadIntent = (
-  content: string,
-  candidates: readonly LinkCandidate[],
-): LinkCandidate | undefined => {
-  if (hasNegatedReadRequest(content)) return undefined;
-  for (const candidate of candidates) {
-    const leading = content.slice(0, candidate.index);
-    const trailing = content
-      .slice(candidate.index + candidate.raw.length)
-      .replace(/^[\s()[\]{},.;:!?\-–—]+/u, "");
-    const colocated = LEADING_READ_ACTION.test(leading) || TRAILING_MENTION_READ_ACTION.test(trailing);
-    if (!intentRequestsReading(trailing) && !colocated) continue;
-    return linkCandidates(trailing)[0] ?? candidate;
-  }
-  return undefined;
-};
-
-export const declinesPageReadRequest = (content: string): boolean =>
-  hasNegatedReadRequest(content) || BURST_CANCEL.test(content);
-
-const requestForCandidate = (
-  candidate: LinkCandidate,
-  input: ResolvePageReadRequestInput,
+const candidateMessages = (
+  input: CollectPageReadCandidatesInput,
   now: number,
-): PageReadRequest => candidate.url
-  ? {
-      url: candidate.url,
-      requestedAt: new Date(now).toISOString(),
-      intent: input.content.slice(0, 500),
-      source: "message",
-    }
-  : {
-      rejection: "unsupported-url",
-      requestedAt: new Date(now).toISOString(),
-      intent: input.content.slice(0, 500),
-      source: "message",
-    };
+): Array<{ message: ChatMessage; source: PageReadCandidate["source"] }> => {
+  const selected: Array<{ message: ChatMessage; source: PageReadCandidate["source"] }> = [];
+  const currentIds = new Set(input.messages.map((message) => message.id));
+  const replyIds = new Set<string>();
 
-export const resolvePageReadRequest = (input: ResolvePageReadRequestInput): PageReadRequest | undefined => {
-  const now = input.now ?? Date.now();
-  if (hasNegatedReadRequest(input.content)) return undefined;
-  const lines = input.content.split(/\r?\n/u);
-  const allCandidates = linkCandidates(input.content);
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index] ?? "";
-    const candidates = linkCandidates(line);
-    const explicit = intentRequestsReading(line);
-    const trailing = candidateFromTrailingReadIntent(line, candidates);
-    const sameLineCandidate = explicit ? candidates[0] : trailing;
-    if (sameLineCandidate) return requestForCandidate(sameLineCandidate, input, now);
-    if (!intentReferencesRecentPage(line)) continue;
-    for (let priorIndex = index - 1; priorIndex >= 0; priorIndex -= 1) {
-      const priorCandidate = linkCandidates(lines[priorIndex] ?? "").at(-1);
-      if (priorCandidate) return requestForCandidate(priorCandidate, input, now);
-    }
-    break;
+  // Newest burst content comes first so U1 is normally the URL the user just
+  // supplied. This is ordering only; choosing whether it should be read is the
+  // semantic router's job.
+  for (const message of [...input.messages].reverse()) selected.push({ message, source: "message" });
+  for (const message of [...input.messages].reverse()) {
+    const reply = input.replyTargetFor?.(message);
+    if (!reply || currentIds.has(reply.id) || replyIds.has(reply.id)) continue;
+    replyIds.add(reply.id);
+    selected.push({ message: reply, source: "reply" });
   }
-  // A link in this same message that was not paired with a request is a plain
-  // paste. Never let a different line or the recent-link fallback authorize it.
-  if (allCandidates.length > 0) return undefined;
-  const replyCandidate = input.replyTarget ? linkCandidates(input.replyTarget.content).at(-1) : undefined;
-  if (input.replyTarget && intentRequestsReading(input.content)) {
-    if (replyCandidate?.url) {
-      return { url: replyCandidate.url, requestedAt: new Date(now).toISOString(), intent: input.content.slice(0, 500), source: "reply" };
-    }
-    return replyCandidate
-      ? {
-          rejection: "unsupported-url",
-          requestedAt: new Date(now).toISOString(),
-          intent: input.content.slice(0, 500),
-          source: "reply",
-        }
-      : undefined;
-  }
-  if (!intentReferencesRecentPage(input.content)) return undefined;
-  let candidate: LinkCandidate | undefined;
   for (const message of [...(input.recentMessages ?? [])].reverse()) {
-    if (message.authorId !== input.requesterId) continue;
+    if (message.authorId !== input.requesterId || currentIds.has(message.id) || replyIds.has(message.id)) continue;
     const createdAt = Date.parse(message.createdAt);
     if (!Number.isFinite(createdAt) || now - createdAt < 0 || now - createdAt > MAX_RECENT_LINK_AGE_MS) continue;
-    candidate = linkCandidates(message.content).at(-1);
-    if (candidate) break;
+    selected.push({ message, source: "recent" });
   }
+  return selected;
+};
+
+export const collectPageReadCandidates = (input: CollectPageReadCandidatesInput): PageReadCandidateSet => {
+  const now = input.now ?? Date.now();
+  const candidates = candidateMessages(input, now)
+    .flatMap(({ message, source }) => [...linkCandidates(message.content)].reverse().map((candidate) => ({
+      raw: candidate.raw.slice(0, 500),
+      ...(candidate.url ? { url: candidate.url } : {}),
+      supported: Boolean(candidate.url),
+      source,
+      messageId: message.id,
+      authorId: message.authorId,
+      createdAt: message.createdAt,
+    })))
+    .slice(0, 12)
+    .map((candidate, index): PageReadCandidate => ({
+      id: `U${index + 1}`,
+      ...candidate,
+    }));
+  return { requestedAt: new Date(now).toISOString(), candidates };
+};
+
+export const resolvePageReadTarget = (input: ResolvePageReadTargetInput): PageReadRequest | undefined => {
+  const candidate = input.candidateSet.candidates.find((item) => item.id === input.targetRef);
   if (!candidate) return undefined;
+  const intent = sanitizePageText(input.intent, 500);
+  const base = {
+    requestedAt: input.candidateSet.requestedAt,
+    intent,
+    retry: input.retry === true,
+    source: candidate.source,
+  } as const;
   return candidate.url
-    ? { url: candidate.url, requestedAt: new Date(now).toISOString(), intent: input.content.slice(0, 500), source: "recent" }
-    : { rejection: "unsupported-url", requestedAt: new Date(now).toISOString(), intent: input.content.slice(0, 500), source: "recent" };
+    ? { ...base, url: candidate.url }
+    : { ...base, rejection: "unsupported-url" };
 };
 
 const readerPolicy: SafeHttpsFetchPolicy = {
@@ -572,211 +491,29 @@ const readerPolicy: SafeHttpsFetchPolicy = {
   userAgent: "TheThirdPlace-PageReader/1.0",
 };
 
-const avanzaJsonPolicy: SafeHttpsFetchPolicy = {
-  timeoutMs: 4_000,
-  maxRedirects: 0,
-  maxBodyBytes: 64 * 1024,
-  acceptedMediaTypes: ["application/json"],
-  acceptHeader: "application/json",
-  userAgent: "TheThirdPlace-AvanzaReader/1.0",
-};
-
-const AVANZA_HOSTS = new Set(["avanza.se", "www.avanza.se"]);
-const AVANZA_MARKET_PATH = /^\/(?:start|borsen-idag(?:\.html)?|hall-koll\/borsen-idag\.html|marknadsoversikt)?\/?$/iu;
-
-type JsonRecord = Record<string, unknown>;
-
-const jsonRecord = (value: unknown): JsonRecord | undefined =>
-  value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : undefined;
-
-const boundedJsonString = (value: unknown, limit: number): string | undefined => {
-  if (typeof value !== "string") return undefined;
-  const cleaned = sanitizePageText(value, limit);
-  return cleaned || undefined;
-};
-
-const finiteIndexLevel = (value: unknown): number | undefined =>
-  typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 1_000_000_000
-    ? value
-    : undefined;
-
-const boundedDailyPercent = (value: unknown): string | undefined => {
-  const raw = boundedJsonString(value, 20);
-  if (!raw || !/^[+-]?\d{1,3}(?:[,.]\d{1,6})?$/u.test(raw)) return undefined;
-  const numeric = Number(raw.replace(",", "."));
-  return Number.isFinite(numeric) && Math.abs(numeric) <= 100 ? raw : undefined;
-};
-
-const validMarketTime = (value: unknown): string | undefined => {
-  const raw = boundedJsonString(value, 8);
-  const match = raw?.match(/^(\d{1,2}):(\d{2})$/u);
-  if (!match) return undefined;
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 ? raw : undefined;
-};
-
-interface AvanzaHeaderIndex {
-  orderbookId: string;
-  name: string;
-  shortName?: string;
-  changeToday?: string;
-  updated?: string;
-}
-
-const parseAvanzaHeaderIndexes = (body: Buffer): AvanzaHeaderIndex[] => {
-  try {
-    const parsed = jsonRecord(JSON.parse(body.toString("utf8")));
-    if (!parsed || !Array.isArray(parsed.indexes)) return [];
-    return parsed.indexes.slice(0, 8).flatMap((raw): AvanzaHeaderIndex[] => {
-      const row = jsonRecord(raw);
-      const link = jsonRecord(row?.link);
-      const orderbookId = boundedJsonString(link?.orderbookId, 16);
-      const name = boundedJsonString(link?.linkDisplay, 100);
-      if (!orderbookId || !/^\d{1,12}$/u.test(orderbookId) || !name) return [];
-      const shortName = boundedJsonString(link?.shortLinkDisplay, 24);
-      const changeToday = boundedDailyPercent(row?.quoteChangeToday);
-      const updated = validMarketTime(row?.todayPriceUpdated);
-      return [{ orderbookId, name, ...(shortName ? { shortName } : {}), ...(changeToday ? { changeToday } : {}), ...(updated ? { updated } : {}) }];
-    });
-  } catch {
-    return [];
-  }
-};
-
-const parseAvanzaLastPrices = (body: Buffer, allowedIds: ReadonlySet<string>): Map<string, number> => {
-  const prices = new Map<string, number>();
-  try {
-    const parsed = jsonRecord(JSON.parse(body.toString("utf8")));
-    if (!parsed || !Array.isArray(parsed.orderbooks)) return prices;
-    for (const raw of parsed.orderbooks.slice(0, 8)) {
-      const row = jsonRecord(raw);
-      const orderbookId = boundedJsonString(row?.orderbookId, 16);
-      const lastPrice = finiteIndexLevel(row?.lastPrice);
-      if (orderbookId && allowedIds.has(orderbookId) && lastPrice !== undefined) prices.set(orderbookId, lastPrice);
-    }
-  } catch {
-    return prices;
-  }
-  return prices;
-};
-
-const isAvanzaMarketRequest = (url: URL): boolean =>
-  AVANZA_HOSTS.has(url.hostname.toLocaleLowerCase()) && AVANZA_MARKET_PATH.test(url.pathname);
-
-const avanzaMarketEvidence = async (
-  fetcher: PageFetcher,
-  requestedUrl: URL,
-): Promise<PageEvidence | undefined> => {
-  const headerUrl = new URL("https://www.avanza.se/_api/market-index/header-index");
-  const header = await fetcher(headerUrl, avanzaJsonPolicy).catch(() => undefined);
-  if (!header || header.finalUrl.toString() !== headerUrl.toString()) return undefined;
-  const indexes = parseAvanzaHeaderIndexes(header.body);
-  if (indexes.length === 0) return undefined;
-
-  const allowedIds = new Set(indexes.map((index) => index.orderbookId));
-  const dataUrl = new URL("https://www.avanza.se/_api/market-overview/data/orderbooks");
-  dataUrl.searchParams.set("orderbookIds", [...allowedIds].join(","));
-  const data = await fetcher(dataUrl, avanzaJsonPolicy).catch(() => undefined);
-  const prices = data && data.finalUrl.toString() === dataUrl.toString()
-    ? parseAvanzaLastPrices(data.body, allowedIds)
-    : new Map<string, number>();
-  const completeIndexes = indexes.filter((index) =>
-    prices.has(index.orderbookId) && index.changeToday !== undefined && index.updated !== undefined,
-  );
-  if (completeIndexes.length === 0) return undefined;
-  const numberFormat = new Intl.NumberFormat("sv-SE", { maximumFractionDigits: 2 });
-  const rows = completeIndexes.map((index) => {
-    const price = prices.get(index.orderbookId)!;
-    const label = index.shortName && index.shortName !== index.name ? `${index.name} (${index.shortName})` : index.name;
-    return `${label}: ${numberFormat.format(price)} indexpunkter, ${index.changeToday!.replace(".", ",")} % idag, uppdaterad ${index.updated}.`;
-  });
-  const retrievedAt = new Date().toISOString();
-  return {
-    retrievedAt,
-    cacheTtlMs: 45_000,
-    result: {
-      id: "S1",
-      title: "Avanza – Börsen idag",
-      url: requestedUrl.toString(),
-      snippet: `Avanzas publika marknadsöversikt, hämtad ${retrievedAt}. Detta är huvudindex, inte en full lista över enskilda aktier.\n${rows.join("\n")}`,
-    },
-  };
-};
-
 export class PageReader {
   private readonly cache = new Map<string, CachedRead>();
-  private readonly inFlight = new Map<string, Promise<PageEvidence | undefined>>();
+  private readonly inFlight = new Map<string, Promise<PageProviderEvidence | undefined>>();
   private readonly globalTimestamps: number[] = [];
   private readonly requesterTimestamps = new Map<string, number[]>();
   private readonly originTimestamps = new Map<string, number[]>();
   private activeRequests = 0;
 
-  constructor(private readonly fetcher: PageFetcher = fetchPublicHttps) {}
+  constructor(
+    private readonly fetcher: PageProviderFetcher = fetchPublicHttps,
+    private readonly providers: PageProviderRegistry = defaultPageProviderRegistry,
+  ) {}
 
-  resolveRequest(input: ResolvePageReadRequestInput): PageReadRequest | undefined {
-    if (process.env.LINK_READER_ENABLED === "false") return undefined;
-    return resolvePageReadRequest(input);
+  collectCandidates(input: CollectPageReadCandidatesInput): PageReadCandidateSet {
+    if (process.env.LINK_READER_ENABLED === "false") {
+      return { requestedAt: new Date(input.now ?? Date.now()).toISOString(), candidates: [] };
+    }
+    return collectPageReadCandidates(input);
   }
 
-  resolveBurst(input: ResolvePageReadBurstInput): PageReadRequest | undefined {
+  resolveTarget(input: ResolvePageReadTargetInput): PageReadRequest | undefined {
     if (process.env.LINK_READER_ENABLED === "false") return undefined;
-    const now = input.now ?? Date.now();
-    let forwardLink: LinkCandidate | undefined;
-    let forwardIsCorrection = false;
-    for (const message of [...input.messages].reverse()) {
-      const messageIndex = input.recentMessages.findIndex((candidate) => candidate.id === message.id);
-      const recentMessages = messageIndex >= 0
-        ? input.recentMessages.slice(0, messageIndex + 1)
-        : input.recentMessages.filter((candidate) => Date.parse(candidate.createdAt) <= Date.parse(message.createdAt));
-      const replyTarget = input.replyTargetFor?.(message);
-      // A bare link sent immediately after "read this" belongs to that request.
-      // First preserve any explicit URL/reply on the request itself, then bind
-      // the forward link before the older-history fallback can select stale data.
-      if (forwardLink) {
-        const selfContained = resolvePageReadRequest({
-          content: message.content,
-          requesterId: input.requesterId,
-          recentMessages: [],
-          replyTarget,
-          now,
-        });
-        if (selfContained && !forwardIsCorrection) return selfContained;
-        if (declinesPageReadRequest(message.content)) return undefined;
-        if (intentReferencesRecentPage(message.content) || (forwardIsCorrection && intentRequestsReading(message.content))) {
-          return requestForCandidate(forwardLink, {
-            content: message.content,
-            requesterId: input.requesterId,
-            now,
-          }, now);
-        }
-        if (selfContained) return selfContained;
-      }
-      const resolved = resolvePageReadRequest({
-        content: message.content,
-        requesterId: input.requesterId,
-        recentMessages,
-        replyTarget,
-        now,
-      });
-      if (resolved) return resolved;
-      if (declinesPageReadRequest(message.content)) return undefined;
-      if (!forwardLink) {
-        const candidates = linkCandidates(message.content);
-        const candidate = candidates.length === 1 ? candidates[0] : undefined;
-        const correction = CORRECTION_PREFIX.test(message.content);
-        if (candidate) {
-          const remainder = `${message.content.slice(0, candidate.index)}${message.content.slice(candidate.index + candidate.raw.length)}`
-            .replace(/[\s()[\]{},.;:!?\-–—]+/gu, "");
-          if (!remainder || correction) {
-            forwardLink = candidate;
-            forwardIsCorrection = correction;
-          }
-        }
-        if (correction && !candidate) return undefined;
-      }
-    }
-    return undefined;
+    return resolvePageReadTarget(input);
   }
 
   async read(request: PageReadRequest, requesterId: string): Promise<ResearchPacket | undefined> {
@@ -786,19 +523,19 @@ export class PageReader {
     this.prune();
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
-      const explicitRetry = isRetryReadRequest(request.intent);
-      if (cached.evidence || !explicitRetry) return this.packetFor(request, cached.evidence);
+      if (cached.evidence || !request.retry) return this.packetFor(request, cached.evidence);
       this.cache.delete(key);
     }
     const existing = this.inFlight.get(key);
     if (existing) return existing.then((evidence) => this.packetFor(request, evidence));
     if (this.activeRequests >= 2 || !this.reserve(requesterId, requestedUrl.origin)) return undefined;
     this.activeRequests += 1;
-    const evidenceRequest: Promise<PageEvidence | undefined> = isAvanzaMarketRequest(requestedUrl)
-      ? avanzaMarketEvidence(this.fetcher, requestedUrl)
+    const provider = this.providers.supporting(requestedUrl);
+    const evidenceRequest: Promise<PageProviderEvidence | undefined> = provider
+      ? provider.read({ fetcher: this.fetcher, requestedUrl })
       : this.fetcher(requestedUrl, readerPolicy).then((result) => {
         if (!result) return undefined;
-        const extracted = extractReadablePage(result.body, result.mediaType, result.finalUrl);
+        const extracted = extractReadablePage(result.body, result.mediaType, result.finalUrl, result.contentType);
         if (!extracted) return undefined;
         return {
           retrievedAt: new Date().toISOString(),
@@ -825,7 +562,7 @@ export class PageReader {
     return pending.then((evidence) => this.packetFor(request, evidence));
   }
 
-  private packetFor(request: PageReadRequest, evidence?: PageEvidence): ResearchPacket | undefined {
+  private packetFor(request: PageReadRequest, evidence?: PageProviderEvidence): ResearchPacket | undefined {
     return evidence
       ? {
           kind: "page",

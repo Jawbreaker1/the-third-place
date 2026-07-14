@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
-import { buildSceneSystemPrompt, isExplicitAiIdentityQuestion, LmStudioClient, type SceneRequest } from "./lmStudio.js";
+import { buildSceneSystemPrompt, LmStudioClient, sanitizeObservationText, type SceneRequest } from "./lmStudio.js";
 import { PERSONAS } from "./personas.js";
+import { turnAnalysisInputSchema, type NormalizedTurnAnalysisInput } from "./semanticRouter.js";
 
 const jsonResponse = (payload: unknown) =>
   new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -17,22 +18,750 @@ const completionResponse = (messages: Array<{ personaId: string; content: string
     }],
   });
 
+const turnInput = (turnId = "turn-analysis-1"): NormalizedTurnAnalysisInput => turnAnalysisInputSchema.parse({
+  turnId,
+  medium: "public",
+  channel: { id: "lobby", name: "lobby" },
+  latestMessage: {
+    id: `${turnId}-message`,
+    authorId: "human-jaw-b",
+    authorName: "Jaw_B",
+    content: "Mira, ¿puedes leer este enlace? https://example.com/noticia",
+  },
+  recentMessages: [],
+  personaCandidates: [
+    { id: "ai-mira", name: "Mira", interests: ["news"] },
+    { id: "ai-sana", name: "Sana", interests: ["programming"] },
+  ],
+  urlCandidates: [{ ref: "latest:0", source: "latest_message", context: "the only link in the latest message" }],
+  availableCapabilities: ["read_url", "web_search", "local_datetime"],
+});
+
+const turnAnalysisCompletion = (overrides: Record<string, unknown> = {}) => jsonResponse({
+  choices: [{
+    message: {
+      content: JSON.stringify({
+        language: { tag: "es", confidence: 0.99 },
+        intent: { kind: "request", isQuestion: true, replyExpected: "expected", confidence: 0.98 },
+        personas: {
+          addressedIds: ["ai-mira"],
+          requestedReplyIds: ["ai-mira"],
+          relevantIds: ["ai-mira"],
+          addressConfidence: 0.98,
+          relevanceConfidence: 0.9,
+        },
+        social: {
+          warmth: 0.5,
+          hostility: 0,
+          playfulness: 0,
+          absurdity: 0,
+          urgency: 0.1,
+          energy: 0.4,
+          pileOnRisk: 0,
+          claimStrength: 0.1,
+          confidence: 0.96,
+        },
+        moderation: { risk: "none", action: "none", categories: [], confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "read_url",
+          confidence: 0.99,
+          query: null,
+          urlRef: "latest:0",
+          searchMode: null,
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+        capabilities: {
+          discussed: ["read_url"],
+          requestKind: "execute",
+          asksAboutAcoustics: false,
+          asksAboutAiIdentity: false,
+          asksForList: false,
+          confidence: 0.96,
+        },
+        ...overrides,
+      }),
+    },
+  }],
+});
+
+const candidateReviewCompletion = (reviews: Array<{
+  personaId: string;
+  severity: "none" | "low" | "medium" | "high";
+  issues: string[];
+  rewriteInstruction: string | null;
+}>) => jsonResponse({
+  choices: [{ message: { content: JSON.stringify({ reviews }) } }],
+});
+
+const originalCandidateReviewSetting = process.env.CANDIDATE_REVIEW_ENABLED;
+
+beforeEach(() => {
+  process.env.CANDIDATE_REVIEW_ENABLED = "false";
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  if (originalCandidateReviewSetting === undefined) delete process.env.CANDIDATE_REVIEW_ENABLED;
+  else process.env.CANDIDATE_REVIEW_ENABLED = originalCandidateReviewSetting;
+});
+
+describe("LM Studio one-pass semantic turn analysis", () => {
+  it("uses one strict temperature-zero call with dynamic target enums and deduplicates a turn", async () => {
+    let completionCalls = 0;
+    let completionBody: any;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      completionBody = JSON.parse(String(init?.body));
+      return turnAnalysisCompletion();
+    }));
+
+    const lm = new LmStudioClient();
+    const first = lm.analyzeTurn(turnInput("same-turn"));
+    const duplicate = lm.analyzeTurn(turnInput("same-turn"));
+    expect(duplicate).toBe(first);
+    await expect(first).resolves.toMatchObject({
+      source: "lm",
+      language: { tag: "es" },
+      evidence: { action: "read_url", urlRef: "latest:0" },
+    });
+
+    expect(completionCalls).toBe(1);
+    expect(completionBody).toMatchObject({
+      temperature: 0,
+      top_p: 1,
+      reasoning_effort: "none",
+      stream: false,
+      response_format: { type: "json_schema", json_schema: { strict: true } },
+    });
+    const schema = completionBody.response_format.json_schema.schema.properties;
+    expect(schema.p.properties.a.items.enum).toEqual(["ai-mira", "ai-sana"]);
+    expect(schema.p.properties.v.items.enum).toEqual(["ai-mira", "ai-sana"]);
+    expect(schema.e.properties.u.anyOf[0].enum).toEqual(["latest:0"]);
+    expect(completionBody.messages[1].content).toContain('"ref":"latest:0"');
+    expect(completionBody.messages[1].content).not.toContain('"url":');
+  });
+
+  it("runs persistent memory as a separate strict multilingual pass and deduplicates it", async () => {
+    let completionCalls = 0;
+    let completionBody: any;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      completionBody = JSON.parse(String(init?.body));
+      return jsonResponse({
+        choices: [{ message: { content: JSON.stringify({
+          y: [
+            { o: "forget", k: "likes", v: "Rust", f: true, x: 0.98 },
+            { o: "remember", k: "prefers", v: "Go", f: true, x: 0.98 },
+          ],
+        }) } }],
+      });
+    }));
+
+    const lm = new LmStudioClient();
+    const request = {
+      turnId: "memory-ja-1",
+      authorId: "human-hana",
+      authorName: "Hana",
+      content: "もうRustは好きじゃない。今はGoのほうが好きです。",
+      currentBurstMessages: [{
+        id: "message-ja-1",
+        content: "もうRustは好きじゃない。今はGoのほうが好きです。",
+      }],
+    };
+    const first = lm.analyzeMemoryTurn(request);
+    expect(lm.analyzeMemoryTurn(request)).toBe(first);
+    await expect(first).resolves.toMatchObject({
+      source: "lm",
+      items: [
+        { operation: "forget", value: "Rust" },
+        { operation: "remember", value: "Go" },
+      ],
+    });
+    expect(completionCalls).toBe(1);
+    expect(completionBody).toMatchObject({
+      temperature: 0,
+      reasoning_effort: "none",
+      response_format: { type: "json_schema", json_schema: { strict: true } },
+    });
+    expect(completionBody.messages[0].content).toContain("pro-drop and topic-prominent languages");
+    expect(completionBody.messages[1].content).toContain('"currentBurstMessages"');
+  });
+
+  it("preempts an active low-priority memory pass for the next live turn router", async () => {
+    let memoryStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { memoryStarted = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        memoryStarted?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+
+    const lm = new LmStudioClient();
+    const memory = lm.analyzeMemoryTurn({
+      turnId: "memory-background",
+      authorId: "human-hana",
+      authorName: "Hana",
+      content: "Goのほうが好きです。",
+    });
+    await started;
+    const live = lm.analyzeTurn(turnInput("live-preempts-memory"));
+
+    await expect(memory).resolves.toMatchObject({ source: "fallback", items: [] });
+    await expect(live).resolves.toMatchObject({ source: "lm", evidence: { action: "read_url" } });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("does not retry structured analysis as unstructured output", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return new Response("schema unsupported", { status: 422 });
+    }));
+
+    await expect(new LmStudioClient().analyzeTurn(turnInput("no-retry"))).resolves.toMatchObject({
+      source: "fallback",
+      failureReason: "transport_error",
+      evidence: { action: "none" },
+    });
+    expect(completionCalls).toBe(1);
+  });
+
+  it("fails closed after the bounded end-to-end deadline spent waiting in the queue", async () => {
+    const previousModel = process.env.LM_STUDIO_MODEL;
+    process.env.LM_STUDIO_MODEL = "test-model";
+    vi.useFakeTimers();
+    try {
+      let startedScene: (() => void) | undefined;
+      const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
+      let completionCalls = 0;
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        completionCalls += 1;
+        startedScene?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }));
+      const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+      const controller = new AbortController();
+      const lm = new LmStudioClient();
+      const scene = lm.generateScene({
+        kind: "public",
+        channelId: "lobby",
+        channelName: "lobby",
+        selected: [sana],
+        history: [],
+      }, 0, controller.signal);
+      await sceneStarted;
+
+      const analysis = lm.analyzeTurn(turnInput("queued-timeout"));
+      await vi.advanceTimersByTimeAsync(20_000);
+      await expect(analysis).resolves.toMatchObject({
+        source: "fallback",
+        failureReason: "timeout",
+        evidence: { action: "none" },
+      });
+      expect(completionCalls).toBe(1);
+
+      controller.abort(new Error("test complete"));
+      await expect(scene).rejects.toThrow("test complete");
+    } finally {
+      vi.useRealTimers();
+      if (previousModel === undefined) delete process.env.LM_STUDIO_MODEL;
+      else process.env.LM_STUDIO_MODEL = previousModel;
+    }
+  });
+
+  it("preempts ambient generation so live semantic routing can run first", async () => {
+    let startedAmbient: (() => void) | undefined;
+    const ambientStarted = new Promise<void>((resolve) => { startedAmbient = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        startedAmbient?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const lm = new LmStudioClient();
+    const ambient = lm.generateScene({
+      kind: "ambient",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+    }, 4);
+    await ambientStarted;
+
+    const analysis = lm.analyzeTurn(turnInput("preempt-ambient"));
+    await expect(ambient).rejects.toThrow();
+    await expect(analysis).resolves.toMatchObject({ source: "lm", evidence: { action: "read_url" } });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("rejects URL leakage from model fields without a second call", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return turnAnalysisCompletion({
+        evidence: {
+          need: "required",
+          action: "web_search",
+          confidence: 0.99,
+          query: "https://example.com/noticia",
+          urlRef: null,
+          searchMode: "web",
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+      });
+    }));
+
+    await expect(new LmStudioClient().analyzeTurn(turnInput("url-leak"))).resolves.toMatchObject({
+      source: "fallback",
+      failureReason: "invalid_output",
+      evidence: { action: "none" },
+    });
+    expect(completionCalls).toBe(1);
+  });
+});
+
+describe("multilingual mechanical safety boundaries", () => {
+  it("redacts secret-shaped OCR assignments without an English label list", () => {
+    expect(sanitizeObservationText("lösenord: hemligt123", 200)).toBe("lösenord=[redacted]");
+    expect(sanitizeObservationText("contraseña = secreto456", 200)).toBe("contraseña=[redacted]");
+    expect(sanitizeObservationText("كلمة المرور: سرّي-طويل", 200)).toContain("[redacted]");
+    expect(sanitizeObservationText("كَلِمَةُ السِّرِّ: verysecret", 200)).toContain("[redacted]");
+  });
+
+  it("keeps a meaningful one-grapheme CJK chat contribution", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      return completionResponse([{ personaId: mira.id, content: "嗯" }]);
+    }));
+    await expect(new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      mustReplyIds: [mira.id],
+    })).resolves.toEqual([expect.objectContaining({ content: "嗯" })]);
+  });
+});
+
+describe("LM Studio multilingual batch candidate review", () => {
+  it("keeps free-form ambient language guidance out of the BCP-47 review field", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{ personaId: sana.id, content: "Lite märkligt hur fort kvällen gick." }])
+        : candidateReviewCompletion([
+            { personaId: sana.id, severity: "none", issues: [], rewriteInstruction: null },
+          ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+      languageHint: "the language used in the latest human-authored message",
+    });
+
+    expect(lines).toEqual([expect.objectContaining({ personaId: sana.id })]);
+    expect(bodies).toHaveLength(2);
+    const reviewPayload = JSON.parse(bodies[1].messages[1].content);
+    expect(reviewPayload.semanticContext.languageTag).toBeNull();
+  });
+
+  it("reviews every generated line in one strict temperature-zero batch", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([
+            { personaId: sana.id, content: "Yo probaría el caso pequeño primero." },
+            { personaId: mira.id, content: "Sí, y luego mediría dónde cambia." },
+          ])
+        : candidateReviewCompletion([
+            { personaId: sana.id, severity: "none", issues: [], rewriteInstruction: null },
+            { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+          ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana, mira],
+      history: [],
+      trigger: { author: "Luz", content: "¿Cómo lo probaríais?" },
+      semanticContext: {
+        languageTag: "es",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toHaveLength(2);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toMatchObject({
+      temperature: 0,
+      top_p: 1,
+      reasoning_effort: "none",
+      stream: false,
+      response_format: { type: "json_schema", json_schema: { strict: true } },
+    });
+    const reviewPayload = JSON.parse(bodies[1].messages[1].content);
+    expect(reviewPayload.candidates.map((candidate: any) => candidate.personaId)).toEqual([sana.id, mira.id]);
+    expect(bodies[1].response_format.json_schema.schema.properties.reviews.items.properties.personaId.enum)
+      .toEqual([sana.id, mira.id]);
+  });
+
+  it("accepts a French quoted denial when the semantic review marks the asserted meaning clean", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const quoted = "Il disait « je ne peux jamais lire le web », mais la page prouve exactement le contraire.";
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: mira.id, content: quoted, sourceIds: ["S1"] }])
+        : candidateReviewCompletion([
+            { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+          ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Léa", content: "Est-ce une incapacité permanente ?" },
+      semanticContext: {
+        languageTag: "fr",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "article",
+        retrievedAt: new Date().toISOString(),
+        results: [{ id: "S1", title: "Article", url: "https://example.com/article", snippet: "L'accès a réussi; l'échec précédent était temporaire." }],
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([quoted]);
+    expect(call).toBe(2);
+  });
+
+  it("drops a German false evidence denial without sending it to style repair", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: sana.id, content: "Ich kann diese Seite hier grundsätzlich nicht lesen.", sourceIds: ["S1"] }])
+        : candidateReviewCompletion([{
+            personaId: sana.id,
+            severity: "high",
+            issues: ["false_evidence_denial", "permanent_web_denial"],
+            rewriteInstruction: "Antworte mit den bereits gelieferten Seitenfakten.",
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [sana],
+      history: [],
+      trigger: { author: "Noah", content: "Was steht auf der Seite?" },
+      semanticContext: {
+        languageTag: "de",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "Seite lesen",
+        retrievedAt: new Date().toISOString(),
+        results: [{ id: "S1", title: "Dokumentation", url: "https://example.com/docs", snippet: "Version 4 behebt den Fehler." }],
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(call).toBe(2);
+  });
+
+  it("drops a Norwegian written-medium illusion as grounding, not style", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: mira.id, content: "Du roper ganske høyt nå." }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "high",
+            issues: ["written_medium_illusion"],
+            rewriteInstruction: "Reager bare på ordene i tekstmeldingen.",
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Ola", content: "Jeg skriker vel ikke?" },
+      semanticContext: {
+        languageTag: "nb",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: true,
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(call).toBe(2);
+  });
+
+  it("uses semantic pub review instead of an intoxicant word list", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([
+            { personaId: juno.id, content: "Den filmen tappar mig helt i tredje akten." },
+            { personaId: bosse.id, content: "Andra ölen säger att tredje akten är ett mästerverk." },
+          ])
+        : candidateReviewCompletion([
+            { personaId: juno.id, severity: "none", issues: [], rewriteInstruction: null },
+            {
+              personaId: bosse.id,
+              severity: "high",
+              issues: ["pub_intoxicant_gimmick"],
+              rewriteInstruction: "Ge din faktiska filminvändning utan en återkommande alkoholgrej.",
+            },
+          ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [juno, bosse],
+      history: [],
+      trigger: { author: "guest", content: "vad tycker ni om filmen?" },
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines.map((line) => line.personaId)).toEqual([juno.id]);
+    expect(call).toBe(2);
+  });
+
+  it("drops an unsupported acoustic assertion in voice without style repair", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: mira.id, content: "Tu cries vraiment fort." }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "high",
+            issues: ["unsupported_acoustic_assertion"],
+            rewriteInstruction: "Réagis seulement aux mots transcrits, sans inventer le volume.",
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "voice",
+      channelId: "lobby",
+      channelName: "lobby voice",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Léa", content: "Je ne crie pas, si ?" },
+      semanticContext: {
+        languageTag: "fr",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: true,
+      },
+      voiceContext: {
+        latestSpeakerId: "human-1",
+        latestUtteranceOrigin: "microphone-stt",
+        acousticEvidenceAvailable: false,
+        participants: [
+          { memberId: "human-1", name: "Léa", kind: "human" },
+          { memberId: mira.id, name: mira.name, kind: "ai" },
+        ],
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(call).toBe(2);
+  });
+
+  it("repairs a Spanish assistant-register line once from the multilingual instruction", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: sana.id, content: "Por supuesto. Aquí tienes una respuesta completa y equilibrada." }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: sana.id,
+          severity: "high",
+          issues: ["assistant_register"],
+          rewriteInstruction: "Empieza con tu objeción concreta, como una compañera del canal.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{ personaId: sana.id, content: "Yo empezaría por el fallo pequeño; ahí está la pista." }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+      trigger: { author: "Luz", content: "¿Qué mirarías primero?" },
+      semanticContext: {
+        languageTag: "es",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["Yo empezaría por el fallo pequeño; ahí está la pista."]);
+    expect(bodies).toHaveLength(4);
+    expect(JSON.stringify(bodies[2])).toContain("Empieza con tu objeción concreta");
+  });
+
+  it("fails closed for every scene when review output is invalid", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const run = async (kind: "public" | "voice") => {
+      let call = 0;
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        call += 1;
+        return call === 1
+          ? completionResponse([{ personaId: mira.id, content: "Kort och relevant." }])
+          : completionResponse([]); // Valid completion envelope, wrong review schema.
+      }));
+      return await new LmStudioClient().generateScene({
+        kind,
+        channelId: "lobby",
+        channelName: kind === "voice" ? "lobby voice" : "lobby",
+        selected: [mira],
+        history: [],
+        trigger: { author: "guest", content: "säg något kort" },
+        semanticContext: {
+          languageTag: "sv",
+          asksForList: false,
+          asksAboutAiIdentity: false,
+          asksAboutAcoustics: false,
+        },
+        ...(kind === "voice"
+          ? {
+              voiceContext: {
+                latestSpeakerId: "human-1",
+                latestUtteranceOrigin: "microphone-stt" as const,
+                acousticEvidenceAvailable: false as const,
+                participants: [
+                  { memberId: "human-1", name: "guest", kind: "human" as const },
+                  { memberId: mira.id, name: mira.name, kind: "ai" as const },
+                ],
+              },
+            }
+          : {}),
+      });
+    };
+
+    await expect(run("public")).resolves.toEqual([]);
+    vi.unstubAllGlobals();
+    await expect(run("voice")).resolves.toEqual([]);
+  });
 });
 
 describe("LM Studio room prompt", () => {
-  it("distinguishes identity questions from ordinary discussion about AI", () => {
-    expect(isExplicitAiIdentityQuestion("är du en AI eller människa?")).toBe(true);
-    expect(isExplicitAiIdentityQuestion("är du verkligen en AI?")).toBe(true);
-    expect(isExplicitAiIdentityQuestion("du är väl en bot?")).toBe(true);
-    expect(isExplicitAiIdentityQuestion("Who are you, really?")).toBe(true);
-    expect(isExplicitAiIdentityQuestion("you're an AI, right?")).toBe(true);
-    expect(isExplicitAiIdentityQuestion("vilken AI-modell är bäst för kod?")).toBe(false);
-    expect(isExplicitAiIdentityQuestion("that bot benchmark looks real")).toBe(false);
-  });
-
   it("places stock-market freshness and expertise calibration in the trusted system prompt", () => {
     const runtime = new ActorChannelRuntime();
     const farah = PERSONAS.find((persona) => persona.id === "ai-farah")!;
@@ -53,6 +782,25 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain("Do not perform every trait every time");
     expect(prompt).toContain("Less-skilled actors should ask, hedge or react instead of bluffing");
     expect(prompt).toContain("Never claim to be human");
+  });
+
+  it("mirrors the latest trigger when semantic routing has no known language", () => {
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+      trigger: { author: "Hana", content: "今日はどう？" },
+      semanticContext: {
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+    expect(prompt).toContain("required language for this scene is the language of the latest triggering message");
+    expect(prompt).not.toContain("required language for this scene is und");
   });
 
   it("treats remembered guest context as fallible data rather than instructions", () => {
@@ -158,7 +906,7 @@ describe("LM Studio room prompt", () => {
     expect(prompt).not.toContain("may override the ordinary style maximum");
   });
 
-  it("allows only one drink reference when a human explicitly asks and drops invented pub URLs", async () => {
+  it("leaves intoxicant meaning to semantic review but still drops invented pub URLs mechanically", async () => {
     const previousRepairSetting = process.env.HUMANIZER_REPAIR_ENABLED;
     process.env.HUMANIZER_REPAIR_ENABLED = "false";
     try {
@@ -186,8 +934,7 @@ describe("LM Studio room prompt", () => {
         history: [],
         trigger: { author: "guest", content: "vilket vin gillar ni?" },
       });
-      expect(drinkLines).toHaveLength(1);
-      expect(drinkLines[0]?.personaId).toBe(juno.id);
+      expect(drinkLines.map((line) => line.personaId)).toEqual([juno.id, bosse.id]);
 
       const urlLines = await lm.generateScene({
         kind: "public",
@@ -204,7 +951,7 @@ describe("LM Studio room prompt", () => {
     }
   });
 
-  it("reapplies the pub contract after the one-pass humanizer repair", async () => {
+  it("does not apply a Swedish intoxicant lexicon when semantic review is disabled", async () => {
     const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
     const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
     let completion = 0;
@@ -230,9 +977,8 @@ describe("LM Studio room prompt", () => {
       trigger: { author: "guest", content: "vilket vin gillar ni?" },
     });
 
-    expect(completion).toBe(2);
-    expect(lines).toHaveLength(1);
-    expect(lines[0]?.personaId).toBe(juno.id);
+    expect(completion).toBe(1);
+    expect(lines.map((line) => line.personaId)).toEqual([juno.id, bosse.id]);
   });
 
   it("gives voice turns a short spoken-only contract", () => {
@@ -509,8 +1255,8 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionBodies).toHaveLength(2);
-    expect(JSON.stringify(completionBodies[1])).toContain("register_mismatch");
-    expect(JSON.stringify(completionBodies[1])).toContain("vardaglig chatt");
+    expect(JSON.stringify(completionBodies[1])).toContain("style_contract");
+    expect(JSON.stringify(completionBodies[1])).toContain("between 18 and 42 words");
     const repairMessages = completionBodies[1]!.messages as Array<{ content: string }>;
     expect(JSON.parse(repairMessages[1]!.content)).toMatchObject({ roomRegister: "everyday" });
     expect(lines).toEqual([expect.objectContaining({ personaId: ibrahim.id, content: natural })]);
@@ -624,7 +1370,7 @@ describe("LM Studio one-pass humanizer", () => {
     expect(lines[0]?.content.split(/\s+/u)).toHaveLength(12);
   });
 
-  it("repairs a high-severity illusion break once and preserves code and URLs", async () => {
+  it("mechanically drops an invented URL without a language-specific semantic rule", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     const completionBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -637,6 +1383,20 @@ describe("LM Studio one-pass humanizer", () => {
           content: "Som en AI kan jag föreslå `fetch(url)` och https://example.com/docs.",
         }]);
       }
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+      expect(body.messages[0]?.content).toContain("immutableTechnicalTokens");
+      expect(body.messages[0]?.content).not.toContain("⟦..._TECH_n⟧");
+      const repairData = JSON.parse(body.messages[1]!.content) as {
+        candidates: Array<{
+          immutableTechnicalTokens: string[];
+          rewriteRequirements: string;
+        }>;
+      };
+      expect(repairData.candidates[0]?.immutableTechnicalTokens).toEqual([
+        "⟦AI_SANA_TECH_0⟧",
+        "⟦AI_SANA_TECH_1⟧",
+      ]);
+      expect(repairData.candidates[0]?.rewriteRequirements).not.toContain("⟦AI_SANA_TECH_0⟧");
       return completionResponse([{
         personaId: sana.id,
         content: "testa ⟦AI_SANA_TECH_0⟧ mot ⟦AI_SANA_TECH_1⟧ först, felet brukar synas direkt",
@@ -654,43 +1414,43 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionBodies).toHaveLength(2);
-    expect(JSON.stringify(completionBodies[1])).toContain("humanized_chat_lines");
-    expect(JSON.stringify(completionBodies[1])).not.toContain("fetch(url)");
-    expect(JSON.stringify(completionBodies[1])).not.toContain("https://example.com/docs");
-    const initialMessages = completionBodies[0]?.messages as Array<{ role: string; content: string }>;
-    const repairMessages = completionBodies[1]?.messages as Array<{ role: string; content: string }>;
-    const repairPayload = JSON.parse(repairMessages[1]!.content) as {
-      candidates: Array<{ stableVoice: string }>;
-    };
-    expect(initialMessages[0]?.content).toContain(repairPayload.candidates[0]?.stableVoice);
-    expect(repairPayload.candidates[0]?.stableVoice).toContain("Turn policy / emoji");
-    expect(repairPayload.candidates[0]?.stableVoice).toContain("Turn policy / habit");
-    expect(repairPayload.candidates[0]?.stableVoice).toContain("Turn policy / ending");
-    expect(lines).toEqual([expect.objectContaining({
-      personaId: sana.id,
-      content: "testa `fetch(url)` mot https://example.com/docs först, felet brukar synas direkt",
-    })]);
+    expect(lines).toEqual([]);
   });
 
-  it("uses collision-safe repair sentinels even when the draft contains the obvious token", async () => {
+  it("does not treat an AI phrase as a semantic regex match", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     let completionCalls = 0;
-    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
       if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
       completionCalls += 1;
-      if (completionCalls === 1) {
-        return completionResponse([{
-          personaId: sana.id,
-          content: "Som en AI: literal ⟦AI_SANA_TECH_0⟧ och kör `npm test`.",
-        }]);
-      }
-      const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
-      const repairData = JSON.parse(body.messages[1]!.content) as { candidates: Array<{ rejectedDraft: string }> };
-      expect(repairData.candidates[0]?.rejectedDraft).toContain("⟦AI_SANA_TECH_0⟧");
-      expect(repairData.candidates[0]?.rejectedDraft).toContain("⟦AI_SANA_1_TECH_0⟧");
       return completionResponse([{
         personaId: sana.id,
-        content: "literal ⟦AI_SANA_TECH_0⟧; kör ⟦AI_SANA_1_TECH_0⟧ innan du ändrar något",
+        content: "Som en AI kan jag fortfarande föreslå att du kör `npm test`.",
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [sana],
+      history: [],
+      mustReplyIds: [sana.id],
+    });
+
+    expect(completionCalls).toBe(1);
+    expect(lines[0]?.content).toContain("Som en AI kan jag fortfarande föreslå att du kör `npm test`");
+  });
+
+  it("drops a leaked generic repair marker before publication", async () => {
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return completionResponse([{
+        personaId: sana.id,
+        content: "Testa samma flöde igen utan ⟦..._TECH_n⟧ så ser vi felet.",
       }]);
     }));
 
@@ -704,10 +1464,48 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(2);
-    expect(lines[0]?.content).toContain("literal ⟦AI_SANA_TECH_0⟧; kör `npm test`");
+    expect(lines).toEqual([]);
   });
 
-  it("drops a rejected sourced line instead of rewriting under a stale citation", async () => {
+  it.each(["trigger", "history"] as const)(
+    "preserves an exact user-authored marker literal from %s",
+    async (source) => {
+      const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+      const marker = "⟦..._TECH_n⟧";
+      let completionCalls = 0;
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+        if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        completionCalls += 1;
+        return completionResponse([{
+          personaId: sana.id,
+          content: `Du skrev ${marker}; den visas exakt som du skickade den.`,
+        }]);
+      }));
+
+      const lines = await new LmStudioClient().generateScene({
+        kind: "public",
+        channelId: "ai-programming",
+        channelName: "ai-programming",
+        selected: [sana],
+        history: source === "history" ? [{
+          author: "guest",
+          kind: "human",
+          content: `Behåll literaltexten ${marker}.`,
+          createdAt: "2026-07-14T12:00:00.000Z",
+        }] : [],
+        trigger: {
+          author: "guest",
+          content: source === "trigger" ? `Behåll literaltexten ${marker}.` : "Kan du upprepa det?",
+        },
+        mustReplyIds: [sana.id],
+      });
+
+      expect(completionCalls).toBe(1);
+      expect(lines[0]?.content).toContain(marker);
+    },
+  );
+
+  it("does not reject a sourced line from an AI phrase alone when semantic review is disabled", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     let completionCalls = 0;
     let requestBody: Record<string, unknown> | undefined;
@@ -737,11 +1535,11 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(1);
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.content)).toEqual(["Som en AI kan jag bekräfta att uppgiften är aktuell."]);
     expect(JSON.stringify(requestBody)).toContain('"minItems":0');
   });
 
-  it("never repairs a rejected page-evidence line before the director attaches S1", async () => {
+  it("does not infer evidence grounding from Swedish words when semantic review is disabled", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     let completionCalls = 0;
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -770,10 +1568,10 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(1);
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.content)).toEqual(["Som en AI kan jag bekräfta exakt vad sidan säger."]);
   });
 
-  it("rejects false access denials when linked-page evidence is already present", async () => {
+  it("does not classify a Swedish access denial with a lexical regex", async () => {
     const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
     let completionCalls = 0;
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -802,10 +1600,10 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(1);
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.content)).toEqual(["Jag kan inte hämta live-data från externa webbplatser direkt."]);
   });
 
-  it("rejects a vague page reaction with no concrete evidence overlap", async () => {
+  it("does not use stopword overlap as a grounding classifier", async () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     let completionCalls = 0;
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -839,7 +1637,7 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(1);
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.content)).toEqual(["nu börjar det bli spännande igen."]);
   });
 
   it("accepts concrete Avanza and Blizzard page answers", async () => {
@@ -899,7 +1697,7 @@ describe("LM Studio one-pass humanizer", () => {
     expect(blizzard.map((line) => line.content)).toEqual([completions[1]!.content]);
   });
 
-  it("rejects an Avanza answer that names indexes but omits the supplied market row", async () => {
+  it("does not contain an Avanza-specific answer validator", async () => {
     const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
     let completionCalls = 0;
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -933,10 +1731,12 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(1);
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.content)).toEqual([
+      "Vilka kurser menar du? Jag ser bara index som OMXS30 och Dow Jones här.",
+    ]);
   });
 
-  it("rejects wrong signs and swapped roles in an otherwise source-like Avanza row", async () => {
+  it("leaves numeric grounding and directional meaning to mandatory semantic review", async () => {
     const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
     const invalid = [
       "OMXS30 ligger på -3 167,16, upp +0,33 procent vid 17:30.",
@@ -973,13 +1773,53 @@ describe("LM Studio one-pass humanizer", () => {
       },
     };
 
-    for (const candidate of invalid) {
-      expect(await lm.generateScene(request), candidate).toEqual([]);
-    }
+    expect((await lm.generateScene(request)).map((line) => line.content)).toEqual([invalid[0]]);
+    expect((await lm.generateScene(request)).map((line) => line.content)).toEqual([invalid[1]]);
+    expect((await lm.generateScene(request)).map((line) => line.content)).toEqual([invalid[2]]);
     expect(completionCalls).toBe(invalid.length);
   });
 
-  it("catches additional temporary-denial phrasings after a successful page read", async () => {
+  it("does not impose a locale-specific decimal parser before semantic review", async () => {
+    const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
+    const outputs = [
+      "المؤشر عند ١٢٣٫٤٥ نقطة.",
+      "المؤشر عند ١٢٩٫٤٥ نقطة.",
+    ];
+    let completionCalls = 0;
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      return completionResponse([{
+        personaId: linnea.id,
+        content: outputs[completionCalls++] ?? "",
+        sourceIds: ["S1"],
+      }]);
+    }));
+    const lm = new LmStudioClient();
+    const request: SceneRequest = {
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [linnea],
+      history: [],
+      research: {
+        kind: "page",
+        query: "السعر الحالي",
+        retrievedAt: new Date().toISOString(),
+        results: [{
+          id: "S1",
+          title: "السوق",
+          url: "https://example.com/market",
+          snippet: "المؤشر عند 123.45 نقطة.",
+        }],
+      },
+    };
+
+    expect((await lm.generateScene(request)).map((line) => line.content)).toEqual([outputs[0]]);
+    expect((await lm.generateScene(request)).map((line) => line.content)).toEqual([outputs[1]]);
+  });
+
+  it("does not use numeric substrings as a deterministic evidence classifier", async () => {
     const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
     const denials = [
       "OMXS30 står på 3 167,16, men sidan går inte att öppna här just nu.",
@@ -1017,12 +1857,12 @@ describe("LM Studio one-pass humanizer", () => {
           }],
         },
       });
-      expect(lines, denial).toEqual([]);
+      expect(lines.map((line) => line.content), denial).toEqual([denial]);
     }
     expect(completionCalls).toBe(denials.length);
   });
 
-  it("rejects permanent web incapability after a failed attempt but allows a temporary result", async () => {
+  it("does not distinguish permanent and temporary web wording with a Swedish regex", async () => {
     const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
     const completions = [
       "Jag kan inte läsa externa webbplatser direkt.",
@@ -1051,12 +1891,12 @@ describe("LM Studio one-pass humanizer", () => {
     const permanent = await lm.generateScene(request);
     const temporary = await lm.generateScene(request);
 
-    expect(permanent).toEqual([]);
+    expect(permanent.map((line) => line.content)).toEqual([completions[0]]);
     expect(temporary.map((line) => line.content)).toEqual([completions[1]]);
     expect(buildSceneSystemPrompt(request)).toContain("this specific evidence request returned no usable source");
   });
 
-  it("requires a valid citation and concrete overlap for successful search evidence", async () => {
+  it("leaves semantic citation relevance to candidate review while preserving source IDs", async () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     const completions = [
       { personaId: mira.id, content: "nu börjar det bli spännande igen.", sourceIds: [] },
@@ -1089,12 +1929,12 @@ describe("LM Studio one-pass humanizer", () => {
       },
     };
 
-    expect(await lm.generateScene(request)).toEqual([]);
+    expect((await lm.generateScene(request)).map((line) => line.content)).toEqual([completions[0]!.content]);
     expect((await lm.generateScene(request)).map((line) => line.content)).toEqual([completions[1]!.content]);
     expect(completionCalls).toBe(2);
   });
 
-  it("does not style-repair a false denial without the successful search packet", async () => {
+  it("does not lexical-classify a denial when candidate review is explicitly disabled", async () => {
     const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
     let completionCalls = 0;
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -1123,7 +1963,7 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(1);
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.content)).toEqual(["Får inte upp innehållet här, vad handlar det om?"]);
   });
 
   it("does not spend a repair call on a medium warning", async () => {
@@ -1149,7 +1989,7 @@ describe("LM Studio one-pass humanizer", () => {
     expect(lines).toHaveLength(1);
   });
 
-  it("drops a still-invalid repair without starting a repair loop", async () => {
+  it("does not trigger repair from AI-identity wording alone", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     let completionCalls = 0;
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
@@ -1171,7 +2011,9 @@ describe("LM Studio one-pass humanizer", () => {
       mustReplyIds: [sana.id],
     });
 
-    expect(completionCalls).toBe(2);
-    expect(lines).toEqual([]);
+    expect(completionCalls).toBe(1);
+    expect(lines.map((line) => line.content)).toEqual([
+      "Som en AI kan jag inte känna något, men jag hjälper gärna till.",
+    ]);
   });
 });

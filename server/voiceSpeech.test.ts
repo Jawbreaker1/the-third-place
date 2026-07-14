@@ -127,7 +127,7 @@ describe("OpenAI-compatible speech providers", () => {
       seenMultipart = await request.text();
       return new Response(JSON.stringify({
         text: `  hej\u202e    ${"x".repeat(4_100)}  `,
-        language: "sv",
+        language: "zh-Hant-TW-u-ca-chinese",
         segments: [{ start: 0.1, end: 0.7, text: " hej " }],
       }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } });
     };
@@ -140,13 +140,13 @@ describe("OpenAI-compatible speech providers", () => {
     const result = await service.transcribe({
       audio: Buffer.from("browser-audio"),
       mimeType: "audio/webm;codecs=opus",
-      language: "sv",
+      language: "zh-Hant-TW-u-ca-chinese",
       prompt: " room context ",
     });
 
     expect(result.text).toHaveLength(4_000);
     expect(result.text).not.toContain("\u202e");
-    expect(result.language).toBe("sv");
+    expect(result.language).toBe("zh-Hant-TW");
     expect(result.segments?.[0]).toEqual({ startMs: 100, endMs: 700, text: "hej" });
     expect(seenAuthorization).toBe("Bearer test-secret");
     expect(seenContentType).toMatch(/^multipart\/form-data; boundary=/);
@@ -154,7 +154,9 @@ describe("OpenAI-compatible speech providers", () => {
     expect(seenMultipart).toContain("whisper-test");
     expect(seenMultipart).toContain('filename="utterance.wav"');
     expect(seenMultipart).toContain('name="response_format"');
-    expect(seenMultipart).toContain("json");
+    expect(seenMultipart).toContain("verbose_json");
+    expect(seenMultipart).toContain('name="language"');
+    expect(seenMultipart).toContain("zh-Hant-TW");
   });
 
   it("posts sanitized TTS JSON and stores audio behind room-scoped expiring lookup", async () => {
@@ -171,6 +173,7 @@ describe("OpenAI-compatible speech providers", () => {
         TTS_BASE_URL: "https://speech.test/v1",
         TTS_MODEL: "tts-test",
         TTS_VOICE: "mira-voice",
+        TTS_LANGUAGES: "sv,zh-Hant",
         TTS_FORMAT: "mp3",
         TTS_AUDIO_TTL_MS: "5000",
       },
@@ -179,7 +182,12 @@ describe("OpenAI-compatible speech providers", () => {
       now: () => now,
     });
 
-    const metadata = await service.synthesize({ roomId: "voice:lobby", text: " hej\u0000   där ", speed: 1.15 });
+    const metadata = await service.synthesize({
+      roomId: "voice:lobby",
+      text: " hej\u0000   där ",
+      language: "sv-SE",
+      speed: 1.15,
+    });
 
     expect(requestPayload).toMatchObject({
       model: "tts-test",
@@ -209,14 +217,19 @@ describe("OpenAI-compatible speech providers", () => {
       });
     };
     const service = new VoiceSpeechService({
-      env: { TTS_BASE_URL: "https://speech.test/v1", TTS_MODEL: "tts-test", TTS_VOICE: "voice" },
+      env: {
+        TTS_BASE_URL: "https://speech.test/v1",
+        TTS_MODEL: "tts-test",
+        TTS_VOICE: "voice",
+        TTS_LANGUAGES: "en",
+      },
       fetchImpl: mockedFetch as typeof fetch,
       normalizer: fakeNormalizer,
     });
 
-    await expectVoiceError(service.synthesize({ roomId: "voice:lobby", text: "hello" }), "INVALID_PROVIDER_MIME");
+    await expectVoiceError(service.synthesize({ roomId: "voice:lobby", text: "hello", language: "en-US" }), "INVALID_PROVIDER_MIME");
     mode = "large";
-    await expectVoiceError(service.synthesize({ roomId: "voice:lobby", text: "hello" }), "PROVIDER_RESPONSE_TOO_LARGE");
+    await expectVoiceError(service.synthesize({ roomId: "voice:lobby", text: "hello", language: "en-US" }), "PROVIDER_RESPONSE_TOO_LARGE");
   });
 
   it("rejects untrusted configured provider URL forms at construction", () => {
@@ -255,13 +268,57 @@ describe("OpenAI-compatible speech providers", () => {
       available: true,
       provider: "openai-compatible",
       model: "piper-sv",
+      supportedLanguages: ["sv"],
     });
-    await withPerCallVoice.synthesize({ roomId: "room-1", text: "hej", voice: "lisa-warm", format: "wav" });
+    await withPerCallVoice.synthesize({
+      roomId: "room-1",
+      text: "hej",
+      language: "sv-SE",
+      voice: "lisa-warm",
+      format: "wav",
+    });
     expect(requestedVoice).toBe("lisa-warm");
     await expectVoiceError(
-      withPerCallVoice.synthesize({ roomId: "room-1", text: "hej", voice: "nst-deep", format: "wav" }),
+      withPerCallVoice.synthesize({ roomId: "room-1", text: "hej", language: "sv-SE", voice: "nst-deep", format: "wav" }),
       "UNCONFIGURED_TTS_VOICE",
     );
+  });
+
+  it("keeps generic TTS default-deny until BCP-47 language ranges are explicit", async () => {
+    const baseEnv = {
+      TTS_BASE_URL: "https://speech.test/v1",
+      TTS_MODEL: "generic-tts",
+      TTS_VOICE: "provider-default",
+    };
+    const denied = new VoiceSpeechService({ env: baseEnv, normalizer: fakeNormalizer });
+    expect((await denied.capabilities()).tts).toMatchObject({ available: false, supportedLanguages: [] });
+
+    const configured = new VoiceSpeechService({
+      env: { ...baseEnv, TTS_LANGUAGES: "zh-Hant,th" },
+      normalizer: fakeNormalizer,
+      fetchImpl: (async () => new Response("audio", { headers: { "Content-Type": "audio/mpeg" } })) as typeof fetch,
+    });
+    expect((await configured.capabilities()).tts).toMatchObject({
+      available: true,
+      supportedLanguages: ["zh-Hant", "th"],
+    });
+    await configured.synthesize({ roomId: "room-1", text: "您好", language: "zh-Hant-TW" });
+    await expectVoiceError(
+      configured.synthesize({ roomId: "room-1", text: "こんにちは", language: "ja-JP" }),
+      "UNSUPPORTED_TTS_LANGUAGE",
+    );
+    await expectVoiceError(
+      configured.synthesize({ roomId: "room-1", text: "unknown", language: "und" }),
+      "UNSUPPORTED_TTS_LANGUAGE",
+    );
+  });
+
+  it("rejects malformed or undetermined TTS language configuration", () => {
+    const base = { TTS_BASE_URL: "https://speech.test/v1", TTS_MODEL: "generic", TTS_VOICE: "voice" };
+    expect(() => new VoiceSpeechService({ env: { ...base, TTS_LANGUAGES: "und" }, normalizer: fakeNormalizer }))
+      .toThrowError(expect.objectContaining({ code: "INVALID_TTS_LANGUAGES" }));
+    expect(() => new VoiceSpeechService({ env: { ...base, TTS_LANGUAGES: "not_a_locale" }, normalizer: fakeNormalizer }))
+      .toThrowError(expect.objectContaining({ code: "INVALID_TTS_LANGUAGES" }));
   });
 });
 

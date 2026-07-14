@@ -1,6 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import ipaddr from "ipaddr.js";
+import { findUrlTextCandidates, hasStandaloneUrlStartBoundary } from "../shared/unicodeBoundaries.js";
 
 export interface PublicAddress {
   address: string;
@@ -141,38 +142,13 @@ export const validatePublicHttpsUrl = (raw: string): URL | undefined => {
   }
 };
 
-const trimUrlCandidate = (raw: string): string => {
-  let value = raw.replace(/[.,!?;:]+$/gu, "");
-  const pairs: Array<[string, string]> = [["(", ")"], ["[", "]"], ["{", "}"]];
-  for (const [open, close] of pairs) {
-    while (value.endsWith(close) && value.split(close).length > value.split(open).length) value = value.slice(0, -1);
-  }
-  return value;
-};
-
-export const hasStandaloneUrlBoundary = (content: string, index: number): boolean => {
-  if (index < 0 || index > content.length) return false;
-  const previous = content[index - 1];
-  if (previous && /[\p{L}\p{N}_@.\/\\-]/u.test(previous)) return false;
-  let containerStart = index;
-  // Scan the whole non-whitespace container, not merely back to `(` or a
-  // quote: forbidden schemes can wrap a nested URL as javascript:open(https:)
-  // or mailto:...?body=(https:). Ordinary Markdown prefixes contain no scheme.
-  while (containerStart > 0 && !/\s/u.test(content[containerStart - 1] ?? "")) containerStart -= 1;
-  const prefix = content.slice(containerStart, index);
-  // Reject URLs embedded inside another scheme token, including forms without
-  // `//` such as data:, javascript:, mailto: and blob:.
-  return !/[a-z][a-z0-9+.-]*:[^\s]*$/iu.test(prefix);
-};
+export const hasStandaloneUrlBoundary = hasStandaloneUrlStartBoundary;
 
 export const extractPublicHttpsUrls = (content: string, limit = 3): URL[] => {
   const results: URL[] = [];
   const seen = new Set<string>();
-  const candidatePattern = /(?:https:\/\/|www\.)[^\s<>"'`]+/giu;
-  for (const match of content.matchAll(candidatePattern)) {
-    const index = match.index ?? 0;
-    if (!hasStandaloneUrlBoundary(content, index)) continue;
-    const candidate = trimUrlCandidate(match[0] ?? "");
+  for (const match of findUrlTextCandidates(content, { allowWww: true, limit: Math.max(1, Math.min(limit, 10)) })) {
+    const candidate = match.value;
     const normalized = validatePublicHttpsUrl(/^www\./iu.test(candidate) ? `https://${candidate}` : candidate);
     if (!normalized || seen.has(normalized.toString())) continue;
     seen.add(normalized.toString());

@@ -1,3 +1,7 @@
+import { trimTrailingUrlPunctuation } from "../shared/unicodeBoundaries.js";
+import { unicodeCaselessKey } from "../shared/unicodeSafety.js";
+import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
+
 export type HumanizerMode = "chat" | "voice" | "technical";
 
 export type HumanizerRegister =
@@ -95,31 +99,17 @@ const severityRank: Record<HumanizerSeverity, number> = {
 };
 
 const SELF_HINT =
-  "Tillför en ny tanke eller en tydligt annan vinkel; återanvänd inte personans senaste formulering.";
+  "Add a genuinely new thought or angle without reusing the actor's recent wording; keep the candidate's language.";
 const PEER_HINT =
-  "Svara med personans egen ståndpunkt och rytm i stället för att spegla en annan bots formulering.";
-const OPENING_HINT = "Börja direkt i sak med en annan öppning och meningsrytm.";
-const CLICHE_HINT = "Ta bort servicefrasen och skriv som en person mitt i ett pågående samtal.";
-const META_HINT = "Skriv som personen själv; nämn inte AI, språkmodell, prompt eller hur svaret skapades.";
-const POLISHED_HINT = "Gör repliken rakare och mindre uppsatslik; behåll bara den poäng personen faktiskt vill göra.";
-const REGISTER_HINT =
-  "Behåll tanken och intelligensen, men skriv den som vardaglig chatt: en konkret poäng, enklare verb och lite mänsklig ojämnhet i stället för abstrakt seminarie- eller debattprosa.";
-const LIST_HINT = "Gör om listan till en eller två naturliga chattrader om ingen uttryckligen bad om en lista.";
+  "Use this actor's own stance and rhythm instead of echoing another participant; keep the candidate's language.";
+const OPENING_HINT = "Start directly with a different opening and sentence rhythm; keep the candidate's language.";
+const LIST_HINT = "Turn the unsolicited list into one or two natural chat lines in the same language.";
 
 const collapseWhitespace = (value: string) => value.replace(/\s+/gu, " ").trim();
 
 const stripUrlTail = (value: string): { value: string; tail: string } => {
-  let end = value.length;
-  while (end > 0 && /[.,!?;:}\]]/u.test(value[end - 1] ?? "")) end -= 1;
-  // A closing parenthesis belongs to the URL only when it balances an opening one.
-  while (end > 0 && value[end - 1] === ")") {
-    const body = value.slice(0, end);
-    const opens = (body.match(/\(/gu) ?? []).length;
-    const closes = (body.match(/\)/gu) ?? []).length;
-    if (closes <= opens) break;
-    end -= 1;
-  }
-  return { value: value.slice(0, end), tail: value.slice(end) };
+  const stripped = trimTrailingUrlPunctuation(value);
+  return { value: stripped, tail: value.slice(stripped.length) };
 };
 
 /**
@@ -160,9 +150,7 @@ export const restoreTechnicalFragments = (
 
 const normalizeAnalysisText = (input: string): string =>
   collapseWhitespace(
-    input
-      .normalize("NFKC")
-      .toLocaleLowerCase("sv-SE")
+    unicodeCaselessKey(input)
       .replace(/[’']/gu, "'")
       .replace(/[\p{Pd}-]+/gu, " ")
       .replace(/[_*~#>|]/gu, " "),
@@ -179,9 +167,7 @@ const textForSimilarityAnalysis = (input: string): string => {
   const protectedText = protectTechnicalFragments(input);
   let analyzable = protectedText.text;
   for (const fragment of protectedText.fragments) {
-    const fragmentWords = fragment.value
-      .normalize("NFKC")
-      .toLocaleLowerCase("sv-SE")
+    const fragmentWords = unicodeCaselessKey(fragment.value)
       .match(/[\p{L}\p{M}\p{N}]+/gu)
       ?.slice(0, 10)
       .join(" ") ?? "";
@@ -192,11 +178,23 @@ const textForSimilarityAnalysis = (input: string): string => {
   return normalizeAnalysisText(analyzable);
 };
 
-const wordsOf = (input: string): string[] =>
-  textForAnalysis(input).match(/[\p{L}\p{M}\p{N}]+(?:['-][\p{L}\p{M}\p{N}]+)*/gu) ?? [];
+export const segmentWords = (input: string, languageTag?: string): string[] => {
+  const text = input.normalize("NFKC").trim();
+  if (!text) return [];
+  const locale = canonicalRegisteredLanguageTag(languageTag);
+  try {
+    const segmenter = new Intl.Segmenter(locale, { granularity: "word" });
+    return [...segmenter.segment(text)]
+      .filter((segment) => segment.isWordLike)
+      .map((segment) => unicodeCaselessKey(segment.segment));
+  } catch {
+    return unicodeCaselessKey(text).match(/[\p{L}\p{M}\p{N}]+(?:['-][\p{L}\p{M}\p{N}]+)*/gu) ?? [];
+  }
+};
 
-const similarityWordsOf = (input: string): string[] =>
-  textForSimilarityAnalysis(input).match(/[\p{L}\p{M}\p{N}]+(?:['-][\p{L}\p{M}\p{N}]+)*/gu) ?? [];
+const wordsOf = (input: string): string[] => segmentWords(textForAnalysis(input));
+
+const similarityWordsOf = (input: string): string[] => segmentWords(textForSimilarityAnalysis(input));
 
 const setOfNgrams = (parts: readonly string[], size: number): Set<string> => {
   if (parts.length === 0) return new Set();
@@ -273,38 +271,6 @@ const openingKey = (input: string, size: number): string | undefined => {
   return words.length >= Math.max(7, size) ? words.slice(0, size).join(" ") : undefined;
 };
 
-interface PhraseRule {
-  pattern: RegExp;
-  label: string;
-  severity: "medium" | "high";
-  minWords: number;
-}
-
-const clicheRules: readonly PhraseRule[] = [
-  { pattern: /^(?:absolut|sj\u00e4lvklart)[!,.]?\s+(?:h\u00e4r|jag|det|l\u00e5t)/iu, label: "Absolut/Sj\u00e4lvklart \u2026", severity: "medium", minWords: 7 },
-  { pattern: /^bra (?:fr\u00e5ga|po\u00e4ng)[!,.]?\s/iu, label: "Bra fr\u00e5ga/po\u00e4ng \u2026", severity: "medium", minWords: 7 },
-  { pattern: /\bdet (?:\u00e4r|kan vara) viktigt att (?:notera|komma ih\u00e5g)\b/iu, label: "viktigt att notera", severity: "medium", minWords: 8 },
-  { pattern: /\bl\u00e5t oss (?:dyka ner|utforska|titta n\u00e4rmare)\b/iu, label: "L\u00e5t oss dyka ner", severity: "medium", minWords: 7 },
-  { pattern: /\bjag (?:hj\u00e4lper|hj\u00e4lper dig) g\u00e4rna\b/iu, label: "hj\u00e4lper g\u00e4rna", severity: "medium", minWords: 7 },
-  { pattern: /^(?:absolutely|certainly)[!,.]?\s+(?:here|i|that|let)/iu, label: "Absolutely/Certainly \u2026", severity: "medium", minWords: 7 },
-  { pattern: /^great (?:question|point)[!,.]?\s/iu, label: "Great question/point \u2026", severity: "medium", minWords: 7 },
-  { pattern: /\bit(?:'|\u2019)s important to (?:note|remember)\b/iu, label: "It is important to note", severity: "medium", minWords: 8 },
-  { pattern: /\blet(?:'|\u2019)s (?:dive in|explore|break (?:it|this) down)\b/iu, label: "Let's dive in", severity: "medium", minWords: 7 },
-  { pattern: /\bi(?:'|\u2019)d be happy to\b/iu, label: "I'd be happy to", severity: "medium", minWords: 7 },
-];
-
-const metaRules: readonly PhraseRule[] = [
-  { pattern: /\bsom (?:en )?(?:ai|artificiell intelligens|spr\u00e5kmodell)\b/iu, label: "som en AI/spr\u00e5kmodell", severity: "high", minWords: 1 },
-  { pattern: /\b(?:min|mitt) (?:tr\u00e4ningsdata|kunskapsgr\u00e4ns|systemprompt|prompt)\b/iu, label: "tr\u00e4ningsdata/prompt", severity: "high", minWords: 1 },
-  { pattern: /\bjag (?:kan inte|har ingen m\u00f6jlighet att) (?:surfa|webbl\u00e4sa|ha k\u00e4nslor)\b/iu, label: "AI-begr\u00e4nsning", severity: "high", minWords: 1 },
-  { pattern: /\bas an (?:ai|artificial intelligence|language model)\b/iu, label: "as an AI/language model", severity: "high", minWords: 1 },
-  { pattern: /\bmy (?:training data|knowledge cutoff|system prompt|prompt)\b/iu, label: "training data/prompt", severity: "high", minWords: 1 },
-  { pattern: /\bi (?:cannot|can(?:'|\u2019)t|do not) (?:browse|have feelings)\b/iu, label: "AI limitation", severity: "high", minWords: 1 },
-];
-
-const findRules = (text: string, rules: readonly PhraseRule[], wordCount: number): PhraseRule[] =>
-  rules.filter((rule) => wordCount >= rule.minWords && rule.pattern.test(text));
-
 const nonCodeLines = (input: string): string[] => {
   const protectedText = protectTechnicalFragments(input);
   let masked = protectedText.text;
@@ -313,29 +279,10 @@ const nonCodeLines = (input: string): string[] => {
 };
 
 const listItemCount = (input: string): number =>
-  nonCodeLines(input).filter((line) => /^\s*(?:[-*\u2022]|\d{1,2}[.)])\s+\S/u.test(line)).length;
+  nonCodeLines(input).filter((line) => /^\s*(?:[-*\u2022]|\p{Nd}{1,2}[.)])\s+\S/u.test(line)).length;
 
 const headingCount = (input: string): number =>
   nonCodeLines(input).filter((line) => /^\s{0,3}#{1,4}\s+\S/u.test(line)).length;
-
-const transitionLabels = (input: string): string[] => {
-  const plain = textForAnalysis(input);
-  const transitions: Array<[RegExp, string]> = [
-    [/\bf\u00f6r det f\u00f6rsta\b/iu, "f\u00f6r det f\u00f6rsta"],
-    [/\bf\u00f6r det andra\b/iu, "f\u00f6r det andra"],
-    [/\bdessutom\b/iu, "dessutom"],
-    [/\bsammanfattningsvis\b/iu, "sammanfattningsvis"],
-    [/\b\u00e5 ena sidan\b/iu, "\u00e5 ena sidan"],
-    [/\b\u00e5 andra sidan\b/iu, "\u00e5 andra sidan"],
-    [/\bfirst(?:ly)?\b/iu, "firstly"],
-    [/\bsecond(?:ly)?\b/iu, "secondly"],
-    [/\bmoreover\b/iu, "moreover"],
-    [/\bin conclusion\b/iu, "in conclusion"],
-    [/\bon the one hand\b/iu, "on the one hand"],
-    [/\bon the other hand\b/iu, "on the other hand"],
-  ];
-  return transitions.filter(([pattern]) => pattern.test(plain)).map(([, label]) => label);
-};
 
 export interface ConversationRegisterAnalysis {
   wordCount: number;
@@ -344,54 +291,28 @@ export interface ConversationRegisterAnalysis {
 }
 
 /**
- * Detects combinations characteristic of op-ed/essay prose. A single formal
- * word is intentionally harmless: casual-room rejection requires both an
- * essay-shaped structure and a separate concentration of abstractions.
+ * Language-neutral structural preflight. Meaning and register are reviewed by
+ * the model; this layer only catches conspicuously essay-shaped typography and
+ * density without maintaining Swedish/English vocabulary lists.
  */
 export const analyzeConversationRegister = (input: string): ConversationRegisterAnalysis => {
   const protectedText = protectTechnicalFragments(input);
   let prose = protectedText.text;
   for (const fragment of protectedText.fragments) prose = prose.split(fragment.placeholder).join(" ");
-  const plain = normalizeAnalysisText(prose);
-  const words = plain.match(/[\p{L}\p{M}\p{N}]+(?:['-][\p{L}\p{M}\p{N}]+)*/gu) ?? [];
+  const words = segmentWords(normalizeAnalysisText(prose));
   const structureSignals: string[] = [];
   const abstractionSignals: string[] = [];
+  const sentences = prose.split(/[.!?。！？]+/u).map((sentence) => sentence.trim()).filter(Boolean);
+  const averageSentenceWords = words.length / Math.max(1, sentences.length);
+  const commaCount = (prose.match(/[,،，]/gu) ?? []).length;
+  const semicolonCount = (prose.match(/[;；]/gu) ?? []).length;
+  const paragraphCount = prose.split(/\n\s*\n/gu).filter((paragraph) => paragraph.trim()).length;
 
-  if (/^(?:(?:spänningen|utmaningen|paradoxen|nyckeln|problemet) (?:ligger|finns) i|(?:the )?(?:tension|challenge|paradox|key|problem) (?:lies|is found) in)\b/iu.test(plain)) {
-    structureSignals.push("abstract-thesis-opening");
-  }
-  if (/\b(?:medan|samtidigt som|å ena sidan|å andra sidan|whereas|on the one hand|on the other hand)\b/iu.test(plain)) {
-    structureSignals.push("balanced-contrast");
-  }
-  if (/\b(?:om|if)\b.{8,120}\b(?:riskerar|leder|innebär|risks?|leads?|means?)\b/iu.test(plain)) {
-    structureSignals.push("conditional-consequence");
-  }
-  if (/\b(?:utan|without)\b.{8,120}\b(?:blir|förlorar|saknar|becomes?|loses?|lacks?)\b/iu.test(plain)) {
-    structureSignals.push("counterfactual-consequence");
-  }
-  if (words.length >= 30 && prose.includes(";")) structureSignals.push("long-semicolon-contrast");
-  const sentences = prose.split(/[.!?]+/u).map((sentence) => sentence.trim()).filter(Boolean);
-  if (words.length >= 34 && words.length / Math.max(1, sentences.length) >= 20) {
-    structureSignals.push("long-balanced-sentences");
-  }
-
-  const hasShortHorizon = /\b(?:kortsiktig\w*|kort sikt|short[- ]term)\b/iu.test(plain);
-  const hasLongHorizon = /\b(?:långsiktig\w*|lång sikt|long[- ]term)\b/iu.test(plain);
-  if (hasShortHorizon && hasLongHorizon) abstractionSignals.push("paired-time-horizons");
-
-  const abstractTerms = plain.match(
-    /\b(?:institutionell\w*|engagemangsmätning\w*|infrastruktur\w*|strukturell\w*|systemisk\w*|sammanhängande utveckling|isolerade händelser|institutional\w*|engagement metric\w*|infrastructure\w*|structural\w*|systemic\w*|coherent development|isolated events)\b/giu,
-  ) ?? [];
-  if (new Set(abstractTerms.map((term) => term.toLocaleLowerCase())).size >= 2) {
-    abstractionSignals.push("dense-institutional-vocabulary");
-  }
-
-  const formalConnectors = plain.match(
-    /\b(?:i förlängningen|på ett övergripande plan|ur ett [\p{L}\p{M}-]+ perspektiv|därmed|följaktligen|riskerar man att|in the longer term|at a structural level|from an? [\p{L}\p{M}-]+ perspective|consequently|thereby)\b/giu,
-  ) ?? [];
-  if (new Set(formalConnectors.map((term) => term.toLocaleLowerCase())).size >= 2) {
-    abstractionSignals.push("formal-connector-density");
-  }
+  if (words.length >= 28 && averageSentenceWords >= 18) structureSignals.push("long-sentence-density");
+  if (words.length >= 28 && commaCount >= 3) structureSignals.push("multi-clause-density");
+  if (words.length >= 24 && semicolonCount >= 1) structureSignals.push("semicolon-structure");
+  if (paragraphCount >= 3) structureSignals.push("multi-paragraph-structure");
+  if (words.length >= 42 && sentences.length <= 2) structureSignals.push("compressed-essay-block");
 
   return { wordCount: words.length, structureSignals, abstractionSignals };
 };
@@ -404,12 +325,16 @@ export const conversationRegisterMismatch = (
   if (register === "technical" || register === "analytical") return { ...analysis, mismatch: false };
   const minimumWords = register === "banter" ? 24 : register === "everyday" ? 28 : 32;
   const minimumStructures = register === "banter" || register === "everyday" ? 2 : 3;
+  const strongEssayShape =
+    analysis.structureSignals.includes("semicolon-structure") ||
+    analysis.structureSignals.includes("multi-paragraph-structure") ||
+    analysis.structureSignals.length >= 4;
   return {
     ...analysis,
     mismatch:
       analysis.wordCount >= minimumWords &&
       analysis.structureSignals.length >= minimumStructures &&
-      analysis.abstractionSignals.length >= 1,
+      strongEssayShape,
   };
 };
 
@@ -438,7 +363,7 @@ export const assessCandidate = (input: AssessCandidateInput): HumanizerAssessmen
       addReason(reasons, {
         code: "near_duplicate_self",
         severity,
-        message: `Repliken ligger f\u00f6r n\u00e4ra personans eget tidigare inl\u00e4gg (${ownMatch.similarity.combined.toFixed(2)}).`,
+        message: `The candidate is too close to this actor's earlier line (${ownMatch.similarity.combined.toFixed(2)}).`,
         hint: SELF_HINT,
         similarity: ownMatch.similarity,
         matchedText: ownMatch.text,
@@ -457,7 +382,7 @@ export const assessCandidate = (input: AssessCandidateInput): HumanizerAssessmen
       addReason(reasons, {
         code: "near_duplicate_peer",
         severity,
-        message: `Repliken speglar en annan deltagares formulering (${peerMatch.similarity.combined.toFixed(2)}).`,
+        message: `The candidate echoes another participant's wording (${peerMatch.similarity.combined.toFixed(2)}).`,
         hint: PEER_HINT,
         similarity: peerMatch.similarity,
         matchedText: peerMatch.text,
@@ -474,34 +399,11 @@ export const assessCandidate = (input: AssessCandidateInput): HumanizerAssessmen
       addReason(reasons, {
         code: "reused_opening",
         severity: matchingOpenings.length >= 2 ? "medium" : "low",
-        message: `Personan har nyligen anv\u00e4nt samma \u00f6ppning: \u201d${opening4 ?? opening3}\u201d.`,
+        message: `The actor recently used the same opening: “${opening4 ?? opening3}”.`,
         hint: OPENING_HINT,
         evidence: [opening4 ?? opening3],
       });
     }
-  }
-
-  const plainText = textForAnalysis(input.text);
-  const clichés = findRules(plainText, clicheRules, wordCount);
-  if (clichés.length > 0) {
-    addReason(reasons, {
-      code: "assistant_cliche",
-      severity: clichés.some((rule) => rule.severity === "high") ? "high" : "medium",
-      message: `Repliken anv\u00e4nder en typisk assistentfras: ${clichés.map((rule) => rule.label).join(", ")}.`,
-      hint: CLICHE_HINT,
-      evidence: clichés.map((rule) => rule.label),
-    });
-  }
-
-  const meta = input.allowAiIdentity ? [] : findRules(plainText, metaRules, wordCount);
-  if (meta.length > 0) {
-    addReason(reasons, {
-      code: "ai_meta_language",
-      severity: "high",
-      message: `Repliken bryter illusionen med AI-meta: ${meta.map((rule) => rule.label).join(", ")}.`,
-      hint: META_HINT,
-      evidence: meta.map((rule) => rule.label),
-    });
   }
 
   const lists = listItemCount(input.text);
@@ -510,35 +412,10 @@ export const assessCandidate = (input: AssessCandidateInput): HumanizerAssessmen
     addReason(reasons, {
       code: "list_like_reply",
       severity: lists >= 5 || headings >= 3 ? "high" : "low",
-      message: `Repliken ser ut som ett assistentsvar (${lists} listpunkter, ${headings} rubriker).`,
+      message: `The candidate has unsolicited answer formatting (${lists} list items, ${headings} headings).`,
       hint: LIST_HINT,
       evidence: [`listpunkter:${lists}`, `rubriker:${headings}`],
     });
-  }
-
-  const transitions = transitionLabels(input.text);
-  const polishedLimit = mode === "voice" ? 2 : 3;
-  if (wordCount >= (mode === "voice" ? 24 : 38) && transitions.length >= polishedLimit) {
-    addReason(reasons, {
-      code: "overly_polished",
-      severity: transitions.length >= polishedLimit + 1 ? "medium" : "low",
-      message: `Repliken l\u00e5ter mer som en uppsats \u00e4n spontan chatt: ${transitions.join(", ")}.`,
-      hint: POLISHED_HINT,
-      evidence: transitions,
-    });
-  }
-
-  if (input.register) {
-    const registerFit = conversationRegisterMismatch(input.text, input.register);
-    if (registerFit.mismatch) {
-      addReason(reasons, {
-        code: "register_mismatch",
-        severity: "high",
-        message: "Repliken är sakligt relevant men betydligt mer essä- eller seminarieformad än rummets språkregister.",
-        hint: REGISTER_HINT,
-        evidence: [...registerFit.structureSignals, ...registerFit.abstractionSignals],
-      });
-    }
   }
 
   let severity = reasons.reduce<HumanizerSeverity>(
@@ -546,14 +423,9 @@ export const assessCandidate = (input: AssessCandidateInput): HumanizerAssessmen
     "none",
   );
   const reasonCodes = new Set(reasons.map((reason) => reason.code));
-  const clearlyAssistantShaped =
-    reasonCodes.has("assistant_cliche") &&
-    (reasonCodes.has("list_like_reply") || reasonCodes.has("overly_polished"));
   const repeatedPerformance =
     reasonCodes.has("near_duplicate_self") && reasonCodes.has("reused_opening");
-  // Two independent medium signals are more trustworthy than aggressively
-  // rejecting one common chat phrase. This is the only composite escalation.
-  if (severity !== "high" && (clearlyAssistantShaped || repeatedPerformance)) severity = "high";
+  if (severity !== "high" && repeatedPerformance) severity = "high";
   const hints = [...new Set(reasons.map((reason) => reason.hint))];
   const protectedFragments = protectTechnicalFragments(input.text).fragments;
   return {

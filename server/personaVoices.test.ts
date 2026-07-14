@@ -15,7 +15,6 @@ describe("resident voice profiles", () => {
     for (const persona of PERSONAS) {
       const profile = voiceProfileForPersona(persona.id);
       expect(profile, persona.id).toBeDefined();
-      expect(profile?.language).toBe("sv-SE");
       expect(PIPER_PROVIDER_VOICES).toContain(profile?.providerVoice);
       expect(profile?.speed).toBeGreaterThanOrEqual(0.85);
       expect(profile?.speed).toBeLessThanOrEqual(1.15);
@@ -27,8 +26,8 @@ describe("resident voice profiles", () => {
     expect(voiceProfileForPersona("ai-future-resident")).toBeUndefined();
   });
 
-  it("only advertises provider aliases that the cast actually uses", () => {
-    expect(configuredPersonaProviderVoices().sort()).toEqual([
+  it("only advertises cast aliases to the bundled Piper provider", () => {
+    expect(configuredPersonaProviderVoices("piper-sv").sort()).toEqual([
       "lisa-bright",
       "lisa-calm",
       "lisa-dry",
@@ -38,5 +37,7 @@ describe("resident voice profiles", () => {
       "nst-deep",
       "nst-dry",
     ]);
+    expect(configuredPersonaProviderVoices("generic-multilingual")).toEqual([]);
+    expect(configuredPersonaProviderVoices(undefined)).toEqual([]);
   });
 });

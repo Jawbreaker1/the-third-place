@@ -51,9 +51,51 @@ describe("safe HTTPS fetch", () => {
     )).toEqual([]);
   });
 
+  it("keeps Unicode sentence punctuation and wrappers out of URL hosts", () => {
+    const cases = [
+      ["شاهد https://example.com،", "https://example.com/"],
+      ["شاهد https://example.com؛", "https://example.com/"],
+      ["شاهد https://example.com؟", "https://example.com/"],
+      ["見てhttps://example.com。", "https://example.com/"],
+      ["見て「https://example.com」", "https://example.com/"],
+      ["見て【https://example.com】", "https://example.com/"],
+      ["見て（https://example.com）", "https://example.com/"],
+      ["見てhttps://example.com！", "https://example.com/"],
+      ["見てhttps://example.com・", "https://example.com/"],
+      ["見てhttps://example.com—", "https://example.com/"],
+      ["شاهد https://example.com٪", "https://example.com/"],
+      ["شاهد https://example.com؍", "https://example.com/"],
+    ] as const;
+    for (const [content, expected] of cases) {
+      expect(extractPublicHttpsUrls(content)[0]?.toString(), content).toBe(expected);
+    }
+  });
+
+  it("accepts no-space-script prefixes and IDNs without accepting embedded ASCII tokens", () => {
+    expect(extractPublicHttpsUrls("見てhttps://例え.テスト。")?.[0]?.toString()).toBe("https://xn--r8jz45g.xn--zckzah/");
+    expect(extractPublicHttpsUrls("انظرhttps://مثال.إختبار؟")?.[0]?.hostname).toBe("xn--mgbh0fb.xn--kgbechtv");
+    expect(extractPublicHttpsUrls("見てhttps://example.comニュース")?.[0]?.toString()).toBe("https://example.com/");
+    expect(extractPublicHttpsUrls("https://example.com、次")?.[0]?.toString()).toBe("https://example.com/");
+    expect(extractPublicHttpsUrls("看https://例子.中国新闻")?.[0]?.toString()).toBe("https://xn--fsqu00a.xn--fiqs8s/");
+    expect(extractPublicHttpsUrls("看https://例子.中国/新闻/今天")?.[0]?.pathname).toBe("/%E6%96%B0%E9%97%BB/%E4%BB%8A%E5%A4%A9");
+    expect(extractPublicHttpsUrls("abchttps://example.com foohttps://example.org xwww.example.net")).toEqual([]);
+  });
+
   it("rejects private, mapped and reserved network destinations", () => {
     expect(isPublicAddress("93.184.216.34")).toBe(true);
-    for (const address of ["10.0.0.1", "127.0.0.1", "169.254.1.2", "::1", "::ffff:192.168.1.2", "2001:db8::1"]) {
+    for (const address of [
+      "0.0.0.0",
+      "10.0.0.1",
+      "100.64.0.1",
+      "127.0.0.1",
+      "169.254.1.2",
+      "224.0.0.1",
+      "::1",
+      "::ffff:192.168.1.2",
+      "2001:db8::1",
+      "fc00::1",
+      "fe80::1",
+    ]) {
       expect(isPublicAddress(address), address).toBe(false);
     }
   });
@@ -121,6 +163,63 @@ describe("safe HTTPS fetch", () => {
     expect(resolved).toEqual(["first.example", "second.example"]);
     expect(requested).toEqual(["https://first.example/start", "https://second.example/final"]);
     expect(result?.finalUrl.toString()).toBe("https://second.example/final");
+  });
+
+  it("re-resolves the same hostname after a redirect and blocks a DNS rebinding answer", async () => {
+    let lookups = 0;
+    let requests = 0;
+    const result = await fetchPublicHttps("https://first.example/start", policy, {
+      lookupImpl: async () => {
+        lookups += 1;
+        return lookups === 1
+          ? [{ address: "93.184.216.34", family: 4 }]
+          : [{ address: "127.0.0.1", family: 4 }];
+      },
+      requestHop: async () => {
+        requests += 1;
+        return { redirect: "/after-rebind" };
+      },
+    });
+    expect(result).toBeUndefined();
+    expect(lookups).toBe(2);
+    expect(requests).toBe(1);
+  });
+
+  it("blocks a redirected host when any of its fresh DNS answers is private", async () => {
+    const resolved: string[] = [];
+    const requested: string[] = [];
+    const result = await fetchPublicHttps("https://public.example/start", policy, {
+      lookupImpl: async (hostname) => {
+        resolved.push(hostname);
+        return hostname === "public.example"
+          ? [{ address: "93.184.216.34", family: 4 }]
+          : [
+              { address: "93.184.216.35", family: 4 },
+              { address: "10.0.0.7", family: 4 },
+            ];
+      },
+      requestHop: async (url) => {
+        requested.push(url.toString());
+        return { redirect: "https://mixed.example/private" };
+      },
+    });
+    expect(result).toBeUndefined();
+    expect(resolved).toEqual(["public.example", "mixed.example"]);
+    expect(requested).toEqual(["https://public.example/start"]);
+  });
+
+  it("honours the redirect limit without issuing an extra hop", async () => {
+    const requested: string[] = [];
+    const oneRedirectPolicy = { ...policy, maxRedirects: 1 };
+    const result = await fetchPublicHttps("https://first.example/start", oneRedirectPolicy, {
+      lookupImpl: publicLookup,
+      requestHop: async (url) => {
+        requested.push(url.toString());
+        return { redirect: `/hop-${requested.length}` };
+      },
+    });
+    expect(result).toBeUndefined();
+    expect(requested).toEqual(["https://first.example/start", "https://first.example/hop-1"]);
   });
 
   it("rejects redirect downgrades, credentials and loops before another unsafe request", async () => {

@@ -9,6 +9,8 @@ import type {
   TypingMemberPayload,
   VisualObservation,
 } from "../shared/types.js";
+import { containsExactMention } from "../shared/unicodeBoundaries.js";
+import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import {
   CHANNELS,
@@ -20,14 +22,32 @@ import {
 import { PERSONAS, type Persona } from "./personas.js";
 import { type GeneratedLine, type TranscriptLine, LmStudioClient } from "./lmStudio.js";
 import { createMessage, RoomStore } from "./store.js";
-import { ResearchBroker, type ResearchPacket } from "./researchBroker.js";
-import { PageReader, type PageReadRequest } from "./pageReader.js";
+import {
+  ResearchBroker,
+  type ResearchPacket,
+  type ResearchRequest,
+} from "./researchBroker.js";
+import {
+  PageReader,
+  type PageReadCandidate,
+  type PageReadCandidateSet,
+  type PageReadRequest,
+} from "./pageReader.js";
 import { assessCandidate, protectTechnicalFragments, restoreTechnicalFragments } from "./humanizer.js";
 import type { HumanMemory } from "./humanMemory.js";
+import {
+  createFailClosedTurnAnalysis,
+  projectTrustedTurnAnalysis,
+  TURN_TRUST_THRESHOLDS,
+  type MemoryAnalysis,
+  type TurnAnalysis,
+  type TurnAnalysisInput,
+} from "./semanticRouter.js";
+import { resolveLocalDateTime, type LocalDateTimeResult } from "./timeResolver.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
-  matchedTopics: Set<string>;
+  relevantIds: string[];
   isQuestion: boolean;
   energy: number;
   absurdity: number;
@@ -39,21 +59,8 @@ export interface SocialSignals {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const choose = <T>(items: T[], rng = Math.random): T => items[Math.floor(rng() * items.length)] as T;
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
-const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const containsWholePhrase = (content: string, phrase: string): boolean =>
-  new RegExp(`(?:^|[^\\p{L}\\p{N}_])${escapeRegExp(phrase)}(?=$|[^\\p{L}\\p{N}_])`, "iu").test(content);
-const languageHint = (content: string): string => {
-  const lower = ` ${content.toLocaleLowerCase()} `;
-  const swedishSignals = [" jag ", " och ", " inte ", " tänk ", " vad ", " hur ", " är ", " mig ", " dig ", " skriv ", " ge "];
-  return /[åäö]/i.test(content) || swedishSignals.some((signal) => lower.includes(signal))
-    ? "Swedish"
-    : "the language of the latest message";
-};
-
 const boundedUntrustedText = (value: string, maxLength: number): string =>
-  value
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+  stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, maxLength);
@@ -62,92 +69,71 @@ const boundedUntrustedText = (value: string, maxLength: number): string =>
 export const normalizeGeneratedMessageContent = (value: string, maxLength = 500): string | undefined => {
   const protectedText = protectTechnicalFragments(value);
   const normalized = protectedText.text
-    .replace(/\s*\[S\d+\](?:\s*[:;,\-–—]\s*|(?=[\s.,!?)]|$))/giu, " ")
+    .replace(/\s*\[S\d+\](?=\p{P})/giu, "")
+    .replace(/\s*\[S\d+\](?:\s*[:;,،؛\-–—]\s*|(?=$|[\s\p{P}\p{S}]))/giu, " ")
     .replace(/[^\S\r\n]+/gu, " ")
     .replace(/ *\r?\n */gu, "\n")
     .replace(/\n{3,}/gu, "\n\n")
     .trim();
   const restored = restoreTechnicalFragments(normalized, protectedText.fragments)
-    .replace(/(?<![\p{L}\p{N}_/])`+\[S\d+\]`+(?=$|[\s.,!?:;)])/giu, "")
+    .replace(/`+\[S\d+\]`+(?=$|[\s\p{P}\p{S}])/giu, "")
     .replace(/[^\S\r\n]+/gu, " ")
     .trim();
   return restored && restored.length <= maxLength ? restored : undefined;
 };
 
 export function analyzeSocialSignals(content: string, personas = PERSONAS): SocialSignals {
-  const lower = content.toLocaleLowerCase();
-  const words = lower.match(/[\p{L}\p{N}_-]+/gu) ?? [];
   const mentionedIds = personas
-    .filter(
-      (persona) =>
-        containsWholePhrase(lower, `@${persona.name.toLocaleLowerCase()}`) ||
-        containsWholePhrase(lower, persona.name.toLocaleLowerCase()),
-    )
+    .filter((persona) => containsExactMention(content, persona.name))
     .map((persona) => persona.id);
-  const matchedTopics = new Set(
-    personas.flatMap((persona) => persona.interests).filter((topic) => lower.includes(topic.toLocaleLowerCase())),
-  );
-  const capitals = [...content].filter((character) => /[A-ZÅÄÖ]/.test(character)).length;
-  const letters = [...content].filter((character) => /[\p{L}]/u.test(character)).length;
-  const punctuationEnergy = (content.match(/[!?]/g) ?? []).length;
-  const emojiEnergy = (content.match(/\p{Extended_Pictographic}/gu) ?? []).length;
-  const absurdHits = [
-    "what if",
-    "tänk om",
-    "hear me out",
-    "lyssna nu",
-    "banan",
-    "banana",
-    "aliens",
-    "utomjording",
-    "pineapple",
-    "ananas",
-    "unhinged",
-    "galet",
-    "wtf",
-    "plot twist",
-  ].filter((phrase) => containsWholePhrase(lower, phrase)).length;
-  const warmHits = ["tack", "thanks", "love", "älskar", "nice", "snäll", "kind", "brilliant", "bra idé"].filter(
-    (phrase) => lower.includes(phrase),
-  ).length;
-  const aggressionHits = [
-    "håll käften",
-    "shut up",
-    "idiot",
-    "hate you",
-    "hatar dig",
-    "kill yourself",
-    "dra åt helvete",
-  ].filter((phrase) => containsWholePhrase(lower, phrase)).length;
-  const claimHits = [
-    "alltid",
-    "aldrig",
-    "alla vet",
-    "självklart",
-    "uppenbarligen",
-    "bäst",
-    "sämst",
-    "måste",
-    "borde",
-    "always",
-    "never",
-    "everyone knows",
-    "obviously",
-    "best",
-    "worst",
-    "must",
-    "should",
-  ].filter((phrase) => containsWholePhrase(lower, phrase)).length;
 
   return {
     mentionedIds,
-    matchedTopics,
-    isQuestion: content.includes("?") || /^(vem|vad|varför|hur|when|who|what|why|how)\b/i.test(words.join(" ")),
-    energy: clamp(punctuationEnergy * 0.13 + emojiEnergy * 0.12 + (letters > 5 ? capitals / letters : 0), 0, 1),
-    absurdity: clamp(absurdHits * 0.32 + (punctuationEnergy >= 4 ? 0.2 : 0), 0, 1),
-    warmth: clamp(warmHits * 0.3, 0, 1),
-    aggression: clamp(aggressionHits * 0.46, 0, 1),
-    claimStrength: clamp(claimHits * 0.32 + (content.length > 20 && !content.includes("?") ? 0.06 : 0), 0, 1),
+    relevantIds: [],
+    isQuestion: false,
+    // Punctuation and emoji are not reliable proxies for pragmatic energy
+    // across writing systems or individual styles. The semantic router owns
+    // that judgment; this deterministic layer resolves exact addresses only.
+    energy: 0,
+    absurdity: 0,
+    warmth: 0,
+    aggression: 0,
+    claimStrength: 0,
+  };
+}
+
+/**
+ * Turns the single multilingual model analysis into director weights. Exact
+ * @mentions and reply targets are supplied by the server and take precedence;
+ * the model may infer a direct target only when no deterministic target exists.
+ */
+export function socialSignalsFromTurnAnalysis(
+  analysis: TurnAnalysis,
+  deterministicAddressedIds: readonly string[],
+  mechanicalBaseline: SocialSignals,
+): SocialSignals {
+  if (analysis.source !== "lm") {
+    return { ...mechanicalBaseline, mentionedIds: [...deterministicAddressedIds] };
+  }
+  const trusted = projectTrustedTurnAnalysis(analysis);
+  const inferredAddressed = deterministicAddressedIds.length === 0
+    ? trusted.inferredAddressedIds
+    : [];
+  const moderationEscalation =
+    analysis.moderation.confidence >= TURN_TRUST_THRESHOLDS.moderation &&
+    ["deescalate", "report", "block"].includes(analysis.moderation.action)
+      ? 0.48
+      : 0;
+  return {
+    ...mechanicalBaseline,
+    mentionedIds: [...new Set(deterministicAddressedIds.length > 0 ? deterministicAddressedIds : inferredAddressed)],
+    relevantIds: [...new Set(trusted.relevantIds)],
+    isQuestion: trusted.isQuestion,
+    energy: Math.max(mechanicalBaseline.energy, trusted.social.energy),
+    absurdity: trusted.social.absurdity,
+    warmth: trusted.social.warmth,
+    aggression: Math.max(trusted.social.hostility, moderationEscalation),
+    claimStrength: trusted.social.claimStrength,
   };
 }
 
@@ -171,20 +157,22 @@ export function selectResponders(
   rng = Math.random,
   attention?: ReadonlyMap<string, number>,
 ): Persona[] {
+  const direct = personas.filter((persona) => signals.mentionedIds.includes(persona.id));
   if (signals.aggression >= 0.4) {
     const moderator = personas.find((persona) => persona.id === "ai-runa");
-    if (moderator) return [moderator];
+    if (moderator) {
+      return [...new Map([...direct.slice(0, 2), moderator].map((persona) => [persona.id, persona])).values()].slice(0, 3);
+    }
+    if (direct.length > 0) return direct.slice(0, 2);
   }
-  const direct = personas.filter((persona) => signals.mentionedIds.includes(persona.id));
   const maxResponders = direct.length > 0 ? clamp(direct.length + 1, 1, 3) : signals.absurdity > 0.45 || signals.energy > 0.72 ? 3 : 2;
   const scored = personas
     .filter((persona) => !direct.includes(persona))
     .map((persona) => {
       const elapsed = now - (lastSpoke.get(persona.id) ?? 0);
       const coolingDown = elapsed < persona.cooldownMs;
-      const topicHits = persona.interests.filter((topic) => signals.matchedTopics.has(topic)).length;
       let score = persona.talkativeness * 0.54 + rng() * 0.35;
-      score += Math.min(topicHits, 2) * 0.24;
+      score += signals.relevantIds.includes(persona.id) ? 0.34 : 0;
       score += signals.isQuestion ? persona.curiosity * 0.17 : 0;
       score += signals.absurdity * persona.mischief * 0.34;
       score += signals.warmth * persona.warmth * 0.18;
@@ -242,6 +230,7 @@ export interface AmbientThreadState {
   messageCount: number;
   lastMessageId?: string;
   languageHint: string;
+  languageTag?: string;
   updatedAt: number;
 }
 
@@ -263,10 +252,23 @@ export function ambientLanguageHint(messages: readonly AmbientHistoryMessage[]):
   const latestHuman = [...messages]
     .reverse()
     .find((message) => !message.system && !message.authorId.startsWith("ai-") && message.content.trim());
-  if (!latestHuman) return "Swedish";
-  return languageHint(latestHuman.content) === "Swedish"
-    ? "Swedish"
-    : "the language used in the latest human-authored message";
+  return latestHuman
+    ? "the language used in the latest human-authored message"
+    : "the room's established language";
+}
+
+/** Keeps the actual human language anchor inside the bounded model history. */
+export function ambientHistoryWithAnchor<T extends AmbientHistoryMessage>(
+  messages: readonly T[],
+  limit: number,
+): T[] {
+  const boundedLimit = Math.max(1, limit);
+  const tail = messages.slice(-boundedLimit);
+  const latestHuman = [...messages]
+    .reverse()
+    .find((message) => !message.system && !message.authorId.startsWith("ai-") && message.content.trim());
+  if (!latestHuman || tail.some((message) => message.id === latestHuman.id)) return tail;
+  return [latestHuman, ...tail.slice(-(boundedLimit - 1))];
 }
 
 /** Room expertise and capacity for a real claim matter more than sheer chatter. */
@@ -638,7 +640,7 @@ export interface PublicCandidateGuardInput {
 }
 
 const normalizeExactCandidate = (content: string): string =>
-  content.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  unicodeCaselessKey(content).replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim();
 
 /**
  * Publication remains permissive: exact channel duplicates are rejected, while
@@ -721,131 +723,80 @@ export function sourceIdsForPageResponder(
   return [...new Set(sourceIds)].slice(0, 3);
 }
 
-const isAvanzaMarketEvidence = (research: ResearchPacket | undefined): boolean => {
-  const first = research?.kind === "page" ? research.results.find((result) => result.id === "S1") : undefined;
-  if (first?.title !== "Avanza – Börsen idag") return false;
-  try {
-    const host = new URL(first.url).hostname.toLocaleLowerCase();
-    return host === "avanza.se" || host === "www.avanza.se";
-  } catch {
-    return false;
-  }
-};
-
-export function pageEvidenceAnswerContract(research?: ResearchPacket): string {
-  const concrete = "Give at least one concrete supported detail from the page; a generic acknowledgement or capability statement does not answer the request.";
-  const first = research?.kind === "page" ? research.results[0] : undefined;
-  if (!first) return concrete;
-  if (isAvanzaMarketEvidence(research)) {
-    return `${concrete} For this Avanza market overview, state the supplied headline-index level, today's percentage change and update time before clarifying that an individual share requires its name or ticker.`;
-  }
-  try {
-    const url = new URL(first.url);
-    const host = url.hostname.toLocaleLowerCase();
-    if ((host === "blizzard.com" || host.endsWith(".blizzard.com")) && /(?:^|\/)news(?:\/|$)/iu.test(url.pathname)) {
-      return `${concrete} Name an exact supplied headline and one supported reason it stands out instead of offering generic game-release excitement.`;
-    }
-  } catch {
-    // Research URLs were validated before reaching the director. Keep the
-    // generic contract if a synthetic/test packet does not contain one.
-  }
-  return concrete;
-}
-
-export interface GroundedEvidenceAnswer {
-  content: string;
-  sourceIds: string[];
-}
-
-const visibleGroundedEvidence = (value: string, maxLength: number): string =>
-  boundedUntrustedText(
-    value
-      .replace(/https?:\/\/[^\s<>"'`]+/giu, " ")
-      .replace(/\[S\d+\]/giu, " "),
-    maxLength,
-  );
-
-const swedishEvidenceReply = (languageOrContent: string): boolean =>
-  /^\s*(?:sv|swedish)\s*$/iu.test(languageOrContent) || languageHint(languageOrContent) === "Swedish";
-
-const completeAvanzaIndexRow = (
-  snippet: string,
-): { label: string; level: string; change: string; updated: string } | undefined => {
-  const rowPattern = /^([^:\n]{1,120}):\s*([−+\-]?\d[\d\s\u00a0\u202f]*(?:[,.]\d+)?)\s+indexpunkter,\s*([−+\-]?\d+(?:[,.]\d+)?)\s+%\s+idag,\s*uppdaterad\s+(\d{1,2}:\d{2})\.?$/iu;
-  for (const segment of snippet.split(/\n+/u)) {
-    const match = visibleGroundedEvidence(segment, 280).match(rowPattern);
-    if (!match) continue;
-    const [, rawLabel, level, change, updated] = match;
-    const label = visibleGroundedEvidence(rawLabel ?? "", 120);
-    if (label && level && change && updated) return { label, level, change, updated };
-  }
-  return undefined;
-};
-
-/**
- * Last-resort answer assembled only from the already validated research packet.
- * It deliberately avoids model generation, visible URLs and arbitrary source IDs.
- */
-export function groundedEvidenceFallback(
-  research: ResearchPacket | undefined,
-  languageOrContent = "",
-): GroundedEvidenceAnswer | undefined {
-  if (!research) return undefined;
-  const first = research.results.find((result) => result.id === "S1");
-  if (!first) return undefined;
-  const swedish = swedishEvidenceReply(languageOrContent);
-
-  if (isAvanzaMarketEvidence(research)) {
-    const row = completeAvanzaIndexRow(first.snippet);
-    if (row) {
-      return {
-        content: swedish
-          ? `Avanza visar ${row.label}: ${row.level} indexpunkter, ${row.change} % idag (uppdaterad ${row.updated}). Säg vilken aktie eller ticker du menar om du vill ha en enskild kurs.`
-          : `Avanza shows ${row.label} at ${row.level} index points, ${row.change}% today (updated ${row.updated}). Name the share or ticker if you want an individual quote.`,
-        sourceIds: ["S1"],
-      };
-    }
-  }
-
-  const title = visibleGroundedEvidence(first.title, 110);
-  if (!title) return undefined;
-  if (research.kind === "page") {
-    const titleKey = title.toLocaleLowerCase();
-    const block = first.snippet
-      .split(/\n{2,}|\r?\n/u)
-      .map((value) => visibleGroundedEvidence(value, 210))
-      .find((value) => value.length >= 8 && value.toLocaleLowerCase() !== titleKey);
-    if (!block) return undefined;
-    return {
-      content: swedish
-        ? `På “${title}” står bland annat: ${block}`
-        : `From “${title}”: ${block}`,
-      sourceIds: ["S1"],
-    };
-  }
-
-  return {
-    content: swedish ? `Första källträffen är “${title}”.` : `The first source result is “${title}”.`,
-    sourceIds: ["S1"],
-  };
+export function pageEvidenceAnswerContract(_research?: ResearchPacket): string {
+  return "Answer the human's actual request with at least one concrete detail supported by the supplied page. A generic acknowledgement, capability statement or title-only reaction is not an answer. When asked to compare or choose, identify the relevant supplied item and explain the choice only from supplied evidence.";
 }
 
 export function evidenceFailureFallback(
-  pageRequested: boolean,
-  languageOrContent = "",
-): GroundedEvidenceAnswer {
-  const swedish = swedishEvidenceReply(languageOrContent);
-  return {
-    content: pageRequested
-      ? swedish
-        ? "Jag fick inte fram något läsbart från just den länken den här gången."
-        : "I couldn't get readable content from that link this time."
-      : swedish
-        ? "Jag fick ingen användbar källträff på just den sökningen den här gången."
-        : "I didn't get a usable source result for that search this time.",
-    sourceIds: [],
-  };
+  _pageRequested: boolean,
+  _languageOrContent = "",
+): undefined {
+  // A fixed Swedish/English failure sentence is itself a language heuristic.
+  // Required responders get one focused model retry in the classified turn's
+  // language; if that fails, silence is safer than an unrelated canned line.
+  return undefined;
 }
+
+interface ClassifiedToolPlan {
+  pageReadRequest?: PageReadRequest;
+  searchRequest?: ResearchRequest;
+  localDateTime?: LocalDateTimeResult;
+}
+
+const pageCandidateContext = (candidate: PageReadCandidate): string => {
+  if (!candidate.url) return `unsupported candidate; source=${candidate.source}`;
+  const path = (() => {
+    try {
+      return decodeURIComponent(candidate.url.pathname);
+    } catch {
+      return candidate.url.pathname;
+    }
+  })();
+  return boundedUntrustedText(
+    `host=${candidate.url.hostname.toLocaleLowerCase()}; path=${path || "/"}; source=${candidate.source}`,
+    220,
+  );
+};
+
+const semanticUrlCandidates = (candidateSet: PageReadCandidateSet): TurnAnalysisInput["urlCandidates"] =>
+  candidateSet.candidates.map((candidate) => ({
+    ref: candidate.id,
+    source: candidate.source === "message"
+      ? "latest_message" as const
+      : candidate.source === "reply"
+        ? "replied_message" as const
+        : "recent_same_author" as const,
+    context: pageCandidateContext(candidate),
+  }));
+
+const semanticFlagsPremise = (analysis: TurnAnalysis): string => {
+  const trusted = projectTrustedTurnAnalysis(analysis);
+  if (!trusted.capabilityTrusted) return "";
+  return [
+    trusted.asksForList
+      ? "The semantic turn analysis confirms that the human explicitly requested a list; list formatting is allowed if it is the natural answer."
+      : "",
+    trusted.asksAboutAiIdentity
+      ? "AI identity is explicitly the subject of this turn; answer honestly in character rather than evading it."
+      : "",
+    trusted.asksAboutAcoustics
+      ? "The human is explicitly asking about acoustic evidence. This text-chat scene has no reliable audio evidence; do not infer any."
+      : "",
+  ].filter(Boolean).join(" ");
+};
+
+export const classifiedLanguage = (analysis: TurnAnalysis): string | undefined =>
+  projectTrustedTurnAnalysis(analysis).languageTag;
+
+const semanticSceneContext = (analysis: TurnAnalysis) => {
+  const trusted = projectTrustedTurnAnalysis(analysis);
+  return {
+    languageTag: trusted.languageTag,
+    asksForList: trusted.asksForList,
+    asksAboutAiIdentity: trusted.asksAboutAiIdentity,
+    asksAboutAcoustics: trusted.asksAboutAcoustics,
+  };
+};
 
 export class SocialDirector {
   private readonly lastSpoke = new Map<string, number>();
@@ -858,6 +809,7 @@ export class SocialDirector {
   private ambientTimer?: NodeJS.Timeout;
   private readonly channelEpoch = new Map<string, number>();
   private readonly lastHumanMessageAtByChannel = new Map<string, number>();
+  private readonly lastTrustedLanguageByChannel = new Map<string, string>();
   private lastAmbientChannelId?: string;
   private started = false;
   private voiceRoomActive = false;
@@ -928,7 +880,7 @@ export class SocialDirector {
     this.channelEpoch.set(channelId, (this.channelEpoch.get(channelId) ?? 0) + 1);
   }
 
-  async welcome(human: Member, options: { returning?: boolean } = {}): Promise<void> {
+  async welcome(human: Member, options: { returning?: boolean; languageHint?: string } = {}): Promise<void> {
     const returning = options.returning === true;
     const arrivalAt = this.now();
     this.lastHumanActivityAt = arrivalAt;
@@ -968,6 +920,7 @@ export class SocialDirector {
             ? `Give ${human.name} one light, character-specific welcome back. Recognition may be subtle. Use at most one remembered detail only if it fits naturally; never recite memory or make them the center of a parade.`
             : `Give ${human.name} one warm, character-specific welcome. Do not make them the center of a parade.`,
           mustReplyIds: [persona.id],
+          languageHint: options.languageHint ?? ambientLanguageHint(this.store.getRecent("lobby", 18)),
           relationshipNotes: this.relationshipNotes([persona], human),
           actorChannelNotes: this.actorChannels.promptNotes([persona], "lobby"),
           actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], "lobby"),
@@ -976,18 +929,19 @@ export class SocialDirector {
       );
       line = generated[0];
     } catch (error) {
-      console.warn("Welcome scene used fallback:", error instanceof Error ? error.message : error);
+      console.warn("Welcome scene failed:", error instanceof Error ? error.message : error);
     } finally {
       this.setTyping("lobby", persona.id, false);
     }
     await delay(450);
     if (!this.canSpeak()) return;
+    if (!line) return;
     const posted = this.postPublic(
       "lobby",
       persona,
-      line?.content ?? (returning ? this.returningWelcomeFallback(persona, human.name) : this.fallback(persona, human.name, "welcome")),
+      line.content,
       undefined,
-      line ? "lm" : "fallback",
+      "lm",
     );
     if (posted) this.updateRelationship(persona.id, human.id, { warmth: 0.2, aggression: 0 }, 0.025);
   }
@@ -1033,27 +987,197 @@ export class SocialDirector {
     this.channelEpoch.set(message.channelId, (this.channelEpoch.get(message.channelId) ?? 0) + 1);
   }
 
+  private classifierMessage(message: ChatMessage): TurnAnalysisInput["latestMessage"] {
+    const member = this.getMembers().find((candidate) => candidate.id === message.authorId)
+      ?? PERSONAS.find((candidate) => candidate.id === message.authorId);
+    return {
+      id: message.id,
+      authorId: message.authorId,
+      authorName: boundedUntrustedText(member?.name ?? (message.system ? "room" : "guest"), 80),
+      // Raw human/AI chat text only. Image observations and OCR are excluded so
+      // they can never create tool, moderation, address or memory decisions.
+      content: boundedUntrustedText(message.content, 1_200),
+      createdAt: message.createdAt,
+    };
+  }
+
+  private async analyzeHumanTurn(input: {
+    medium: "public" | "dm";
+    turnId: string;
+    channelId: string;
+    latest: ChatMessage;
+    burst: readonly ChatMessage[];
+    recent: readonly ChatMessage[];
+    replyTarget?: ChatMessage;
+    personas: readonly Persona[];
+    candidateSet: PageReadCandidateSet;
+    allowSearch: boolean;
+  }): Promise<TurnAnalysis> {
+    const channel = getChannelProfile(input.channelId);
+    const currentIds = new Set(input.burst.map((message) => message.id));
+    const recentPool = [
+      ...input.recent.filter((message) => !currentIds.has(message.id)).slice(-10),
+      ...input.burst.slice(0, -1),
+      ...(input.replyTarget ? [input.replyTarget] : []),
+    ];
+    const uniqueRecent = [...new Map(recentPool.map((message) => [message.id, message])).values()]
+      .slice(-12)
+      .map((message) => this.classifierMessage(message));
+    const availableCapabilities: TurnAnalysisInput["availableCapabilities"] = ["local_datetime"];
+    if (process.env.LINK_READER_ENABLED !== "false" && input.candidateSet.candidates.length > 0) {
+      availableCapabilities.unshift("read_url");
+    }
+    if (input.allowSearch && process.env.RESEARCH_ENABLED === "true") {
+      availableCapabilities.push("web_search");
+    }
+    const latest = this.classifierMessage(input.latest);
+    latest.content = boundedUntrustedText(input.latest.content, 4_000);
+    try {
+      if (typeof this.lm.analyzeTurn !== "function") return createFailClosedTurnAnalysis("disabled");
+      return await this.lm.analyzeTurn({
+        turnId: input.turnId,
+        medium: input.medium,
+        channel: {
+          id: input.channelId,
+          name: channel?.public.name ?? input.channelId,
+          topic: channel?.topic.brief,
+        },
+        latestMessage: latest,
+        recentMessages: uniqueRecent,
+        personaCandidates: input.personas.map((persona) => ({
+          id: persona.id,
+          name: boundedUntrustedText(persona.name, 80),
+          interests: persona.interests.slice(0, 16).map((interest) => boundedUntrustedText(interest, 80)),
+        })),
+        urlCandidates: semanticUrlCandidates(input.candidateSet),
+        availableCapabilities,
+      });
+    } catch (error) {
+      console.warn("Turn analysis failed closed:", error instanceof Error ? error.message : error);
+      return createFailClosedTurnAnalysis("transport_error");
+    }
+  }
+
+  private classifiedToolPlan(
+    analysis: TurnAnalysis,
+    candidateSet: PageReadCandidateSet,
+    intent: string,
+    requesterId: string,
+  ): ClassifiedToolPlan {
+    const trusted = projectTrustedTurnAnalysis(analysis);
+    if (!trusted.evidenceTrusted) return {};
+    if (analysis.evidence.action === "read_url" && analysis.evidence.urlRef) {
+      const pageReadRequest = this.pageReader.resolveTarget({
+        candidateSet,
+        targetRef: analysis.evidence.urlRef,
+        intent,
+        retry: trusted.capabilityTrusted && analysis.capabilities.requestKind === "retry",
+      });
+      return pageReadRequest ? { pageReadRequest } : {};
+    }
+    if (
+      analysis.evidence.action === "web_search" &&
+      analysis.evidence.query &&
+      analysis.evidence.searchMode
+    ) {
+      return {
+        searchRequest: {
+          query: analysis.evidence.query,
+          mode: analysis.evidence.searchMode,
+          requesterId,
+        },
+      };
+    }
+    if (
+      analysis.evidence.action === "local_datetime" &&
+      analysis.evidence.timeZone &&
+      analysis.evidence.locationLabel
+    ) {
+      const localDateTime = resolveLocalDateTime({
+        timeZone: analysis.evidence.timeZone,
+        locationLabel: analysis.evidence.locationLabel,
+        languageTag: classifiedLanguage(analysis),
+        now: new Date(this.now()),
+      });
+      return localDateTime ? { localDateTime } : {};
+    }
+    return {};
+  }
+
+  private applyClassifiedMemoryChanges(
+    items: MemoryAnalysis["items"],
+    humanId: string,
+    channelId: string,
+  ): void {
+    for (const item of items) {
+      if (item.operation === "forget") {
+        this.humanMemory.forgetClassifiedMemoryFact?.(humanId, channelId, item, this.now());
+      } else {
+        this.humanMemory.noteClassifiedMemoryFact?.(humanId, channelId, item, this.now());
+      }
+    }
+  }
+
+  private schedulePersistentMemory(messages: readonly ChatMessage[], human: Member): void {
+    const currentBurst = messages
+      .filter((message) => !message.system && message.authorId === human.id)
+      .slice(-3);
+    const latest = currentBurst.at(-1);
+    if (!latest) return;
+    // Defer the optional low-priority pass until the live reply generation has
+    // entered the inference queue. Memory can never delay or decide the reply.
+    setTimeout(() => {
+      const recent = this.store.getRecent(latest.channelId, 40);
+      const currentIds = new Set(currentBurst.map((message) => message.id));
+      const firstCurrentIndex = recent.findIndex((candidate) => currentIds.has(candidate.id));
+      // If the bounded store window cannot prove where this burst starts, omit
+      // prior context rather than risk passing a later or different-author turn.
+      const priorPool = firstCurrentIndex >= 0 ? recent.slice(0, firstCurrentIndex) : [];
+      const prior = priorPool
+        .filter((candidate) => !candidate.system && candidate.authorId === human.id)
+        .slice(-5)
+        .map((candidate) => ({
+          id: candidate.id,
+          content: boundedUntrustedText(candidate.content, 1_200),
+          createdAt: candidate.createdAt,
+        }));
+      const currentBurstMessages = currentBurst.map((message) => ({
+        id: message.id,
+        content: boundedUntrustedText(message.content, 1_200),
+        createdAt: message.createdAt,
+      }));
+      const request = this.lm.analyzeMemoryTurn?.({
+        turnId: `memory:${latest.id}`,
+        authorId: human.id,
+        authorName: human.name,
+        content: latest.content,
+        currentBurstMessages,
+        recentSameAuthorMessages: prior,
+      });
+      if (!request) return;
+      void request.then((analysis) => {
+        if (analysis.source !== "lm") return;
+        this.applyClassifiedMemoryChanges(analysis.items, human.id, latest.channelId);
+      }).catch((error) => {
+        console.warn("Persistent memory analysis failed safely:", error instanceof Error ? error.message : error);
+      });
+    }, 0);
+  }
+
   private async resolveRequestedEvidence(
     pageReadRequest: PageReadRequest | undefined,
-    searchRequested: boolean,
-    content: string,
+    searchRequest: ResearchRequest | undefined,
     requesterId: string,
-    channelId?: string,
   ): Promise<ResearchPacket | undefined> {
     if (pageReadRequest) {
       const page = await this.pageReader.read(pageReadRequest, requesterId).catch((error) => {
-        console.warn("Exact linked-page read failed open:", error instanceof Error ? error.message : error);
+        console.warn("Exact linked-page read failed safely:", error instanceof Error ? error.message : error);
         return undefined;
       });
-      if (page) return page;
-      if (!pageReadRequest.url) return undefined;
-      return this.researchBroker.researchUrlFallback(content, pageReadRequest.url, requesterId).catch((error) => {
-        console.warn("Same-site evidence fallback failed open:", error instanceof Error ? error.message : error);
-        return undefined;
-      });
+      return page;
     }
-    if (!searchRequested) return undefined;
-    return this.researchBroker.research(content, requesterId, channelId).catch((error) => {
+    if (!searchRequest) return undefined;
+    return this.researchBroker.research(searchRequest).catch((error) => {
       console.warn("Fresh evidence lookup failed open:", error instanceof Error ? error.message : error);
       return undefined;
     });
@@ -1065,7 +1189,6 @@ export class SocialDirector {
     // would make an old relation look current and intentionally hide it from
     // the privacy-bounded promptNote filter.
     const relationshipNotes = this.relationshipNotes([persona], human);
-    this.updateRelationship(persona.id, human.id, { warmth: 0.15, aggression: 0 }, 0.08);
     this.publishDirectorEvent({
       trigger: "dm",
       summary: `${persona.name} prioritised a direct message from ${human.name}.`,
@@ -1078,18 +1201,51 @@ export class SocialDirector {
     let line: GeneratedLine | undefined;
     let research: ResearchPacket | undefined;
     const dmMessages = this.store.getDmMessages(message.channelId);
-    const pageReadRequest = this.pageReader.resolveRequest({
-      content: message.content,
+    const replyTarget = message.replyToId
+      ? dmMessages.find((candidate) => candidate.id === message.replyToId)
+      : undefined;
+    const candidateSet = this.pageReader.collectCandidates({
+      messages: [message],
       requesterId: human.id,
       recentMessages: dmMessages.slice(-120),
-      replyTarget: message.replyToId ? dmMessages.find((candidate) => candidate.id === message.replyToId) : undefined,
+      replyTargetFor: () => replyTarget,
       now: this.now(),
     });
-    const searchRequested = Boolean(!pageReadRequest && persona.canResearch && this.researchBroker.shouldResearch(message.content));
+    const analysis = await this.analyzeHumanTurn({
+      medium: "dm",
+      turnId: `dm:${message.id}`,
+      channelId: message.channelId,
+      latest: message,
+      burst: [message],
+      recent: dmMessages,
+      replyTarget,
+      personas: [persona],
+      candidateSet,
+      allowSearch: Boolean(persona.canResearch),
+    });
+    const signals = socialSignalsFromTurnAnalysis(analysis, [], analyzeSocialSignals(message.content, [persona]));
+    this.updateRelationship(persona.id, human.id, signals, 0.08);
+    const toolPlan = this.classifiedToolPlan(analysis, candidateSet, message.content, human.id);
+    const networkEvidenceRequested = Boolean(toolPlan.pageReadRequest || toolPlan.searchRequest);
     try {
-      if (pageReadRequest || searchRequested) {
-        research = await this.resolveRequestedEvidence(pageReadRequest, searchRequested, message.content, human.id);
+      if (networkEvidenceRequested) {
+        research = await this.resolveRequestedEvidence(
+          toolPlan.pageReadRequest,
+          toolPlan.searchRequest,
+          human.id,
+        );
       }
+      const evidencePremise = toolPlan.localDateTime
+        ? `${toolPlan.localDateTime.promptFact} Answer the requested current date/time from this trusted server clock fact; do not browse, estimate or cite a web source.`
+        : toolPlan.pageReadRequest
+          ? research
+            ? `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
+            : "This specific server-bound linked-page attempt returned no readable evidence. In the human's classified language, say only that this attempt failed; do not invent a cause or claim a permanent inability."
+          : toolPlan.searchRequest
+            ? research
+              ? `${persona.name} deliberately ran the classified fresh lookup. Answer only from the supplied results and cite only source IDs that support the claim.`
+              : "This specific classified fresh lookup returned no usable evidence. In the human's classified language, say so briefly as a temporary result and invent no current facts."
+            : "";
       const generated = await this.lm.generateScene(
         {
           kind: "dm",
@@ -1100,47 +1256,36 @@ export class SocialDirector {
           trigger: { author: human.name, content: message.content, messageId: message.id },
           mustReplyIds: [persona.id],
           relationshipNotes,
-          languageHint: languageHint(message.content),
+          languageHint: classifiedLanguage(analysis),
+          semanticContext: semanticSceneContext(analysis),
           actorChannelNotes: this.actorChannels.promptNotes([persona]),
           research,
-          evidenceOutcome: pageReadRequest || searchRequested ? (research ? "succeeded" : "failed") : undefined,
-          premise: pageReadRequest
-            ? research
-              ? research.kind === "page"
-                ? `${persona.name} opened the exact linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)} The page is already available: never claim that external pages cannot be fetched or that this link is dead.`
-                : `${persona.name} could not extract the exact page, but a same-site lookup returned the supplied evidence. Answer only what those snippets support, cite the relevant source IDs, and never claim to have opened the page itself.`
-              : "This specific linked-page attempt and its same-site fallback returned no readable evidence. Say only that it could not be retrieved this time; never invent a cause, call the link dead, or claim permanent inability to access external sites."
-            : searchRequested && !research
-              ? "This specific live lookup returned no usable source. Say so briefly as a temporary result, not a permanent lack of web access, and never invent current facts."
-              : undefined,
+          evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          premise: [semanticFlagsPremise(analysis), evidencePremise].filter(Boolean).join(" ") || undefined,
         },
         0,
       );
       line = generated[0];
     } catch (error) {
-      console.warn("DM scene used fallback:", error instanceof Error ? error.message : error);
+      console.warn("DM scene failed:", error instanceof Error ? error.message : error);
     } finally {
       this.setTyping(message.channelId, persona.id, false, [`user:${human.id}`]);
     }
 
     await delay(clamp(persona.latency[0] * 0.35, 500, 2_300));
-    const evidenceRequested = Boolean(pageReadRequest || searchRequested);
-    const mayUseGeneratedReply = !evidenceRequested || Boolean(research);
-    const generatedReply = mayUseGeneratedReply && line
+    const generatedReply = line
       ? normalizeGeneratedMessageContent(line.content)
       : undefined;
-    const evidenceReply = generatedReply || !evidenceRequested
-      ? undefined
-      : groundedEvidenceFallback(research, message.content)
-        ?? evidenceFailureFallback(Boolean(pageReadRequest), message.content);
-    const replyText = generatedReply ?? evidenceReply?.content ?? normalizeGeneratedMessageContent(this.fallback(persona, human.name, "dm"))!;
+    const replyText = generatedReply
+      ?? toolPlan.localDateTime?.fallbackText;
+    if (!replyText) return;
     const replySourceIds = generatedReply
       ? sourceIdsForPageResponder(
           research,
           line?.sourceIds ?? [],
-          Boolean(pageReadRequest),
+          Boolean(toolPlan.pageReadRequest),
         )
-      : evidenceReply?.sourceIds ?? [];
+      : [];
     const reply = this.store.addDmMessage(
       message.channelId,
       persona.id,
@@ -1157,7 +1302,7 @@ export class SocialDirector {
       channelId: message.channelId,
       channelName: `private chat with ${human.name}`,
     });
-    this.lastSpoke.set(persona.id, Date.now());
+    this.lastSpoke.set(persona.id, this.now());
   }
 
   private async handleHumanBurst(
@@ -1169,25 +1314,55 @@ export class SocialDirector {
     if (!trigger) return;
     const hasImage = Boolean(trigger.attachments?.length);
     const combined = messages.map((message) => message.content).filter(Boolean).join("\n");
-    const visualSignalText = visualObservation
-      ? `${visualObservation.summary}\n${visualObservation.details.join("\n")}\n${visualObservation.topics.join(" ")}`
-      : "";
-    const humanSignals = analyzeSocialSignals(combined);
-    const visualSignals = visualObservation ? analyzeSocialSignals(visualSignalText) : undefined;
-    // Derived visual text may contain names, quoted attacks or imperative OCR.
-    // It may improve topical routing, but only the human caption is allowed to
-    // create mentions, moderation events, dissent requirements or research.
-    const signals: SocialSignals = visualSignals
-      ? {
-          ...humanSignals,
-          matchedTopics: new Set([...humanSignals.matchedTopics, ...visualSignals.matchedTopics]),
-        }
-      : humanSignals;
     const replyTarget = trigger.replyToId ? this.store.getMessage(trigger.replyToId) : undefined;
-    signals.mentionedIds = addressedPersonaIds(signals.mentionedIds, replyTarget);
+    const recentMessages = this.store.getRecent(trigger.channelId, 120);
+    const candidateSet = this.pageReader.collectCandidates({
+      messages,
+      requesterId: human.id,
+      recentMessages,
+      replyTargetFor: (candidate) => candidate.replyToId ? this.store.getMessage(candidate.replyToId) : undefined,
+      now: this.now(),
+    });
+    const initialCandidates = this.actorChannels.candidatesFor(trigger.channelId);
+    const analysis = await this.analyzeHumanTurn({
+      medium: "public",
+      turnId: `public:${trigger.id}`,
+      channelId: trigger.channelId,
+      latest: trigger,
+      burst: messages,
+      recent: recentMessages,
+      replyTarget,
+      personas: initialCandidates,
+      candidateSet,
+      allowSearch: true,
+    });
+    const trustedLanguage = classifiedLanguage(analysis);
+    if (trustedLanguage) this.lastTrustedLanguageByChannel.set(trigger.channelId, trustedLanguage);
+    const mechanicalSignals = analyzeSocialSignals(combined);
+    const deterministicAddressedIds = addressedPersonaIds(mechanicalSignals.mentionedIds, replyTarget);
+    if (analysis.source !== "lm" && deterministicAddressedIds.length === 0) {
+      // Without semantic routing we cannot safely infer relevance, moderation,
+      // question intent or social dynamics. Exact @mentions/replies may still
+      // use the scene model, but an ordinary public turn stays quiet instead of
+      // recruiting a mostly random resident from punctuation alone.
+      this.publishDirectorEvent({
+        trigger: "message",
+        summary: "Semantic routing was unavailable, so the room did not force a reply.",
+        considered: PERSONAS.length,
+        noticed: 0,
+        replied: 0,
+        reacted: 0,
+      });
+      this.schedulePersistentMemory(messages, human);
+      return;
+    }
+    // The classifier sees human-authored chat text only. Visual observations
+    // are passed later as scene context and cannot affect tools, moderation,
+    // mentions, dissent or persistent memory.
+    const signals = socialSignalsFromTurnAnalysis(analysis, deterministicAddressedIds, mechanicalSignals);
     const candidates = this.actorChannels.candidatesFor(trigger.channelId, signals.mentionedIds);
     const attention = new Map(candidates.map((persona) => [persona.id, this.actorChannels.affinity(persona.id, trigger.channelId)]));
-    let selected = selectResponders(candidates, signals, this.lastSpoke, Date.now(), Math.random, attention);
+    let selected = selectResponders(candidates, signals, this.lastSpoke, this.now(), this.rng, attention);
     if (visualObservation && selected.length === 0) {
       const mostRelevant = [...candidates].sort(
         (a, b) =>
@@ -1196,15 +1371,9 @@ export class SocialDirector {
       )[0];
       if (mostRelevant) selected = [mostRelevant];
     }
-    const pageReadRequest = this.pageReader.resolveBurst({
-      messages,
-      requesterId: human.id,
-      recentMessages: this.store.getRecent(trigger.channelId, 120),
-      replyTargetFor: (message) => message.replyToId ? this.store.getMessage(message.replyToId) : undefined,
-      now: this.now(),
-    });
-    const searchRequested = !pageReadRequest && this.researchBroker.shouldResearch(combined, trigger.channelId);
-    const evidenceRequested = Boolean(pageReadRequest) || searchRequested;
+    const toolPlan = this.classifiedToolPlan(analysis, candidateSet, combined, human.id);
+    const networkEvidenceRequested = Boolean(toolPlan.pageReadRequest || toolPlan.searchRequest);
+    const evidenceRequested = networkEvidenceRequested || Boolean(toolPlan.localDateTime);
     let evidenceResponder: Persona | undefined;
     if (evidenceRequested) {
       const evidenceSelection = ensureEvidenceResponder(
@@ -1212,7 +1381,7 @@ export class SocialDirector {
         candidates,
         signals.mentionedIds,
         attention,
-        !pageReadRequest,
+        Boolean(toolPlan.searchRequest),
       );
       selected = evidenceSelection.selected;
       evidenceResponder = evidenceSelection.responder;
@@ -1233,10 +1402,11 @@ export class SocialDirector {
         replied: 0,
         reacted: reactionCount,
       });
+      this.schedulePersistentMemory(messages, human);
       return;
     }
     for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, true);
-    const generatedAt = Date.now();
+    const generatedAt = this.now();
     const humanizerBudget = { repairsRemaining: 1 };
     const requiredIds = [
       ...new Set([
@@ -1251,24 +1421,23 @@ export class SocialDirector {
     let research: ResearchPacket | undefined;
     let evidencePremise = "";
     try {
-      if (pageReadRequest || searchRequested) {
+      if (networkEvidenceRequested) {
         research = await this.resolveRequestedEvidence(
-          pageReadRequest,
-          searchRequested,
-          combined,
+          toolPlan.pageReadRequest,
+          toolPlan.searchRequest,
           human.id,
-          trigger.channelId,
         );
         if (research) triggerType = "research";
-        evidencePremise = pageReadRequest
+        evidencePremise = toolPlan.pageReadRequest
           ? research
-            ? research.kind === "page"
-              ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact linked page and is solely responsible for answering the request from the supplied page evidence. ${pageEvidenceAnswerContract(research)} The page is already available: this resident must not claim that external pages cannot be fetched, that the content is unavailable, or that the link is dead. Other selected residents may react briefly but must not claim to have read it. Attach S1 to every message that relies on the page.`
-              : `${evidenceResponder?.name ?? "The designated resident"} could not extract the exact page, but a same-site lookup returned the supplied evidence. This resident answers only what those snippets support and cites the relevant source IDs, without claiming to have opened the page. Other selected residents must not discuss retrieval or repeat a limitation.`
-            : `${evidenceResponder?.name ?? "The designated resident"} alone says that this specific linked-page attempt and its same-site fallback returned no readable evidence. Phrase it as a temporary result; never invent a cause, call the link dead, or claim permanent inability to access external sites. Nobody may guess contents or repeat the failure.`
+            ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound linked page and is solely responsible for answering from the supplied page evidence. ${pageEvidenceAnswerContract(research)} Attach S1 to every message that relies on the page.`
+            : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific server-bound linked-page attempt returned no readable evidence. It is a temporary result; nobody guesses contents or invents a cause.`
           : research
-            ? `${evidenceResponder?.name ?? "The designated resident"} deliberately looked up fresh evidence and is responsible for the sourced answer. Use it selectively and attach only source IDs that support each factual claim. Other selected residents must not pretend to have performed the lookup.`
-            : `${evidenceResponder?.name ?? "The designated resident"} alone says this specific live lookup returned no usable source. Phrase it as temporary, never as a permanent lack of web access, and do not invent current facts or let other residents repeat the failure.`;
+            ? `${evidenceResponder?.name ?? "The designated resident"} ran the classifier's standalone fresh-data query and is responsible for the sourced answer. Attach only source IDs that support each claim; result rank alone is never an answer.`
+            : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific fresh lookup returned no usable source. Treat it as temporary and invent no current facts.`;
+      } else if (toolPlan.localDateTime) {
+        triggerType = "research";
+        evidencePremise = `${toolPlan.localDateTime.promptFact} ${evidenceResponder?.name ?? "The designated resident"} alone answers the requested current date/time from this trusted server clock fact. Do not browse, estimate or cite a web source.`;
       }
       const dissenter = selected.find((persona) => (persona.disagreement ?? 0) >= 0.65);
       const premise = [
@@ -1278,6 +1447,7 @@ export class SocialDirector {
         hasImage && !visualObservation
           ? "The human shared an image, but visual analysis was unavailable. Never claim to see or know visual details; respond only to the caption, or briefly acknowledge that the image details are unavailable."
           : "",
+        semanticFlagsPremise(analysis),
         evidencePremise,
         signals.claimStrength > 0.28 && dissenter
           ? `${dissenter.name} should make one specific respectful disagreement, acknowledge any valid part, and avoid a pile-on. Other actors must add a different angle rather than echoing the challenge.`
@@ -1296,18 +1466,19 @@ export class SocialDirector {
           trigger: { author: human.name, content: combined, messageId: trigger.id },
           mustReplyIds: requiredIds,
           relationshipNotes,
-          languageHint: languageHint(trigger.content),
+          languageHint: classifiedLanguage(analysis),
+          semanticContext: semanticSceneContext(analysis),
           actorChannelNotes: this.actorChannels.promptNotes(selected, trigger.channelId),
           actorExpertiseNotes: this.actorChannels.expertiseNotes(selected, trigger.channelId),
           visualObservation,
           research,
-          evidenceOutcome: evidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
           premise: premise || undefined,
         },
         signals.mentionedIds.length ? 0 : 2,
       );
     } catch (error) {
-      console.warn("Public scene used fallback:", error instanceof Error ? error.message : error);
+      console.warn("Public scene failed:", error instanceof Error ? error.message : error);
     } finally {
       for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, false);
     }
@@ -1316,7 +1487,6 @@ export class SocialDirector {
     for (const requiredId of requiredIds.filter((id) => !lines.some((line) => line.personaId === id))) {
       const persona = selected.find((candidate) => candidate.id === requiredId);
       if (!persona) continue;
-      if (evidenceRequested && !research && evidenceResponder?.id === persona.id) continue;
       this.setTyping(trigger.channelId, persona.id, true);
       try {
         const focused = await this.lm.generateScene(
@@ -1330,13 +1500,15 @@ export class SocialDirector {
             trigger: { author: human.name, content: trigger.content, messageId: trigger.id },
             mustReplyIds: [persona.id],
             relationshipNotes: { [persona.id]: relationshipNotes[persona.id]! },
-            languageHint: languageHint(trigger.content),
+            languageHint: classifiedLanguage(analysis),
+            semanticContext: semanticSceneContext(analysis),
             actorChannelNotes: this.actorChannels.promptNotes([persona], trigger.channelId),
             actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], trigger.channelId),
             visualObservation,
             research,
-            evidenceOutcome: evidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+            evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
             premise: [
+              semanticFlagsPremise(analysis),
               evidencePremise,
               signals.mentionedIds.includes(persona.id)
                 ? `${persona.name} was directly addressed and must answer in their own concise voice.`
@@ -1349,43 +1521,38 @@ export class SocialDirector {
         );
         if (focused[0]) lines.push(focused[0]);
       } catch (error) {
-        console.warn("Focused mention retry used fallback:", error instanceof Error ? error.message : error);
+        console.warn("Focused mention retry failed:", error instanceof Error ? error.message : error);
       } finally {
         this.setTyping(trigger.channelId, persona.id, false);
       }
     }
-    if (evidenceRequested && !research) {
-      const failedResponder = evidenceResponder ?? selected[0];
-      const failed = evidenceFailureFallback(Boolean(pageReadRequest), trigger.content);
-      lines = failedResponder
-        ? [{
-            personaId: failedResponder.id,
-            content: failed.content,
-            source: "fallback",
-            sourceIds: failed.sourceIds,
-          }]
+    if ((networkEvidenceRequested && !research) || toolPlan.localDateTime) {
+      // A failed lookup or trusted clock answer has one owner. Do not let
+      // generic crowd lines turn a required factual turn into social noise.
+      lines = evidenceResponder
+        ? lines.filter((line) => line.personaId === evidenceResponder.id)
         : [];
     }
-    if (!(evidenceRequested && !research)) {
-      for (const persona of selected) {
-        if (!lines.some((line) => line.personaId === persona.id) && (required.has(persona.id) || lines.length === 0)) {
-          const grounded = evidenceRequested && evidenceResponder?.id === persona.id
-            ? groundedEvidenceFallback(research, trigger.content)
-              ?? evidenceFailureFallback(Boolean(pageReadRequest), trigger.content)
-            : undefined;
-          lines.push({
-            personaId: persona.id,
-            content: grounded?.content ?? (hasImage
-              ? this.imageFallback(persona, human.name, Boolean(visualObservation))
-              : this.fallback(persona, human.name, "public", trigger.content)),
-            source: "fallback",
-            sourceIds: grounded?.sourceIds ?? [],
-          });
-        }
-      }
+    const safeEvidenceFallback = toolPlan.localDateTime
+      ? { content: toolPlan.localDateTime.fallbackText, sourceIds: [] }
+      : undefined;
+    if (
+      safeEvidenceFallback &&
+      evidenceResponder &&
+      !lines.some((line) => line.personaId === evidenceResponder.id)
+    ) {
+      lines.push({
+        personaId: evidenceResponder.id,
+        content: safeEvidenceFallback.content,
+        source: "fallback",
+        sourceIds: safeEvidenceFallback.sourceIds,
+      });
     }
     lines.sort((a, b) => Number(required.has(b.personaId)) - Number(required.has(a.personaId)));
-    if (Date.now() - generatedAt > 45_000 && required.size === 0) return;
+    if (this.now() - generatedAt > 45_000 && required.size === 0) {
+      this.schedulePersistentMemory(messages, human);
+      return;
+    }
 
     const actualSpeakers = lines
       .map((line) => selected.find((persona) => persona.id === line.personaId))
@@ -1418,7 +1585,7 @@ export class SocialDirector {
             research,
             line.sourceIds,
             Boolean(
-              pageReadRequest &&
+              toolPlan.pageReadRequest &&
               evidenceResponder?.id === line.personaId &&
               (line.source === "lm" || line.sourceIds.includes("S1")),
             ),
@@ -1426,22 +1593,20 @@ export class SocialDirector {
         ),
       );
       if (!posted && required.has(persona.id)) {
-        const grounded = evidenceRequested && evidenceResponder?.id === persona.id
-          ? groundedEvidenceFallback(research, trigger.content)
-            ?? evidenceFailureFallback(Boolean(pageReadRequest), trigger.content)
-          : undefined;
-        this.postPublic(
-          trigger.channelId,
-          persona,
-          grounded?.content ?? (hasImage
-            ? this.imageFallback(persona, human.name, Boolean(visualObservation))
-            : this.fallback(persona, human.name, "public", trigger.content)),
-          trigger.id,
-          "fallback",
-          this.messageSources(research, grounded?.sourceIds ?? []),
-        );
+        const fallback = evidenceResponder?.id === persona.id ? safeEvidenceFallback : undefined;
+        if (fallback) {
+          this.postPublic(
+            trigger.channelId,
+            persona,
+            fallback.content,
+            trigger.id,
+            "fallback",
+            this.messageSources(research, fallback.sourceIds),
+          );
+        }
       }
     }
+    this.schedulePersistentMemory(messages, human);
   }
 
   private scheduleCrowdReactions(message: ChatMessage, signals: SocialSignals, responders: Persona[]): number {
@@ -1527,10 +1692,12 @@ export class SocialDirector {
     const freshSeeds = profile.ambientPremises.filter((seed) => seed !== previousSeed);
     const seed = choose(freshSeeds.length > 0 ? freshSeeds : profile.ambientPremises, this.rng);
     const recent = this.store.getRecent(channelId, 80);
+    const languageTag = this.lastTrustedLanguageByChannel.get(channelId);
     const thread: AmbientThreadState = {
       seed,
       messageCount: 0,
-      languageHint: ambientLanguageHint(recent),
+      languageHint: languageTag ?? ambientLanguageHint(recent),
+      ...(languageTag ? { languageTag } : {}),
       updatedAt: now,
     };
     this.ambientThreads.set(channelId, thread);
@@ -1575,7 +1742,7 @@ export class SocialDirector {
     let responseLine: GeneratedLine | undefined;
     try {
       try {
-        const history = this.transcript(channel.id, 18);
+        const history = this.ambientTranscript(channel.id, 18);
         const leadLines = await this.lm.generateScene(
           {
             kind: "ambient",
@@ -1589,6 +1756,12 @@ export class SocialDirector {
             mustReplyIds: [plan.lead.id],
             wordLimits: { [plan.lead.id]: leadWordLimit },
             languageHint: thread.languageHint,
+            semanticContext: thread.languageTag ? {
+              languageTag: thread.languageTag,
+              asksForList: false,
+              asksAboutAiIdentity: false,
+              asksAboutAcoustics: false,
+            } : undefined,
             actorChannelNotes: this.actorChannels.promptNotes([plan.lead], channel.id),
             actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.lead], channel.id),
           },
@@ -1618,6 +1791,12 @@ export class SocialDirector {
               mustReplyIds: [plan.responder.id],
               wordLimits: { [plan.responder.id]: responseWordLimit },
               languageHint: thread.languageHint,
+              semanticContext: thread.languageTag ? {
+                languageTag: thread.languageTag,
+                asksForList: false,
+                asksAboutAiIdentity: false,
+                asksAboutAcoustics: false,
+              } : undefined,
               actorChannelNotes: this.actorChannels.promptNotes([plan.responder], channel.id),
               actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.responder], channel.id),
             },
@@ -1784,10 +1963,16 @@ export class SocialDirector {
             channelId: channel.id,
             channelName: channel.name,
             selected,
-            history: this.transcript(channel.id, 18),
+            history: this.ambientTranscript(channel.id, 18),
             premise,
             wordLimits,
             languageHint: thread.languageHint,
+            semanticContext: thread.languageTag ? {
+              languageTag: thread.languageTag,
+              asksForList: false,
+              asksAboutAiIdentity: false,
+              asksAboutAcoustics: false,
+            } : undefined,
             actorChannelNotes: this.actorChannels.promptNotes(selected, channel.id),
             actorExpertiseNotes: this.actorChannels.expertiseNotes(selected, channel.id),
           },
@@ -1933,11 +2118,19 @@ export class SocialDirector {
   }
 
   private transcript(channelId: string, limit: number): TranscriptLine[] {
+    return this.transcriptMessages(this.store.getRecent(channelId, limit));
+  }
+
+  private ambientTranscript(channelId: string, limit: number): TranscriptLine[] {
+    return this.transcriptMessages(ambientHistoryWithAnchor(this.store.getRecent(channelId, 80), limit));
+  }
+
+  private transcriptMessages(messages: readonly ChatMessage[]): TranscriptLine[] {
     const members = new Map(this.getMembers().map((member) => [member.id, member]));
     for (const persona of PERSONAS) members.set(persona.id, persona);
-    return this.store.getRecent(channelId, limit).map((message) => ({
-      author: members.get(message.authorId)?.name ?? (message.system ? "room" : "unknown"),
-      kind: message.system ? "system" : members.get(message.authorId)?.kind ?? "human",
+    return messages.map((message) => ({
+      author: members.get(message.authorId)?.name ?? message.authorSnapshot?.name ?? (message.system ? "room" : "unknown"),
+      kind: message.system ? "system" : members.get(message.authorId)?.kind ?? message.authorSnapshot?.kind ?? "human",
       content: this.transcriptContent(message),
       createdAt: message.createdAt,
     }));
@@ -2060,42 +2253,6 @@ export class SocialDirector {
         ];
       }),
     );
-  }
-
-  private fallback(persona: Persona, humanName: string, kind: "welcome" | "dm" | "public", content = ""): string {
-    if (kind === "welcome") {
-      const welcomes: Record<string, string> = {
-        "ai-bosse": `${humanName} has joined. everybody hide the normal opinions`,
-        "ai-sana": `Hey ${humanName} — welcome in. You arrived mid-chaos, which is ideal.`,
-        "ai-mira": `oh hey ${humanName} 👋 perfect timing, we need one more opinion in here`,
-        "ai-moss": `welcome, ${humanName} — there is room by the window`,
-      };
-      return welcomes[persona.id] ?? `Hey ${humanName}, welcome in 👋`;
-    }
-    if (kind === "dm") return `hey ${humanName} — saw this. ${persona.id === "ai-nox" ? "give me a second to think." : "what's your angle?"}`;
-    if (persona.id === "ai-bosse") return `bold thing to put in writing, ${humanName}`;
-    if (persona.id === "ai-nox") return "That got stranger the longer I looked at it.";
-    if (persona.id === "ai-runa") return "Let's keep the chaos aimed at ideas, not at each other.";
-    if (persona.id === "ai-sana") return `Wait, there's actually something good in that idea — ${content.slice(0, 42)}${content.length > 42 ? "…" : ""}`;
-    return `okay ${humanName}, that definitely got my attention`;
-  }
-
-  private returningWelcomeFallback(persona: Persona, humanName: string): string {
-    const welcomes: Record<string, string> = {
-      "ai-bosse": `${humanName} is back. we had almost restored order`,
-      "ai-sana": `Hey ${humanName} — good to see you back in here.`,
-      "ai-mira": `oh hey ${humanName}, welcome back 👋`,
-      "ai-moss": `welcome back, ${humanName} — your corner is still here`,
-    };
-    return welcomes[persona.id] ?? `Hey ${humanName}, welcome back 👋`;
-  }
-
-  private imageFallback(persona: Persona, humanName: string, visualDetailsAvailable: boolean): string {
-    if (!visualDetailsAvailable) return `I can see the upload, ${humanName}, but I can't make out its details right now.`;
-    if (persona.id === "ai-pixel") return "okay, that image has the room's visual brain fully awake";
-    if (persona.id === "ai-nox") return "That image has more going on the longer you sit with it.";
-    if (persona.id === "ai-bosse") return "dropping this into the room without warning was a powerful choice";
-    return `okay ${humanName}, that image definitely got my attention`;
   }
 
 }
