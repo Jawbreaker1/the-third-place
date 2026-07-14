@@ -5,7 +5,8 @@ import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { CHANNELS, getChannelProfile } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
-import type { LmStudioClient, TranscriptLine } from "./lmStudio.js";
+import type { TranscriptLine } from "./lmStudio.js";
+import type { SocialModelClient } from "./switchableModel.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import { mappedProviderVoiceForPersona, voiceProfileForPersona } from "./personaVoices.js";
 import {
@@ -48,7 +49,7 @@ export interface VoiceChannelRecentMessage {
 
 export interface VoiceDirectorOptions {
   runtime: VoiceRoomRuntime;
-  lm: Pick<LmStudioClient, "analyzeTurn" | "generateScene"> & Partial<Pick<LmStudioClient, "rememberDeliveredLine">>;
+  lm: Pick<SocialModelClient, "analyzeTurn" | "generateScene"> & Partial<Pick<SocialModelClient, "rememberDeliveredLine">>;
   speech: Pick<VoiceSpeechService, "capabilities" | "synthesize">;
   actorChannels: ActorChannelRuntime;
   events: VoiceDirectorEvents;

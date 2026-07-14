@@ -9,10 +9,13 @@ import {
   hasStrictAdminOrigin,
 } from "./adminAuth.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
+import { ModelProviderManagerError, type AdminLlmProviderControl } from "./modelProviderManager.js";
 
 const loginSchema = z.object({ password: z.string().min(1).max(1_024) }).strict();
 const moderationSchema = z.object({ reason: z.string().min(1).max(240).optional() }).strict();
 const idParam = z.string().min(1).max(100);
+const providerPatchSchema = z.object({ activeProvider: z.enum(["lmstudio", "codex"]) }).strict();
+const emptyBodySchema = z.object({}).strict();
 
 export interface AdminRouterDependencies {
   auth: AdminAuthManager;
@@ -23,10 +26,16 @@ export interface AdminRouterDependencies {
   banHuman: (memberId: string, reason?: string) => AdminHumanMember | undefined;
   isSecure?: (request: Request) => boolean;
   now?: () => number;
+  llmProviders?: AdminLlmProviderControl;
+  onLlmProviderChanged?: () => Promise<void> | void;
 }
 
 const sendError = (response: Response, error: unknown): void => {
   if (error instanceof AdminStateError) {
+    response.status(error.status).json({ ok: false, code: error.code, error: error.message });
+    return;
+  }
+  if (error instanceof ModelProviderManagerError) {
     response.status(error.status).json({ ok: false, code: error.code, error: error.message });
     return;
   }
@@ -118,6 +127,60 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
 
   const stateResponse = () => dependencies.state.snapshot(dependencies.getHumans());
   router.get("/state", (_request, response) => response.json({ ok: true, state: stateResponse() }));
+
+  router.get("/llm", async (_request, response, next) => {
+    if (!dependencies.llmProviders) {
+      response.status(503).json({ ok: false, error: "AI provider administration is unavailable." });
+      return;
+    }
+    try {
+      response.json(await dependencies.llmProviders.snapshot());
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.patch("/llm", async (request, response, next) => {
+    if (!dependencies.llmProviders) {
+      response.status(503).json({ ok: false, error: "AI provider administration is unavailable." });
+      return;
+    }
+    try {
+      const patch = providerPatchSchema.parse(request.body);
+      await dependencies.llmProviders.setActiveProvider(patch.activeProvider);
+      await dependencies.onLlmProviderChanged?.();
+      response.json(await dependencies.llmProviders.snapshot());
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.post("/llm/codex/login", async (request, response, next) => {
+    if (!dependencies.llmProviders) {
+      response.status(503).json({ ok: false, error: "Codex CLI is unavailable." });
+      return;
+    }
+    try {
+      emptyBodySchema.parse(request.body ?? {});
+      response.json(await dependencies.llmProviders.startCodexLogin());
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.delete("/llm/codex/session", async (request, response, next) => {
+    if (!dependencies.llmProviders) {
+      response.status(503).json({ ok: false, error: "Codex CLI is unavailable." });
+      return;
+    }
+    try {
+      emptyBodySchema.parse(request.body ?? {});
+      await dependencies.llmProviders.logoutCodex();
+      response.status(204).end();
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
 
   router.patch("/behavior", async (request, response, next) => {
     try {

@@ -26,8 +26,8 @@ import {
   type GeneratedLine,
   type RoomRecallEvidence,
   type TranscriptLine,
-  LmStudioClient,
 } from "./lmStudio.js";
+import type { SocialModelClient } from "./switchableModel.js";
 import { createMessage, RoomStore } from "./store.js";
 import {
   ResearchBroker,
@@ -1262,7 +1262,7 @@ export class SocialDirector {
   constructor(
     private readonly io: Server,
     private readonly store: RoomStore,
-    private readonly lm: LmStudioClient,
+    private readonly lm: SocialModelClient,
     private readonly actorChannels: ActorChannelRuntime,
     private readonly researchBroker: ResearchBroker,
     private readonly humanMemory: HumanMemory,

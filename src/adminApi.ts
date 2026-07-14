@@ -6,6 +6,13 @@ import type {
   AdminStateSnapshot,
 } from "../shared/adminTypes";
 import { normalizeAdminState } from "./adminModel";
+import {
+  normalizeAdminCodexLoginResult,
+  normalizeAdminLlmState,
+  type AdminCodexLoginResult,
+  type AdminLlmProviderId,
+  type AdminLlmState,
+} from "./adminLlmModel";
 
 export class AdminApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -83,6 +90,22 @@ export async function deleteAdminSession(): Promise<void> {
 
 export async function getAdminState(): Promise<AdminStateSnapshot> {
   return normalizeAdminState(await request("/api/admin/state"));
+}
+
+export async function getAdminLlmState(): Promise<AdminLlmState> {
+  return normalizeAdminLlmState(await request("/api/admin/llm"));
+}
+
+export async function patchAdminLlmProvider(activeProvider: AdminLlmProviderId): Promise<void> {
+  await request("/api/admin/llm", { method: "PATCH", body: jsonBody({ activeProvider }) });
+}
+
+export async function startAdminCodexLogin(): Promise<AdminCodexLoginResult> {
+  return normalizeAdminCodexLoginResult(await request("/api/admin/llm/codex/login", { method: "POST" }));
+}
+
+export async function deleteAdminCodexSession(): Promise<void> {
+  await request("/api/admin/llm/codex/session", { method: "DELETE" });
 }
 
 export async function patchAdminBehavior(patch: AdminBehaviorPatch): Promise<void> {

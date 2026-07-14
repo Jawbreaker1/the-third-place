@@ -42,6 +42,10 @@ import { LinkPreviewBroker } from "./linkPreviewBroker.js";
 import { fetchRemoteImage, ImageStore, ImageStoreError } from "./imageStore.js";
 import { HUMAN_MEMORY_DEFAULTS, HumanMemoryStore } from "./humanMemory.js";
 import { LmStudioClient } from "./lmStudio.js";
+import { LmStudioBackend } from "./lmStudioBackend.js";
+import { CodexBackend } from "./codexBackend.js";
+import { ModelProviderManager } from "./modelProviderManager.js";
+import { SwitchableSocialModel } from "./switchableModel.js";
 import { CHANNELS } from "./channels.js";
 import { PERSONAS, memberView } from "./personas.js";
 import { configuredProviderVoiceIds } from "./personaVoices.js";
@@ -409,7 +413,17 @@ const store = new RoomStore();
 const humanMemory = new HumanMemoryStore();
 let adminState!: AdminStateStore;
 const behaviorTuningProvider = (channelId?: string) => adminState?.behaviorTuning(channelId);
-const lm = new LmStudioClient({ behaviorTuningProvider });
+const lmStudioBackend = new LmStudioBackend();
+const codexBackend = new CodexBackend();
+const lmStudioClient = new LmStudioClient({ behaviorTuningProvider, backend: lmStudioBackend });
+const codexClient = new LmStudioClient({
+  behaviorTuningProvider,
+  backend: codexBackend,
+  timeoutMs: Number.parseInt(process.env.CODEX_TIMEOUT_MS ?? "120000", 10),
+});
+const lm = new SwitchableSocialModel({ lmstudio: lmStudioClient, codex: codexClient });
+const modelProviders = new ModelProviderManager(lm, codexBackend);
+await modelProviders.load();
 const researchBroker = new ResearchBroker();
 const linkPreviewBroker = new LinkPreviewBroker();
 const imageStore = new ImageStore();
@@ -821,6 +835,13 @@ app.use("/api/admin", createAdminRouter({
   kickHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, true),
   banHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, false),
   isSecure: (request) => request.secure || publicOrigin?.startsWith("https://") === true,
+  llmProviders: modelProviders,
+  onLlmProviderChanged: async () => {
+    await lm.probe();
+    director.reconcileCatalog();
+    voiceDirector.onCatalogChanged(voiceRooms.listRooms().map((room) => room.id));
+    io.to("public").emit("health:update", getHealth());
+  },
 }));
 
 app.get("/api/voice/capabilities", (_request, response) => {
@@ -1688,14 +1709,18 @@ const healthInterval = setInterval(async () => {
     if (recent.length > 0) joinAttempts.set(ip, recent);
     else joinAttempts.delete(ip);
   }
-  await lm.probe();
+  try {
+    await lm.probe();
+  } catch (error) {
+    console.warn("AI provider health probe was invalidated:", error instanceof Error ? error.message : error);
+  }
   io.to("public").emit("health:update", getHealth());
 }, 15_000);
 healthInterval.unref();
 
 httpServer.listen(PORT, HOST, () => {
   console.log(`The Third Place is live on http://${HOST}:${PORT}`);
-  console.log(`LM Studio: ${lm.health().connected ? lm.health().id : "offline — model-driven replies are unavailable"}`);
+  console.log(`AI provider (${lm.activeProvider()}): ${lm.health().connected ? lm.health().id : "offline — model-driven replies are unavailable"}`);
 });
 
 const shutdown = async (signal: string) => {
@@ -1703,7 +1728,7 @@ const shutdown = async (signal: string) => {
   clearInterval(healthInterval);
   director.stop();
   io.close();
-  await Promise.all([store.flush(), humanMemory.flush(), adminState.flush()]);
+  await Promise.all([store.flush(), humanMemory.flush(), adminState.flush(), modelProviders.close()]);
   httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5_000).unref();
 };

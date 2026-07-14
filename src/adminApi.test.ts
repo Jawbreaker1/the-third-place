@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deleteAdminSession, patchAdminBehavior, patchAdminPersona } from "./adminApi";
+import {
+  deleteAdminCodexSession,
+  deleteAdminSession,
+  getAdminLlmState,
+  patchAdminBehavior,
+  patchAdminLlmProvider,
+  patchAdminPersona,
+  startAdminCodexLogin,
+} from "./adminApi";
 
 describe("admin behavior API", () => {
   afterEach(() => {
@@ -75,5 +83,68 @@ describe("admin session API", () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(networkError));
 
     await expect(deleteAdminSession()).rejects.toBe(networkError);
+  });
+});
+
+describe("admin LLM provider API", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reads and normalizes provider status through the authenticated admin boundary", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      activeProvider: "codex",
+      providers: {
+        lmstudio: { status: "connected", model: "gemma" },
+        codex: { status: "authenticated", model: "gpt-5.6-luna", reasoningEffort: "low" },
+      },
+    }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getAdminLlmState()).resolves.toMatchObject({
+      activeProvider: "codex",
+      providers: { codex: { status: "authenticated", reasoningEffort: "low" } },
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/llm", expect.objectContaining({
+      credentials: "same-origin",
+      headers: expect.objectContaining({ Accept: "application/json" }),
+    }));
+  });
+
+  it("switches providers with only the allowlisted provider ID", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await patchAdminLlmProvider("codex");
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/llm", expect.objectContaining({
+      method: "PATCH",
+      credentials: "same-origin",
+      body: JSON.stringify({ activeProvider: "codex" }),
+    }));
+  });
+
+  it("starts and disconnects Codex auth without sending browser credentials", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        status: "pending",
+        verificationUrl: "https://auth.openai.com/device",
+        userCode: "ABCD-EFGH",
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(startAdminCodexLogin()).resolves.toMatchObject({ status: "pending", userCode: "ABCD-EFGH" });
+    await deleteAdminCodexSession();
+
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/admin/llm/codex/login",
+      expect.objectContaining({ method: "POST", credentials: "same-origin" }),
+    ]);
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).body).toBeUndefined();
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "/api/admin/llm/codex/session",
+      expect.objectContaining({ method: "DELETE", credentials: "same-origin" }),
+    ]);
   });
 });

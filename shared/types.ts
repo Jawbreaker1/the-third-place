@@ -135,6 +135,7 @@ export interface ServerHealth {
     label: string;
     latencyMs?: number;
     queueDepth: number;
+    provider?: "lmstudio" | "codex";
   };
   onlineHumans: number;
   aiPace: "calm" | "lively" | "party";

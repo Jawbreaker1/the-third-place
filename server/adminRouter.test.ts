@@ -314,6 +314,88 @@ describe("admin HTTP API", () => {
     expect(wrong.body).toMatchObject({ ok: false, authenticated: false });
   });
 
+  it("exposes only device-code provider controls behind the admin boundary", async () => {
+    const state = new AdminStateStore({ persist: async () => undefined });
+    await state.load();
+    const selected: string[] = [];
+    let loggedOut = false;
+    const app = express();
+    app.use("/api/admin", createAdminRouter({
+      auth: new AdminAuthManager({
+        password: "correct horse battery staple",
+        randomToken: () => "p".repeat(43),
+      }),
+      state,
+      configuredOrigins: ["https://admin.example"],
+      getHumans: () => [],
+      kickHuman: () => undefined,
+      banHuman: () => undefined,
+      llmProviders: {
+        snapshot: async () => ({
+          activeProvider: selected.at(-1) === "codex" ? "codex" : "lmstudio",
+          providers: {
+            lmstudio: { status: "connected", model: "gemma" },
+            codex: { status: "authenticated", model: "gpt-5.6-luna", reasoningEffort: "low", accountLabel: "owner@example.test" },
+          },
+        }),
+        setActiveProvider: async (provider) => { selected.push(provider); },
+        startCodexLogin: async () => ({
+          status: "pending",
+          instructions: "Use the official device page.",
+          verificationUrl: "https://auth.openai.com/device",
+          userCode: "ABCD-EFGH",
+        }),
+        logoutCodex: async () => { loggedOut = true; },
+      },
+    }));
+
+    expect((await dispatch(app, { method: "GET", path: "/api/admin/llm" })).status).toBe(401);
+    const login = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/session",
+      origin: "https://admin.example",
+      body: { password: "correct horse battery staple" },
+    });
+    const cookie = String(login.headers["set-cookie"]).split(";", 1)[0]!;
+    const snapshot = await dispatch(app, { method: "GET", path: "/api/admin/llm", cookie });
+    expect(snapshot.status).toBe(200);
+    expect(snapshot.body).toMatchObject({ activeProvider: "lmstudio", providers: { codex: { model: "gpt-5.6-luna" } } });
+    expect(JSON.stringify(snapshot.body)).not.toContain("token");
+
+    const credentialInjection = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/llm/codex/login",
+      cookie,
+      origin: "https://admin.example",
+      body: { email: "owner@example.test", password: "do-not-accept" },
+    });
+    expect(credentialInjection.status).toBe(400);
+    const deviceLogin = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/llm/codex/login",
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    });
+    expect(deviceLogin.body).toMatchObject({ status: "pending", userCode: "ABCD-EFGH" });
+
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/llm",
+      cookie,
+      origin: "https://admin.example",
+      body: { activeProvider: "codex" },
+    })).status).toBe(200);
+    expect(selected).toEqual(["codex"]);
+    expect((await dispatch(app, {
+      method: "DELETE",
+      path: "/api/admin/llm/codex/session",
+      cookie,
+      origin: "https://admin.example",
+    })).status).toBe(204);
+    expect(loggedOut).toBe(true);
+  });
+
   it("does not let one login source lock out a different source", async () => {
     const state = new AdminStateStore({ persist: async () => undefined });
     await state.load();

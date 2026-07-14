@@ -26,6 +26,9 @@ import {
   type ProtectedFragment,
 } from "./humanizer.js";
 import type { Persona } from "./personas.js";
+import { LmStudioBackend } from "./lmStudioBackend.js";
+import type { ModelBackend } from "./modelBackend.js";
+import { ModelBackendError } from "./modelBackend.js";
 import {
   buildPersonaStylePromptNote,
   derivePersonaStyleTurnPolicy,
@@ -678,13 +681,14 @@ export interface LmStudioClientOptions {
   hostTimeZone?: string;
   /** Read at execution time so public, DM, ambient and voice scenes update live. */
   behaviorTuningProvider?: BehaviorTuningProvider;
+  /** Fixed transport for this social-model client. Defaults to LM Studio. */
+  backend?: ModelBackend;
+  timeoutMs?: number;
 }
 
 export class LmStudioClient {
-  private readonly baseUrl = (process.env.LM_STUDIO_BASE_URL ?? "http://127.0.0.1:1234/v1").replace(/\/$/, "");
-  private readonly configuredModel = process.env.LM_STUDIO_MODEL?.trim();
-  private readonly apiToken = process.env.LM_STUDIO_API_TOKEN?.trim();
-  private readonly timeoutMs = Number.parseInt(process.env.LM_STUDIO_TIMEOUT_MS ?? "90000", 10);
+  private readonly backend: ModelBackend;
+  private readonly timeoutMs: number;
   private readonly configuredMaxTokens = Number.parseInt(process.env.LM_STUDIO_MAX_TOKENS ?? "0", 10);
   private readonly enabled = process.env.AI_ENABLED !== "false";
   private readonly humanizerRepairEnabled = process.env.HUMANIZER_REPAIR_ENABLED !== "false";
@@ -699,6 +703,7 @@ export class LmStudioClient {
   private nextQueueId = 1;
   private activeScene?: SceneQueueItem;
   private activeSceneAbort?: AbortController;
+  private activeVision?: VisionQueueItem;
   private activeTurnAnalysis?: TurnAnalysisQueueItem;
   private activeTurnAnalysisAbort?: AbortController;
   private activeMemoryAnalysis?: MemoryAnalysisQueueItem;
@@ -714,6 +719,8 @@ export class LmStudioClient {
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
 
   constructor(options: LmStudioClientOptions = {}) {
+    this.backend = options.backend ?? new LmStudioBackend();
+    this.timeoutMs = options.timeoutMs ?? Number.parseInt(process.env.LM_STUDIO_TIMEOUT_MS ?? "90000", 10);
     this.now = options.now ?? Date.now;
     this.behaviorTuningProvider = options.behaviorTuningProvider;
     this.communityTimeZone = resolveCommunityTimeZone({
@@ -735,16 +742,10 @@ export class LmStudioClient {
 
     const started = performance.now();
     try {
-      const response = await fetch(`${this.baseUrl}/models`, {
-        headers: this.headers(),
-        signal: AbortSignal.timeout(Math.min(this.timeoutMs, 5_000)),
-      });
-      if (!response.ok) throw new LmHttpError(`LM Studio returned ${response.status}`, response.status);
-      const payload = (await response.json()) as { data?: Array<{ id?: string }> };
-      const available = payload.data?.map((entry) => entry.id).filter((id): id is string => Boolean(id)) ?? [];
-      this.resolvedModel = this.configuredModel || available[0];
-      this.connected = Boolean(this.resolvedModel);
-      this.lastLatencyMs = Math.round(performance.now() - started);
+      const result = await this.backend.probe(AbortSignal.timeout(Math.min(this.timeoutMs, 15_000)));
+      this.resolvedModel = result.id ?? this.backend.configuredModel;
+      this.connected = result.connected;
+      this.lastLatencyMs = result.latencyMs ?? Math.round(performance.now() - started);
     } catch {
       this.connected = false;
       this.lastLatencyMs = undefined;
@@ -753,13 +754,14 @@ export class LmStudioClient {
   }
 
   health(overrideLabel?: string): ServerHealth["model"] {
-    const model = this.resolvedModel ?? this.configuredModel;
+    const model = this.resolvedModel ?? this.backend.configuredModel;
     return {
       connected: this.connected,
       id: model,
-      label: overrideLabel ?? (model ? model.split("/").at(-1)?.replaceAll("-", " ") ?? model : "LM Studio offline"),
+      label: overrideLabel ?? (model ? model.split("/").at(-1)?.replaceAll("-", " ") ?? model : `${this.backend.providerId} offline`),
       latencyMs: this.lastLatencyMs,
       queueDepth: this.queue.length + (this.running ? 1 : 0),
+      provider: this.backend.providerId,
     };
   }
 
@@ -975,6 +977,17 @@ export class LmStudioClient {
     this.humanStyleMemory.remember(this.styleMemoryKey(context, personaId), content);
   }
 
+  cancelPending(reason = "Model provider changed"): void {
+    const error = new Error(reason);
+    for (const item of this.queue.splice(0)) item.reject(error);
+    this.activeSceneAbort?.abort(error);
+    this.activeTurnAnalysisAbort?.abort(error);
+    this.activeMemoryAnalysisAbort?.abort(error);
+    this.activeVision?.reject(error);
+    this.turnAnalysisById.clear();
+    this.memoryAnalysisById.clear();
+  }
+
   analyzeImage(image: Buffer, caption = "", priority = 1): Promise<VisualObservation> {
     if (!this.enabled) return Promise.reject(new Error("AI generation is disabled"));
     return new Promise((resolve, reject) => {
@@ -1004,6 +1017,7 @@ export class LmStudioClient {
           this.activeSceneAbort = abort;
           item.resolve(await this.perform(item.request, abort.signal));
         } else if (item.type === "vision") {
+          this.activeVision = item;
           item.resolve(await this.performVision(item.image, item.caption));
         } else if (item.type === "turn-analysis") {
           const abort = new AbortController();
@@ -1023,6 +1037,7 @@ export class LmStudioClient {
           this.activeScene = undefined;
           this.activeSceneAbort = undefined;
         }
+        if (this.activeVision?.id === item.id) this.activeVision = undefined;
         if (this.activeTurnAnalysis?.id === item.id) {
           this.activeTurnAnalysis = undefined;
           this.activeTurnAnalysisAbort = undefined;
@@ -1104,21 +1119,24 @@ export class LmStudioClient {
   }
 
   private async resolveModelForTurnAnalysis(signal: AbortSignal): Promise<string | undefined> {
-    const known = this.resolvedModel ?? this.configuredModel;
+    const known = this.resolvedModel ?? this.backend.configuredModel;
     if (known) return known;
-    const response = await fetch(`${this.baseUrl}/models`, {
-      headers: this.headers(),
-      signal,
-    });
-    if (!response.ok) {
-      const details = (await response.text()).slice(0, 500);
-      this.connected = false;
-      throw new LmHttpError(`LM Studio ${response.status}: ${details}`, response.status);
-    }
-    const payload = (await response.json()) as { data?: Array<{ id?: string }> };
-    const model = payload.data?.find((entry) => Boolean(entry.id))?.id;
-    if (model) this.resolvedModel = model;
+    const result = await this.backend.probe(signal);
+    this.connected = result.connected;
+    const model = result.id ?? this.backend.configuredModel;
+    if (result.connected && model) this.resolvedModel = model;
+    if (!result.connected) throw new LmHttpError(result.detail ?? `${this.backend.providerId} is unavailable`, 404);
     return model;
+  }
+
+  private async complete(body: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
+    try {
+      return await this.backend.complete(body, signal);
+    } catch (error) {
+      this.connected = false;
+      if (error instanceof ModelBackendError) throw new LmHttpError(error.message, error.status);
+      throw error;
+    }
   }
 
   private async callTurnAnalysis(
@@ -1141,18 +1159,7 @@ export class LmStudioClient {
       stream: false,
       response_format: buildTurnAnalysisResponseFormat(input),
     };
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { ...this.headers(), "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal,
-    });
-    if (!response.ok) {
-      const details = (await response.text()).slice(0, 500);
-      this.connected = false;
-      throw new LmHttpError(`LM Studio turn analysis ${response.status}: ${details}`, response.status);
-    }
-    return await response.json();
+    return await this.complete(body, signal);
   }
 
   private async callMemoryAnalysis(
@@ -1160,10 +1167,7 @@ export class LmStudioClient {
     model: string,
     signal: AbortSignal,
   ): Promise<unknown> {
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { ...this.headers(), "Content-Type": "application/json" },
-      body: JSON.stringify({
+    return await this.complete({
         model,
         messages: [
           { role: "system", content: buildMemoryAnalysisSystemPrompt() },
@@ -1175,20 +1179,13 @@ export class LmStudioClient {
         max_tokens: 480,
         stream: false,
         response_format: buildMemoryAnalysisResponseFormat(),
-      }),
-      signal,
-    });
-    if (!response.ok) {
-      const details = (await response.text()).slice(0, 500);
-      throw new LmHttpError(`LM Studio memory analysis ${response.status}: ${details}`, response.status);
-    }
-    return await response.json();
+      }, signal);
   }
 
   private async performVision(image: Buffer, caption: string): Promise<VisualObservation> {
     if (!this.resolvedModel) await this.probe();
-    const model = this.resolvedModel ?? this.configuredModel;
-    if (!model) throw new Error("No LM Studio model is available");
+    const model = this.resolvedModel ?? this.backend.configuredModel;
+    if (!model) throw new Error(`No ${this.backend.providerId} model is available`);
     // LM Studio's OpenAI-compatible endpoint currently rejects WebP data URLs
     // even though the native SDK supports WebP. The stored image remains WebP;
     // only the bounded in-memory inference copy is converted to metadata-free JPEG.
@@ -1213,10 +1210,10 @@ export class LmStudioClient {
       raw = await this.callVision(visionImage, caption, model, false, 1.4);
       parsed = parseVisualObservation(raw);
     }
-    if (!parsed) throw new Error("LM Studio returned no valid visual observation");
+    if (!parsed) throw new Error(`${this.backend.providerId} returned no valid visual observation`);
 
     const summary = sanitizeObservationText(parsed.summary, 500);
-    if (summary.length < 1) throw new Error("LM Studio returned an empty visual observation");
+    if (summary.length < 1) throw new Error(`${this.backend.providerId} returned an empty visual observation`);
     this.connected = true;
     this.lastLatencyMs = Math.round(performance.now() - started);
     return {
@@ -1271,8 +1268,8 @@ export class LmStudioClient {
     };
     if (!this.resolvedModel) await this.probe();
     if (signal?.aborted) throw signal.reason ?? new Error("Generation aborted");
-    const model = this.resolvedModel ?? this.configuredModel;
-    if (!model) throw new Error("No LM Studio model is available");
+    const model = this.resolvedModel ?? this.backend.configuredModel;
+    if (!model) throw new Error(`No ${this.backend.providerId} model is available`);
 
     const started = performance.now();
     let raw: unknown;
@@ -1293,7 +1290,7 @@ export class LmStudioClient {
       parsedCompletion = completionSchema.parse(raw);
       content = parsedCompletion.choices[0]?.message.content;
     }
-    if (!content) throw new Error("LM Studio returned no message content");
+    if (!content) throw new Error(`${this.backend.providerId} returned no message content`);
     const lines = this.parseSceneLines(content, request);
     let semanticReviews: ReadonlyMap<string, CandidateLineReview> | undefined;
     let reviewUnavailable = false;
@@ -1552,10 +1549,7 @@ export class LmStudioClient {
       Math.min(CANDIDATE_REVIEW_TIMEOUT_MS, this.timeoutMs),
     );
     try {
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { ...this.headers(), "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const raw = await this.complete({
           model,
           messages: [
             { role: "system", content: buildCandidateReviewSystemPrompt() },
@@ -1567,14 +1561,8 @@ export class LmStudioClient {
           max_tokens: clampTokenBudget(420 + input.candidates.length * 220),
           stream: false,
           response_format: buildCandidateReviewResponseFormat(input),
-        }),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        const details = (await response.text()).slice(0, 500);
-        throw new LmHttpError(`LM Studio candidate review ${response.status}: ${details}`, response.status);
-      }
-      const completion = completionSchema.safeParse(await response.json());
+        }, controller.signal);
+      const completion = completionSchema.safeParse(raw);
       const content = completion.success ? completion.data.choices[0]?.message.content : undefined;
       if (!content) return undefined;
       const parsed = parseCandidateReviewContent(content, input);
@@ -1997,17 +1985,7 @@ export class LmStudioClient {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     let raw: unknown;
     try {
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { ...this.headers(), "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        const details = (await response.text()).slice(0, 500);
-        throw new LmHttpError(`LM Studio humanizer ${response.status}: ${details}`, response.status);
-      }
-      raw = await response.json();
+      raw = await this.complete(body, controller.signal);
     } finally {
       stopForwardingAbort();
       clearTimeout(timeout);
@@ -2152,18 +2130,7 @@ export class LmStudioClient {
     };
 
     try {
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { ...this.headers(), "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        const details = (await response.text()).slice(0, 500);
-        this.connected = false;
-        throw new LmHttpError(`LM Studio ${response.status}: ${details}`, response.status);
-      }
-      return await response.json();
+      return await this.complete(body, controller.signal);
     } finally {
       stopForwardingAbort();
       clearTimeout(timeout);
@@ -2224,18 +2191,7 @@ export class LmStudioClient {
       ...(structured ? { response_format: responseFormat } : {}),
     };
     try {
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { ...this.headers(), "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        const details = (await response.text()).slice(0, 500);
-        this.connected = false;
-        throw new LmHttpError(`LM Studio ${response.status}: ${details}`, response.status);
-      }
-      return await response.json();
+      return await this.complete(body, controller.signal);
     } finally {
       clearTimeout(timeout);
     }
@@ -2309,9 +2265,6 @@ export class LmStudioClient {
     };
   }
 
-  private headers(): Record<string, string> {
-    return this.apiToken ? { Authorization: `Bearer ${this.apiToken}` } : {};
-  }
 }
 
 const clampTokenBudget = (value: number) => Math.max(500, Math.min(value, 2_400));

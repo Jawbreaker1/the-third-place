@@ -2483,7 +2483,7 @@ export default function App() {
         </div>
         <div className="model-card">
           <div className="model-icon"><Icon name="spark" size={15} /></div>
-          <div><span>Local cast engine</span><strong>{health?.model.label ?? "checking LM Studio"}</strong></div>
+          <div><span>Cast engine</span><strong>{health?.model.label ?? "checking AI provider"}</strong></div>
           <i className={health?.model.connected ? "online" : "offline"} />
         </div>
       </aside>
@@ -2510,7 +2510,7 @@ export default function App() {
         <div className="drawer-backdrop" onClick={() => setShowDirector(false)}>
           <aside className="director-drawer" onClick={(event) => event.stopPropagation()}>
             <header><div className="director-icon"><Icon name="pulse" /></div><div><span>BACKSTAGE</span><h2>Director view</h2></div><button className="icon-button" onClick={() => setShowDirector(false)}><Icon name="close" /></button></header>
-            <div className="director-explainer"><Icon name="info" size={17} /><p>This is the restraint layer. It chooses who notices, who reacts and — crucially — who stays quiet. Gemma only writes for the selected cast.</p></div>
+            <div className="director-explainer"><Icon name="info" size={17} /><p>This is the restraint layer. It chooses who notices, who reacts and — crucially — who stays quiet. The selected model only writes for that cast.</p></div>
             <div className="director-health">
               <div><span className="metric-value">{health?.model.queueDepth ?? 0}</span><small>in queue</small></div>
               <div><span className="metric-value">{health?.aiPace ?? "lively"}</span><small>room pace</small></div>

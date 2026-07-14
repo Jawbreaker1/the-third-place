@@ -20,15 +20,28 @@ import {
   createAdminSession,
   deleteAdminBan,
   deleteAdminChannel,
+  deleteAdminCodexSession,
   deleteAdminPersona,
   deleteAdminSession,
+  getAdminLlmState,
   getAdminSession,
   getAdminState,
   moderateAdminHuman,
   patchAdminBehavior,
   patchAdminChannel,
+  patchAdminLlmProvider,
   patchAdminPersona,
+  startAdminCodexLogin,
 } from "./adminApi";
+import {
+  adminLlmProviderReady,
+  codexStatusLabel,
+  lmStudioStatusLabel,
+  mergeCodexLoginResult,
+  type AdminCodexLoginResult,
+  type AdminLlmProviderId,
+  type AdminLlmState,
+} from "./adminLlmModel";
 import {
   activePersonaRoomAffinities,
   createChannelDraft,
@@ -37,7 +50,7 @@ import {
   personaVoiceChoices,
 } from "./adminModel";
 
-type AdminSection = "overview" | "residents" | "rooms" | "humans";
+type AdminSection = "overview" | "provider" | "residents" | "rooms" | "humans";
 type AuthPhase = "checking" | "signed-out" | "signed-in";
 type Notice = { tone: "success" | "error"; message: string };
 type ConfirmRequest = {
@@ -49,6 +62,7 @@ type ConfirmRequest = {
 
 const sections: Array<{ id: AdminSection; label: string; hint: string }> = [
   { id: "overview", label: "Overview", hint: "Live controls" },
+  { id: "provider", label: "AI provider", hint: "Gemma or GPT" },
   { id: "residents", label: "Residents", hint: "Identity & voice" },
   { id: "rooms", label: "Rooms", hint: "Topics & seeds" },
   { id: "humans", label: "Humans", hint: "Moderation" },
@@ -87,7 +101,11 @@ const formatDateTime = (value?: string): string => {
 };
 
 const mutationErrorMessage = (error: unknown): string => {
-  if (error instanceof AdminApiError && error.status === 503) {
+  if (
+    error instanceof AdminApiError
+    && error.status === 503
+    && /administration|admin_password/iu.test(error.message)
+  ) {
     return "Admin controls are not configured on this server. Set ADMIN_PASSWORD to at least 12 characters and restart it.";
   }
   return error instanceof Error ? error.message : "The admin request failed.";
@@ -253,6 +271,10 @@ export default function AdminApp() {
   const [authPhase, setAuthPhase] = useState<AuthPhase>("checking");
   const [password, setPassword] = useState("");
   const [snapshot, setSnapshot] = useState<AdminStateSnapshot | null>(null);
+  const [llmState, setLlmState] = useState<AdminLlmState>();
+  const [llmError, setLlmError] = useState<string>();
+  const [providerDraft, setProviderDraft] = useState<AdminLlmProviderId>("lmstudio");
+  const [codexLogin, setCodexLogin] = useState<AdminCodexLoginResult>();
   const [section, setSection] = useState<AdminSection>("overview");
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice>();
@@ -279,9 +301,22 @@ export default function AdminApp() {
     setSelectedChannelId((current) => next.channels.some((channel) => channel.id === current) ? current : next.channels[0]?.id ?? "");
   };
 
+  const installLlmState = (next: AdminLlmState) => {
+    setLlmState(next);
+    setProviderDraft(next.activeProvider);
+    setLlmError(undefined);
+    if (next.providers.codex.status !== "pending") setCodexLogin(undefined);
+  };
+
   const refreshState = async (): Promise<AdminStateSnapshot> => {
     const next = await getAdminState();
     installSnapshot(next);
+    return next;
+  };
+
+  const refreshLlmState = async (): Promise<AdminLlmState> => {
+    const next = await getAdminLlmState();
+    installLlmState(next);
     return next;
   };
 
@@ -308,6 +343,12 @@ export default function AdminApp() {
         if (!active) return;
         installSnapshot(next);
         setAuthPhase("signed-in");
+        try {
+          const providerState = await getAdminLlmState();
+          if (active) installLlmState(providerState);
+        } catch (error) {
+          if (active) setLlmError(mutationErrorMessage(error));
+        }
       })
       .catch((error) => {
         if (!active) return;
@@ -381,6 +422,11 @@ export default function AdminApp() {
       installSnapshot(next);
       setAuthPhase("signed-in");
       setNotice({ tone: "success", message: "Admin session opened." });
+      try {
+        installLlmState(await getAdminLlmState());
+      } catch (error) {
+        setLlmError(mutationErrorMessage(error));
+      }
     } catch (error) {
       setNotice({ tone: "error", message: mutationErrorMessage(error) });
       setPassword("");
@@ -395,11 +441,76 @@ export default function AdminApp() {
     try {
       await deleteAdminSession();
       setSnapshot(null);
+      setLlmState(undefined);
+      setLlmError(undefined);
+      setCodexLogin(undefined);
       setPassword("");
       setAuthPhase("signed-out");
     } catch (error) {
       // Keep the authenticated UI intact: the HttpOnly session may still be valid.
       setNotice({ tone: "error", message: mutationErrorMessage(error) });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runLlmMutation = async (
+    key: string,
+    successMessage: string,
+    operation: () => Promise<void>,
+    after?: () => void,
+  ): Promise<boolean> => {
+    setBusy(key);
+    setNotice(undefined);
+    setLlmError(undefined);
+    try {
+      await operation();
+      await refreshLlmState();
+      after?.();
+      setNotice({ tone: "success", message: successMessage });
+      return true;
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setLlmState(undefined);
+        setAuthPhase("signed-out");
+      }
+      const message = mutationErrorMessage(error);
+      setLlmError(message);
+      setNotice({ tone: "error", message });
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const startCodexAuth = async () => {
+    setBusy("codex-login");
+    setNotice(undefined);
+    setLlmError(undefined);
+    try {
+      const result = await startAdminCodexLogin();
+      setCodexLogin(result);
+      setLlmState((current) => current ? mergeCodexLoginResult(current, result) : current);
+      if (result.status === "authenticated") {
+        await refreshLlmState();
+        setNotice({ tone: "success", message: "ChatGPT is connected through Codex CLI." });
+      } else if (result.status === "pending") {
+        setNotice({ tone: "success", message: "Codex login started. Complete the browser step, then refresh the status." });
+      } else {
+        const message = result.detail ?? "Codex CLI could not start the ChatGPT login flow.";
+        setLlmError(message);
+        setNotice({ tone: "error", message });
+      }
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setLlmState(undefined);
+        setAuthPhase("signed-out");
+      }
+      const message = mutationErrorMessage(error);
+      setLlmError(message);
+      setNotice({ tone: "error", message });
     } finally {
       setBusy(null);
     }
@@ -591,6 +702,176 @@ export default function AdminApp() {
       </section>
       {behaviorPanel}
     </>
+  );
+
+  const selectedProviderReady = llmState ? adminLlmProviderReady(llmState, providerDraft) : false;
+  const providerIsUnchanged = llmState?.activeProvider === providerDraft;
+  const lmStudioStatus = llmState?.providers.lmstudio.status;
+  const codexStatus = llmState?.providers.codex.status;
+  const applyProviderLabel = providerIsUnchanged
+    ? "Currently active"
+    : !selectedProviderReady
+      ? providerDraft === "codex" ? "Connect ChatGPT first" : "Start LM Studio first"
+      : providerDraft === "codex" ? "Switch to GPT-5.6 Luna" : "Switch to local Gemma";
+
+  const provider = (
+    <div className="admin-provider-layout">
+      <section className="admin-card" aria-labelledby="ai-provider-title">
+        <div className="admin-card-heading">
+          <div><p className="admin-kicker">Runtime routing</p><h2 id="ai-provider-title">AI model provider</h2></div>
+          <button
+            className="admin-button subtle"
+            disabled={Boolean(busy)}
+            onClick={() => {
+              setBusy("refresh-provider");
+              setNotice(undefined);
+              setLlmError(undefined);
+              void refreshLlmState()
+                .then(() => setNotice({ tone: "success", message: "AI provider status refreshed." }))
+                .catch((error) => {
+                  const message = mutationErrorMessage(error);
+                  setLlmError(message);
+                  setNotice({ tone: "error", message });
+                })
+                .finally(() => setBusy(null));
+            }}
+            type="button"
+          >{busy === "refresh-provider" ? "Refreshing…" : "Refresh status"}</button>
+        </div>
+        <p className="admin-card-intro">Choose the model runtime for new resident turns. Authentication and model execution happen on this server, never in a visitor's browser.</p>
+        {llmError && <div className="admin-provider-warning" role="alert">{llmError}</div>}
+        <div aria-label="AI model provider" className="admin-provider-options" role="radiogroup">
+          <label className={`admin-provider-option ${providerDraft === "lmstudio" ? "selected" : ""}`}>
+            <input
+              checked={providerDraft === "lmstudio"}
+              disabled={!llmState || Boolean(busy)}
+              name="ai-provider"
+              onChange={() => setProviderDraft("lmstudio")}
+              type="radio"
+              value="lmstudio"
+            />
+            <span className="admin-provider-mark local" aria-hidden="true">G</span>
+            <span className="admin-provider-copy">
+              <span className="admin-provider-title-row">
+                <strong>Local Gemma 4</strong>
+                {llmState?.activeProvider === "lmstudio" && <i>Active</i>}
+              </span>
+              <small>Private local inference through LM Studio.</small>
+              <span>{llmState?.providers.lmstudio.model ?? "LM Studio model"}</span>
+              {llmState?.providers.lmstudio.detail && <em>{llmState.providers.lmstudio.detail}</em>}
+            </span>
+            <span className={`admin-provider-status ${lmStudioStatus ?? "checking"}`}>
+              {lmStudioStatus ? lmStudioStatusLabel(lmStudioStatus) : "Checking…"}
+            </span>
+          </label>
+
+          <label className={`admin-provider-option ${providerDraft === "codex" ? "selected" : ""}`}>
+            <input
+              checked={providerDraft === "codex"}
+              disabled={!llmState || Boolean(busy)}
+              name="ai-provider"
+              onChange={() => setProviderDraft("codex")}
+              type="radio"
+              value="codex"
+            />
+            <span className="admin-provider-mark codex" aria-hidden="true">C</span>
+            <span className="admin-provider-copy">
+              <span className="admin-provider-title-row">
+                <strong>GPT-5.6 Luna</strong>
+                {llmState?.activeProvider === "codex" && <i>Active</i>}
+              </span>
+              <small>ChatGPT subscription through the server's Codex CLI wrapper.</small>
+              <span>Low reasoning · fast, low-cost profile</span>
+              {llmState?.providers.codex.accountLabel && <em>{llmState.providers.codex.accountLabel}</em>}
+              {llmState?.providers.codex.detail && <em>{llmState.providers.codex.detail}</em>}
+            </span>
+            <span className={`admin-provider-status ${codexStatus ?? "checking"}`}>
+              {codexStatus ? codexStatusLabel(codexStatus) : "Checking…"}
+            </span>
+          </label>
+        </div>
+        <div className="admin-provider-apply">
+          <span>Switching affects new turns; it never exposes either provider's credentials to connected users.</span>
+          <button
+            className="admin-button primary"
+            disabled={Boolean(busy) || !llmState || providerIsUnchanged || !selectedProviderReady}
+            onClick={() => { void runLlmMutation(
+              "switch-provider",
+              providerDraft === "codex" ? "GPT-5.6 Luna is now active." : "Local Gemma is now active.",
+              () => patchAdminLlmProvider(providerDraft),
+            ); }}
+            type="button"
+          >{busy === "switch-provider" ? "Switching…" : applyProviderLabel}</button>
+        </div>
+      </section>
+
+      <section className="admin-card admin-codex-auth" aria-labelledby="codex-auth-title">
+        <div className="admin-card-heading">
+          <div><p className="admin-kicker">Subscription connection</p><h2 id="codex-auth-title">ChatGPT login</h2></div>
+          {codexStatus && <span className={`admin-provider-status ${codexStatus}`}>{codexStatusLabel(codexStatus)}</span>}
+        </div>
+        <div className="admin-security-callout">
+          <strong>Login stays outside this page</strong>
+          <span>“Start ChatGPT login” asks Codex CLI on the server to begin the official browser flow. Never paste a password, API key, cookie or token here.</span>
+        </div>
+        <div className="admin-security-callout warning">
+          <strong>Experimental, supervised demo provider</strong>
+          <span>OpenAI does not recommend exposing Codex automation to untrusted public traffic. This wrapper disables every Codex tool, uses an isolated account directory and hard turn budgets; keep the room invite-only and supervised.</span>
+        </div>
+
+        {codexLogin && codexLogin.status !== "authenticated" && (
+          <div className="admin-device-flow" aria-live="polite">
+            <strong>{codexLogin.status === "pending" ? "Complete the login in your browser" : "Codex login response"}</strong>
+            {codexLogin.instructions && <p>{codexLogin.instructions}</p>}
+            {codexLogin.detail && <p>{codexLogin.detail}</p>}
+            {codexLogin.userCode && <div><span>One-time code</span><code>{codexLogin.userCode}</code></div>}
+            {codexLogin.verificationUrl && (
+              <a className="admin-button primary admin-external-action" href={codexLogin.verificationUrl} rel="noreferrer" target="_blank">Open verification page ↗</a>
+            )}
+            <small>After approving the login, use “Refresh status”. The provider will not switch automatically.</small>
+          </div>
+        )}
+
+        <div className="admin-codex-facts">
+          <div><span>Model</span><strong>GPT-5.6 Luna</strong></div>
+          <div><span>Reasoning</span><strong>Low</strong></div>
+          <div><span>Execution</span><strong>Server-side Codex CLI</strong></div>
+          <div><span>Account</span><strong>{llmState?.providers.codex.accountLabel ?? (codexStatus === "authenticated" ? "Connected" : "Not connected")}</strong></div>
+        </div>
+
+        <div className="admin-card-actions">
+          {codexStatus === "authenticated" ? (
+            <button
+              className="admin-button danger-quiet"
+              disabled={Boolean(busy) || llmState?.activeProvider === "codex"}
+              onClick={() => setConfirm({
+                title: "Disconnect ChatGPT?",
+                message: "The server-side Codex CLI session will be signed out. Local Gemma remains available, but switch to it before disconnecting if GPT is currently active.",
+                confirmLabel: "Disconnect ChatGPT",
+                action: () => runLlmMutation(
+                  "codex-disconnect",
+                  "ChatGPT was disconnected from Codex CLI.",
+                  deleteAdminCodexSession,
+                  () => setCodexLogin(undefined),
+                ),
+              })}
+              title={llmState?.activeProvider === "codex" ? "Switch to local Gemma before disconnecting ChatGPT." : undefined}
+              type="button"
+            >Disconnect</button>
+          ) : (
+            <button
+              className="admin-button primary"
+              disabled={Boolean(busy) || !llmState || codexStatus === "pending" || codexStatus === "unavailable"}
+              onClick={() => { void startCodexAuth(); }}
+              type="button"
+            >{busy === "codex-login" ? "Starting…" : codexStatus === "pending" ? "Login pending" : codexStatus === "unavailable" ? "Codex CLI unavailable" : "Start ChatGPT login"}</button>
+          )}
+        </div>
+        {codexStatus === "authenticated" && llmState?.activeProvider === "codex" && (
+          <p className="admin-fieldset-note">Switch to local Gemma before disconnecting the active ChatGPT session.</p>
+        )}
+      </section>
+    </div>
   );
 
   const residents = (
@@ -976,6 +1257,7 @@ export default function AdminApp() {
         {notice && <div className={`admin-notice ${notice.tone}`} role={notice.tone === "error" ? "alert" : "status"}>{notice.message}<button aria-label="Dismiss message" onClick={() => setNotice(undefined)} type="button">×</button></div>}
         <div className="admin-content">
           {section === "overview" && overview}
+          {section === "provider" && provider}
           {section === "residents" && residents}
           {section === "rooms" && rooms}
           {section === "humans" && humans}

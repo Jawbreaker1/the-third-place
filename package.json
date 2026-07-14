@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A living AI community powered by a local LM Studio model and a deterministic social director.",
+  "description": "A living AI community with local LM Studio inference, an experimental Codex subscription provider, and a deterministic social director.",
   "scripts": {
     "dev": "concurrently -k -n api,web -c yellow,cyan \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
     "dev:voice": "concurrently -k -n tts,app -c magenta,cyan \"npm run start:tts\" \"npm run dev\"",
