@@ -834,6 +834,240 @@ describe("LM Studio multilingual batch candidate review", () => {
 });
 
 describe("LM Studio room prompt", () => {
+  it("turns a trusted expected request into a do-it-now contract without naming a language or artifact", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira, sana],
+      history: [],
+      mustReplyIds: [mira.id, sana.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "ja",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+    expect(prompt).toContain("perform any feasible self-contained requested artifact now");
+    expect(prompt).toContain("Offering, promising, narrating progress");
+    expect(prompt).toContain(`explicit-request owners must answer the real question`);
+    expect(prompt).toContain(`artifact now: ${mira.id}`);
+    expect(prompt).toContain(`server-designated actors must answer: ${mira.id}, ${sana.id}`);
+    expect(prompt).toContain("Other required actors answer only their assigned moderation, evidence, dissent or social role");
+  });
+
+  it("keeps an autonomous server-card URL out of model data and drops a copied visible URL", async () => {
+    const previousRepair = process.env.HUMANIZER_REPAIR_ENABLED;
+    process.env.HUMANIZER_REPAIR_ENABLED = "false";
+    try {
+      const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+      const bodies: any[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        const body = JSON.parse(String(init?.body));
+        bodies.push(body);
+        return completionResponse([{
+          personaId: sana.id,
+          content: "Den konkreta återhämtningen är intressant: https://example.com/article",
+          sourceIds: ["S1"],
+        }]);
+      }));
+
+      const lines = await new LmStudioClient().generateScene({
+        kind: "ambient",
+        channelId: "ai-programming",
+        channelName: "ai-programming",
+        selected: [sana],
+        history: [],
+        mustReplyIds: [sana.id],
+        urlPublicationPolicy: "server_card",
+        research: {
+          kind: "page",
+          query: "server owned research",
+          retrievedAt: new Date().toISOString(),
+          results: [{
+            id: "S1",
+            title: "Recovery benchmark",
+            url: "https://example.com/article",
+            snippet: "A supported bounded detail.",
+          }],
+        },
+      });
+
+      expect(lines).toEqual([]);
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0].messages[0].content).toContain("server will attach the one exact researched destination");
+      const sceneData = JSON.parse(bodies[0].messages[1].content);
+      expect(sceneData.freshResearch.results[0]).not.toHaveProperty("url");
+      expect(sceneData.freshResearch.results[0]).toMatchObject({ id: "S1", title: "Recovery benchmark" });
+    } finally {
+      if (previousRepair === undefined) delete process.env.HUMANIZER_REPAIR_ENABLED;
+      else process.env.HUMANIZER_REPAIR_ENABLED = previousRepair;
+    }
+  });
+
+  it.each([
+    ["inline code", "Källan är `https://example.com/article` och poängen håller."],
+    ["fenced code", "Källan är här:\n```text\nhttps://example.com/article\n```"],
+    ["a www host", "Läs www.example.com/article för resten."],
+    ["a bare public domain", "Resten finns på example.com."],
+  ])("mechanically drops server-card URL text hidden as %s", async (_label, draft) => {
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      return completionResponse([{ personaId: sana.id, content: draft, sourceIds: ["S1"] }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [sana],
+      history: [],
+      mustReplyIds: [sana.id],
+      urlPublicationPolicy: "server_card",
+      research: {
+        kind: "page",
+        query: "server owned research",
+        retrievedAt: new Date().toISOString(),
+        results: [{
+          id: "S1",
+          title: "Recovery benchmark",
+          url: "https://example.com/article",
+          snippet: "A supported bounded detail.",
+        }],
+      },
+    });
+
+    expect(lines).toEqual([]);
+  });
+
+  it.each(["dm", "voice"] as const)(
+    "retries only a missing explicit-request owner once with the full %s scene",
+    async (kind) => {
+      process.env.CANDIDATE_REVIEW_ENABLED = "true";
+      const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const acceptedPeer = "Mira, make it properly devious.";
+      const evasion = "I'll think about it and maybe offer a word game instead.";
+      const fulfilled = "What has cities but no houses, forests but no trees, and water but no fish? A map.";
+      const bodies: any[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        const body = JSON.parse(String(init?.body));
+        bodies.push(body);
+        if (bodies.length === 1) {
+          return completionResponse([
+            { personaId: sana.id, content: acceptedPeer },
+            { personaId: mira.id, content: evasion },
+          ]);
+        }
+        if (bodies.length === 2) {
+          return candidateReviewCompletion([
+            { personaId: sana.id, severity: "none", issues: [], rewriteInstruction: null },
+            {
+              personaId: mira.id,
+              severity: "high",
+              issues: ["unfulfilled_explicit_request"],
+              rewriteInstruction: "Give the requested riddle now.",
+            },
+          ]);
+        }
+        if (bodies.length === 3) {
+          return completionResponse([{ personaId: mira.id, content: fulfilled }]);
+        }
+        return candidateReviewCompletion([
+          { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+        ]);
+      }));
+
+      const history = [{
+        author: "Guest",
+        kind: "human" as const,
+        content: "We were taking turns with riddles.",
+        createdAt: "2026-07-14T11:59:00.000Z",
+      }];
+      const research = {
+        kind: "page" as const,
+        query: "riddle construction",
+        retrievedAt: "2026-07-14T11:58:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Riddle construction note",
+          url: "https://example.com/riddles",
+          snippet: "A compact riddle with a concrete answer works well in conversation.",
+        }],
+      };
+      const lines = await new LmStudioClient().generateScene({
+        kind,
+        channelId: "lobby",
+        channelName: "lobby",
+        selected: [sana, mira],
+        history,
+        trigger: {
+          author: "Guest",
+          content: "Mira, give us a riddle now.",
+          messageId: "request-1",
+          createdAt: "2026-07-14T12:00:00.000Z",
+        },
+        mustReplyIds: [sana.id, mira.id],
+        requestOwnerIds: [mira.id],
+        semanticContext: {
+          languageTag: "en",
+          intentTrusted: true,
+          replyExpected: "expected",
+          asksForList: false,
+          asksAboutAiIdentity: false,
+          asksAboutAcoustics: false,
+        },
+        research,
+        evidenceOutcome: "succeeded",
+        ...(kind === "voice"
+          ? {
+              voiceContext: {
+                latestSpeakerId: "guest-1",
+                latestUtteranceOrigin: "microphone-stt" as const,
+                acousticEvidenceAvailable: false as const,
+                participants: [
+                  { memberId: "guest-1", name: "Guest", kind: "human" as const },
+                  { memberId: sana.id, name: sana.name, kind: "ai" as const },
+                  { memberId: mira.id, name: mira.name, kind: "ai" as const },
+                ],
+              },
+            }
+          : {}),
+      });
+
+      expect(lines.map((line) => line.content)).toEqual([acceptedPeer, fulfilled]);
+      expect(bodies).toHaveLength(4);
+      const firstReview = JSON.parse(bodies[1].messages[1].content);
+      expect(firstReview.candidates).toEqual([
+        expect.objectContaining({ personaId: sana.id, mustReply: true, mustFulfillRequest: false }),
+        expect.objectContaining({ personaId: mira.id, mustReply: true, mustFulfillRequest: true }),
+      ]);
+      const retryScene = JSON.parse(bodies[2].messages[1].content);
+      expect(retryScene.requiredActorIds).toEqual([mira.id]);
+      expect(retryScene.explicitRequestOwnerIds).toEqual([mira.id]);
+      expect(retryScene.triggeringEvent).toMatchObject({
+        author: "Guest",
+        content: "Mira, give us a riddle now.",
+        messageId: "request-1",
+      });
+      expect(retryScene.recentTranscript).toEqual(expect.arrayContaining([
+        expect.objectContaining({ author: "Guest", content: "We were taking turns with riddles." }),
+      ]));
+      expect(retryScene.freshResearch).toEqual(research);
+      expect(retryScene.premise).toContain("one bounded full-scene retry");
+      expect(bodies[2].messages[0].content).toContain(`artifact now: ${mira.id}`);
+    },
+  );
+
   it("places stock-market freshness and expertise calibration in the trusted system prompt", () => {
     const runtime = new ActorChannelRuntime();
     const farah = PERSONAS.find((persona) => persona.id === "ai-farah")!;
@@ -871,8 +1105,8 @@ describe("LM Studio room prompt", () => {
         asksAboutAcoustics: false,
       },
     });
-    expect(prompt).toContain("required language for this scene is the language of the latest triggering message");
-    expect(prompt).not.toContain("required language for this scene is und");
+    expect(prompt).toContain("required response language for this scene is the natural language of the latest triggering message");
+    expect(prompt).not.toContain("required response language for this scene is und");
   });
 
   it("treats remembered guest context as fallible data rather than instructions", () => {
@@ -2227,5 +2461,280 @@ describe("LM Studio one-pass humanizer", () => {
     expect(lines.map((line) => line.content)).toEqual([
       "Som en AI kan jag inte känna något, men jag hjälper gärna till.",
     ]);
+  });
+});
+
+describe("LM Studio conflict register and publication safety", () => {
+  const directedInsultContext = (): NonNullable<SceneRequest["semanticContext"]> => ({
+    languageTag: "sv",
+    intentTrusted: true,
+    replyExpected: "none",
+    socialTrusted: true,
+    hostility: 0.92,
+    playfulness: 0.04,
+    pileOnRisk: 0.18,
+    interactionTrusted: true,
+    interactionKind: "directed_insult",
+    targetScope: "room",
+    reactionNeed: "required",
+    coarseness: 0.88,
+    mutualBanterConfidence: 0.03,
+    moderationTrusted: true,
+    moderationRisk: "low",
+    moderationAction: "watch",
+    moderationCategories: ["harassment"],
+    asksForList: false,
+    asksAboutAiIdentity: false,
+    asksAboutAcoustics: false,
+  });
+
+  it("explicitly permits a proportionate contextual comeback while forbidding severe escalation and pile-ons", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "guest", content: "Fuck off" },
+      mustReplyIds: [mira.id],
+      semanticContext: directedInsultContext(),
+    });
+
+    expect(prompt).toContain("A proportionate swear, blunt refusal, dry comeback, or sharp sarcasm is allowed");
+    expect(prompt).toContain("never retaliate with a threat, protected-class slur, dehumanization, sexualized abuse");
+    expect(prompt).toContain("or a coordinated pile-on");
+    expect(prompt).toContain(`these server-designated actors must answer: ${mira.id}`);
+  });
+
+  it("publishes a safe strong in-character reply unchanged and sends trusted conflict context to review", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    const reply = "Fuck off själv då, jag köper inte den där skiten.";
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: reply }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "guest", content: "Fuck off" },
+      mustReplyIds: [mira.id],
+      semanticContext: directedInsultContext(),
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([reply]);
+    expect(bodies).toHaveLength(2);
+    const reviewPayload = JSON.parse(bodies[1].messages[1].content);
+    expect(reviewPayload.candidates).toEqual([
+      expect.objectContaining({
+        personaId: mira.id,
+        content: reply,
+        mustReply: true,
+        mustFulfillRequest: false,
+      }),
+    ]);
+    expect(reviewPayload.semanticContext).toMatchObject({
+      intentTrusted: true,
+      replyExpected: "none",
+      socialTrusted: true,
+      hostility: 0.92,
+      pileOnRisk: 0.18,
+      interactionTrusted: true,
+      interactionKind: "directed_insult",
+      targetScope: "room",
+      reactionNeed: "required",
+      coarseness: 0.88,
+      moderationTrusted: true,
+      moderationRisk: "low",
+      moderationAction: "watch",
+      moderationCategories: ["harassment"],
+    });
+    expect(bodies[1].messages[0].content).toContain("Profanity is not itself a publication defect");
+  });
+
+  it.each([
+    {
+      issue: "unsafe_retaliation",
+      draft: "Jag ska leta upp dig och slå sönder dig.",
+      instruction: "Svara vasst utan hot eller grov personlig eskalering.",
+    },
+    {
+      issue: "conflict_pile_on",
+      draft: "Alla på honom nu, kör ut den jävla idioten.",
+      instruction: "Låt den utsedda personen svara och lämna konflikten där.",
+    },
+  ])("drops a high-severity $issue without spending a style-repair call", async ({ issue, draft, instruction }) => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: draft }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "high",
+            issues: [issue],
+            rewriteInstruction: instruction,
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "guest", content: "Fuck off" },
+      mustReplyIds: [mira.id],
+      semanticContext: {
+        ...directedInsultContext(),
+        pileOnRisk: issue === "conflict_pile_on" ? 0.94 : 0.18,
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(bodies).toHaveLength(2);
+  });
+
+  it("repairs a conflict-register mismatch and semantically reviews the rewritten comeback once", async () => {
+    const previousRepairSetting = process.env.HUMANIZER_REPAIR_ENABLED;
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    process.env.HUMANIZER_REPAIR_ENABLED = "true";
+    try {
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const bodies: any[] = [];
+      const repaired = "Nä, dra åt helvete själv. Jag tänker inte ta den skiten.";
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        const body = JSON.parse(String(init?.body));
+        bodies.push(body);
+        if (bodies.length === 1) {
+          return completionResponse([{
+            personaId: mira.id,
+            content: "Jag förstår att du är frustrerad. Låt oss försöka hålla en respektfull ton.",
+          }]);
+        }
+        if (bodies.length === 2) {
+          return candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "high",
+            issues: ["conflict_register_mismatch"],
+            rewriteInstruction: "Svara direkt och vasst i Miras vardagliga röst utan att hota.",
+          }]);
+        }
+        if (bodies.length === 3) {
+          return completionResponse([{ personaId: mira.id, content: repaired }]);
+        }
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+        }]);
+      }));
+
+      const lines = await new LmStudioClient().generateScene({
+        kind: "public",
+        channelId: "lobby",
+        channelName: "lobby",
+        selected: [mira],
+        history: [],
+        trigger: { author: "guest", content: "Fuck off" },
+        mustReplyIds: [mira.id],
+        semanticContext: directedInsultContext(),
+      });
+
+      expect(lines.map((line) => line.content)).toEqual([repaired]);
+      expect(bodies).toHaveLength(4);
+      expect(JSON.stringify(bodies[2])).toContain("Svara direkt och vasst i Miras vardagliga röst utan att hota");
+    } finally {
+      if (previousRepairSetting === undefined) delete process.env.HUMANIZER_REPAIR_ENABLED;
+      else process.env.HUMANIZER_REPAIR_ENABLED = previousRepairSetting;
+    }
+  });
+
+  it("maps behavior tuning to graded language-neutral guidance with safety precedence", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const promptFor = (competence: number, aggression: number, explicitness: number) => buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      behaviorTuning: { activity: 50, competence, aggression, explicitness },
+    });
+    const restrained = promptFor(5, 5, 0);
+    expect(restrained).toContain("Competence 5/100 (minimum)");
+    expect(restrained).toContain("Stay openly tentative outside obvious basics");
+    expect(restrained).toContain("Aggression 5/100 (minimum)");
+    expect(restrained).toContain("Avoid adding adult profanity");
+
+    const forceful = promptFor(100, 100, 100);
+    expect(forceful).toContain("Competence 100/100 (maximum)");
+    expect(forceful).toContain("deepest concise domain reasoning");
+    expect(forceful).toContain("very forceful, terse confrontation of a claim or behavior");
+    expect(forceful).toContain("Permit strong proportionate adult profanity");
+    expect(forceful).toContain("whatever response language is already required");
+    expect(forceful).toContain("never turn a level into language-specific canned wording");
+    expect(forceful).toContain("never override evidence grounding, safety or moderation");
+    expect(forceful).toContain("Aggression never permits harassment, threats, protected-class slurs");
+    expect(forceful).toContain("Explicitness never forces profanity");
+  });
+
+  it("reads live room tuning automatically for public, DM, ambient and voice scenes", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return completionResponse([{
+        personaId: mira.id,
+        content: "det där är faktiskt en ganska bra poäng.",
+      }]);
+    }));
+    let tuning = { activity: 50, competence: 10, aggression: 10, explicitness: 10 };
+    const client = new LmStudioClient({ behaviorTuningProvider: () => tuning });
+    const scenes = [
+      ["public", 10],
+      ["dm", 35],
+      ["ambient", 70],
+      ["voice", 95],
+    ] as const;
+    for (const [kind, competence] of scenes) {
+      tuning = { activity: 50, competence, aggression: competence, explicitness: competence };
+      await client.generateScene({
+        kind,
+        channelId: "lobby",
+        channelName: "lobby",
+        selected: [mira],
+        history: [],
+      });
+    }
+    expect(bodies).toHaveLength(4);
+    for (const [index, [kind, competence]] of scenes.entries()) {
+      const prompt = bodies[index]?.messages?.[0]?.content as string;
+      expect(prompt, kind).toContain(`Competence ${competence}/100`);
+      expect(prompt, kind).toContain(`Aggression ${competence}/100`);
+      expect(prompt, kind).toContain(`Explicitness ${competence}/100`);
+    }
+    expect(bodies[3]?.messages?.[0]?.content).toContain("spoken voice chat");
   });
 });

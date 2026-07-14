@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import { io, type Socket } from "socket.io-client";
 import type {
   ActionResult,
+  CatalogUpdatePayload,
   Channel,
   ChatMessage,
   DirectorEvent,
@@ -35,6 +36,7 @@ import { unicodeCaselessKey } from "../shared/unicodeSafety";
 import { VoicePeerMesh } from "./voicePeer";
 import { VoiceActivityDetector, type VoiceActivityEvent } from "./voiceActivity";
 import { conversationEntryTarget, type ConversationViewport, type PendingConversationEntry } from "./chatScroll";
+import { formatSourceDate, linkPreviewAriaLabel, linkPreviewDomainLabel } from "./linkPreview";
 import {
   createBrowserVoicePlaybackController,
   type VoiceAiSpeechPayload,
@@ -365,6 +367,9 @@ export default function App() {
   const socketRef = useRef<Socket | null>(null);
   const meRef = useRef<Member | null>(null);
   const activeChannelRef = useRef("lobby");
+  const channelsRef = useRef<Channel[]>([]);
+  const membersRef = useRef<Member[]>([]);
+  const dmThreadsRef = useRef<DmThread[]>([]);
   const typingTimer = useRef<number | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -676,10 +681,13 @@ export default function App() {
     shouldStickToBottom.current = true;
     meRef.current = snapshot.me;
     setMe(snapshot.me);
+    membersRef.current = snapshot.members;
     setMembers(snapshot.members);
+    channelsRef.current = snapshot.channels;
     setChannels(snapshot.channels);
     setMessages(snapshot.messages);
     setHistoryPageInfo(snapshot.historyPageInfo ?? {});
+    dmThreadsRef.current = snapshot.dmThreads;
     setDmThreads(snapshot.dmThreads);
     setHealth(snapshot.health);
     setDirectorEvents(snapshot.directorEvents);
@@ -814,7 +822,56 @@ export default function App() {
           : participant),
       }));
     });
-    socket.on("presence:update", (payload: PresencePayload) => setMembers(payload.members));
+    socket.on("presence:update", (payload: PresencePayload) => {
+      membersRef.current = payload.members;
+      setMembers(payload.members);
+    });
+    socket.on("catalog:update", (payload: CatalogUpdatePayload) => {
+      const activeId = activeChannelRef.current;
+      const activePublicRoomWasRemoved = channelsRef.current.some((channel) => channel.id === activeId)
+        && !payload.channels.some((channel) => channel.id === activeId);
+      const activeDmThread = dmThreadsRef.current.find((thread) => thread.id === activeId);
+      const nextMemberIds = new Set(payload.members.map((member) => member.id));
+      const removedAiIds = new Set(
+        membersRef.current
+          .filter((member) => member.kind === "ai" && !nextMemberIds.has(member.id))
+          .map((member) => member.id),
+      );
+      const activeDmResidentWasRemoved = Boolean(activeDmThread && removedAiIds.has(activeDmThread.peerId));
+
+      channelsRef.current = payload.channels;
+      setChannels(payload.channels);
+      membersRef.current = payload.members;
+      setMembers(payload.members);
+      // Catalog updates omit offline humans, so only remove a DM when a
+      // previously known AI resident has actually left the catalog.
+      const survivingThreads = dmThreadsRef.current.filter((thread) => !removedAiIds.has(thread.peerId));
+      dmThreadsRef.current = survivingThreads;
+      setDmThreads(survivingThreads);
+      setProfile((current) => current
+        ? payload.members.find((member) => member.id === current.id) ?? null
+        : null);
+
+      if (activePublicRoomWasRemoved || activeDmResidentWasRemoved) {
+        const fallbackId = payload.channels.find((channel) => channel.id === "lobby")?.id
+          ?? payload.channels[0]?.id;
+        if (fallbackId) {
+          shouldStickToBottom.current = true;
+          activeChannelRef.current = fallbackId;
+          setActiveChannelId(fallbackId);
+          setReplyTo(null);
+          setMobilePanel(null);
+          setChannelNotices((current) => clearChannelNotice(current, fallbackId));
+          pushToast({
+            tone: "info",
+            title: activeDmResidentWasRemoved ? "Conversation closed" : "Room changed",
+            message: activeDmResidentWasRemoved
+              ? "That AI resident was removed by an administrator. Existing history remains on the server."
+              : "That room was removed by an administrator. You were moved to the lobby.",
+          });
+        }
+      }
+    });
     socket.on("typing:member", (payload: TypingMemberPayload) => {
       setTyping((current) => {
         const channel = new Set(current[payload.channelId] ?? []);
@@ -842,7 +899,11 @@ export default function App() {
           ),
         };
         const exists = current.some((thread) => thread.id === payload.thread.id);
-        return exists ? current.map((thread) => (thread.id === payload.thread.id ? nextThread : thread)) : [...current, nextThread];
+        const next = exists
+          ? current.map((thread) => (thread.id === payload.thread.id ? nextThread : thread))
+          : [...current, nextThread];
+        dmThreadsRef.current = next;
+        return next;
       });
       if (
         payload.message &&
@@ -856,6 +917,23 @@ export default function App() {
       }
     });
     socket.on("toast", pushToast);
+    socket.on("session:moderated", (payload: { action: "kick" | "ban"; message?: string }) => {
+      pushToast({
+        tone: "warning",
+        title: payload.action === "ban" ? "Access removed" : "Disconnected by an administrator",
+        message: payload.message ?? (payload.action === "ban"
+          ? "You have been banned from this room."
+          : "You can reconnect after a short cooldown."),
+      });
+      clearVoiceMedia();
+      joinedVoiceRoomRef.current = null;
+      setJoinedVoiceRoomId(null);
+      setVoiceJoinState("idle");
+      meRef.current = null;
+      setMe(null);
+      setConnection("preview");
+      socket.disconnect();
+    });
     socket.on("disconnect", (reason) => {
       if (reason !== "io client disconnect") setConnection("reconnecting");
       if (reason !== "io client disconnect" && joinedVoiceRoomRef.current) setVoiceJoinState("reconnecting");
@@ -879,7 +957,7 @@ export default function App() {
       });
     });
     socket.on("connect_error", (error) => {
-      if (error.message === "AUTH_REQUIRED") {
+      if (["AUTH_REQUIRED", "BANNED", "KICK_COOLDOWN"].includes(error.message)) {
         setMe(null);
         meRef.current = null;
         clearVoiceMedia();
@@ -888,6 +966,15 @@ export default function App() {
         setVoiceJoinState("idle");
         setConnection("preview");
         socket.disconnect();
+        if (error.message !== "AUTH_REQUIRED") {
+          pushToast({
+            tone: "warning",
+            title: error.message === "BANNED" ? "Access removed" : "Reconnect cooldown",
+            message: error.message === "BANNED"
+              ? "This identity has been banned from the room."
+              : "An administrator disconnected this identity for a short cooldown.",
+          });
+        }
       } else {
         setConnection("offline");
       }
@@ -902,6 +989,7 @@ export default function App() {
         if (!alive) return;
         setPreview(data);
         setMembers(data.members);
+        channelsRef.current = data.channels;
         setChannels(data.channels);
         setMessages(data.messages);
         setHealth(data.health);
@@ -1203,6 +1291,29 @@ export default function App() {
     if (!shouldStickToBottom.current) return;
     requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }));
   }, [activeMessages.length, activeChannelId, foldedSearch]);
+
+  useEffect(() => {
+    const scroller = scrollRef.current;
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      // Compact layout, the software keyboard, reply banners and attachments
+      // can all change the viewport without adding a message. Preserve the
+      // bottom anchor only when the guest was already following the latest
+      // messages; never pull someone down while they are reading history.
+      if (!shouldStickToBottom.current) return;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const current = scrollRef.current;
+        if (current && shouldStickToBottom.current) current.scrollTop = current.scrollHeight;
+      });
+    });
+    observer.observe(scroller);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, []);
 
   const join = async (event: FormEvent) => {
     event.preventDefault();
@@ -1796,11 +1907,13 @@ export default function App() {
       captureCurrentViewport();
       const currentThread = dmThreads.find((thread) => thread.id === result.thread!.id);
       queueConversationEntry(result.thread.id, firstUnreadDmMessageId(currentThread));
-      setDmThreads((current) =>
-        current.some((thread) => thread.id === result.thread!.id)
+      setDmThreads((current) => {
+        const next = current.some((thread) => thread.id === result.thread!.id)
           ? current.map((thread) => (thread.id === result.thread!.id ? result.thread! : thread))
-          : [...current, result.thread!],
-      );
+          : [...current, result.thread!];
+        dmThreadsRef.current = next;
+        return next;
+      });
       activeChannelRef.current = result.thread.id;
       setVoiceViewRoomId(null);
       setVoiceCreateOpen(false);
@@ -2139,6 +2252,13 @@ export default function App() {
                   content: replied.content || (replied.attachments?.length ? "📷 Image" : "Message"),
                 }
               : message.replyPreview;
+            const previewSource = message.linkPreview
+              ? message.sources?.find((source) => source.url === message.linkPreview?.url)
+              : undefined;
+            const remainingSources = message.sources?.filter(
+              (source) => !message.linkPreview || source.url !== message.linkPreview.url,
+            ) ?? [];
+            const previewPublishedDate = formatSourceDate(previewSource?.publishedAt);
             if (message.system) return (
               <Fragment key={message.id}>
                 {startsDay && <div className="day-divider"><span>{formatDayLabel(message.createdAt)}</span></div>}
@@ -2193,24 +2313,33 @@ export default function App() {
                       </figure>
                     );
                   })}
-                  {message.linkPreview && !message.sources?.some((source) => source.url === message.linkPreview?.url) && (
+                  {message.linkPreview && (
                     <div className="link-preview-list">
                       <a
-                        className="link-preview-card"
+                        className={`link-preview-card${previewSource ? " link-preview-card-sourced" : ""}`}
                         href={message.linkPreview.url}
                         target="_blank"
                         rel="noopener noreferrer nofollow"
                         referrerPolicy="no-referrer"
-                        aria-label={`Open link preview: ${message.linkPreview.title} (opens in a new tab)`}
+                        aria-label={linkPreviewAriaLabel(message.linkPreview.title, Boolean(previewSource))}
                       >
                         <span className="link-preview-domain">
-                          {message.linkPreview.siteName === message.linkPreview.displayHost
-                            ? message.linkPreview.displayHost
-                            : `${message.linkPreview.siteName} · ${message.linkPreview.displayHost}`}
+                          <span>{linkPreviewDomainLabel(message.linkPreview.siteName, message.linkPreview.displayHost)}</span>
                           <Icon name="external" size={11} />
                         </span>
                         <strong className="link-preview-title" dir="auto">{message.linkPreview.title}</strong>
                         {message.linkPreview.description && <span className="link-preview-description" dir="auto">{message.linkPreview.description}</span>}
+                        {previewSource && (
+                          <span className="link-preview-footer">
+                            <span className="link-preview-provenance"><Icon name="search" size={11} /> Looked up</span>
+                            {previewPublishedDate && (
+                              <>
+                                <span className="link-preview-separator" aria-hidden="true">•</span>
+                                <time dateTime={previewPublishedDate.dateTime}>Published {previewPublishedDate.label}</time>
+                              </>
+                            )}
+                          </span>
+                        )}
                       </a>
                     </div>
                   )}
@@ -2224,10 +2353,10 @@ export default function App() {
                       ))}
                     </div>
                   )}
-                  {message.sources && message.sources.length > 0 && (
+                  {remainingSources.length > 0 && (
                     <div className="source-row">
                       <span><Icon name="search" size={11} /> looked up</span>
-                      {message.sources.map((source) => (
+                      {remainingSources.map((source) => (
                         <a dir="auto" key={source.url} href={source.url} target="_blank" rel="noopener noreferrer nofollow" referrerPolicy="no-referrer" title={source.title}>
                           {source.title}
                         </a>

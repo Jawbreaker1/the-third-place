@@ -73,6 +73,35 @@ describe("language-agnostic page target binding", () => {
     ]);
   });
 
+  it("binds a human reply to the exact URL on a server-created source card", () => {
+    const now = Date.now();
+    const sourceCard: ChatMessage = {
+      ...message("Det intressanta är återställningen efter verktygsfelet.", "ai-mira", new Date(now - 1_000).toISOString()),
+      linkPreview: {
+        url: "https://example.com/research/concrete-item",
+        displayHost: "example.com",
+        siteName: "example.com",
+        title: "A practical recovery benchmark",
+        description: "One safely read detail.",
+        fetchedAt: new Date(now - 1_000).toISOString(),
+      },
+      sources: [
+        { title: "A practical recovery benchmark", url: "https://example.com/research/concrete-item" },
+        { title: "Rejected metadata", url: "http://127.0.0.1/private" },
+      ],
+    };
+    const target = classifiedRequest({
+      content: "Vad säger källan mer exakt?",
+      requesterId: "guest-1",
+      replyTarget: sourceCard,
+      now,
+    });
+    expect(target).toMatchObject({
+      source: "reply",
+      url: new URL("https://example.com/research/concrete-item"),
+    });
+  });
+
   it("resolves only an exact server-issued candidate ID", () => {
     const current = message("https://one.example/a https://two.example/b");
     const candidateSet = collectPageReadCandidates({ messages: [current], requesterId: "guest-1" });

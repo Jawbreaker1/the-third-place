@@ -82,6 +82,14 @@ export type VoiceTranscriptAppendResult =
   | { ok: true; entry: VoiceTranscriptEntry }
   | VoiceActionFailure;
 
+export type VoiceChannelCatalogResult =
+  | { ok: true }
+  | { ok: false; code: "CHANNEL_IN_USE"; channelIds: string[] };
+
+export type VoicePersonaCatalogResult =
+  | { ok: true }
+  | { ok: false; code: "PERSONA_IN_USE"; personaIds: string[] };
+
 export interface VoiceTranscriptAppendOptions {
   startedAt?: number;
   endedAt?: number;
@@ -161,6 +169,57 @@ export class VoiceRoomRuntime {
 
   capabilities(): VoiceCapabilities {
     return cloneCapabilities(this.runtimeCapabilities);
+  }
+
+  validateChannelIds(channelIds: readonly string[]): VoiceChannelCatalogResult {
+    const next = new Set(channelIds);
+    const blocked = [...this.rooms.values()]
+      .filter((room) => !next.has(room.channelId))
+      .map((room) => room.channelId)
+      .filter((channelId, index, values) => values.indexOf(channelId) === index)
+      .sort();
+    return blocked.length > 0 ? { ok: false, code: "CHANNEL_IN_USE", channelIds: blocked } : { ok: true };
+  }
+
+  /** Atomically replaces creatable voice channels; active rooms block removal. */
+  setChannelIds(channelIds: readonly string[]): VoiceChannelCatalogResult {
+    const validation = this.validateChannelIds(channelIds);
+    if (!validation.ok) return validation;
+    const next = new Set(channelIds);
+    this.channelIds.clear();
+    for (const channelId of next) this.channelIds.add(channelId);
+    return { ok: true };
+  }
+
+  validatePersonaIds(personaIds: readonly string[]): VoicePersonaCatalogResult {
+    const active = new Set(personaIds);
+    const blocked = [...this.rooms.values()]
+      .flatMap((room) => [...room.participants.values()])
+      .filter((participant) => participant.view.kind === "ai" && !active.has(participant.view.memberId))
+      .map((participant) => participant.view.memberId)
+      .filter((personaId, index, values) => values.indexOf(personaId) === index)
+      .sort();
+    return blocked.length > 0 ? { ok: false, code: "PERSONA_IN_USE", personaIds: blocked } : { ok: true };
+  }
+
+  /** Updates live bot display names after a catalog edit. Missing IDs are refused by the admin guard. */
+  reconcileBotCatalog(personas: readonly { id: string; name: string }[]): VoiceRoomView[] {
+    const names = new Map(personas.map((persona) => [persona.id, cleanName(persona.name)]));
+    const changed: VoiceRoomView[] = [];
+    for (const room of this.rooms.values()) {
+      let roomChanged = false;
+      for (const participant of room.participants.values()) {
+        if (participant.view.kind !== "ai") continue;
+        const name = names.get(participant.view.memberId);
+        if (!name || name === participant.view.name) continue;
+        participant.view.name = name;
+        roomChanged = true;
+      }
+      if (!roomChanged) continue;
+      room.revision += 1;
+      changed.push(this.view(room));
+    }
+    return changed;
   }
 
   listRooms(): VoiceRoomView[] {

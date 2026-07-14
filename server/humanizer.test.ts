@@ -163,6 +163,20 @@ describe("humanizer structural checks", () => {
 });
 
 describe("humanizer false-positive guardrails", () => {
+  it("does not mechanically reject multilingual coarse language through a word list", () => {
+    for (const text of [
+      "dra åt helvete då",
+      "vete a la mierda",
+      "ふざけんなよ",
+      "تبّاً لك",
+      "Да пошёл ты нахуй",
+    ]) {
+      const result = assessCandidate({ personaId: "ai-a", text });
+      expect(result.acceptable, text).toBe(true);
+      expect(result.reasonCodes, text).toEqual([]);
+    }
+  });
+
   it("allows short natural replies including a standalone agreement", () => {
     for (const text of ["Absolut!", "nä, håller inte med", "haha exakt", "kör 🫡"]) {
       expect(assessCandidate({ personaId: "ai-a", text }).reasonCodes).toEqual([]);

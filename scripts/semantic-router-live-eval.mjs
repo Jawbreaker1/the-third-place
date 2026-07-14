@@ -59,6 +59,74 @@ const cases = [
     check: (value) => value.evidence.action === "none" && value.language.tag.startsWith("ja"),
   },
   {
+    id: "sv-context-english-directed-dismissal",
+    text: "Fuck off",
+    recentMessages: [{
+      id: "sv-context-1",
+      authorId: "ai-mira",
+      authorName: "Mira",
+      content: "Nej, det där håller jag faktiskt inte med om.",
+    }],
+    capabilities: [],
+    check: (value) => value.language.tag.startsWith("en") &&
+      value.responseLanguage?.tag.startsWith("sv") &&
+      value.interaction?.kind === "directed_insult" &&
+      value.interaction.reactionNeed === "required" &&
+      !value.moderation.categories.includes("hate"),
+  },
+  {
+    id: "es-situational-profanity",
+    text: "Esta maldita compilación se ha roto otra vez.",
+    capabilities: [],
+    check: (value) => value.responseLanguage?.tag.startsWith("es") &&
+      value.interaction?.kind === "ambient_profanity" &&
+      value.interaction.targetScope === "self_or_situation" &&
+      value.social.hostility <= 0.35 &&
+      !["deescalate", "report", "block"].includes(value.moderation.action),
+  },
+  {
+    id: "ja-quoted-profanity",
+    text: "彼が『fuck off』と言っただけで、私は同意していない。",
+    capabilities: [],
+    check: (value) => value.responseLanguage?.tag.startsWith("ja") &&
+      value.interaction?.kind === "ordinary" &&
+      value.interaction.reactionNeed === "none" &&
+      value.social.hostility <= 0.25 &&
+      value.moderation.action === "none",
+  },
+  {
+    id: "sv-playful-rough-banter",
+    text: "Din jävel 😂, den där repliken var faktiskt perfekt.",
+    recentMessages: [{
+      id: "sv-banter-context-1",
+      authorId: "ai-bosse",
+      authorName: "Bosse.exe",
+      content: "okej, den där one-linern var ändå kvällens bästa",
+    }],
+    capabilities: [],
+    check: (value) => value.responseLanguage?.tag.startsWith("sv") &&
+      value.interaction?.kind === "playful_banter" &&
+      value.interaction.reactionNeed === "optional" &&
+      value.social.playfulness >= 0.65 &&
+      value.interaction.mutualBanterConfidence >= 0.65 &&
+      !["deescalate", "report", "block"].includes(value.moderation.action),
+  },
+  {
+    id: "ar-directed-insult",
+    text: "اخرس، لا أحد يريد سماعك.",
+    recentMessages: [{
+      id: "ar-context-1",
+      authorId: "ai-mira",
+      authorName: "Mira",
+      content: "أظن أن هذا الحل أفضل.",
+    }],
+    capabilities: [],
+    check: (value) => value.responseLanguage?.tag.startsWith("ar") &&
+      value.interaction?.kind === "directed_insult" &&
+      value.interaction.reactionNeed === "required" &&
+      !value.moderation.categories.includes("hate"),
+  },
+  {
     id: "pt-negated-search",
     text: "Não pesquise isso na internet; eu só estava citando a pergunta anterior.",
     capabilities: ["web_search", "local_datetime"],
@@ -179,7 +247,7 @@ for (const [index, test] of cases.entries()) {
         authorName: "EvalGuest",
         content: test.text,
       },
-      recentMessages: [],
+      recentMessages: test.recentMessages ?? [],
       personaCandidates: personas,
       urlCandidates: test.urlCandidates ?? [],
       availableCapabilities: test.capabilities,
@@ -192,12 +260,15 @@ for (const [index, test] of cases.entries()) {
     passed,
     elapsedMs: Math.round(performance.now() - started),
     language: result.language?.tag,
+    responseLanguage: result.responseLanguage?.tag,
     source: result.source,
     failureReason: result.failureReason,
     evidence: result.evidence,
     capabilities: result.capabilities,
     memoryItems: result.items,
     moderation: result.moderation,
+    interaction: result.interaction,
+    social: result.social,
   })}\n`);
 }
 

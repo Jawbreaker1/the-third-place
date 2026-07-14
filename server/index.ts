@@ -29,8 +29,13 @@ import type {
   VoiceRoomView,
   VoiceTranscriptEntry,
 } from "../shared/types.js";
+import type { AdminHumanMember } from "../shared/adminTypes.js";
 import { displayNameGlyph, normalizeDisplayName, validDisplayName } from "../shared/displayName.js";
-import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
+import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
+import { AdminAuthManager } from "./adminAuth.js";
+import { AdminModerationGuard } from "./adminModeration.js";
+import { createAdminRouter } from "./adminRouter.js";
+import { AdminStateError, AdminStateStore } from "./adminState.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { SocialDirector } from "./director.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
@@ -39,8 +44,20 @@ import { HUMAN_MEMORY_DEFAULTS, HumanMemoryStore } from "./humanMemory.js";
 import { LmStudioClient } from "./lmStudio.js";
 import { CHANNELS } from "./channels.js";
 import { PERSONAS, memberView } from "./personas.js";
-import { configuredPersonaProviderVoices } from "./personaVoices.js";
+import { configuredProviderVoiceIds } from "./personaVoices.js";
+import { participantIdentityKey } from "./participantIdentity.js";
+import {
+  configuredWebOrigin,
+  parseWebOriginConfiguration,
+  socketOriginAllowed,
+} from "./originPolicy.js";
 import { ResearchBroker } from "./researchBroker.js";
+import {
+  ADMIN_JSON_BODY_LIMIT_BYTES,
+  PUBLIC_JSON_BODY_LIMIT_BYTES,
+  isAdminApiPath,
+} from "./requestBodyPolicy.js";
+import { installSpaHosting } from "./spaHosting.js";
 import { createMessage, type HistoryPosition, RoomStore } from "./store.js";
 import { VoiceDirector } from "./voiceDirector.js";
 import { preferredRequestLanguage } from "./requestLanguage.js";
@@ -100,6 +117,7 @@ interface HumanSession {
   member: Member;
   socketIds: Set<string>;
   lastSeenAt: number;
+  createdAt: number;
   historyBucket: TokenBucket;
   imageBucket: TokenBucket;
   voiceBucket: TokenBucket;
@@ -130,11 +148,13 @@ const createHumanSession = (
   tokenHash: string,
   member: Member,
   lastSeenAt = Date.now(),
+  createdAt = lastSeenAt,
 ): HumanSession => ({
   tokenHash,
   member: { ...member, avatar: { ...member.avatar }, status: "offline" },
   socketIds: new Set(),
   lastSeenAt,
+  createdAt,
   historyBucket: new TokenBucket(8, 1),
   imageBucket: new TokenBucket(3, 1 / 25),
   voiceBucket: new TokenBucket(12, 0.5),
@@ -323,7 +343,7 @@ const parseCookies = (header?: string): Record<string, string> =>
       }),
   );
 const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
-const safeNameKey = (name: string) => unicodeCaselessKey(name).replace(/[\s._-]/gu, "");
+const safeNameKey = participantIdentityKey;
 const randomAvatar = (): Member["avatar"] => {
   const palettes = [
     ["#ff7163", "#ffb866"],
@@ -358,13 +378,19 @@ app.use((_request, response, next) => {
   response.setHeader("Permissions-Policy", "microphone=(self)");
   next();
 });
-app.use(express.json({ limit: "16kb" }));
+// Forty multilingual room seeds can exceed 64 KiB in UTF-8 while remaining
+// inside the strict character schema. Keep admin writes separately bounded.
+const publicJsonParser = express.json({ limit: PUBLIC_JSON_BODY_LIMIT_BYTES });
+const adminJsonParser = express.json({ limit: ADMIN_JSON_BODY_LIMIT_BYTES });
+app.use((request, response, next) => {
+  (isAdminApiPath(request.path) ? adminJsonParser : publicJsonParser)(request, response, next);
+});
 
 const httpServer = createServer(app);
-const configuredOrigins = (process.env.ALLOWED_ORIGINS ?? "")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const { configuredOrigins, publicOrigin } = parseWebOriginConfiguration(
+  process.env.ALLOWED_ORIGINS,
+  process.env.PUBLIC_ORIGIN,
+);
 const io = new Server(httpServer, {
   maxHttpBufferSize: 64 * 1024,
   pingInterval: 22_000,
@@ -372,7 +398,7 @@ const io = new Server(httpServer, {
   connectionStateRecovery: { maxDisconnectionDuration: 120_000, skipMiddlewares: false },
   cors: {
     origin: (origin, callback) => {
-      if (!origin || configuredOrigins.length === 0 || configuredOrigins.includes(origin)) callback(null, true);
+      if (socketOriginAllowed(origin, configuredOrigins, publicOrigin)) callback(null, true);
       else callback(new Error("Origin not allowed"));
     },
     credentials: true,
@@ -381,17 +407,39 @@ const io = new Server(httpServer, {
 
 const store = new RoomStore();
 const humanMemory = new HumanMemoryStore();
-const lm = new LmStudioClient();
-const actorChannels = new ActorChannelRuntime();
+let adminState!: AdminStateStore;
+const behaviorTuningProvider = (channelId?: string) => adminState?.behaviorTuning(channelId);
+const lm = new LmStudioClient({ behaviorTuningProvider });
 const researchBroker = new ResearchBroker();
 const linkPreviewBroker = new LinkPreviewBroker();
 const imageStore = new ImageStore();
+const allowedTtsVoiceIds = configuredProviderVoiceIds(
+  process.env.TTS_MODEL,
+  process.env.TTS_VOICE,
+  process.env.TTS_VOICES,
+);
 const voiceSpeech = new VoiceSpeechService({
-  // Persona aliases belong to the bundled Piper provider. Generic providers
-  // use only their explicitly configured default voice.
-  ttsVoices: configuredPersonaProviderVoices(process.env.TTS_MODEL),
+  ttsVoices: allowedTtsVoiceIds,
 });
 const voiceSpeechCapabilities = await voiceSpeech.capabilities();
+const exposedTtsVoiceIds = voiceSpeechCapabilities.tts.available ? allowedTtsVoiceIds : [];
+const exposedTtsLanguages = [...(voiceSpeechCapabilities.tts.supportedLanguages ?? [])];
+adminState = new AdminStateStore({
+  voiceOptions: {
+    languages: exposedTtsLanguages,
+    voices: exposedTtsVoiceIds.map((id) => ({
+      id,
+      label: id,
+      languages: exposedTtsLanguages,
+    })),
+  },
+});
+await adminState.load();
+const adminAuth = new AdminAuthManager({ password: process.env.ADMIN_PASSWORD });
+const adminModeration = new AdminModerationGuard({
+  kickCooldownMs: Number.parseInt(process.env.ADMIN_KICK_COOLDOWN_MS ?? "300000", 10),
+});
+const actorChannels = new ActorChannelRuntime();
 const voiceRooms = new VoiceRoomRuntime(
   CHANNELS.map((channel) => channel.id),
   {
@@ -503,7 +551,17 @@ const getHealth = (): ServerHealth => ({
   onlineHumans: onlineHumanCount(),
   aiPace: PACE,
 });
-const director = new SocialDirector(io, store, lm, actorChannels, researchBroker, humanMemory, getMembers, onlineHumanCount);
+const director = new SocialDirector(
+  io,
+  store,
+  lm,
+  actorChannels,
+  researchBroker,
+  humanMemory,
+  getMembers,
+  onlineHumanCount,
+  { behaviorTuningProvider },
+);
 
 const voiceSocketRoom = (roomId: string) => `voice:${roomId}`;
 const publishVoiceRooms = (): void => {
@@ -558,7 +616,11 @@ const analyzeImageMessage = (message: ChatMessage, human: Member): void => {
 
 const sessionFromRequest = (request: Request): HumanSession | undefined => {
   const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
-  return token ? sessions.get(hashToken(token)) : undefined;
+  const session = token ? sessions.get(hashToken(token)) : undefined;
+  if (!session || adminState.isBanned(session.member.id, session.member.name) || adminModeration.isKicked(session.member.id, session.member.name)) {
+    return undefined;
+  }
+  return session;
 };
 
 const authenticatedSessionFromRequest = (
@@ -567,7 +629,10 @@ const authenticatedSessionFromRequest = (
   const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
   if (!token) return undefined;
   const session = sessions.get(hashToken(token));
-  return session ? { session, token } : undefined;
+  if (!session || adminState.isBanned(session.member.id, session.member.name) || adminModeration.isKicked(session.member.id, session.member.name)) {
+    return undefined;
+  }
+  return { session, token };
 };
 
 const clientIp = (request: Request): string => {
@@ -581,7 +646,8 @@ const clientIp = (request: Request): string => {
 const hasAllowedOrigin = (request: Request): boolean => {
   const origin = request.headers.origin;
   if (!origin) return true;
-  if (configuredOrigins.includes(origin) || process.env.PUBLIC_ORIGIN === origin) return true;
+  const normalized = configuredWebOrigin(origin);
+  if (normalized && (configuredOrigins.includes(normalized) || publicOrigin === normalized)) return true;
   try {
     return new URL(origin).host === request.get("host");
   } catch {
@@ -626,12 +692,122 @@ const attachLinkPreview = (message: ChatMessage, requesterId: string): void => {
 };
 
 const setSessionCookie = (request: Request, response: Response, token: string): void => {
-  const secure = request.secure || process.env.PUBLIC_ORIGIN?.startsWith("https://");
+  const secure = request.secure || publicOrigin?.startsWith("https://");
   response.setHeader(
     "Set-Cookie",
     `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_COOKIE_MAX_AGE_SECONDS}${secure ? "; Secure" : ""}`,
   );
 };
+
+const adminHumans = (): AdminHumanMember[] => [...sessions.values()]
+  .map((session) => ({
+    id: session.member.id,
+    name: session.member.name,
+    status: session.member.status,
+    joinedAt: new Date(session.createdAt).toISOString(),
+  }))
+  .sort((a, b) => a.name.localeCompare(b.name));
+
+const disconnectModeratedHuman = (
+  memberId: string,
+  reason: string | undefined,
+  reconnectCooldown: boolean,
+): AdminHumanMember | undefined => {
+  const session = [...sessions.values()].find((candidate) => candidate.member.id === memberId);
+  if (!session) return undefined;
+  if (reconnectCooldown) adminModeration.kick(session.member.id, session.member.name);
+  for (const socketId of [...session.socketIds]) {
+    const socket = io.sockets.sockets.get(socketId);
+    socket?.emit("session:moderated", {
+      action: reconnectCooldown ? "kick" : "ban",
+      message: reason || (reconnectCooldown ? "You were removed from the room for a short cooldown." : "You were banned from this room."),
+    });
+    const voiceRoom = voiceRooms.getRoomForSocket(socketId);
+    const voiceResult = voiceRooms.leaveRoom(socketId);
+    if (voiceRoom && voiceResult.ok) {
+      if (voiceResult.closed) {
+        voiceDirector.forgetRoom(voiceResult.roomId);
+        forgetVoiceIngestRoom(voiceResult.roomId);
+        voiceSpeech.audioStore.deleteRoom(voiceResult.roomId);
+        io.to(voiceSocketRoom(voiceResult.roomId)).emit("voice:room:closed", { roomId: voiceResult.roomId });
+        publishVoiceRooms();
+      } else {
+        publishVoiceRoom(voiceResult.room);
+      }
+    }
+    socket?.disconnect(true);
+  }
+  session.member.status = "offline";
+  io.to("public").emit("presence:update", { members: getMembers() });
+  return {
+    id: session.member.id,
+    name: session.member.name,
+    status: session.member.status,
+    joinedAt: new Date(session.createdAt).toISOString(),
+  };
+};
+
+adminState.setHooks({
+  validateChannelIds: (channelIds) => {
+    const result = voiceRooms.validateChannelIds(channelIds);
+    if (!result.ok) {
+      throw new AdminStateError(409, "CHANNEL_IN_USE", `Close the active voice room in #${result.channelIds[0]} before removing that channel.`);
+    }
+  },
+  validatePersonaIds: (personaIds) => {
+    const result = voiceRooms.validatePersonaIds(personaIds);
+    if (!result.ok) {
+      throw new AdminStateError(409, "PERSONA_IN_VOICE", `Remove ${result.personaIds[0]} from voice chat before disabling that persona.`);
+    }
+  },
+  validatePersonaNames: (personas) => {
+    const humansByName = new Map<string, string>();
+    for (const session of sessions.values()) humansByName.set(safeNameKey(session.member.name), session.member.name);
+    for (const profile of humanMemory.listRestorableProfiles()) {
+      humansByName.set(safeNameKey(profile.member.name), profile.member.name);
+    }
+    for (const persona of personas) {
+      const reservedBy = humansByName.get(safeNameKey(persona.name));
+      if (!reservedBy) continue;
+      throw new AdminStateError(
+        409,
+        "PERSONA_NAME_RESERVED",
+        `The resident name ${persona.name} conflicts with the remembered human identity ${reservedBy}.`,
+      );
+    }
+  },
+  reconcileCatalog: () => {
+    actorChannels.reconcileCatalog();
+    const channelResult = voiceRooms.setChannelIds(CHANNELS.map((channel) => channel.id));
+    if (!channelResult.ok) {
+      throw new AdminStateError(409, "CHANNEL_IN_USE", "An active voice room still references a removed channel.");
+    }
+    for (const room of voiceRooms.reconcileBotCatalog(PERSONAS)) publishVoiceRoom(room);
+  },
+  onCommitted: (_snapshot, catalogChanged) => {
+    if (!catalogChanged) return;
+    director.reconcileCatalog();
+    voiceDirector.onCatalogChanged(voiceRooms.listRooms().map((room) => room.id));
+    io.to("public").emit("catalog:update", {
+      channels: CHANNELS.map((channel) => ({ ...channel })),
+      members: getMembers(),
+    });
+  },
+});
+
+const adminOrigins = [
+  ...configuredOrigins,
+  ...(publicOrigin ? [publicOrigin] : []),
+];
+app.use("/api/admin", createAdminRouter({
+  auth: adminAuth,
+  state: adminState,
+  configuredOrigins: adminOrigins,
+  getHumans: adminHumans,
+  kickHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, true),
+  banHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, false),
+  isSecure: (request) => request.secure || publicOrigin?.startsWith("https://") === true,
+}));
 
 app.get("/api/voice/capabilities", (_request, response) => {
   const capabilities = voiceRooms.capabilities();
@@ -970,6 +1146,14 @@ app.post("/api/session", async (request, response) => {
     response.status(400).json({ ok: false, error: "Use 1–24 letters, numbers, spaces, dots, dashes or underscores." });
     return;
   }
+  if (adminState.isBanned(undefined, name)) {
+    response.status(403).json({ ok: false, error: "That identity is banned from this room." });
+    return;
+  }
+  if (adminModeration.isKicked(undefined, name)) {
+    response.status(429).json({ ok: false, error: "That identity is on a short reconnect cooldown." });
+    return;
+  }
   const reserved = new Set([
     ...PERSONAS.map((persona) => safeNameKey(persona.name)),
     ...humanMemory.listRestorableProfiles().map((profile) => safeNameKey(profile.member.name)),
@@ -1011,6 +1195,14 @@ io.use((socket, next) => {
   const session = token ? sessions.get(hashToken(token)) : undefined;
   if (!session) {
     next(new Error("AUTH_REQUIRED"));
+    return;
+  }
+  if (adminState.isBanned(session.member.id, session.member.name)) {
+    next(new Error("BANNED"));
+    return;
+  }
+  if (adminModeration.isKicked(session.member.id, session.member.name)) {
+    next(new Error("KICK_COOLDOWN"));
     return;
   }
   socket.data.sessionHash = session.tokenHash;
@@ -1401,19 +1593,43 @@ const distPath = resolve(process.cwd(), "dist");
 if (existsSync(distPath)) {
   // This is a fast-moving live demo: always let reloads pick up the newest
   // hashed asset manifest instead of holding an old index page for an hour.
-  app.use(express.static(distPath, { maxAge: 0 }));
-  app.get(/^(?!\/api\/).*/, (_request, response) => response.sendFile(resolve(distPath, "index.html")));
+  installSpaHosting(app, distPath);
 }
 
-app.use((error: unknown, _request: Request, response: Response, _next: unknown) => {
-  console.error(error);
-  response.status(500).json({ ok: false, error: "The room tripped over a cable." });
+app.use((error: unknown, request: Request, response: Response, _next: unknown) => {
+  const metadata = error as { type?: unknown; status?: unknown };
+  const malformedJson = metadata.type === "entity.parse.failed";
+  const bodyTooLarge = metadata.type === "entity.too.large" || metadata.status === 413;
+  const adminRequest = request.originalUrl.startsWith("/api/admin");
+  if (adminRequest) {
+    response.setHeader("Cache-Control", "private, no-store");
+    response.setHeader("Pragma", "no-cache");
+  }
+  if (adminRequest || malformedJson || bodyTooLarge) {
+    // Body-parser errors can carry the raw malformed JSON in `error.body`.
+    // Never hand that object to a logger on the credential boundary.
+    console.error("Admin request failed safely.", {
+      type: malformedJson ? "malformed-json" : bodyTooLarge ? "body-too-large" : "internal",
+      status: typeof metadata.status === "number" ? metadata.status : undefined,
+    });
+  } else {
+    console.error(error);
+  }
+  response.status(bodyTooLarge ? 413 : malformedJson ? 400 : 500).json({
+    ok: false,
+    error: bodyTooLarge
+      ? "The request body is too large."
+      : malformedJson
+        ? "The request body is not valid JSON."
+        : "The room tripped over a cable.",
+  });
 });
 
 await humanMemory.load();
 for (const profile of humanMemory.listRestorableProfiles()) {
   sessions.set(profile.tokenHash, createHumanSession(profile.tokenHash, profile.member, profile.lastSeenAt));
 }
+adminState.validateActiveCatalog();
 await store.load();
 await imageStore.initialize(store.getAllMessages());
 store.onMessagesRemoved((removed) => {
@@ -1450,6 +1666,8 @@ const healthInterval = setInterval(async () => {
     }
   }
   humanMemory.prune(now);
+  adminAuth.prune(now);
+  adminModeration.prune(now);
   synchronizeOfflineSessionsWithMemory();
   for (const [ip, timestamps] of joinAttempts) {
     const recent = timestamps.filter((timestamp) => now - timestamp < 10 * 60_000);
@@ -1471,7 +1689,7 @@ const shutdown = async (signal: string) => {
   clearInterval(healthInterval);
   director.stop();
   io.close();
-  await Promise.all([store.flush(), humanMemory.flush()]);
+  await Promise.all([store.flush(), humanMemory.flush(), adminState.flush()]);
   httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5_000).unref();
 };

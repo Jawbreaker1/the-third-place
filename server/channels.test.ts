@@ -9,6 +9,16 @@ import { PERSONAS, type Persona } from "./personas.js";
 import { buildRoomExpertiseMatrix, EXPERTISE_RANK } from "./roomExpertise.js";
 
 const NEW_ROOM_IDS = ["the-pub", "ai-programming", "stock-market", "world-of-warcraft", "3d-visualisation"];
+const RESEARCH_ROOM_IDS = [
+  "the-pub",
+  "ai-lab",
+  "ai-programming",
+  "stock-market",
+  "world-of-warcraft",
+  "3d-visualisation",
+];
+
+const normalizedContentKey = (value: string): string => value.normalize("NFKC").trim().toLocaleLowerCase("und");
 
 describe("channel profiles", () => {
   it("defines a single scalable profile for every public room", () => {
@@ -20,10 +30,44 @@ describe("channel profiles", () => {
     for (const profile of CHANNEL_PROFILES) {
       expect(profile.topic.brief.length).toBeGreaterThan(20);
       expect(profile.topic.tags.length).toBeGreaterThan(2);
-      expect(profile.ambientPremises.length).toBeGreaterThanOrEqual(3);
+      expect(profile.ambientPremises.length).toBeGreaterThanOrEqual(profile.public.id === "the-pub" ? 20 : 16);
+      expect(new Set(profile.ambientPremises.map(normalizedContentKey)).size).toBe(profile.ambientPremises.length);
+      if (profile.ambientPremiseFamilies) {
+        expect(profile.ambientPremiseFamilies).toHaveLength(profile.ambientPremises.length);
+        expect(profile.ambientPremiseFamilies.every((family) => /^[a-z0-9-]{3,48}$/.test(family))).toBe(true);
+        expect(new Set(profile.ambientPremiseFamilies).size).toBeGreaterThanOrEqual(8);
+      }
       expect(CONVERSATION_REGISTERS[profile.conversationRegister].guidance.length).toBeGreaterThan(40);
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
     }
+    const allPremises = CHANNEL_PROFILES.flatMap((profile) => profile.ambientPremises.map(normalizedContentKey));
+    expect(new Set(allPremises).size).toBe(allPremises.length);
+  });
+
+  it("defines bounded, stable and non-repeating autonomous research starters", () => {
+    const allIds: string[] = [];
+    const allQueries: string[] = [];
+    for (const profile of CHANNEL_PROFILES) {
+      const seeds = profile.autonomousResearchSeeds ?? [];
+      if (RESEARCH_ROOM_IDS.includes(profile.public.id)) {
+        expect(seeds.length, profile.public.id).toBeGreaterThanOrEqual(3);
+        expect(seeds.length, profile.public.id).toBeLessThanOrEqual(5);
+      }
+      for (const seed of seeds) {
+        expect(seed.id, profile.public.id).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u);
+        expect(seed.id.length, profile.public.id).toBeLessThanOrEqual(80);
+        expect(seed.query.length, seed.id).toBeGreaterThanOrEqual(12);
+        expect(seed.query.length, seed.id).toBeLessThanOrEqual(140);
+        expect(seed.query, seed.id).not.toMatch(/https?:\/\//u);
+        expect(["web", "news"], seed.id).toContain(seed.mode);
+        expect(seed.discussionAngle.length, seed.id).toBeGreaterThanOrEqual(30);
+        expect(seed.discussionAngle.length, seed.id).toBeLessThanOrEqual(280);
+        allIds.push(seed.id);
+        allQueries.push(normalizedContentKey(seed.query));
+      }
+    }
+    expect(new Set(allIds).size).toBe(allIds.length);
+    expect(new Set(allQueries).size).toBe(allQueries.length);
   });
 
   it("keeps internal expertise and freshness rules out of public channel objects", () => {
@@ -31,6 +75,7 @@ describe("channel profiles", () => {
       expect(channel).not.toHaveProperty("topic");
       expect(channel).not.toHaveProperty("expertiseOverrides");
       expect(channel).not.toHaveProperty("ambientPremises");
+      expect(channel).not.toHaveProperty("autonomousResearchSeeds");
       expect(channel).not.toHaveProperty("conversationGuidance");
       expect(channel).not.toHaveProperty("conversationRegister");
       expect(channel).not.toHaveProperty("ambientMode");
@@ -118,10 +163,29 @@ describe("channel profiles", () => {
     expect(matrix.get("the-pub")?.get("ai-juno")?.level).toBe("specialist");
   });
 
+  it("gives the two technical AI rooms explicit broad seed families", () => {
+    const aiLab = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-lab")!;
+    const programming = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")!;
+    expect(aiLab.ambientPremiseFamilies).toEqual(expect.arrayContaining([
+      "multimodal",
+      "voice-interaction",
+      "privacy-deployment",
+      "safety",
+    ]));
+    expect(programming.ambientPremiseFamilies).toEqual(expect.arrayContaining([
+      "language-contracts",
+      "accessibility-ui",
+      "python-runtime",
+      "local-hardware",
+      "api-backpressure",
+      "open-source-delivery",
+    ]));
+  });
+
   it("gives the pub a broad subject mix and a room-local banter contract", () => {
     const pub = CHANNEL_PROFILES.find((profile) => profile.public.id === "the-pub")!;
     expect(pub.ambientMode).toBe("banter");
-    expect(pub.ambientPremises.length).toBeGreaterThanOrEqual(12);
+    expect(pub.ambientPremises.length).toBeGreaterThanOrEqual(20);
     expect(pub.topic.tags).toEqual(expect.arrayContaining(["film", "music", "work", "politics", "memes", "food"]));
     expect(pub.conversationGuidance).toContain("Autonomous residents never introduce alcohol");
     expect(pub.conversationGuidance).toContain("at most one selected actor");

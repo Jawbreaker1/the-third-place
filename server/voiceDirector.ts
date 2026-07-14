@@ -7,7 +7,7 @@ import { CHANNELS, getChannelProfile } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
 import type { LmStudioClient, TranscriptLine } from "./lmStudio.js";
 import { PERSONAS, type Persona } from "./personas.js";
-import { voiceProfileForPersona } from "./personaVoices.js";
+import { mappedProviderVoiceForPersona, voiceProfileForPersona } from "./personaVoices.js";
 import {
   projectTrustedTurnAnalysis,
   type TurnAnalysis,
@@ -127,12 +127,17 @@ const analysisInputFor = (
   };
 };
 
-const routedLanguage = (analysis: TurnAnalysis | undefined, transcriptLanguage?: string): string | undefined => {
+export const routedLanguage = (analysis: TurnAnalysis | undefined, transcriptLanguage?: string): string | undefined => {
   const transcribed = canonicalRegisteredLanguageTag(transcriptLanguage);
   const classified = canonicalRegisteredLanguageTag(projectTrustedTurnAnalysis(analysis).languageTag);
-  // Provider-reported STT language is trusted transport metadata. It wins over
-  // a semantic router guess; typed voice turns have no such transport hint.
-  return transcribed ?? classified;
+  const contextualResponseLanguage = analysis?.source === "lm" && analysis.responseLanguage
+    ? classified
+    : undefined;
+  // The provider tag describes the latest utterance. Compact router v2 adds a
+  // distinct natural response language; prefer that trusted contextual result
+  // so a short outburst does not flip an established call. Older descriptive
+  // results have no such field, so the canonical STT tag still wins there.
+  return contextualResponseLanguage ?? transcribed ?? classified;
 };
 
 const routedLanguageHint = (language: string | undefined): string =>
@@ -195,6 +200,19 @@ export class VoiceDirector {
     return epoch;
   }
 
+  /**
+   * A committed live catalog edit invalidates voice work built from the old
+   * persona/room snapshot. Reset visible bot state as well so a cancelled
+   * generation or synthesis cannot leave a resident stuck on "thinking".
+   */
+  onCatalogChanged(roomIds: readonly string[]): void {
+    for (const roomId of new Set(roomIds)) {
+      if (!this.options.runtime.getRoom(roomId)) continue;
+      this.invalidateRoom(roomId);
+      this.resetBotsToListening(roomId);
+    }
+  }
+
   forgetRoom(roomId: string): void {
     const pending = this.pendingResponseTimerByRoom.get(roomId);
     if (pending) clearTimeout(pending);
@@ -227,9 +245,17 @@ export class VoiceDirector {
     analysis: TurnAnalysis | undefined,
   ): Persona | undefined {
     if (invited.length === 0) return undefined;
+    const trusted = projectTrustedTurnAnalysis(analysis);
+    if (
+      trusted.moderationTrusted &&
+      ["deescalate", "report", "block"].includes(trusted.moderation.action)
+    ) {
+      const moderator = invited.find((persona) => persona.id === "ai-runa");
+      if (moderator) return moderator;
+    }
     const explicitMention = invited.find((persona) => explicitlyMentionsPersona(entry.text, persona.name));
     if (explicitMention) return explicitMention;
-    const inferredIds = projectTrustedTurnAnalysis(analysis).inferredAddressedIds;
+    const inferredIds = trusted.inferredAddressedIds;
     if (inferredIds.length > 0) {
       const inferredTarget = inferredIds
         .map((id) => invited.find((persona) => persona.id === id))
@@ -324,6 +350,12 @@ export class VoiceDirector {
         trusted.capabilityTrusted
           ? `asksAboutAcoustics=${trusted.asksAboutAcoustics}`
           : "",
+        trusted.interactionTrusted
+          ? `interaction=${trusted.interaction.kind}; targetScope=${trusted.interaction.targetScope}; reactionNeed=${trusted.interaction.reactionNeed}; coarseness=${trusted.interaction.coarseness}; mutualBanterConfidence=${trusted.interaction.mutualBanterConfidence}`
+          : "",
+        trusted.moderationTrusted
+          ? `moderationRisk=${trusted.moderation.risk}; moderationAction=${trusted.moderation.action}`
+          : "",
         localDateTime
           ? "The latest utterance explicitly requests current date/time; answer from trustedTemporalContext.requestedClock without estimating."
           : "",
@@ -340,9 +372,26 @@ export class VoiceDirector {
           history: transcriptFor(this.options.runtime.getTranscript(room.id), persona.id),
           trigger: { author: entry.speakerName, content: entry.text, messageId: entry.id, createdAt: entry.endedAt },
           mustReplyIds: [persona.id],
+          requestOwnerIds: trusted.intentTrusted && trusted.replyExpected === "expected" ? [persona.id] : [],
           languageHint: routedLanguageHint(utteranceLanguage),
           semanticContext: {
             ...(utteranceLanguage ? { languageTag: utteranceLanguage } : {}),
+            intentTrusted: trusted.intentTrusted,
+            replyExpected: trusted.replyExpected,
+            socialTrusted: trusted.socialTrusted,
+            hostility: trusted.social.hostility,
+            playfulness: trusted.social.playfulness,
+            pileOnRisk: trusted.social.pileOnRisk,
+            interactionTrusted: trusted.interactionTrusted,
+            interactionKind: trusted.interaction.kind,
+            targetScope: trusted.interaction.targetScope,
+            reactionNeed: trusted.interaction.reactionNeed,
+            coarseness: trusted.interaction.coarseness,
+            mutualBanterConfidence: trusted.interaction.mutualBanterConfidence,
+            moderationTrusted: trusted.moderationTrusted,
+            moderationRisk: trusted.moderation.risk,
+            moderationAction: trusted.moderation.action,
+            moderationCategories: trusted.moderation.categories,
             asksForList: trusted.asksForList,
             asksAboutAiIdentity: trusted.asksAboutAiIdentity,
             asksAboutAcoustics: trusted.asksAboutAcoustics,
@@ -387,10 +436,7 @@ export class VoiceDirector {
       return;
     }
 
-    const voiceProfile = voiceProfileForPersona(persona.id);
-    if (!voiceProfile) {
-      console.warn(`Voice profile missing for ${persona.id}; server synthesis is disabled for this turn.`);
-    }
+    const voiceProfile = voiceProfileForPersona(persona.id, utteranceLanguage);
     let audio: { id: string; mimeType: string } | undefined;
     let browserFallbackAllowed = false;
     const speechAbort = new AbortController();
@@ -400,25 +446,27 @@ export class VoiceDirector {
       browserFallbackAllowed = capabilities.browserFallbackAllowed;
       if (
         capabilities.tts.available &&
-        voiceProfile &&
         ttsModelSupportsLanguage(capabilities.tts.supportedLanguages, utteranceLanguage)
       ) {
-        const providerVoice = capabilities.tts.model === "piper-sv"
-          ? voiceProfile.providerVoice
-          : capabilities.tts.defaultVoice;
+        const mappedVoice = mappedProviderVoiceForPersona(persona.id, utteranceLanguage);
+        const providerVoice = mappedVoice
+          ?? (capabilities.tts.model === "piper-sv" ? voiceProfile?.providerVoice : undefined)
+          ?? capabilities.tts.defaultVoice;
         if (!providerVoice) throw new Error("TTS provider has no configured voice for this turn");
         const stored = await this.options.speech.synthesize({
           roomId: room.id,
           text: spoken,
           language: utteranceLanguage,
           voice: providerVoice,
-          speed: voiceProfile.speed,
+          speed: voiceProfile?.speed ?? 1,
           signal: speechAbort.signal,
         });
         audio = { id: stored.id, mimeType: stored.mimeType };
       }
     } catch (error) {
-      console.warn("Voice TTS unavailable; clients may use their disclosed browser voice:", error instanceof Error ? error.message : error);
+      if (!speechAbort.signal.aborted) {
+        console.warn("Voice TTS unavailable; clients may use their disclosed browser voice:", error instanceof Error ? error.message : error);
+      }
     } finally {
       if (this.speechAbortByRoom.get(room.id) === speechAbort) this.speechAbortByRoom.delete(room.id);
     }

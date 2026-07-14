@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
+import { PERSONAS } from "./personas.js";
+import { setAdminPersonaVoiceMappings } from "./personaVoices.js";
 import { createFailClosedTurnAnalysis, type TurnAnalysis, type TurnAnalysisInput } from "./semanticRouter.js";
-import { mentionsPersona, VoiceDirector, sanitizeSpokenLine, ttsModelSupportsLanguage } from "./voiceDirector.js";
+import { mentionsPersona, routedLanguage, VoiceDirector, sanitizeSpokenLine, ttsModelSupportsLanguage } from "./voiceDirector.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
@@ -36,7 +38,26 @@ const routedAnalysis = (
 };
 const analyzeSwedish = async (_input: TurnAnalysisInput): Promise<TurnAnalysis> => routedAnalysis();
 
+const installCustomPersona = (id: string, name: string): (() => void) => {
+  const template = structuredClone(PERSONAS.find((persona) => persona.id === "ai-sana")!);
+  PERSONAS.push({ ...template, id, name, prompt: `${name} answers directly and naturally.` });
+  return () => {
+    const index = PERSONAS.findIndex((persona) => persona.id === id);
+    if (index >= 0) PERSONAS.splice(index, 1);
+  };
+};
+
 describe("VoiceDirector", () => {
+  it("prefers router v2's contextual response language but keeps STT ahead of legacy guesses", () => {
+    const legacy = routedAnalysis("ja-JP");
+    expect(routedLanguage(legacy, "zh-Hant-TW")).toBe("zh-Hant-TW");
+    const contextual = {
+      ...legacy,
+      responseLanguage: { tag: "sv-SE", confidence: 0.99 },
+    } as TurnAnalysis;
+    expect(routedLanguage(contextual, "en-US")).toBe("sv-SE");
+  });
+
   it("turns one final human utterance into one bounded AI turn without recursion", async () => {
     const runtime = new VoiceRoomRuntime(["lobby"]);
     const created = runtime.createRoom("lobby", { socketId: "socket-a", memberId: "human-a", name: "Alex" });
@@ -52,12 +73,14 @@ describe("VoiceDirector", () => {
     const transcripts: string[] = [];
     const speeches: string[] = [];
     let generated = 0;
+    let requestOwnerIds: string[] | undefined;
     const director = new VoiceDirector({
       runtime,
       lm: {
         analyzeTurn: analyzeSwedish,
-        generateScene: async () => {
+        generateScene: async (request) => {
           generated += 1;
+          requestOwnerIds = request.requestOwnerIds;
           return [{ personaId: "ai-sana", content: "**Bra grund.** Jag skulle testa den med fem användare först ✨ https://bad.invalid", source: "lm", sourceIds: [] }];
         },
       },
@@ -82,6 +105,7 @@ describe("VoiceDirector", () => {
     director.onHumanFinal(human.entry);
     await settle();
     expect(generated).toBe(1);
+    expect(requestOwnerIds).toEqual(["ai-sana"]);
     expect(transcripts).toEqual(["Bra grund. Jag skulle testa den med fem användare först"]);
     expect(speeches).toEqual(transcripts);
     const aiEntry = runtime.getTranscript(created.room.id).at(-1)!;
@@ -626,6 +650,145 @@ describe("VoiceDirector", () => {
     expect(syntheses[0]?.voice).not.toMatch(/^(?:lisa|nst)/u);
   });
 
+  it("lets an admin-created resident inherit the provider default with neutral prosody", async () => {
+    const personaId = "ai-admin-default-voice";
+    const uninstall = installCustomPersona(personaId, "Aster");
+    setAdminPersonaVoiceMappings({});
+    try {
+      const runtime = new VoiceRoomRuntime(["lobby"]);
+      const created = runtime.createRoom("lobby", { socketId: "socket-custom-default", memberId: "human-custom-default", name: "Naoko" });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      expect(runtime.inviteBot(created.room.id, "socket-custom-default", { personaId, name: "Aster" }).ok).toBe(true);
+      runtime.setBotState(created.room.id, personaId, "listening");
+      const human = runtime.appendFinalTranscript(created.room.id, "human-custom-default", "どう思う？", { language: "ja-JP" });
+      expect(human.ok).toBe(true);
+      if (!human.ok) return;
+      const syntheses: Array<Record<string, unknown>> = [];
+      const director = new VoiceDirector({
+        runtime,
+        lm: {
+          analyzeTurn: async () => routedAnalysis("ja-JP", { addressedIds: [personaId] }),
+          generateScene: async () => [{ personaId, content: "まず小さく試そう。", source: "lm", sourceIds: [] }],
+        },
+        speech: {
+          capabilities: async () => ({
+            stt: { available: true, provider: "openai-compatible", inputMimeTypes: [] },
+            tts: {
+              available: true,
+              provider: "openai-compatible",
+              model: "generic-multilingual",
+              formats: ["mp3"],
+              defaultVoice: "provider-default",
+              supportedLanguages: ["ja"],
+            },
+            normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
+            browserFallbackAllowed: true,
+          }),
+          synthesize: async (input) => {
+            syntheses.push(input as unknown as Record<string, unknown>);
+            return {
+              id: "custom-default-audio",
+              roomId: created.room.id,
+              mimeType: "audio/mpeg",
+              bytes: 10,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            };
+          },
+        },
+        actorChannels: new ActorChannelRuntime(),
+        events: {
+          roomChanged: () => undefined,
+          transcriptFinal: () => undefined,
+          aiSpeech: () => undefined,
+          aiStop: () => undefined,
+        },
+      });
+
+      director.onHumanFinal(human.entry);
+      await settle();
+
+      expect(syntheses).toEqual([expect.objectContaining({
+        voice: "provider-default",
+        language: "ja-JP",
+        speed: 1,
+      })]);
+    } finally {
+      setAdminPersonaVoiceMappings({});
+      uninstall();
+    }
+  });
+
+  it("prefers an admin-created resident's explicit language voice over the provider default", async () => {
+    const personaId = "ai-admin-mapped-voice";
+    const uninstall = installCustomPersona(personaId, "Aster");
+    setAdminPersonaVoiceMappings({ [personaId]: { ja: "ja-admin-voice" } });
+    try {
+      const runtime = new VoiceRoomRuntime(["lobby"]);
+      const created = runtime.createRoom("lobby", { socketId: "socket-custom-mapped", memberId: "human-custom-mapped", name: "Naoko" });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      expect(runtime.inviteBot(created.room.id, "socket-custom-mapped", { personaId, name: "Aster" }).ok).toBe(true);
+      runtime.setBotState(created.room.id, personaId, "listening");
+      const human = runtime.appendFinalTranscript(created.room.id, "human-custom-mapped", "もう一度？", { language: "ja-JP" });
+      expect(human.ok).toBe(true);
+      if (!human.ok) return;
+      const syntheses: Array<Record<string, unknown>> = [];
+      const director = new VoiceDirector({
+        runtime,
+        lm: {
+          analyzeTurn: async () => routedAnalysis("ja-JP", { addressedIds: [personaId] }),
+          generateScene: async () => [{ personaId, content: "もちろん。", source: "lm", sourceIds: [] }],
+        },
+        speech: {
+          capabilities: async () => ({
+            stt: { available: true, provider: "openai-compatible", inputMimeTypes: [] },
+            tts: {
+              available: true,
+              provider: "openai-compatible",
+              model: "generic-multilingual",
+              formats: ["mp3"],
+              defaultVoice: "provider-default",
+              supportedLanguages: ["ja"],
+            },
+            normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
+            browserFallbackAllowed: true,
+          }),
+          synthesize: async (input) => {
+            syntheses.push(input as unknown as Record<string, unknown>);
+            return {
+              id: "custom-mapped-audio",
+              roomId: created.room.id,
+              mimeType: "audio/mpeg",
+              bytes: 10,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            };
+          },
+        },
+        actorChannels: new ActorChannelRuntime(),
+        events: {
+          roomChanged: () => undefined,
+          transcriptFinal: () => undefined,
+          aiSpeech: () => undefined,
+          aiStop: () => undefined,
+        },
+      });
+
+      director.onHumanFinal(human.entry);
+      await settle();
+
+      expect(syntheses).toEqual([expect.objectContaining({
+        voice: "ja-admin-voice",
+        language: "ja-JP",
+        speed: 1,
+      })]);
+      expect(syntheses[0]?.voice).not.toBe("provider-default");
+    } finally {
+      setAdminPersonaVoiceMappings({});
+      uninstall();
+    }
+  });
+
   it("answers a multilingual current-time voice request from the server clock without web access", async () => {
     const runtime = new VoiceRoomRuntime(["lobby"]);
     const created = runtime.createRoom("lobby", { socketId: "socket-time", memberId: "human-time", name: "Léa" });
@@ -700,6 +863,132 @@ describe("VoiceDirector", () => {
     expect(temporalPolicy).toBe("direct_answer");
     expect(speeches[0]).toMatchObject({ language: "fr-FR" });
     expect(String(speeches[0]?.text)).toContain("14:01:30");
+  });
+
+  it("aborts in-flight generation and resets thinking bots after a committed catalog edit", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-catalog-generation", memberId: "human-catalog-generation", name: "Alex" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-catalog-generation", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-catalog-generation", "Sana, vad tror du?");
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+
+    let generationSignal: AbortSignal | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const aiStops: string[] = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        analyzeTurn: analyzeSwedish,
+        generateScene: async (_request, _priority, signal) => {
+          generationSignal = signal;
+          markStarted?.();
+          return await new Promise((resolve, reject) => {
+            const fail = () => reject(signal?.reason ?? new Error("aborted"));
+            if (signal?.aborted) fail();
+            else signal?.addEventListener("abort", fail, { once: true });
+          });
+        },
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: () => undefined,
+        aiStop: ({ roomId }) => aiStops.push(roomId),
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await started;
+    expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState).toBe("thinking");
+    const stopCountBeforeCatalogEdit = aiStops.length;
+
+    director.onCatalogChanged([created.room.id, created.room.id]);
+    await settle();
+
+    expect(generationSignal?.aborted).toBe(true);
+    expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState).toBe("listening");
+    expect(aiStops.slice(stopCountBeforeCatalogEdit)).toEqual([created.room.id]);
+  });
+
+  it("aborts in-flight synthesis and resets thinking bots after a committed catalog edit", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", { socketId: "socket-catalog-tts", memberId: "human-catalog-tts", name: "Alex" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-catalog-tts", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-catalog-tts", "Sana, säg det högt.");
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+
+    let synthesisSignal: AbortSignal | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const speeches: string[] = [];
+    const director = new VoiceDirector({
+      runtime,
+      lm: {
+        analyzeTurn: analyzeSwedish,
+        generateScene: async () => [{ personaId: "ai-sana", content: "Det här är den gamla katalogversionen.", source: "lm", sourceIds: [] }],
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: true, provider: "openai-compatible", inputMimeTypes: [] },
+          tts: {
+            available: true,
+            provider: "openai-compatible",
+            model: "piper-sv",
+            formats: ["wav"],
+            defaultVoice: "lisa-warm",
+            supportedLanguages: ["sv"],
+          },
+          normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async (input) => {
+          synthesisSignal = input.signal;
+          markStarted?.();
+          return await new Promise((resolve, reject) => {
+            const fail = () => reject(input.signal?.reason ?? new Error("aborted"));
+            if (input.signal?.aborted) fail();
+            else input.signal?.addEventListener("abort", fail, { once: true });
+          });
+        },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: (payload) => speeches.push(payload.text),
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await started;
+    expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState).toBe("thinking");
+
+    director.onCatalogChanged([created.room.id]);
+    await settle();
+
+    expect(synthesisSignal?.aborted).toBe(true);
+    expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState).toBe("listening");
+    expect(speeches).toEqual([]);
   });
 
   it("aborts the previous room generation when a newer human utterance arrives", async () => {

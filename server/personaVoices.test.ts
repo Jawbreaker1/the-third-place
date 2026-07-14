@@ -3,7 +3,10 @@ import { PERSONAS } from "./personas.js";
 import {
   PIPER_PROVIDER_VOICES,
   PERSONA_VOICE_PROFILES,
+  configuredProviderVoiceIds,
   configuredPersonaProviderVoices,
+  mappedProviderVoiceForPersona,
+  setAdminPersonaVoiceMappings,
   voiceProfileForPersona,
 } from "./personaVoices.js";
 
@@ -39,5 +42,27 @@ describe("resident voice profiles", () => {
     ]);
     expect(configuredPersonaProviderVoices("generic-multilingual")).toEqual([]);
     expect(configuredPersonaProviderVoices(undefined)).toEqual([]);
+  });
+
+  it("bounds generic provider allowlists and selects validated per-language mappings", () => {
+    expect(configuredProviderVoiceIds("generic-multilingual", "default", "sv-one, en-one,sv-one")).toEqual([
+      "sv-one",
+      "en-one",
+      "default",
+    ]);
+    expect(() => configuredProviderVoiceIds("generic", "default", "not a valid voice"))
+      .toThrow("invalid provider voice ID");
+
+    setAdminPersonaVoiceMappings({
+      "ai-sana": { sv: "sv-one", "en-US": "en-one", "*": "default" },
+    });
+    try {
+      expect(mappedProviderVoiceForPersona("ai-sana", "sv-SE")).toBe("sv-one");
+      expect(mappedProviderVoiceForPersona("ai-sana", "en-US")).toBe("en-one");
+      expect(mappedProviderVoiceForPersona("ai-sana", "ja-JP")).toBe("default");
+      expect(voiceProfileForPersona("ai-sana", "sv-SE")?.providerVoice).toBe("sv-one");
+    } finally {
+      setAdminPersonaVoiceMappings({});
+    }
   });
 });

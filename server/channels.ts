@@ -23,6 +23,21 @@ export interface ExpertiseOverride {
   blindSpots?: string[];
 }
 
+/**
+ * A trusted, server-authored starting point for the rare autonomous link share.
+ * The director still owns cadence, tool access and publication; these values
+ * are content configuration rather than instructions inferred from chat text.
+ */
+export interface AutonomousResearchSeed {
+  /** Stable configuration key used for cooldown and anti-repeat history. */
+  id: string;
+  /** Short standalone lookup subject. It must never contain a user-authored URL. */
+  query: string;
+  mode: "web" | "news";
+  /** Concrete room-local question or tension to discuss after evidence arrives. */
+  discussionAngle: string;
+}
+
 export type AmbientMode = "discussion" | "casual" | "banter";
 
 export type ConversationRegister =
@@ -89,6 +104,13 @@ export interface ChannelProfile {
   ambientReactionPalette?: string[];
   expertiseOverrides?: Partial<Record<string, ExpertiseOverride>>;
   ambientPremises: string[];
+  /**
+   * Semantic families aligned by index with ambientPremises. The director
+   * rotates recent families as well as exact prose, so two differently worded
+   * seeds cannot keep reopening the same narrow subject.
+   */
+  ambientPremiseFamilies?: string[];
+  autonomousResearchSeeds?: AutonomousResearchSeed[];
 }
 
 export const CHANNEL_PROFILES: ChannelProfile[] = [
@@ -121,6 +143,34 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       "Chronological and ranked feeds reward different annoying habits. Name one habit and let the reply disagree from experience-shaped intuition, not platform theory.",
       "A tiny joining question might improve a room—or just repel people who hate forms. Keep the case grounded in what a newcomer actually sees.",
       "A friendly room grows until not everyone knows each other. Focus on the first small thing that breaks, not a general theory of moderation.",
+      "A profile picture that has survived fifteen years can feel more recognizable than a real name. Pick one kind of ancient avatar and say what changing it would erase.",
+      "Someone returns to a dormant group chat with no explanation. Give the first ordinary message that could make the room feel inhabited again without announcing a revival.",
+      "Typing indicators can create anticipation or make a three-second pause feel awkward. Use one tiny chat moment where turning them off would genuinely help.",
+      "Old forum signatures were clutter, personality and accidental time capsules at once. Choose one harmless signature habit worth bringing back for a week.",
+      "A recommendation gets better when it is oddly specific. Recommend one real thing for one narrow situation, and let a reply question the situation rather than the taste.",
+      "One harmless house rule can make a room distinctive without becoming bureaucracy. Name the rule and the first funny edge case it creates.",
+      "Voice notes feel warmer to some people and like an unsolicited task to others. Keep the disagreement to one everyday scenario where both reactions make sense.",
+      "A visible online-status dot can be an invitation or unwanted social pressure. Start with one moment when somebody deliberately leaves it on or off.",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "lobby-digital-community-ritual",
+        query: "recent reporting on online community rituals and digital belonging",
+        mode: "news",
+        discussionAngle: "Pick one concrete ritual from the source and ask whether it would make an ordinary chat room warmer or merely more performative.",
+      },
+      {
+        id: "lobby-old-web-revival",
+        query: "independent web communities and old internet formats returning",
+        mode: "web",
+        discussionAngle: "Share the most recognizable revived format and argue briefly over which part was genuinely better and which part is nostalgia.",
+      },
+      {
+        id: "lobby-messaging-design",
+        query: "recent messaging app design experiments for healthier group chats",
+        mode: "news",
+        discussionAngle: "Pull out one specific design choice and let the room decide whether it reduces pressure or just hides activity.",
+      },
     ],
   },
   {
@@ -182,6 +232,40 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       "Start a serious-sounding observation about adult life, then let another resident derail exactly one word into harmless nonsense without losing the original thread completely.",
       "Recommend one film or album for a very specific mood, then have the reply narrow, challenge or one-up the recommendation instead of asking the room a question.",
       "Argue about the correct snack for a terrible movie using taste, texture or mess as the only evidence; keep it short enough to sound like table talk.",
+      "Pick a cover song that changes the original enough to justify existing. Defend one musical choice; a reply may insist the original did that bit better.",
+      "A film can earn a long runtime or simply refuse to edit itself. Name one kind of scene that earns the extra minutes without turning this into a review.",
+      "Choose a famous song intro that should never be skipped, then let someone identify the exact second where patience starts losing the argument.",
+      "Subtitles preserve a performance while dubbing can make a film easier to inhabit. Keep the disagreement attached to one concrete viewing situation.",
+      "Translate one piece of empty workplace jargon into what it usually means in an ordinary inbox. The reply may offer a less cynical translation.",
+      "Nominate one household chore for competitive-sport commentary and describe only the decisive moment; another resident gets one worse event to nominate.",
+      "Pick one unfashionable song, film or snack opinion worth defending without pretending it is secretly sophisticated.",
+      "Invent a terrible double feature using two real films connected by one absurdly narrow detail. The reply may repair only one half of it.",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "pub-new-music-releases",
+        query: "notable new music releases and reviews this week",
+        mode: "news",
+        discussionAngle: "Choose one supplied release for the imaginary queue and let another resident challenge the choice using one specific detail from the source.",
+      },
+      {
+        id: "pub-film-festival-reaction",
+        query: "recent film festival premieres with sharply divided reactions",
+        mode: "news",
+        discussionAngle: "Find the premiere with the most interesting disagreement and turn it into a short pro-versus-con table take without declaring a winner.",
+      },
+      {
+        id: "pub-work-culture-story",
+        query: "recent strange workplace culture story or office policy",
+        mode: "news",
+        discussionAngle: "Share the concrete policy or habit, then ask whether it is genuinely useful or management theatre.",
+      },
+      {
+        id: "pub-meme-origin",
+        query: "recent internet meme origin and how the format spread",
+        mode: "web",
+        discussionAngle: "Describe the supplied meme format in plain language and debate which tiny feature made it reusable without inventing a URL or example.",
+      },
     ],
   },
   {
@@ -204,14 +288,66 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       "ai-aya": { level: "advanced", specialties: ["privacy", "local inference security"] },
     },
     ambientPremises: [
-      "Argue whether a small local model with reliable tool use is more useful than a stronger model that occasionally ignores the tool contract; name the failure mode that matters most.",
+      "A small local model with reliable tool use and a stronger model that occasionally ignores the tool contract fail in different ways. Name the failure you would rather debug and why.",
       "Debate whether evaluation regressions hidden by a higher aggregate benchmark score are a release blocker, and identify one task whose result should outweigh the leaderboard.",
-      "Take a side on retrieval versus better task decomposition for improving a local model, with one concrete case where the other approach fails.",
+      "Retrieval and better task decomposition solve different local-model failures. Give one concrete task where choosing the wrong one adds complexity without fixing the answer.",
       "Debate whether an agent's memory should default to forgetting or retaining, and name one failure caused by keeping too much seemingly harmless context.",
-      "Argue whether deterministic checks should outrank an LLM judge in model evaluation, using one behaviour that fluent prose can conceal.",
+      "A fluent answer can conceal a broken tool sequence. Propose one deterministic check that catches the break without trying to judge the prose.",
       "Take a position on whether quantisation should be judged mainly by benchmark loss or by changes in consistency across repeated real tasks.",
-      "Debate whether synthetic training data eventually narrows a model's range of ideas even when its measured accuracy improves.",
-      "Argue whether an autonomous agent becomes more useful or merely harder to trust when it can revise its own plan without exposing each revision.",
+      "Synthetic training data can improve measured accuracy while quietly narrowing unusual answers. Name one creative or cultural task where that loss would show before a benchmark catches it.",
+      "A private local assistant and a powerful hosted assistant make different promises before either answers. Choose the one piece of personal context that changes which deployment you would trust.",
+      "A model passes ten runs and fails the eleventh in a completely different way. Name the trace detail you would inspect before touching the prompt.",
+      "A voice model gets every word right but still sounds socially late. Point to the turn-taking cue that matters more than transcript accuracy in that moment.",
+      "A local model feels faster after quantisation but starts changing its answer between identical runs. Focus on the first real task where that inconsistency becomes annoying.",
+      "Give an AI confidence indicator one job it can actually do without pretending to measure truth. A reply may replace the indicator with a more honest UI cue.",
+      "An image model notices every object but misses why the picture is funny. Point to the missing relationship rather than describing computer vision in general.",
+      "Choose the smallest memory an agent should retain after a failed task, then name the one detail it must deliberately forget.",
+      "A model refuses a harmless request because its safety boundary is too broad. Name the smallest extra context that should change the decision without weakening the real boundary.",
+      "Open-source weights improve inspectability but do not automatically make a deployed system transparent. Name one operational question the weights cannot answer.",
+    ],
+    ambientPremiseFamilies: [
+      "tool-use",
+      "evaluation",
+      "reasoning-architecture",
+      "memory",
+      "tool-use",
+      "local-inference",
+      "training-data",
+      "privacy-deployment",
+      "observability",
+      "voice-interaction",
+      "local-inference",
+      "trust-interface",
+      "multimodal",
+      "memory",
+      "safety",
+      "open-source-governance",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "ai-lab-evaluation-research",
+        query: "recent research on evaluating autonomous AI agents in realistic tasks",
+        mode: "news",
+        discussionAngle: "Extract one evaluation design choice and argue whether it measures useful recovery or merely produces a cleaner leaderboard.",
+      },
+      {
+        id: "ai-lab-local-model-release",
+        query: "recent open local language model release technical report",
+        mode: "news",
+        discussionAngle: "Pick one claimed capability and identify the practical repeated-run test the room would want before trusting it.",
+      },
+      {
+        id: "ai-lab-agent-memory-paper",
+        query: "recent research paper on long-term memory for language model agents",
+        mode: "web",
+        discussionAngle: "Use one concrete memory mechanism from the source to discuss what it remembers well and what it could quietly distort.",
+      },
+      {
+        id: "ai-lab-multimodal-evaluation",
+        query: "recent multimodal model evaluation with documented failure cases",
+        mode: "web",
+        discussionAngle: "Share one supplied failure case and let two residents disagree about whether perception, reasoning or evaluation design caused it.",
+      },
     ],
   },
   {
@@ -237,13 +373,65 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     },
     ambientPremises: [
       "Debate whether a deterministic director should decide who speaks while the model only writes dialogue, or whether the model should orchestrate the whole scene; cite one debugging consequence.",
-      "Argue for pruning old chat context versus continuously summarising it, using one concrete way either strategy can silently corrupt a long-running conversation.",
+      "Old chat context can be pruned or continuously summarised. Trace one concrete way either strategy could silently corrupt a long-running conversation.",
       "Take a position on fail-silent behaviour versus canned fallback text when an AI backend fails, and identify the user experience that would change your mind.",
-      "Debate whether schema-constrained generation is worth the added coupling compared with validating and repairing ordinary JSON, using one production failure as the test.",
-      "Argue whether a visible state machine beats a multi-agent abstraction for most AI applications, and identify the complexity threshold where that answer flips.",
-      "Take a position on storing raw prompts for observability versus retaining only structured traces, naming one debugging benefit and one privacy cost.",
+      "Schema-constrained generation and repairing ordinary JSON leave different failure traces. Describe one production failure that would make the choice obvious in hindsight.",
+      "A TypeScript client and Python worker disagree about one optional field after a deploy. Choose the contract test that catches it before either side invents a default.",
+      "Raw prompts and structured traces reveal different parts of a failure. Pick one debugging incident and name the minimum evidence worth retaining despite the privacy cost.",
       "Debate whether retries belong inside each tool adapter or in one orchestration layer, with idempotency as the deciding constraint.",
-      "Argue whether perceived responsiveness is improved more by streaming early text or by waiting for a shorter, better-formed answer.",
+      "A streaming answer keeps a screen-reader user guessing whether anything changed. Pick one ARIA or focus decision that preserves speed without reading every token aloud.",
+      "A Python async worker is cancelled during a model stream but the browser still looks connected. Identify the one cleanup signal every layer must agree on.",
+      "Name the smallest trace that would let you reproduce an agent failure without storing the entire private conversation.",
+      "A WebSocket reconnect delivers the same human message twice. Walk through the one idempotency boundary that prevents two believable AI replies.",
+      "A prompt-injection defence blocks a harmless quoted instruction in a document. Identify which trust boundary was modelled too broadly.",
+      "A local 8-bit model barely fits in VRAM until image input arrives. Choose which buffer, context or concurrency cost you would measure before buying hardware.",
+      "An external API rate-limits one busy room. Decide where backpressure should become visible so the app stays honest without turning every delay into an error banner.",
+      "An evaluation passes locally and flakes only in CI. Start with one observable difference worth measuring before increasing the timeout.",
+      "An open-source dependency saves a month but brings an awkward licence and one unmaintained transitive package. Name the first release decision that changes.",
+    ],
+    ambientPremiseFamilies: [
+      "orchestration",
+      "context-memory",
+      "failure-experience",
+      "structured-output",
+      "language-contracts",
+      "observability",
+      "retries",
+      "accessibility-ui",
+      "python-runtime",
+      "observability",
+      "realtime-idempotency",
+      "security",
+      "local-hardware",
+      "api-backpressure",
+      "testing-deployment",
+      "open-source-delivery",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "ai-programming-sdk-release",
+        query: "recent official release notes for production AI application SDKs",
+        mode: "web",
+        discussionAngle: "Choose one concrete API or behaviour change and discuss the migration failure a real application should test first.",
+      },
+      {
+        id: "ai-programming-agent-observability",
+        query: "recent engineering write-up on observability for production AI agents",
+        mode: "web",
+        discussionAngle: "Extract one trace or metric from the source and argue whether it would reveal a real failure or just create attractive dashboards.",
+      },
+      {
+        id: "ai-programming-prompt-injection",
+        query: "recent practical prompt injection defence research for tool-using agents",
+        mode: "news",
+        discussionAngle: "Use one documented attack or defence to identify the exact boundary the application, rather than the model, must enforce.",
+      },
+      {
+        id: "ai-programming-local-inference-stack",
+        query: "recent local language model inference server performance update",
+        mode: "news",
+        discussionAngle: "Pick one measured latency or compatibility improvement and ask which end-to-end application bottleneck it still leaves untouched.",
+      },
     ],
   },
   {
@@ -268,13 +456,47 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     },
     ambientPremises: [
       "Debate whether a durable competitive advantage matters more than a cheap valuation when the underlying business is merely average; keep all claims timeless rather than pretending to know today's price.",
-      "Argue whether broad diversification protects investors from ignorance or prevents them from understanding what they own; distinguish risk capacity from confidence.",
+      "Broad diversification can protect against ignorance while also hiding it. Give one portfolio-review question that separates risk capacity from vague confidence.",
       "Take a position on whether management incentives deserve more weight than forecasts in a long-term thesis, with one concrete incentive that can mislead outsiders.",
-      "Debate when share buybacks signal disciplined capital allocation and when they merely hide a lack of productive reinvestment opportunities.",
-      "Argue how to distinguish a temporarily cyclical downturn from a structurally weakening business without relying on today's market price.",
+      "Share buybacks can signal discipline or a lack of useful reinvestment. Name the first piece of business evidence that separates those stories.",
+      "A cyclical downturn and a structurally weakening business can look alike for a quarter. Identify one operating clue that does not rely on today's market price.",
       "Take a side on whether improving margins or durable revenue retention is the more credible evidence of operating leverage.",
-      "Debate whether paying a persistent quality premium reduces risk or quietly assumes that an excellent company can never disappoint.",
+      "A persistent quality premium may reduce some business risk while increasing expectation risk. Describe the disappointment that exposes the difference.",
       "Argue whether a compelling business narrative is a necessary map for incomplete information or mainly a machine for excusing weak evidence.",
+      "A business reports growing revenue while receivables grow much faster. Explain the first ordinary question that mismatch should trigger without pretending it proves fraud.",
+      "Customer concentration can create efficient focus or one terrifying renewal date. Name the evidence that would separate those stories.",
+      "Stock-based compensation is called non-cash while dilution is very real. Keep the disagreement on which per-share number makes the cost hardest to ignore.",
+      "A founder-controlled company can make patient decisions and ignore outside owners. Pick one governance signal that would move your confidence either way.",
+      "Working capital quietly funds growth until it suddenly consumes cash. Use one inventory or payment-cycle example rather than a textbook definition.",
+      "A cyclical company looks cheapest near the top of its cycle. Name one operating clue that matters more than the apparently low multiple.",
+      "An investment thesis should change before the share price forces the conversation. Identify one business fact that deserves a written update but not an immediate verdict.",
+      "Two companies report the same margin but one earns it through pricing and the other through postponed spending. Say which follow-up line would expose the difference.",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "stock-earnings-margin-surprise",
+        query: "recent company earnings report with an unexpected margin change",
+        mode: "news",
+        discussionAngle: "Separate the documented cause from the market reaction, then debate whether the margin change looks durable or temporary.",
+      },
+      {
+        id: "stock-capital-allocation-filing",
+        query: "recent corporate filing on buybacks dividends or major reinvestment",
+        mode: "news",
+        discussionAngle: "Use the supplied filing facts to compare the chosen use of cash with one plausible alternative, without issuing investment advice.",
+      },
+      {
+        id: "stock-central-bank-decision",
+        query: "latest central bank policy decision and stated economic rationale",
+        mode: "news",
+        discussionAngle: "Pick one stated trade-off and discuss which kind of business would feel it first, while keeping forecasts explicitly uncertain.",
+      },
+      {
+        id: "stock-accounting-quality",
+        query: "recent accounting analysis of cash flow earnings quality or working capital",
+        mode: "web",
+        discussionAngle: "Extract one concrete accounting signal and let the room disagree about when it is a warning versus ordinary business mechanics.",
+      },
     ],
   },
   {
@@ -307,6 +529,40 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       "Old-content transmog runs can feel like exploration or a cosmetic checklist. Use one specific kind of reward loop rather than reviewing the whole system.",
       "Some raid failures belong to one player; others belong to the group's timing. Use one timeless mechanic pattern and let the reply choose the other kind.",
       "A legacy system can feel like texture right up until a newcomer needs three wikis. Name one kind of old rule that crosses that line.",
+      "A profession feels alive when its output changes what people do, not only what they buy. Name one kind of crafted item that creates that feeling without using current numbers.",
+      "Quest text can carry a zone or become the thing everyone clicks through. Pick one storytelling moment worth slowing the levelling route for.",
+      "A clean default UI can teach the game while a customized UI can reveal the fight. Name the first piece of information that deserves moving.",
+      "Large raid groups create spectacle and logistical comedy. Focus on one mechanic that becomes better or worse when the group size changes.",
+      "Class fantasy can survive an awkward rotation, but only up to a point. Choose one animation, sound or ability rhythm that carries the fantasy.",
+      "A mount can be memorable because of a difficult route, a silly animation or pure rarity. Let two residents defend different reasons without citing current drop rates.",
+      "Guild recruitment messages often promise the same things. Rewrite one promise into the concrete weekly behaviour that would actually prove it.",
+      "One piece of zone music can make an old area feel inhabited again. Name the kind of moment when players notice it instead of rushing onward.",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "wow-official-news",
+        query: "latest official World of Warcraft news and developer update",
+        mode: "news",
+        discussionAngle: "Choose the supplied announcement with the clearest player consequence and discuss the trade-off without inventing patch details.",
+      },
+      {
+        id: "wow-current-hotfixes",
+        query: "latest official World of Warcraft hotfix notes",
+        mode: "news",
+        discussionAngle: "Pick one documented hotfix and ask whether it improves clarity, balance or merely shifts which problem players notice.",
+      },
+      {
+        id: "wow-developer-interview",
+        query: "recent World of Warcraft developer interview on class or encounter design",
+        mode: "web",
+        discussionAngle: "Pull out one specific design intention and compare it with the player behaviour that intention is likely to create.",
+      },
+      {
+        id: "wow-community-creation",
+        query: "recent notable World of Warcraft community creation addon or machinima",
+        mode: "web",
+        discussionAngle: "Share the supplied creation and focus the conversation on one clever design, joke or practical choice rather than generic praise.",
+      },
     ],
   },
   {
@@ -332,13 +588,47 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     },
     ambientPremises: [
       "Argue whether believable lighting contributes more to a convincing render than complex materials, naming one visual cue that exposes the weaker side.",
-      "Debate whether artists should lock the camera and lens before adding fine model detail, with one concrete production cost of deciding late.",
+      "An artist changes the camera and lens after fine model detail is finished. Point to the first concrete production cost that appears downstream.",
       "Take a position on whether real-time rendering constraints improve visual decisions or mainly force compromises; identify one constraint that genuinely helps composition.",
-      "Debate whether physical accuracy should yield to deliberate art direction when a technically correct render communicates the wrong mood.",
+      "A technically correct render communicates the wrong mood. Choose one physically inaccurate adjustment that could fix the read without becoming arbitrary.",
       "Argue whether clean topology matters when the final asset is a single still image, and name the downstream change that could make it matter suddenly.",
-      "Take a side on spending the render budget on more samples versus better texture detail when denoising can conceal both noise and material character.",
+      "Denoising can conceal both noise and material character. Name the visible artifact that tells you whether the next render minute belongs to samples or texture detail.",
       "Debate whether another hour gathering references usually saves more time than another hour iterating the model, using one concrete visual mismatch.",
-      "Argue whether reusing a modular asset library creates production coherence or makes every environment reveal the same visual grammar.",
+      "A modular asset library creates coherence until every environment reveals the same visual grammar. Pick the repeated cue that should be broken first.",
+      "A perfectly sharp render can feel miniature because the scale cues disagree. Identify one bevel, texture or camera clue you would inspect first.",
+      "Two materials use the same base colour but only one feels heavy. Describe the roughness, edge or reflection cue doing the real work.",
+      "A wide lens creates energy and quietly distorts the product. Choose the object feature that tells you the lens has gone too far.",
+      "Procedural materials save repetition until every surface shares the same logic. Name one hand-authored imperfection worth protecting.",
+      "An animation blockout should communicate weight before polish. Pick the single pose or spacing decision that reveals whether it works.",
+      "A render-farm job fails on frame 438 after succeeding all night. Start with the one scene dependency you would verify before rerunning everything.",
+      "Compositing can rescue hierarchy without repairing the 3D scene. Name one adjustment that belongs in comp and one that should force a return to lighting.",
+      "A reference image is beautiful but physically inconsistent. Point to the part worth copying for mood and the part the 3D scene should refuse.",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "3d-renderer-release",
+        query: "recent official 3D renderer release notes with production features",
+        mode: "news",
+        discussionAngle: "Choose one documented feature and discuss the specific studio bottleneck it solves, plus the workflow cost it might introduce.",
+      },
+      {
+        id: "3d-graphics-paper",
+        query: "recent computer graphics research paper on rendering materials or animation",
+        mode: "web",
+        discussionAngle: "Translate one demonstrated result into a practical artist question without pretending the research is already production-ready.",
+      },
+      {
+        id: "3d-production-breakdown",
+        query: "recent detailed 3D art production breakdown lighting materials pipeline",
+        mode: "web",
+        discussionAngle: "Pick one visible before-and-after decision from the breakdown and let the room debate which step did most of the work.",
+      },
+      {
+        id: "3d-realtime-performance",
+        query: "recent real-time rendering performance analysis for complex scenes",
+        mode: "news",
+        discussionAngle: "Use one supplied bottleneck to compare the visual gain with its frame-time cost instead of reciting benchmark numbers.",
+      },
     ],
   },
   {
@@ -370,6 +660,34 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       "A cooperative game can strengthen a friendship or expose two completely incompatible decision styles. Name the harmless moment when that becomes obvious.",
       "Researching gear is part of a hobby until it quietly replaces making anything. Use one recognizable tab, basket or comparison habit.",
       "A tightly planned trip can create freedom—or delete every accidental discovery. Anchor the take in one hour of the day, not travel philosophy.",
+      "Take a short walk with a camera but allow only one subject. Pick the subject and the frame you would probably miss under that rule.",
+      "A beginner instrument sounds discouraging until one tiny phrase suddenly resembles music. Name the phrase-sized milestone, not a practice plan.",
+      "A repair can remain visibly patched instead of pretending nothing happened. Choose one object where the scar improves it and one where it would annoy you.",
+      "The best person to teach a board game may not be the best player. Describe the one explanation habit that separates those skills.",
+      "Build a meal around one awkward leftover ingredient, but keep the suggestion to a single dish and let a reply reject the texture combination.",
+      "A collection becomes interesting when it has a strange boundary. Invent one narrow collecting rule that creates better stories than buying everything.",
+      "An outdoor hobby can be ruined by optimizing every gram. Name one supposedly inefficient item still worth carrying for comfort or delight.",
+      "Give a one-evening project a deliberately visible finish line. The reply may cut the scope once more instead of turning it into a productivity lesson.",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "side-quests-creative-project",
+        query: "recent small creative hobby project with a detailed build log",
+        mode: "web",
+        discussionAngle: "Share one clever constraint or imperfect decision from the build and ask what made the result more personal.",
+      },
+      {
+        id: "side-quests-indie-game",
+        query: "recent unusual independent game demo or developer diary",
+        mode: "news",
+        discussionAngle: "Pick one concrete mechanic from the supplied source and discuss whether its limitation creates charm or friction.",
+      },
+      {
+        id: "side-quests-repair-idea",
+        query: "practical repair or reuse project with clear before and after photos",
+        mode: "web",
+        discussionAngle: "Focus on one repair choice that preserved character instead of making the object look factory-new.",
+      },
     ],
   },
 ];

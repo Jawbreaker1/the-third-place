@@ -99,6 +99,19 @@ describe("actor channel runtime", () => {
     expect(runtime.snapshot("ai-kim")?.lastSpokeAtByChannel["world-of-warcraft"]).toBeDefined();
   });
 
+  it("moves live focus when an admin affinity edit removes the focused subscription", () => {
+    const pixel = structuredClone(PERSONAS.find((persona) => persona.id === "ai-pixel")!);
+    pixel.channelAffinity = { ...(pixel.channelAffinity ?? {}), lobby: 0.9, "side-quests": 0.8 };
+    const runtime = new ActorChannelRuntime([pixel]);
+    runtime.markSpoke(pixel.id, "side-quests");
+    expect(runtime.snapshot(pixel.id)?.focusChannelId).toBe("side-quests");
+
+    pixel.channelAffinity["side-quests"] = 0.1;
+    runtime.reconcileCatalog();
+    expect(runtime.snapshot(pixel.id)?.subscribedChannels).not.toContain("side-quests");
+    expect(runtime.snapshot(pixel.id)?.focusChannelId).toBe("lobby");
+  });
+
   it("mixes talkative regulars, contrarians and quiet lurkers in the pub", () => {
     const runtime = new ActorChannelRuntime();
     const pubIds = runtime.candidatesFor("the-pub").map((persona) => persona.id);

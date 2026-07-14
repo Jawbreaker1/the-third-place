@@ -447,10 +447,30 @@ const candidateMessages = (
   return selected;
 };
 
+const messageLinkCandidates = (message: ChatMessage): LinkCandidate[] => {
+  const visible = [...linkCandidates(message.content)].reverse();
+  const seen = new Set(visible.map((candidate) => candidate.url?.toString() ?? candidate.raw));
+  const attachedUrls = [
+    ...(message.linkPreview ? [message.linkPreview.url] : []),
+    ...(message.sources ?? []).map((source) => source.url),
+  ];
+  for (const attachedUrl of attachedUrls) {
+    // Metadata is server-attached, but it still crosses the persisted-store
+    // boundary. Run it through the exact same URL parser and safe reader path.
+    const candidate = linkCandidates(attachedUrl).find((item) => item.url?.toString() === attachedUrl);
+    if (!candidate) continue;
+    const key = candidate.url?.toString() ?? candidate.raw;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    visible.push(candidate);
+  }
+  return visible;
+};
+
 export const collectPageReadCandidates = (input: CollectPageReadCandidatesInput): PageReadCandidateSet => {
   const now = input.now ?? Date.now();
   const candidates = candidateMessages(input, now)
-    .flatMap(({ message, source }) => [...linkCandidates(message.content)].reverse().map((candidate) => ({
+    .flatMap(({ message, source }) => messageLinkCandidates(message).map((candidate) => ({
       raw: candidate.raw.slice(0, 500),
       ...(candidate.url ? { url: candidate.url } : {}),
       supported: Boolean(candidate.url),

@@ -52,10 +52,21 @@ const deriveAffinity = (persona: Persona, channelId: string, expertise: ActorRoo
 
 export class ActorChannelRuntime {
   private readonly states = new Map<string, ActorChannelState>();
-  private readonly expertiseMatrix: RoomExpertiseMatrix;
+  private expertiseMatrix: RoomExpertiseMatrix;
 
   constructor(private readonly personas = PERSONAS) {
     this.expertiseMatrix = buildRoomExpertiseMatrix(personas);
+    this.reconcileCatalog();
+  }
+
+  /** Rebuilds catalog-derived state while retaining read/unread history for surviving rooms. */
+  reconcileCatalog(): void {
+    this.expertiseMatrix = buildRoomExpertiseMatrix(this.personas);
+    const activePersonaIds = new Set(this.personas.map((persona) => persona.id));
+    for (const personaId of this.states.keys()) {
+      if (!activePersonaIds.has(personaId)) this.states.delete(personaId);
+    }
+    const channelIds = new Set(CHANNELS.map((channel) => channel.id));
     for (const persona of this.personas) {
       const affinities = Object.fromEntries(
         CHANNELS.map((channel) => [
@@ -66,19 +77,26 @@ export class ActorChannelRuntime {
       const focusChannelId = [...CHANNELS].sort(
         (a, b) => (affinities[b.id] ?? 0) - (affinities[a.id] ?? 0),
       )[0]?.id ?? "lobby";
+      const existing = this.states.get(persona.id);
+      const subscribedChannels = CHANNELS.filter(
+        (channel) => (affinities[channel.id] ?? 0) >= SUBSCRIPTION_AFFINITY_THRESHOLD,
+      ).map((channel) => channel.id);
+      const nextFocus = existing && channelIds.has(existing.focusChannelId) && subscribedChannels.includes(existing.focusChannelId)
+        ? existing.focusChannelId
+        : subscribedChannels.includes(focusChannelId)
+          ? focusChannelId
+          : subscribedChannels[0] ?? focusChannelId;
       this.states.set(persona.id, {
         personaId: persona.id,
-        subscribedChannels: CHANNELS.filter(
-          (channel) => (affinities[channel.id] ?? 0) >= SUBSCRIPTION_AFFINITY_THRESHOLD,
-        ).map(
-          (channel) => channel.id,
-        ),
-        focusChannelId,
+        subscribedChannels,
+        focusChannelId: nextFocus,
         attentionByChannel: affinities,
-        unreadByChannel: Object.fromEntries(CHANNELS.map((channel) => [channel.id, 0])),
-        lastReadMessageByChannel: Object.fromEntries(CHANNELS.map((channel) => [channel.id, undefined])),
-        lastReadAtByChannel: Object.fromEntries(CHANNELS.map((channel) => [channel.id, undefined])),
-        lastSpokeAtByChannel: Object.fromEntries(CHANNELS.map((channel) => [channel.id, undefined])),
+        unreadByChannel: Object.fromEntries(CHANNELS.map((channel) => [channel.id, existing?.unreadByChannel[channel.id] ?? 0])),
+        lastReadMessageByChannel: Object.fromEntries(
+          CHANNELS.map((channel) => [channel.id, existing?.lastReadMessageByChannel[channel.id]]),
+        ),
+        lastReadAtByChannel: Object.fromEntries(CHANNELS.map((channel) => [channel.id, existing?.lastReadAtByChannel[channel.id]])),
+        lastSpokeAtByChannel: Object.fromEntries(CHANNELS.map((channel) => [channel.id, existing?.lastSpokeAtByChannel[channel.id]])),
       });
     }
   }

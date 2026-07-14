@@ -204,6 +204,11 @@ export interface PresencePayload {
   members: Member[];
 }
 
+export interface CatalogUpdatePayload {
+  members: Member[];
+  channels: Channel[];
+}
+
 export interface ReactionPayload {
   messageId: string;
   channelId: string;

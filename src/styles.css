@@ -1182,37 +1182,47 @@ textarea:focus-visible,
 
 .link-preview-list {
   display: grid;
-  width: min(460px, 100%);
+  width: min(520px, 100%);
   gap: 6px;
-  margin-top: 7px;
+  margin-top: 8px;
 }
 
 .link-preview-card {
   position: relative;
   display: grid;
   min-width: 0;
-  gap: 3px;
-  padding: 10px 12px 10px 14px;
+  gap: 5px;
+  padding: 12px 14px 11px 15px;
   overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  border-radius: 5px;
   color: inherit;
-  background: #191d26;
+  background: linear-gradient(145deg, #191d26 0%, #171a22 100%);
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.11);
   text-decoration: none;
 }
 
 .link-preview-card::before {
   position: absolute;
   inset: 0 auto 0 0;
-  width: 3px;
+  width: 4px;
   background: #7f72bc;
   content: "";
 }
 
+.link-preview-card-sourced::before {
+  background: var(--mint);
+}
+
+.link-preview-card-sourced {
+  background: linear-gradient(145deg, rgba(86, 213, 173, 0.055) 0%, #171a22 58%);
+}
+
 .link-preview-card:hover,
 .link-preview-card:focus-visible {
-  border-color: var(--line-strong);
+  border-color: rgba(255, 255, 255, 0.14);
   background: #1e232e;
+  box-shadow: 0 7px 22px rgba(0, 0, 0, 0.17);
 }
 
 .link-preview-card:focus-visible {
@@ -1225,20 +1235,32 @@ textarea:focus-visible,
   min-width: 0;
   align-items: center;
   gap: 5px;
-  overflow: hidden;
   color: #9298a7;
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 680;
+  line-height: 1.25;
+}
+
+.link-preview-domain > span {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.link-preview-domain svg {
+  flex: 0 0 auto;
+  opacity: 0.72;
 }
 
 .link-preview-title {
   display: -webkit-box;
   overflow: hidden;
-  color: #e1e3e8;
-  font-size: 14px;
+  color: #dfe3ff;
+  font-size: 15px;
+  font-weight: 720;
   line-height: 1.35;
+  overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
@@ -1246,11 +1268,43 @@ textarea:focus-visible,
 .link-preview-description {
   display: -webkit-box;
   overflow: hidden;
-  color: #9298a7;
-  font-size: 12px;
-  line-height: 1.45;
+  color: #a0a6b4;
+  font-size: 13px;
+  line-height: 1.42;
+  overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
+}
+
+.link-preview-footer {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.065);
+  color: #9298a7;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.link-preview-provenance {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #86cfb7;
+  font-weight: 700;
+}
+
+.link-preview-footer time {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.link-preview-separator {
+  color: #555d6d;
 }
 
 .link-preview-card:hover .link-preview-title,
@@ -2689,7 +2743,7 @@ textarea:focus-visible,
     height: 100dvh;
   }
 
-  .voice-stage { bottom: 50px; }
+  .voice-stage { bottom: calc(50px + env(safe-area-inset-bottom)); }
   .voice-stage-header { min-height: 57px; padding: 0 9px; }
   .voice-stage-icon { display: none; }
   .voice-stage-header > div span { max-width: 58vw; }
@@ -2736,7 +2790,8 @@ textarea:focus-visible,
   .people-button { display: inline-grid; }
 
   .message-scroller {
-    padding-bottom: 55px;
+    padding-bottom: 8px;
+    scroll-padding-bottom: 18px;
   }
 
   .channel-intro {
@@ -2760,8 +2815,9 @@ textarea:focus-visible,
   .image-expand { opacity: 0.82; transform: none; }
   .history-retry { min-height: 44px; }
   .link-preview-list { width: 100%; }
-  .link-preview-card { padding: 9px 10px 9px 13px; }
-  .link-preview-title { font-size: 13px; }
+  .link-preview-card { padding: 10px 11px 10px 13px; }
+  .link-preview-title { font-size: 14px; }
+  .link-preview-description { font-size: 12px; }
   .link-preview-description { -webkit-line-clamp: 2; }
   .group-time { font-size: 0; }
 
@@ -2771,15 +2827,19 @@ textarea:focus-visible,
   }
 
   .composer-wrap {
-    position: absolute;
-    right: 0;
-    bottom: 50px;
-    left: 0;
+    /* Keep the composer in the flex layout on compact screens. Its real
+       height (reply, image, multiline draft and keyboard changes included)
+       then reduces the scroll viewport instead of covering the final row. */
+    position: relative;
+    right: auto;
+    bottom: auto;
+    left: auto;
+    flex: 0 0 auto;
     padding: 0 10px 6px;
   }
 
   .chat-panel:has(.pending-image) .message-scroller,
-  .chat-panel:has(.image-url-entry) .message-scroller { padding-bottom: 116px; }
+  .chat-panel:has(.image-url-entry) .message-scroller { padding-bottom: 8px; }
 
   .composer-note { display: none; }
   .composer { min-height: 43px; padding: 5px; border-radius: 12px; }
@@ -2798,14 +2858,18 @@ textarea:focus-visible,
   .lightbox-close { top: max(9px, env(safe-area-inset-top)); right: max(9px, env(safe-area-inset-right)); }
 
   .mobile-nav {
-    position: absolute;
+    position: relative;
     z-index: 8;
-    right: 0;
-    bottom: 0;
-    left: 0;
+    right: auto;
+    bottom: auto;
+    left: auto;
     display: grid;
-    height: 50px;
+    width: 100%;
+    height: calc(50px + env(safe-area-inset-bottom));
+    min-height: calc(50px + env(safe-area-inset-bottom));
+    flex: 0 0 auto;
     grid-template-columns: repeat(4, 1fr);
+    padding-bottom: env(safe-area-inset-bottom);
     border-top: 1px solid var(--line);
     background: rgba(17, 20, 27, 0.96);
     backdrop-filter: blur(16px);

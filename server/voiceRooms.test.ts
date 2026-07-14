@@ -37,6 +37,41 @@ describe("voice room runtime", () => {
     expect(runtime.createRoom("missing", human(3))).toMatchObject({ ok: false, code: "CHANNEL_NOT_FOUND" });
   });
 
+  it("atomically reconciles channel and persona catalogs around active voice rooms", () => {
+    const runtime = runtimeFactory();
+    expect(runtime.setChannelIds(["lobby"])).toEqual({ ok: true });
+    const created = runtime.createRoom("lobby", human(1));
+    if (!created.ok) throw new Error(created.error);
+    expect(runtime.inviteBot(created.room.id, "socket-1", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+
+    expect(runtime.validateChannelIds(["ai-lab"])).toEqual({
+      ok: false,
+      code: "CHANNEL_IN_USE",
+      channelIds: ["lobby"],
+    });
+    expect(runtime.setChannelIds(["ai-lab"])).toMatchObject({ ok: false, code: "CHANNEL_IN_USE" });
+    expect(runtime.validatePersonaIds(["ai-pixel"])).toEqual({
+      ok: false,
+      code: "PERSONA_IN_USE",
+      personaIds: ["ai-sana"],
+    });
+
+    const changed = runtime.reconcileBotCatalog([{ id: "ai-sana", name: "Sana Live" }]);
+    expect(changed).toHaveLength(1);
+    expect(changed[0]?.revision).toBe(created.room.revision + 2);
+    expect(changed[0]?.participants.find((participant) => participant.memberId === "ai-sana")?.name).toBe("Sana Live");
+    expect(runtime.validatePersonaIds(["ai-sana"])).toEqual({ ok: true });
+
+    expect(runtime.leaveRoom("socket-1")).toMatchObject({ ok: true, closed: true });
+    // The failed replacement did not mutate the original channel set.
+    const stillLobby = runtime.createRoom("lobby", human(2));
+    expect(stillLobby.ok).toBe(true);
+    if (stillLobby.ok) expect(runtime.leaveRoom("socket-2")).toMatchObject({ ok: true, closed: true });
+    expect(runtime.setChannelIds(["ai-lab"])).toEqual({ ok: true });
+    expect(runtime.createRoom("lobby", human(3))).toMatchObject({ ok: false, code: "CHANNEL_NOT_FOUND" });
+    expect(runtime.createRoom("ai-lab", human(3)).ok).toBe(true);
+  });
+
   it("caps a small P2P room at six human peers", () => {
     const runtime = runtimeFactory();
     const created = runtime.createRoom("lobby", human(1));

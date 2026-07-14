@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { writeFile } from "node:fs/promises";
+import { readdir, readFile, writeFile } from "node:fs/promises";
+import { basename, dirname } from "node:path";
 import { createMessage, RoomStore } from "./store.js";
 import { CHANNELS } from "./channels.js";
 
@@ -61,5 +62,33 @@ describe("room history", () => {
     expect(store.getRecent("lobby", 1)[0]?.content).toBe("busy 600");
     expect(store.getAllMessages().filter((message) => message.channelId === "lobby").length).toBe(500);
     await store.flush();
+  });
+
+  it("serializes overlapping flushes and atomically leaves the latest state on disk", async () => {
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath);
+    const expectedIds: string[] = [];
+    const flushes: Array<Promise<void>> = [];
+
+    for (let index = 0; index < 12; index += 1) {
+      const message = createMessage("lobby", "ai-mira", `overlap ${index}`);
+      expectedIds.push(message.id);
+      store.addPublicMessage(message);
+      flushes.push(store.flush());
+    }
+
+    await expect(Promise.all(flushes)).resolves.toHaveLength(12);
+    const persisted = JSON.parse(await readFile(filePath, "utf8")) as {
+      version: number;
+      messages: Array<{ id: string }>;
+    };
+    expect(persisted.version).toBe(1);
+    expect(persisted.messages.map((message) => message.id)).toEqual(expectedIds);
+
+    const temporaryPrefix = `${basename(filePath)}.`;
+    const leftovers = (await readdir(dirname(filePath))).filter(
+      (entry) => entry.startsWith(temporaryPrefix) && entry.endsWith(".tmp"),
+    );
+    expect(leftovers).toEqual([]);
   });
 });

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type {
   ChatMessage,
@@ -269,6 +269,7 @@ export const createMessage = (
     authorSnapshot?: Member;
     generation?: "lm" | "fallback";
     sources?: MessageSource[];
+    linkPreview?: LinkPreview;
     attachments?: ImageAttachment[];
   } = {},
 ): ChatMessage => ({
@@ -286,6 +287,7 @@ export class RoomStore {
   private messages: ChatMessage[] = [];
   private readonly privateThreads = new Map<string, PrivateThread>();
   private persistTimer?: NodeJS.Timeout;
+  private writeQueue: Promise<void> = Promise.resolve();
   private removalHandler?: (messages: ChatMessage[]) => void;
 
   constructor(filePath = resolve(process.cwd(), process.env.ROOM_STATE_PATH ?? "data/room-state.json")) {
@@ -463,16 +465,36 @@ export class RoomStore {
   async flush(): Promise<void> {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     this.persistTimer = undefined;
-    await mkdir(dirname(this.filePath), { recursive: true });
-    const tempPath = this.filePath.replace(/\.json$/, ".tmp");
-    const payload: PersistedState = { version: 1, messages: this.messages };
-    await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-    await rename(tempPath, this.filePath);
+    // Serialize writes from timer callbacks and explicit flushes. The payload
+    // is captured only when this queued operation begins, so a later queued
+    // flush always persists the newest in-memory state rather than an older
+    // snapshot winning a rename race.
+    this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
+      await mkdir(dirname(this.filePath), { recursive: true });
+      const payload: PersistedState = { version: 1, messages: this.messages };
+      const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+        await rename(tempPath, this.filePath);
+      } catch (error) {
+        await unlink(tempPath).catch((cleanupError: NodeJS.ErrnoException) => {
+          if (cleanupError.code !== "ENOENT") {
+            console.warn("Could not remove failed room-state temp file.", cleanupError);
+          }
+        });
+        throw error;
+      }
+    });
+    return this.writeQueue;
   }
 
   private schedulePersist(): void {
     if (this.persistTimer) clearTimeout(this.persistTimer);
-    this.persistTimer = setTimeout(() => void this.flush(), 350);
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      void this.flush().catch((error) => console.warn("Could not persist room state.", error));
+    }, 350);
+    this.persistTimer.unref?.();
   }
 
   private trimAllChannels(limit: number): void {

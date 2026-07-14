@@ -14,8 +14,8 @@ export const PIPER_PROVIDER_VOICES = [
 export type PiperProviderVoice = (typeof PIPER_PROVIDER_VOICES)[number];
 
 export interface PersonaVoiceProfile {
-  /** Voice alias understood only by the bundled `piper-sv` sidecar. */
-  providerVoice: PiperProviderVoice;
+  /** Provider voice ID already allowed by the server-side speech service. */
+  providerVoice: string;
   speed: number;
   browserRate: number;
   browserPitch: number;
@@ -60,10 +60,67 @@ export const PERSONA_VOICE_PROFILES: Readonly<Record<string, PersonaVoiceProfile
   "ai-robin": voiceProfile("nst-calm", 1.01, 1, 1.02),
 });
 
-export const voiceProfileForPersona = (personaId: string): PersonaVoiceProfile | undefined =>
-  PERSONA_VOICE_PROFILES[personaId];
+let adminLanguageVoices: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({});
 
-export const configuredPersonaProviderVoices = (model: string | undefined): PiperProviderVoice[] =>
+/** Replaces only server-validated voice IDs; provider credentials never enter this map. */
+export const setAdminPersonaVoiceMappings = (
+  mappings: Readonly<Record<string, Readonly<Record<string, string>>>>,
+): void => {
+  adminLanguageVoices = Object.freeze(Object.fromEntries(
+    Object.entries(mappings).map(([personaId, voices]) => [personaId, Object.freeze({ ...voices })]),
+  ));
+};
+
+const mappedVoice = (personaId: string, language?: string): string | undefined => {
+  const voices = adminLanguageVoices[personaId];
+  if (!voices) return undefined;
+  const canonical = language?.trim();
+  const base = canonical?.split("-")[0];
+  return (canonical ? voices[canonical] ?? voices[canonical.toLocaleLowerCase()] : undefined)
+    ?? (base ? voices[base] : undefined)
+    ?? voices["*"];
+};
+
+/** Returns only an administrator-selected, server-validated provider voice. */
+export const mappedProviderVoiceForPersona = (personaId: string, language?: string): string | undefined =>
+  mappedVoice(personaId, language);
+
+export const voiceProfileForPersona = (personaId: string, language?: string): PersonaVoiceProfile | undefined => {
+  const configured = mappedVoice(personaId, language);
+  const base = PERSONA_VOICE_PROFILES[personaId];
+  if (!configured) return base;
+  return {
+    providerVoice: configured,
+    speed: base?.speed ?? 1,
+    browserRate: base?.browserRate ?? 1,
+    browserPitch: base?.browserPitch ?? 1,
+  };
+};
+
+export const configuredPersonaProviderVoices = (model: string | undefined): string[] =>
   model?.trim().toLocaleLowerCase() === "piper-sv"
-    ? [...new Set(Object.values(PERSONA_VOICE_PROFILES).map((profile) => profile.providerVoice))]
+    ? [...new Set([
+        ...Object.values(PERSONA_VOICE_PROFILES).map((profile) => profile.providerVoice),
+        ...Object.values(adminLanguageVoices).flatMap((voices) => Object.values(voices)),
+      ])]
     : [];
+
+const validProviderVoiceId = (value: string): boolean =>
+  value.length <= 80 && /^[\p{L}\p{N}._:-]+$/u.test(value);
+
+/** Public configuration IDs only; credentials and provider URLs are never included. */
+export const configuredProviderVoiceIds = (
+  model: string | undefined,
+  defaultVoice: string | undefined,
+  configuredVoices: string | undefined,
+): string[] => {
+  if (model?.trim().toLocaleLowerCase() === "piper-sv") return [...PIPER_PROVIDER_VOICES];
+  const values = [
+    ...(configuredVoices?.split(",") ?? []),
+    ...(defaultVoice ? [defaultVoice] : []),
+  ].map((value) => value.normalize("NFKC").trim()).filter(Boolean);
+  if (values.length > 64 || values.some((value) => !validProviderVoiceId(value))) {
+    throw new TypeError("TTS_VOICES contains an invalid provider voice ID");
+  }
+  return [...new Set(values)];
+};
