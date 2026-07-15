@@ -4391,6 +4391,282 @@ describe("social director", () => {
     }
   });
 
+  it("never exposes an optional public-scene candidate as composing when only the accountable reviewed line survives", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-15T17:00:00.000Z");
+      const human = {
+        id: "guest-typing-single",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+      const store = new RoomStore("/tmp/director-typing-single-unused.json");
+      const incoming = createMessage("lobby", human.id, "Vad tycker ni om idén?");
+      store.addPublicMessage(incoming);
+      const emitted: Array<{ event: string; payload: unknown }> = [];
+      const emit = vi.fn((event: string, payload: unknown) => emitted.push({ event, payload }));
+      let selectedIds: string[] = [];
+      const generateScene = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => {
+        selectedIds = request.selected.map((persona) => persona.id);
+        return [{
+          personaId: request.selected[0]!.id,
+          content: "Jag gillar riktningen, men den behöver ett konkret test först.",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime([mira, vale]),
+        {} as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, mira, vale],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await pending;
+
+      expect(selectedIds).toHaveLength(2);
+      const typingEvents = emitted.filter((entry) => entry.event === "typing:member") as Array<{
+        event: string;
+        payload: { memberId: string; active: boolean };
+      }>;
+      const activeIds = typingEvents
+        .filter((entry) => entry.payload.active)
+        .map((entry) => entry.payload.memberId);
+      expect(new Set(activeIds)).toEqual(new Set([selectedIds[0]]));
+      expect(activeIds).not.toContain(selectedIds[1]);
+
+      const activeAtEnd = new Set<string>();
+      for (const { payload } of typingEvents) {
+        if (payload.active) activeAtEnd.add(payload.memberId);
+        else activeAtEnd.delete(payload.memberId);
+      }
+      expect(activeAtEnd.size).toBe(0);
+      expect(
+        emitted
+          .filter((entry) => entry.event === "message:new")
+          .map((entry) => (entry.payload as { authorId: string }).authorId),
+      ).toEqual([selectedIds[0]]);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("exposes two reviewed public speakers sequentially and balances every composing transition", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-15T17:05:00.000Z");
+      const human = {
+        id: "guest-typing-two",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+      const store = new RoomStore("/tmp/director-typing-two-unused.json");
+      const incoming = createMessage("lobby", human.id, "Vad tycker ni om idén?");
+      store.addPublicMessage(incoming);
+      const emitted: Array<{ event: string; payload: unknown }> = [];
+      const emit = vi.fn((event: string, payload: unknown) => emitted.push({ event, payload }));
+      let selectedIds: string[] = [];
+      const generateScene = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => {
+        selectedIds = request.selected.map((persona) => persona.id);
+        return request.selected.map((persona, index) => ({
+          personaId: persona.id,
+          content: index === 0
+            ? "Jag gillar riktningen, särskilt om vi testar den på riktigt."
+            : "Jag köper målet, men vad skulle faktiskt motbevisa idén?",
+          source: "lm" as const,
+          sourceIds: [],
+        }));
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime([mira, vale]),
+        {} as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, mira, vale],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await pending;
+
+      expect(selectedIds).toHaveLength(2);
+      const publicEvents = emitted.filter((entry) =>
+        entry.event === "typing:member" || entry.event === "message:new",
+      );
+      const messageIndexes = publicEvents.flatMap((entry, index) => entry.event === "message:new" ? [index] : []);
+      const publishedIds = messageIndexes.map((index) =>
+        (publicEvents[index]!.payload as { authorId: string }).authorId,
+      );
+      expect(publishedIds).toEqual(selectedIds);
+
+      const firstActiveIndex = (memberId: string): number => publicEvents.findIndex((entry) =>
+        entry.event === "typing:member" &&
+        (entry.payload as { memberId: string; active: boolean }).memberId === memberId &&
+        (entry.payload as { memberId: string; active: boolean }).active,
+      );
+      expect(firstActiveIndex(selectedIds[0]!)).toBeGreaterThanOrEqual(0);
+      expect(firstActiveIndex(selectedIds[0]!)).toBeLessThan(messageIndexes[0]!);
+      expect(firstActiveIndex(selectedIds[1]!)).toBeGreaterThan(messageIndexes[0]!);
+      expect(firstActiveIndex(selectedIds[1]!)).toBeLessThan(messageIndexes[1]!);
+
+      const active = new Set<string>();
+      const counts = new Map<string, { active: number; inactive: number }>();
+      for (const entry of publicEvents) {
+        if (entry.event !== "typing:member") continue;
+        const payload = entry.payload as { memberId: string; active: boolean };
+        const count = counts.get(payload.memberId) ?? { active: 0, inactive: 0 };
+        if (payload.active) {
+          count.active += 1;
+          active.add(payload.memberId);
+        } else {
+          count.inactive += 1;
+          active.delete(payload.memberId);
+        }
+        counts.set(payload.memberId, count);
+        expect(active.size).toBeLessThanOrEqual(1);
+      }
+      expect(active.size).toBe(0);
+      for (const memberId of selectedIds) {
+        expect(counts.get(memberId)?.active).toBeGreaterThan(0);
+        expect(counts.get(memberId)?.inactive).toBe(counts.get(memberId)?.active);
+      }
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("never exposes an absent optional ambient responder as composing", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-15T17:10:00.000Z");
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+      const store = new RoomStore("/tmp/director-typing-ambient-unused.json");
+      const emitted: Array<{ event: string; payload: unknown }> = [];
+      const emit = vi.fn((event: string, payload: unknown) => emitted.push({ event, payload }));
+      let selectedIds: string[] = [];
+      const generateScene = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => {
+        selectedIds = request.selected.map((persona) => persona.id);
+        return [{
+          personaId: request.selected[0]!.id,
+          content: "Det här borde testas med ett litet konkret experiment först.",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime([mira, vale]),
+        {} as never,
+        {} as never,
+        () => [mira, vale],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.25,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+        },
+      );
+
+      const pending = (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await pending;
+
+      expect(selectedIds).toHaveLength(2);
+      const typingEvents = emitted.filter((entry) => entry.event === "typing:member") as Array<{
+        event: string;
+        payload: { memberId: string; active: boolean };
+      }>;
+      const activeIds = typingEvents
+        .filter((entry) => entry.payload.active)
+        .map((entry) => entry.payload.memberId);
+      expect(new Set(activeIds)).toEqual(new Set([selectedIds[0]]));
+      expect(activeIds).not.toContain(selectedIds[1]);
+      const activeAtEnd = new Set<string>();
+      for (const { payload } of typingEvents) {
+        if (payload.active) activeAtEnd.add(payload.memberId);
+        else activeAtEnd.delete(payload.memberId);
+      }
+      expect(activeAtEnd.size).toBe(0);
+      expect(
+        emitted
+          .filter((entry) => entry.event === "message:new")
+          .map((entry) => (entry.payload as { authorId: string }).authorId),
+      ).toEqual([selectedIds[0]]);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("discards and backs off a zero-message ambient thread so another room gets a turn", async () => {
     vi.useFakeTimers();
     try {

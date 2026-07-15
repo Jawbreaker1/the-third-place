@@ -43,6 +43,7 @@ import {
   type VoicePlaybackController,
 } from "./voicePlayback";
 import { clearChannelNotice, firstUnreadDmMessageId, nextDmUnread, noteChannelMessage, type ChannelNotices } from "./unread";
+import { reduceTypingPresence, TypingPresenceExpiry } from "./typingPresence";
 
 const REACTIONS = ["👍", "👀", "😂", "💀", "🤔", "💛", "🔥", "✨"];
 const CLIENT_CHANNEL_MESSAGE_LIMIT = 600;
@@ -371,6 +372,12 @@ export default function App() {
   const membersRef = useRef<Member[]>([]);
   const dmThreadsRef = useRef<DmThread[]>([]);
   const typingTimer = useRef<number | undefined>(undefined);
+  const typingExpiryRef = useRef<TypingPresenceExpiry | null>(null);
+  if (!typingExpiryRef.current) {
+    typingExpiryRef.current = new TypingPresenceExpiry((payload) => {
+      setTyping((current) => reduceTypingPresence(current, payload));
+    });
+  }
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const shouldStickToBottom = useRef(true);
@@ -678,6 +685,8 @@ export default function App() {
   }, [getVoicePlayback]);
 
   const applySnapshot = useCallback((snapshot: RoomSnapshot) => {
+    typingExpiryRef.current?.clear();
+    setTyping({});
     shouldStickToBottom.current = true;
     meRef.current = snapshot.me;
     setMe(snapshot.me);
@@ -873,12 +882,8 @@ export default function App() {
       }
     });
     socket.on("typing:member", (payload: TypingMemberPayload) => {
-      setTyping((current) => {
-        const channel = new Set(current[payload.channelId] ?? []);
-        if (payload.active) channel.add(payload.memberId);
-        else channel.delete(payload.memberId);
-        return { ...current, [payload.channelId]: [...channel] };
-      });
+      typingExpiryRef.current?.observe(payload);
+      setTyping((current) => reduceTypingPresence(current, payload));
     });
     socket.on("director:event", (event: DirectorEvent) => setDirectorEvents((current) => [...current.slice(-23), event]));
     socket.on("health:update", (nextHealth: ServerHealth) => setHealth(nextHealth));
@@ -935,6 +940,8 @@ export default function App() {
       socket.disconnect();
     });
     socket.on("disconnect", (reason) => {
+      typingExpiryRef.current?.clear();
+      setTyping({});
       if (reason !== "io client disconnect") setConnection("reconnecting");
       if (reason !== "io client disconnect" && joinedVoiceRoomRef.current) setVoiceJoinState("reconnecting");
     });
@@ -1002,6 +1009,7 @@ export default function App() {
       .catch(() => undefined);
     return () => {
       alive = false;
+      typingExpiryRef.current?.clear();
       if (joinedVoiceRoomRef.current) socketRef.current?.emit("voice:room:leave", { roomId: joinedVoiceRoomRef.current });
       clearVoiceMedia();
       socketRef.current?.disconnect();

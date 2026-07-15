@@ -62,6 +62,8 @@ import { recallChannelHistory } from "./channelRecall.js";
 import {
   DmTurnCoordinator,
   type DmTurn,
+  type TypingLease,
+  TypingLeaseCounter,
 } from "./dmTurnCoordinator.js";
 import {
   CapabilityRegistry,
@@ -1492,6 +1494,12 @@ export class SocialDirector {
     "pollOfficialFeeds" | "evaluateMarketObservations"
   >;
   private readonly dmTurns: DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>;
+  private readonly typingLeases: TypingLeaseCounter<string>;
+  private readonly typingTargets = new Map<string, {
+    channelId: string;
+    memberId: string;
+    rooms: readonly string[];
+  }>();
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
   private lastAutonomousResearchSuccessAt?: number;
   private autonomousResearchGlobalRetryAfterAt?: number;
@@ -1510,6 +1518,12 @@ export class SocialDirector {
   ) {
     this.rng = options.rng ?? Math.random;
     this.now = options.now ?? Date.now;
+    this.typingLeases = new TypingLeaseCounter<string>((key, active) => {
+      const target = this.typingTargets.get(key);
+      if (!target) return;
+      this.emitTypingState(target.channelId, target.memberId, active, target.rooms);
+      if (!active) this.typingTargets.delete(key);
+    });
     this.pageReader = options.pageReader ?? new PageReader();
     this.capabilityRegistry = new CapabilityRegistry({
       pageReader: this.pageReader,
@@ -1529,7 +1543,7 @@ export class SocialDirector {
         const participants: readonly string[] = this.store.getDmParticipants(threadId) ?? [];
         const persona = PERSONAS.find((candidate) => participants.includes(candidate.id));
         const humanId = participants.find((id) => id !== persona?.id);
-        if (persona && humanId) this.setTyping(threadId, persona.id, active, [`user:${humanId}`], false);
+        if (persona && humanId) this.emitTypingState(threadId, persona.id, active, [`user:${humanId}`]);
       },
       onError: (error, turn) => {
         for (const input of turn.messages) input.settle();
@@ -1588,6 +1602,7 @@ export class SocialDirector {
     for (const burst of this.pendingBursts.values()) clearTimeout(burst.timer);
     this.pendingBursts.clear();
     this.dmTurns.dispose();
+    this.typingLeases.clearAll();
   }
 
   getEvents(): DirectorEvent[] {
@@ -1607,6 +1622,7 @@ export class SocialDirector {
   reconcileCatalog(): void {
     this.catalogEpoch += 1;
     this.dmTurns.cancelAll();
+    this.typingLeases.clearAll();
     const channelIds = new Set([
       ...CHANNELS.map((channel) => channel.id),
       ...this.channelEpoch.keys(),
@@ -1669,7 +1685,7 @@ export class SocialDirector {
 
     await delay(900 + Math.random() * 1_400);
     if (catalogEpoch !== this.catalogEpoch || !this.canSpeak()) return;
-    this.setTyping("lobby", persona.id, true);
+    const typingLease = this.acquireTyping("lobby", persona.id);
     let line: GeneratedLine | undefined;
     try {
       const generated = await this.lm.generateScene(
@@ -1702,20 +1718,22 @@ export class SocialDirector {
       line = generated[0];
     } catch (error) {
       console.warn("Welcome scene failed:", error instanceof Error ? error.message : error);
-    } finally {
-      this.setTyping("lobby", persona.id, false);
     }
-    await delay(450);
-    if (catalogEpoch !== this.catalogEpoch || !this.canSpeak()) return;
-    if (!line) return;
-    const posted = this.postPublic(
-      "lobby",
-      persona,
-      line.content,
-      undefined,
-      "lm",
-    );
-    if (posted) this.updateRelationship(persona.id, human.id, { warmth: 0.2, aggression: 0 }, 0.025);
+    try {
+      await delay(450);
+      if (catalogEpoch !== this.catalogEpoch || !this.canSpeak()) return;
+      if (!line) return;
+      const posted = this.postPublic(
+        "lobby",
+        persona,
+        line.content,
+        undefined,
+        "lm",
+      );
+      if (posted) this.updateRelationship(persona.id, human.id, { warmth: 0.2, aggression: 0 }, 0.025);
+    } finally {
+      typingLease.release();
+    }
   }
 
   onHumanMessage(message: ChatMessage, human: Member): void {
@@ -2484,10 +2502,6 @@ export class SocialDirector {
       this.schedulePersistentMemory(messages, human);
       return;
     }
-    let primaryTypingVisible = !autoSharedLinkAttempt;
-    if (primaryTypingVisible) {
-      for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, true);
-    }
     const generatedAt = this.now();
     const humanizerBudget = { repairsRemaining: 1 };
     const responseRecoveryBudget = { retriesRemaining: 1 };
@@ -2504,6 +2518,15 @@ export class SocialDirector {
           : []),
       ]),
     ];
+    // Selection means "considered for this scene", not "has committed a
+    // message". During generation, expose only the one accountable primary;
+    // optional candidates become visible later only if a reviewed line is
+    // actually staged for publication.
+    const accountablePrimary = requestOwner
+      ?? selected.find((persona) => requiredIds.includes(persona.id));
+    let primaryTypingLease: TypingLease | undefined = autoSharedLinkAttempt || !accountablePrimary
+      ? undefined
+      : this.acquireTyping(trigger.channelId, accountablePrimary.id);
     let lines: GeneratedLine[] = [];
     let research: ResearchPacket | undefined;
     let capabilityResolution: EvidenceResolution | undefined;
@@ -2533,8 +2556,9 @@ export class SocialDirector {
           return;
         }
         if (autoSharedLinkAttempt) {
-          for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, true);
-          primaryTypingVisible = true;
+          if (accountablePrimary) {
+            primaryTypingLease = this.acquireTyping(trigger.channelId, accountablePrimary.id);
+          }
         }
         if (research) triggerType = "research";
       }
@@ -2600,9 +2624,7 @@ export class SocialDirector {
     } catch (error) {
       console.warn("Public scene failed:", error instanceof Error ? error.message : error);
     } finally {
-      if (primaryTypingVisible) {
-        for (const persona of selected.slice(0, 2)) this.setTyping(trigger.channelId, persona.id, false);
-      }
+      primaryTypingLease?.release();
     }
 
     if (!burstIsCurrent()) {
@@ -2623,7 +2645,7 @@ export class SocialDirector {
       // ladder in the director after that bounded attempt has already run.
       if (focusedOwnsRequest && responseRecoveryBudget.retriesRemaining <= 0) continue;
       if (focusedOwnsRequest) responseRecoveryBudget.retriesRemaining -= 1;
-      this.setTyping(trigger.channelId, persona.id, true);
+      const retryTypingLease = this.acquireTyping(trigger.channelId, persona.id);
       try {
         const focused = await this.lm.generateScene(
           {
@@ -2683,7 +2705,7 @@ export class SocialDirector {
       } catch (error) {
         console.warn("Focused mention retry failed:", error instanceof Error ? error.message : error);
       } finally {
-        this.setTyping(trigger.channelId, persona.id, false);
+        retryTypingLease.release();
       }
     }
     if (!burstIsCurrent()) {
@@ -2740,62 +2762,67 @@ export class SocialDirector {
       if (!burstIsCurrent()) break;
       const persona = selected.find((candidate) => candidate.id === line.personaId);
       if (!persona) continue;
-      await delay(index === 0 ? 350 : 1_200 + Math.random() * 1_600);
-      const ordinarySlotAvailable = this.canSpeak();
-      const prioritySlotAvailable = !ordinarySlotAvailable &&
-        !priorityReplyPublished &&
-        (!autoSharedLinkAttempt || automaticReadResponseRequired) &&
-        required.has(persona.id) &&
-        this.canUsePriorityHumanReply();
-      if (
-        !burstIsCurrent() ||
-        (!ordinarySlotAvailable && !prioritySlotAvailable) ||
-        (autoSharedLinkAttempt && this.voiceRoomActive)
-      ) break;
-      const publishedSourceIds = this.capabilityRegistry.sourceIds(
-        capabilityResolution,
-        line.sourceIds,
-        evidenceResponder?.id === line.personaId,
-      );
-      const linkCardSourceId = this.capabilityRegistry.linkCardSourceId(
-        capabilityResolution,
-        publishedSourceIds,
-      );
-      const posted = this.postPublic(
-        trigger.channelId,
-        persona,
-        line.content,
-        trigger.id,
-        line.source,
-        this.messageSources(research, publishedSourceIds),
-        linkCardSourceId && research ? linkPreviewFromResearch(research, linkCardSourceId) : undefined,
-      );
-      if (posted) {
-        publishedResponses.push(posted);
-        if (prioritySlotAvailable) {
-          this.recordPriorityHumanReply();
-          priorityReplyPublished = true;
+      const publicationTypingLease = this.acquireTyping(trigger.channelId, persona.id);
+      try {
+        await delay(index === 0 ? 350 : 1_200 + Math.random() * 1_600);
+        const ordinarySlotAvailable = this.canSpeak();
+        const prioritySlotAvailable = !ordinarySlotAvailable &&
+          !priorityReplyPublished &&
+          (!autoSharedLinkAttempt || automaticReadResponseRequired) &&
+          required.has(persona.id) &&
+          this.canUsePriorityHumanReply();
+        if (
+          !burstIsCurrent() ||
+          (!ordinarySlotAvailable && !prioritySlotAvailable) ||
+          (autoSharedLinkAttempt && this.voiceRoomActive)
+        ) break;
+        const publishedSourceIds = this.capabilityRegistry.sourceIds(
+          capabilityResolution,
+          line.sourceIds,
+          evidenceResponder?.id === line.personaId,
+        );
+        const linkCardSourceId = this.capabilityRegistry.linkCardSourceId(
+          capabilityResolution,
+          publishedSourceIds,
+        );
+        const posted = this.postPublic(
+          trigger.channelId,
+          persona,
+          line.content,
+          trigger.id,
+          line.source,
+          this.messageSources(research, publishedSourceIds),
+          linkCardSourceId && research ? linkPreviewFromResearch(research, linkCardSourceId) : undefined,
+        );
+        if (posted) {
+          publishedResponses.push(posted);
+          if (prioritySlotAvailable) {
+            this.recordPriorityHumanReply();
+            priorityReplyPublished = true;
+          }
         }
-      }
-      if (!posted && required.has(persona.id)) {
-        const fallback = evidenceResponder?.id === persona.id ? safeEvidenceFallback : undefined;
-        if (fallback) {
-          const fallbackMessage = this.postPublic(
-            trigger.channelId,
-            persona,
-            fallback.content,
-            trigger.id,
-            "fallback",
-            this.messageSources(research, fallback.sourceIds),
-          );
-          if (fallbackMessage) {
-            publishedResponses.push(fallbackMessage);
-            if (prioritySlotAvailable) {
-              this.recordPriorityHumanReply();
-              priorityReplyPublished = true;
+        if (!posted && required.has(persona.id)) {
+          const fallback = evidenceResponder?.id === persona.id ? safeEvidenceFallback : undefined;
+          if (fallback) {
+            const fallbackMessage = this.postPublic(
+              trigger.channelId,
+              persona,
+              fallback.content,
+              trigger.id,
+              "fallback",
+              this.messageSources(research, fallback.sourceIds),
+            );
+            if (fallbackMessage) {
+              publishedResponses.push(fallbackMessage);
+              if (prioritySlotAvailable) {
+                this.recordPriorityHumanReply();
+                priorityReplyPublished = true;
+              }
             }
           }
         }
+      } finally {
+        publicationTypingLease.release();
       }
     }
     if (autoSharedLinkAttempt && research && publishedResponses.length > 0) {
@@ -3337,7 +3364,7 @@ export class SocialDirector {
     const temporalCue = this.ambientTemporalCue(plan.lead.id);
     this.consideredConversationInFlight = true;
     this.lastConsideredConversationAt = this.now();
-    this.setTyping(channel.id, plan.lead.id, true);
+    const leadGenerationTypingLease = this.acquireTyping(channel.id, plan.lead.id);
     let leadLine: GeneratedLine | undefined;
     let responseLine: GeneratedLine | undefined;
     try {
@@ -3409,38 +3436,46 @@ export class SocialDirector {
       } catch (error) {
         console.warn("Considered ambient scene skipped:", error instanceof Error ? error.message : error);
       } finally {
-        this.setTyping(channel.id, plan.lead.id, false);
+        leadGenerationTypingLease.release();
       }
 
       // A shallow fallback would undermine the point of this rare beat. If the
       // model cannot produce both distinct turns, leave the room quiet instead.
       if (!leadLine || !responseLine || !this.consideredConversationIsStillSafe(channel.id, epoch, 2)) return;
 
-      const leadMessage = this.postPublic(
-        channel.id,
-        plan.lead,
-        leadLine.content,
-        thread.lastMessageId,
-        leadLine.source,
-      );
+      const leadPublicationTypingLease = this.acquireTyping(channel.id, plan.lead.id);
+      let leadMessage: ChatMessage | undefined;
+      try {
+        leadMessage = this.postPublic(
+          channel.id,
+          plan.lead,
+          leadLine.content,
+          thread.lastMessageId,
+          leadLine.source,
+        );
+      } finally {
+        leadPublicationTypingLease.release();
+      }
       if (!leadMessage) return;
       this.recordAmbientPost(thread, leadMessage);
 
-      this.setTyping(channel.id, plan.responder.id, true);
-      await delay(3_200 + this.rng() * 2_800);
-      this.setTyping(channel.id, plan.responder.id, false);
-
       let responsePosted = false;
-      if (this.consideredConversationIsStillSafe(channel.id, epoch, 1)) {
-        const responseMessage = this.postPublic(
-          channel.id,
-          plan.responder,
-          responseLine.content,
-          leadMessage.id,
-          responseLine.source,
-        );
-        responsePosted = Boolean(responseMessage);
-        if (responseMessage) this.recordAmbientPost(thread, responseMessage);
+      const responseTypingLease = this.acquireTyping(channel.id, plan.responder.id);
+      try {
+        await delay(3_200 + this.rng() * 2_800);
+        if (this.consideredConversationIsStillSafe(channel.id, epoch, 1)) {
+          const responseMessage = this.postPublic(
+            channel.id,
+            plan.responder,
+            responseLine.content,
+            leadMessage.id,
+            responseLine.source,
+          );
+          responsePosted = Boolean(responseMessage);
+          if (responseMessage) this.recordAmbientPost(thread, responseMessage);
+        }
+      } finally {
+        responseTypingLease.release();
       }
       this.publishDirectorEvent({
         trigger: "ambient",
@@ -3453,8 +3488,7 @@ export class SocialDirector {
         reacted: 0,
       });
     } finally {
-      this.setTyping(channel.id, plan.lead.id, false);
-      this.setTyping(channel.id, plan.responder.id, false);
+      leadGenerationTypingLease.release();
       this.consideredConversationInFlight = false;
     }
   }
@@ -3668,7 +3702,7 @@ export class SocialDirector {
     );
     const responder = choose(contrasting.length > 0 ? contrasting : responderPool, this.rng);
 
-    this.setTyping(channel.id, lead.id, true);
+    const leadGenerationTypingLease = this.acquireTyping(channel.id, lead.id);
     let research: ResearchPacket | undefined;
     let lines: GeneratedLine[] = [];
     try {
@@ -3723,7 +3757,7 @@ export class SocialDirector {
       console.warn("Autonomous sourced conversation skipped:", error instanceof Error ? error.message : error);
       return this.recordAutonomousResearchFailure(channel.id, seed, "generation_failed");
     } finally {
-      this.setTyping(channel.id, lead.id, false);
+      leadGenerationTypingLease.release();
     }
 
     const leadLine = lines.find((line) => line.personaId === lead.id);
@@ -3749,15 +3783,21 @@ export class SocialDirector {
     if (!preview) return this.recordAutonomousResearchFailure(channel.id, seed, "missing_preview");
 
     const leadSources = this.messageSources(selectedResearch, [selectedSourceId]);
-    const leadMessage = this.postPublic(
-      channel.id,
-      lead,
-      leadLine.content,
-      thread.lastMessageId,
-      leadLine.source,
-      leadSources,
-      preview,
-    );
+    const leadPublicationTypingLease = this.acquireTyping(channel.id, lead.id);
+    let leadMessage: ChatMessage | undefined;
+    try {
+      leadMessage = this.postPublic(
+        channel.id,
+        lead,
+        leadLine.content,
+        thread.lastMessageId,
+        leadLine.source,
+        leadSources,
+        preview,
+      );
+    } finally {
+      leadPublicationTypingLease.release();
+    }
     if (!leadMessage) return this.recordAutonomousResearchFailure(channel.id, seed, "publication_failed");
     // Success accounting begins only once a source-backed message is actually
     // in room history. Everything before this point uses short retry backoff.
@@ -3768,32 +3808,36 @@ export class SocialDirector {
     thread.research = boundedThreadResearch(selectedResearch, this.now());
     this.recordAmbientPost(thread, leadMessage);
 
-    this.setTyping(channel.id, responder.id, true);
-    await delay(2_000 + this.rng() * 1_800);
-    this.setTyping(channel.id, responder.id, false);
-    if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [responder], 1)) {
-      this.publishDirectorEvent({
-        trigger: "research",
-        summary: `${lead.name} shared one safely read source in #${channel.name}; the room changed before a follow-up.`,
-        considered: PERSONAS.length,
-        noticed: 1,
-        replied: 1,
-        reacted: 0,
-      });
-      return true;
+    const responseTypingLease = this.acquireTyping(channel.id, responder.id);
+    let responseMessage: ChatMessage | undefined;
+    try {
+      await delay(2_000 + this.rng() * 1_800);
+      if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [responder], 1)) {
+        this.publishDirectorEvent({
+          trigger: "research",
+          summary: `${lead.name} shared one safely read source in #${channel.name}; the room changed before a follow-up.`,
+          considered: PERSONAS.length,
+          noticed: 1,
+          replied: 1,
+          reacted: 0,
+        });
+        return true;
+      }
+      const responseSources = this.messageSources(
+        selectedResearch,
+        responseLine.sourceIds,
+      );
+      responseMessage = this.postPublic(
+        channel.id,
+        responder,
+        responseLine.content,
+        leadMessage.id,
+        responseLine.source,
+        responseSources,
+      );
+    } finally {
+      responseTypingLease.release();
     }
-    const responseSources = this.messageSources(
-      selectedResearch,
-      responseLine.sourceIds,
-    );
-    const responseMessage = this.postPublic(
-      channel.id,
-      responder,
-      responseLine.content,
-      leadMessage.id,
-      responseLine.source,
-      responseSources,
-    );
     if (responseMessage) this.recordAmbientPost(thread, responseMessage);
     this.publishDirectorEvent({
       trigger: "research",
@@ -3953,7 +3997,10 @@ export class SocialDirector {
         ambientMode,
       );
       const wordLimits = ambientSceneWordLimits(first, selected[1], thread.messageCount > 0, ambientMode);
-      for (const persona of selected.slice(0, 2)) this.setTyping(channel.id, persona.id, true);
+      // The lead owns this ambient generation. A possible second actor is only
+      // a candidate and must not appear to compose unless its reviewed line is
+      // later staged for publication.
+      const generationTypingLease = this.acquireTyping(channel.id, first.id);
       let lines: GeneratedLine[] = [];
       try {
         lines = await this.lm.generateScene(
@@ -3983,7 +4030,7 @@ export class SocialDirector {
       } catch (error) {
         console.warn("Ambient scene skipped:", error instanceof Error ? error.message : error);
       } finally {
-        for (const persona of selected.slice(0, 2)) this.setTyping(channel.id, persona.id, false);
+        generationTypingLease.release();
       }
       if (epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
       const leadLine = lines.find((line) => line.personaId === first.id);
@@ -4002,46 +4049,51 @@ export class SocialDirector {
       for (const [index, line] of orderedLines.entries()) {
         const persona = selected.find((candidate) => candidate.id === line.personaId);
         if (!persona || !this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) break;
-        if (index > 0) await delay(2_000 + this.rng() * 2_500);
-        if (!this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) break;
-        const posted = this.postPublic(
-          channel.id,
-          persona,
-          line.content,
-          thread.lastMessageId,
-          line.source,
-          this.messageSources(thread.research, line.sourceIds),
-        );
-        if (!posted) {
-          if (index === 0) {
-            if (thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
-            break;
+        const publicationTypingLease = this.acquireTyping(channel.id, persona.id);
+        try {
+          if (index > 0) await delay(2_000 + this.rng() * 2_500);
+          if (!this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) break;
+          const posted = this.postPublic(
+            channel.id,
+            persona,
+            line.content,
+            thread.lastMessageId,
+            line.source,
+            this.messageSources(thread.research, line.sourceIds),
+          );
+          if (!posted) {
+            if (index === 0) {
+              if (thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
+              break;
+            }
+            continue;
           }
-          continue;
-        }
-        this.recordAmbientPost(thread, posted);
-        postedMessages.push({ message: posted, persona });
-        if (postedMessages.length === 1) {
-          const reactors = this.actorChannels.candidatesFor(channel.id).filter((candidate) => !selected.includes(candidate));
-          const reactor = reactors.length > 0 ? choose(reactors, this.rng) : undefined;
-          if (reactor) {
-            setTimeout(() => {
-              const reaction = this.store.togglePublicReaction(
-                channel.id,
-                posted.id,
-                choose(profile?.ambientReactionPalette ?? ["👀", "😂", "🤔", "✨"], this.rng),
-                reactor.id,
-                true,
-              );
-              if (reaction) {
-                this.io.to("public").emit("reaction:update", {
-                  messageId: posted.id,
-                  channelId: channel.id,
-                  reaction,
-                });
-              }
-            }, 900 + this.rng() * 1_600);
+          this.recordAmbientPost(thread, posted);
+          postedMessages.push({ message: posted, persona });
+          if (postedMessages.length === 1) {
+            const reactors = this.actorChannels.candidatesFor(channel.id).filter((candidate) => !selected.includes(candidate));
+            const reactor = reactors.length > 0 ? choose(reactors, this.rng) : undefined;
+            if (reactor) {
+              setTimeout(() => {
+                const reaction = this.store.togglePublicReaction(
+                  channel.id,
+                  posted.id,
+                  choose(profile?.ambientReactionPalette ?? ["👀", "😂", "🤔", "✨"], this.rng),
+                  reactor.id,
+                  true,
+                );
+                if (reaction) {
+                  this.io.to("public").emit("reaction:update", {
+                    messageId: posted.id,
+                    channelId: channel.id,
+                    reaction,
+                  });
+                }
+              }, 900 + this.rng() * 1_600);
+            }
           }
+        } finally {
+          publicationTypingLease.release();
         }
       }
       if (postedMessages.length === 0) return;
@@ -4245,21 +4297,43 @@ export class SocialDirector {
     }));
   }
 
-  private setTyping(
+  private emitTypingState(
     channelId: string,
     memberId: string,
     active: boolean,
-    rooms = ["public"],
-    expire = true,
+    rooms: readonly string[] = ["public"],
   ): void {
     const payload: TypingMemberPayload = { channelId, memberId, active };
     for (const room of rooms) this.io.to(room).emit("typing:member", payload);
-    if (active && expire) {
-      setTimeout(() => {
-        const expiry: TypingMemberPayload = { channelId, memberId, active: false };
-        for (const room of rooms) this.io.to(room).emit("typing:member", expiry);
-      }, 14_000);
-    }
+  }
+
+  /**
+   * Operation-scoped composing state. Multiple overlapping operations owned by
+   * the same resident share one outward state transition, and an old timeout
+   * can release only its own lease instead of clearing newer work.
+   */
+  private acquireTyping(
+    channelId: string,
+    memberId: string,
+    rooms: readonly string[] = ["public"],
+    expireAfterMs = 14_000,
+  ): TypingLease {
+    const normalizedRooms = [...new Set(rooms)].sort();
+    const key = JSON.stringify([channelId, memberId, normalizedRooms]);
+    this.typingTargets.set(key, { channelId, memberId, rooms: normalizedRooms });
+    const lease = this.typingLeases.acquire(key);
+    const expiry = expireAfterMs > 0
+      ? setTimeout(() => lease.release(), expireAfterMs)
+      : undefined;
+    return {
+      get released() {
+        return lease.released;
+      },
+      release: () => {
+        if (expiry) clearTimeout(expiry);
+        lease.release();
+      },
+    };
   }
 
   private publishDirectorEvent(event: Omit<DirectorEvent, "id" | "createdAt" | "stayedQuiet">): void {
