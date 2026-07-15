@@ -1781,6 +1781,156 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(call).toBe(2);
   });
 
+  it("exposes typed weather success to generation and carries weather evidence into candidate review", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    const grounded = "Göteborg når runt 18 grader i morgon och blir svalare mot kvällen.";
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: grounded, sourceIds: ["S1"] }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Jaw_B",
+        content: "Kan någon kolla vädret i Göteborg? Kommer det bli kallare snart?",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      research: {
+        kind: "weather",
+        query: "Göteborg",
+        retrievedAt: "2026-07-15T14:00:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Väderprognos för Göteborg",
+          url: "https://example.com/weather/gothenburg",
+          snippet: "I morgon cirka 18 °C, därefter sjunkande temperatur mot kvällen.",
+        }],
+      },
+      capabilityContext: {
+        available: ["weather_forecast"],
+        requestKind: "execute",
+        discussed: ["weather_forecast"],
+        plannedAction: "weather_forecast",
+        executionStatus: "succeeded",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([grounded]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].messages[0].content).toContain("supplied a typed weather forecast from the fixed forecast provider");
+    expect(bodies[0].messages[0].content).toContain("include at least one concrete forecast detail, attach S1");
+    expect(bodies[0].messages[0].content).toContain("never claim that current weather or forecast data is unavailable");
+    const generationPayload = JSON.parse(bodies[0].messages[1].content);
+    expect(generationPayload.freshResearch).toMatchObject({
+      kind: "weather",
+      query: "Göteborg",
+      results: [{ id: "S1", title: "Väderprognos för Göteborg" }],
+    });
+    const reviewPayload = JSON.parse(bodies[1].messages[1].content);
+    expect(reviewPayload).toMatchObject({
+      evidence: {
+        outcome: "succeeded",
+        kind: "weather",
+        query: "Göteborg",
+        results: [{ id: "S1", title: "Väderprognos för Göteborg" }],
+      },
+      capabilityContext: {
+        available: ["weather_forecast"],
+        plannedAction: "weather_forecast",
+        executionStatus: "succeeded",
+      },
+      candidates: [{ personaId: mira.id, sourceIds: ["S1"] }],
+    });
+  });
+
+  it("keeps failed weather evidence non-successful and exposes failed_temporary to candidate review", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    const honestFailure = "Väderkollen gav inget användbart svar den här gången, tyvärr.";
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: honestFailure }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "Blir det kallare i Göteborg snart?" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      evidenceOutcome: "failed",
+      capabilityContext: {
+        available: ["weather_forecast"],
+        requestKind: "execute",
+        discussed: ["weather_forecast"],
+        plannedAction: "weather_forecast",
+        executionStatus: "failed_temporary",
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([honestFailure]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].messages[0].content).toContain("this specific evidence request returned no usable source");
+    expect(bodies[0].messages[0].content).toContain("Only failed_temporary may be described as this specific attempt");
+    expect(bodies[0].messages[0].content).toContain("No successful freshResearch evidence is supplied for this scene");
+    expect(bodies[0].messages[0].content).not.toContain("supplied a typed weather forecast from the fixed forecast provider");
+    const generationPayload = JSON.parse(bodies[0].messages[1].content);
+    expect(generationPayload.freshResearch).toBeNull();
+    expect(generationPayload.trustedCapabilityContext).toMatchObject({
+      plannedAction: "weather_forecast",
+      executionStatus: "failed_temporary",
+    });
+    const reviewPayload = JSON.parse(bodies[1].messages[1].content);
+    expect(reviewPayload).toMatchObject({
+      evidence: { outcome: "failed", kind: null, query: null, results: [] },
+      capabilityContext: {
+        available: ["weather_forecast"],
+        discussed: ["weather_forecast"],
+        plannedAction: "weather_forecast",
+        executionStatus: "failed_temporary",
+      },
+      candidates: [{ personaId: mira.id, sourceIds: [] }],
+    });
+  });
+
   it("drops an incorrectly grounded elapsed-time claim without a style-repair call", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;

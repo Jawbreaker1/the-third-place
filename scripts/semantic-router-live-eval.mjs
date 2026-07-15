@@ -36,6 +36,31 @@ const cases = [
     check: (value) => value.evidence.action === "local_datetime" && value.evidence.timeZone?.startsWith("America/"),
   },
   {
+    id: "sv-weather-forecast",
+    text: "Kan någon kolla vädret i Göteborg? Kommer det bli kallare snart?",
+    capabilities: ["web_search", "local_datetime", "weather_forecast"],
+    check: (value) => value.evidence.action === "weather_forecast" &&
+      value.evidence.locationLabel?.toLocaleLowerCase().includes("göteborg") &&
+      value.capabilities.discussed.includes("weather_forecast") &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
+    id: "es-weather-forecast",
+    text: "¿Va a hacer más frío en Barcelona durante los próximos días?",
+    capabilities: ["web_search", "local_datetime", "weather_forecast"],
+    check: (value) => value.evidence.action === "weather_forecast" &&
+      value.evidence.locationLabel?.toLocaleLowerCase().includes("barcelona") &&
+      value.capabilities.discussed.includes("weather_forecast"),
+  },
+  {
+    id: "ja-weather-forecast",
+    text: "札幌は今週もっと寒くなりますか？天気を確認して。",
+    capabilities: ["web_search", "local_datetime", "weather_forecast"],
+    check: (value) => value.evidence.action === "weather_forecast" &&
+      value.evidence.locationLabel?.includes("札幌") &&
+      value.capabilities.discussed.includes("weather_forecast"),
+  },
+  {
     id: "es-current-market",
     text: "¿Alguien puede buscar la cotización actual de Telefónica?",
     capabilities: ["web_search", "local_datetime"],

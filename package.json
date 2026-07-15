@@ -20,6 +20,7 @@
     "test:tts-sidecar": "node --test scripts/piper-tts-setup.node-test.mjs && python3 -m unittest scripts.tts.test_piper_sidecar",
     "smoke:image": "node scripts/image-smoke.mjs",
     "smoke:research": "node scripts/research-smoke.mjs",
+    "smoke:weather": "node scripts/weather-smoke.mjs",
     "smoke:history-links": "node scripts/history-link-smoke.mjs",
     "audit:humanity": "node scripts/humanity-audit.mjs",
     "eval:humanity": "node --import tsx scripts/humanity-live-eval.mjs",

@@ -71,6 +71,11 @@ import {
   DmTurnCoordinator,
   type DmTurn,
 } from "./dmTurnCoordinator.js";
+import { resolveSearchEvidence } from "./evidenceResolver.js";
+import {
+  WeatherForecastProvider,
+  type WeatherForecastResult,
+} from "./weatherForecast.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -623,6 +628,8 @@ export interface SocialDirectorOptions {
   /** Structural DM burst window; no message text is inspected by this coordinator. */
   dmDebounceMs?: number;
   pageReader?: PageReader;
+  /** Fixed-host typed forecast capability. `null` disables it explicitly in tests or deployments. */
+  weatherForecastProvider?: Pick<WeatherForecastProvider, "forecast"> | null;
   /** Live server-owned behavior settings; storage and authorization stay outside the director. */
   behaviorTuningProvider?: BehaviorTuningProvider;
 }
@@ -1182,11 +1189,90 @@ export function sourceIdsForPageResponder(
   research: ResearchPacket | undefined,
   sourceIds: readonly string[],
   forcePageSource: boolean,
+  allowSelectedPageSources = false,
 ): string[] {
-  if (research?.kind === "page") {
+  if (research?.kind === "weather") {
     return forcePageSource && research.results.some((result) => result.id === "S1") ? ["S1"] : [];
   }
-  return [...new Set(sourceIds)].slice(0, 3);
+  if (research?.kind === "page") {
+    if (forcePageSource && research.results.some((result) => result.id === "S1")) return ["S1"];
+    if (!allowSelectedPageSources) return [];
+  }
+  const available = new Set(research?.results.map((result) => result.id) ?? []);
+  return [...new Set(sourceIds)].filter((sourceId) => available.has(sourceId)).slice(0, 3);
+}
+
+const weatherCodeLabel = (code: number): string => ({
+  0: "clear sky",
+  1: "mainly clear",
+  2: "partly cloudy",
+  3: "overcast",
+  45: "fog",
+  48: "depositing rime fog",
+  51: "light drizzle",
+  53: "moderate drizzle",
+  55: "dense drizzle",
+  56: "light freezing drizzle",
+  57: "dense freezing drizzle",
+  61: "slight rain",
+  63: "moderate rain",
+  65: "heavy rain",
+  66: "light freezing rain",
+  67: "heavy freezing rain",
+  71: "slight snowfall",
+  73: "moderate snowfall",
+  75: "heavy snowfall",
+  77: "snow grains",
+  80: "slight rain showers",
+  81: "moderate rain showers",
+  82: "violent rain showers",
+  85: "slight snow showers",
+  86: "heavy snow showers",
+  95: "thunderstorm",
+  96: "thunderstorm with slight hail",
+  99: "thunderstorm with heavy hail",
+}[code] ?? `WMO weather code ${code}`);
+
+/** Converts already validated provider data into the one evidence format used by generation and review. */
+export function weatherForecastResearchPacket(forecast: WeatherForecastResult): ResearchPacket {
+  const place = [forecast.resolved.place, forecast.resolved.admin, forecast.resolved.country]
+    .filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index)
+    .join(", ");
+  const evidence = {
+    provider: forecast.provider,
+    resolvedLocation: {
+      label: place,
+      latitude: forecast.resolved.latitude,
+      longitude: forecast.resolved.longitude,
+      timezone: forecast.resolved.timezone,
+    },
+    units: forecast.units,
+    daily: forecast.daily.map((day) => ({
+      ...day,
+      weatherDescription: weatherCodeLabel(day.weatherCode),
+    })),
+    temperatureTrend: forecast.temperatureTrend,
+  };
+  return {
+    kind: "weather",
+    query: forecast.query,
+    retrievedAt: forecast.retrievedAt,
+    results: [{
+      id: "S1",
+      title: `7-day Open-Meteo forecast for ${place}`,
+      url: forecast.sourceUrl,
+      snippet: JSON.stringify(evidence),
+    }],
+  };
+}
+
+/** Search-result titles alone are retrieval metadata, not answer-bearing evidence. */
+export function researchPacketIsAnswerable(research: ResearchPacket | undefined): boolean {
+  return Boolean(
+    research &&
+    (research.kind === "page" || research.kind === "weather") &&
+    research.results.some((result) => result.id === "S1" && result.snippet.trim().length > 0),
+  );
 }
 
 export function pageEvidenceAnswerContract(_research?: ResearchPacket): string {
@@ -1214,6 +1300,7 @@ interface ClassifiedToolPlan {
     mode: SearchMode;
   };
   searchRequest?: ResearchRequest;
+  weatherLocation?: string;
   localDateTime?: LocalDateTimeResult;
 }
 
@@ -1390,6 +1477,7 @@ export class SocialDirector {
   private readonly autonomousResearchHumanQuietMsOverride?: number;
   private readonly autoSharedLinkDiscussionEnabled: boolean;
   private readonly pageReader: PageReader;
+  private readonly weatherForecastProvider?: Pick<WeatherForecastProvider, "forecast">;
   private readonly dmTurns: DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>;
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
   private lastAutonomousResearchSuccessAt?: number;
@@ -1410,6 +1498,11 @@ export class SocialDirector {
     this.rng = options.rng ?? Math.random;
     this.now = options.now ?? Date.now;
     this.pageReader = options.pageReader ?? new PageReader();
+    this.weatherForecastProvider = options.weatherForecastProvider === null
+      ? undefined
+      : options.weatherForecastProvider ?? (
+          process.env.WEATHER_ENABLED === "false" ? undefined : new WeatherForecastProvider({ now: this.now })
+        );
     this.behaviorTuningProvider = options.behaviorTuningProvider;
     this.dmTurns = new DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>({
       debounceMs: options.dmDebounceMs,
@@ -1735,6 +1828,7 @@ export class SocialDirector {
     allowSearch: boolean,
   ): TurnCapability[] {
     const available: TurnCapability[] = ["local_datetime"];
+    if (this.weatherForecastProvider) available.push("weather_forecast");
     if (process.env.LINK_READER_ENABLED !== "false" && candidateSet.candidates.length > 0) {
       available.unshift("read_url");
     }
@@ -1753,9 +1847,11 @@ export class SocialDirector {
       ? "read_url"
       : input.toolPlan.searchRequest
         ? "web_search"
-        : input.toolPlan.localDateTime
-          ? "local_datetime"
-          : null;
+        : input.toolPlan.weatherLocation
+          ? "weather_forecast"
+          : input.toolPlan.localDateTime
+            ? "local_datetime"
+            : null;
     return {
       available: [...input.available],
       requestKind: trusted.capabilityTrusted ? input.analysis.capabilities.requestKind : "none",
@@ -1809,6 +1905,12 @@ export class SocialDirector {
           requesterId,
         },
       };
+    }
+    if (
+      analysis.evidence.action === "weather_forecast" &&
+      analysis.evidence.locationLabel
+    ) {
+      return { weatherLocation: analysis.evidence.locationLabel };
     }
     if (
       analysis.evidence.action === "local_datetime" &&
@@ -1977,7 +2079,19 @@ export class SocialDirector {
     searchRequest: ResearchRequest | undefined,
     requesterId: string,
     siteResearch?: ClassifiedToolPlan["siteResearch"],
+    weatherLocation?: string,
   ): Promise<ResearchPacket | undefined> {
+    if (weatherLocation) {
+      if (!this.weatherForecastProvider) return undefined;
+      const forecast = await this.weatherForecastProvider.forecast({
+        location: weatherLocation,
+        requesterId,
+      }).catch((error) => {
+        console.warn("Typed weather forecast failed safely:", error instanceof Error ? error.message : error);
+        return undefined;
+      });
+      return forecast ? weatherForecastResearchPacket(forecast) : undefined;
+    }
     if (pageReadRequest) {
       const pageUrl = pageReadRequest.url;
       const explicitRootUrl = pageUrl &&
@@ -2000,7 +2114,16 @@ export class SocialDirector {
         // The broker supplies structural URL/date quality; semantic relevance
         // remains the model reviewer's responsibility.
         const quality = sameSite?.search?.site?.quality;
-        if (sameSite?.results.length && (!quality || hasSpecificSiteResearchResults(quality))) return sameSite;
+        if (sameSite?.results.length && (!quality || hasSpecificSiteResearchResults(quality))) {
+          const expanded = await resolveSearchEvidence({
+            packet: sameSite,
+            semanticGoal: siteResearch.goal,
+            requesterId,
+            now: this.now(),
+            pageReader: this.pageReader,
+          });
+          if (expanded.readiness === "answerable") return expanded.packet;
+        }
       }
       const page = await this.pageReader.read(pageReadRequest, requesterId).catch((error) => {
         console.warn("Exact linked-page read failed safely:", error instanceof Error ? error.message : error);
@@ -2009,10 +2132,19 @@ export class SocialDirector {
       return page;
     }
     if (!searchRequest) return undefined;
-    return this.researchBroker.research(searchRequest).catch((error) => {
+    const search = await this.researchBroker.research(searchRequest).catch((error) => {
       console.warn("Fresh evidence lookup failed open:", error instanceof Error ? error.message : error);
       return undefined;
     });
+    if (!search) return undefined;
+    const expanded = await resolveSearchEvidence({
+      packet: search,
+      semanticGoal: searchRequest.query,
+      requesterId,
+      now: this.now(),
+      pageReader: this.pageReader,
+    });
+    return expanded.packet;
   }
 
   async onDirectMessage(message: ChatMessage, human: Member, persona: Persona): Promise<void> {
@@ -2070,7 +2202,9 @@ export class SocialDirector {
     const availableCapabilities = this.availableTurnCapabilities(candidateSet, Boolean(persona.canResearch));
     const trustedDmTurn = projectTrustedTurnAnalysis(analysis);
     const toolPlan = this.classifiedToolPlan(analysis, candidateSet, combined, human.id);
-    const networkEvidenceRequested = Boolean(toolPlan.pageReadRequest || toolPlan.searchRequest);
+    const networkEvidenceRequested = Boolean(
+      toolPlan.pageReadRequest || toolPlan.searchRequest || toolPlan.weatherLocation,
+    );
     const evidenceExecutionRequested = networkEvidenceRequested || Boolean(toolPlan.localDateTime);
     const dmRequestOwnerIds = (
       trustedDmTurn.intentTrusted && trustedDmTurn.replyExpected === "expected"
@@ -2084,30 +2218,41 @@ export class SocialDirector {
     );
     this.updateRelationship(persona.id, human.id, signals, 0.08);
 
-    let research: ResearchPacket | undefined;
+    let resolvedResearch: ResearchPacket | undefined;
     if (networkEvidenceRequested) {
-      research = await this.resolveRequestedEvidence(
+      resolvedResearch = await this.resolveRequestedEvidence(
         toolPlan.pageReadRequest,
         toolPlan.searchRequest,
         human.id,
         toolPlan.siteResearch,
+        toolPlan.weatherLocation,
       );
     }
+    const research = researchPacketIsAnswerable(resolvedResearch) ? resolvedResearch : undefined;
+    const evidenceRetrieved = Boolean(resolvedResearch);
     if (!turn.isCurrent()) return undefined;
 
     const evidencePremise = toolPlan.localDateTime
       ? `${persona.name} answers the requested current date/time from trustedTemporalContext.requestedClock; do not browse, estimate or cite a web source.`
-      : toolPlan.pageReadRequest
+      : toolPlan.weatherLocation
         ? research
-          ? research.kind === "search"
-            ? `${persona.name} ran the bounded same-site lookup resolved from the human's root-site request. Answer only from the supplied same-site results and cite only source IDs that support the answer.`
-            : `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
-          : "This specific server-bound linked-page attempt returned no readable evidence. In the human's classified language, say only that this attempt failed; do not invent a cause or claim a permanent inability."
-        : toolPlan.searchRequest
+          ? `${persona.name} received the typed seven-day forecast for the server-resolved location. Answer the requested place and horizon from S1, include concrete values or a supported trend, and attach S1.`
+          : evidenceRetrieved
+            ? "The typed forecast attempt returned metadata but no answer-bearing forecast. In the human's classified language, report only that this attempt lacked usable forecast data; invent no weather values or cause."
+            : "The typed forecast attempt returned no validated result. In the human's classified language, report only this temporary result; invent no weather values or cause."
+        : toolPlan.pageReadRequest
           ? research
-            ? `${persona.name} deliberately ran the classified fresh lookup. Answer only from the supplied results and cite only source IDs that support the claim.`
-            : "This specific classified fresh lookup returned no usable evidence. In the human's classified language, say so briefly as a temporary result and invent no current facts."
-          : "";
+            ? research.kind === "search"
+              ? `${persona.name} ran the bounded same-site lookup resolved from the human's root-site request. Answer only from the supplied same-site results and cite only source IDs that support the answer.`
+              : `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
+            : "This specific server-bound linked-page attempt returned no readable evidence. In the human's classified language, say only that this attempt failed; do not invent a cause or claim a permanent inability."
+          : toolPlan.searchRequest
+            ? research
+              ? `${persona.name} deliberately ran the classified fresh lookup. Answer only from the supplied results and cite only source IDs that support the claim.`
+              : evidenceRetrieved
+                ? "The classified lookup returned result metadata but no safely readable answer-bearing page. In the human's classified language, report that bounded outcome briefly and invent no current facts."
+                : "This specific classified fresh lookup returned no usable evidence. In the human's classified language, say so briefly as a temporary result and invent no current facts."
+            : "";
     const generated = await this.lm.generateScene(
       {
         kind: "dm",
@@ -2131,7 +2276,7 @@ export class SocialDirector {
           toolPlan,
           research,
         }),
-        urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
+        urlPublicationPolicy: toolPlan.pageReadRequest || toolPlan.weatherLocation ? "server_card" : undefined,
         requestedClock: toolPlan.localDateTime,
         temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
         temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
@@ -2152,7 +2297,12 @@ export class SocialDirector {
       return undefined;
     }
     const sourceIds = generatedReply
-      ? sourceIdsForPageResponder(research, line?.sourceIds ?? [], Boolean(toolPlan.pageReadRequest))
+      ? sourceIdsForPageResponder(
+          research,
+          line?.sourceIds ?? [],
+          Boolean(toolPlan.pageReadRequest || toolPlan.weatherLocation),
+          Boolean(toolPlan.searchRequest),
+        )
       : [];
     return {
       threadId: latest.channelId,
@@ -2353,6 +2503,7 @@ export class SocialDirector {
       structuralAutoCandidate &&
       !classifiedToolPlan.pageReadRequest &&
       !classifiedToolPlan.searchRequest &&
+      !classifiedToolPlan.weatherLocation &&
       !classifiedToolPlan.localDateTime
     ) {
       // A claimed passive link never falls through into an ungrounded normal
@@ -2386,7 +2537,9 @@ export class SocialDirector {
       toolPlan = { pageReadRequest };
     }
     try {
-      const networkEvidenceRequested = Boolean(toolPlan.pageReadRequest || toolPlan.searchRequest);
+      const networkEvidenceRequested = Boolean(
+        toolPlan.pageReadRequest || toolPlan.searchRequest || toolPlan.weatherLocation,
+      );
     const evidenceRequested = networkEvidenceRequested || Boolean(toolPlan.localDateTime);
     let evidenceResponder: Persona | undefined;
     if (evidenceRequested) {
@@ -2476,15 +2629,19 @@ export class SocialDirector {
     ];
     let lines: GeneratedLine[] = [];
     let research: ResearchPacket | undefined;
+    let evidenceRetrieved = false;
     let evidencePremise = "";
     try {
       if (networkEvidenceRequested) {
-        research = await this.resolveRequestedEvidence(
+        const resolvedResearch = await this.resolveRequestedEvidence(
           toolPlan.pageReadRequest,
           toolPlan.searchRequest,
           human.id,
           toolPlan.siteResearch,
+          toolPlan.weatherLocation,
         );
+        evidenceRetrieved = Boolean(resolvedResearch);
+        research = researchPacketIsAnswerable(resolvedResearch) ? resolvedResearch : undefined;
         if (autoSharedLinkAttempt && !research) {
           // Passive-link failures are intentionally silent. They never turn
           // into a search, a capability apology or an ungrounded normal reply.
@@ -2503,7 +2660,13 @@ export class SocialDirector {
           primaryTypingVisible = true;
         }
         if (research) triggerType = "research";
-        evidencePremise = toolPlan.pageReadRequest
+        evidencePremise = toolPlan.weatherLocation
+          ? research
+            ? `${evidenceResponder?.name ?? "The designated resident"} received the typed seven-day forecast for the server-resolved location and alone answers the request. Use concrete supported values or the supplied trend from S1 and attach S1.`
+            : evidenceRetrieved
+              ? `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this forecast attempt returned metadata but no answer-bearing forecast. Nobody invents weather values or a cause.`
+              : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this typed forecast attempt returned no validated result. Treat it as temporary; nobody invents weather values or a cause.`
+          : toolPlan.pageReadRequest
           ? research
             ? autoSharedLinkAttempt
               ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound page that the human just shared and is solely responsible for one grounded response. ${sharedLinkDiscussionContract()} Attach S1 to the response.`
@@ -2513,7 +2676,9 @@ export class SocialDirector {
             : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific server-bound linked-page attempt returned no readable evidence. It is a temporary result; nobody guesses contents or invents a cause.`
           : research
             ? `${evidenceResponder?.name ?? "The designated resident"} ran the classifier's standalone fresh-data query and is responsible for the sourced answer. Attach only source IDs that support each claim; result rank alone is never an answer.`
-            : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific fresh lookup returned no usable source. Treat it as temporary and invent no current facts.`;
+            : evidenceRetrieved
+              ? `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that the lookup returned result metadata but no safely readable answer-bearing page. Treat it as temporary and invent no current facts.`
+              : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific fresh lookup returned no usable source. Treat it as temporary and invent no current facts.`;
       } else if (toolPlan.localDateTime) {
         evidencePremise = `${evidenceResponder?.name ?? "The designated resident"} alone answers the requested current date/time from trustedTemporalContext.requestedClock. Do not browse, estimate or cite a web source.`;
       }
@@ -2567,7 +2732,7 @@ export class SocialDirector {
             toolPlan,
             research,
           }),
-          urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
+          urlPublicationPolicy: toolPlan.pageReadRequest || toolPlan.weatherLocation ? "server_card" : undefined,
           requestedClock: toolPlan.localDateTime,
           temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
           temporalSurfaceActorId: toolPlan.localDateTime ? evidenceResponder?.id : undefined,
@@ -2630,7 +2795,7 @@ export class SocialDirector {
               toolPlan,
               research,
             }),
-            urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
+            urlPublicationPolicy: toolPlan.pageReadRequest || toolPlan.weatherLocation ? "server_card" : undefined,
             requestedClock: toolPlan.localDateTime,
             temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
             temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
@@ -2731,10 +2896,11 @@ export class SocialDirector {
         research,
         line.sourceIds,
         Boolean(
-          toolPlan.pageReadRequest &&
+          (toolPlan.pageReadRequest || toolPlan.weatherLocation) &&
           evidenceResponder?.id === line.personaId &&
           (line.source === "lm" || line.sourceIds.includes("S1"))
         ),
+        Boolean(toolPlan.searchRequest && evidenceResponder?.id === line.personaId),
       );
       const posted = this.postPublic(
         trigger.channelId,

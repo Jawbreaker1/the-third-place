@@ -49,7 +49,7 @@ const input = (overrides: Partial<NormalizedTurnAnalysisInput> = {}): Normalized
       { ref: "latest:0", source: "latest_message", context: "first link in the latest message" },
       { ref: "reply:0", source: "replied_message", context: "link in the replied-to message" },
     ],
-    availableCapabilities: ["read_url", "web_search", "local_datetime"],
+    availableCapabilities: ["read_url", "web_search", "local_datetime", "weather_forecast"],
     ...overrides,
   });
 
@@ -94,6 +94,33 @@ const modelOutput = (): any => ({
     asksForList: false,
     confidence: 0.95,
   },
+});
+
+const compactWeatherOutput = (overrides: Record<string, any> = {}): any => ({
+  l: "sv",
+  lx: 0.99,
+  rl: "sv",
+  rlx: 0.99,
+  i: { k: "question", q: true, r: "expected", x: 0.98 },
+  p: { a: [], r: [], v: ["ai-mira"], x: 0, y: 0.9 },
+  s: { w: 0.4, h: 0, p: 0, a: 0, u: 0.1, e: 0.4, o: 0.1, c: 0.2, x: 0.96 },
+  b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 0.97 },
+  m: { r: "none", a: "none", c: [], x: 0.99 },
+  e: {
+    a: "weather_forecast",
+    x: 0.98,
+    g: "vädret i Göteborg och om det blir kallare snart",
+    q: null,
+    u: null,
+    m: null,
+    z: null,
+    k: null,
+    l: "Göteborg",
+  },
+  c: { d: ["weather_forecast"], r: "execute", a: false, i: false, l: false, x: 0.97 },
+  h: { n: "none", q: null, x: 0.95 },
+  y: [],
+  ...overrides,
 });
 
 describe("multilingual semantic router contract", () => {
@@ -156,7 +183,7 @@ describe("multilingual semantic router contract", () => {
     expect(format.json_schema.schema.additionalProperties).toBe(false);
     expect(properties.p.properties.a.items.enum).toEqual(["ai-mira", "ai-sana"]);
     expect(properties.e.properties.u.anyOf[0].enum).toEqual(["latest:0", "reply:0"]);
-    expect(properties.e.properties.a.enum).toEqual(["none", "read_url", "web_search", "local_datetime"]);
+    expect(properties.e.properties.a.enum).toEqual(["none", "read_url", "web_search", "local_datetime", "weather_forecast"]);
     expect(properties.e.properties.g.anyOf[0]).toMatchObject({ type: "string", maxLength: 240 });
     expect(properties.e.required).toContain("g");
     expect(format.json_schema.schema.required).toEqual(expect.arrayContaining(["rl", "rlx", "b"]));
@@ -180,6 +207,148 @@ describe("multilingual semantic router contract", () => {
       language: { tag: "ja" },
       evidence: { action: "local_datetime", timeZone: "Asia/Tokyo" },
       personas: { requestedReplyIds: ["ai-mira"] },
+    });
+  });
+
+  it("routes a room weather question to the typed forecast capability without calling it a capability question", () => {
+    const turn = input({
+      latestMessage: {
+        id: "weather-sv",
+        authorId: "human-1",
+        authorName: "Hana",
+        content: "Kan någon kolla vädret i Göteborg? Kommer det bli kallare snart?",
+      },
+      urlCandidates: [],
+    });
+    const parsed = parseTurnAnalysisContent(JSON.stringify(compactWeatherOutput()), turn);
+
+    expect(parsed).toMatchObject({
+      language: { tag: "sv" },
+      intent: { kind: "question", isQuestion: true, replyExpected: "expected" },
+      evidence: {
+        need: "required",
+        action: "weather_forecast",
+        goal: "vädret i Göteborg och om det blir kallare snart",
+        query: null,
+        urlRef: null,
+        searchMode: null,
+        timeZone: null,
+        timeKind: null,
+        locationLabel: "Göteborg",
+      },
+      capabilities: { discussed: ["weather_forecast"], requestKind: "execute" },
+    });
+    expect(parsed?.intent.kind).not.toBe("capability_question");
+
+    const descriptive = modelOutput();
+    descriptive.intent = { kind: "request", isQuestion: true, replyExpected: "expected", confidence: 0.98 };
+    descriptive.evidence = {
+      need: "required",
+      action: "weather_forecast",
+      confidence: 0.98,
+      goal: "vädret i Göteborg och om det blir kallare snart",
+      query: null,
+      urlRef: null,
+      searchMode: null,
+      timeZone: null,
+      timeKind: null,
+      locationLabel: "Göteborg",
+    };
+    descriptive.capabilities = {
+      ...descriptive.capabilities,
+      discussed: ["weather_forecast"],
+      requestKind: "execute",
+    };
+    expect(parseTurnAnalysisContent(JSON.stringify(descriptive), turn)).toMatchObject({
+      intent: { kind: "request" },
+      evidence: { action: "weather_forecast", locationLabel: "Göteborg" },
+    });
+  });
+
+  it("preserves multilingual named weather locations without translating them into provider queries", () => {
+    const cases = [
+      {
+        content: "Could someone check whether it will rain in Seattle tomorrow?",
+        language: "en",
+        goal: "whether it will rain in Seattle tomorrow",
+        location: "Seattle",
+      },
+      {
+        content: "¿Va a refrescar pronto en Ciudad de México?",
+        language: "es",
+        goal: "si va a refrescar pronto en Ciudad de México",
+        location: "Ciudad de México",
+      },
+      {
+        content: "明日の札幌は雪になりますか？",
+        language: "ja",
+        goal: "明日の札幌の降雪予報",
+        location: "札幌",
+      },
+    ];
+
+    for (const item of cases) {
+      const output = compactWeatherOutput({
+        l: item.language,
+        rl: item.language,
+        e: {
+          ...compactWeatherOutput().e,
+          g: item.goal,
+          l: item.location,
+        },
+      });
+      const parsed = parseTurnAnalysisContent(JSON.stringify(output), input({
+        latestMessage: {
+          id: `weather-${item.language}`,
+          authorId: "human-1",
+          authorName: "Hana",
+          content: item.content,
+        },
+        urlCandidates: [],
+      }));
+      expect(parsed).toMatchObject({
+        language: { tag: item.language },
+        evidence: {
+          action: "weather_forecast",
+          goal: item.goal,
+          query: null,
+          locationLabel: item.location,
+        },
+      });
+    }
+  });
+
+  it("fails closed on weather plans that substitute another capability's arguments", () => {
+    const descriptive = modelOutput();
+    descriptive.evidence = {
+      need: "required",
+      action: "weather_forecast",
+      confidence: 0.98,
+      goal: "morgondagens väder i Göteborg",
+      query: "Göteborg väder imorgon",
+      urlRef: null,
+      searchMode: null,
+      timeZone: null,
+      timeKind: null,
+      locationLabel: "Göteborg",
+    };
+    descriptive.capabilities = {
+      ...descriptive.capabilities,
+      discussed: ["weather_forecast"],
+      requestKind: "execute",
+    };
+    expect(parseTurnAnalysisContent(JSON.stringify(descriptive), input())).toBeUndefined();
+
+    const compactWithQuery = compactWeatherOutput({
+      e: { ...compactWeatherOutput().e, q: "Göteborg väder imorgon" },
+    });
+    expect(parseTurnAnalysisContent(JSON.stringify(compactWithQuery), input())).toBeUndefined();
+
+    const compactWithHarmlessDefaultMode = compactWeatherOutput({
+      e: { ...compactWeatherOutput().e, m: "web" },
+    });
+    expect(parseTurnAnalysisContent(JSON.stringify(compactWithHarmlessDefaultMode), input())).toMatchObject({
+      evidence: { action: "weather_forecast", searchMode: null, locationLabel: "Göteborg" },
     });
   });
 
@@ -908,7 +1077,7 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("participant/resident AI identity");
     expect(prompt).toContain("preserve the actual referent in the turn");
     expect(prompt).toContain("never reinterpret it as permission for a resident self-disclosure");
-    expect(prompt).toContain("An identity question alone is not a read/search/time capability question");
+    expect(prompt).toContain("An identity question alone is not a read/search/time/weather capability question");
     expect(prompt).toContain("Ordinary technical discussion of external AI systems is not a participant-identity question");
     expect(prompt).toContain("a source name or instruction to inspect it is not itself the information goal");
     expect(prompt).toContain("availableCapabilities is trusted server-owned runtime inventory");
@@ -917,6 +1086,9 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("Preserve the guest's language and script");
     expect(prompt).toContain("availability alone never executes a tool");
     expect(prompt).toContain("select that available discussed capability as e.a");
+    expect(prompt).toContain("weather_forecast: use for current conditions or a future weather forecast");
+    expect(prompt).toContain("ordinary question or request to execute weather_forecast, not a capability_question");
+    expect(prompt).toContain("Keep local_datetime for time/date, web_search for general external discovery or news, and read_url");
     expect(prompt).toContain("including when the question itself suggests that a transcript may make this unknowable");
     expect(prompt).toContain("never acoustic or identity word matching");
     expect(prompt).toContain("quoted/reporting speech from endorsement");
@@ -1187,6 +1359,81 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(JSON.stringify(buildEvidencePlanVerifierUserData(verifierInput))).not.toContain("https://");
   });
 
+  it("recovers a typed weather plan when the primary left an answer-expected room request empty", () => {
+    const turn = stockTurn("Kan någon kolla vädret i Göteborg? Kommer det bli kallare snart?", {
+      recentMessages: [],
+      availableCapabilities: ["weather_forecast", "web_search", "local_datetime"],
+    });
+    const verifierInput = createEvidencePlanVerifierInput(turn, {
+      source: "fallback",
+      failureReason: "invalid_output",
+    });
+    const parsed = parseEvidencePlanVerifierContent(JSON.stringify({
+      v: "use_action",
+      a: "weather_forecast",
+      r: "execute",
+      d: ["weather_forecast"],
+      x: 0.98,
+      g: "vädret i Göteborg och om det blir kallare snart",
+      q: null,
+      u: null,
+      m: null,
+      z: null,
+      k: null,
+      l: "Göteborg",
+    }), verifierInput);
+
+    expect(parsed).toMatchObject({
+      decision: "use_action",
+      evidence: {
+        action: "weather_forecast",
+        goal: "vädret i Göteborg och om det blir kallare snart",
+        query: null,
+        urlRef: null,
+        searchMode: null,
+        timeZone: null,
+        timeKind: null,
+        locationLabel: "Göteborg",
+      },
+      capabilities: { discussed: ["weather_forecast"], requestKind: "execute" },
+    });
+    expect(projectEvidencePlanVerification(parsed)).toMatchObject({
+      evidenceTrusted: true,
+      capabilityTrusted: true,
+      evidence: { action: "weather_forecast", locationLabel: "Göteborg" },
+    });
+  });
+
+  it("keeps weather verifier plans typed and rejects arguments belonging to search or time", () => {
+    const verifierInput = createEvidencePlanVerifierInput(stockTurn("¿Va a refrescar pronto en Ciudad de México?", {
+      recentMessages: [],
+      availableCapabilities: ["weather_forecast"],
+    }), primarySummary());
+    const valid = {
+      v: "use_action",
+      a: "weather_forecast",
+      r: "execute",
+      d: ["weather_forecast"],
+      x: 0.97,
+      g: "si va a refrescar pronto en Ciudad de México",
+      q: null,
+      u: null,
+      m: null,
+      z: null,
+      k: null,
+      l: "Ciudad de México",
+    };
+    expect(parseEvidencePlanVerifierContent(JSON.stringify(valid), verifierInput)).toMatchObject({
+      evidence: { action: "weather_forecast", locationLabel: "Ciudad de México" },
+    });
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, m: "web" }), verifierInput)).toMatchObject({
+      evidence: { action: "weather_forecast", searchMode: null },
+    });
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, q: "clima Ciudad de México" }), verifierInput)).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, z: "America/Mexico_City" }), verifierInput)).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, l: null }), verifierInput)).toBeUndefined();
+  });
+
   it("accepts language-preserving Japanese, Arabic and German semantic outcomes", () => {
     const japanese = createEvidencePlanVerifierInput(input({
       latestMessage: {
@@ -1367,6 +1614,14 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(format.json_schema.schema.required).toEqual([
       "v", "a", "r", "d", "x", "g", "q", "u", "m", "z", "k", "l",
     ]);
+    const weatherFormat = buildEvidencePlanVerifierResponseFormat(createEvidencePlanVerifierInput(
+      stockTurn("明日の札幌の天気は？", {
+        availableCapabilities: ["weather_forecast", "local_datetime"],
+      }),
+      primarySummary(),
+    )) as any;
+    expect(weatherFormat.json_schema.schema.properties.a.enum)
+      .toEqual(["none", "weather_forecast", "local_datetime"]);
 
     const prompt = buildEvidencePlanVerifierSystemPrompt();
     expect(prompt).toContain("strict multilingual evidence-plan verifier");
@@ -1394,6 +1649,9 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(prompt).toContain("candidate context field path=/ marks a root page");
     expect(prompt).toContain("set m to news for actual news/current-events intent and otherwise web");
     expect(prompt).toContain("For a non-root exact/deep page");
+    expect(prompt).toContain("weather_forecast is only for current conditions or a future forecast");
+    expect(prompt).toContain("normal request to check weather is an execution request or question, not a capability-availability question");
+    expect(prompt).toContain("Keep local_datetime for time/date, web_search for general discovery or news, and read_url");
     expect(prompt).toContain("self-contained question, social or creative request, passive link");
     expect(prompt).toContain("pure capability-availability question");
     expect(prompt).toContain("explicit instruction not to execute");
@@ -1567,6 +1825,36 @@ const explicitRequestReviewInput = (options: {
 };
 
 describe("multilingual batch candidate-review contract", () => {
+  it("accepts typed weather evidence for grounding review", () => {
+    const base = reviewInput();
+    const parsed = candidateReviewInputSchema.parse({
+      ...base,
+      evidence: {
+        outcome: "succeeded",
+        kind: "weather",
+        query: "Göteborg",
+        results: [{
+          id: "W1",
+          title: "Göteborg weather forecast",
+          snippet: "Forecast evidence supplied by the typed weather provider.",
+        }],
+      },
+      capabilityContext: {
+        available: ["weather_forecast"],
+        requestKind: "execute",
+        discussed: ["weather_forecast"],
+        plannedAction: "weather_forecast",
+        executionStatus: "succeeded",
+      },
+      candidates: base.candidates.map((candidate, index) => ({
+        ...candidate,
+        sourceIds: index === 0 ? ["W1"] : [],
+      })),
+    });
+    expect(parsed.evidence.kind).toBe("weather");
+    expect(parsed.capabilityContext).toMatchObject({ plannedAction: "weather_forecast" });
+  });
+
   it("carries trusted autonomous source-fit context and requires semantic rather than lexical matching", () => {
     const base = reviewInput();
     const autonomousResearchContext = {
@@ -1941,7 +2229,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("roomRecall.witnessPersonaIds");
     expect(prompt).toContain("A roomRecall anchor proves only that the row directly matched retrieval");
     expect(prompt).toContain("A context row proves only that it appeared nearby");
-    expect(prompt).toContain("capabilityContext lists read_url or web_search");
+    expect(prompt).toContain("capabilityContext lists read_url, web_search or weather_forecast");
     expect(prompt).toContain("resident model having no personal tool is irrelevant");
     expect(prompt).toContain("unsupported_room_recall");
     expect(prompt).toContain("A non-witness may accurately say it checked retained room history");

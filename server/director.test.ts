@@ -24,6 +24,7 @@ import {
   linkPreviewFromResearch,
   normalizeGeneratedMessageContent,
   pageEvidenceAnswerContract,
+  researchPacketIsAnswerable,
   selectAutoSharedLinkCandidate,
   selectAmbientLead,
   selectAmbientSeed,
@@ -197,13 +198,20 @@ describe("social director", () => {
       retrievedAt: requestedAt,
       results: [{ id: "S1", title: "Root page", url: rootUrl.toString(), snippet: "General market overview." }],
     };
+    const deepPacket = {
+      kind: "page" as const,
+      query: goal,
+      retrievedAt: requestedAt,
+      results: [{ id: "S1", title: "Company quote", url: articleUrl.toString(), snippet: "A current company quote." }],
+    };
     const sameSitePacket = {
       kind: "search" as const,
       query: `site:markets.example ${goal}`,
       retrievedAt: requestedAt,
       results: [{ id: "S1", title: "Company quote", url: articleUrl.toString(), snippet: "A current company quote." }],
     };
-    const read = vi.fn(async () => rootPacket);
+    const read = vi.fn(async (request: { url?: URL }) =>
+      request.url?.toString() === articleUrl.toString() ? deepPacket : rootPacket);
     const resolveTarget = vi.fn(({ intent }: { intent: string }) => ({
       url: rootUrl,
       requestedAt,
@@ -299,7 +307,7 @@ describe("social director", () => {
         search: undefined,
         requesterId: string,
         site?: { goal: string; mode: "web" | "news" },
-      ) => Promise<typeof sameSitePacket | typeof rootPacket | undefined>;
+      ) => Promise<typeof sameSitePacket | typeof rootPacket | typeof deepPacket | undefined>;
     };
 
     const plan = internal.classifiedToolPlan(analysis, candidateSet, "gå bara till sajten", human.id);
@@ -315,7 +323,7 @@ describe("social director", () => {
       undefined,
       human.id,
       plan.siteResearch,
-    )).resolves.toEqual(sameSitePacket);
+    )).resolves.toEqual(deepPacket);
     expect(researchSite).toHaveBeenCalledWith({
       url: rootUrl,
       query: goal,
@@ -323,7 +331,7 @@ describe("social director", () => {
       requesterId: human.id,
       cachePolicy: "default",
     });
-    expect(read).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledTimes(1);
 
     await expect(internal.resolveRequestedEvidence(
       plan.pageReadRequest,
@@ -332,7 +340,7 @@ describe("social director", () => {
       plan.siteResearch,
     )).resolves.toEqual(rootPacket);
     expect(researchSite).toHaveBeenCalledTimes(2);
-    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledTimes(2);
 
     researchSite.mockClear();
     read.mockClear();
@@ -341,7 +349,7 @@ describe("social director", () => {
       undefined,
       human.id,
       plan.siteResearch,
-    )).resolves.toEqual(rootPacket);
+    )).resolves.toEqual(deepPacket);
     expect(researchSite).not.toHaveBeenCalled();
     expect(read).toHaveBeenCalledTimes(1);
 
@@ -365,8 +373,8 @@ describe("social director", () => {
       status: "online" as const,
       avatar: { color: "#123", accent: "#456", glyph: "G" },
     };
-    const rootUrl = new URL("https://example.test/");
-    const deepUrl = new URL("https://example.test/items/42");
+    const rootUrl = new URL("https://example.com/");
+    const deepUrl = new URL("https://example.com/items/42");
     const requestedAt = "2026-07-15T10:00:00.000Z";
     const goal = "latest published items";
     const quality = (
@@ -384,19 +392,19 @@ describe("social director", () => {
     });
     const rootOnlyPacket = {
       kind: "search" as const,
-      query: `site:example.test ${goal}`,
+      query: `site:example.com ${goal}`,
       retrievedAt: requestedAt,
       results: [{ id: "S1", title: "Example", url: rootUrl.toString(), snippet: "General landing page." }],
       search: {
         scope: "site" as const,
         requestedMode: "news" as const,
         providerMode: "web" as const,
-        site: { host: "example.test", quality: quality("root_only", 1, 0, 0) },
+        site: { host: "example.com", quality: quality("root_only", 1, 0, 0) },
       },
     };
     const specificPacket = {
       kind: "search" as const,
-      query: `site:example.test ${goal}`,
+      query: `site:example.com ${goal}`,
       retrievedAt: requestedAt,
       results: [{
         id: "S1",
@@ -409,7 +417,7 @@ describe("social director", () => {
         scope: "site" as const,
         requestedMode: "news" as const,
         providerMode: "web" as const,
-        site: { host: "example.test", quality: quality("fresh_results", 0, 1, 1) },
+        site: { host: "example.com", quality: quality("fresh_results", 0, 1, 1) },
       },
     };
     const pageFallback = {
@@ -418,10 +426,23 @@ describe("social director", () => {
       retrievedAt: requestedAt,
       results: [{ id: "S1", title: "Example root", url: rootUrl.toString(), snippet: "Readable root content." }],
     };
+    const specificPage = {
+      kind: "page" as const,
+      query: goal,
+      retrievedAt: requestedAt,
+      results: [{
+        id: "S1",
+        title: "Specific item",
+        url: deepUrl.toString(),
+        snippet: "A concrete recent item.",
+        publishedAt: "2026-07-15T09:30:00.000Z",
+      }],
+    };
     const researchSite = vi.fn()
       .mockResolvedValueOnce(rootOnlyPacket)
       .mockResolvedValueOnce(specificPacket);
-    const read = vi.fn(async () => pageFallback);
+    const read = vi.fn(async (request: { url?: URL }) =>
+      request.url?.toString() === deepUrl.toString() ? specificPage : pageFallback);
     const resolveTarget = vi.fn(({ intent, retry }: { intent: string; retry?: boolean }) => ({
       url: rootUrl,
       requestedAt,
@@ -528,8 +549,8 @@ describe("social director", () => {
       undefined,
       human.id,
       plan.siteResearch,
-    )).resolves.toEqual(specificPacket);
-    expect(read).toHaveBeenCalledTimes(1);
+    )).resolves.toEqual(specificPage);
+    expect(read).toHaveBeenCalledTimes(2);
     expect(researchSite).toHaveBeenCalledTimes(2);
     for (const [request] of researchSite.mock.calls) {
       expect(request).toEqual({
@@ -2321,7 +2342,11 @@ describe("social director", () => {
     expect(sourceIdsForPageResponder(pageResearch, ["S1"], true)).toEqual(["S1"]);
     expect(sourceIdsForPageResponder(pageResearch, [], false)).toEqual([]);
     expect(sourceIdsForPageResponder(pageResearch, ["S1"], false)).toEqual([]);
+    expect(sourceIdsForPageResponder(pageResearch, ["S1"], false, true)).toEqual(["S1"]);
     expect(sourceIdsForPageResponder({ ...pageResearch, kind: "search" }, [], true)).toEqual([]);
+    expect(researchPacketIsAnswerable(pageResearch)).toBe(true);
+    expect(researchPacketIsAnswerable({ ...pageResearch, kind: "search" })).toBe(false);
+    expect(researchPacketIsAnswerable({ ...pageResearch, results: [] })).toBe(false);
   });
 
   it("always prioritises a directly mentioned quiet resident", () => {
@@ -4508,6 +4533,351 @@ describe("social director", () => {
       expect(store.getAllMessages()).toEqual([]);
       director.stop();
     } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("executes a typed multilingual weather plan and publishes only sourced answerable forecast evidence", async () => {
+    vi.useFakeTimers();
+    const fixedNow = Date.parse("2026-07-15T12:00:00.000Z");
+    try {
+      const human = {
+        id: "guest-weather-ar",
+        name: "Nour",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "N" },
+      };
+      const store = new RoomStore("/tmp/director-weather-capability-unused.json");
+      const incoming = createMessage("lobby", human.id, "هل سيصبح الجو أبرد قريبًا في غوتنبرغ؟");
+      store.addPublicMessage(incoming);
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        language: { tag: "ar", confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "weather_forecast",
+          confidence: 0.99,
+          goal: "اتجاه درجات الحرارة خلال الأيام القادمة في غوتنبرغ",
+          query: null,
+          urlRef: null,
+          searchMode: null,
+          timeZone: null,
+          timeKind: null,
+          locationLabel: "Göteborg, Sverige",
+        },
+        capabilities: {
+          discussed: ["weather_forecast"],
+          requestKind: "execute",
+          asksAboutAcoustics: false,
+          asksAboutAiIdentity: false,
+          asksForList: false,
+          confidence: 0.99,
+        },
+      }));
+      const forecast = vi.fn(async () => ({
+        provider: "open-meteo" as const,
+        query: "Göteborg, Sverige",
+        retrievedAt: new Date(fixedNow).toISOString(),
+        resolved: {
+          place: "Göteborg",
+          admin: "Västra Götaland",
+          country: "Sweden",
+          countryCode: "SE",
+          timezone: "Europe/Stockholm",
+          latitude: 57.7072,
+          longitude: 11.9668,
+        },
+        sourceUrl: "https://api.open-meteo.com/v1/forecast?latitude=57.7072&longitude=11.9668",
+        units: {
+          temperature: "°C" as const,
+          precipitationProbability: "%" as const,
+          precipitation: "mm" as const,
+          weatherCode: "wmo code" as const,
+        },
+        daily: [
+          {
+            date: "2026-07-15",
+            temperatureMax: 24,
+            temperatureMin: 16,
+            precipitationProbabilityMax: 10,
+            precipitationSum: 0,
+            weatherCode: 1,
+          },
+          {
+            date: "2026-07-21",
+            temperatureMax: 18,
+            temperatureMin: 12,
+            precipitationProbabilityMax: 55,
+            precipitationSum: 3.2,
+            weatherCode: 61,
+          },
+        ],
+        temperatureTrend: {
+          direction: "cooler" as const,
+          change: -5,
+          fromDate: "2026-07-15",
+          toDate: "2026-07-21",
+          basis: "daily_mean_temperature" as const,
+          unit: "°C" as const,
+        },
+      }));
+      const research = vi.fn(async () => {
+        throw new Error("generic research must not run for a typed forecast");
+      });
+      const researchSite = vi.fn(async () => undefined);
+      const sceneRequests: Array<{
+        selected: Array<(typeof PERSONAS)[number]>;
+        mustReplyIds: string[];
+        requestOwnerIds: string[];
+        research?: { kind?: string; results: Array<{ id: string; url: string; snippet: string }> };
+        evidenceOutcome?: string;
+        capabilityContext?: {
+          available: string[];
+          plannedAction: string | null;
+          executionStatus: string;
+        };
+        premise?: string;
+      }> = [];
+      const generateScene = vi.fn(async (request: (typeof sceneRequests)[number]) => {
+        sceneRequests.push(request);
+        return [{
+          personaId: request.requestOwnerIds[0]!,
+          content: "Ja, prognosen blir ungefär fem grader svalare mot slutet av perioden.",
+          source: "lm" as const,
+          // The director must force S1 for the designated forecast answer even
+          // when the model forgets to emit a source token.
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeTurn, generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        { research, researchSite } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => fixedNow,
+          rng: () => 0.99,
+          weatherForecastProvider: { forecast },
+          pageReader: {
+            collectCandidates: vi.fn(() => ({
+              requestedAt: new Date(fixedNow).toISOString(),
+              candidates: [],
+            })),
+            read: vi.fn(),
+          } as never,
+        },
+      );
+
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(forecast).toHaveBeenCalledWith({
+        location: "Göteborg, Sverige",
+        requesterId: human.id,
+      });
+      expect(research).not.toHaveBeenCalled();
+      expect(researchSite).not.toHaveBeenCalled();
+      expect(analyzeTurn.mock.calls[0]?.[0].availableCapabilities).toContain("weather_forecast");
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const scene = sceneRequests[0]!;
+      expect(scene.requestOwnerIds).toHaveLength(1);
+      expect(scene.mustReplyIds).toContain(scene.requestOwnerIds[0]);
+      expect(scene.research).toMatchObject({
+        kind: "weather",
+        results: [{
+          id: "S1",
+          url: "https://api.open-meteo.com/v1/forecast?latitude=57.7072&longitude=11.9668",
+        }],
+      });
+      expect(scene.research?.results[0]?.snippet).toContain('"direction":"cooler"');
+      expect(scene.evidenceOutcome).toBe("succeeded");
+      expect(scene.capabilityContext).toMatchObject({
+        available: expect.arrayContaining(["weather_forecast"]),
+        plannedAction: "weather_forecast",
+        executionStatus: "succeeded",
+      });
+      expect(scene.premise).toContain("typed seven-day forecast");
+      const reply = store.getRecent("lobby", 1)[0]!;
+      expect(reply.replyToId).toBe(incoming.id);
+      expect(reply.sources).toEqual([{
+        title: "7-day Open-Meteo forecast for Göteborg, Västra Götaland, Sweden",
+        url: "https://api.open-meteo.com/v1/forecast?latitude=57.7072&longitude=11.9668",
+      }]);
+      expect(reply.linkPreview?.url).toBe(
+        "https://api.open-meteo.com/v1/forecast?latitude=57.7072&longitude=11.9668",
+      );
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats unreadable generic search metadata as failed evidence with one required owner", async () => {
+    vi.useFakeTimers();
+    const fixedNow = Date.parse("2026-07-15T12:30:00.000Z");
+    const previousResearchEnabled = process.env.RESEARCH_ENABLED;
+    process.env.RESEARCH_ENABLED = "true";
+    try {
+      const human = {
+        id: "guest-search-ja",
+        name: "Aoi",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "A" },
+      };
+      const store = new RoomStore("/tmp/director-unreadable-search-unused.json");
+      const incoming = createMessage("lobby", human.id, "今日の地域ニュースで最も重要な話題を調べてくれる？");
+      store.addPublicMessage(incoming);
+      const query = "今日 地域 重要 ニュース";
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        language: { tag: "ja", confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "web_search",
+          confidence: 0.99,
+          goal: "今日の地域ニュースで最も重要な話題",
+          query,
+          urlRef: null,
+          searchMode: "news",
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+        capabilities: {
+          discussed: ["web_search"],
+          requestKind: "execute",
+          asksAboutAcoustics: false,
+          asksAboutAiIdentity: false,
+          asksForList: false,
+          confidence: 0.99,
+        },
+      }));
+      const searchPacket = {
+        kind: "search" as const,
+        query,
+        retrievedAt: new Date(fixedNow).toISOString(),
+        results: [
+          { id: "S1", title: "検索結果一", url: "https://news.example.jp/one", snippet: "検索概要だけ" },
+          { id: "S2", title: "検索結果二", url: "https://updates.example.jp/two", snippet: "検索概要だけ" },
+          { id: "S3", title: "検索結果三", url: "https://journal.example.jp/three", snippet: "検索概要だけ" },
+        ],
+        search: { scope: "generic" as const, requestedMode: "news" as const, providerMode: "news" as const },
+      };
+      const research = vi.fn(async () => searchPacket);
+      const read = vi.fn(async () => undefined);
+      const sceneRequests: Array<{
+        selected: Array<(typeof PERSONAS)[number]>;
+        mustReplyIds: string[];
+        requestOwnerIds: string[];
+        research?: unknown;
+        evidenceOutcome?: string;
+        capabilityContext?: { plannedAction: string | null; executionStatus: string };
+        premise?: string;
+      }> = [];
+      const generateScene = vi.fn(async (request: (typeof sceneRequests)[number]) => {
+        sceneRequests.push(request);
+        const ownerId = request.requestOwnerIds[0]!;
+        return [
+          {
+            personaId: ownerId,
+            content: "今回は記事本文を安全に取得できなかった。",
+            source: "lm" as const,
+            sourceIds: ["S1"],
+          },
+          ...request.selected
+            .filter((persona) => persona.id !== ownerId)
+            .slice(0, 1)
+            .map((persona) => ({
+              personaId: persona.id,
+              content: "検索は成功したよ。",
+              source: "lm" as const,
+              sourceIds: ["S1"],
+            })),
+        ];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeTurn, generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        { research, researchSite: vi.fn(async () => undefined) } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => fixedNow,
+          rng: () => 0.99,
+          weatherForecastProvider: null,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({
+              requestedAt: new Date(fixedNow).toISOString(),
+              candidates: [],
+            })),
+            read,
+          } as never,
+        },
+      );
+
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(research).toHaveBeenCalledWith({ query, mode: "news", requesterId: human.id });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(read).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        url: new URL("https://news.example.jp/one"),
+        initiator: "automatic",
+        retry: false,
+      }), human.id);
+      expect(read).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        url: new URL("https://updates.example.jp/two"),
+        initiator: "automatic",
+        retry: false,
+      }), human.id);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const scene = sceneRequests[0]!;
+      expect(scene.requestOwnerIds).toHaveLength(1);
+      expect(scene.mustReplyIds).toContain(scene.requestOwnerIds[0]);
+      expect(scene.research).toBeUndefined();
+      expect(scene.evidenceOutcome).toBe("failed");
+      expect(scene.capabilityContext).toEqual(expect.objectContaining({
+        plannedAction: "web_search",
+        executionStatus: "failed_temporary",
+      }));
+      expect(scene.premise).toContain("result metadata but no safely readable answer-bearing page");
+      const replies = store.getRecent("lobby", 4).filter((message) => message.authorId.startsWith("ai-"));
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).toMatchObject({
+        authorId: scene.requestOwnerIds[0],
+        content: "今回は記事本文を安全に取得できなかった。",
+        sources: [],
+      });
+      expect(replies[0]?.linkPreview).toBeUndefined();
+    } finally {
+      if (previousResearchEnabled === undefined) delete process.env.RESEARCH_ENABLED;
+      else process.env.RESEARCH_ENABLED = previousResearchEnabled;
       vi.clearAllTimers();
       vi.useRealTimers();
     }

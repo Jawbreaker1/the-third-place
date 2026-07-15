@@ -243,7 +243,7 @@ export interface SceneRequest {
   /** Trusted voice-transport facts; participant names remain untrusted display labels. */
   voiceContext?: VoiceSceneContext;
   research?: {
-    kind?: "search" | "page";
+    kind?: "search" | "page" | "weather";
     query: string;
     retrievedAt: string;
     results: Array<{ id: string; title: string; url: string; snippet: string; publishedAt?: string }>;
@@ -789,7 +789,9 @@ ${voiceOriginRule}
     : "";
 
   const evidenceOutcome = request.research ? "succeeded" : request.evidenceOutcome;
-  const evidenceAvailabilityRule = request.research?.kind === "page"
+  const evidenceAvailabilityRule = request.research?.kind === "weather"
+    ? "- Trusted server state supplied a typed weather forecast from the fixed forecast provider. Answer the requested place and time horizon only from freshResearch, include at least one concrete forecast detail, attach S1, and never claim that current weather or forecast data is unavailable."
+    : request.research?.kind === "page"
     ? "- Trusted server state says the exact linked-page evidence in freshResearch was successfully fetched. Answer from it when relevant; never claim the page is inaccessible, external fetching is impossible, or the link is dead."
     : request.research
       ? "- Trusted server state says the freshResearch lookup succeeded. Use only supported results and source IDs; never claim that the lookup was unavailable or that external fetching is impossible."
@@ -801,11 +803,12 @@ ${voiceOriginRule}
             ? "- Trusted server state marks the evidence request successful, but no evidence packet is present. Do not invent its contents or claim a permanent inability to access external pages or the web."
             : "";
 
-  const webCapabilityAvailable = Boolean(
-    request.capabilityContext?.available.some((capability) => capability === "read_url" || capability === "web_search"),
+  const externalEvidenceCapabilityAvailable = Boolean(
+    request.capabilityContext?.available.some((capability) =>
+      capability === "read_url" || capability === "web_search" || capability === "weather_forecast"),
   );
-  const capabilityAvailabilityRule = webCapabilityAvailable
-    ? "- trustedCapabilityContext is server-owned runtime truth. This turn's server can read public links and/or search the web as listed there. Never claim a permanent lack of internet, browser, link-reading, API or live-data capability merely because the resident model itself has no tool. Only failed_temporary may be described as this specific attempt returning no usable evidence. If no execution result is supplied, do not pretend a lookup happened and do not guess a current fact."
+  const capabilityAvailabilityRule = externalEvidenceCapabilityAvailable
+    ? "- trustedCapabilityContext is server-owned runtime truth. This turn's server can read public links, search the web and/or retrieve typed forecasts exactly as listed there. Never claim a permanent lack of internet, browser, link-reading, API, weather or live-data capability merely because the resident model itself has no tool. Only failed_temporary may be described as this specific attempt returning no usable evidence. If no execution result is supplied, do not pretend a lookup happened and do not guess a current fact."
     : request.capabilityContext
       ? "- trustedCapabilityContext is server-owned runtime truth. Do not invent a capability absent from its available list or pretend an action ran when plannedAction is null."
       : "";

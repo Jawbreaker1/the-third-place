@@ -11,7 +11,8 @@ export interface ResearchResult {
 }
 
 export interface ResearchPacket {
-  kind?: "search" | "page";
+  /** Trusted server evidence transport; `weather` is produced only by the typed forecast provider. */
+  kind?: "search" | "page" | "weather";
   query: string;
   retrievedAt: string;
   results: ResearchResult[];
