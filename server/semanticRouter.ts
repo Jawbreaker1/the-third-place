@@ -1656,16 +1656,23 @@ export const shouldVerifyEvidencePlan = (
 ): boolean => {
   const summary = summarizePrimaryEvidenceAnalysis(primary);
   if (input.availableCapabilities.length === 0) return false;
+  const available = new Set<TurnCapability>(input.availableCapabilities);
   // A hint retained from invalid output is never executable, regardless of
   // the confidence numbers the contradictory primary happened to emit.
   if (summary.failureReason === "invalid_output") return true;
   if (summary.evidence.action !== "none") {
-    return input.recentMessages.length > 0 ||
+    // A confident primary can still expose that it was torn between two
+    // executable providers. Let the independent verifier settle that
+    // structural conflict instead of trusting whichever action came first.
+    const competingAvailableDiscussions = new Set(
+      summary.capabilities.discussed.filter((capability) => available.has(capability)),
+    ).size > 1;
+    return competingAvailableDiscussions ||
+      input.recentMessages.length > 0 ||
       summary.evidence.confidence < TURN_TRUST_THRESHOLDS.evidence ||
       summary.capabilities.confidence < TURN_TRUST_THRESHOLDS.capability;
   }
 
-  const available = new Set<TurnCapability>(input.availableCapabilities);
   const trustedCapabilityDiscussion = summary.source === "lm" &&
     summary.capabilities.confidence >= TURN_TRUST_THRESHOLDS.capability &&
     summary.capabilities.discussed.some((capability) => available.has(capability));

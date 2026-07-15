@@ -1337,6 +1337,20 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       evidence: { action: "web_search", confidence: 0.96 },
       capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.96 },
     }))).toBe(false);
+    expect(shouldVerifyEvidencePlan(
+      stockTurn("arbitrary first-turn request", {
+        recentMessages: [],
+        availableCapabilities: ["web_search", "football_data", "local_datetime"],
+      }),
+      primarySummary({
+        evidence: { action: "web_search", confidence: 0.96 },
+        capabilities: {
+          discussed: ["football_data", "web_search"],
+          requestKind: "execute",
+          confidence: 0.96,
+        },
+      }),
+    )).toBe(true);
     expect(shouldVerifyEvidencePlan(stockTurn("Länka det du just beskrev"), primarySummary({
       evidence: { action: "web_search", confidence: 0.96 },
       capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.96 },
