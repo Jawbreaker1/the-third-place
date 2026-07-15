@@ -25,6 +25,7 @@ describe("Avanza market page provider", () => {
 
   it("decodes bounded provider fields into typed evidence under the strict JSON policy", async () => {
     const requests: string[] = [];
+    const updatedAt = Date.now() - 60_000;
     const fetcher: PageProviderFetcher = async (rawUrl, policy) => {
       const url = new URL(String(rawUrl));
       requests.push(url.toString());
@@ -40,18 +41,28 @@ describe("Avanza market page provider", () => {
           finalUrl: url,
           mediaType: "application/json",
           contentType: "application/json",
-          body: Buffer.from(JSON.stringify({ indexes: [{
-            link: { orderbookId: "19002", linkDisplay: "OMX Stockholm 30", shortLinkDisplay: "OMXS30" },
-            quoteChangeToday: "-0,33",
-            todayPriceUpdated: "17:30",
-          }] })),
+          body: Buffer.from(JSON.stringify({ indexes: [
+            {
+              link: { orderbookId: "19002", linkDisplay: "OMX Stockholm 30", shortLinkDisplay: "OMXS30" },
+              quoteChangeToday: "-0,33",
+              todayPriceUpdated: "17:30",
+            },
+            {
+              link: { orderbookId: "155458", linkDisplay: "Dow Jones U.S. Index", shortLinkDisplay: "DJUS" },
+              quoteChangeToday: "0,00",
+              todayPriceUpdated: "19:20",
+            },
+          ] })),
         };
       }
       return {
         finalUrl: url,
         mediaType: "application/json",
         contentType: "application/json",
-        body: Buffer.from(JSON.stringify({ orderbooks: [{ orderbookId: "19002", lastPrice: 3167.16 }] })),
+        body: Buffer.from(JSON.stringify({ orderbooks: [
+          { orderbookId: "19002", lastPrice: 3167.16, updated: updatedAt },
+          { orderbookId: "155458", lastPrice: 1834.44, updated: updatedAt },
+        ] })),
       };
     };
 
@@ -68,6 +79,14 @@ describe("Avanza market page provider", () => {
         level: 3167.16,
         dailyChangePercent: -0.33,
         updatedLocalTime: "17:30",
+        updatedAt: new Date(updatedAt).toISOString(),
+      }, {
+        name: "Dow Jones U.S. Index",
+        symbol: "DJUS",
+        level: 1834.44,
+        dailyChangePercent: 0,
+        updatedLocalTime: "19:20",
+        updatedAt: new Date(updatedAt).toISOString(),
       }],
     });
   });
@@ -87,7 +106,7 @@ describe("Avanza market page provider", () => {
                 todayPriceUpdated: "99:99",
               }],
             }
-          : { orderbooks: [{ orderbookId: "19002", lastPrice: -1 }] })),
+          : { orderbooks: [{ orderbookId: "19002", lastPrice: -1, updated: Date.now() }] })),
       };
     };
     expect(await avanzaMarketPageProvider.read({

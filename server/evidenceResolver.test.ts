@@ -216,12 +216,14 @@ describe("search evidence resolver", () => {
     expect(result.packet.kind).toBe("search");
   });
 
-  it("never attempts more than two unique valid search results", async () => {
+  it("tries one bounded fallback batch when the first two unique pages are unreadable", async () => {
     const requested: string[] = [];
     const reader: EvidencePageReader = {
       read: vi.fn(async (request) => {
         requested.push(request.url!.toString());
-        return undefined;
+        return request.url?.pathname === "/three"
+          ? pagePacket(request.url.toString(), 3)
+          : undefined;
       }),
     };
 
@@ -233,11 +235,40 @@ describe("search evidence resolver", () => {
       "https://weather.example.com/four",
     ]), reader);
 
-    expect(result.attemptedPages).toBe(2);
+    expect(result).toMatchObject({ attemptedPages: 4, readPages: 1, readiness: "grounding_available" });
     expect(requested).toEqual([
       "https://weather.example.com/one",
       "https://weather.example.com/two",
+      "https://weather.example.com/three",
+      "https://weather.example.com/four",
     ]);
+  });
+
+  it("keeps reading the bounded search window when early pages are readable but may lack the answer", async () => {
+    const requested: string[] = [];
+    const reader: EvidencePageReader = {
+      read: vi.fn(async (request) => {
+        requested.push(request.url!.toString());
+        return pagePacket(request.url!.toString(), requested.length);
+      }),
+    };
+
+    const result = await resolve(searchPacket([
+      "https://market.example/overview",
+      "https://market.example/commentary",
+      "https://market.example/numbers",
+      "https://market.example/world",
+      "https://market.example/outside-window",
+    ]), reader, "current global index levels and moves");
+
+    expect(result).toMatchObject({ attemptedPages: 4, readPages: 4, readiness: "grounding_available" });
+    expect(requested).toEqual([
+      "https://market.example/overview",
+      "https://market.example/commentary",
+      "https://market.example/numbers",
+      "https://market.example/world",
+    ]);
+    expect(result.packet.results.map((source) => source.id)).toEqual(["S1", "S2", "S3", "S4"]);
   });
 
   it("contains thrown page reads and retains any independently successful source", async () => {

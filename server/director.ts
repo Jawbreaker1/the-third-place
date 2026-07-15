@@ -1144,9 +1144,15 @@ export function ensureEvidenceResponder(
   attention: ReadonlyMap<string, number> = new Map(),
   requireResearchCapability = true,
 ): { selected: Persona[]; responder?: Persona } {
-  const existing = requireResearchCapability
+  // Capability execution is server-owned. An exactly addressed resident may
+  // therefore deliver its bounded result even when autonomous research is not
+  // part of that persona's ordinary behavior. Research affinity remains the
+  // preference only for unaddressed room requests.
+  const addressed = selected.find((persona) => mentionedIds.includes(persona.id)) ??
+    candidates.find((persona) => mentionedIds.includes(persona.id));
+  const existing = addressed ?? (requireResearchCapability
     ? selected.find((persona) => persona.canResearch)
-    : selected.find((persona) => mentionedIds.includes(persona.id)) ?? selected.find((persona) => persona.canResearch) ?? selected[0];
+    : selected.find((persona) => persona.canResearch) ?? selected[0]);
   const preferred = existing ?? [...candidates]
     .filter((persona) => !requireResearchCapability || persona.canResearch)
     .sort(

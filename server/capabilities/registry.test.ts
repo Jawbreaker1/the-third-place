@@ -181,7 +181,10 @@ const analysisFor = (
         ? action === "local_datetime" ? "current_datetime" : null
         : overrides.timeKind,
       locationLabel: overrides.locationLabel === undefined
-        ? action === "local_datetime" ? "Stockholm" : action === "weather_forecast" ? "G\u00f6teborg" : null
+        ? action === "local_datetime" ? "Stockholm"
+          : action === "weather_forecast" ? "G\u00f6teborg"
+            : action === "market_snapshot" ? "OMXS30"
+              : null
         : overrides.locationLabel,
     },
     capabilities: {
@@ -242,6 +245,7 @@ describe("capability registry contract", () => {
     expect(registry.hasExternalEvidence(["local_datetime"])).toBe(false);
 
     expect(registry.available({ medium: "public", candidateSet: emptyCandidateSet(), allowSearch: false })).toEqual([
+      "market_snapshot",
       "local_datetime",
       "weather_forecast",
     ]);
@@ -278,7 +282,87 @@ describe("capability registry contract", () => {
     });
     expect(registry.compile(analysisFor("read_url"), voiceContext)).toBeUndefined();
     expect(registry.compile(analysisFor("web_search"), voiceContext)).toBeUndefined();
+    expect(registry.compile(analysisFor("market_snapshot"), voiceContext)).toBeUndefined();
     expect(registry.compile(analysisFor("weather_forecast"), voiceContext)).toBeUndefined();
+  });
+
+  it("executes a narrow headline-index snapshot through the registered structured page provider", async () => {
+    vi.stubEnv("LINK_READER_ENABLED", "true");
+    const { registry, pageReader } = createHarness();
+    const sourceUrl = "https://www.avanza.se/borsen-idag.html";
+    pageReader.read.mockResolvedValue(pagePacket(sourceUrl, [{
+      id: "S1",
+      title: "Avanza market overview",
+      url: sourceUrl,
+      snippet: JSON.stringify({
+        sourceKind: "market_overview",
+        retrievedAt: new Date(NOW).toISOString(),
+        scope: "headline indexes only; not individual equities",
+        indexes: [
+          {
+            name: "OMX Stockholm 30",
+            symbol: "OMXS30",
+            level: 3150.86,
+            dailyChangePercent: -0.38,
+            updatedLocalTime: "17:30",
+            updatedAt: "2026-07-15T15:30:00.000Z",
+          },
+          {
+            name: "Dow Jones U.S. Index",
+            symbol: "DJUS",
+            level: 1834.44,
+            dailyChangePercent: 0,
+            updatedLocalTime: "19:20",
+            updatedAt: "2026-07-15T17:20:00.000Z",
+          },
+        ],
+      }),
+    }]));
+
+    const invocation = registry.compile(analysisFor("market_snapshot"), compileContext())!;
+    expect(invocation).toMatchObject({
+      capability: "market_snapshot",
+      marketLabel: "OMXS30",
+      requiresResearchPersona: false,
+    });
+    expect(registry.compile(
+      analysisFor("market_snapshot", { locationLabel: "NASDAQ" }),
+      compileContext(),
+    )).toBeUndefined();
+    const resolution = await registry.execute(invocation, "guest-1");
+    expect(pageReader.read).toHaveBeenCalledWith(expect.objectContaining({
+      url: new URL(sourceUrl),
+      initiator: "automatic",
+      retry: false,
+    }), "guest-1");
+    expect(resolution).toMatchObject({
+      state: "grounding_available",
+      research: { results: [{ url: sourceUrl }] },
+    });
+    const selectedEvidence = JSON.parse(
+      resolution.state === "grounding_available" ? resolution.research!.results[0]!.snippet : "{}",
+    );
+    expect(selectedEvidence.indexes).toEqual([expect.objectContaining({ symbol: "OMXS30" })]);
+    expect(registry.sceneContract(invocation, resolution, { actorName: "Vale" })).toMatchObject({
+      evidenceOutcome: "succeeded",
+      urlPublicationPolicy: "server_card",
+      premise: expect.stringContaining("validated structured headline-index snapshot"),
+    });
+
+    const missing = registry.compile(
+      analysisFor("market_snapshot", { locationLabel: "DJUS" }),
+      compileContext(),
+    )!;
+    pageReader.read.mockResolvedValueOnce(pagePacket(sourceUrl, [{
+      id: "S1",
+      title: "Avanza market overview",
+      url: sourceUrl,
+      snippet: JSON.stringify({ ...selectedEvidence, indexes: selectedEvidence.indexes }),
+    }]));
+    await expect(registry.execute(missing, "guest-2")).resolves.toMatchObject({
+      state: "failed_temporary",
+      detail: "empty",
+    });
   });
 
   it("compiles only jointly trusted evidence and capability requests", () => {
@@ -456,6 +540,8 @@ describe("capability registry contract", () => {
       kind: "page",
       results: [{ id: "S1", url: sourceUrl, snippet: "Concrete evidence from S1" }],
     });
+    expect(registry.sceneContract(invocation, answer, { actorName: "Mira" }).groundingInstruction)
+      .toContain("name that exact missing datum naturally");
     expect(metadataOnly).toMatchObject({
       invocation,
       state: "retrieved_only",
@@ -682,7 +768,7 @@ describe("capability registry contract", () => {
     expect(requiredFailure).toMatchObject({
       evidenceOutcome: "failed",
       suppressResponse: false,
-      premise: expect.stringContaining("returned no readable evidence"),
+      premise: expect.stringContaining("did not yield readable material for the requested answer this time"),
     });
     expect(requiredFailure).not.toHaveProperty("research");
     expect(requiredFailure).not.toHaveProperty("urlPublicationPolicy");

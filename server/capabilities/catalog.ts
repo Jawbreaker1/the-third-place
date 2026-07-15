@@ -18,6 +18,14 @@ export interface CapabilityArgumentContract {
   allowed: readonly CapabilityArgumentField[];
   /** Additional trusted structural preconditions for otherwise allowed fields. */
   conditional?: Readonly<Partial<Record<CapabilityArgumentField, CapabilityArgumentCondition>>>;
+  /**
+   * Authority-neutral recovery for a field omitted by a structured-output
+   * engine after it already declared this action and supplied the same
+   * bounded semantic value elsewhere. This never creates an action.
+   */
+  recoverFromGoal?: Readonly<Partial<Record<CapabilityArgumentField, true>>>;
+  /** Fixed provider identifiers accepted for otherwise free-form wire fields. */
+  allowedStringValues?: Readonly<Partial<Record<CapabilityArgumentField, readonly string[]>>>;
 }
 
 export interface CapabilityRoutingGuidance {
@@ -66,12 +74,28 @@ const capabilityDefinitions = {
     arguments: {
       required: ["q", "m"],
       allowed: ["q", "m"],
+      recoverFromGoal: { q: true },
     },
     routingGuidance: {
-      primary: "return a short standalone query in the latest message's language and writing system, containing the subject and requested freshness, without conversational filler, usernames, URLs or unrelated prior text. Reuse suitable subject wording from the request; translating the provider query into English or another language is invalid. Set searchMode to news only for actual news/current-events intent; otherwise use web.",
-      verifier: "requires q and m with u/z/k/l null. Use news only for actual news/current-events intent, otherwise web. q must retain the guest request's language and writing system, reusing suitable subject wording from the request; a translated provider query is invalid. Never put a URL in q.",
+      primary: "return a short standalone query in the latest message's language and writing system, containing the subject, the requested answer dimension and any requested or contextually inherited freshness, without conversational filler, usernames, URLs or unrelated prior text. The query must express what is being sought, not merely repeat a bare entity label when the goal asks for its current status, development, comparison, explanation or latest information. Reuse suitable subject wording from the request; translating the provider query into English or another language is invalid. Set searchMode to news only for actual news/current-events intent; otherwise use web.",
+      verifier: "requires q and m with u/z/k/l null. q must be a standalone provider query that preserves the subject, requested answer dimension and requested or inherited freshness; do not reduce a current-status, development, comparison, explanation or latest-information goal to a bare entity label. Use news only for actual news/current-events intent, otherwise web. Retain the guest request's language and writing system, reusing suitable subject wording from the request; a translated provider query is invalid. Never put a URL in q.",
     },
     validationMessage: "web_search requires only a URL-free provider query and mode",
+  },
+  market_snapshot: {
+    routingClass: "narrow_structured",
+    media: ["public", "dm"],
+    external: true,
+    arguments: {
+      required: ["l"],
+      allowed: ["l"],
+      allowedStringValues: { l: ["OMXS30", "DJUS"] },
+    },
+    routingGuidance: {
+      primary: "use only for the latest reported numeric level and provider-reported session change of one specifically named headline equity index supported by the server snapshot: OMXS30 or DJUS. Put the resolved official symbol in l and keep q/u/m/z/k null. A common informal name may be resolved semantically to its official symbol, but never invent a symbol. A normal request to check one of these values is an execution question or request, not a capability-availability question. This snapshot is not individual-equity data, a whole-world market survey, news, history, a forecast, advice or analysis; use web_search for those.",
+      verifier: "market_snapshot requires exactly one supported official headline-index symbol, OMXS30 or DJUS, in l with q/u/m/z/k null. Use it only for that index's latest reported numeric level or provider-reported session change. A normal request to check one of these values is an execution question or request, not a capability-availability question. Keep broad/global surveys, individual equities, news, historical questions, forecasts, advice and analysis on web_search, and keep none if the requested index cannot be resolved safely.",
+    },
+    validationMessage: "market_snapshot requires only one supported official headline-index symbol",
   },
   local_datetime: {
     routingClass: "narrow_structured",
@@ -158,6 +182,7 @@ export interface CapabilityArgumentShapeResult {
   missing: CapabilityArgumentField[];
   forbidden: CapabilityArgumentField[];
   conditional: CapabilityArgumentField[];
+  invalidValue: CapabilityArgumentField[];
   message?: string;
 }
 
@@ -185,12 +210,20 @@ export const validateCapabilityArgumentShape = (
     if (!condition) return false;
     return !activeConditions.has(condition);
   });
-  const valid = missing.length === 0 && forbidden.length === 0 && conditional.length === 0;
+  const invalidValue = CAPABILITY_ARGUMENT_FIELDS.filter((field) => {
+    if (!present(values[field])) return false;
+    const allowedValues = argumentContract.allowedStringValues?.[field];
+    return Boolean(allowedValues && (
+      typeof values[field] !== "string" || !allowedValues.includes(values[field] as string)
+    ));
+  });
+  const valid = missing.length === 0 && forbidden.length === 0 && conditional.length === 0 && invalidValue.length === 0;
   return {
     valid,
     missing,
     forbidden,
     conditional,
+    invalidValue,
     ...(!valid ? { message: definition.validationMessage } : {}),
   };
 };

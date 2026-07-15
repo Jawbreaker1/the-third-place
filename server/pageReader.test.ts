@@ -464,6 +464,9 @@ describe("page reader broker", () => {
       title: "Structured source",
       url: "https://structured.example/overview",
     });
+    const shared = await reader.read({ ...request, intent: "a separate caller query" }, "guest-2");
+    expect(providerReads).toBe(1);
+    expect(shared?.query).toBe("a separate caller query");
   });
 
   it("partitions automatic cache and in-flight reads from explicit reads", async () => {
@@ -576,6 +579,28 @@ describe("page reader broker", () => {
     expect(await reader.read({ ...first, intent: "try again", retry: false }, "guest-1")).toBeUndefined();
     expect((await reader.read({ ...first, intent: "再試行", retry: true }, "guest-1"))?.results[0]?.title).toBe("Recovered");
     expect(fetches).toBe(2);
+  });
+
+  it("keeps enough requester quota for two immediate four-candidate search turns", async () => {
+    let fetches = 0;
+    const reader = new PageReader(async () => {
+      fetches += 1;
+      return undefined;
+    });
+    for (let index = 0; index < 8; index += 1) {
+      const request = classifiedRequest({
+        content: `https://source-${index}.example/report`,
+        requesterId: "follow-up-guest",
+      })!;
+      await reader.read(request, "follow-up-guest");
+    }
+    const overBudget = classifiedRequest({
+      content: "https://source-9.example/report",
+      requesterId: "follow-up-guest",
+    })!;
+    await reader.read(overBudget, "follow-up-guest");
+
+    expect(fetches).toBe(8);
   });
 
   it("never fetches a rejected or fabricated target", async () => {

@@ -13,7 +13,9 @@ const MAX_RESULT_ID_LENGTH = 40;
 const MAX_RESULT_TITLE_LENGTH = 180;
 const MAX_RESULT_SNIPPET_LENGTH = 4_500;
 const MAX_SEARCH_RESULTS = 5;
-const MAX_EXPANDED_PAGES = 2;
+const MAX_ACCEPTED_PAGES = 4;
+const MAX_EXPANSION_ATTEMPTS = 4;
+const EXPANSION_BATCH_SIZE = 2;
 const FUTURE_TIMESTAMP_TOLERANCE_MS = 5 * 60_000;
 
 /** A safe page was read; semantic relevance is still decided during review. */
@@ -119,7 +121,9 @@ const boundedPacket = (packet: ResearchPacket, now: number): ResearchPacket => {
   };
 };
 
-const genericReadCandidates = (packet: ResearchPacket): ReadCandidate[] => {
+const genericReadCandidates = (
+  packet: ResearchPacket,
+): ReadCandidate[] => {
   const seen = new Set<string>();
   const candidates: ReadCandidate[] = [];
   for (const result of packet.results) {
@@ -130,9 +134,8 @@ const genericReadCandidates = (packet: ResearchPacket): ReadCandidate[] => {
       url,
       ...(result.publishedAt ? { publishedAt: result.publishedAt } : {}),
     });
-    if (candidates.length >= MAX_EXPANDED_PAGES) break;
   }
-  return candidates;
+  return candidates.slice(0, MAX_EXPANSION_ATTEMPTS);
 };
 
 const readCandidate = async (
@@ -204,15 +207,22 @@ export const resolveSearchEvidence = async (
     source: "message",
     initiator: "automatic",
   };
-  const attemptedPages = candidates.length;
-  const reads = await Promise.all(candidates.map((candidate) =>
-    readCandidate(candidate, request, input.requesterId, input.pageReader, input.now)));
-  const accepted = reads.filter((value): value is AcceptedPage => value !== undefined);
+  let attemptedPages = 0;
+  const accepted: AcceptedPage[] = [];
+  for (let offset = 0; offset < candidates.length; offset += EXPANSION_BATCH_SIZE) {
+    const batch = candidates.slice(offset, offset + EXPANSION_BATCH_SIZE);
+    attemptedPages += batch.length;
+    const reads = await Promise.all(batch.map((candidate) =>
+      readCandidate(candidate, request, input.requesterId, input.pageReader, input.now)));
+    accepted.push(...reads.filter((value): value is AcceptedPage => value !== undefined));
+  }
   if (accepted.length === 0) {
     return { packet: bounded, readiness: "retrieved", attemptedPages, readPages: 0 };
   }
 
-  const results = accepted.map(({ result }, index) => ({ ...result, id: `S${index + 1}` }));
+  const results = accepted
+    .slice(0, MAX_ACCEPTED_PAGES)
+    .map(({ result }, index) => ({ ...result, id: `S${index + 1}` }));
   const retrievedAt = safeInstant(accepted[0]?.packet.retrievedAt, input.now) ?? requestedAt;
   return {
     packet: {

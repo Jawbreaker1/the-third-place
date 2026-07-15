@@ -101,6 +101,10 @@ const MAX_PARSE_DEPTH = 128;
 const MAX_JSON_LD_BYTES = 128 * 1024;
 const MAX_JSON_LD_BLOCKS = 12;
 const MAX_JSON_LD_ENTITIES = 64;
+const MAX_ACTIVE_PAGE_READS = 2;
+const MAX_GLOBAL_PAGE_READS_PER_MINUTE = 16;
+const MAX_REQUESTER_PAGE_READS_PER_MINUTE = 8;
+const MAX_ORIGIN_PAGE_READS_PER_MINUTE = 2;
 const PUBLISHABLE_SCHEMA_TYPES = new Set([
   "article",
   "advertisercontentarticle",
@@ -771,7 +775,12 @@ export class PageReader {
     if (process.env.LINK_READER_ENABLED === "false" || !request.url) return undefined;
     const requestedUrl = request.url;
     const initiator = request.initiator ?? "explicit";
-    const key = `${initiator}\u0000${requesterId}\u0000${requestedUrl.toString()}`;
+    const provider = this.providers.supporting(requestedUrl);
+    // Registered providers return public, request-independent typed evidence.
+    // Share only that bounded evidence/cache work across guests; packetFor
+    // still reconstructs each caller's own query and never shares chat text.
+    const cachePrincipal = provider ? `provider:${provider.id}` : `requester:${requesterId}`;
+    const key = `${initiator}\u0000${cachePrincipal}\u0000${requestedUrl.toString()}`;
     this.prune();
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
@@ -780,9 +789,8 @@ export class PageReader {
     }
     const existing = this.inFlight.get(key);
     if (existing) return existing.then((evidence) => this.packetFor(request, evidence));
-    if (this.activeRequests >= 2 || !this.reserve(requesterId, requestedUrl.origin)) return undefined;
+    if (this.activeRequests >= MAX_ACTIVE_PAGE_READS || !this.reserve(requesterId, requestedUrl.origin)) return undefined;
     this.activeRequests += 1;
-    const provider = this.providers.supporting(requestedUrl);
     const fetcher: PageProviderFetcher = initiator === "automatic"
       ? (rawUrl, policy) => this.fetcher(rawUrl, {
           ...policy,
@@ -843,7 +851,11 @@ export class PageReader {
     const originRequests = this.originTimestamps.get(origin) ?? [];
     trim(requester);
     trim(originRequests);
-    if (this.globalTimestamps.length >= 8 || requester.length >= 2 || originRequests.length >= 2) return false;
+    if (
+      this.globalTimestamps.length >= MAX_GLOBAL_PAGE_READS_PER_MINUTE ||
+      requester.length >= MAX_REQUESTER_PAGE_READS_PER_MINUTE ||
+      originRequests.length >= MAX_ORIGIN_PAGE_READS_PER_MINUTE
+    ) return false;
     this.globalTimestamps.push(now);
     requester.push(now);
     originRequests.push(now);

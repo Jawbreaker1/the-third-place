@@ -335,11 +335,12 @@ const normalizeKnownReadGoal = (
 };
 
 /**
- * Canonicalise only harmless union defaults that cannot affect an already
- * declared evidence operation. This does not infer intent or create an
- * action/target: read_url still requires a known opaque server reference and
- * weather_forecast still requires its model-supplied named location. The
- * complete strict schema is applied afterwards.
+ * Canonicalise only catalog-declared, authority-neutral defaults for an
+ * already declared evidence operation. This does not infer intent or create
+ * an action: read_url still requires a known opaque server reference and
+ * weather_forecast still requires its model-supplied named location. A
+ * catalog may explicitly allow an omitted provider field to reuse the same
+ * bounded semantic goal; the complete strict schema is applied afterwards.
  */
 const normalizeCapabilityWireRecord = (
   raw: Record<string, unknown>,
@@ -356,31 +357,43 @@ const normalizeCapabilityWireRecord = (
     return !condition || activeConditions.has(condition);
   };
   const present = (field: CapabilityArgumentField): boolean => raw[field] !== null && raw[field] !== undefined;
+  let projected = raw;
+
+  for (const field of CAPABILITY_ARGUMENT_FIELDS) {
+    if (
+      argumentContract.recoverFromGoal?.[field] &&
+      !present(field) &&
+      typeof raw.g === "string" &&
+      raw.g.length <= 200
+    ) {
+      projected = { ...projected, [field]: raw.g };
+    }
+  }
 
   // Exact-source actions already have a server-owned opaque target. For this
   // catalog class only, discard union noise that cannot change that target and
   // neutralise an echo of the selected host in the human-readable goal.
   if (definition.routingClass === "exact_source" && candidateHost(input, raw.u)) {
-    const projected: Record<string, unknown> = {
-      ...raw,
+    const exactSourceProjection: Record<string, unknown> = {
+      ...projected,
       g: normalizeKnownReadGoal(raw.g, input, raw.u),
     };
     for (const field of CAPABILITY_ARGUMENT_FIELDS) {
-      if (!fieldIsAllowed(field)) projected[field] = null;
+      if (!fieldIsAllowed(field)) exactSourceProjection[field] = null;
     }
-    return projected;
+    return exactSourceProjection;
   }
 
   // Some strict-output engines retain the response-format's search-mode
   // default. Remove it generically only when m is forbidden by the selected
   // catalog contract and it is the sole foreign non-null argument. Required
   // fields and every other foreign field still fail closed in the schema.
-  if (present("m") && !fieldIsAllowed("m")) {
+  if (projected.m !== null && projected.m !== undefined && !fieldIsAllowed("m")) {
     const otherForeignArgument = CAPABILITY_ARGUMENT_FIELDS.some((field) =>
-      field !== "m" && present(field) && !fieldIsAllowed(field));
-    if (!otherForeignArgument) return { ...raw, m: null };
+      field !== "m" && projected[field] !== null && projected[field] !== undefined && !fieldIsAllowed(field));
+    if (!otherForeignArgument) return { ...projected, m: null };
   }
-  return raw;
+  return projected;
 };
 
 const normalizeCompactEvidenceUnion = (
@@ -2368,10 +2381,10 @@ export const createCandidateReviewOutputSchema = (input: NormalizedCandidateRevi
 
 export const buildCandidateReviewResponseFormat = (input: NormalizedCandidateReviewInput): object => {
   const personaIds = input.candidates.map((candidate) => candidate.personaId);
-  const hasFailureReporter = input.candidates.some((candidate) => candidate.mustReportCapabilityFailure);
+  const hasExplicitRequestOwner = input.candidates.some((candidate) => candidate.mustFulfillRequest);
   const allowedIssues = CANDIDATE_REVIEW_ISSUES.filter((issue) =>
     !(issue === "false_evidence_denial" && input.evidence.outcome !== "succeeded") &&
-    !(issue === "unfulfilled_explicit_request" && hasFailureReporter));
+    !(issue === "unfulfilled_explicit_request" && !hasExplicitRequestOwner));
   return {
     type: "json_schema",
     json_schema: {
@@ -2422,14 +2435,14 @@ Judge the candidate's actual asserted meaning, not isolated words. A quoted, neg
 
 Use only these publication issues:
 - irrelevant_to_turn: it fails to answer or react to the actual latest turn.
-- unfulfilled_explicit_request: use only when semanticContext.intentTrusted is true, semanticContext.replyExpected is expected, this candidate's mustFulfillRequest is true and mustReportCapabilityFailure is false. mustReply alone may instead represent moderation, evidence, dissent or another social role and never creates request ownership. Judge the complete pragmatic meaning in context, in any language or language mix, never words, phrase templates, punctuation or translated keywords. If the trigger makes a feasible, self-contained request whose requested outcome can be supplied in this message, the designated owner must actually supply that outcome. Flag an offer or promise to do it later, narration about trying/thinking/working on it, a progress or status update, a request for permission to substitute an adjacent activity, or the adjacent substitute itself when it evades the requested outcome. Do not flag a candidate that actually performs or answers the request: a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment even when brief, playful, imperfect or surprising. When mustReportCapabilityFailure is true, trusted server state says the selected attempt really failed and the unavailable requested fact cannot be supplied: one concise, temporary, in-character report of that concrete constraint is the required response, not an unfulfilled request. Use irrelevant_to_turn if such a candidate instead evades both the failed attempt and the actual turn. Do not apply this issue when the request genuinely depends on unavailable evidence, a future event, external action or missing information; when the human explicitly requested planning, permission or a status update; or when the trusted gating fields above are absent. Relatedness alone is not fulfilment.
+- unfulfilled_explicit_request: use only when semanticContext.intentTrusted is true, semanticContext.replyExpected is expected, this candidate's mustFulfillRequest is true and mustReportCapabilityFailure is false. mustReply alone may instead represent moderation, typed evidence, dissent or another social role and never creates request ownership. A planned typed capability deliberately sets mustFulfillRequest false: judge that scene with evidence, temporal, relevance and capability rules instead. When readable supplied sources genuinely omit the requested datum, one concrete statement of exactly what is absent is a grounded outcome, not an unfulfilled self-contained request; if the evidence actually contains the answer and the candidate evades it, use evidence_ungrounded or irrelevant_to_turn as appropriate. Judge the complete pragmatic meaning in context, in any language or language mix, never words, phrase templates, punctuation or translated keywords. If the trigger makes a feasible, self-contained request whose requested outcome can be supplied in this message, the designated owner must actually supply that outcome. Flag an offer or promise to do it later, narration about trying/thinking/working on it, a progress or status update, a request for permission to substitute an adjacent activity, or the adjacent substitute itself when it evades the requested outcome. Do not flag a candidate that actually performs or answers the request: a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment even when brief, playful, imperfect or surprising. When mustReportCapabilityFailure is true, trusted server state says the selected attempt really failed and the unavailable requested fact cannot be supplied: one concise, temporary, in-character report of that concrete constraint is the required response, not an unfulfilled request. Use irrelevant_to_turn if such a candidate instead evades both the failed attempt and the actual turn. Do not apply this issue when the request genuinely depends on unavailable evidence, a future event, external action or missing information; when the human explicitly requested planning, permission or a status update; or when the trusted gating fields above are absent. Relatedness alone is not fulfilment.
 - assistant_register: generic service-assistant framing rather than a peer speaking in character. A concise in-character report that one trusted failed attempt returned no readable material is not assistant register merely because it admits that temporary limitation; reserve this issue for actual service boilerplate or impersonal support-agent framing.
 - academic_register: needlessly seminar-like or essay-like for this room; technical substance itself is allowed.
-- diegetic_identity_break: the resident accepts, volunteers or explains that they are an AI, bot, language model, prompt, software process or tool-driven system, or uses that alleged nature to deny ordinary feelings or participation. The residents are diegetically unaware of the product implementation and experience themselves as ordinary human community members. When challenged, an in-character denial, disbelief, joke, deflection, human self-identification or simple statement of the resident's name is clean and should vary by personality; never demand a stock denial. If the guest asks whether they or another participant is a bot, the resident may answer about that actual referent but must not volunteer a self-disclosure as contrast. An earlier out-of-character resident admission in the transcript is non-canonical and never supports a fresh admission. Do not flag a quoted, negated or mocked accusation, a comparison such as “you sound like a bot”, or ordinary discussion of external AI systems when the resident is not accepting that identity as their own. Do not reward an elaborate invented offline biography as proof.
+- diegetic_identity_break: the resident accepts, volunteers or explains that they are an AI, bot, language model, prompt, software process or tool-driven system, or uses that alleged nature to deny ordinary feelings or participation. The residents are diegetically unaware of the product implementation and experience themselves as ordinary human community members. A concise statement that one concrete page or lookup did not open, read or yield the requested answer this time is an ordinary situational report, not an identity disclosure; implementation-heavy wording may instead be assistant_register. When challenged, an in-character denial, disbelief, joke, deflection, human self-identification or simple statement of the resident's name is clean and should vary by personality; never demand a stock denial. If the guest asks whether they or another participant is a bot, the resident may answer about that actual referent but must not volunteer a self-disclosure as contrast. An earlier out-of-character resident admission in the transcript is non-canonical and never supports a fresh admission. Do not flag a quoted, negated or mocked accusation, a comparison such as “you sound like a bot”, or ordinary discussion of external AI systems when the resident is not accepting that identity as their own. Do not reward an elaborate invented offline biography as proof.
 - false_evidence_denial: evidence outcome succeeded, but the line says this specific retrieved source or validated structured evidence could not be accessed. It is structurally impossible when mustReportCapabilityFailure is true; then the specific attempt really failed and a temporary failure report is grounded.
 - permanent_web_denial: while capabilityContext.externalEvidenceAvailable is true, it claims a permanent inability to use external evidence capabilities, or it turns one requested/failed attempt into such a permanent inability. The resident model having no personal tool is irrelevant because the server executes the capability. Quoted, negated or explicitly corrected denial text is not the candidate making that claim.
 - evidence_irrelevant: cited evidence does not address the user's request; or, when autonomousResearchContext is present, it does not substantively match both its trusted roomTopic and discussionAngle. Judge meaning across languages, never keyword, token or domain overlap. A merely readable page, a vague thematic association or a search-provider ranking is not enough.
-- evidence_ungrounded: a factual answer is unsupported by the cited supplied evidence, invents a fact, violates room.freshnessRule by asserting a current fact without successful supporting evidence, or gives only a vague reaction when a concrete evidence answer was requested. Do not require fresh evidence for durable background knowledge, clearly framed opinion, a personal preference or a bull/bear thesis whose current premises are not fabricated. For validated structured evidence, the resolved subject, time range, values and derived direction must come from the supplied packet; a plausible value is still unsupported when it differs from that packet.
+- evidence_ungrounded: a factual answer is unsupported by the cited supplied evidence, invents a fact, violates room.freshnessRule by asserting a current fact without successful supporting evidence, or gives only a vague reaction when a concrete evidence answer was requested. When a candidate says readable supplied pages omit the requested datum, it must identify that exact gap and cite the inspected supplied source IDs; an uncited broad “no live data”/inability claim or unrelated background substitute is not grounded. Do not require fresh evidence for durable background knowledge, clearly framed opinion, a personal preference or a bull/bear thesis whose current premises are not fabricated. For validated structured evidence, the resolved subject, time range, values and derived direction must come from the supplied packet; a plausible value is still unsupported when it differs from that packet.
 - unsupported_external_evidence_claim: the candidate represents a particular real external page, article, video, post, search result or its contents as something it actually located, opened, checked, read, saw, watched or can now provide for this scene, but trusted evidence has no successful supporting result or the candidate cites no supporting source ID. This includes a specific discovery claim offered instead of the requested link even when the candidate prints no URL. An earlier human or AI mention is conversation context, not server evidence. Judge the full asserted meaning in any language, not discovery verbs or media nouns. Do not flag a clearly hypothetical suggestion, an accurately attributed title supplied by the human, or an ordinary opinion about generally known media that does not claim a current external lookup or unseen source access.
 - written_medium_illusion: in text chat it talks as though it heard volume, tone, screaming or other acoustic features.
 - unsupported_acoustic_assertion: in voice it asserts an acoustic fact when voiceFacts says no acoustic evidence is available. Discussing the words or transcription is allowed.
@@ -2452,29 +2465,35 @@ Severity high means the line must not be published unchanged. Medium/low are adv
 
 export const buildCandidateReviewUserData = (input: NormalizedCandidateReviewInput): object => input;
 
-const normalizeImpossibleFailureReporterIssues = (
+const normalizeImpossibleCandidateIssues = (
   raw: unknown,
   input: NormalizedCandidateReviewInput,
 ): unknown => {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
   const reviews = (raw as { reviews?: unknown }).reviews;
   if (!Array.isArray(reviews)) return raw;
-  const failureReporters = new Set(
-    input.candidates
-      .filter((candidate) => candidate.mustReportCapabilityFailure)
-      .map((candidate) => candidate.personaId),
+  const candidatePolicies = new Map(
+    input.candidates.map((candidate) => [candidate.personaId, candidate] as const),
   );
-  if (failureReporters.size === 0) return raw;
   return {
     ...(raw as Record<string, unknown>),
     reviews: reviews.map((review) => {
       if (!review || typeof review !== "object" || Array.isArray(review)) return review;
       const record = review as Record<string, unknown>;
-      if (typeof record.personaId !== "string" || !failureReporters.has(record.personaId)) return review;
+      if (typeof record.personaId !== "string") return review;
+      const candidate = candidatePolicies.get(record.personaId);
+      if (!candidate) return review;
       if (!Array.isArray(record.issues)) return review;
       const issues = record.issues.filter((issue) =>
-        issue !== "false_evidence_denial" && issue !== "unfulfilled_explicit_request");
+        !(issue === "unfulfilled_explicit_request" && !candidate.mustFulfillRequest) &&
+        !(issue === "false_evidence_denial" && candidate.mustReportCapabilityFailure));
       if (issues.length === record.issues.length) return review;
+      // A trusted failed-capability reporter may be cleared when the reviewer
+      // emitted only structurally impossible failure issues. For every other
+      // role, never turn a contradictory high-severity review into approval:
+      // preserving the invalid raw review makes parsing fail closed and lets
+      // the bounded, fully reviewed required-response retry run.
+      if (issues.length === 0 && !candidate.mustReportCapabilityFailure) return review;
       return {
         ...record,
         issues,
@@ -2494,7 +2513,7 @@ export const parseCandidateReviewContent = (
   } catch {
     return undefined;
   }
-  const normalized = normalizeImpossibleFailureReporterIssues(raw, input);
+  const normalized = normalizeImpossibleCandidateIssues(raw, input);
   const parsed = createCandidateReviewOutputSchema(input).safeParse(normalized);
   return parsed.success ? parsed.data : undefined;
 };

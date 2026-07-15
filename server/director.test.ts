@@ -1241,7 +1241,8 @@ describe("social director", () => {
         expect(request.selected.map((persona) => persona.id)).toEqual(["ai-mira"]);
         expect(request.requestOwnerIds).toEqual(["ai-mira"]);
         expect(request.evidenceOutcome).toBe("failed");
-        expect(request.premise).toContain("returned no readable evidence");
+        expect(request.premise).toContain("did not yield readable material for the requested answer this time");
+        expect(request.premise).toContain("without implementation jargon");
         expect(request.research).toBeUndefined();
       };
       generateScene.mockImplementationOnce(async (request) => {
@@ -2402,7 +2403,7 @@ describe("social director", () => {
     }
   });
 
-  it("keeps mentions while reserving one bounded slot for a capable evidence reader", () => {
+  it("lets an exactly mentioned resident own server-fetched evidence", () => {
     const researcher = PERSONAS.find((persona) => persona.canResearch)!;
     const nonResearchers = PERSONAS.filter((persona) => !persona.canResearch).slice(0, 3);
     const result = ensureEvidenceResponder(
@@ -2413,8 +2414,20 @@ describe("social director", () => {
     );
     expect(result.selected).toHaveLength(3);
     expect(result.selected.map((persona) => persona.id)).toContain(nonResearchers[0]!.id);
-    expect(result.selected.map((persona) => persona.id)).toContain(researcher.id);
+    expect(result.responder?.id).toBe(nonResearchers[0]!.id);
+  });
+
+  it("still prefers a research-oriented resident for an unaddressed room lookup", () => {
+    const researcher = PERSONAS.find((persona) => persona.canResearch)!;
+    const ordinary = PERSONAS.find((persona) => !persona.canResearch)!;
+    const result = ensureEvidenceResponder(
+      [ordinary],
+      [ordinary, researcher],
+      [],
+      new Map([[researcher.id, 1]]),
+    );
     expect(result.responder?.id).toBe(researcher.id);
+    expect(result.selected.map((persona) => persona.id)).toContain(researcher.id);
   });
 
   it("can designate a mentioned resident for a supplied page when all three slots are mentioned", () => {
@@ -4966,7 +4979,7 @@ describe("social director", () => {
       director.stop();
 
       expect(research).toHaveBeenCalledWith({ query, mode: "news", requesterId: human.id });
-      expect(read).toHaveBeenCalledTimes(2);
+      expect(read).toHaveBeenCalledTimes(3);
       expect(read).toHaveBeenNthCalledWith(1, expect.objectContaining({
         url: new URL("https://news.example.jp/one"),
         initiator: "automatic",
@@ -4974,6 +4987,11 @@ describe("social director", () => {
       }), human.id);
       expect(read).toHaveBeenNthCalledWith(2, expect.objectContaining({
         url: new URL("https://updates.example.jp/two"),
+        initiator: "automatic",
+        retry: false,
+      }), human.id);
+      expect(read).toHaveBeenNthCalledWith(3, expect.objectContaining({
+        url: new URL("https://journal.example.jp/three"),
         initiator: "automatic",
         retry: false,
       }), human.id);
@@ -4987,7 +5005,8 @@ describe("social director", () => {
         plannedAction: "web_search",
         executionStatus: "failed_temporary",
       }));
-      expect(scene.premise).toContain("result metadata but no safely readable answer-bearing page");
+      expect(scene.premise).toContain("did not yield readable material for the requested answer this time");
+      expect(scene.premise).toContain("without search-system or implementation jargon");
       const replies = store.getRecent("lobby", 4).filter((message) => message.authorId.startsWith("ai-"));
       expect(replies).toHaveLength(1);
       expect(replies[0]).toMatchObject({

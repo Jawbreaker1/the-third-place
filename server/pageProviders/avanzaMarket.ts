@@ -74,7 +74,7 @@ const parseHeaderIndexes = (body: Buffer): HeaderIndex[] => {
         orderbookId,
         name,
         ...(shortName ? { shortName } : {}),
-        ...(changeToday ? { changeToday } : {}),
+        ...(changeToday !== undefined ? { changeToday } : {}),
         ...(updated ? { updated } : {}),
       }];
     });
@@ -83,8 +83,27 @@ const parseHeaderIndexes = (body: Buffer): HeaderIndex[] => {
   }
 };
 
-const parseLastPrices = (body: Buffer, allowedIds: ReadonlySet<string>): Map<string, number> => {
-  const prices = new Map<string, number>();
+interface LastPriceObservation {
+  level: number;
+  updatedAt: string;
+}
+
+const providerInstant = (value: unknown, now: number): string | undefined => {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return undefined;
+  if (value > now + 5 * 60_000 || value < now - 7 * 24 * 60 * 60_000) return undefined;
+  try {
+    return new Date(value).toISOString();
+  } catch {
+    return undefined;
+  }
+};
+
+const parseLastPrices = (
+  body: Buffer,
+  allowedIds: ReadonlySet<string>,
+  now: number,
+): Map<string, LastPriceObservation> => {
+  const prices = new Map<string, LastPriceObservation>();
   try {
     const parsed = jsonRecord(JSON.parse(body.toString("utf8")));
     if (!parsed || !Array.isArray(parsed.orderbooks)) return prices;
@@ -92,7 +111,10 @@ const parseLastPrices = (body: Buffer, allowedIds: ReadonlySet<string>): Map<str
       const row = jsonRecord(raw);
       const orderbookId = boundedString(row?.orderbookId, 16);
       const lastPrice = finiteIndexLevel(row?.lastPrice);
-      if (orderbookId && allowedIds.has(orderbookId) && lastPrice !== undefined) prices.set(orderbookId, lastPrice);
+      const updatedAt = providerInstant(row?.updated, now);
+      if (orderbookId && allowedIds.has(orderbookId) && lastPrice !== undefined && updatedAt) {
+        prices.set(orderbookId, { level: lastPrice, updatedAt });
+      }
     }
   } catch {
     return prices;
@@ -111,15 +133,16 @@ const readMarketEvidence: PageProviderAdapter["read"] = async ({ fetcher, reques
   const dataUrl = new URL("https://www.avanza.se/_api/market-overview/data/orderbooks");
   dataUrl.searchParams.set("orderbookIds", [...allowedIds].join(","));
   const data = await fetcher(dataUrl, jsonPolicy).catch(() => undefined);
+  const retrievedAtMs = Date.now();
   const prices = data && data.finalUrl.toString() === dataUrl.toString()
-    ? parseLastPrices(data.body, allowedIds)
-    : new Map<string, number>();
+    ? parseLastPrices(data.body, allowedIds, retrievedAtMs)
+    : new Map<string, LastPriceObservation>();
   const completeIndexes = indexes.filter((index) =>
     prices.has(index.orderbookId) && index.changeToday !== undefined && index.updated !== undefined,
   );
   if (completeIndexes.length === 0) return undefined;
 
-  const retrievedAt = new Date().toISOString();
+  const retrievedAt = new Date(retrievedAtMs).toISOString();
   // Provider adapters decode bounded fields into inert typed evidence. They do
   // not classify intent or pre-compose a Swedish, English or other chat reply.
   const snippet = JSON.stringify({
@@ -129,9 +152,10 @@ const readMarketEvidence: PageProviderAdapter["read"] = async ({ fetcher, reques
     indexes: completeIndexes.map((index) => ({
       name: index.name,
       ...(index.shortName && index.shortName !== index.name ? { symbol: index.shortName } : {}),
-      level: prices.get(index.orderbookId)!,
+      level: prices.get(index.orderbookId)!.level,
       dailyChangePercent: index.changeToday!,
       updatedLocalTime: index.updated!,
+      updatedAt: prices.get(index.orderbookId)!.updatedAt,
     })),
   });
   return {

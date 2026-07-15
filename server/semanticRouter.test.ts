@@ -265,6 +265,35 @@ describe("multilingual semantic router contract", () => {
     });
   });
 
+  it("recovers an omitted web provider query only from the declared bounded goal", () => {
+    const compact = compactWeatherOutput({
+      e: {
+        a: "web_search",
+        x: 0.98,
+        g: "OMXS30 aktuell status och utveckling idag",
+        q: null,
+        u: null,
+        m: "web",
+        z: null,
+        k: null,
+        l: null,
+      },
+      c: { d: ["web_search"], r: "execute", a: false, i: false, l: false, x: 0.97 },
+    });
+
+    expect(parseTurnAnalysisContent(JSON.stringify(compact), input())).toMatchObject({
+      evidence: {
+        action: "web_search",
+        goal: "OMXS30 aktuell status och utveckling idag",
+        query: "OMXS30 aktuell status och utveckling idag",
+      },
+    });
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compact,
+      e: { ...compact.e, g: "x".repeat(201) },
+    }), input())).toBeUndefined();
+  });
+
   it("preserves multilingual named weather locations without translating them into provider queries", () => {
     const cases = [
       {
@@ -1084,6 +1113,7 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("never let a prior resident denial override the inventory");
     expect(prompt).toContain("g is a short standalone description of the exact information the guest wants");
     expect(prompt).toContain("translating the provider query into English or another language is invalid");
+    expect(prompt).toContain("not merely repeat a bare entity label");
     expect(prompt).toContain("availability alone never executes a tool");
     expect(prompt).toContain("select that available discussed capability as e.a");
     expect(prompt).toContain("weather_forecast: use for current conditions or a future weather forecast");
@@ -2042,7 +2072,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviews.items.properties.issues.items.enum).toContain("unsupported_room_recall");
     expect(reviews.items.properties.issues.items.enum).toContain("incorrect_temporal_claim");
     expect(reviews.items.properties.issues.items.enum).toContain("gratuitous_time_reference");
-    expect(reviews.items.properties.issues.items.enum).toContain("unfulfilled_explicit_request");
+    expect(reviews.items.properties.issues.items.enum).not.toContain("unfulfilled_explicit_request");
     expect(reviews.items.properties.issues.items.enum).toContain("unsupported_external_evidence_claim");
     expect(reviews.items.properties.issues.items.enum).toContain("diegetic_identity_break");
     expect(reviews.items.properties.issues.items.enum).not.toContain("identity_dishonesty");
@@ -2052,6 +2082,10 @@ describe("multilingual batch candidate-review contract", () => {
     expect(failedIssues).not.toContain("false_evidence_denial");
     expect(failedIssues).not.toContain("unfulfilled_explicit_request");
     expect(failedIssues).toContain("permanent_web_denial");
+
+    const explicitFormat = buildCandidateReviewResponseFormat(explicitRequestReviewInput()) as any;
+    const explicitIssues = explicitFormat.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
+    expect(explicitIssues).toContain("unfulfilled_explicit_request");
   });
 
   it("accepts quoted multilingual discussion as clean and rejects missing or duplicate persona reviews", () => {
@@ -2267,7 +2301,7 @@ describe("multilingual batch candidate-review contract", () => {
     }).success).toBe(false);
   });
 
-  it("rejects the request-fulfilment issue without every trusted server gate", () => {
+  it("rejects the request-fulfilment issue without trusted turn gates and fails closed for a non-owner", () => {
     const blocked = {
       reviews: [{
         personaId: "ai-mira",
@@ -2291,7 +2325,7 @@ describe("multilingual batch candidate-review contract", () => {
     )).toBeUndefined();
   });
 
-  it("does not confuse a required moderator, evidence or dissent line with explicit-request ownership", () => {
+  it("does not approve a contradictory review of a required moderator, evidence or dissent line", () => {
     const blocked = {
       reviews: [{
         personaId: "ai-mira",
@@ -2333,7 +2367,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("complete pragmatic meaning in context");
     expect(prompt).toContain("never words, phrase templates, punctuation or translated keywords");
     expect(prompt).toContain("the designated owner must actually supply that outcome");
-    expect(prompt).toContain("mustReply alone may instead represent moderation, evidence, dissent or another social role");
+    expect(prompt).toContain("mustReply alone may instead represent moderation, typed evidence, dissent or another social role");
     expect(prompt).toContain("a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment");
     expect(prompt).toContain("mustReportCapabilityFailure is true");
     expect(prompt).toContain("one concise, temporary, in-character report of that concrete constraint is the required response");
@@ -2344,6 +2378,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("A context row proves only that it appeared nearby");
     expect(prompt).toContain("capabilityContext.externalEvidenceAvailable is true");
     expect(prompt).toContain("validated structured evidence");
+    expect(prompt).toContain("it must identify that exact gap and cite the inspected supplied source IDs");
     expect(prompt).toContain("resident model having no personal tool is irrelevant");
     expect(prompt).toContain("unsupported_room_recall");
     expect(prompt).toContain("A non-witness may accurately say it checked retained room history");

@@ -347,6 +347,43 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     }
   });
 
+  it("preserves a valid primary route when only the supplementary verifier times out", async () => {
+    vi.useFakeTimers();
+    try {
+      let completionCalls = 0;
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        completionCalls += 1;
+        if (completionCalls === 1) return turnAnalysisCompletion();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }));
+      const base = turnInput("verifier-timeout-keeps-primary");
+      const analysis = new LmStudioClient().analyzeTurn({
+        ...base,
+        recentMessages: [{
+          id: "prior-message",
+          authorId: "human-jaw-b",
+          authorName: "Jaw_B",
+          content: "Kan du kontrollera uppgiften?",
+        }],
+      });
+
+      await vi.advanceTimersByTimeAsync(8_000);
+      await expect(analysis).resolves.toMatchObject({
+        source: "lm",
+        failureReason: null,
+        evidence: { action: "read_url", urlRef: "latest:0" },
+      });
+      expect(completionCalls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("preempts a stale same-channel public scene so the newer turn router cannot time out behind it", async () => {
     let startedScene: (() => void) | undefined;
     const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
@@ -1242,6 +1279,88 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(bodies[1].messages[0].content).toContain("diegetic_identity_break");
     expect(JSON.parse(bodies[2].messages[1].content).premise).toContain("one bounded full-scene retry");
     expect(bodies[2].messages[0].content).toContain("ordinary human community members");
+  });
+
+  it("carries a failed evidence review into the one bounded full-scene recovery", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const gap = "De läsbara sidorna saknar exakta globala indexnivåer och procentförändringar.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: mira.id, content: "Jag får inte fram någon live-data." }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["evidence_ungrounded"],
+          rewriteInstruction: "Name the exact missing values and cite the inspected sources.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{ personaId: mira.id, content: gap, sourceIds: ["S1", "S2"] }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Guest", content: "I resten av världen då?" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "börsen i resten av världen idag",
+        retrievedAt: "2026-07-15T17:30:00.000Z",
+        results: [
+          { id: "S1", title: "World markets one", url: "https://example.com/one", snippet: "No exact numeric levels in the readable page text." },
+          { id: "S2", title: "World markets two", url: "https://example.org/two", snippet: "No exact percentage moves in the readable page text." },
+        ],
+      },
+      evidenceOutcome: "succeeded",
+      urlPublicationPolicy: "server_card",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({ content: gap, sourceIds: ["S1", "S2"] })]);
+    expect(bodies).toHaveLength(4);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    expect(firstReview.candidates[0]).toMatchObject({
+      personaId: mira.id,
+      mustReply: true,
+      mustFulfillRequest: false,
+    });
+    const retryScene = JSON.parse(bodies[2].messages[1].content);
+    expect(retryScene.premise).toContain("earlier draft failed the evidence contract");
+    expect(bodies[2].messages[0].content).toContain("Never write any source identifier in visible message content");
   });
 
   it("recovers one rejected ordinary sole-resident DM without manufacturing request ownership", async () => {

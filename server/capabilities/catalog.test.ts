@@ -28,6 +28,7 @@ describe("declarative capability catalog", () => {
     expect(TURN_CAPABILITIES).toEqual([
       "read_url",
       "web_search",
+      "market_snapshot",
       "local_datetime",
       "weather_forecast",
     ]);
@@ -45,6 +46,7 @@ describe("declarative capability catalog", () => {
   it("classifies generic discovery, exact-source reads and narrow structured lookups declaratively", () => {
     expect(CAPABILITY_CATALOG.web_search.routingClass).toBe("generic_external_default");
     expect(CAPABILITY_CATALOG.read_url.routingClass).toBe("exact_source");
+    expect(CAPABILITY_CATALOG.market_snapshot.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.local_datetime.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.weather_forecast.routingClass).toBe("narrow_structured");
     expect(isExternalEvidenceCapability("local_datetime")).toBe(false);
@@ -71,11 +73,12 @@ describe("declarative capability catalog", () => {
     values: Partial<CapabilityArgumentValues>;
   }>([
     { capability: "web_search", values: { q: "今日のニュース", m: "news" } },
+    { capability: "market_snapshot", values: { l: "OMXS30" } },
     { capability: "local_datetime", values: { z: "Asia/Tokyo", k: "current_time", l: "東京" } },
     { capability: "weather_forecast", values: { l: "Ciudad de México" } },
   ])("accepts only the declared argument shape for $capability", ({ capability, values }) => {
     const valid = validateCapabilityArgumentShape(capability, { ...emptyArguments(), ...values });
-    expect(valid).toEqual({ valid: true, missing: [], forbidden: [], conditional: [] });
+    expect(valid).toEqual({ valid: true, missing: [], forbidden: [], conditional: [], invalidValue: [] });
 
     const foreignField = capability === "web_search" ? { l: "extra" } : { q: "extra" };
     const invalid = validateCapabilityArgumentShape(capability, {
@@ -86,6 +89,17 @@ describe("declarative capability catalog", () => {
     expect(invalid.valid).toBe(false);
     expect(invalid.forbidden).not.toEqual([]);
     expect(invalid.message).toBe(CAPABILITY_CATALOG[capability].validationMessage);
+  });
+
+  it("rejects provider identifiers outside a capability's declarative fixed set", () => {
+    expect(validateCapabilityArgumentShape("market_snapshot", {
+      ...emptyArguments(),
+      l: "NASDAQ",
+    })).toMatchObject({ valid: false, invalidValue: ["l"] });
+    expect(validateCapabilityArgumentShape("market_snapshot", {
+      ...emptyArguments(),
+      l: "DJUS",
+    }).valid).toBe(true);
   });
 
   it("allows read_url mode only for a server-confirmed structural root", () => {
@@ -127,6 +141,6 @@ describe("declarative capability catalog", () => {
     const verifier = buildCapabilityRoutingGuidance(["web_search", "local_datetime"], "verifier");
     expect(verifier).toContain("- web_search: requires q and m");
     expect(verifier).toContain("- local_datetime: requires a valid IANA z");
-    expect(verifier).toContain("retain the guest request's language and writing system");
+    expect(verifier).toContain("Retain the guest request's language and writing system");
   });
 });

@@ -394,6 +394,24 @@ const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonC
   peer_echo: "near_duplicate_peer",
 };
 
+const reviewedRecoveryPolicy = (
+  personaIds: readonly string[],
+  reviews: ReadonlyMap<string, CandidateLineReview> | undefined,
+): string => {
+  if (!reviews) return "";
+  const issues = new Set(personaIds.flatMap((personaId) => reviews.get(personaId)?.issues ?? []));
+  if (
+    issues.has("evidence_ungrounded") ||
+    issues.has("evidence_irrelevant") ||
+    issues.has("false_evidence_denial") ||
+    issues.has("permanent_web_denial") ||
+    issues.has("unsupported_external_evidence_claim")
+  ) {
+    return " Trusted recovery correction: the earlier draft failed the evidence contract. Use only supplied evidence and attach the supporting source IDs as metadata. If the readable supplied evidence genuinely lacks the requested datum, name exactly that missing datum and make no unrelated factual substitute, broad inability claim or access claim.";
+  }
+  return "";
+};
+
 interface SceneQueueItem {
   type: "scene";
   id: number;
@@ -517,6 +535,13 @@ const forwardAbort = (controller: AbortController, signal?: AbortSignal): (() =>
   else signal.addEventListener("abort", abort, { once: true });
   return () => signal.removeEventListener("abort", abort);
 };
+
+// The verifier is supplementary to a schema-valid primary route. Reserve
+// enough of the hard turn deadline to return that primary cleanly when the
+// local model is busy instead of letting the outer timer replace it with a
+// fail-closed empty analysis.
+const EVIDENCE_PLAN_VERIFIER_TIMEOUT_MS = 8_000;
+const TURN_ANALYSIS_SETTLE_MARGIN_MS = 750;
 
 const parseVisualObservation = (raw: unknown): ParsedVisualObservation | undefined => {
   const completion = completionSchema.safeParse(raw);
@@ -894,7 +919,7 @@ ${capabilityAvailabilityRule}
 ${externalEvidenceClaimRule}
 ${serverCardRule}
 - Never invent, autocomplete or guess a URL. A visible link may appear only when that exact URL occurs in the latest human trigger or supplied research; otherwise name the title, artist or source in plain text.
-- Source IDs are metadata only. Never write bracketed source IDs such as [S1] in the visible message content; the UI renders source links separately.
+- Source IDs are metadata only. Never write any source identifier in visible message content—not S1, s1, [S1], “source S1” or a similar rendering. Put the exact allowed ID only in sourceIds; the UI renders source links separately.
 - ${required}
 - When research is supplied, include only the source IDs actually supporting that message. Otherwise sourceIds must be [].
 - Return only {"messages":[{"personaId":"…","content":"…","sourceIds":[]}]}.`;
@@ -1374,25 +1399,44 @@ export class LmStudioClient {
 
       if (shouldVerifyEvidencePlan(input, verificationPrimary)) {
         const verifierInput = createEvidencePlanVerifierInput(input, verificationPrimary);
-        try {
-          const verifierRaw = await this.callEvidencePlanVerification(verifierInput, model, signal);
-          if (signal.aborted || performance.now() >= deadlineAt) {
-            return createFailClosedTurnAnalysis("timeout");
-          }
-          const verifierCompletion = completionSchema.safeParse(verifierRaw);
-          const verifierContent = verifierCompletion.success
-            ? verifierCompletion.data.choices[0]?.message.content
-            : undefined;
-          const verification = verifierContent
-            ? parseEvidencePlanVerifierContent(verifierContent, verifierInput)
-            : undefined;
-          if (verification) analysis = mergeVerifiedEvidencePlan(primary, verification);
-        } catch {
-          // This verifier is a bounded fail-closed supplement. Its own
-          // transport/schema failure must never erase an otherwise valid
-          // primary classification or manufacture a tool request.
-          if (signal.aborted || performance.now() >= deadlineAt) {
-            return createFailClosedTurnAnalysis("timeout");
+        const verifierBudgetMs = Math.min(
+          EVIDENCE_PLAN_VERIFIER_TIMEOUT_MS,
+          Math.max(0, deadlineAt - performance.now() - TURN_ANALYSIS_SETTLE_MARGIN_MS),
+        );
+        if (verifierBudgetMs > 0) {
+          const verifierController = new AbortController();
+          const stopForwardingAbort = forwardAbort(verifierController, signal);
+          const verifierTimeout = setTimeout(
+            () => verifierController.abort(new DOMException("Evidence-plan verifier deadline exceeded", "TimeoutError")),
+            verifierBudgetMs,
+          );
+          try {
+            const verifierRaw = await this.callEvidencePlanVerification(
+              verifierInput,
+              model,
+              verifierController.signal,
+            );
+            if (signal.aborted || performance.now() >= deadlineAt) {
+              return createFailClosedTurnAnalysis("timeout");
+            }
+            const verifierCompletion = completionSchema.safeParse(verifierRaw);
+            const verifierContent = verifierCompletion.success
+              ? verifierCompletion.data.choices[0]?.message.content
+              : undefined;
+            const verification = verifierContent
+              ? parseEvidencePlanVerifierContent(verifierContent, verifierInput)
+              : undefined;
+            if (verification) analysis = mergeVerifiedEvidencePlan(primary, verification);
+          } catch {
+            // This verifier is a bounded supplement. Its own timeout,
+            // transport or schema failure must never erase an otherwise valid
+            // primary classification or manufacture a tool request.
+            if (signal.aborted || performance.now() >= deadlineAt) {
+              return createFailClosedTurnAnalysis("timeout");
+            }
+          } finally {
+            stopForwardingAbort();
+            clearTimeout(verifierTimeout);
           }
         }
       }
@@ -1453,7 +1497,7 @@ export class LmStudioClient {
     try {
       return await this.backend.complete(body, signal);
     } catch (error) {
-      this.connected = false;
+      if (!signal.aborted) this.connected = false;
       if (error instanceof ModelBackendError) throw new LmHttpError(error.message, error.status);
       throw error;
     }
@@ -1668,9 +1712,10 @@ export class LmStudioClient {
       const missingActors = request.selected.filter((persona) => missingRequiredIds.includes(persona.id));
       const retryOwnerIds = missingRequiredIds.filter((personaId) => explicitOwnerIds.includes(personaId));
       const actorNames = missingActors.map((persona) => persona.name).join(", ");
+      const reviewCorrection = reviewedRecoveryPolicy(missingRequiredIds, semanticReviews);
       const completionPremise = retryOwnerIds.length > 0
-        ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: complete the actual triggering request in this message now. An offer, promise, progress report, permission request or adjacent substitute is not completion. Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.`
-        : `${actorNames || "The sole selected resident"} is the only resident in this direct conversation and the first candidate did not survive review. This is the one bounded full-scene recovery: respond directly and relevantly to the complete triggering turn now, preserving the supplied transcript and evidence. Do not change subject merely to produce a line and do not invent an explicit request that the human did not make.`;
+        ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: complete the actual triggering request in this message now. An offer, promise, progress report, permission request or adjacent substitute is not completion. Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
+        : `${actorNames || "The sole selected resident"} is the only resident in this direct conversation and the first candidate did not survive review. This is the one bounded full-scene recovery: respond directly and relevantly to the complete triggering turn now, preserving the supplied transcript and evidence. Do not change subject merely to produce a line and do not invent an explicit request that the human did not make.${reviewCorrection}`;
       try {
         const retryLines = await this.perform(
           {
@@ -1770,6 +1815,10 @@ export class LmStudioClient {
       : undefined;
     const requestOwnerIds = new Set(explicitRequestOwnerIds(request));
     const failureReporterIds = new Set(failedCapabilityReporterIds(request));
+    const capabilityOwnsFulfilment = Boolean(
+      request.capabilityContext?.plannedAction &&
+      request.capabilityContext.executionStatus !== "not_requested",
+    );
     const candidates = lines.flatMap((line) => {
       const persona = request.selected.find((candidate) => candidate.id === line.personaId);
       if (!persona) return [];
@@ -1789,7 +1838,13 @@ export class LmStudioClient {
         content: line.content.slice(0, 500),
         sourceIds: line.sourceIds,
         mustReply: request.mustReplyIds?.includes(line.personaId) ?? false,
-        mustFulfillRequest: requestOwnerIds.has(line.personaId) && !failureReporterIds.has(line.personaId),
+        // Self-contained artifacts use the explicit-request contract. A typed
+        // capability scene instead uses its evidence/temporal grounding
+        // contract, which can truthfully establish that readable sources omit
+        // the requested detail without being mislabeled as an evasion.
+        mustFulfillRequest: requestOwnerIds.has(line.personaId) &&
+          !failureReporterIds.has(line.personaId) &&
+          !capabilityOwnsFulfilment,
         mustReportCapabilityFailure: failureReporterIds.has(line.personaId),
         surfaceStylePlan: {
           visibleAffect: surfaceStyle.visibleAffect,

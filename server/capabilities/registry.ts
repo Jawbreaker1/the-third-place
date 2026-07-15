@@ -1,3 +1,4 @@
+import { z } from "zod";
 import {
   hasSpecificSiteResearchResults,
   type ResearchBroker,
@@ -66,6 +67,11 @@ export interface WebSearchInvocation extends CapabilityInvocationBase {
   searchRequest: ResearchRequest;
 }
 
+export interface MarketSnapshotInvocation extends CapabilityInvocationBase {
+  capability: "market_snapshot";
+  marketLabel: string;
+}
+
 export interface LocalDateTimeInvocation extends CapabilityInvocationBase {
   capability: "local_datetime";
   timeZone: string;
@@ -82,6 +88,7 @@ export interface WeatherForecastInvocation extends CapabilityInvocationBase {
 export type CapabilityInvocation =
   | ReadUrlInvocation
   | WebSearchInvocation
+  | MarketSnapshotInvocation
   | LocalDateTimeInvocation
   | WeatherForecastInvocation;
 
@@ -448,12 +455,12 @@ const readUrlAdapter: CapabilityAdapter<ReadUrlInvocation> = {
     const automatic = context.automatic || invocation.pageReadRequest.initiator === "automatic";
     const groundingInstruction = automatic
       ? "Make one concise, natural comment on the shared page with at least one concrete detail supported by the primary supplied source and one room-relevant reaction, implication or question. Attach that server-issued source ID; a title-only acknowledgement or tooling narration is not a response."
-      : "Answer the human's actual request with at least one concrete detail supported by freshResearch. Attach the supporting server-issued source ID and do not substitute a title-only reaction, capability statement or unsupported guess.";
+      : "Answer the human's actual request with at least one concrete detail supported by freshResearch. If the readable source genuinely omits the requested detail, state that specific gap naturally instead of inventing it or claiming the page was inaccessible. Attach the supporting server-issued source ID and do not substitute a title-only reaction, capability statement or unsupported guess.";
     const premise = success
       ? automatic
         ? `${context.actorName} opened the exact server-bound page that the human just shared and is solely responsible for one grounded response. ${groundingInstruction}`
         : `${context.actorName} opened the server-bound linked source and is solely responsible for answering from the supplied page evidence. ${groundingInstruction}`
-      : `${context.actorName} alone reports in the human's classified language that this specific server-bound linked-page attempt ${resolution.state === "retrieved_only" ? "returned metadata but no safely readable answer-bearing page" : "returned no readable evidence"}. It is a temporary result; do not invent a cause or page contents.`;
+      : `${context.actorName} alone reports in the human's classified language that this specific linked-page attempt did not yield readable material for the requested answer this time. Describe only that temporary human-visible result, without implementation jargon; do not invent a cause or page contents.`;
     return {
       ...(success ? { research: resolution.research } : {}),
       evidenceOutcome: success ? "succeeded" : "failed",
@@ -512,17 +519,109 @@ const webSearchAdapter: CapabilityAdapter<WebSearchInvocation> = {
   },
   scene: (invocation, resolution, context) => {
     const success = resolution.state === "grounding_available" && resolution.research;
-    const groundingInstruction = "Answer the classified external-information request only from freshResearch and attach only source IDs that support each claim. Search rank, title or snippet alone is never evidence.";
+    const groundingInstruction = "Answer the classified external-information request only from freshResearch and attach only source IDs that support each claim. Search rank, title or search snippet alone is never evidence. If the readable supplied pages genuinely omit the requested fact, name that exact missing datum naturally, attach the source IDs for the inspected pages that establish the gap, and stop there; do not broaden it into a permanent or generic no-live-data claim and do not substitute unrelated background.";
     const premise = success
       ? `${context.actorName} ran the classified fresh lookup and is responsible for the sourced answer. ${groundingInstruction}`
-      : resolution.state === "retrieved_only"
-        ? `${context.actorName} alone reports in the human's classified language that the lookup returned result metadata but no safely readable answer-bearing page. Treat this as a temporary bounded outcome and invent no current facts.`
-        : `${context.actorName} alone reports in the human's classified language that this specific fresh lookup returned no usable source. Treat it as temporary and invent no current facts.`;
+      : `${context.actorName} alone reports in the human's classified language that this specific lookup did not yield readable material for the requested answer this time. Describe only that temporary human-visible result, without search-system or implementation jargon, and invent no current facts.`;
     return {
       ...(success ? { research: resolution.research } : {}),
       evidenceOutcome: success ? "succeeded" : "failed",
       groundingInstruction,
       premise,
+      externalEvidence: true,
+      suppressResponse: false,
+      responsePolicy: resolution.responsePolicy,
+    };
+  },
+};
+
+const MARKET_OVERVIEW_URL = new URL("https://www.avanza.se/borsen-idag.html");
+const marketOverviewEvidenceSchema = z.object({
+  sourceKind: z.literal("market_overview"),
+  retrievedAt: z.string().datetime(),
+  scope: z.literal("headline indexes only; not individual equities"),
+  indexes: z.array(z.object({
+    name: z.string().min(1).max(100),
+    symbol: z.string().min(1).max(24),
+    level: z.number().finite().positive().max(1_000_000_000),
+    dailyChangePercent: z.number().finite().min(-100).max(100),
+    updatedLocalTime: z.string().min(4).max(8),
+    updatedAt: z.string().datetime(),
+  }).strict()).max(8),
+}).strict();
+
+const selectMarketSnapshot = (
+  packet: ResearchPacket | undefined,
+  symbol: string,
+): ResearchPacket | undefined => {
+  if (packet?.kind !== "page") return undefined;
+  const source = packet.results.find((result) =>
+    result.id === "S1" && result.url === MARKET_OVERVIEW_URL.toString());
+  if (!source) return undefined;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(source.snippet);
+  } catch {
+    return undefined;
+  }
+  const parsed = marketOverviewEvidenceSchema.safeParse(raw);
+  if (!parsed.success) return undefined;
+  const selected = parsed.data.indexes.find((index) => index.symbol === symbol);
+  if (!selected) return undefined;
+  return {
+    ...packet,
+    results: [{
+      ...source,
+      snippet: JSON.stringify({ ...parsed.data, indexes: [selected] }),
+    }],
+  };
+};
+
+const marketSnapshotAdapter: CapabilityAdapter<MarketSnapshotInvocation> = {
+  id: "market_snapshot",
+  available: () =>
+    process.env.LINK_READER_ENABLED !== "false" &&
+    process.env.MARKET_SNAPSHOT_ENABLED !== "false",
+  compile: (analysis) => {
+    if (
+      analysis.evidence.action !== "market_snapshot" ||
+      !analysis.evidence.locationLabel
+    ) return undefined;
+    const base = baseInvocation("market_snapshot", analysis, primarySourcePolicy, false);
+    return base ? {
+      ...base,
+      capability: "market_snapshot",
+      marketLabel: analysis.evidence.locationLabel,
+    } : undefined;
+  },
+  execute: async (invocation, requesterId, runtime) => {
+    const packet = await runtime.pageReader.read({
+      url: MARKET_OVERVIEW_URL,
+      requestedAt: new Date(runtime.now()).toISOString(),
+      intent: invocation.goal,
+      retry: invocation.requestKind !== "execute",
+      source: "message",
+      initiator: "automatic",
+    }, requesterId).catch((error) => {
+      console.warn("Typed market snapshot failed safely:", error instanceof Error ? error.message : error);
+      return undefined;
+    });
+    const selectedPacket = selectMarketSnapshot(packet, invocation.marketLabel);
+    return selectedPacket && packetHasPrimaryContent(selectedPacket)
+      ? groundingAvailable(invocation, selectedPacket)
+      : failed(invocation, "empty");
+  },
+  scene: (invocation, resolution, context) => {
+    const success = resolution.state === "grounding_available" && resolution.research;
+    const groundingInstruction = "Answer only for the specifically requested headline index from the single-row validated structured market snapshot in freshResearch. Describe it as the provider's latest reported level and reported session change, include the exact absolute updatedAt date/time (the local display time may be added), preserve the sign and attach the primary server-issued source ID. Do not claim that the market is open or that the observation belongs to the current calendar day unless the supplied absolute timestamp proves it. The packet's declared scope is not a whole-world survey; do not generalize it, give advice or invent absent instruments.";
+    return {
+      ...(success ? { research: resolution.research } : {}),
+      evidenceOutcome: success ? "succeeded" : "failed",
+      ...(success ? { urlPublicationPolicy: "server_card" as const } : {}),
+      groundingInstruction,
+      premise: success
+        ? `${context.actorName} received a validated structured headline-index snapshot and alone answers the requested latest index-report question. ${groundingInstruction}`
+        : `${context.actorName} alone reports in the human's classified language that the requested headline-index snapshot did not return a usable current value this time. Treat it as temporary, avoid implementation jargon and invent no market values.`,
       externalEvidence: true,
       suppressResponse: false,
       responsePolicy: resolution.responsePolicy,
@@ -625,6 +724,7 @@ const weatherForecastAdapter: CapabilityAdapter<WeatherForecastInvocation> = {
 const builtInAdapters: readonly CapabilityAdapter[] = [
   readUrlAdapter as CapabilityAdapter,
   webSearchAdapter as CapabilityAdapter,
+  marketSnapshotAdapter as CapabilityAdapter,
   localDateTimeAdapter as CapabilityAdapter,
   weatherForecastAdapter as CapabilityAdapter,
 ];

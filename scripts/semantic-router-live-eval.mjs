@@ -61,16 +61,50 @@ const cases = [
       value.capabilities.discussed.includes("weather_forecast"),
   },
   {
+    id: "sv-omxs30-snapshot",
+    text: "Förlåt. Har ni koll på OMX30?",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "market_snapshot" &&
+      value.evidence.locationLabel === "OMXS30" &&
+      value.capabilities.discussed.includes("market_snapshot") &&
+      value.intent.kind !== "capability_question" &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
+    id: "de-omxs30-snapshot",
+    text: "Kann jemand den zuletzt gemeldeten Stand und die Sitzungsänderung des OMX30 prüfen?",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "market_snapshot" &&
+      value.evidence.locationLabel === "OMXS30" &&
+      value.capabilities.discussed.includes("market_snapshot"),
+  },
+  {
+    id: "sv-global-market-followup",
+    text: "I resten av världen då?",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    recentMessages: [
+      { id: "sv-global-market-1", authorId: "live-eval-human", authorName: "EvalGuest", content: "Har ni koll på vad som hänt på börsen idag?" },
+      { id: "sv-global-market-2", authorId: "ai-mira", authorName: "Mira", content: "OMX Stockholm 30 är ned 0,38 procent i den senaste rapporteringen." },
+    ],
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.query?.toLocaleLowerCase().includes("värld") &&
+      value.evidence.query?.toLocaleLowerCase().includes("idag") &&
+      value.capabilities.discussed.includes("web_search"),
+  },
+  {
     id: "es-current-market",
     text: "¿Alguien puede buscar la cotización actual de Telefónica?",
-    capabilities: ["web_search", "local_datetime"],
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
     check: (value) => value.evidence.action === "web_search" && value.evidence.query?.toLocaleLowerCase().includes("telefónica"),
   },
   {
     id: "sv-screenshot-current-tesla",
     text: "Någon som har sett hur det står till med Tessla aktien idag?",
     channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
-    capabilities: ["web_search", "local_datetime"],
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
     check: (value) => value.evidence.action === "web_search" &&
       value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
       value.capabilities.discussed.includes("web_search"),
@@ -84,7 +118,7 @@ const cases = [
       { id: "sv-market-1", authorId: "live-eval-human", authorName: "EvalGuest", content: "Någon som har sett hur det står till med Tessla aktien idag?" },
       { id: "sv-market-2", authorId: "ai-mira", authorName: "Mira", content: "Jag har ingen live-koppling till börsen, så jag kan tyvärr inte se exakt vad den står i just nu." },
     ],
-    capabilities: ["web_search", "local_datetime"],
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
     check: (value) => value.evidence.action === "web_search" &&
       value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
       ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
@@ -99,7 +133,7 @@ const cases = [
       { id: "sv-market-5", authorId: "live-eval-human", authorName: "EvalGuest", content: "@mira kolla avanza!" },
       { id: "sv-market-6", authorId: "ai-mira", authorName: "Mira", content: "haha, jag har ju inte tillgång till deras app!" },
     ],
-    capabilities: ["web_search", "local_datetime"],
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
     check: (value) => value.evidence.action === "web_search" &&
       value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
       ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
@@ -430,13 +464,13 @@ const cases = [
 
 const lm = new LmStudioClient();
 let modelHealth;
-for (let attempt = 0; attempt < 3; attempt += 1) {
+for (let attempt = 0; attempt < 6; attempt += 1) {
   modelHealth = await lm.probe();
   if (modelHealth.connected) break;
-  await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
 }
 if (!modelHealth.connected) {
-  throw new Error(`Semantic live eval requires a connected model (${modelHealth.label}).`);
+  throw new Error(`Semantic live eval requires a connected model (${modelHealth.label}: ${modelHealth.detail ?? "no detail"}).`);
 }
 const requestedCaseIds = new Set(process.argv.slice(2));
 const selectedCases = requestedCaseIds.size > 0
