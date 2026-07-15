@@ -85,6 +85,9 @@ const modelOutput = (): any => ({
     timeZone: "Asia/Tokyo",
     timeKind: "current_time",
     locationLabel: "東京",
+    competitionTarget: null,
+    footballView: null,
+    footballFilter: null,
   },
   capabilities: {
     discussed: ["local_datetime"],
@@ -116,11 +119,35 @@ const compactWeatherOutput = (overrides: Record<string, any> = {}): any => ({
     z: null,
     k: null,
     l: "Göteborg",
+    c: null,
+    w: null,
+    f: null,
   },
   c: { d: ["weather_forecast"], r: "execute", a: false, i: false, l: false, x: 0.97 },
   h: { n: "none", q: null, x: 0.95 },
   y: [],
   ...overrides,
+});
+
+const compactFootballOutput = (
+  view: "overview" | "today" | "recent_results" | "upcoming" | "standings" = "overview",
+  focus: string | null = null,
+): any => compactWeatherOutput({
+  e: {
+    a: "football_data",
+    x: 0.99,
+    g: "VM 2026 matcher och resultat",
+    q: null,
+    u: null,
+    m: null,
+    z: null,
+    k: null,
+    l: null,
+    c: "FIFA_WC_2026",
+    w: view,
+    f: focus,
+  },
+  c: { d: ["football_data"], r: "execute", a: false, i: false, l: false, x: 0.99 },
 });
 
 describe("multilingual semantic router contract", () => {
@@ -264,6 +291,92 @@ describe("multilingual semantic router contract", () => {
       intent: { kind: "request" },
       evidence: { action: "weather_forecast", locationLabel: "Göteborg" },
     });
+  });
+
+  it("maps compact football c/w/f arguments while keeping live, news and tactics on web search", () => {
+    const footballTurn = input({
+      latestMessage: {
+        id: "football-1",
+        authorId: "human-1",
+        authorName: "Hana",
+        content: "Vilka matcher spelar Sverige härnäst i VM 2026?",
+      },
+      urlCandidates: [],
+      availableCapabilities: ["football_data", "web_search"],
+    });
+
+    for (const view of ["overview", "today", "recent_results", "upcoming", "standings"] as const) {
+      expect(parseTurnAnalysisContent(
+        JSON.stringify(compactFootballOutput(view, view === "upcoming" ? "Sweden" : null)),
+        footballTurn,
+      )).toMatchObject({
+        evidence: {
+          action: "football_data",
+          competitionTarget: "FIFA_WC_2026",
+          footballView: view,
+          footballFilter: view === "upcoming" ? "Sweden" : null,
+          query: null,
+          urlRef: null,
+          searchMode: null,
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+        capabilities: { discussed: ["football_data"], requestKind: "execute" },
+      });
+    }
+
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compactFootballOutput(),
+      e: { ...compactFootballOutput().e, c: "WORLD_CUP" },
+    }), footballTurn)).toBeUndefined();
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compactFootballOutput(),
+      e: { ...compactFootballOutput().e, w: "live" },
+    }), footballTurn)).toBeUndefined();
+
+    const webCases = [
+      { goal: "pågående VM-match live just nu", query: "VM 2026 live score pågående match", mode: "web" },
+      { goal: "senaste nyheterna från VM 2026", query: "senaste nyheterna VM 2026", mode: "news" },
+      { goal: "taktisk analys av Sveriges presspel", query: "VM 2026 Sverige taktisk analys presspel", mode: "web" },
+    ] as const;
+    for (const item of webCases) {
+      const output = compactWeatherOutput({
+        e: {
+          ...compactWeatherOutput().e,
+          a: "web_search",
+          g: item.goal,
+          q: item.query,
+          m: item.mode,
+          l: null,
+        },
+        c: { d: ["web_search"], r: "execute", a: false, i: false, l: false, x: 0.99 },
+      });
+      expect(parseTurnAnalysisContent(JSON.stringify(output), footballTurn)).toMatchObject({
+        evidence: {
+          action: "web_search",
+          goal: item.goal,
+          query: item.query,
+          competitionTarget: null,
+          footballView: null,
+          footballFilter: null,
+        },
+      });
+    }
+
+    const format = buildTurnAnalysisResponseFormat(footballTurn) as any;
+    const evidenceProperties = format.json_schema.schema.properties.e.properties;
+    expect(evidenceProperties.a.enum).toEqual(["none", "football_data", "web_search"]);
+    expect(evidenceProperties.c.anyOf[0].enum).toEqual(["FIFA_WC_2026"]);
+    expect(evidenceProperties.w.anyOf[0].enum).toEqual([
+      "overview", "today", "recent_results", "upcoming", "standings",
+    ]);
+    expect(evidenceProperties.f.anyOf[0]).toMatchObject({ type: "string", maxLength: 120 });
+
+    const prompt = buildTurnAnalysisSystemPrompt();
+    expect(prompt).toContain("requests for an in-progress live score");
+    expect(prompt).toContain("tactical or causal analysis");
+    expect(prompt).toContain("remain web_search");
   });
 
   it("recovers an omitted web provider query only from the declared bounded goal", () => {
@@ -1677,7 +1790,7 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(properties.u.anyOf[0].enum).toEqual(["latest:0"]);
     expect(properties.d.maxItems).toBe(1);
     expect(format.json_schema.schema.required).toEqual([
-      "t", "tx", "v", "a", "r", "d", "x", "g", "q", "u", "m", "z", "k", "l",
+      "t", "tx", "v", "a", "r", "d", "x", "g", "q", "u", "m", "z", "k", "l", "c", "w", "f",
     ]);
     const weatherFormat = buildEvidencePlanVerifierResponseFormat(createEvidencePlanVerifierInput(
       stockTurn("明日の札幌の天気は？", {

@@ -20,6 +20,16 @@ import {
 } from "../marketData/catalog.js";
 import { MarketSnapshotService } from "../marketData/service.js";
 import type { MarketSnapshot } from "../marketData/types.js";
+import {
+  FootballCompetitionProvider,
+  type FootballCompetitionSnapshot,
+} from "../footballCompetition.js";
+import {
+  isFootballCompetitionId,
+  isFootballDataView,
+  type FootballCompetitionId,
+  type FootballDataView,
+} from "../footballData/catalog.js";
 import { YahooChartMarketDataProvider } from "../marketData/providers/yahooChart.js";
 import {
   refreshLocalDateTime,
@@ -46,6 +56,7 @@ import {
 export type { ResearchPacket } from "../researchBroker.js";
 export type WeatherForecastCapabilityProvider = Pick<WeatherForecastProvider, "forecast">;
 export type MarketSnapshotCapabilityProvider = Pick<MarketSnapshotService, "snapshot">;
+export type FootballCompetitionCapabilityProvider = Pick<FootballCompetitionProvider, "snapshot">;
 
 export type CapabilityExecutionRequestKind = "execute" | "retry" | "correct_limitation";
 export type EvidenceResolutionState = "grounding_available" | "retrieved_only" | "failed_temporary";
@@ -82,6 +93,13 @@ export interface MarketSnapshotInvocation extends CapabilityInvocationBase {
   marketTargetId: MarketTargetId;
 }
 
+export interface FootballDataInvocation extends CapabilityInvocationBase {
+  capability: "football_data";
+  competitionId: FootballCompetitionId;
+  view: FootballDataView;
+  focus?: string;
+}
+
 export interface LocalDateTimeInvocation extends CapabilityInvocationBase {
   capability: "local_datetime";
   timeZone: string;
@@ -102,6 +120,7 @@ export type CapabilityInvocation =
   | ReadUrlInvocation
   | WebSearchInvocation
   | MarketSnapshotInvocation
+  | FootballDataInvocation
   | LocalDateTimeInvocation
   | WeatherForecastInvocation;
 
@@ -166,6 +185,7 @@ interface CapabilityRuntimeDependencies {
   pageReader: PageReader;
   researchBroker: Pick<ResearchBroker, "research" | "researchSite">;
   marketSnapshotProvider?: MarketSnapshotCapabilityProvider;
+  footballCompetitionProvider?: FootballCompetitionCapabilityProvider;
   weatherForecastProvider?: WeatherForecastCapabilityProvider;
   now: () => number;
 }
@@ -174,6 +194,7 @@ export interface CapabilityRegistryOptions {
   pageReader: PageReader;
   researchBroker: Pick<ResearchBroker, "research" | "researchSite">;
   marketSnapshotProvider?: MarketSnapshotCapabilityProvider | null;
+  footballCompetitionProvider?: FootballCompetitionCapabilityProvider | null;
   weatherForecastProvider?: WeatherForecastCapabilityProvider | null;
   now?: () => number;
 }
@@ -242,6 +263,9 @@ const analysisArgumentShapeIsValid = (
     z: analysis.evidence.timeZone,
     k: analysis.evidence.timeKind,
     l: analysis.evidence.locationLabel,
+    c: analysis.evidence.competitionTarget,
+    w: analysis.evidence.footballView,
+    f: analysis.evidence.footballFilter,
   }, {
     activeConditions: structuralRoot ? ["structural_root_only"] : [],
   }).valid;
@@ -409,6 +433,73 @@ export const marketSnapshotEvidencePacket = (snapshot: MarketSnapshot): Research
       },
     }),
   })),
+});
+
+const compactFootballScore = (score: FootballCompetitionSnapshot["recentResults"][number]["score"]): unknown =>
+  score ? {
+    ...(score.halftime ? { ht: score.halftime } : {}),
+    ...(score.fulltime ? { ft: score.fulltime } : {}),
+    ...(score.extraTime ? { et: score.extraTime } : {}),
+    ...(score.penalties ? { pens: score.penalties } : {}),
+  } : undefined;
+
+const compactFootballMatch = (match: FootballCompetitionSnapshot["recentResults"][number]) => ({
+  kickoffUtc: match.kickoffUtc,
+  status: match.status,
+  round: match.round,
+  ...(match.group ? { group: match.group } : {}),
+  home: match.homeTeam,
+  away: match.awayTeam,
+  ...(match.score ? { score: compactFootballScore(match.score) } : {}),
+  venue: match.venue,
+});
+
+/** Converts one validated provider batch into a bounded, provider-neutral evidence row. */
+export const footballCompetitionEvidencePacket = (
+  snapshot: FootballCompetitionSnapshot,
+): ResearchPacket => ({
+  kind: "football",
+  query: `${snapshot.targetId}:${snapshot.view}${snapshot.focus ? `:${snapshot.focus}` : ""}`,
+  retrievedAt: snapshot.retrievedAt,
+  results: [{
+    id: "S1",
+    title: `${snapshot.competition.name} fixtures and latest reported results`,
+    url: snapshot.sourceUrl,
+    snippet: JSON.stringify({
+      provider: snapshot.provider,
+      retrievedAt: snapshot.retrievedAt,
+      latency: snapshot.latency,
+      displayTimeZone: snapshot.displayTimeZone,
+      requested: {
+        competition: snapshot.targetId,
+        view: snapshot.view,
+        ...(snapshot.focus ? { focus: snapshot.focus } : {}),
+      },
+      competition: snapshot.competition,
+      coverage: snapshot.coverage,
+      recentResults: snapshot.recentResults.map(compactFootballMatch),
+      awaitingResults: snapshot.awaitingResults.map(compactFootballMatch),
+      upcomingMatches: snapshot.upcomingMatches.map(compactFootballMatch),
+      ...((snapshot.view === "standings" || snapshot.focus) ? {
+        groupStandings: snapshot.groupStandings.map((table) => ({
+          group: table.group,
+          rankingBasis: table.rankingBasis,
+          rows: table.rows.map((row) => ({
+            pos: row.position,
+            team: row.team,
+            p: row.played,
+            w: row.won,
+            d: row.drawn,
+            l: row.lost,
+            gf: row.goalsFor,
+            ga: row.goalsAgainst,
+            gd: row.goalDifference,
+            pts: row.points,
+          })),
+        })),
+      } : {}),
+    }),
+  }],
 });
 
 const groundingAvailable = (
@@ -749,6 +840,61 @@ const marketSnapshotAdapter: CapabilityAdapter<MarketSnapshotInvocation> = {
   },
 };
 
+const footballDataAdapter: CapabilityAdapter<FootballDataInvocation> = {
+  id: "football_data",
+  available: (_context, runtime) => Boolean(runtime.footballCompetitionProvider),
+  compile: (analysis) => {
+    if (
+      analysis.evidence.action !== "football_data" ||
+      !isFootballCompetitionId(analysis.evidence.competitionTarget) ||
+      !isFootballDataView(analysis.evidence.footballView)
+    ) return undefined;
+    const base = baseInvocation("football_data", analysis, primarySourcePolicy, false);
+    const focus = analysis.evidence.footballFilter?.trim();
+    return base ? {
+      ...base,
+      capability: "football_data",
+      competitionId: analysis.evidence.competitionTarget,
+      view: analysis.evidence.footballView,
+      ...(focus ? { focus } : {}),
+    } : undefined;
+  },
+  execute: async (invocation, requesterId, runtime) => {
+    if (!runtime.footballCompetitionProvider) return failed(invocation, "invalid_target");
+    const snapshot = await runtime.footballCompetitionProvider.snapshot({
+      targetId: invocation.competitionId,
+      view: invocation.view,
+      ...(invocation.focus ? { focus: invocation.focus } : {}),
+      requesterId,
+      ...(invocation.requestKind === "execute" ? {} : { cachePolicy: "bypass" as const }),
+    }).catch((error) => {
+      console.warn("Typed football lookup failed safely:", error instanceof Error ? error.message : error);
+      return undefined;
+    });
+    if (!snapshot || snapshot.targetId !== invocation.competitionId || snapshot.view !== invocation.view) {
+      return failed(invocation, "empty");
+    }
+    const packet = footballCompetitionEvidencePacket(snapshot);
+    return packetHasPrimaryContent(packet) ? groundingAvailable(invocation, packet) : failed(invocation, "empty");
+  },
+  scene: (invocation, resolution, context) => {
+    const success = resolution.state === "grounding_available" && resolution.research;
+    const groundingInstruction = "Answer only from the validated structured football snapshot in freshResearch. Treat every score, status and fixture as the provider's latest reported observation at retrievedAt, preserve kickoffUtc and displayTimeZone, and say plainly when a kicked-off match is still awaiting a reported result. Attach the primary server-issued source ID. Respect coverage and the requested view/filter; provisional group tables do not establish official tie-break order. Do not invent live minute, scorers, lineups, injuries, odds, causes, tactical claims or advancement that the supplied rows do not establish.";
+    return {
+      ...(success ? { research: resolution.research } : {}),
+      evidenceOutcome: success ? "succeeded" : "failed",
+      ...(success ? { urlPublicationPolicy: "server_card" as const } : {}),
+      groundingInstruction,
+      premise: success
+        ? `${context.actorName} received one validated provider-neutral football snapshot and alone answers the requested competition question. ${groundingInstruction}`
+        : `${context.actorName} alone reports in the human's classified language that this requested football-data attempt returned no validated result this time. Treat it as temporary, avoid implementation jargon and invent no fixtures, scores or causes.`,
+      externalEvidence: true,
+      suppressResponse: false,
+      responsePolicy: resolution.responsePolicy,
+    };
+  },
+};
+
 const localDateTimeAdapter: CapabilityAdapter<LocalDateTimeInvocation> = {
   id: "local_datetime",
   available: () => true,
@@ -851,6 +997,7 @@ const builtInAdapters: readonly CapabilityAdapter[] = [
   readUrlAdapter as CapabilityAdapter,
   webSearchAdapter as CapabilityAdapter,
   marketSnapshotAdapter as CapabilityAdapter,
+  footballDataAdapter as CapabilityAdapter,
   localDateTimeAdapter as CapabilityAdapter,
   weatherForecastAdapter as CapabilityAdapter,
 ];
@@ -889,6 +1036,10 @@ export class CapabilityRegistry {
             providers: [new YahooChartMarketDataProvider()],
             now,
           }),
+      footballCompetitionProvider: process.env.FOOTBALL_DATA_ENABLED === "false" ||
+        options.footballCompetitionProvider === null
+        ? undefined
+        : options.footballCompetitionProvider ?? new FootballCompetitionProvider({ now }),
       weatherForecastProvider: options.weatherForecastProvider === null
         ? undefined
         : options.weatherForecastProvider ?? (

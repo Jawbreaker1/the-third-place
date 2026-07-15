@@ -60,6 +60,8 @@ import { PageReader } from "./pageReader.js";
 import { CapabilityRegistry } from "./capabilities/registry.js";
 import { MarketSnapshotService } from "./marketData/service.js";
 import { YahooChartMarketDataProvider } from "./marketData/providers/yahooChart.js";
+import { FootballCompetitionProvider } from "./footballCompetition.js";
+import { resolveCommunityTimeZone } from "./timeResolver.js";
 import {
   JsonFileMarketPulseStateStore,
   MarketPulseCoordinator,
@@ -580,6 +582,13 @@ const marketSnapshotProvider = process.env.MARKET_SNAPSHOT_ENABLED === "false"
   : new MarketSnapshotService({
       providers: [new YahooChartMarketDataProvider()],
     });
+const footballCompetitionProvider = process.env.FOOTBALL_DATA_ENABLED === "false"
+  ? null
+  : new FootballCompetitionProvider({
+      displayTimeZone: resolveCommunityTimeZone({
+        configuredTimeZone: process.env.COMMUNITY_TIME_ZONE,
+      }),
+    });
 const marketPulseCoordinator = process.env.MARKET_PULSE_ENABLED === "false"
   ? null
   : new MarketPulseCoordinator(
@@ -600,6 +609,7 @@ const director = new SocialDirector(
   {
     behaviorTuningProvider,
     marketSnapshotProvider,
+    footballCompetitionProvider,
     marketPulseCoordinator,
   },
 );
@@ -618,6 +628,7 @@ const voiceCapabilityRegistry = new CapabilityRegistry({
   researchBroker,
   weatherForecastProvider: null,
   marketSnapshotProvider: null,
+  footballCompetitionProvider: null,
 });
 const voiceDirector = new VoiceDirector({
   runtime: voiceRooms,

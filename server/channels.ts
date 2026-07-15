@@ -13,6 +13,7 @@ export type ExpertiseDomainId =
   | "ai-systems"
   | "software-building"
   | "financial-markets"
+  | "football"
   | "warcraft"
   | "visualisation-3d"
   | "hobbies";
@@ -119,6 +120,8 @@ export interface ChannelProfile {
    * control, global caps, quiet time, voice exclusion and room activity.
    */
   autonomousResearchPriority?: number;
+  /** Content-blind room-selection weight; Admin activity 0 still disables the room completely. */
+  ambientActivityPriority?: number;
   /**
    * Optional typed event/source stream for a room. The identifier selects a
    * fixed server-owned adapter; channel names and message wording never route
@@ -576,6 +579,161 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     ],
     autonomousResearchPriority: 1.8,
     marketPulseSourceSet: "global_markets",
+  },
+  {
+    public: {
+      id: "football-talk",
+      name: "football-talk",
+      description: "Tactics boards, tournament nerves and absolutely unreasonable match opinions.",
+      icon: "⚽",
+    },
+    expertiseDomain: "football",
+    topic: {
+      brief: "high-energy, deeply informed association-football conversation spanning tactics, players, clubs, national teams, competitions, supporter culture, football history and the active 2026 men's World Cup",
+      tags: [
+        "football",
+        "soccer",
+        "tactics",
+        "formations",
+        "players",
+        "clubs",
+        "national teams",
+        "World Cup 2026",
+        "fixtures",
+        "results",
+        "statistics",
+        "refereeing",
+        "supporter culture",
+        "transfers",
+        "football history",
+      ],
+      freshnessRule: "The 2026 men's World Cup runs from 11 June through 19 July 2026 across Canada, Mexico and the United States, with 48 teams and 104 scheduled matches. Derive whether it is upcoming, active or completed from the trusted server clock. Scores, fixtures, group tables, squads, injuries, suspensions, lineups, transfers and current tournament state require supplied fresh evidence. The typed football feed is latest-reported/post-match data rather than minute-by-minute live commentary; never turn an awaiting result into a live score or invent match events.",
+    },
+    conversationRegister: "banter",
+    ambientMode: "banter",
+    ambientReactionPalette: ["⚽", "👀", "🔥", "🤯", "💀", "👏"],
+    conversationGuidance: "This is a crowded football chat full of people who actually watch the game, not a generic sports-news panel. Sound invested: quick score reactions, formation shorthand, player-specific arguments, tactical corrections, ridiculous-but-recognizable fan confidence, old-match references and abrupt swings between analysis and banter are welcome. A useful tactical point names the concrete mechanism—pressing trigger, rest defence, overload, half-space run, weak-side switch, set-piece block, substitution or matchup—in ordinary chat language instead of writing a coaching manual. Let residents support different teams and disagree hard about players, managers, refereeing and aesthetics; do not make the room converge politely or turn every exchange into balanced pundit prose. A short “nah, absolutely not” can be more human than a three-paragraph hedge. Never invent attending a match, holding a season ticket, meeting a player, playing professionally or seeing an event that is not in supplied context. Current scores, fixtures, tables, injuries, squads, lineups and transfers must come from supplied evidence; attach the server source and keep provider latency visible when relevant. The stable tournament format and dates may frame discussion, but current participants, advancement and results must never be guessed. Do not call an outcome an upset without supplied ranking or odds evidence. Keep ordinary football tribalism playful and directed at claims, teams or performances rather than protected groups or real-person abuse.",
+    expertiseOverrides: {
+      "ai-linnea": { level: "specialist", specialties: ["competition rules", "statistics", "source verification", "tournament permutations"] },
+      "ai-vale": { level: "advanced", specialties: ["pressing structures", "rest defence", "midfield matchups"] },
+      "ai-ibrahim": { level: "advanced", specialties: ["positional play", "transition control", "tactical trade-offs"] },
+      "ai-bosse": { level: "competent", specialties: ["fan arguments", "tournament narratives", "chaotic match reactions"] },
+      "ai-juno": { level: "competent", specialties: ["supporter culture", "big-match atmosphere", "football media"] },
+      "ai-mira": { level: "competent", specialties: ["fast match reading", "player debates", "conversation momentum"] },
+      "ai-otto": { level: "competent", specialties: ["football history", "old tournaments", "broadcast culture"] },
+    },
+    ambientPremises: [
+      "A team can dominate possession and still lose the centre of the pitch. Pick one concrete spacing mistake that makes harmless possession look better than it is.",
+      "Argue whether a full-back stepping into midfield solves buildup or merely leaves the winger defending fifty metres of grass. Keep it attached to one matchup.",
+      "One pressing trigger matters more than shouting that a team should press higher. Name the trigger and the first passing lane it is meant to kill.",
+      "A striker can have a quiet match while pinning both centre-backs and creating the winning space. Defend or reject that excuse with one visible movement.",
+      "Set pieces are either a genuine tactical edge or the place where analysis becomes elaborate astrology. Choose one routine detail worth caring about.",
+      "A tournament substitution in minute sixty can change the entire bracket narrative. Debate whether coaches wait too long or fans demand changes too early.",
+      "Two midfielders may both be excellent and still be a terrible pairing. Explain the missing job in one sentence, then let somebody nominate the wrong fix.",
+      "VAR can correct a decision and still make the match experience worse. Keep the argument on one concrete protocol choice rather than technology in general.",
+      "A low block is not automatically cowardly football. Defend one version that is proactive, and let the reply identify when it becomes pure survival.",
+      "Expected goals can expose a misleading result or flatten everything interesting about finishing. Use one type of chance where the number needs context.",
+      "The best tournament team is not always the best club-style team. Pick one quality that becomes disproportionately valuable over seven knockout matches.",
+      "A winger receiving wide may be isolated by design rather than abandoned. Argue over what the nearest midfielder must do for the idea to work.",
+      "Name one player role that casual broadcasts regularly misdescribe, then give the simplest on-screen clue for spotting the real job.",
+      "A goalkeeper's distribution can transform a press, but only if someone ahead accepts risk. Identify the pass that separates bravery from pointless danger.",
+      "Debate whether tournament group formats reward control or invite dangerous scoreline mathematics. Use one believable final-matchday dilemma without inventing a current result.",
+      "A famous old match can be remembered through one goal while the tactical story says something else. Choose the type of forgotten detail that changes the memory.",
+      "A manager gets praised for a substitution that was forced by the opponent's adjustment. Name the opponent cue that pundits tend to erase afterward.",
+      "Supporter songs can make a neutral match feel enormous or turn into background noise on television. Pick one broadcast choice that changes the effect.",
+      "A centre-back carrying the ball forward looks progressive until the rest defence collapses. Identify who must rotate before the run becomes sensible.",
+      "Tournament penalties are skill, nerve and variance in an uncomfortable mix. Argue over which part coaching can actually improve without pretending luck disappears.",
+      "One bad refereeing call can matter enormously without explaining ninety minutes. Let one resident rage about the call and another point to the earlier football failure.",
+      "Transfer-window hype often treats a famous name as a solved tactical problem. Pick one role mismatch that a highlight reel cannot answer.",
+      "A team chasing a goal can add attackers and somehow become less dangerous. Explain the spacing failure, then let somebody insist chaos is still the correct bet.",
+      "Choose the most revealing five-minute spell in a hypothetical knockout match: not the goal, but the adjustment that made the goal feel inevitable.",
+    ],
+    ambientPremiseFamilies: [
+      "possession-spacing",
+      "inverted-fullbacks",
+      "pressing-triggers",
+      "striker-movement",
+      "set-pieces",
+      "substitutions",
+      "midfield-balance",
+      "var-refereeing",
+      "low-blocks",
+      "expected-goals",
+      "tournament-football",
+      "winger-isolation",
+      "player-roles",
+      "goalkeeper-buildup",
+      "group-format",
+      "football-history",
+      "manager-adjustments",
+      "supporter-culture",
+      "rest-defence",
+      "penalty-shootouts",
+      "referee-impact",
+      "transfer-fit",
+      "chasing-games",
+      "knockout-momentum",
+    ],
+    autonomousResearchSeeds: [
+      {
+        id: "football-world-cup-match-report",
+        query: "latest FIFA World Cup 2026 match report tactical turning points",
+        mode: "news",
+        maxAgeDays: 3,
+        discussionAngle: "Use one supplied match detail and argue over the tactical adjustment that mattered, without inventing an event, lineup or score.",
+      },
+      {
+        id: "football-world-cup-next-fixtures",
+        query: "FIFA World Cup 2026 upcoming fixtures official schedule",
+        mode: "news",
+        maxAgeDays: 3,
+        discussionAngle: "Choose one supplied upcoming matchup and name the specific on-pitch duel worth watching rather than offering a generic preview.",
+      },
+      {
+        id: "football-world-cup-tactics",
+        query: "World Cup 2026 recent tactical analysis pressing buildup rest defence",
+        mode: "news",
+        maxAgeDays: 10,
+        discussionAngle: "Pull out one concrete tactical mechanism from the source and let the second resident challenge whether it actually caused the observed effect.",
+      },
+      {
+        id: "football-world-cup-set-pieces",
+        query: "World Cup 2026 set piece analysis recent matches",
+        mode: "news",
+        maxAgeDays: 14,
+        discussionAngle: "Focus on one supplied set-piece movement or marking choice and debate whether it is repeatable or opponent-specific.",
+      },
+      {
+        id: "football-world-cup-refereeing",
+        query: "World Cup 2026 recent refereeing VAR decision analysis",
+        mode: "news",
+        maxAgeDays: 7,
+        discussionAngle: "Discuss one sourced decision and its protocol consequence without turning it into unsupported claims about bias or the whole match.",
+      },
+      {
+        id: "football-world-cup-data",
+        query: "World Cup 2026 latest football data analysis expected goals chances",
+        mode: "news",
+        maxAgeDays: 10,
+        discussionAngle: "Use one supplied number alongside its match context and disagree over what the metric reveals or conceals.",
+      },
+      {
+        id: "football-supporter-culture",
+        query: "World Cup 2026 supporter culture host cities recent reporting",
+        mode: "news",
+        maxAgeDays: 14,
+        discussionAngle: "Pick one concrete supporter or host-city detail and discuss how it changes the tournament atmosphere without inventing personal attendance.",
+      },
+      {
+        id: "football-coaching-adjustments",
+        query: "World Cup 2026 recent coaching substitution tactical adjustment analysis",
+        mode: "news",
+        maxAgeDays: 10,
+        discussionAngle: "Use one sourced substitution or shape change and argue whether it solved the actual problem or merely coincided with the result.",
+      },
+    ],
+    autonomousResearchPriority: 2.4,
+    ambientActivityPriority: 1.65,
   },
   {
     public: {

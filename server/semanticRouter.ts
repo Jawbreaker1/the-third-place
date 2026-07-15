@@ -23,6 +23,10 @@ import {
   PERSONA_STANCE_INTENSITIES,
   TURN_SURFACE_TEXTURES,
 } from "./personaStyle.js";
+import {
+  FOOTBALL_COMPETITION_IDS,
+  FOOTBALL_DATA_VIEWS,
+} from "./footballData/catalog.js";
 
 /** Includes queueing headroom; compact Gemma 4 routing is normally ~5–9s locally. */
 export const TURN_ANALYSIS_TIMEOUT_MS = 20_000;
@@ -403,7 +407,16 @@ const normalizeCompactEvidenceUnion = (
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
   const record = raw as Record<string, unknown>;
   if (!record.e || typeof record.e !== "object" || Array.isArray(record.e)) return raw;
-  return { ...record, e: normalizeCapabilityWireRecord(record.e as Record<string, unknown>, input) };
+  // Compact v1 fixtures and queued completions predate the football fields.
+  // Production v2 still requires all keys in response_format; only the replay
+  // boundary supplies neutral nulls for fields that did not exist yet.
+  const evidence = {
+    c: null,
+    w: null,
+    f: null,
+    ...(record.e as Record<string, unknown>),
+  };
+  return { ...record, e: normalizeCapabilityWireRecord(evidence, input) };
 };
 
 export const createTurnAnalysisModelSchema = (input: NormalizedTurnAnalysisInput) => {
@@ -498,6 +511,11 @@ export const createTurnAnalysisModelSchema = (input: NormalizedTurnAnalysisInput
       timeZone: nullableTimeZoneSchema,
       timeKind: z.enum(timeKinds).nullable(),
       locationLabel: noUrlTextSchema(1, 120).nullable(),
+      // Optional only for replaying descriptive v1 fixtures. Compact
+      // production output requires the corresponding c/w/f keys.
+      competitionTarget: z.enum(FOOTBALL_COMPETITION_IDS).nullable().optional().default(null),
+      footballView: z.enum(FOOTBALL_DATA_VIEWS).nullable().optional().default(null),
+      footballFilter: noUrlTextSchema(1, 120).nullable().optional().default(null),
     }).strict(),
     capabilities: z.object({
       discussed: z.array(capabilitySchema).max(TURN_CAPABILITIES.length),
@@ -567,7 +585,11 @@ export const createTurnAnalysisModelSchema = (input: NormalizedTurnAnalysisInput
       }
     }
     if (evidence.action === "none") {
-      if (evidence.query !== null || evidence.urlRef !== null || evidence.searchMode !== null || evidence.timeZone !== null || evidence.timeKind !== null || evidence.locationLabel !== null) {
+      if (
+        evidence.query !== null || evidence.urlRef !== null || evidence.searchMode !== null ||
+        evidence.timeZone !== null || evidence.timeKind !== null || evidence.locationLabel !== null ||
+        evidence.competitionTarget !== null || evidence.footballView !== null || evidence.footballFilter !== null
+      ) {
         context.addIssue({ code: z.ZodIssueCode.custom, path: ["evidence"], message: "No evidence action may not carry tool arguments" });
       }
     } else {
@@ -578,6 +600,9 @@ export const createTurnAnalysisModelSchema = (input: NormalizedTurnAnalysisInput
         z: evidence.timeZone,
         k: evidence.timeKind,
         l: evidence.locationLabel,
+        c: evidence.competitionTarget,
+        w: evidence.footballView,
+        f: evidence.footballFilter,
       }, {
         activeConditions: capabilityArgumentConditions(input, evidence.urlRef),
       });
@@ -841,7 +866,11 @@ export const createFailClosedTurnAnalysis = (reason: TurnAnalysisFailureReason):
   personas: { addressedIds: [], requestedReplyIds: [], relevantIds: [], addressConfidence: 0, relevanceConfidence: 0 },
   social: { warmth: 0.5, hostility: 0, playfulness: 0, absurdity: 0, urgency: 0, energy: 0.25, pileOnRisk: 0, claimStrength: 0, confidence: 0 },
   moderation: { risk: "uncertain", action: "watch", categories: [], confidence: 0 },
-  evidence: { need: "none", action: "none", confidence: 0, goal: null, query: null, urlRef: null, searchMode: null, timeZone: null, timeKind: null, locationLabel: null },
+  evidence: {
+    need: "none", action: "none", confidence: 0, goal: null, query: null, urlRef: null,
+    searchMode: null, timeZone: null, timeKind: null, locationLabel: null,
+    competitionTarget: null, footballView: null, footballFilter: null,
+  },
   capabilities: {
     discussed: [],
     requestKind: "none",
@@ -1059,6 +1088,9 @@ const createTurnAnalysisWireSchema = (input: NormalizedTurnAnalysisInput) => {
       z: nullableTimeZoneSchema,
       k: z.enum(timeKinds).nullable(),
       l: noUrlTextSchema(1, 120).nullable(),
+      c: z.enum(FOOTBALL_COMPETITION_IDS).nullable(),
+      w: z.enum(FOOTBALL_DATA_VIEWS).nullable(),
+      f: noUrlTextSchema(1, 120).nullable(),
     }).strict(),
     c: z.object({
       d: z.array(capabilitySchema).max(TURN_CAPABILITIES.length),
@@ -1092,6 +1124,9 @@ const createTurnAnalysisWireSchema = (input: NormalizedTurnAnalysisInput) => {
         z: value.e.z,
         k: value.e.k,
         l: value.e.l,
+        c: value.e.c,
+        w: value.e.w,
+        f: value.e.f,
       }, {
         activeConditions: capabilityArgumentConditions(input, value.e.u),
       });
@@ -1225,8 +1260,11 @@ export const buildTurnAnalysisResponseFormat = (input: NormalizedTurnAnalysisInp
               z: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 80 }),
               k: nullableJsonSchema({ type: "string", enum: timeKinds }),
               l: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 120 }),
+              c: nullableJsonSchema({ type: "string", enum: FOOTBALL_COMPETITION_IDS }),
+              w: nullableJsonSchema({ type: "string", enum: FOOTBALL_DATA_VIEWS }),
+              f: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 120 }),
             },
-            required: ["a", "x", "g", "q", "u", "m", "z", "k", "l"],
+            required: ["a", "x", "g", "q", "u", "m", "z", "k", "l", "c", "w", "f"],
           },
           c: {
             type: "object",
@@ -1371,6 +1409,9 @@ export const parseTurnAnalysisContent = (
     timeZone: value.e.z,
     timeKind: value.e.k,
     locationLabel: value.e.l,
+    competitionTarget: value.e.c,
+    footballView: value.e.w,
+    footballFilter: value.e.f,
   };
   const converted: TurnAnalysisModelOutput = {
     language: { tag: value.l, confidence: value.l === "und" ? 0 : value.lx },
@@ -1703,6 +1744,9 @@ export const createEvidencePlanVerifierOutputSchema = (
     z: nullableTimeZoneSchema,
     k: z.enum(timeKinds).nullable(),
     l: noUrlTextSchema(1, 120).nullable(),
+    c: z.enum(FOOTBALL_COMPETITION_IDS).nullable(),
+    w: z.enum(FOOTBALL_DATA_VIEWS).nullable(),
+    f: noUrlTextSchema(1, 120).nullable(),
   }).strict().superRefine((value, context) => {
     if (new Set(value.d).size !== value.d.length) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["d"], message: "Discussed capabilities must be unique" });
@@ -1711,7 +1755,7 @@ export const createEvidencePlanVerifierOutputSchema = (
       if (
         value.a !== "none" || value.r !== "none" || value.d.length !== 0 || value.g !== null ||
         value.q !== null || value.u !== null || value.m !== null || value.z !== null ||
-        value.k !== null || value.l !== null
+        value.k !== null || value.l !== null || value.c !== null || value.w !== null || value.f !== null
       ) {
         context.addIssue({ code: z.ZodIssueCode.custom, message: "keep_none may not carry a capability plan" });
       }
@@ -1741,6 +1785,9 @@ export const createEvidencePlanVerifierOutputSchema = (
       z: value.z,
       k: value.k,
       l: value.l,
+      c: value.c,
+      w: value.w,
+      f: value.f,
     }, {
       activeConditions: capabilityArgumentConditions(input.turn, value.u),
     });
@@ -1774,7 +1821,7 @@ Use latestMessage as the current act and recentMessages only to resolve semantic
 
 An imperative directed to a resident to inspect a named source remains an execution request when recentMessages contain the unresolved information goal, even if primary called the latest words social or playful and omitted requestedReplyIds. An expected room-directed nudge from the same speaker after their unresolved evidence request can renew that request even when primary labels the latest act question, greeting or other rather than follow_up. When that latest act supplies no self-contained replacement subject and the immediately preceding same-speaker request still has a complete available evidence plan, use_action with retry; primary's intent label never overrides this conversation relation. A short request for the missing link or source immediately after an AI resident claims to have found, seen, read or watched a particular external item inherits that claimed item's description as the unresolved search subject. The resident claim is not evidence and does not prove that the item or URL exists: when web_search is available, verify it with web_search and use retry, resolving g and q from the described item plus the guest's request. If the description is genuinely too vague to form a safe query, keep_none instead of inventing details. An explicit request whose requested deliverable requires discovering a real external destination must use web_search when no target URL was supplied and that capability is available; never leave it to the conversation model to invent a URL. A requested real link or destination is an external deliverable regardless of whether its subject is current, timeless, playful or creative: if the guest asks residents to provide, share, recommend or link to something reachable at a real URL and no supplied URL is the target, use web_search with execute. The same applies when pragmatic question form performs that request; a question label does not make the external deliverable self-contained. In particular, when the pragmatic purpose of an answer-expected room question is to get somebody to share or post one or more real links now, use web_search with execute even if its literal grammar asks whether anybody has one, wonders why nobody is sharing, or observes that none have appeared. Grammatical negativity or rhetorical form does not negate execution intent; only an actual prohibition, passive mention or retrospective discussion does. Distinguish that present solicitation from a retrospective discussion about whether link sharing happened. Decide this from the full communicative act across languages, never from any of those English phrasings as templates. Keep none only for a self-contained creative or conversational request whose complete requested deliverable can actually be produced inside the message itself. Likewise, correcting a resident's false app/web/internet limitation inside an unresolved evidence thread is execution, not a pure availability question, even if primary called it capability_question or availability. When primary is invalid_output, classify evidence need afresh from the quoted turn and recent conversation relation: a supplied opaque latest-message URL may support read_url, but no URL is required for a resolvable web_search request or inherited missing-link follow-up. Invalid primary output is uncertainty, never proof that the turn needs evidence. These are semantic conversation relations in any language, never phrase or domain matches.
 
-Return exactly one compact JSON object. t is the registered BCP-47 language tag of latestMessage (or und only when genuinely indeterminate) and tx is its confidence; these fields are classification metadata and never capability authority. v is keep_none or use_action; a is none or one of ${TURN_CAPABILITIES.join(", ")}; r is none/execute/retry/correct_limitation; d is the discussed capability list; x is confidence; g is the resolved evidence goal; q/u/m/z/k/l are typed action arguments.
+Return exactly one compact JSON object. t is the registered BCP-47 language tag of latestMessage (or und only when genuinely indeterminate) and tx is its confidence; these fields are classification metadata and never capability authority. v is keep_none or use_action; a is none or one of ${TURN_CAPABILITIES.join(", ")}; r is none/execute/retry/correct_limitation; d is the discussed capability list; x is confidence; g is the resolved evidence goal; q/u/m/z/k/l/c/w/f are typed action arguments.
 
 Use use_action only when the guest actually requests external/current evidence and one complete available plan can be resolved with confidence at least ${TURN_TRUST_THRESHOLDS.evidence}. Use execute for a first request, retry when the guest renews an unresolved or failed attempt, and correct_limitation when the guest rejects a resident's false capability limitation. If v is use_action, r MUST NEVER be none; choose execute when the more specific retry/correct_limitation distinction is genuinely uncertain. d must contain exactly a. Preserve the guest's language and writing system in g and l. q is capability-specific, not always a search query: for web_search it preserves the guest's language, subject and freshness; for weather_forecast it follows the catalog's place-only fallback-alias rule and may intentionally use another script/language. Every other action keeps q null. g must state the exact information wanted after resolving recent ellipsis/correction, without a URL, username, conversational filler or tool narration.
 
@@ -1825,8 +1872,11 @@ export const buildEvidencePlanVerifierResponseFormat = (
           z: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 80 }),
           k: nullableJsonSchema({ type: "string", enum: timeKinds }),
           l: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 120 }),
+          c: nullableJsonSchema({ type: "string", enum: FOOTBALL_COMPETITION_IDS }),
+          w: nullableJsonSchema({ type: "string", enum: FOOTBALL_DATA_VIEWS }),
+          f: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 120 }),
         },
-        required: ["t", "tx", "v", "a", "r", "d", "x", "g", "q", "u", "m", "z", "k", "l"],
+        required: ["t", "tx", "v", "a", "r", "d", "x", "g", "q", "u", "m", "z", "k", "l", "c", "w", "f"],
       },
     },
   };
@@ -1848,7 +1898,16 @@ export const parseEvidencePlanVerifierContent = (
   // kind, and the complete strict verifier schema still runs afterwards.
   let normalizedRaw: unknown = raw;
   if (normalizedRaw && typeof normalizedRaw === "object" && !Array.isArray(normalizedRaw)) {
-    const plan = normalizedRaw as Record<string, unknown>;
+    // Verifier v1 replay compatibility mirrors the compact router boundary:
+    // old queued results have no football fields, while current production
+    // response_format still requires them explicitly.
+    const plan: Record<string, unknown> = {
+      c: null,
+      w: null,
+      f: null,
+      ...(normalizedRaw as Record<string, unknown>),
+    };
+    normalizedRaw = plan;
     if (plan.v === "use_action") normalizedRaw = normalizeCapabilityWireRecord(plan, input.turn);
   }
   const parsed = createEvidencePlanVerifierOutputSchema(input).safeParse(normalizedRaw);
@@ -1870,6 +1929,9 @@ export const parseEvidencePlanVerifierContent = (
       timeZone: value.z,
       timeKind: value.k,
       locationLabel: value.l,
+      competitionTarget: value.c,
+      footballView: value.w,
+      footballFilter: value.f,
     },
     capabilities: {
       discussed: value.d,
@@ -1906,6 +1968,9 @@ export const projectEvidencePlanVerification = (
         timeZone: null,
         timeKind: null,
         locationLabel: null,
+        competitionTarget: null,
+        footballView: null,
+        footballFilter: null,
       },
       capabilities: { discussed: [], requestKind: "none", confidence: verification?.confidence ?? 0 },
     };
@@ -2062,7 +2127,7 @@ export const candidateReviewInputSchema = z.object({
   }).strict().nullable().default(null),
   evidence: z.object({
     outcome: z.enum(["none", "requested", "succeeded", "failed"]),
-    kind: z.enum(["search", "page", "weather", "market"]).nullable(),
+    kind: z.enum(["search", "page", "weather", "market", "football"]).nullable(),
     query: boundedText(300).nullable(),
     results: z.array(z.object({
       id: safeId,

@@ -12,6 +12,22 @@ Copyright © 1991–2025 Unicode, Inc. All rights reserved.
 
 ---
 
+## World Cup 2026 fixture/result dataset
+
+The optional `football_data` development provider reads the 2026 JSON dataset
+from [upbound-web/worldcup-live.json](https://github.com/upbound-web/worldcup-live.json).
+The upstream project describes the football data as public domain under CC0.
+No copy of the dataset is committed or redistributed by this repository; it is
+fetched at runtime from the fixed upstream HTTPS location. Attribution and a
+source link are retained in every grounded chat response even though CC0 does
+not require attribution.
+
+The source is a community-maintained dataset, not an official FIFA feed and not
+a contractual real-time data service. Verify its current license and usage
+terms before bundling, mirroring or commercially redistributing the data.
+
+---
+
 ## Optional Piper TTS runtime and Swedish voices
 
 `npm run setup:tts` optionally downloads `piper-tts==1.4.2` into the ignored,

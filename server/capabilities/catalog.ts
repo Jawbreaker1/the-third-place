@@ -5,8 +5,13 @@ import {
   MARKET_INDEX_IDS,
   MARKET_TARGET_IDS,
 } from "../marketData/catalog.js";
+import {
+  FOOTBALL_COMPETITION_CATALOG,
+  FOOTBALL_COMPETITION_IDS,
+  FOOTBALL_DATA_VIEWS,
+} from "../footballData/catalog.js";
 
-export const CAPABILITY_ARGUMENT_FIELDS = ["q", "u", "m", "z", "k", "l"] as const;
+export const CAPABILITY_ARGUMENT_FIELDS = ["q", "u", "m", "z", "k", "l", "c", "w", "f"] as const;
 
 export type CapabilityArgumentField = (typeof CAPABILITY_ARGUMENT_FIELDS)[number];
 
@@ -59,6 +64,10 @@ const marketTargetRoutingMap = [
   ...MARKET_BASKET_IDS.map((id) => `${id}: ${MARKET_BASKET_CATALOG[id].semanticDescription}`),
 ].join("; ");
 
+const footballTargetRoutingMap = FOOTBALL_COMPETITION_IDS
+  .map((id) => `${id}: ${FOOTBALL_COMPETITION_CATALOG[id].semanticDescription}`)
+  .join("; ");
+
 /**
  * The keys of this object are the single source of truth for capability IDs.
  * Descriptors are deliberately declarative: runtime providers and credentials
@@ -109,6 +118,24 @@ const capabilityDefinitions = {
       verifier: `market_snapshot requires exactly one registered canonical exact-index or fixed-basket ID in l with q/u/m/z/k null. Use it only for latest reported index levels and previous-close changes, including a bounded global or regional overview when the matching basket is explicitly or contextually intended. A follow-up asking how the rest of the world or other world markets performed after one supplied index move uses GLOBAL_MAJOR unless it asks for news or causes. Resolve wording semantically across languages; never invent an ID, map a company/security to an index, or treat DJIA as the broader DJUS index. Keep individual equities, news, historical questions, causal explanations, forecasts, advice and analysis on web_search, and keep none if the target cannot be resolved safely. Registered targets: ${marketTargetRoutingMap}.`,
     },
     validationMessage: "market_snapshot requires only one registered canonical index or basket target",
+  },
+  football_data: {
+    routingClass: "narrow_structured",
+    media: ["public", "dm"],
+    external: true,
+    arguments: {
+      required: ["c", "w"],
+      allowed: ["c", "w", "f"],
+      allowedStringValues: {
+        c: FOOTBALL_COMPETITION_IDS,
+        w: FOOTBALL_DATA_VIEWS,
+      },
+    },
+    routingGuidance: {
+      primary: `use only for structured fixtures, latest provider-reported completed results, today's matches, upcoming matches, tournament overview or group standings in one registered football competition. Put its canonical competition ID in c and exactly one view in w: overview for a current bounded tournament digest, today for matches falling on the server community's current local date, recent_results for completed results, upcoming for the next fixtures, or standings for provisional group tables. f is optional and may contain only one concise provider-compatible team or group alias that narrows the same competition; use a widely used international team alias when the guest's local-language name would not match the provider, and keep f null when no confident equivalent is known. Never put dates, score wording, questions, usernames or a different competition in f. Keep q/u/m/z/k/l null. The typed feed is post-match/current-schedule data, not minute-by-minute live commentary: requests for an in-progress live score, news, transfers, injuries, squads, lineups, tactical or causal analysis, predictions, odds, history outside the current registered competition, or mixed score-and-cause questions remain web_search. A normal request for fixtures/results is an execution request, not a capability-availability question. Registered targets: ${footballTargetRoutingMap}.`,
+      verifier: `football_data requires exactly one registered canonical competition c and one view w (overview, today, recent_results, upcoming or standings), with optional f as one provider-compatible team/group alias for that same competition and q/u/m/z/k/l null. Use it for structured schedules, latest provider-reported completed results and group tables, not minute-by-minute live scores, news, injuries, lineups, transfers, tactics, causes, predictions, odds or unrelated history; those remain web_search. Preserve a confidently known team identity across languages through f without translating or weakening it to a different team, and keep f null when uncertain. Registered targets: ${footballTargetRoutingMap}.`,
+    },
+    validationMessage: "football_data requires one registered competition, one supported data view and at most one team/group filter",
   },
   local_datetime: {
     routingClass: "narrow_structured",
@@ -183,6 +210,9 @@ export interface CapabilityArgumentValues {
   z: unknown | null | undefined;
   k: unknown | null | undefined;
   l: unknown | null | undefined;
+  c: unknown | null | undefined;
+  w: unknown | null | undefined;
+  f: unknown | null | undefined;
 }
 
 export interface CapabilityArgumentShapeOptions {

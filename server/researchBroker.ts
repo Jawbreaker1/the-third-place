@@ -12,7 +12,7 @@ export interface ResearchResult {
 
 export interface ResearchPacket {
   /** Trusted server evidence transport; structured kinds come only from typed fixed-provider services. */
-  kind?: "search" | "page" | "weather" | "market";
+  kind?: "search" | "page" | "weather" | "market" | "football";
   query: string;
   retrievedAt: string;
   results: ResearchResult[];

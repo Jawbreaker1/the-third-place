@@ -50,6 +50,7 @@ describe("actor channel runtime", () => {
       "ai-lab",
       "ai-programming",
       "stock-market",
+      "football-talk",
       "world-of-warcraft",
       "3d-visualisation",
     ];
@@ -118,6 +119,38 @@ describe("actor channel runtime", () => {
     expect(pubIds).toEqual(expect.arrayContaining(["ai-mira", "ai-bosse", "ai-juno", "ai-kim", "ai-nox", "ai-farah", "ai-runa"]));
     expect(pubIds.length).toBeGreaterThanOrEqual(9);
     expect(pubIds.length).toBeLessThan(PERSONAS.length);
+  });
+
+  it("builds a selective football roster with experts, researchers and varied chat energy", () => {
+    const runtime = new ActorChannelRuntime();
+    const candidates = runtime.candidatesFor("football-talk");
+    const ids = candidates.map((persona) => persona.id);
+
+    expect(ids).toEqual(expect.arrayContaining([
+      "ai-runa",
+      "ai-mira",
+      "ai-bosse",
+      "ai-linnea",
+      "ai-vale",
+      "ai-juno",
+      "ai-ibrahim",
+      "ai-otto",
+    ]));
+    expect(candidates.length).toBeGreaterThanOrEqual(8);
+    expect(candidates.length).toBeLessThan(PERSONAS.length);
+    expect(candidates.filter((persona) => persona.canResearch).map((persona) => persona.id)).toEqual(
+      expect.arrayContaining(["ai-mira", "ai-linnea", "ai-ibrahim"]),
+    );
+    expect(candidates.some((persona) => persona.talkativeness >= 0.8)).toBe(true);
+    expect(candidates.some((persona) => persona.talkativeness <= 0.2)).toBe(true);
+    expect(candidates.some((persona) => persona.disagreement >= 0.9)).toBe(true);
+
+    expect(runtime.expertise("ai-linnea", "football-talk")).toMatchObject({
+      level: "specialist",
+      specialties: expect.arrayContaining(["competition rules", "source verification"]),
+    });
+    expect(runtime.expertise("ai-vale", "football-talk").level).toBe("advanced");
+    expect(runtime.expertise("ai-ibrahim", "football-talk").level).toBe("advanced");
   });
 
   it("restores an actor's last channel focus from persisted history", () => {

@@ -70,6 +70,7 @@ import {
   type CapabilityInvocation,
   type CapabilitySceneContract,
   type EvidenceResolution,
+  type FootballCompetitionCapabilityProvider,
   type ResearchPacket,
   type WeatherForecastCapabilityProvider,
 } from "./capabilities/registry.js";
@@ -638,6 +639,8 @@ export interface SocialDirectorOptions {
   weatherForecastProvider?: WeatherForecastCapabilityProvider | null;
   /** Provider-neutral typed market snapshots shared by direct turns and MarketPulse. */
   marketSnapshotProvider?: Pick<MarketSnapshotService, "snapshot"> | null;
+  /** Provider-neutral typed football snapshots shared with the server capability inventory. */
+  footballCompetitionProvider?: FootballCompetitionCapabilityProvider | null;
   /** Fixed-source market event coordinator. `null` disables autonomous market events. */
   marketPulseCoordinator?: Pick<
     MarketPulseCoordinator,
@@ -1530,6 +1533,7 @@ export class SocialDirector {
       researchBroker: this.researchBroker,
       weatherForecastProvider: options.weatherForecastProvider,
       marketSnapshotProvider: options.marketSnapshotProvider,
+      footballCompetitionProvider: options.footballCompetitionProvider,
       now: this.now,
     });
     this.marketSnapshotProvider = options.marketSnapshotProvider ?? undefined;
@@ -3899,7 +3903,7 @@ export class SocialDirector {
                 random: this.rng(),
               }),
               channelTuning.activity,
-            ),
+            ) * (getChannelProfile(candidate.id)?.ambientActivityPriority ?? 1),
           };
         })
         .sort((a, b) => b.score - a.score)[0]?.candidate;

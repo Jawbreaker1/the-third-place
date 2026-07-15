@@ -7,6 +7,11 @@ import type {
 import type { ResearchBroker, ResearchPacket } from "../researchBroker.js";
 import { createFailClosedTurnAnalysis, type TurnAnalysis } from "../semanticRouter.js";
 import type { WeatherForecastResult } from "../weatherForecast.js";
+import type { FootballCompetitionSnapshot } from "../footballCompetition.js";
+import {
+  FOOTBALL_DATA_VIEWS,
+  type FootballDataView,
+} from "../footballData/catalog.js";
 import {
   MARKET_INDEX_CATALOG,
   isMarketIndexId,
@@ -20,6 +25,7 @@ import {
   CapabilityRegistry,
   type CapabilityCompileContext,
   type EvidenceResolution,
+  type FootballCompetitionCapabilityProvider,
   type MarketSnapshotCapabilityProvider,
   type WeatherForecastCapabilityProvider,
 } from "./registry.js";
@@ -217,6 +223,86 @@ const marketSnapshot = (
   };
 };
 
+const footballSnapshot = (
+  view: FootballDataView = "overview",
+  focus?: string,
+): FootballCompetitionSnapshot => ({
+  provider: "openfootball-live",
+  targetId: "FIFA_WC_2026",
+  competition: {
+    name: "FIFA World Cup 2026",
+    startDate: "2026-06-11",
+    endDate: "2026-07-19",
+    hosts: ["Canada", "Mexico", "United States"],
+    teams: 48,
+    scheduledMatches: 104,
+    lifecycle: "ongoing",
+  },
+  retrievedAt: new Date(NOW).toISOString(),
+  sourceUrl: "https://github.com/upbound-web/worldcup-live.json/blob/master/2026/worldcup.json",
+  latency: "community-updated-within-hours-not-live",
+  view,
+  displayTimeZone: "Europe/Stockholm",
+  ...(focus ? { focus } : {}),
+  coverage: {
+    totalMatches: 104,
+    matchingMatches: focus ? 3 : 104,
+    finished: 1,
+    awaitingResult: 1,
+    scheduled: 1,
+  },
+  recentResults: [{
+    fixtureKey: "2026-07-14T19:00:00.000Z|France|Spain",
+    kickoffUtc: "2026-07-14T19:00:00.000Z",
+    providerLocalDate: "2026-07-14",
+    providerLocalTime: "12:00 UTC-7",
+    status: "finished",
+    round: "Semi-finals",
+    homeTeam: "France",
+    awayTeam: "Spain",
+    score: { halftime: [1, 1], fulltime: [2, 1] },
+    venue: "MetLife Stadium",
+  }],
+  awaitingResults: [{
+    fixtureKey: "2026-07-15T10:00:00.000Z|Sweden|Brazil",
+    kickoffUtc: "2026-07-15T10:00:00.000Z",
+    providerLocalDate: "2026-07-15",
+    providerLocalTime: "03:00 UTC-7",
+    status: "awaiting_result",
+    round: "Semi-finals",
+    homeTeam: "Sweden",
+    awayTeam: "Brazil",
+    venue: "SoFi Stadium",
+  }],
+  upcomingMatches: [{
+    fixtureKey: "2026-07-15T19:00:00.000Z|England|Argentina",
+    kickoffUtc: "2026-07-15T19:00:00.000Z",
+    providerLocalDate: "2026-07-15",
+    providerLocalTime: "12:00 UTC-7",
+    status: "scheduled",
+    round: "Semi-finals",
+    homeTeam: "England",
+    awayTeam: "Argentina",
+    venue: "AT&T Stadium",
+  }],
+  groupStandings: [{
+    group: "Group A",
+    rankingBasis: "provisional_points_goal_difference_goals_for",
+    rows: [{
+      position: 1,
+      team: "Sweden",
+      played: 3,
+      won: 2,
+      drawn: 1,
+      lost: 0,
+      goalsFor: 6,
+      goalsAgainst: 2,
+      goalDifference: 4,
+      points: 7,
+    }],
+  }],
+});
+
 interface AnalysisOverrides {
   goal?: string | null;
   evidenceConfidence?: number;
@@ -229,6 +315,9 @@ interface AnalysisOverrides {
   timeZone?: string | null;
   timeKind?: TurnAnalysis["evidence"]["timeKind"];
   locationLabel?: string | null;
+  competitionTarget?: TurnAnalysis["evidence"]["competitionTarget"];
+  footballView?: TurnAnalysis["evidence"]["footballView"];
+  footballFilter?: string | null;
   languageTag?: string;
   responseLanguageTag?: string;
   languageConfidence?: number;
@@ -274,6 +363,13 @@ const analysisFor = (
             : action === "market_snapshot" ? "SE_OMXS30"
               : null
         : overrides.locationLabel,
+      competitionTarget: overrides.competitionTarget === undefined
+        ? action === "football_data" ? "FIFA_WC_2026" : null
+        : overrides.competitionTarget,
+      footballView: overrides.footballView === undefined
+        ? action === "football_data" ? "overview" : null
+        : overrides.footballView,
+      footballFilter: overrides.footballFilter ?? null,
     },
     capabilities: {
       ...fallback.capabilities,
@@ -298,7 +394,9 @@ const compileContext = (
 const createHarness = (options: {
   resolveTarget?: PageReadRequest;
   defaultMarket?: boolean;
+  defaultFootball?: boolean;
   market?: MarketSnapshotCapabilityProvider | null;
+  football?: FootballCompetitionCapabilityProvider | null;
   weather?: WeatherForecastCapabilityProvider | null;
 } = {}) => {
   const pageReader = {
@@ -313,6 +411,9 @@ const createHarness = (options: {
     pageReader: pageReader as unknown as PageReader,
     researchBroker: researchBroker as unknown as Pick<ResearchBroker, "research" | "researchSite">,
     marketSnapshotProvider: options.defaultMarket ? undefined : options.market === undefined ? null : options.market,
+    footballCompetitionProvider: options.defaultFootball
+      ? undefined
+      : options.football === undefined ? null : options.football,
     weatherForecastProvider: options.weather === undefined ? null : options.weather,
     now: () => NOW,
   });
@@ -332,7 +433,10 @@ describe("capability registry contract", () => {
     const market: MarketSnapshotCapabilityProvider = {
       snapshot: vi.fn(async ({ targetId }) => marketSnapshot(targetId)),
     };
-    const { registry } = createHarness({ market, weather });
+    const football: FootballCompetitionCapabilityProvider = {
+      snapshot: vi.fn(async ({ view, focus }) => footballSnapshot(view, focus)),
+    };
+    const { registry } = createHarness({ market, football, weather });
 
     expect(registry.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual(TURN_CAPABILITIES);
     expect(registry.hasExternalEvidence(TURN_CAPABILITIES)).toBe(true);
@@ -340,6 +444,7 @@ describe("capability registry contract", () => {
 
     expect(registry.available({ medium: "public", candidateSet: emptyCandidateSet(), allowSearch: false })).toEqual([
       "market_snapshot",
+      "football_data",
       "local_datetime",
       "weather_forecast",
     ]);
@@ -348,6 +453,7 @@ describe("capability registry contract", () => {
     vi.stubEnv("RESEARCH_ENABLED", "false");
     expect(registry.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual([
       "market_snapshot",
+      "football_data",
       "local_datetime",
       "weather_forecast",
     ]);
@@ -362,8 +468,16 @@ describe("capability registry contract", () => {
     expect(noWeather.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual(["local_datetime"]);
 
     vi.stubEnv("MARKET_SNAPSHOT_ENABLED", "false");
-    const disabledMarket = createHarness({ market, weather }).registry;
+    const disabledMarket = createHarness({ market, football, weather }).registry;
     expect(disabledMarket.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual([
+      "football_data",
+      "local_datetime",
+      "weather_forecast",
+    ]);
+
+    vi.stubEnv("FOOTBALL_DATA_ENABLED", "false");
+    const disabledFootball = createHarness({ market, football, weather }).registry;
+    expect(disabledFootball.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual([
       "local_datetime",
       "weather_forecast",
     ]);
@@ -391,6 +505,7 @@ describe("capability registry contract", () => {
     expect(registry.compile(analysisFor("read_url"), voiceContext)).toBeUndefined();
     expect(registry.compile(analysisFor("web_search"), voiceContext)).toBeUndefined();
     expect(registry.compile(analysisFor("market_snapshot"), voiceContext)).toBeUndefined();
+    expect(registry.compile(analysisFor("football_data"), voiceContext)).toBeUndefined();
     expect(registry.compile(analysisFor("weather_forecast"), voiceContext)).toBeUndefined();
   });
 
@@ -540,6 +655,149 @@ describe("capability registry contract", () => {
       coverage: { requested: 8, available: 5, complete: false, stale: 0 },
       missingIndexIds: globalIds.slice(5),
     });
+  });
+
+  it("compiles and executes every registered football view through the typed provider", async () => {
+    const football: FootballCompetitionCapabilityProvider = {
+      snapshot: vi.fn(async ({ view, focus }) => footballSnapshot(view, focus)),
+    };
+    const { registry, pageReader, researchBroker } = createHarness({ football });
+
+    for (const view of FOOTBALL_DATA_VIEWS) {
+      const invocation = registry.compile(analysisFor("football_data", { footballView: view }), compileContext())!;
+      expect(invocation).toMatchObject({
+        capability: "football_data",
+        competitionId: "FIFA_WC_2026",
+        view,
+        requiresResearchPersona: false,
+        responsePolicy: {
+          citations: "force_primary",
+          linkCard: "primary",
+          maxSources: 1,
+        },
+      });
+      await expect(registry.execute(invocation, `guest-${view}`)).resolves.toMatchObject({
+        state: "grounding_available",
+        research: {
+          kind: "football",
+          query: `FIFA_WC_2026:${view}`,
+          results: [{
+            id: "S1",
+            url: "https://github.com/upbound-web/worldcup-live.json/blob/master/2026/worldcup.json",
+          }],
+        },
+      });
+    }
+
+    const filtered = registry.compile(analysisFor("football_data", {
+      footballView: "upcoming",
+      footballFilter: "  Sweden  ",
+    }), compileContext())!;
+    expect(filtered).toMatchObject({
+      capability: "football_data",
+      competitionId: "FIFA_WC_2026",
+      view: "upcoming",
+      focus: "Sweden",
+    });
+    const resolution = await registry.execute(filtered, "guest-filtered");
+    expect(football.snapshot).toHaveBeenLastCalledWith({
+      targetId: "FIFA_WC_2026",
+      view: "upcoming",
+      focus: "Sweden",
+      requesterId: "guest-filtered",
+    });
+    expect(pageReader.read).not.toHaveBeenCalled();
+    expect(researchBroker.research).not.toHaveBeenCalled();
+    expect(researchBroker.researchSite).not.toHaveBeenCalled();
+    if (resolution.state !== "grounding_available" || !resolution.research) {
+      throw new Error("expected grounded football evidence");
+    }
+    const evidence = JSON.parse(resolution.research.results[0]!.snippet) as Record<string, unknown>;
+    expect(evidence).toMatchObject({
+      provider: "openfootball-live",
+      latency: "community-updated-within-hours-not-live",
+      displayTimeZone: "Europe/Stockholm",
+      requested: {
+        competition: "FIFA_WC_2026",
+        view: "upcoming",
+        focus: "Sweden",
+      },
+      coverage: { totalMatches: 104, matchingMatches: 3 },
+      recentResults: [{
+        home: "France",
+        away: "Spain",
+        status: "finished",
+        score: { ht: [1, 1], ft: [2, 1] },
+      }],
+      awaitingResults: [{ home: "Sweden", away: "Brazil", status: "awaiting_result" }],
+      upcomingMatches: [{ home: "England", away: "Argentina", status: "scheduled" }],
+      groupStandings: [{
+        group: "Group A",
+        rankingBasis: "provisional_points_goal_difference_goals_for",
+        rows: [{ team: "Sweden", p: 3, pts: 7 }],
+      }],
+    });
+    expect(resolution.research.results[0]!.snippet).not.toContain("sourceUrl");
+    expect(registry.sourceIds(resolution, [], true)).toEqual(["S1"]);
+    expect(registry.linkCardSourceId(resolution, ["S1"])).toBe("S1");
+    expect(registry.sceneContract(filtered, resolution, { actorName: "Mira" })).toMatchObject({
+      evidenceOutcome: "succeeded",
+      urlPublicationPolicy: "server_card",
+      suppressResponse: false,
+      premise: expect.stringContaining("validated provider-neutral football snapshot"),
+      groundingInstruction: expect.stringContaining("Do not invent live minute"),
+    });
+
+    const retry = registry.compile(analysisFor("football_data", {
+      footballView: "today",
+      requestKind: "retry",
+    }), compileContext())!;
+    await registry.execute(retry, "guest-retry");
+    expect(football.snapshot).toHaveBeenLastCalledWith({
+      targetId: "FIFA_WC_2026",
+      view: "today",
+      requesterId: "guest-retry",
+      cachePolicy: "bypass",
+    });
+  });
+
+  it("fails football compilation and execution closed for foreign fields and invalid provider results", async () => {
+    const football: FootballCompetitionCapabilityProvider = {
+      snapshot: vi.fn(async ({ view }) => footballSnapshot(view)),
+    };
+    const { registry } = createHarness({ football });
+
+    expect(registry.compile(analysisFor("football_data", {
+      competitionTarget: "WORLD_CUP" as TurnAnalysis["evidence"]["competitionTarget"],
+    }), compileContext())).toBeUndefined();
+    expect(registry.compile(analysisFor("football_data", {
+      footballView: "live" as TurnAnalysis["evidence"]["footballView"],
+    }), compileContext())).toBeUndefined();
+    expect(registry.compile(analysisFor("football_data", { query: "live score" }), compileContext())).toBeUndefined();
+    expect(registry.compile(analysisFor("football_data", { locationLabel: "United States" }), compileContext()))
+      .toBeUndefined();
+
+    const invocation = registry.compile(analysisFor("football_data"), compileContext())!;
+    football.snapshot = vi.fn(async () => footballSnapshot("today"));
+    await expect(registry.execute(invocation, "guest-mismatch")).resolves.toMatchObject({
+      state: "failed_temporary",
+      detail: "empty",
+    });
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    football.snapshot = vi.fn(async () => { throw new Error("provider unavailable"); });
+    const failure = await registry.execute(invocation, "guest-failure");
+    expect(failure).toMatchObject({ state: "failed_temporary", detail: "empty" });
+    expect(failure).not.toHaveProperty("research");
+    expect(warning).toHaveBeenCalledWith("Typed football lookup failed safely:", "provider unavailable");
+    expect(registry.sceneContract(invocation, failure, { actorName: "Mira" })).toMatchObject({
+      evidenceOutcome: "failed",
+      suppressResponse: false,
+      premise: expect.stringContaining("returned no validated result this time"),
+    });
+
+    const unavailable = createHarness({ football: null }).registry;
+    expect(unavailable.compile(analysisFor("football_data"), compileContext())).toBeUndefined();
   });
 
   it("compiles only jointly trusted evidence and capability requests", () => {

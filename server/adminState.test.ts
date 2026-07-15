@@ -78,7 +78,14 @@ describe("persistent admin overlay state", () => {
     });
     expect(initial.behavior.channels).toEqual({});
     expect(initial.automation.autonomousLinkChannelIds).toContain("the-pub");
+    expect(initial.automation.autonomousLinkChannelIds).toContain("football-talk");
     expect(initial.channels.some((channel) => channel.id === "lobby")).toBe(true);
+    expect(initial.channels.find((channel) => channel.id === "football-talk")).toMatchObject({
+      name: "football-talk",
+      register: "banter",
+      mode: "banter",
+      seeds: expect.arrayContaining([expect.stringContaining("pressing trigger")]),
+    });
 
     await store.createChannel(customChannel());
     await store.createPersona(customPersona(CHANNELS.map((channel) => channel.id)));
@@ -152,6 +159,40 @@ describe("persistent admin overlay state", () => {
       .toBeUndefined();
     expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "stock-market")?.marketPulseSourceSet)
       .toBeUndefined();
+  });
+
+  it("exposes football controls, preserves room tuning and retires topic-bound automation safely", async () => {
+    const store = makeStore();
+    await store.load();
+    const footballConfig = store.snapshot().channels.find((channel) => channel.id === "football-talk")!;
+    const footballProfile = CHANNEL_PROFILES.find((profile) => profile.public.id === "football-talk")!;
+
+    expect(footballConfig.seeds).toHaveLength(24);
+    expect(footballProfile.autonomousResearchSeeds).toHaveLength(8);
+    expect(footballProfile.autonomousResearchPriority).toBeGreaterThan(1);
+    expect(footballProfile.ambientActivityPriority).toBeGreaterThan(1);
+
+    const tuning = {
+      activity: 92,
+      autonomousLinkFrequency: 88,
+      competence: 94,
+      aggression: 72,
+      explicitness: 55,
+    };
+    await store.updateBehavior({ scope: "channel", channelId: "football-talk", tuning });
+    expect(store.snapshot().behavior.channels["football-talk"]).toEqual(tuning);
+    expect(store.behaviorForChannel("football-talk").channel).toEqual(tuning);
+
+    await store.updateChannel("football-talk", {
+      ...footballConfig,
+      topic: "a completely unrelated administrator-authored room topic",
+    });
+    const replaced = CHANNEL_PROFILES.find((profile) => profile.public.id === "football-talk")!;
+    expect(replaced.autonomousResearchSeeds).toBeUndefined();
+    expect(replaced.autonomousResearchPriority).toBeUndefined();
+    expect(replaced.ambientActivityPriority).toBeUndefined();
+    expect(store.snapshot().automation.autonomousLinkChannelIds).not.toContain("football-talk");
+    expect(store.behaviorForChannel("football-talk").channel).toEqual(tuning);
   });
 
   it("rolls runtime arrays back when atomic persistence fails", async () => {

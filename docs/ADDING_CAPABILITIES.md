@@ -14,7 +14,7 @@ Use `web_search` for general external discovery. A new dedicated adapter is just
 - deterministic calculations that should not be left to the dialogue model; or
 - a non-web local fact such as the validated server clock.
 
-An exact URL supplied by the guest remains `read_url`. A current date or time request remains `local_datetime`. A current-day or future forecast at a resolvable named location remains `weather_forecast`. Everything else that asks for current or external discovery should normally remain `web_search`.
+An exact URL supplied by the guest remains `read_url`. A current date or time request remains `local_datetime`. A current-day or future forecast at a resolvable named location remains `weather_forecast`. Fixtures, latest provider-reported results and provisional group tables for the registered 2026 World Cup target remain `football_data`; minute-by-minute scores, news, injuries, lineups, tactics and causes remain `web_search`. Everything else that asks for current or external discovery should normally remain `web_search`.
 
 This default applies when the semantic router selects an action. It is not an execution fallback. Once a trusted `CapabilityInvocation` selects a dedicated capability, a failed attempt must remain a failure of that exact action. The registry must never silently run `web_search`, `read_url` or another adapter instead. A new turn may make a new semantic decision, but one invocation has one identity and one bounded authority.
 

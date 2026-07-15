@@ -8,12 +8,20 @@ import {
 import { PERSONAS, type Persona } from "./personas.js";
 import { buildRoomExpertiseMatrix, EXPERTISE_RANK } from "./roomExpertise.js";
 
-const NEW_ROOM_IDS = ["the-pub", "ai-programming", "stock-market", "world-of-warcraft", "3d-visualisation"];
+const NEW_ROOM_IDS = [
+  "the-pub",
+  "ai-programming",
+  "stock-market",
+  "football-talk",
+  "world-of-warcraft",
+  "3d-visualisation",
+];
 const RESEARCH_ROOM_IDS = [
   "the-pub",
   "ai-lab",
   "ai-programming",
   "stock-market",
+  "football-talk",
   "world-of-warcraft",
   "3d-visualisation",
 ];
@@ -40,6 +48,10 @@ describe("channel profiles", () => {
       if (profile.autonomousResearchPriority !== undefined) {
         expect(profile.autonomousResearchPriority, profile.public.id).toBeGreaterThanOrEqual(0.25);
         expect(profile.autonomousResearchPriority, profile.public.id).toBeLessThanOrEqual(4);
+      }
+      if (profile.ambientActivityPriority !== undefined) {
+        expect(profile.ambientActivityPriority, profile.public.id).toBeGreaterThanOrEqual(0.25);
+        expect(profile.ambientActivityPriority, profile.public.id).toBeLessThanOrEqual(4);
       }
       expect(CONVERSATION_REGISTERS[profile.conversationRegister].guidance.length).toBeGreaterThan(40);
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
@@ -110,6 +122,7 @@ describe("channel profiles", () => {
 
     expect(profile("lobby")).toMatchObject({ ambientMode: "casual", conversationRegister: "everyday" });
     expect(profile("the-pub")).toMatchObject({ ambientMode: "banter", conversationRegister: "banter" });
+    expect(profile("football-talk")).toMatchObject({ ambientMode: "banter", conversationRegister: "banter" });
     expect(profile("world-of-warcraft")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
     expect(profile("side-quests")).toMatchObject({ ambientMode: "casual", conversationRegister: "everyday" });
     expect(profile("ai-programming").conversationRegister).toBe("technical");
@@ -181,6 +194,9 @@ describe("channel profiles", () => {
     const matrix = buildRoomExpertiseMatrix(PERSONAS);
     expect(matrix.get("ai-programming")?.get("ai-sana")?.level).toBe("specialist");
     expect(matrix.get("stock-market")?.get("ai-farah")?.level).toBe("specialist");
+    expect(matrix.get("football-talk")?.get("ai-linnea")?.level).toBe("specialist");
+    expect(matrix.get("football-talk")?.get("ai-vale")?.level).toBe("advanced");
+    expect(matrix.get("football-talk")?.get("ai-ibrahim")?.level).toBe("advanced");
     expect(matrix.get("world-of-warcraft")?.get("ai-pixel")?.level).toBe("specialist");
     expect(matrix.get("3d-visualisation")?.get("ai-pixel")?.level).toBe("specialist");
     expect(matrix.get("the-pub")?.get("ai-juno")?.level).toBe("specialist");
@@ -216,6 +232,58 @@ describe("channel profiles", () => {
     expect(pub.conversationGuidance).toContain("without inventing drinking, intoxication, a visit or a lifestyle");
     expect(pub.conversationGuidance).toContain("never explain a punchline");
     expect(pub.ambientReactionPalette).toEqual(expect.arrayContaining(["😂", "🍿", "🎵"]));
+  });
+
+  it("gives football-talk deep seed variety and a strict current-evidence contract", () => {
+    const football = CHANNEL_PROFILES.find((profile) => profile.public.id === "football-talk")!;
+
+    expect(football).toMatchObject({
+      public: { name: "football-talk", icon: "⚽" },
+      expertiseDomain: "football",
+      ambientMode: "banter",
+      conversationRegister: "banter",
+      expertiseOverrides: {
+        "ai-linnea": { level: "specialist" },
+        "ai-vale": { level: "advanced" },
+        "ai-ibrahim": { level: "advanced" },
+      },
+    });
+    expect(football.topic.tags).toEqual(expect.arrayContaining([
+      "football",
+      "tactics",
+      "World Cup 2026",
+      "fixtures",
+      "results",
+      "refereeing",
+      "supporter culture",
+    ]));
+    expect(football.topic.freshnessRule).toContain("11 June through 19 July 2026");
+    expect(football.topic.freshnessRule).toContain("Derive whether it is upcoming, active or completed from the trusted server clock");
+    expect(football.topic.freshnessRule).toContain("require supplied fresh evidence");
+    expect(football.topic.freshnessRule).toContain("latest-reported/post-match data");
+    expect(football.topic.freshnessRule).toContain("never turn an awaiting result into a live score");
+    expect(football.conversationGuidance).toContain("pressing trigger");
+    expect(football.conversationGuidance).toContain("do not make the room converge politely");
+    expect(football.conversationGuidance).toContain("Never invent attending a match");
+
+    expect(football.ambientPremises).toHaveLength(24);
+    expect(football.ambientPremiseFamilies).toHaveLength(24);
+    expect(new Set(football.ambientPremiseFamilies).size).toBe(24);
+    expect(football.ambientPremiseFamilies).toEqual(expect.arrayContaining([
+      "pressing-triggers",
+      "expected-goals",
+      "supporter-culture",
+      "penalty-shootouts",
+      "knockout-momentum",
+    ]));
+
+    expect(football.autonomousResearchSeeds).toHaveLength(8);
+    expect(football.autonomousResearchSeeds?.every((seed) => seed.mode === "news")).toBe(true);
+    expect(football.autonomousResearchSeeds?.every((seed) => (seed.maxAgeDays ?? Infinity) <= 14)).toBe(true);
+    expect(football.autonomousResearchPriority).toBeGreaterThan(1);
+    expect(football.autonomousResearchPriority).toBeLessThanOrEqual(4);
+    expect(football.ambientActivityPriority).toBeGreaterThan(1);
+    expect(football.ambientActivityPriority).toBeLessThanOrEqual(4);
   });
 
   it("keeps stock-market discussion concrete and informal without weakening evidence boundaries", () => {

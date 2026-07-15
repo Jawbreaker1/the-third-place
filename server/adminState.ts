@@ -378,6 +378,7 @@ const runtimeChannelFromConfig = (
   if (topicReplaced) {
     delete profile.autonomousResearchSeeds;
     delete profile.autonomousResearchPriority;
+    delete profile.ambientActivityPriority;
     delete profile.marketPulseSourceSet;
   }
   return profile;

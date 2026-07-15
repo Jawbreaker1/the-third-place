@@ -15,7 +15,7 @@ export const HUMAN_MEMORY_DEFAULTS = {
   revisitThresholdMs: 4 * 60 * 60_000,
   maxProfiles: 500,
   maxFactsPerProfile: 4,
-  maxChannelScoresPerProfile: 8,
+  maxChannelScoresPerProfile: 12,
   maxRelationsPerProfile: 24,
   persistDelayMs: 250,
 } as const;

@@ -254,7 +254,7 @@ export interface SceneRequest {
   /** Trusted voice-transport facts; participant names remain untrusted display labels. */
   voiceContext?: VoiceSceneContext;
   research?: {
-    kind?: "search" | "page" | "weather" | "market";
+    kind?: "search" | "page" | "weather" | "market" | "football";
     query: string;
     retrievedAt: string;
     results: Array<{ id: string; title: string; url: string; snippet: string; publishedAt?: string }>;

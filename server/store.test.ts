@@ -33,6 +33,31 @@ describe("room history", () => {
     expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
   });
 
+  it("migrates existing history with a lively football opening exactly once", async () => {
+    const filePath = tempStorePath();
+    const existing = createMessage("lobby", "human-returning", "preserve this pre-football history");
+    await writeFile(filePath, JSON.stringify({ version: 1, messages: [existing] }), "utf8");
+
+    const migrated = new RoomStore(filePath);
+    await migrated.load();
+    const footballMessages = migrated.getRecent("football-talk", 50);
+    const firstFootballIds = footballMessages.map((message) => message.id);
+
+    expect(footballMessages.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(footballMessages.map((message) => message.authorId))).toEqual(
+      new Set(["ai-bosse", "ai-vale", "ai-linnea"]),
+    );
+    expect(footballMessages.some((message) =>
+      message.reactions?.some((reaction) => reaction.emoji === "⚽"),
+    )).toBe(true);
+    expect(migrated.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+
+    const reloaded = new RoomStore(filePath);
+    await reloaded.load();
+    expect(reloaded.getRecent("football-talk", 50).map((message) => message.id)).toEqual(firstFootballIds);
+    expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+  });
+
   it("returns stable chronological pages before a composite cursor", async () => {
     const store = tempStore();
     for (let index = 0; index < 95; index += 1) {

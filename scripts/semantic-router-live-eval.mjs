@@ -70,6 +70,54 @@ const cases = [
       value.capabilities.discussed.includes("weather_forecast"),
   },
   {
+    id: "sv-world-cup-today",
+    text: "Vilka matcher spelas i fotbolls-VM idag? Kolla det aktuella spelschemat.",
+    channel: { id: "football-talk", name: "football-talk", topic: "Deep football talk, tactics, supporters and the active 2026 World Cup." },
+    capabilities: ["web_search", "football_data", "local_datetime"],
+    check: (value) => value.evidence.action === "football_data" &&
+      value.evidence.competitionTarget === "FIFA_WC_2026" &&
+      value.evidence.footballView === "today" &&
+      value.capabilities.discussed.includes("football_data") &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
+    id: "es-world-cup-upcoming",
+    text: "¿Cuáles son los próximos partidos del Mundial 2026? Comprueba el calendario actual.",
+    channel: { id: "football-talk", name: "football-talk", topic: "Deep football talk, tactics, supporters and the active 2026 World Cup." },
+    capabilities: ["web_search", "football_data", "local_datetime"],
+    check: (value) => value.evidence.action === "football_data" &&
+      value.evidence.competitionTarget === "FIFA_WC_2026" &&
+      value.evidence.footballView === "upcoming" &&
+      value.capabilities.discussed.includes("football_data"),
+  },
+  {
+    id: "de-world-cup-recent-result",
+    text: "Wie endete das zuletzt gemeldete Spiel bei der WM 2026? Bitte die Ergebnisse prüfen.",
+    channel: { id: "football-talk", name: "football-talk", topic: "Deep football talk, tactics, supporters and the active 2026 World Cup." },
+    capabilities: ["web_search", "football_data", "local_datetime"],
+    check: (value) => value.evidence.action === "football_data" &&
+      value.evidence.competitionTarget === "FIFA_WC_2026" &&
+      value.evidence.footballView === "recent_results" &&
+      value.capabilities.discussed.includes("football_data"),
+  },
+  {
+    id: "en-world-cup-live-score-stays-search",
+    text: "What is the minute-by-minute live score in the World Cup match right now?",
+    channel: { id: "football-talk", name: "football-talk", topic: "Deep football talk, tactics, supporters and the active 2026 World Cup." },
+    capabilities: ["web_search", "football_data", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.capabilities.discussed.includes("web_search"),
+  },
+  {
+    id: "sv-world-cup-causal-analysis-stays-search",
+    text: "Varför förlorade Frankrike semifinalen mot Spanien, och vilka taktiska problem avgjorde?",
+    channel: { id: "football-talk", name: "football-talk", topic: "Deep football talk, tactics, supporters and the active 2026 World Cup." },
+    capabilities: ["web_search", "football_data", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.query?.toLocaleLowerCase().includes("frankrike") &&
+      value.capabilities.discussed.includes("web_search"),
+  },
+  {
     id: "sv-omxs30-snapshot",
     text: "Förlåt. Har ni koll på OMX30?",
     channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },

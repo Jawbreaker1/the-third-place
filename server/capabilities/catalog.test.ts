@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import {
+  FOOTBALL_COMPETITION_IDS,
+  FOOTBALL_DATA_VIEWS,
+} from "../footballData/catalog.js";
 import { MARKET_TARGET_IDS } from "../marketData/catalog.js";
 import {
   CAPABILITY_ARGUMENT_FIELDS,
@@ -22,6 +26,9 @@ const emptyArguments = (): CapabilityArgumentValues => ({
   z: null,
   k: null,
   l: null,
+  c: null,
+  w: null,
+  f: null,
 });
 
 describe("declarative capability catalog", () => {
@@ -30,6 +37,7 @@ describe("declarative capability catalog", () => {
       "read_url",
       "web_search",
       "market_snapshot",
+      "football_data",
       "local_datetime",
       "weather_forecast",
     ]);
@@ -48,6 +56,7 @@ describe("declarative capability catalog", () => {
     expect(CAPABILITY_CATALOG.web_search.routingClass).toBe("generic_external_default");
     expect(CAPABILITY_CATALOG.read_url.routingClass).toBe("exact_source");
     expect(CAPABILITY_CATALOG.market_snapshot.routingClass).toBe("narrow_structured");
+    expect(CAPABILITY_CATALOG.football_data.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.local_datetime.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.weather_forecast.routingClass).toBe("narrow_structured");
     expect(isExternalEvidenceCapability("local_datetime")).toBe(false);
@@ -58,8 +67,8 @@ describe("declarative capability catalog", () => {
     expect(capabilitiesForMedium("dm")).toEqual(TURN_CAPABILITIES);
   });
 
-  it("declares every compact q/u/m/z/k/l field exactly once in the shared wire vocabulary", () => {
-    expect(CAPABILITY_ARGUMENT_FIELDS).toEqual(["q", "u", "m", "z", "k", "l"]);
+  it("declares every compact q/u/m/z/k/l/c/w/f field exactly once in the shared wire vocabulary", () => {
+    expect(CAPABILITY_ARGUMENT_FIELDS).toEqual(["q", "u", "m", "z", "k", "l", "c", "w", "f"]);
     const known = new Set(CAPABILITY_ARGUMENT_FIELDS);
     for (const definition of Object.values(CAPABILITY_CATALOG)) {
       for (const field of [...definition.arguments.required, ...definition.arguments.allowed]) {
@@ -75,6 +84,7 @@ describe("declarative capability catalog", () => {
   }>([
     { capability: "web_search", values: { q: "今日のニュース", m: "news" } },
     { capability: "market_snapshot", values: { l: "SE_OMXS30" } },
+    { capability: "football_data", values: { c: "FIFA_WC_2026", w: "today", f: "Sweden" } },
     { capability: "local_datetime", values: { z: "Asia/Tokyo", k: "current_time", l: "東京" } },
     { capability: "weather_forecast", values: { l: "札幌", q: "Sapporo" } },
   ])("accepts only the declared argument shape for $capability", ({ capability, values }) => {
@@ -137,6 +147,37 @@ describe("declarative capability catalog", () => {
     }).valid).toBe(true);
   });
 
+  it("accepts only registered football competitions and provider-neutral data views", () => {
+    expect(CAPABILITY_CATALOG.football_data.arguments.allowedStringValues).toEqual({
+      c: FOOTBALL_COMPETITION_IDS,
+      w: FOOTBALL_DATA_VIEWS,
+    });
+    for (const view of FOOTBALL_DATA_VIEWS) {
+      expect(validateCapabilityArgumentShape("football_data", {
+        ...emptyArguments(),
+        c: "FIFA_WC_2026",
+        w: view,
+      }).valid).toBe(true);
+    }
+    expect(validateCapabilityArgumentShape("football_data", {
+      ...emptyArguments(),
+      c: "WORLD_CUP",
+      w: "today",
+    })).toMatchObject({ valid: false, invalidValue: ["c"] });
+    expect(validateCapabilityArgumentShape("football_data", {
+      ...emptyArguments(),
+      c: "FIFA_WC_2026",
+      w: "live",
+    })).toMatchObject({ valid: false, invalidValue: ["w"] });
+    expect(validateCapabilityArgumentShape("football_data", {
+      ...emptyArguments(),
+      c: "FIFA_WC_2026",
+      w: "upcoming",
+      f: "Argentina",
+      q: "latest score",
+    })).toMatchObject({ valid: false, forbidden: ["q"] });
+  });
+
   it("allows read_url mode only for a server-confirmed structural root", () => {
     const exactRead = { ...emptyArguments(), u: "U1", m: null };
     expect(validateCapabilityArgumentShape("read_url", exactRead).valid).toBe(true);
@@ -188,5 +229,17 @@ describe("declarative capability catalog", () => {
     expect(market).toContain("GLOBAL_MAJOR: a bounded cross-region overview");
     expect(market).toContain("rest of the world or other world markets performed");
     expect(market).toContain("Individual equities, market news, history, causes");
+
+    const football = buildCapabilityRoutingGuidance(["football_data"], "primary");
+    expect(football).toContain("structured fixtures");
+    expect(football).toContain("FIFA_WC_2026");
+    expect(football).toContain("today");
+    expect(football).toContain("recent_results");
+    expect(football).toContain("upcoming");
+    expect(football).toContain("standings");
+    expect(football).toContain("in-progress live score");
+    expect(football).toContain("news, transfers, injuries");
+    expect(football).toContain("tactical or causal analysis");
+    expect(football).toContain("remain web_search");
   });
 });
