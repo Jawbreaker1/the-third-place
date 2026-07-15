@@ -91,6 +91,16 @@ const cases = [
       value.capabilities.discussed.includes("football_data"),
   },
   {
+    id: "sv-world-cup-overview",
+    text: "Kan du kolla fotbolls-VM 2026 och säga det senaste rapporterade resultatet och vilka matcher som kommer härnäst?",
+    channel: { id: "football-talk", name: "football-talk", topic: "Deep football talk, tactics, supporters and the active 2026 World Cup." },
+    capabilities: ["web_search", "football_data", "local_datetime"],
+    check: (value) => value.evidence.action === "football_data" &&
+      value.evidence.competitionTarget === "FIFA_WC_2026" &&
+      value.evidence.footballView === "overview" &&
+      value.capabilities.discussed.includes("football_data"),
+  },
+  {
     id: "de-world-cup-recent-result",
     text: "Wie endete das zuletzt gemeldete Spiel bei der WM 2026? Bitte die Ergebnisse prüfen.",
     channel: { id: "football-talk", name: "football-talk", topic: "Deep football talk, tactics, supporters and the active 2026 World Cup." },
