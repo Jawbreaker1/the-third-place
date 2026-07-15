@@ -144,7 +144,7 @@ export interface ServerHealth {
 export interface DirectorEvent {
   id: string;
   createdAt: string;
-  trigger: "join" | "message" | "mention" | "dm" | "ambient" | "research";
+  trigger: "join" | "message" | "mention" | "reaction" | "dm" | "ambient" | "research";
   summary: string;
   considered: number;
   noticed: number;

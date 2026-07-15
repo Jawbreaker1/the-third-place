@@ -10,6 +10,7 @@ import type {
   TypingMemberPayload,
   VisualObservation,
 } from "../shared/types.js";
+import { isPublicReactionEmoji, type PublicReactionEmoji } from "../shared/reactions.js";
 import { containsExactMention } from "../shared/unicodeBoundaries.js";
 import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
@@ -105,7 +106,7 @@ export interface SocialSignals {
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const choose = <T>(items: T[], rng = Math.random): T => items[Math.floor(rng() * items.length)] as T;
+const choose = <T>(items: readonly T[], rng = Math.random): T => items[Math.floor(rng() * items.length)] as T;
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const AUTO_SHARED_LINK_WINDOW_MS = 60_000;
 const AUTO_SHARED_LINK_SUCCESS_COOLDOWN_MS = 20 * 60_000;
@@ -113,6 +114,19 @@ const AUTO_SHARED_LINK_GLOBAL_LIMIT = 4;
 const AUTO_SHARED_LINK_STATE_LIMIT = 1_000;
 const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_BASE_MS = 60_000;
 const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS = 4 * 60_000;
+const HUMAN_REACTION_STATE_LIMIT = 1_000;
+const HUMAN_REACTION_DEBOUNCE_MS = 700;
+const HUMAN_REACTION_HUMAN_COOLDOWN_MS = 24_000;
+const HUMAN_REACTION_MESSAGE_COOLDOWN_MS = 75_000;
+const CROWD_REACTION_PALETTES = {
+  hostile: ["😬", "👀", "🛑"],
+  debate: ["🤔", "👀", "🫡"],
+  playful: ["😂", "💀", "👀"],
+  absurd: ["😂", "💀", "👀", "🤯"],
+  warm: ["💛", "🙌", "✨"],
+  question: ["🤔", "👀", "💡"],
+  ordinary: ["👀", "✨", "👍"],
+} as const satisfies Record<string, readonly PublicReactionEmoji[]>;
 const boundedUntrustedText = (value: string, maxLength: number): string =>
   stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/g, " ")
@@ -634,6 +648,12 @@ export interface SocialDirectorOptions {
   autoSharedLinkDiscussionEnabled?: boolean;
   /** Structural DM burst window; no message text is inspected by this coordinator. */
   dmDebounceMs?: number;
+  /** Structural reaction burst window; emoji meaning remains model-owned. */
+  humanReactionDebounceMs?: number;
+  humanReactionHumanCooldownMs?: number;
+  humanReactionMessageCooldownMs?: number;
+  /** Optional deterministic test/deployment override. Ordinary behavior derives this from the target resident. */
+  humanReactionResponseChance?: number;
   pageReader?: PageReader;
   /** Fixed-host typed forecast capability. `null` disables it explicitly in tests or deployments. */
   weatherForecastProvider?: WeatherForecastCapabilityProvider | null;
@@ -648,6 +668,44 @@ export interface SocialDirectorOptions {
   > | null;
   /** Live server-owned behavior settings; storage and authorization stay outside the director. */
   behaviorTuningProvider?: BehaviorTuningProvider;
+}
+
+export interface HumanReactionResponseGate {
+  now: number;
+  lastHumanTurnAt?: number;
+  lastMessageTurnAt?: number;
+  humanCooldownMs: number;
+  messageCooldownMs: number;
+  modelConnected: boolean;
+  queueDepth: number;
+  availableMessageSlots: number;
+  voiceRoomActive: boolean;
+  alreadyInFlight: boolean;
+  responseChance: number;
+  rng: () => number;
+}
+
+/**
+ * Transport/pacing only. Emoji meaning is deliberately absent: the scene
+ * model decides whether the gesture warrants words in its full room context.
+ */
+export function shouldStartHumanReactionResponse(gate: HumanReactionResponseGate): boolean {
+  if (
+    !gate.modelConnected ||
+    gate.queueDepth !== 0 ||
+    gate.availableMessageSlots < 1 ||
+    gate.voiceRoomActive ||
+    gate.alreadyInFlight
+  ) return false;
+  if (
+    gate.lastHumanTurnAt !== undefined &&
+    gate.now - gate.lastHumanTurnAt < gate.humanCooldownMs
+  ) return false;
+  if (
+    gate.lastMessageTurnAt !== undefined &&
+    gate.now - gate.lastMessageTurnAt < gate.messageCooldownMs
+  ) return false;
+  return gate.rng() < clamp(gate.responseChance, 0, 1);
 }
 
 export interface AutoSharedLinkDiscussionGate {
@@ -1336,6 +1394,15 @@ interface CoordinatedDmReply {
   linkPreview?: LinkPreview;
 }
 
+interface PendingHumanReaction {
+  channelId: string;
+  messageId: string;
+  human: Member;
+  persona: Persona;
+  emojis: Set<string>;
+  timer: NodeJS.Timeout;
+}
+
 interface AutoSharedLinkAttempt {
   successfulChannelUrlKey: string;
 }
@@ -1432,6 +1499,10 @@ const semanticSceneContext = (analysis: TurnAnalysis) => {
 export class SocialDirector {
   private readonly lastSpoke = new Map<string, number>();
   private readonly pendingBursts = new Map<string, PendingBurst>();
+  private readonly pendingHumanReactions = new Map<string, PendingHumanReaction>();
+  private readonly humanReactionResponsesInFlight = new Set<string>();
+  private readonly lastHumanReactionTurnAtByHumanChannel = new Map<string, number>();
+  private readonly lastHumanReactionTurnAtByMessage = new Map<string, number>();
   private readonly directorEvents: DirectorEvent[] = [];
   private readonly aiTimestamps: number[] = [];
   private readonly priorityHumanReplyTimestamps: number[] = [];
@@ -1489,6 +1560,10 @@ export class SocialDirector {
   private readonly autonomousResearchChannelCooldownMsOverride?: number;
   private readonly autonomousResearchHumanQuietMsOverride?: number;
   private readonly autoSharedLinkDiscussionEnabled: boolean;
+  private readonly humanReactionDebounceMs: number;
+  private readonly humanReactionHumanCooldownMs: number;
+  private readonly humanReactionMessageCooldownMs: number;
+  private readonly humanReactionResponseChanceOverride?: number;
   private readonly pageReader: PageReader;
   private readonly capabilityRegistry: CapabilityRegistry;
   private readonly marketSnapshotProvider?: Pick<MarketSnapshotService, "snapshot">;
@@ -1589,6 +1664,18 @@ export class SocialDirector {
       : Math.max(15_000, options.autonomousResearchHumanQuietMs);
     this.autoSharedLinkDiscussionEnabled = options.autoSharedLinkDiscussionEnabled
       ?? process.env.AUTO_DISCUSS_SHARED_LINKS === "true";
+    this.humanReactionDebounceMs = Math.max(0, options.humanReactionDebounceMs ?? HUMAN_REACTION_DEBOUNCE_MS);
+    this.humanReactionHumanCooldownMs = Math.max(
+      0,
+      options.humanReactionHumanCooldownMs ?? HUMAN_REACTION_HUMAN_COOLDOWN_MS,
+    );
+    this.humanReactionMessageCooldownMs = Math.max(
+      0,
+      options.humanReactionMessageCooldownMs ?? HUMAN_REACTION_MESSAGE_COOLDOWN_MS,
+    );
+    this.humanReactionResponseChanceOverride = options.humanReactionResponseChance === undefined
+      ? undefined
+      : clamp(options.humanReactionResponseChance, 0, 1);
   }
 
   start(): void {
@@ -1605,6 +1692,9 @@ export class SocialDirector {
     this.ambientTimer = undefined;
     for (const burst of this.pendingBursts.values()) clearTimeout(burst.timer);
     this.pendingBursts.clear();
+    for (const reaction of this.pendingHumanReactions.values()) clearTimeout(reaction.timer);
+    this.pendingHumanReactions.clear();
+    this.humanReactionResponsesInFlight.clear();
     this.dmTurns.dispose();
     this.typingLeases.clearAll();
   }
@@ -1627,6 +1717,8 @@ export class SocialDirector {
     this.catalogEpoch += 1;
     this.dmTurns.cancelAll();
     this.typingLeases.clearAll();
+    for (const reaction of this.pendingHumanReactions.values()) clearTimeout(reaction.timer);
+    this.pendingHumanReactions.clear();
     const channelIds = new Set([
       ...CHANNELS.map((channel) => channel.id),
       ...this.channelEpoch.keys(),
@@ -1751,6 +1843,207 @@ export class SocialDirector {
       void this.handleHumanBurst(messages, human);
     }, 700);
     this.pendingBursts.set(burstKey, { messages, human, timer });
+  }
+
+  /**
+   * Treats a human reaction on a resident-authored message as a small social
+   * event. Transport owns add/remove state; this entry point is called only
+   * after an add, then re-checks persisted membership before spending model
+   * work so a quick undo cannot create a ghost reply.
+   */
+  onHumanReaction(
+    event: { channelId: string; messageId: string; emoji: string },
+    human: Member,
+  ): void {
+    if (this.stopped) return;
+    if (!isPublicReactionEmoji(event.emoji)) return;
+    const target = this.store.getMessage(event.messageId);
+    const persona = target && target.channelId === event.channelId
+      ? PERSONAS.find((candidate) => candidate.id === target.authorId)
+      : undefined;
+    if (!target || !persona || target.system) return;
+    if (!CHANNELS.some((channel) => channel.id === event.channelId)) return;
+    if (!this.actorChannels.snapshot(persona.id)?.subscribedChannels.includes(event.channelId)) return;
+    if (!target.reactions.some(
+      (reaction) => reaction.emoji === event.emoji && reaction.memberIds.includes(human.id),
+    )) return;
+
+    const now = this.now();
+    this.lastHumanActivityAt = now;
+    this.lastHumanMessageAtByChannel.set(event.channelId, now);
+    this.ambientThreads.delete(event.channelId);
+
+    const pendingKey = `${event.channelId}:${event.messageId}:${human.id}`;
+    const existing = this.pendingHumanReactions.get(pendingKey);
+    if (existing) clearTimeout(existing.timer);
+    const emojis = new Set(existing?.emojis ?? []);
+    emojis.add(event.emoji);
+    while (emojis.size > 3) {
+      const oldest = emojis.values().next().value as string | undefined;
+      if (!oldest) break;
+      emojis.delete(oldest);
+    }
+    const timer = setTimeout(() => {
+      const pending = this.pendingHumanReactions.get(pendingKey);
+      if (!pending || pending.timer !== timer) return;
+      this.pendingHumanReactions.delete(pendingKey);
+      void this.handleHumanReaction(pending).catch((error) => {
+        console.warn("Human reaction scene failed:", error instanceof Error ? error.message : error);
+      });
+    }, this.humanReactionDebounceMs);
+    this.pendingHumanReactions.set(pendingKey, {
+      channelId: event.channelId,
+      messageId: event.messageId,
+      human,
+      persona,
+      emojis,
+      timer,
+    });
+  }
+
+  private async handleHumanReaction(pending: PendingHumanReaction): Promise<void> {
+    if (this.stopped) return;
+    const target = this.store.getMessage(pending.messageId);
+    if (!target || target.channelId !== pending.channelId || target.authorId !== pending.persona.id) return;
+    const activeEmojis = [...pending.emojis].filter((emoji) =>
+      target.reactions.some((reaction) => reaction.emoji === emoji && reaction.memberIds.includes(pending.human.id)),
+    );
+    if (activeEmojis.length === 0) return;
+
+    const now = this.now();
+    const humanChannelKey = `${pending.channelId}:${pending.human.id}`;
+    const messageKey = pending.messageId;
+    const inFlightKey = `${pending.channelId}:${pending.persona.id}`;
+    const health = this.lm.health();
+    const responseChance = this.humanReactionResponseChanceOverride
+      ?? 0.42 + pending.persona.talkativeness * 0.35;
+    if (!shouldStartHumanReactionResponse({
+      now,
+      lastHumanTurnAt: this.lastHumanReactionTurnAtByHumanChannel.get(humanChannelKey),
+      lastMessageTurnAt: this.lastHumanReactionTurnAtByMessage.get(messageKey),
+      humanCooldownMs: this.humanReactionHumanCooldownMs,
+      messageCooldownMs: this.humanReactionMessageCooldownMs,
+      modelConnected: health.connected,
+      queueDepth: health.queueDepth,
+      availableMessageSlots: this.availableMessageSlots(now),
+      voiceRoomActive: this.voiceRoomActive,
+      alreadyInFlight: this.humanReactionResponsesInFlight.has(inFlightKey),
+      responseChance,
+      rng: this.rng,
+    })) return;
+
+    this.lastHumanReactionTurnAtByHumanChannel.set(humanChannelKey, now);
+    this.lastHumanReactionTurnAtByMessage.set(messageKey, now);
+    this.pruneHumanReactionState(now);
+    this.humanReactionResponsesInFlight.add(inFlightKey);
+    const channelEpoch = this.channelEpoch.get(pending.channelId) ?? 0;
+    const catalogEpoch = this.catalogEpoch;
+    try {
+      const recentWithoutTarget = this.store.getRecent(pending.channelId, 24)
+        .filter((message) => message.id !== target.id)
+        .slice(-23);
+      const lines = await this.lm.generateScene(
+        {
+          kind: "public",
+          channelId: pending.channelId,
+          channelName: CHANNELS.find((channel) => channel.id === pending.channelId)?.name ?? pending.channelId,
+          selected: [pending.persona],
+          // Reproduce an older target immediately before the gesture if it has
+          // left the ordinary window; it remains a resident-authored chat row.
+          history: this.transcriptMessages([...recentWithoutTarget, target]),
+          trigger: {
+            author: pending.human.name,
+            content: activeEmojis.join(" "),
+            createdAt: new Date(now).toISOString(),
+          },
+          relationshipNotes: this.relationshipNotes([pending.persona], pending.human),
+          languageHint: this.lastTrustedLanguageByChannel.get(pending.channelId)
+            ?? ambientLanguageHint(this.store.getRecent(pending.channelId, 18)),
+          actorChannelNotes: this.actorChannels.promptNotes([pending.persona], pending.channelId),
+          actorExpertiseNotes: this.actorChannels.expertiseNotes([pending.persona], pending.channelId),
+          wordLimits: {
+            [pending.persona.id]: {
+              minimum: 1,
+              maximum: Math.max(1, Math.min(18, pending.persona.style.hardMaxWords)),
+            },
+          },
+          temporalPolicy: "reactive_only",
+          premise: "Trusted interaction type: the human added the exact emoji gesture in the trigger to the selected resident's immediately preceding reproduced message. It is a small reaction, not a new text request. Decide from the emoji and conversation whether this resident would naturally send one very short follow-up; silence is valid and preferable for routine acknowledgement. If speaking, contribute a character-specific social beat. Never narrate the interface action, explain the emoji, thank them mechanically, re-answer the old topic, or recruit another resident.",
+        },
+        1,
+      );
+      const line = lines.find((candidate) => candidate.personaId === pending.persona.id);
+      const currentTarget = this.store.getMessage(pending.messageId);
+      const reactionStillPresent = currentTarget?.reactions.some((reaction) =>
+        activeEmojis.includes(reaction.emoji) && reaction.memberIds.includes(pending.human.id),
+      );
+      if (
+        !line ||
+        !reactionStillPresent ||
+        catalogEpoch !== this.catalogEpoch ||
+        channelEpoch !== (this.channelEpoch.get(pending.channelId) ?? 0) ||
+        !this.canSpeak()
+      ) {
+        this.publishDirectorEvent({
+          trigger: "reaction",
+          summary: `${pending.persona.name} noticed ${pending.human.name}'s reaction and left it at that.`,
+          considered: 1,
+          noticed: 1,
+          replied: 0,
+          reacted: 0,
+        });
+        return;
+      }
+      // Optional generation stays invisible. Once a reviewed line exists, a
+      // short publication lease makes composing state truthful rather than
+      // advertising model work that may deliberately resolve to silence.
+      const publicationTypingLease = this.acquireTyping(pending.channelId, pending.persona.id);
+      let posted: ChatMessage | undefined;
+      try {
+        await delay(320 + this.rng() * 420);
+        const latestTarget = this.store.getMessage(pending.messageId);
+        const latestReactionStillPresent = latestTarget?.reactions.some((reaction) =>
+          activeEmojis.includes(reaction.emoji) && reaction.memberIds.includes(pending.human.id),
+        );
+        if (
+          latestReactionStillPresent &&
+          catalogEpoch === this.catalogEpoch &&
+          channelEpoch === (this.channelEpoch.get(pending.channelId) ?? 0) &&
+          this.canSpeak()
+        ) {
+          posted = this.postPublic(pending.channelId, pending.persona, line.content, undefined, "lm");
+        }
+      } finally {
+        publicationTypingLease.release();
+      }
+      this.publishDirectorEvent({
+        trigger: "reaction",
+        summary: posted
+          ? `${pending.persona.name} picked up ${pending.human.name}'s reaction.`
+          : `${pending.persona.name} noticed ${pending.human.name}'s reaction and left it at that.`,
+        considered: 1,
+        noticed: 1,
+        replied: posted ? 1 : 0,
+        reacted: 0,
+      });
+    } finally {
+      this.humanReactionResponsesInFlight.delete(inFlightKey);
+    }
+  }
+
+  private pruneHumanReactionState(now: number): void {
+    const prune = (values: Map<string, number>, maxAgeMs: number): void => {
+      for (const [key, timestamp] of values) {
+        if (now - timestamp >= maxAgeMs) values.delete(key);
+      }
+      while (values.size > HUMAN_REACTION_STATE_LIMIT) {
+        const oldest = values.keys().next().value as string | undefined;
+        if (!oldest) break;
+        values.delete(oldest);
+      }
+    };
+    prune(this.lastHumanReactionTurnAtByHumanChannel, this.humanReactionHumanCooldownMs);
+    prune(this.lastHumanReactionTurnAtByMessage, this.humanReactionMessageCooldownMs);
   }
 
   onHumanImagePosted(message: ChatMessage): void {
@@ -2867,19 +3160,19 @@ export class SocialDirector {
       .filter((persona) => !responders.includes(persona) || this.rng() < 0.28)
       .sort(() => this.rng() - 0.5)
       .slice(0, desired);
-    const emojis = isHostile
-      ? ["😬", "👀", "🛑"]
+    const emojis: readonly PublicReactionEmoji[] = isHostile
+      ? CROWD_REACTION_PALETTES.hostile
       : isDebate
-      ? ["🤔", "👀", "🫡"]
+      ? CROWD_REACTION_PALETTES.debate
       : signals.playfulness > 0.45
-        ? ["😂", "💀", "👀"]
+        ? CROWD_REACTION_PALETTES.playful
       : signals.absurdity > 0.42
-        ? ["😂", "💀", "👀", "🤯"]
+        ? CROWD_REACTION_PALETTES.absurd
         : signals.warmth > 0.25
-          ? ["💛", "🙌", "✨"]
+          ? CROWD_REACTION_PALETTES.warm
           : signals.isQuestion
-            ? ["🤔", "👀", "💡"]
-            : ["👀", "✨", "👍"];
+            ? CROWD_REACTION_PALETTES.question
+            : CROWD_REACTION_PALETTES.ordinary;
 
     candidates.forEach((persona, index) => {
       setTimeout(() => {

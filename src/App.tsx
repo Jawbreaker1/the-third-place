@@ -44,8 +44,9 @@ import {
 } from "./voicePlayback";
 import { clearChannelNotice, firstUnreadDmMessageId, nextDmUnread, noteChannelMessage, type ChannelNotices } from "./unread";
 import { reduceTypingPresence, TypingPresenceExpiry } from "./typingPresence";
+import { EmojiPicker } from "./EmojiPicker";
+import { insertEmojiAtSelection } from "./emoji";
 
-const REACTIONS = ["👍", "👀", "😂", "💀", "🤔", "💛", "🔥", "✨"];
 const CLIENT_CHANNEL_MESSAGE_LIMIT = 600;
 
 type ConnectionState = "preview" | "connecting" | "live" | "reconnecting" | "offline";
@@ -80,6 +81,9 @@ type ImageDraft = {
   label: string;
   error?: string;
 };
+type EmojiPickerTarget =
+  | { kind: "reaction"; messageId: string }
+  | { kind: "composer" };
 
 const Icon = ({ name, size = 18 }: { name: string; size?: number }) => {
   const paths: Record<string, ReactNode> = {
@@ -336,6 +340,7 @@ export default function App() {
   const [toasts, setToasts] = useState<Array<ToastPayload & { id: number }>>([]);
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
+  const [emojiPickerTarget, setEmojiPickerTarget] = useState<EmojiPickerTarget | null>(null);
   const [channelNotices, setChannelNotices] = useState<ChannelNotices>({});
   const [unreadDividers, setUnreadDividers] = useState<Record<string, string | undefined>>({});
   const [historyPageInfo, setHistoryPageInfo] = useState<Record<string, { before?: string; hasMore: boolean }>>({});
@@ -392,6 +397,7 @@ export default function App() {
   const dragDepth = useRef(0);
   const lightboxCloseRef = useRef<HTMLButtonElement | null>(null);
   const lightboxTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const emojiPickerAnchorRef = useRef<HTMLButtonElement | null>(null);
   const imageObjectUrls = useRef(new Set<string>());
   const localVoiceStreamRef = useRef<MediaStream | null>(null);
   const voiceMeshRef = useRef<VoicePeerMesh | null>(null);
@@ -1937,6 +1943,38 @@ export default function App() {
     });
   };
 
+  const closeEmojiPicker = useCallback((restoreFocus = false) => {
+    setEmojiPickerTarget(null);
+    if (restoreFocus) requestAnimationFrame(() => emojiPickerAnchorRef.current?.focus({ preventScroll: true }));
+  }, []);
+
+  const toggleEmojiPicker = (target: EmojiPickerTarget, anchor: HTMLButtonElement) => {
+    const alreadyOpen = emojiPickerTarget?.kind === target.kind && (
+      target.kind === "composer" || (
+        emojiPickerTarget.kind === "reaction" && emojiPickerTarget.messageId === target.messageId
+      )
+    );
+    emojiPickerAnchorRef.current = anchor;
+    setEmojiPickerTarget(alreadyOpen ? null : target);
+  };
+
+  const insertComposerEmoji = (emoji: string) => {
+    const input = composerInputRef.current;
+    const selectionStart = input?.selectionStart ?? composer.length;
+    const selectionEnd = input?.selectionEnd ?? selectionStart;
+    const insertion = insertEmojiAtSelection(composer, emoji, selectionStart, selectionEnd, 500);
+    if (!insertion) {
+      pushToast({ tone: "warning", title: "Message is full", message: "Remove a character before adding an emoji." });
+      return;
+    }
+    notifyTyping(insertion.value);
+    closeEmojiPicker();
+    requestAnimationFrame(() => {
+      input?.focus({ preventScroll: true });
+      input?.setSelectionRange(insertion.caret, insertion.caret);
+    });
+  };
+
   const report = (message: ChatMessage) => {
     socketRef.current?.emit("message:report", { messageId: message.id }, (result: ActionResult) => {
       if (!result.ok) pushToast({ tone: "warning", title: "Report failed", message: result.error });
@@ -1958,6 +1996,7 @@ export default function App() {
     setSearch("");
     setImageUrlOpen(false);
     setImageUrlValue("");
+    setEmojiPickerTarget(null);
     dragDepth.current = 0;
     setDragActive(false);
     setMobilePanel(null);
@@ -2198,7 +2237,9 @@ export default function App() {
           <span className="channel-symbol">{activeThread ? <Icon name="lock" size={18} /> : <Icon name="hash" size={19} />}</span>
           <div className="channel-heading"><strong dir="auto">{activeTitle}</strong><span dir="auto">{activeDescription}</span></div>
           <div className="header-actions">
-            <span className={`connection-pill ${connection}`}><i />{connection === "live" ? "live" : connection}</span>
+            {connection !== "live" && connection !== "preview" && (
+              <span aria-live="polite" className={`connection-pill ${connection}`} role="status"><i />{connection}</span>
+            )}
             <button className={`icon-button ${showDirector ? "active" : ""}`} onClick={() => setShowDirector((value) => !value)} title="Director view"><Icon name="pulse" /></button>
             <button className={`icon-button ${searchOpen ? "active" : ""}`} onClick={() => setSearchOpen((value) => !value)} title="Search"><Icon name="search" /></button>
             <button className="people-button" onClick={() => setMobilePanel("people")}><Icon name="users" /><span>{onlineHumans.length + activeResidents.length}</span></button>
@@ -2280,7 +2321,7 @@ export default function App() {
               {startsDay && <div className="day-divider"><span>{formatDayLabel(message.createdAt)}</span></div>}
               {startsUnread && <div className="unread-divider" role="separator" aria-label="New messages"><span>New</span></div>}
               <article
-                className={`message ${grouped ? "grouped" : ""} ${historicalMessageIds.current.has(message.id) ? "historical" : ""}`}
+                className={`message ${grouped ? "grouped" : ""} ${historicalMessageIds.current.has(message.id) ? "historical" : ""} ${emojiPickerTarget?.kind === "reaction" && emojiPickerTarget.messageId === message.id ? "reaction-picker-open" : ""}`}
                 data-message-id={message.id}
               >
                 {!grouped ? <Avatar member={author} size="md" /> : <time className="group-time">{formatTime(message.createdAt)}</time>}
@@ -2351,14 +2392,33 @@ export default function App() {
                       </a>
                     </div>
                   )}
-                  {message.reactions.length > 0 && (
-                    <div className="reaction-row">
+                  {(message.reactions.length > 0 || (me && !activeThread)) && (
+                    <div className={`reaction-row ${message.reactions.length === 0 ? "reaction-row-empty" : ""}`}>
                       {message.reactions.map((reaction) => (
-                        <button key={reaction.emoji} className={me && reaction.memberIds.includes(me.id) ? "mine" : ""} onClick={() => me && react(message, reaction.emoji)} disabled={!me}>
+                        <button
+                          key={reaction.emoji}
+                          aria-label={`${reaction.emoji} reaction, ${reaction.memberIds.length} ${reaction.memberIds.length === 1 ? "person" : "people"}`}
+                          aria-pressed={Boolean(me && reaction.memberIds.includes(me.id))}
+                          className={me && reaction.memberIds.includes(me.id) ? "mine" : ""}
+                          onClick={() => me && react(message, reaction.emoji)}
+                          disabled={!me}
+                        >
                           <span>{reaction.emoji}</span><b>{reaction.memberIds.length}</b>
                           <i>{reaction.memberIds.slice(0, 3).map((id) => memberMap.get(id)).filter((member): member is Member => Boolean(member)).map((member) => <Avatar key={member.id} member={member} size="sm" showStatus={false} />)}</i>
                         </button>
                       ))}
+                      {me && !activeThread && (
+                        <button
+                          className="reaction-add-touch"
+                          type="button"
+                          data-emoji-picker-trigger
+                          onClick={(event) => toggleEmojiPicker({ kind: "reaction", messageId: message.id }, event.currentTarget)}
+                          title="Add reaction"
+                          aria-label={`Add a reaction to ${author.name}'s message`}
+                          aria-haspopup="dialog"
+                          aria-expanded={emojiPickerTarget?.kind === "reaction" && emojiPickerTarget.messageId === message.id}
+                        ><Icon name="smile" size={15} /></button>
+                      )}
                     </div>
                   )}
                   {remainingSources.length > 0 && (
@@ -2374,10 +2434,17 @@ export default function App() {
                 </div>
                 {me && !activeThread && (
                   <div className="message-actions">
-                    <button type="button" onClick={() => react(message, REACTIONS[Math.floor(Math.random() * REACTIONS.length)]!)} title="React"><Icon name="smile" size={16} /></button>
+                    <button
+                      type="button"
+                      data-emoji-picker-trigger
+                      onClick={(event) => toggleEmojiPicker({ kind: "reaction", messageId: message.id }, event.currentTarget)}
+                      title="Add reaction"
+                      aria-label={`Add a reaction to ${author.name}'s message`}
+                      aria-haspopup="dialog"
+                      aria-expanded={emojiPickerTarget?.kind === "reaction" && emojiPickerTarget.messageId === message.id}
+                    ><Icon name="smile" size={16} /></button>
                     <button type="button" onClick={() => beginReply(message)} title="Reply" aria-label={`Reply to ${author.name}`} aria-controls="message-composer-input"><Icon name="reply" size={16} /></button>
-                    <div className="reaction-menu">{REACTIONS.slice(0, 5).map((emoji) => <button key={emoji} onClick={() => react(message, emoji)}>{emoji}</button>)}</div>
-                    <button onClick={() => report(message)} title="Report"><Icon name="flag" size={15} /></button>
+                    <button type="button" onClick={() => report(message)} title="Report" aria-label={`Report ${author.name}'s message`}><Icon name="flag" size={15} /></button>
                   </div>
                 )}
               </article>
@@ -2465,7 +2532,16 @@ export default function App() {
               maxLength={500}
             />
             <span className={`char-count ${composer.length > 440 ? "show" : ""}`}>{500 - composer.length}</span>
-            <button type="button" className="emoji-button" disabled={!me || pendingImage?.status === "sending"} onClick={() => notifyTyping(`${composer}${composer ? " " : ""}✨`)}><Icon name="smile" /></button>
+            <button
+              type="button"
+              className={`emoji-button ${emojiPickerTarget?.kind === "composer" ? "active" : ""}`}
+              disabled={!me || pendingImage?.status === "sending"}
+              data-emoji-picker-trigger
+              onClick={(event) => toggleEmojiPicker({ kind: "composer" }, event.currentTarget)}
+              aria-label="Choose an emoji"
+              aria-haspopup="dialog"
+              aria-expanded={emojiPickerTarget?.kind === "composer"}
+            ><Icon name="smile" /></button>
             <button type="submit" className="send-button" disabled={!me || (!composer.trim() && !pendingImage) || pendingImage?.status === "preparing" || pendingImage?.status === "sending"}>{pendingImage?.status === "sending" ? <span className="button-spinner" /> : <Icon name="send" size={17} />}</button>
           </form>
           <div className="composer-note"><Icon name="spark" size={11} /> AI residents may read public messages and view shared images. Public HTTPS links may unfurl; an explicit read/check request lets the server fetch bounded page text. DMs stay out of public context.</div>
@@ -2478,6 +2554,23 @@ export default function App() {
           <button onClick={() => setMobilePanel("people")}><Icon name="users" /><span>People</span></button>
         </nav>
       </main>
+
+      {emojiPickerTarget && (
+        <EmojiPicker
+          anchor={emojiPickerAnchorRef.current}
+          label={emojiPickerTarget.kind === "reaction" ? "Add reaction" : "Choose emoji"}
+          onClose={closeEmojiPicker}
+          onSelect={(emoji) => {
+            if (emojiPickerTarget.kind === "reaction") {
+              const message = messages.find((candidate) => candidate.id === emojiPickerTarget.messageId);
+              if (message) react(message, emoji);
+              closeEmojiPicker(true);
+            } else {
+              insertComposerEmoji(emoji);
+            }
+          }}
+        />
+      )}
 
       <aside className={`member-panel ${mobilePanel === "people" ? "mobile-open" : ""}`}>
         <div className="member-panel-head"><div><strong>{voiceRoomInView ? "In voice" : "In the room"}</strong><span>{voiceRoomInView ? `${voiceRoomInView.participants.length} connected` : `${onlineHumans.length} guests · ${activeResidents.length} active residents`}</span></div><button className="icon-button mobile-only" onClick={() => setMobilePanel(null)}><Icon name="close" /></button></div>

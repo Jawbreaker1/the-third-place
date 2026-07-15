@@ -29,6 +29,7 @@ import type {
   VoiceRoomView,
   VoiceTranscriptEntry,
 } from "../shared/types.js";
+import { isPublicReactionEmoji } from "../shared/reactions.js";
 import type { AdminHumanMember } from "../shared/adminTypes.js";
 import { displayNameGlyph, normalizeDisplayName, validDisplayName } from "../shared/displayName.js";
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
@@ -89,7 +90,6 @@ const SESSION_COOKIE = "atrium_session";
 const SESSION_RETENTION_MS = HUMAN_MEMORY_DEFAULTS.retentionMs;
 const SESSION_COOKIE_MAX_AGE_SECONDS = Math.floor(SESSION_RETENTION_MS / 1_000);
 const SESSION_HEARTBEAT_MS = 10 * 60_000;
-const PUBLIC_REACTIONS = new Set(["👍", "👀", "😂", "💀", "🤔", "💛", "🔥", "✨", "🙌", "😬", "🫡", "🌿"]);
 const PACE: ServerHealth["aiPace"] =
   process.env.AI_PACE === "calm" || process.env.AI_PACE === "party" ? process.env.AI_PACE : "lively";
 const VOICE_ENABLED = process.env.VOICE_ENABLED !== "false";
@@ -1591,7 +1591,7 @@ io.on("connection", (socket) => {
       return;
     }
     const parsed = reactionSchema.safeParse(raw);
-    if (!parsed.success || !PUBLIC_REACTIONS.has(parsed.data.emoji)) {
+    if (!parsed.success || !isPublicReactionEmoji(parsed.data.emoji)) {
       acknowledge?.({ ok: false, error: "That reaction isn't available." });
       return;
     }
@@ -1610,6 +1610,13 @@ io.on("connection", (socket) => {
       messageId: parsed.data.messageId,
       reaction,
     });
+    if (reaction.memberIds.includes(session.member.id)) {
+      director.onHumanReaction({
+        channelId: parsed.data.channelId,
+        messageId: parsed.data.messageId,
+        emoji: parsed.data.emoji,
+      }, session.member);
+    }
     acknowledge?.({ ok: true });
   });
 
