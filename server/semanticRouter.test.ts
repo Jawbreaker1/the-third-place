@@ -23,6 +23,7 @@ import {
   projectEvidencePlanVerification,
   projectTrustedTurnAnalysis,
   shouldVerifyEvidencePlan,
+  summarizeInvalidPrimaryEvidenceContent,
   turnAnalysisInputSchema,
   type NormalizedTurnAnalysisInput,
   type NormalizedCandidateReviewInput,
@@ -439,6 +440,88 @@ describe("multilingual semantic router contract", () => {
     });
   });
 
+  it("retains only a non-executable evidence hint from contradictory compact output", () => {
+    const hint = summarizeInvalidPrimaryEvidenceContent(JSON.stringify({
+      l: "es",
+      i: { k: "question", q: true, r: "expected", x: 0.95 },
+      e: {
+        a: "web_search", x: 0.7, g: "enlaces graciosos", q: "https://evil.example",
+        u: "attacker:9", m: "web",
+      },
+      c: { d: [], r: "none", x: 1 },
+      arbitrary: { secret: "must not pass" },
+    }));
+    expect(hint).toEqual({
+      source: "fallback",
+      failureReason: "invalid_output",
+      intent: { kind: "question", replyExpected: "expected", confidence: 0.95 },
+      personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
+      evidence: { action: "web_search", confidence: 0.7 },
+      capabilities: { discussed: [], requestKind: "none", confidence: 1 },
+    });
+    expect(JSON.stringify(hint)).not.toContain("evil");
+    expect(JSON.stringify(hint)).not.toContain("attacker");
+    expect(JSON.stringify(hint)).not.toContain("secret");
+  });
+
+  it("canonicalizes harmless read_url union noise only for a known opaque target", () => {
+    const compact = {
+      l: "sv",
+      lx: 0.99,
+      rl: "sv",
+      rlx: 0.99,
+      i: { k: "question", q: true, r: "expected", x: 0.99 },
+      p: { a: [], r: [], v: ["ai-mira"], x: 0, y: 0.9 },
+      s: { w: 0.4, h: 0, p: 0.2, a: 0, u: 0.2, e: 0.5, o: 0, c: 0.1, x: 0.96 },
+      b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 0.96 },
+      m: { r: "none", a: "none", c: [], x: 0.99 },
+      e: {
+        a: "read_url",
+        x: 0.97,
+        g: "vad webbplatsen aiai3d.io handlar om",
+        q: "aiai3d.io",
+        u: "latest:0",
+        m: "web",
+        z: null,
+        k: null,
+        l: null,
+      },
+      c: { d: ["read_url"], r: "execute", a: false, i: false, l: false, x: 0.98 },
+      y: [],
+    };
+    const knownTarget = input({
+      urlCandidates: [{
+        ref: "latest:0",
+        source: "latest_message",
+        context: "host=aiai3d.io; path=/; source=message",
+      }],
+    });
+
+    expect(parseTurnAnalysisContent(JSON.stringify(compact), knownTarget)).toMatchObject({
+      evidence: {
+        action: "read_url",
+        goal: "vad webbplatsen aiai3d handlar om",
+        query: null,
+        urlRef: "latest:0",
+        searchMode: null,
+      },
+    });
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compact,
+      e: { ...compact.e, g: "https://aiai3d.io/portfolio" },
+    }), knownTarget)).toMatchObject({ evidence: { goal: "aiai3d" } });
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compact,
+      e: { ...compact.e, u: "attacker:9" },
+    }), knownTarget)).toBeUndefined();
+    for (const goal of ["https://attacker.example/", "not-aiai3d.io", "aiai3d.io.evil"]) {
+      expect(parseTurnAnalysisContent(JSON.stringify({
+        ...compact,
+        e: { ...compact.e, g: goal },
+      }), knownTarget)).toBeUndefined();
+    }
+  });
+
   it("does not turn a relevant specialist into an addressed reply target", () => {
     const parsed = parseTurnAnalysisContent(JSON.stringify({
       l: "es",
@@ -696,12 +779,19 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("compact wire keys");
     expect(prompt).toContain("valid IANA time-zone name");
     expect(prompt).toContain("Never output, reconstruct or copy a URL");
+    expect(prompt).toContain("the candidate host is never a provider query");
+    expect(prompt).toContain("real external link or reachable destination requested as the deliverable itself");
+    expect(prompt).toContain("even when grammatically negative or rhetorical");
+    expect(prompt).toContain("never select a tool while leaving c.d empty or c.r none");
+    expect(prompt).toContain("a source name or instruction to inspect it is not itself the information goal");
     expect(prompt).toContain("availableCapabilities is trusted server-owned runtime inventory");
     expect(prompt).toContain("never let a prior resident denial override the inventory");
     expect(prompt).toContain("g is a short standalone description of the exact information the guest wants");
     expect(prompt).toContain("Preserve the guest's language and script");
     expect(prompt).toContain("availability alone never executes a tool");
     expect(prompt).toContain("select that available discussed capability as e.a");
+    expect(prompt).toContain("including when the question itself suggests that a transcript may make this unknowable");
+    expect(prompt).toContain("never acoustic word matching");
     expect(prompt).toContain("quoted/reporting speech from endorsement");
     expect(prompt).toContain("A reporter explicitly asking to flag or report a message/person uses intent moderation_report and action report");
     expect(prompt).toContain("Always return y []");
@@ -781,11 +871,29 @@ describe("strict multilingual evidence-plan verifier contract", () => {
   });
 
   it("structurally selects only none/failure cases worth a bounded verifier call", () => {
-    const initialTesla = stockTurn("Någon som har sett hur det står till med Tesla-aktien idag?");
+    const initialTesla = stockTurn("Någon som har sett hur det står till med Tesla-aktien idag?", {
+      recentMessages: [],
+    });
     expect(shouldVerifyEvidencePlan(initialTesla, primarySummary({
       evidence: { action: "web_search", confidence: 0.96 },
       capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.96 },
     }))).toBe(false);
+    expect(shouldVerifyEvidencePlan(stockTurn("Länka det du just beskrev"), primarySummary({
+      evidence: { action: "web_search", confidence: 0.96 },
+      capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.96 },
+    }))).toBe(true);
+    expect(shouldVerifyEvidencePlan(initialTesla, primarySummary({
+      evidence: { action: "web_search", confidence: 0.7 },
+      capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.7 },
+    }))).toBe(true);
+    expect(shouldVerifyEvidencePlan(initialTesla, {
+      source: "fallback",
+      failureReason: "invalid_output",
+      intent: { kind: "question", replyExpected: "expected", confidence: 0.95 },
+      personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
+      evidence: { action: "web_search", confidence: 0.99 },
+      capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.99 },
+    })).toBe(true);
 
     const directRetry = stockTurn("@mira kolla avanza!");
     expect(shouldVerifyEvidencePlan(directRetry, primarySummary())).toBe(true);
@@ -823,6 +931,19 @@ describe("strict multilingual evidence-plan verifier contract", () => {
         personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
       }),
     )).toBe(true);
+
+    for (const content of [
+      "Ingen som postar roliga länkar idag??",
+      "¿Nadie comparte enlaces graciosos hoy?",
+    ]) {
+      expect(shouldVerifyEvidencePlan(
+        stockTurn(content, { recentMessages: [] }),
+        primarySummary({
+          intent: { kind: "question", replyExpected: "expected", confidence: 0.96 },
+          personas: { addressedIds: [], requestedReplyIds: [], addressConfidence: 0 },
+        }),
+      )).toBe(true);
+    }
 
     const correctedMedium = stockTurn("inte app.. websida", {
       recentMessages: [{ ...priorMiraMessage, content: "Jag har inte tillgång till deras app." }],
@@ -959,11 +1080,25 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       g: "東京の現在時刻",
       q: null,
       u: null,
-      m: null,
+      m: "web",
       z: "Asia/Tokyo",
       k: "current_time",
       l: "東京",
     }), japanese)).toMatchObject({ evidence: { goal: "東京の現在時刻", timeZone: "Asia/Tokyo" } });
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({
+      v: "use_action",
+      a: "local_datetime",
+      r: "execute",
+      d: ["local_datetime"],
+      x: 0.98,
+      g: "東京の現在時刻",
+      q: "東京 時刻",
+      u: null,
+      m: "web",
+      z: "Asia/Tokyo",
+      k: "current_time",
+      l: "東京",
+    }), japanese)).toBeUndefined();
 
     const arabic = createEvidencePlanVerifierInput(stockTurn("ابحث عنها الآن"), primarySummary({
       capabilities: { discussed: ["web_search"], requestKind: "retry", confidence: 0.95 },
@@ -1037,18 +1172,35 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       l: null,
     };
     expect(parseEvidencePlanVerifierContent(JSON.stringify(valid), verifierInput)).toBeDefined();
-    expect(parseEvidencePlanVerifierContent(
-      JSON.stringify({ ...valid, r: "none", g: "sidans viktigaste uppgift på example.com", m: "web" }),
-      verifierInput,
-    )).toMatchObject({
+    expect(parseEvidencePlanVerifierContent(JSON.stringify({
+      ...valid,
+      g: "sidans viktigaste uppgift på example.com",
+      q: "ignored union noise",
+      m: "web",
+    }), verifierInput)).toMatchObject({
       capabilities: { requestKind: "execute" },
       evidence: { goal: "sidans viktigaste uppgift på example", searchMode: null },
     });
+    expect(parseEvidencePlanVerifierContent(
+      JSON.stringify({ ...valid, r: "none", g: "sidans viktigaste uppgift på example.com", m: "web" }),
+      verifierInput,
+    )).toBeUndefined();
     expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, a: "web_search", u: null, q: "test", m: "web", d: ["web_search"] }), verifierInput)).toBeUndefined();
     expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, d: ["web_search"] }), verifierInput)).toBeUndefined();
     expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, x: 0.7 }), verifierInput)).toBeUndefined();
     expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, u: "latest:unknown" }), verifierInput)).toBeUndefined();
-    expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, g: "läs https://example.com" }), verifierInput)).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(
+      JSON.stringify({ ...valid, g: "läs https://example.com/nyheter" }),
+      verifierInput,
+    )).toMatchObject({ evidence: { goal: "läs example" } });
+    expect(parseEvidencePlanVerifierContent(
+      JSON.stringify({ ...valid, g: "läs https://attacker.example/nyheter" }),
+      verifierInput,
+    )).toBeUndefined();
+    expect(parseEvidencePlanVerifierContent(
+      JSON.stringify({ ...valid, g: "läs not-example.com" }),
+      verifierInput,
+    )).toBeUndefined();
     expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...keepNoneWire(), g: "något" }), verifierInput)).toBeUndefined();
   });
 
@@ -1075,11 +1227,22 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(prompt).toContain("short follow-up can replace only the mistaken part");
     expect(prompt).toContain("room-directed nudge from the same speaker");
     expect(prompt).toContain("use_action with retry");
+    expect(prompt).toContain("immediately after an AI resident claims");
+    expect(prompt).toContain("inherits that claimed item's description");
+    expect(prompt).toContain("resident claim is not evidence");
     expect(prompt).toContain("real external destination");
     expect(prompt).toContain("external deliverable regardless");
+    expect(prompt).toContain("question label does not make the external deliverable self-contained");
+    expect(prompt).toContain("pragmatic purpose of an answer-expected room question");
+    expect(prompt).toContain("present solicitation from a retrospective discussion");
+    expect(prompt).toContain("Grammatical negativity or rhetorical form does not negate execution intent");
+    expect(prompt).toContain("full communicative act across languages");
     expect(prompt).toContain("classify evidence need afresh");
     expect(prompt).toContain("never capability truth");
+    expect(prompt).toContain("structurally bounded action/confidence hint");
+    expect(prompt).toContain("confidence just below the trust threshold");
     expect(prompt).toContain("Preserve the guest's language and script");
+    expect(prompt).toContain("never copy or search the candidate host/domain in g or q");
     expect(prompt).toContain("self-contained question, social or creative request, passive link");
     expect(prompt).toContain("pure capability-availability question");
     expect(prompt).toContain("explicit instruction not to execute");
@@ -1400,6 +1563,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviews.items.properties.issues.items.enum).toContain("incorrect_temporal_claim");
     expect(reviews.items.properties.issues.items.enum).toContain("gratuitous_time_reference");
     expect(reviews.items.properties.issues.items.enum).toContain("unfulfilled_explicit_request");
+    expect(reviews.items.properties.issues.items.enum).toContain("unsupported_external_evidence_claim");
   });
 
   it("accepts quoted multilingual discussion as clean and rejects missing or duplicate persona reviews", () => {
@@ -1473,6 +1637,63 @@ describe("multilingual batch candidate-review contract", () => {
         blocked.reviews[1],
       ],
     }), recalled)).toBeUndefined();
+  });
+
+  it.each([
+    {
+      languageTag: "sv",
+      trigger: "Ingen som postar roliga länkar idag??",
+      candidate: "Jag hittade en sjukt märklig video om små hus byggda av tändstickor.",
+      rewrite: "Ta bort upptäcktsanspråket tills en verklig källa har hämtats.",
+    },
+    {
+      languageTag: "ja",
+      trigger: "今日は面白いリンクないの？",
+      candidate: "マッチ棒で小さな家を作る変な動画を見つけたよ。",
+      rewrite: "実際の検索結果がないので、見つけたという主張を削除する。",
+    },
+  ])("accepts an unsupported external discovery in $languageTag only as a high blocker", ({
+    languageTag,
+    trigger,
+    candidate,
+    rewrite,
+  }) => {
+    const base = reviewInput();
+    const unsupported = candidateReviewInputSchema.parse({
+      ...base,
+      trigger: { author: "Guest", content: trigger, createdAt: "2026-07-14T11:59:55.000Z", ageSeconds: 5 },
+      semanticContext: { ...base.semanticContext, languageTag },
+      evidence: { outcome: "none", kind: null, query: null, results: [] },
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "none",
+        discussed: [],
+        plannedAction: null,
+        executionStatus: "not_requested",
+      },
+      candidates: [{
+        personaId: "ai-mira",
+        actorName: "Mira",
+        content: candidate,
+        sourceIds: [],
+        surfaceStylePlan: { visibleAffect: true, surfaceTexture: "fragment" },
+        recentOwnTexts: [],
+        peerTexts: [],
+      }],
+    });
+    const blocked = {
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "high",
+        issues: ["unsupported_external_evidence_claim"],
+        rewriteInstruction: rewrite,
+      }],
+    };
+
+    expect(parseCandidateReviewContent(JSON.stringify(blocked), unsupported)).toEqual(blocked);
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [{ ...blocked.reviews[0], severity: "medium" }],
+    }), unsupported)).toBeUndefined();
   });
 
   it("accepts an unfulfilled explicit request only as a high-severity gated blocker", () => {
@@ -1571,6 +1792,8 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("resident model having no personal tool is irrelevant");
     expect(prompt).toContain("unsupported_room_recall");
     expect(prompt).toContain("A non-witness may accurately say it checked retained room history");
+    expect(prompt).toContain("specific discovery claim offered instead of the requested link");
+    expect(prompt).toContain("Judge the full asserted meaning in any language, not discovery verbs or media nouns");
     expect(prompt).toContain("visibleAffect true permits one genuine feeling");
     expect(prompt).toContain("informal fragment, lowercase opening, letter elongation, brief self-correction, rough orthography, harmless typo, mild profanity");
     expect(prompt).toContain("Do not formalize or copy-edit such permitted texture");

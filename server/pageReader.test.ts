@@ -181,16 +181,70 @@ describe("language-agnostic page target binding", () => {
 });
 
 describe("inert article extraction", () => {
+  it("extracts a strict publisher publication instant from standard HTML metadata", () => {
+    const extracted = extractReadablePage(`<html><head>
+      <meta property="article:published_time" content="2026-07-14T18:25:00+02:00">
+    </head><body><article><h1>Current report</h1>
+      <p>${"A concrete current fact with enough detail for bounded page evidence. ".repeat(5)}</p>
+      <section><time itemprop="datePublished" datetime="2026-07-15T10:00:00Z">comment time</time></section>
+    </article></body></html>`, "text/html", new URL("https://news.example/current"));
+    expect(extracted?.publishedAt).toBe("2026-07-14T16:25:00.000Z");
+  });
+
+  it("extracts datePublished from bounded typed JSON-LD without exposing scripts as evidence", () => {
+    const extracted = extractReadablePage(`<html><head><script type="application/ld+json">${JSON.stringify({
+      "@context": "https://schema.org",
+      "@graph": [
+        { "@type": "Organization", datePublished: "2099-01-01" },
+        { "@type": "NewsArticle", datePublished: "2026-07-12" },
+      ],
+    })}</script></head><body><main><h1>Structured report</h1>
+      <p>${"The readable report remains inert and contains enough attributable detail. ".repeat(5)}</p>
+    </main></body></html>`, "text/html", new URL("https://news.example/structured"));
+    expect(extracted?.publishedAt).toBe("2026-07-12T00:00:00.000Z");
+    expect(extracted?.text).not.toContain("datePublished");
+    expect(extracted?.text).not.toContain("2099");
+  });
+
+  it("fails publication metadata closed when dates are vague, modified-only or contradictory", () => {
+    const article = `<article><h1>Metadata boundary</h1><p>${"Substantive readable evidence remains available without a trusted publication date. ".repeat(5)}</p></article>`;
+    for (const head of [
+      `<meta property="article:published_time" content="yesterday">`,
+      `<meta property="article:published_time" content="2026-02-30">`,
+      `<script type="application/ld+json">${JSON.stringify({
+        "@type": "NewsArticle",
+        dateModified: "2026-07-14T12:00:00Z",
+      })}</script>`,
+      `<meta property="article:published_time" content="2026-07-12T12:00:00Z">
+       <meta property="article:published_time" content="2026-07-13T12:00:00Z">`,
+      `<script type="application/ld+json">${JSON.stringify({
+        "@graph": [
+          { "@type": "NewsArticle", datePublished: "2026-07-12T12:00:00Z" },
+          { "@type": "BlogPosting", datePublished: "2026-07-13T12:00:00Z" },
+        ],
+      })}</script>`,
+    ]) {
+      const extracted = extractReadablePage(
+        `<html><head>${head}</head><body>${article}</body></html>`,
+        "text/html",
+        new URL("https://news.example/ambiguous"),
+      );
+      expect(extracted?.publishedAt, head).toBeUndefined();
+    }
+  });
+
   it("uses bounded head metadata when an oversized HTML body was intentionally not retained", () => {
     const description = "A public platform for creating detailed architectural visualisations faster, with collaborative project workflows for property teams.";
     const extracted = extractReadablePage(Buffer.from(`<!doctype html><html><head>
       <title>Fallback document title</title>
       <meta property="og:title" content="Public 3D visualisation platform">
       <meta name="description" content="${description}">
+      <meta property="article:published_time" content="2026-07-11T09:00:00Z">
     </head>`), "text/html", new URL("https://large.example/"));
     expect(extracted).toEqual({
       title: "Public 3D visualisation platform",
       text: description,
+      publishedAt: "2026-07-11T09:00:00.000Z",
     });
   });
 
@@ -318,6 +372,26 @@ describe("inert article extraction", () => {
 });
 
 describe("page reader broker", () => {
+  it("carries extracted page publication time as bounded source evidence", async () => {
+    const reader = new PageReader(async () => ({
+      finalUrl: new URL("https://news.example/report"),
+      mediaType: "text/html",
+      contentType: "text/html; charset=utf-8",
+      body: Buffer.from(`<html><head>
+        <meta itemprop="datePublished" content="2026-07-14T10:30:00Z">
+      </head><body><article><h1>Fresh report</h1>
+        <p>${"One attributable fact from the freshly published report. ".repeat(6)}</p>
+      </article></body></html>`),
+    }));
+    const request = classifiedRequest({ content: "https://news.example/report", requesterId: "freshness-reader" })!;
+    const packet = await reader.read({ ...request, initiator: "automatic" }, "freshness-reader");
+    expect(packet?.results[0]).toMatchObject({
+      id: "S1",
+      url: "https://news.example/report",
+      publishedAt: "2026-07-14T10:30:00.000Z",
+    });
+  });
+
   it("threads the oversized-HTML head policy through metadata extraction into one source", async () => {
     let observedPolicy: SafeHttpsFetchPolicy | undefined;
     const description = "A bounded public description with enough concrete detail to explain what this large website provides to its visitors.";

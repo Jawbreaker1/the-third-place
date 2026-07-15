@@ -24,6 +24,12 @@ interface DispatchResult {
   body: unknown;
 }
 
+let stateSequence = 0;
+const isolatedAdminState = (): AdminStateStore => new AdminStateStore({
+  path: `/tmp/the-third-place-admin-router-${process.pid}-${stateSequence++}.json`,
+  persist: async () => undefined,
+});
+
 /** Exercises Express' real router/middleware stack without binding a TCP port. */
 const dispatch = async (app: Express, options: DispatchOptions): Promise<DispatchResult> =>
   await new Promise((resolve, reject) => {
@@ -70,7 +76,7 @@ const dispatch = async (app: Express, options: DispatchOptions): Promise<Dispatc
 
 describe("admin HTTP API", () => {
   it("enforces origin, cookie authentication, CRUD and moderation through the router", async () => {
-    const state = new AdminStateStore({ persist: async () => undefined });
+    const state = isolatedAdminState();
     await state.load();
     const auth = new AdminAuthManager({
       password: "correct horse battery staple",
@@ -86,6 +92,19 @@ describe("admin HTTP API", () => {
       configuredOrigins: ["https://admin.example"],
       isSecure: () => true,
       getHumans: () => [human],
+      getAutonomousResearchDiagnostics: () => ({
+        attempts: 5,
+        published: 2,
+        failed: 3,
+        lastFailure: {
+          channelId: "lobby",
+          seedId: "lobby-news",
+          reason: "source_read_failed",
+          failedAt: Date.UTC(2026, 6, 14, 11, 55),
+          retryAfterAt: Date.UTC(2026, 6, 14, 12, 1),
+          consecutiveFailures: 2,
+        },
+      }),
       kickHuman: (memberId, reason) => {
         if (memberId !== human.id) return undefined;
         kicked.push({ memberId, ...(reason ? { reason } : {}) });
@@ -131,7 +150,20 @@ describe("admin HTTP API", () => {
     const initial = await dispatch(app, { method: "GET", path: "/api/admin/state", cookie });
     expect(initial.status).toBe(200);
     expect(initial.headers["cache-control"]).toContain("no-store");
-    expect(initial.body).toMatchObject({ ok: true, state: { behavior: { channels: {} } } });
+    expect(initial.body).toMatchObject({
+      ok: true,
+      state: {
+        behavior: { channels: {} },
+        automation: {
+          autonomousResearch: {
+            attempts: 5,
+            published: 2,
+            failed: 3,
+            lastFailure: { channelId: "lobby", reason: "source_read_failed" },
+          },
+        },
+      },
+    });
 
     const crossOrigin = await dispatch(app, {
       method: "PATCH",
@@ -273,7 +305,7 @@ describe("admin HTTP API", () => {
   });
 
   it("fails closed when admin authentication is disabled or credentials are wrong", async () => {
-    const state = new AdminStateStore({ persist: async () => undefined });
+    const state = isolatedAdminState();
     await state.load();
     const disabled = express();
     disabled.use("/api/admin", createAdminRouter({
@@ -317,7 +349,7 @@ describe("admin HTTP API", () => {
   });
 
   it("exposes only device-code provider controls behind the admin boundary", async () => {
-    const state = new AdminStateStore({ persist: async () => undefined });
+    const state = isolatedAdminState();
     await state.load();
     const selected: string[] = [];
     let loggedOut = false;
@@ -399,7 +431,7 @@ describe("admin HTTP API", () => {
   });
 
   it("does not let one login source lock out a different source", async () => {
-    const state = new AdminStateStore({ persist: async () => undefined });
+    const state = isolatedAdminState();
     await state.load();
     const auth = new AdminAuthManager({
       password: "correct horse battery staple",

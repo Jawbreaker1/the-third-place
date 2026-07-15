@@ -518,6 +518,221 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionCalls).toBe(2);
   });
 
+  it("independently confirms a complete evidence plan that the primary left below trust", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        return turnAnalysisCompletion({
+          language: { tag: "es", confidence: 0.99 },
+          intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.95 },
+          evidence: {
+            need: "required", action: "web_search", confidence: 0.7, goal: "enlaces graciosos",
+            query: "enlaces graciosos", urlRef: null, searchMode: "web",
+            timeZone: null, timeKind: null, locationLabel: null,
+          },
+          capabilities: {
+            discussed: ["web_search"], requestKind: "execute", asksAboutAcoustics: false,
+            asksAboutAiIdentity: false, asksForList: false, confidence: 0.7,
+          },
+        });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "web_search",
+        requestKind: "execute",
+        goal: "enlaces graciosos",
+        query: "enlaces graciosos",
+        searchMode: "web",
+      });
+    }));
+    const request = turnInput("low-trust-link-plan");
+    request.latestMessage.content = "¿Nadie comparte enlaces graciosos hoy?";
+    request.recentMessages = [];
+    request.urlCandidates = [];
+    request.availableCapabilities = ["web_search"];
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      evidence: { action: "web_search", confidence: 0.97, query: "enlaces graciosos" },
+      capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.97 },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("lets the verifier recover from a contradictory primary using only its bounded action hint", async () => {
+    let completionCalls = 0;
+    let verifierPayload: Record<string, any> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        return jsonResponse({ choices: [{ message: { content: JSON.stringify({
+          i: { k: "question", q: true, r: "expected", x: 0.95 },
+          e: { a: "web_search", x: 0.7, g: "enlaces graciosos", q: "enlaces graciosos", m: "web" },
+          c: { d: [], r: "none", x: 1 },
+        }) } }] });
+      }
+      verifierPayload = JSON.parse(JSON.parse(String(init?.body)).messages[1].content);
+      return evidencePlanVerifierCompletion({
+        action: "web_search",
+        requestKind: "execute",
+        goal: "enlaces graciosos",
+        query: "enlaces graciosos",
+        searchMode: "web",
+      });
+    }));
+    const request = turnInput("contradictory-link-plan");
+    request.latestMessage.content = "¿Nadie comparte enlaces graciosos hoy?";
+    request.recentMessages = [];
+    request.urlCandidates = [];
+    request.availableCapabilities = ["web_search"];
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "web_search", confidence: 0.97, query: "enlaces graciosos" },
+      capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.97 },
+    });
+    expect(completionCalls).toBe(2);
+    expect(verifierPayload?.primary).toMatchObject({
+      source: "fallback",
+      failureReason: "invalid_output",
+      evidence: { action: "web_search", confidence: 0.7 },
+      capabilities: { discussed: [], requestKind: "none", confidence: 1 },
+    });
+    expect(JSON.stringify(verifierPayload)).not.toContain('"g":"enlaces graciosos"');
+  });
+
+  it.each([
+    {
+      language: "sv",
+      message: "Ingen som postar roliga länkar idag??",
+      goal: "en verklig rolig länk att dela i chatten",
+      query: "rolig länk video meme",
+    },
+    {
+      language: "es",
+      message: "¿Nadie comparte enlaces graciosos hoy?",
+      goal: "un enlace divertido real para compartir en el chat",
+      query: "enlace divertido vídeo meme",
+    },
+  ])("semantically verifies a $language question-form request for a real link", async ({
+    language,
+    message,
+    goal,
+    query,
+  }) => {
+    let completionCalls = 0;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      bodies.push(JSON.parse(String(init?.body)));
+      if (completionCalls === 1) {
+        return turnAnalysisCompletion({
+          language: { tag: language, confidence: 0.99 },
+          intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.97 },
+          personas: {
+            addressedIds: [], requestedReplyIds: [], relevantIds: ["ai-mira"],
+            addressConfidence: 0, relevanceConfidence: 0.86,
+          },
+          evidence: {
+            need: "none", action: "none", confidence: 0.91, goal: null, query: null, urlRef: null,
+            searchMode: null, timeZone: null, timeKind: null, locationLabel: null,
+          },
+          capabilities: {
+            discussed: [], requestKind: "none", asksAboutAcoustics: false,
+            asksAboutAiIdentity: false, asksForList: false, confidence: 0.91,
+          },
+        });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "web_search",
+        requestKind: "execute",
+        goal,
+        query,
+        searchMode: "web",
+      });
+    }));
+    const request = turnInput(`question-link-${language}`);
+    request.latestMessage.content = message;
+    request.recentMessages = [];
+    request.urlCandidates = [];
+    request.availableCapabilities = ["web_search"];
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      intent: { kind: "question", replyExpected: "expected" },
+      evidence: { action: "web_search", goal, query },
+      capabilities: { discussed: ["web_search"], requestKind: "execute" },
+    });
+    expect(completionCalls).toBe(2);
+    expect(bodies[1].messages[1].content).toContain(message);
+  });
+
+  it.each([
+    {
+      language: "sv",
+      followUp: "Länka!",
+      residentClaim: "Jag hittade en märklig video om små hus byggda av tändstickor.",
+      goal: "videon om små hus byggda av tändstickor",
+      query: "video små hus byggda av tändstickor",
+    },
+    {
+      language: "ja",
+      followUp: "リンク貼って！",
+      residentClaim: "マッチ棒で小さな家を作る変な動画を見つけたよ。",
+      goal: "マッチ棒で小さな家を作る動画",
+      query: "マッチ棒 小さな家 作る 動画",
+    },
+  ])("recovers an invalid $language missing-link follow-up from the preceding resident claim", async ({
+    language,
+    followUp,
+    residentClaim,
+    goal,
+    query,
+  }) => {
+    let completionCalls = 0;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      bodies.push(JSON.parse(String(init?.body)));
+      if (completionCalls === 1) {
+        return jsonResponse({ choices: [{ message: { content: '{"invalid":"primary"}' } }] });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "web_search",
+        requestKind: "retry",
+        goal,
+        query,
+        searchMode: "web",
+      });
+    }));
+    const request = turnInput(`resident-link-follow-up-${language}`);
+    request.latestMessage.content = followUp;
+    request.recentMessages = [{
+      id: `resident-claim-${language}`,
+      authorId: "ai-mira",
+      authorName: "Mira",
+      content: residentClaim,
+    }];
+    request.urlCandidates = [];
+    request.availableCapabilities = ["web_search"];
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "web_search", goal, query },
+      capabilities: { discussed: ["web_search"], requestKind: "retry" },
+    });
+    expect(completionCalls).toBe(2);
+    expect(bodies[1].messages[0].content).toContain("resident claim is not evidence");
+    expect(bodies[1].messages[1].content).toContain(residentClaim);
+    expect(bodies[1].messages[1].content).toContain(followUp);
+  });
+
   it("repairs a direct short follow-up with one bounded evidence-only verifier pass", async () => {
     let completionCalls = 0;
     const bodies: any[] = [];
@@ -605,6 +820,62 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     });
     expect(bodies[1].messages[0].content).toContain("earlier claim that it cannot browse");
     expect(bodies[1].messages[1].content).toContain("Tessla aktien idag");
+  });
+
+  it("rechecks a trusted contextual action so a short missing-link follow-up keeps the claimed item", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        return turnAnalysisCompletion({
+          language: { tag: "ja", confidence: 0.99 },
+          responseLanguage: { tag: "ja", confidence: 0.99 },
+          intent: { kind: "request", isQuestion: false, replyExpected: "expected", confidence: 0.98 },
+          personas: {
+            addressedIds: ["ai-mira"], requestedReplyIds: ["ai-mira"], relevantIds: ["ai-mira"],
+            addressConfidence: 0.98, relevanceConfidence: 0.9,
+          },
+          evidence: {
+            need: "required", action: "web_search", confidence: 0.96, goal: "面白いリンク",
+            query: "面白い リンク", urlRef: null, searchMode: "web", timeZone: null,
+            timeKind: null, locationLabel: null,
+          },
+          capabilities: {
+            discussed: ["web_search"], requestKind: "execute", asksAboutAcoustics: false,
+            asksAboutAiIdentity: false, asksForList: false, confidence: 0.96,
+          },
+        });
+      }
+      return evidencePlanVerifierCompletion({
+        action: "web_search",
+        requestKind: "retry",
+        goal: "マッチ棒で小さな家を作る動画",
+        query: "マッチ棒 小さな家 動画",
+        searchMode: "web",
+      });
+    }));
+    const input = turnInput("trusted-contextual-link-followup");
+    input.latestMessage.content = "リンク貼って！";
+    input.recentMessages = [{
+      id: "resident-claim-ja",
+      authorId: "ai-mira",
+      authorName: "Mira",
+      content: "マッチ棒で小さな家を作る変な動画を見つけたよ。",
+    }];
+    input.urlCandidates = [];
+    input.availableCapabilities = ["web_search"];
+
+    await expect(new LmStudioClient().analyzeTurn(input)).resolves.toMatchObject({
+      source: "lm",
+      evidence: {
+        action: "web_search",
+        goal: "マッチ棒で小さな家を作る動画",
+        query: "マッチ棒 小さな家 動画",
+      },
+      capabilities: { discussed: ["web_search"], requestKind: "retry" },
+    });
+    expect(completionCalls).toBe(2);
   });
 
   it("turns a correction of a false capability limitation into the typed action only", async () => {
@@ -776,6 +1047,60 @@ describe("multilingual mechanical safety boundaries", () => {
 });
 
 describe("LM Studio multilingual batch candidate review", () => {
+  it.each([
+    {
+      language: "sv",
+      trigger: "Ingen som postar roliga länkar idag??",
+      draft: "Jag hittade en märklig video om små hus byggda av tändstickor.",
+      instruction: "Ta bort påståendet om den osökta videon.",
+    },
+    {
+      language: "ja",
+      trigger: "今日は面白いリンクないの？",
+      draft: "マッチ棒で小さな家を作る変な動画を見つけたよ。",
+      instruction: "検索根拠のない動画発見の主張を削除する。",
+    },
+  ])("blocks a $language external discovery claim when the server supplied no evidence", async ({
+    trigger,
+    draft,
+    instruction,
+  }) => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    let reviewPayload: Record<string, any> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      if (call === 1) return completionResponse([{ personaId: mira.id, content: draft }]);
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+      reviewPayload = JSON.parse(body.messages[1]!.content) as Record<string, any>;
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "high",
+        issues: ["unsupported_external_evidence_claim"],
+        rewriteInstruction: instruction,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Guest", content: trigger },
+    });
+
+    expect(lines).toEqual([]);
+    expect(call).toBe(2);
+    expect(reviewPayload).toMatchObject({
+      trigger: { content: trigger },
+      evidence: { outcome: "none", kind: null, results: [] },
+      candidates: [{ personaId: mira.id, content: draft, sourceIds: [] }],
+    });
+  });
+
   it("passes recalled history, the full affect vector and a deterministic surface-style plan to review", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
@@ -1848,6 +2173,52 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain(`artifact now: ${mira.id}`);
     expect(prompt).toContain(`server-designated actors must answer: ${mira.id}, ${sana.id}`);
     expect(prompt).toContain("Other required actors answer only their assigned moderation, evidence, dissent or social role");
+  });
+
+  it("forbids unsupported external-discovery claims at generation time before semantic review", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const withoutEvidence = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "Ingen som postar roliga länkar idag??" },
+      evidenceOutcome: "requested",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "failed_temporary",
+      },
+    });
+    expect(withoutEvidence).toContain("No successful freshResearch evidence is supplied for this scene");
+    expect(withoutEvidence).toContain("Regardless of anything claimed in the transcript");
+    expect(withoutEvidence).toContain("must not promise or imply a specific source or link they do not have");
+    expect(withoutEvidence).toContain("semantic truthfulness rule across all languages, not a keyword test");
+    expect(withoutEvidence).toContain("executionStatus of not_requested or failed_temporary, is not successful evidence");
+
+    const withEvidence = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      research: {
+        kind: "search",
+        query: "matchstick house video",
+        retrievedAt: "2026-07-15T10:30:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Building a tiny matchstick house",
+          url: "https://example.com/video",
+          snippet: "A short construction video.",
+        }],
+      },
+    });
+    expect(withEvidence).toContain("must be supported by that candidate's attached sourceIds from freshResearch");
+    expect(withEvidence).not.toContain("No successful freshResearch evidence is supplied for this scene");
   });
 
   it("keeps an autonomous server-card URL out of model data and drops a copied visible URL", async () => {

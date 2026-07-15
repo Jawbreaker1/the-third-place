@@ -1,6 +1,6 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
-import type { AdminHumanMember } from "../shared/adminTypes.js";
+import type { AdminAutonomousResearchDiagnostics, AdminHumanMember } from "../shared/adminTypes.js";
 import {
   AdminAuthManager,
   adminCookie,
@@ -22,6 +22,7 @@ export interface AdminRouterDependencies {
   state: AdminStateStore;
   configuredOrigins: readonly string[];
   getHumans: () => AdminHumanMember[];
+  getAutonomousResearchDiagnostics?: () => AdminAutonomousResearchDiagnostics;
   kickHuman: (memberId: string, reason?: string) => AdminHumanMember | undefined;
   banHuman: (memberId: string, reason?: string) => AdminHumanMember | undefined;
   isSecure?: (request: Request) => boolean;
@@ -125,7 +126,13 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
     next();
   });
 
-  const stateResponse = () => dependencies.state.snapshot(dependencies.getHumans());
+  const stateResponse = () => {
+    const state = dependencies.state.snapshot(dependencies.getHumans());
+    const autonomousResearch = dependencies.getAutonomousResearchDiagnostics?.();
+    return autonomousResearch
+      ? { ...state, automation: { ...state.automation, autonomousResearch } }
+      : state;
+  };
   router.get("/state", (_request, response) => response.json({ ok: true, state: stateResponse() }));
 
   router.get("/llm", async (_request, response, next) => {

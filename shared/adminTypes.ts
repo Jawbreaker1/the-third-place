@@ -86,6 +86,23 @@ export interface AdminVoiceOptions {
   voices: AdminVoiceOption[];
 }
 
+export interface AdminAutonomousResearchDiagnostics {
+  /** Attempts selected by the scheduler in this server process. */
+  attempts: number;
+  /** Source-backed lead messages actually committed to room history. */
+  published: number;
+  /** Attempts that stopped before a source-backed lead was committed. */
+  failed: number;
+  lastFailure?: {
+    channelId: string;
+    seedId: string;
+    reason: string;
+    failedAt: number;
+    retryAfterAt: number;
+    consecutiveFailures: number;
+  };
+}
+
 export interface AdminStateSnapshot {
   behavior: {
     global: AdminBehaviorTuning;
@@ -94,6 +111,8 @@ export interface AdminStateSnapshot {
   automation: {
     /** Rooms with trusted server-authored subjects for autonomous source posts. */
     autonomousLinkChannelIds: string[];
+    /** Ephemeral process diagnostics; absent when the director is unavailable. */
+    autonomousResearch?: AdminAutonomousResearchDiagnostics;
   };
   personas: AdminPersonaConfig[];
   channels: AdminChannelConfig[];

@@ -18,6 +18,7 @@ import {
   conductResponderIds,
   ensureEvidenceResponder,
   evidenceFailureFallback,
+  autonomousResearchFailureBackoffMs,
   autonomousResearchResultIsFresh,
   canonicalAutonomousResearchUrl,
   linkPreviewFromResearch,
@@ -41,7 +42,7 @@ import {
   type ConsideredConversationGate,
   type AmbientThreadState,
 } from "./director.js";
-import type { AutonomousResearchSeed } from "./channels.js";
+import { CHANNELS, type AutonomousResearchSeed } from "./channels.js";
 import { createFailClosedTurnAnalysis, type TurnAnalysis } from "./semanticRouter.js";
 import {
   ambientRoomSelectionWeight,
@@ -2552,7 +2553,7 @@ describe("social director", () => {
       humanQuietMs: 90_000,
       queueDepth: 0,
       availableMessageSlots: 2,
-      dailyAttempts: 0,
+      dailySuccesses: 0,
       dailyCap: 6,
       voiceRoomActive: false,
       freshThread: true,
@@ -2566,9 +2567,11 @@ describe("social director", () => {
     expect(shouldStartAutonomousResearch({ ...base, voiceRoomActive: true })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, queueDepth: 1 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, availableMessageSlots: 1 })).toBe(false);
-    expect(shouldStartAutonomousResearch({ ...base, dailyAttempts: 6 })).toBe(false);
-    expect(shouldStartAutonomousResearch({ ...base, lastGlobalAttemptAt: base.now - 59_999 })).toBe(false);
-    expect(shouldStartAutonomousResearch({ ...base, lastChannelAttemptAt: base.now - 119_999 })).toBe(false);
+    expect(shouldStartAutonomousResearch({ ...base, dailySuccesses: 6 })).toBe(false);
+    expect(shouldStartAutonomousResearch({ ...base, lastGlobalSuccessAt: base.now - 59_999 })).toBe(false);
+    expect(shouldStartAutonomousResearch({ ...base, lastChannelSuccessAt: base.now - 119_999 })).toBe(false);
+    expect(shouldStartAutonomousResearch({ ...base, globalRetryAfterAt: base.now + 1 })).toBe(false);
+    expect(shouldStartAutonomousResearch({ ...base, channelRetryAfterAt: base.now + 1 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, lastHumanActivityAt: base.now - 89_999 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, rng: () => 0.1 })).toBe(false);
   });
@@ -2584,13 +2587,39 @@ describe("social director", () => {
       dailyCap: 6,
     });
     const raisedDefault = autonomousLinkPolicy(60);
-    expect(raisedDefault.chance).toBeGreaterThan(0.07);
-    expect(raisedDefault.dailyCap).toBe(8);
-    expect(raisedDefault.globalCooldownMs).toBeGreaterThanOrEqual(12 * 60_000);
-    expect(raisedDefault.channelCooldownMs).toBeGreaterThanOrEqual(40 * 60_000);
+    expect(raisedDefault).toEqual({
+      enabled: true,
+      chance: 0.1,
+      globalCooldownMs: 26.4 * 60_000,
+      channelCooldownMs: 104 * 60_000,
+      humanQuietMs: 159_000,
+      dailyCap: 8,
+    });
     const maximum = autonomousLinkPolicy(100);
-    expect(maximum).toMatchObject({ enabled: true, chance: 0.22, dailyCap: 16 });
-    expect(maximum.humanQuietMs).toBe(75_000);
+    expect(maximum).toEqual({
+      enabled: true,
+      chance: 0.65,
+      globalCooldownMs: 5 * 60_000,
+      channelCooldownMs: 20 * 60_000,
+      humanQuietMs: 45_000,
+      dailyCap: 36,
+    });
+    expect(maximum.chance).toBeGreaterThan(raisedDefault.chance * 6);
+    expect(maximum.globalCooldownMs).toBeLessThan(raisedDefault.globalCooldownMs / 5);
+    expect(maximum.channelCooldownMs).toBeLessThan(raisedDefault.channelCooldownMs / 5);
+    expect(maximum.dailyCap).toBeGreaterThan(raisedDefault.dailyCap * 4);
+    expect(maximum.chance).toBeLessThanOrEqual(0.7);
+    expect(maximum.globalCooldownMs).toBeGreaterThanOrEqual(5 * 60_000);
+    expect(maximum.channelCooldownMs).toBeGreaterThanOrEqual(20 * 60_000);
+    expect(maximum.dailyCap).toBeLessThanOrEqual(36);
+  });
+
+  it("uses a short bounded exponential backoff for repeated autonomous research failures", () => {
+    expect(autonomousResearchFailureBackoffMs(1)).toBe(60_000);
+    expect(autonomousResearchFailureBackoffMs(2)).toBe(2 * 60_000);
+    expect(autonomousResearchFailureBackoffMs(3)).toBe(4 * 60_000);
+    expect(autonomousResearchFailureBackoffMs(4)).toBe(4 * 60_000);
+    expect(autonomousResearchFailureBackoffMs(20)).toBe(4 * 60_000);
   });
 
   it("enforces configured autonomous-source freshness without language heuristics", () => {
@@ -2609,6 +2638,97 @@ describe("social director", () => {
     const evergreen = { ...currentSeed, maxAgeDays: undefined };
     expect(autonomousResearchResultIsFresh(evergreen, undefined, now)).toBe(true);
     expect(autonomousResearchResultIsFresh(evergreen, "2026-07-14T12:06:00.000Z", now)).toBe(false);
+  });
+
+  it("falls back to safely read publication metadata without opening explicitly stale search hits", async () => {
+    const now = Date.parse("2026-07-14T12:00:00.000Z");
+    const staleUrl = "https://example.com/old-item";
+    const freshUrl = "https://example.com/fresh-item";
+    const laterStaleUrl = "https://example.com/undated-old-item";
+    const research = vi.fn()
+      .mockResolvedValueOnce({
+        kind: "search",
+        query: "recent bounded item",
+        retrievedAt: new Date(now).toISOString(),
+        results: [
+          {
+            id: "S1",
+            title: "Explicit old item",
+            url: staleUrl,
+            snippet: "Old",
+            publishedAt: "2025-01-01T00:00:00.000Z",
+          },
+          { id: "S2", title: "Undated search hit", url: freshUrl, snippet: "Candidate" },
+        ],
+      })
+      .mockResolvedValueOnce({
+        kind: "search",
+        query: "another bounded item",
+        retrievedAt: new Date(now).toISOString(),
+        results: [{ id: "S1", title: "Another undated hit", url: laterStaleUrl, snippet: "Candidate" }],
+      });
+    const read = vi.fn()
+      .mockResolvedValueOnce({
+        kind: "page",
+        query: "fresh",
+        retrievedAt: new Date(now).toISOString(),
+        results: [{
+          id: "S1",
+          title: "Fresh item",
+          url: freshUrl,
+          snippet: "Fresh bounded detail",
+          publishedAt: "2026-07-13T09:00:00.000Z",
+        }],
+      })
+      .mockResolvedValueOnce({
+        kind: "page",
+        query: "old",
+        retrievedAt: new Date(now).toISOString(),
+        results: [{
+          id: "S1",
+          title: "Old item discovered after read",
+          url: laterStaleUrl,
+          snippet: "Old bounded detail",
+          publishedAt: "2025-01-01T00:00:00.000Z",
+        }],
+      });
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-autonomous-page-date-unused.json"),
+      {} as never,
+      new ActorChannelRuntime(),
+      { research } as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      { now: () => now, pageReader: { read } as never, autonomousResearchEnabled: true },
+    );
+    const safelyRead = (query: string) => (director as unknown as {
+      safelyReadAutonomousResult: (
+        channelId: string,
+        seed: AutonomousResearchSeed,
+      ) => Promise<{ research?: { results: Array<{ url: string; publishedAt?: string }> }; failureReason?: string }>;
+    }).safelyReadAutonomousResult("lobby", {
+      id: query,
+      query,
+      mode: "news",
+      maxAgeDays: 14,
+      discussionAngle: "Discuss one supported detail.",
+    });
+
+    const fresh = await safelyRead("recent bounded item");
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: new URL(freshUrl) }),
+      "ambient-research:lobby",
+    );
+    expect(fresh.research?.results).toEqual([
+      expect.objectContaining({ url: freshUrl, publishedAt: "2026-07-13T09:00:00.000Z" }),
+    ]);
+
+    const staleAfterRead = await safelyRead("another bounded item");
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(staleAfterRead).toEqual({ failureReason: "no_safe_fresh_result" });
   });
 
   it("canonicalizes autonomous source URLs for cross-room repeat protection", () => {
@@ -2650,6 +2770,184 @@ describe("social director", () => {
       if (previousAutonomous === undefined) delete process.env.AUTONOMOUS_RESEARCH_ENABLED;
       else process.env.AUTONOMOUS_RESEARCH_ENABLED = previousAutonomous;
     }
+  });
+
+  it("records failed autonomous lookups without consuming success cooldown or daily quota", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = Date.parse("2026-07-14T11:00:00.000Z");
+      const research = vi.fn(async () => undefined);
+      const actorChannels = new ActorChannelRuntime();
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        new RoomStore("/tmp/director-autonomous-failure-accounting-unused.json"),
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene: vi.fn(async () => []),
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        actorChannels,
+        { research } as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0,
+          autonomousResearchEnabled: true,
+        },
+      );
+      const channel = CHANNELS.find((candidate) => candidate.id === "lobby")!;
+      const available = actorChannels.candidatesFor(channel.id);
+      const thread: AmbientThreadState = {
+        seed: "unused",
+        messageCount: 0,
+        participantIds: [],
+        debateBeat: false,
+        languageHint: "sv",
+        openedAt: now,
+        updatedAt: now,
+      };
+      const seed: AutonomousResearchSeed = {
+        id: "lookup-failure",
+        query: "one bounded lookup",
+        mode: "web",
+        discussionAngle: "Discuss one sourced detail.",
+      };
+      const internals = director as unknown as {
+        runAutonomousResearchConversation: (
+          room: typeof channel,
+          epoch: number,
+          candidates: typeof PERSONAS,
+          state: AmbientThreadState,
+          researchSeed: AutonomousResearchSeed,
+        ) => Promise<boolean>;
+        lastAutonomousResearchSuccessAt?: number;
+        lastAutonomousResearchSuccessAtByChannel: Map<string, number>;
+        autonomousResearchSuccessTimestamps: number[];
+        autonomousResearchFailureStateByChannel: Map<string, {
+          consecutiveFailures: number;
+          retryAfterAt: number;
+        }>;
+        autonomousResearchGlobalRetryAfterAt?: number;
+      };
+
+      expect(await internals.runAutonomousResearchConversation(channel, 0, available, thread, seed)).toBe(false);
+      expect(director.getAutonomousResearchDiagnostics()).toEqual({
+        attempts: 1,
+        published: 0,
+        failed: 1,
+        lastFailure: {
+          channelId: "lobby",
+          seedId: "lookup-failure",
+          reason: "lookup_failed",
+          failedAt: now,
+          retryAfterAt: now + 60_000,
+          consecutiveFailures: 1,
+        },
+      });
+      expect(internals.lastAutonomousResearchSuccessAt).toBeUndefined();
+      expect(internals.lastAutonomousResearchSuccessAtByChannel.size).toBe(0);
+      expect(internals.autonomousResearchSuccessTimestamps).toEqual([]);
+      expect(shouldStartAutonomousResearch({
+        enabled: true,
+        now: now + 59_999,
+        globalRetryAfterAt: internals.autonomousResearchGlobalRetryAfterAt,
+        channelRetryAfterAt: internals.autonomousResearchFailureStateByChannel.get("lobby")?.retryAfterAt,
+        globalCooldownMs: 30 * 60_000,
+        channelCooldownMs: 2 * 60 * 60_000,
+        humanQuietMs: 0,
+        queueDepth: 0,
+        availableMessageSlots: 2,
+        dailySuccesses: 0,
+        dailyCap: 6,
+        voiceRoomActive: false,
+        freshThread: true,
+        availableActors: 2,
+        chance: 1,
+        rng: () => 0,
+      })).toBe(false);
+
+      now += 60_000;
+      expect(await internals.runAutonomousResearchConversation(channel, 0, available, thread, seed)).toBe(false);
+      expect(internals.autonomousResearchSuccessTimestamps).toEqual([]);
+      expect(director.getAutonomousResearchDiagnostics()).toMatchObject({
+        attempts: 2,
+        published: 0,
+        failed: 2,
+        lastFailure: {
+          reason: "lookup_failed",
+          retryAfterAt: now + 2 * 60_000,
+          consecutiveFailures: 2,
+        },
+      });
+      const secondFailure = internals.autonomousResearchFailureStateByChannel.get("lobby")!;
+      const retryGate = (at: number) => shouldStartAutonomousResearch({
+        enabled: true,
+        now: at,
+        globalRetryAfterAt: internals.autonomousResearchGlobalRetryAfterAt,
+        channelRetryAfterAt: secondFailure.retryAfterAt,
+        globalCooldownMs: 30 * 60_000,
+        channelCooldownMs: 2 * 60 * 60_000,
+        humanQuietMs: 0,
+        queueDepth: 0,
+        availableMessageSlots: 2,
+        dailySuccesses: 0,
+        dailyCap: 6,
+        voiceRoomActive: false,
+        freshThread: true,
+        availableActors: 2,
+        chance: 1,
+        rng: () => 0,
+      });
+      expect(retryGate(secondFailure.retryAfterAt - 1)).toBe(false);
+      expect(retryGate(secondFailure.retryAfterAt)).toBe(true);
+      expect(research).toHaveBeenCalledTimes(2);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports the effective global retry time after failures move between rooms", () => {
+    const now = Date.parse("2026-07-14T11:00:00.000Z");
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-autonomous-cross-room-backoff-unused.json"),
+      {} as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      { now: () => now, autonomousResearchEnabled: true },
+    );
+    const recordFailure = (director as unknown as {
+      recordAutonomousResearchFailure: (
+        channelId: string,
+        seed: AutonomousResearchSeed,
+        reason: "lookup_failed",
+      ) => false;
+      autonomousResearchFailureStateByChannel: Map<string, { retryAfterAt: number }>;
+      autonomousResearchGlobalRetryAfterAt?: number;
+    });
+    const seed = (id: string): AutonomousResearchSeed => ({
+      id,
+      query: id,
+      mode: "web",
+      discussionAngle: "Discuss one supported detail.",
+    });
+
+    recordFailure.recordAutonomousResearchFailure("lobby", seed("first"), "lookup_failed");
+    recordFailure.recordAutonomousResearchFailure("the-pub", seed("second"), "lookup_failed");
+
+    expect(recordFailure.autonomousResearchFailureStateByChannel.get("the-pub")?.retryAfterAt)
+      .toBe(now + 60_000);
+    expect(recordFailure.autonomousResearchGlobalRetryAfterAt).toBe(now + 2 * 60_000);
+    expect(director.getAutonomousResearchDiagnostics().lastFailure?.retryAfterAt)
+      .toBe(now + 2 * 60_000);
+    director.stop();
   });
 
   it("builds an inert same-source card from safely read research metadata", () => {
@@ -2797,6 +3095,7 @@ describe("social director", () => {
           title: "A practical recovery benchmark",
           url: sourceUrl,
           snippet: "The benchmark resets a failed tool step and measures whether the agent can recover without corrupting later state.",
+          publishedAt: "2026-07-13T09:00:00.000Z",
         }],
       };
       const offTopicPagePacket = {
@@ -2806,6 +3105,7 @@ describe("social director", () => {
           title: "Windows Recent Files",
           url: offTopicUrl,
           snippet: "How an operating system displays recently opened files.",
+          publishedAt: "2026-07-13T08:00:00.000Z",
         }],
       };
       const store = new RoomStore("/tmp/director-autonomous-source-unused.json");
@@ -2874,10 +3174,45 @@ describe("social director", () => {
         id: "agent-recovery",
         query: "recent practical agent testing",
         mode: "web",
+        maxAgeDays: 7,
         discussionAngle: "Discuss whether recovery should count more than a polished final answer.",
       });
       await vi.advanceTimersByTimeAsync(10_000);
       expect(await pending).toBe(true);
+
+      expect(director.getAutonomousResearchDiagnostics()).toEqual({
+        attempts: 1,
+        published: 1,
+        failed: 0,
+      });
+      const accounting = director as unknown as {
+        lastAutonomousResearchSuccessAt?: number;
+        lastAutonomousResearchSuccessAtByChannel: Map<string, number>;
+        autonomousResearchSuccessTimestamps: number[];
+        autonomousResearchFailureStateByChannel: Map<string, unknown>;
+      };
+      expect(accounting.lastAutonomousResearchSuccessAt).toBe(now);
+      expect(accounting.lastAutonomousResearchSuccessAtByChannel.get("ai-programming")).toBe(now);
+      expect(accounting.autonomousResearchSuccessTimestamps).toEqual([now]);
+      expect(accounting.autonomousResearchFailureStateByChannel.has("ai-programming")).toBe(false);
+      expect(shouldStartAutonomousResearch({
+        enabled: true,
+        now,
+        lastGlobalSuccessAt: accounting.lastAutonomousResearchSuccessAt,
+        lastChannelSuccessAt: accounting.lastAutonomousResearchSuccessAtByChannel.get("ai-programming"),
+        globalCooldownMs: 5 * 60_000,
+        channelCooldownMs: 20 * 60_000,
+        humanQuietMs: 0,
+        queueDepth: 0,
+        availableMessageSlots: 2,
+        dailySuccesses: accounting.autonomousResearchSuccessTimestamps.length,
+        dailyCap: 36,
+        voiceRoomActive: false,
+        freshThread: true,
+        availableActors: 2,
+        chance: 1,
+        rng: () => 0,
+      })).toBe(false);
 
       expect(research.research).toHaveBeenCalledWith(expect.objectContaining({
         requesterId: "ambient-research:ai-programming",
@@ -2907,7 +3242,11 @@ describe("social director", () => {
       const messages = store.getRecent("ai-programming", 10);
       expect(messages).toHaveLength(2);
       expect(messages[0]?.linkPreview?.url).toBe(sourceUrl);
-      expect(messages[0]?.sources).toEqual([{ title: "A practical recovery benchmark", url: sourceUrl }]);
+      expect(messages[0]?.sources).toEqual([{
+        title: "A practical recovery benchmark",
+        url: sourceUrl,
+        publishedAt: "2026-07-13T09:00:00.000Z",
+      }]);
       expect(messages[0]?.content).not.toContain("https://");
       expect(messages[1]?.replyToId).toBe(messages[0]?.id);
       expect(messages[1]?.authorId).not.toBe(messages[0]?.authorId);
@@ -2916,7 +3255,7 @@ describe("social director", () => {
         messageCount: 2,
         research: {
           kind: "page",
-          results: [{ id: "S2", url: sourceUrl }],
+          results: [{ id: "S2", url: sourceUrl, publishedAt: "2026-07-13T09:00:00.000Z" }],
         },
       });
     } finally {
@@ -3243,11 +3582,32 @@ describe("social director", () => {
         actors: Array<typeof actor>,
         requiredSlots: number,
       ) => boolean;
+      autonomousResearchPolicy: (channelId: string) => {
+        enabled: boolean;
+        chance: number;
+        globalCooldownMs: number;
+        channelCooldownMs: number;
+        dailyCap: number;
+      };
       lastHumanActivityAt?: number;
       lastSpoke: Map<string, number>;
       aiTimestamps: number[];
     };
     const safe = () => internals.autonomousResearchIsStillSafe("lobby", 0, [actor], 1);
+    expect(internals.autonomousResearchPolicy("lobby")).toMatchObject({
+      enabled: true,
+      chance: 0.1,
+      dailyCap: 8,
+    });
+    autonomousLinkFrequency = 100;
+    expect(internals.autonomousResearchPolicy("lobby")).toMatchObject({
+      enabled: true,
+      chance: 0.65,
+      globalCooldownMs: 5 * 60_000,
+      channelCooldownMs: 20 * 60_000,
+      dailyCap: 36,
+    });
+    autonomousLinkFrequency = 60;
     expect(safe()).toBe(true);
     queueDepth = 1;
     expect(safe()).toBe(false);

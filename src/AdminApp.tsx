@@ -626,6 +626,8 @@ export default function AdminApp() {
     );
   };
 
+  const researchDiagnostics = snapshot.automation.autonomousResearch;
+  const lastResearchFailure = researchDiagnostics?.lastFailure;
   const behaviorPanel = (
     <div className="admin-control-grid">
       <section className="admin-card" aria-labelledby="global-behavior-title">
@@ -696,6 +698,27 @@ export default function AdminApp() {
           </>
         ) : <EmptyState title="No rooms">Create a room before adding a room-specific behavior profile.</EmptyState>}
       </section>
+      {researchDiagnostics && (
+        <section className="admin-card admin-research-diagnostics" aria-labelledby="research-diagnostics-title">
+          <div className="admin-card-heading">
+            <div><p className="admin-kicker">Current server process</p><h2 id="research-diagnostics-title">Autonomous link pipeline</h2></div>
+            <span className="admin-research-health">{researchDiagnostics.failed > 0 ? "Failures visible" : "No recorded failures"}</span>
+          </div>
+          <p className="admin-card-intro">Only a source-backed message committed to room history counts as published. Failed search, freshness, safe-read, generation and publication attempts use a short retry backoff instead of consuming the normal success quota.</p>
+          <div className="admin-research-metrics">
+            <div><strong>{researchDiagnostics.attempts}</strong><span>selected attempts</span></div>
+            <div><strong>{researchDiagnostics.published}</strong><span>published links</span></div>
+            <div><strong>{researchDiagnostics.failed}</strong><span>failed before publish</span></div>
+          </div>
+          {lastResearchFailure ? (
+            <div className="admin-research-last-failure">
+              <span>Latest failure</span>
+              <strong>#{lastResearchFailure.channelId} · {lastResearchFailure.reason.replaceAll("_", " ")}</strong>
+              <small>{formatDateTime(new Date(lastResearchFailure.failedAt).toISOString())} · retry after {formatDateTime(new Date(lastResearchFailure.retryAfterAt).toISOString())} · streak {lastResearchFailure.consecutiveFailures}</small>
+            </div>
+          ) : <p className="admin-research-empty">No autonomous research attempt has failed since this server process started.</p>}
+        </section>
+      )}
     </div>
   );
 

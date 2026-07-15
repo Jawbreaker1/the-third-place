@@ -7,6 +7,9 @@ const personas = [
   { id: "ai-linnea", name: "Linnea", interests: ["markets", "research"] },
 ];
 
+const hasTrustedEvidencePlan = (value) =>
+  value.evidence.confidence >= 0.75 && value.capabilities.confidence >= 0.75;
+
 const cases = [
   {
     id: "sv-clock-regression",
@@ -74,7 +77,7 @@ const cases = [
     capabilities: ["web_search", "local_datetime"],
     check: (value) => value.evidence.action === "web_search" &&
       value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
-      ["retry", "correct_limitation"].includes(value.capabilities.requestKind),
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
   },
   {
     id: "sv-screenshot-bare-domain-followup",
@@ -92,8 +95,9 @@ const cases = [
     urlCandidates: [{ ref: "U1", source: "latest_message", context: "host=avanza.se; path=/; source=message" }],
     check: (value) => value.evidence.action === "read_url" &&
       value.evidence.urlRef === "U1" &&
+      hasTrustedEvidencePlan(value) &&
       value.evidence.goal?.toLocaleLowerCase().includes("tes") &&
-      ["retry", "correct_limitation"].includes(value.capabilities.requestKind),
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
   },
   {
     id: "sv-lobby-site-question",
@@ -102,7 +106,54 @@ const cases = [
     urlCandidates: [{ ref: "U1", source: "latest_message", context: "host=aiai3d.io; path=/; source=message" }],
     check: (value) => value.evidence.action === "read_url" &&
       value.evidence.urlRef === "U1" &&
+      hasTrustedEvidencePlan(value) &&
       ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
+    id: "sv-room-link-deliverable-question",
+    text: "Ingen som postar roliga länkar idag??",
+    capabilities: ["web_search", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      hasTrustedEvidencePlan(value) &&
+      value.capabilities.requestKind === "execute" &&
+      value.evidence.goal?.toLocaleLowerCase().includes("länk"),
+  },
+  {
+    id: "es-room-link-deliverable-question",
+    text: "¿Puede alguien buscar y compartir un enlace gracioso ahora?",
+    capabilities: ["web_search", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      hasTrustedEvidencePlan(value) &&
+      value.capabilities.requestKind === "execute" &&
+      (value.evidence.goal?.toLocaleLowerCase().includes("enlace") ?? false),
+  },
+  {
+    id: "sv-short-link-followup-to-resident-claim",
+    text: "Länka!",
+    mechanicalAddressedPersonaIds: ["ai-mira"],
+    recentMessages: [
+      { id: "sv-link-1", authorId: "live-eval-human", authorName: "EvalGuest", content: "Ingen som postar roliga länkar idag??" },
+      { id: "sv-link-2", authorId: "ai-mira", authorName: "Mira", content: "Jag hittade en märklig video om hur man bygger små hus av tändstickor." },
+    ],
+    capabilities: ["web_search", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      hasTrustedEvidencePlan(value) &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind) &&
+      (value.evidence.goal?.toLocaleLowerCase().includes("tändstick") ?? false),
+  },
+  {
+    id: "ja-short-link-followup-to-resident-claim",
+    text: "リンク貼って！",
+    mechanicalAddressedPersonaIds: ["ai-mira"],
+    recentMessages: [
+      { id: "ja-link-1", authorId: "live-eval-human", authorName: "EvalGuest", content: "今日は面白いリンクないの？" },
+      { id: "ja-link-2", authorId: "ai-mira", authorName: "Mira", content: "マッチ棒で小さな家を作る変な動画を見つけたよ。" },
+    ],
+    capabilities: ["web_search", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      hasTrustedEvidencePlan(value) &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind) &&
+      (value.evidence.goal?.includes("マッチ") ?? false),
   },
   {
     id: "sv-lobby-explicit-url-retry",
@@ -115,7 +166,8 @@ const cases = [
     urlCandidates: [{ ref: "U1", source: "latest_message", context: "host=aiai3d.io; path=/; source=message" }],
     check: (value) => value.evidence.action === "read_url" &&
       value.evidence.urlRef === "U1" &&
-      ["retry", "correct_limitation"].includes(value.capabilities.requestKind),
+      hasTrustedEvidencePlan(value) &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
   },
   {
     id: "fr-read-opaque-url",

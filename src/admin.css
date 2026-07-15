@@ -117,12 +117,21 @@ body { background: var(--admin-bg); color: var(--admin-text); }
 .admin-stat strong { font-size: 35px; letter-spacing: -.04em; }
 .admin-stat small { align-self: end; color: var(--admin-dim); font-size: 11px; }
 .admin-control-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-.admin-control-grid .admin-voice-summary { grid-column: 1 / -1; }
+.admin-control-grid .admin-voice-summary, .admin-control-grid .admin-research-diagnostics { grid-column: 1 / -1; }
 .admin-card { min-width: 0; padding: clamp(17px, 2vw, 24px); }
 .admin-card-heading, .admin-list-header { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 20px; }
 .admin-card-heading h2, .admin-list-header h2 { font-size: 18px; }
 .admin-card-heading select { width: min(230px, 100%); }
 .admin-card-intro { max-width: 780px; margin: -6px 0 18px; color: var(--admin-muted); font-size: 12px; line-height: 1.55; }
+.admin-research-health { padding: 5px 8px; border: 1px solid rgba(98, 216, 179, .2); border-radius: 999px; color: var(--admin-mint); background: rgba(98, 216, 179, .06); font-size: 9px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.admin-research-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.admin-research-metrics > div { display: grid; gap: 3px; padding: 13px; border: 1px solid var(--admin-line); border-radius: 10px; background: rgba(7, 10, 14, .34); }
+.admin-research-metrics strong { font-size: 24px; letter-spacing: -.035em; }
+.admin-research-metrics span, .admin-research-last-failure span { color: var(--admin-muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.admin-research-last-failure { display: grid; gap: 4px; margin-top: 10px; padding: 13px; border: 1px solid rgba(239, 173, 93, .18); border-radius: 10px; background: rgba(239, 173, 93, .035); }
+.admin-research-last-failure strong { font-size: 12px; text-transform: capitalize; }
+.admin-research-last-failure small, .admin-research-empty { color: var(--admin-dim); font-size: 10px; }
+.admin-research-empty { margin: 12px 0 0; }
 
 .admin-provider-layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(330px, .75fr); align-items: start; gap: 16px; }
 .admin-provider-options { display: grid; gap: 10px; }
@@ -336,6 +345,7 @@ body { background: var(--admin-bg); color: var(--admin-text); }
   .admin-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .admin-stat { min-height: 105px; padding: 13px; }
   .admin-stat strong { font-size: 28px; }
+  .admin-research-metrics { grid-template-columns: 1fr; }
   .admin-card { padding: 14px; border-radius: 11px; }
   .admin-card-heading.stack-mobile, .admin-card-heading { align-items: flex-start; }
   .admin-range-field { grid-template-columns: 1fr; gap: 8px; }

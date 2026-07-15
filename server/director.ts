@@ -93,6 +93,8 @@ const AUTO_SHARED_LINK_WINDOW_MS = 60_000;
 const AUTO_SHARED_LINK_SUCCESS_COOLDOWN_MS = 20 * 60_000;
 const AUTO_SHARED_LINK_GLOBAL_LIMIT = 4;
 const AUTO_SHARED_LINK_STATE_LIMIT = 1_000;
+const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_BASE_MS = 60_000;
+const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS = 4 * 60_000;
 const boundedUntrustedText = (value: string, maxLength: number): string =>
   stripDangerousTextControls(value.normalize("NFKC"))
     .replace(/\s+/g, " ")
@@ -692,15 +694,26 @@ export function selectAutoSharedLinkCandidate(
 export interface AutonomousResearchGate {
   enabled: boolean;
   now: number;
+  /** Last successful source publication. Failed attempts never update it. */
+  lastGlobalSuccessAt?: number;
+  /** Last successful source publication in this channel. */
+  lastChannelSuccessAt?: number;
+  /** @deprecated Compatibility alias for lastGlobalSuccessAt. */
   lastGlobalAttemptAt?: number;
+  /** @deprecated Compatibility alias for lastChannelSuccessAt. */
   lastChannelAttemptAt?: number;
+  globalRetryAfterAt?: number;
+  channelRetryAfterAt?: number;
   lastHumanActivityAt?: number;
   globalCooldownMs: number;
   channelCooldownMs: number;
   humanQuietMs: number;
   queueDepth: number;
   availableMessageSlots: number;
-  dailyAttempts: number;
+  /** Successful publications in the rolling daily window. */
+  dailySuccesses?: number;
+  /** @deprecated Compatibility alias for dailySuccesses. */
+  dailyAttempts?: number;
   dailyCap: number;
   voiceRoomActive: boolean;
   freshThread: boolean;
@@ -711,6 +724,9 @@ export interface AutonomousResearchGate {
 
 /** Server-owned rare-event gate; it never inspects chat text or language. */
 export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boolean {
+  const dailySuccesses = gate.dailySuccesses ?? gate.dailyAttempts ?? 0;
+  const lastGlobalSuccessAt = gate.lastGlobalSuccessAt ?? gate.lastGlobalAttemptAt;
+  const lastChannelSuccessAt = gate.lastChannelSuccessAt ?? gate.lastChannelAttemptAt;
   if (
     !gate.enabled ||
     !gate.freshThread ||
@@ -718,13 +734,61 @@ export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boo
     gate.queueDepth > 0 ||
     gate.availableMessageSlots < 2 ||
     gate.availableActors < 2 ||
-    gate.dailyAttempts >= gate.dailyCap
+    dailySuccesses >= gate.dailyCap
   ) return false;
-  if (gate.lastGlobalAttemptAt !== undefined && gate.now - gate.lastGlobalAttemptAt < gate.globalCooldownMs) return false;
-  if (gate.lastChannelAttemptAt !== undefined && gate.now - gate.lastChannelAttemptAt < gate.channelCooldownMs) return false;
+  if (gate.globalRetryAfterAt !== undefined && gate.now < gate.globalRetryAfterAt) return false;
+  if (gate.channelRetryAfterAt !== undefined && gate.now < gate.channelRetryAfterAt) return false;
+  if (lastGlobalSuccessAt !== undefined && gate.now - lastGlobalSuccessAt < gate.globalCooldownMs) return false;
+  if (lastChannelSuccessAt !== undefined && gate.now - lastChannelSuccessAt < gate.channelCooldownMs) return false;
   if (gate.lastHumanActivityAt !== undefined && gate.now - gate.lastHumanActivityAt < gate.humanQuietMs) return false;
   return gate.rng() < clamp(gate.chance, 0, 1);
 }
+
+/** Short exponential retry delay, always below the normal success cooldown. */
+export function autonomousResearchFailureBackoffMs(consecutiveFailures: number): number {
+  const exponent = Math.max(0, Math.min(2, Math.floor(consecutiveFailures) - 1));
+  return Math.min(
+    AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS,
+    AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_BASE_MS * 2 ** exponent,
+  );
+}
+
+export type AutonomousResearchFailureReason =
+  | "no_researcher"
+  | "no_responder"
+  | "lookup_failed"
+  | "no_safe_fresh_result"
+  | "source_read_failed"
+  | "safety_gate_changed"
+  | "generation_failed"
+  | "invalid_generated_lines"
+  | "missing_single_source"
+  | "missing_preview"
+  | "publication_failed";
+
+export interface AutonomousResearchDiagnostics {
+  attempts: number;
+  published: number;
+  failed: number;
+  lastFailure?: {
+    channelId: string;
+    seedId: string;
+    reason: AutonomousResearchFailureReason;
+    failedAt: number;
+    retryAfterAt: number;
+    consecutiveFailures: number;
+  };
+}
+
+type AutonomousResearchReadOutcome =
+  | { research: ResearchPacket; failureReason?: never }
+  | {
+    research?: never;
+    failureReason: Extract<
+      AutonomousResearchFailureReason,
+      "lookup_failed" | "no_safe_fresh_result" | "source_read_failed"
+    >;
+  };
 
 export function autonomousResearchResultIsFresh(
   seed: AutonomousResearchSeed,
@@ -1252,8 +1316,17 @@ export class SocialDirector {
   private readonly humanMessageEpochById = new Map<string, number>();
   private readonly recentAmbientSeedsByChannel = new Map<string, string[]>();
   private readonly recentAutonomousResearchSeedsByChannel = new Map<string, string[]>();
-  private readonly lastAutonomousResearchAtByChannel = new Map<string, number>();
-  private readonly autonomousResearchAttemptTimestamps: number[] = [];
+  private readonly lastAutonomousResearchSuccessAtByChannel = new Map<string, number>();
+  private readonly autonomousResearchSuccessTimestamps: number[] = [];
+  private readonly autonomousResearchFailureStateByChannel = new Map<string, {
+    consecutiveFailures: number;
+    retryAfterAt: number;
+  }>();
+  private readonly autonomousResearchDiagnostics: AutonomousResearchDiagnostics = {
+    attempts: 0,
+    published: 0,
+    failed: 0,
+  };
   private readonly claimedAutoSharedLinkMessageIds = new Set<string>();
   private readonly autoSharedLinkAttemptTimestamps: number[] = [];
   private readonly lastAutoSharedLinkAttemptAtByRequester = new Map<string, number>();
@@ -1293,7 +1366,9 @@ export class SocialDirector {
   private readonly autoSharedLinkDiscussionEnabled: boolean;
   private readonly pageReader: PageReader;
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
-  private lastAutonomousResearchAt?: number;
+  private lastAutonomousResearchSuccessAt?: number;
+  private autonomousResearchGlobalRetryAfterAt?: number;
+  private autonomousResearchGlobalConsecutiveFailures = 0;
 
   constructor(
     private readonly io: Server,
@@ -1365,6 +1440,15 @@ export class SocialDirector {
 
   getEvents(): DirectorEvent[] {
     return [...this.directorEvents];
+  }
+
+  getAutonomousResearchDiagnostics(): AutonomousResearchDiagnostics {
+    return {
+      ...this.autonomousResearchDiagnostics,
+      ...(this.autonomousResearchDiagnostics.lastFailure
+        ? { lastFailure: { ...this.autonomousResearchDiagnostics.lastFailure } }
+        : {}),
+    };
   }
 
   /** Invalidates every in-flight scene after a live channel/persona catalog edit. */
@@ -3048,18 +3132,60 @@ export class SocialDirector {
     );
   }
 
-  private reserveAutonomousResearchAttempt(channelId: string, seed: AutonomousResearchSeed, now: number): void {
-    this.lastAutonomousResearchAt = now;
-    this.lastAutonomousResearchAtByChannel.set(channelId, now);
-    this.autonomousResearchAttemptTimestamps.push(now);
+  private beginAutonomousResearchAttempt(channelId: string, seed: AutonomousResearchSeed): void {
+    this.autonomousResearchDiagnostics.attempts += 1;
     const recent = this.recentAutonomousResearchSeedsByChannel.get(channelId) ?? [];
     this.recentAutonomousResearchSeedsByChannel.set(channelId, [...recent, seed.id].slice(-2));
+  }
+
+  private recordAutonomousResearchFailure(
+    channelId: string,
+    seed: AutonomousResearchSeed,
+    reason: AutonomousResearchFailureReason,
+  ): false {
+    const failedAt = this.now();
+    const previous = this.autonomousResearchFailureStateByChannel.get(channelId);
+    const consecutiveFailures = (previous?.consecutiveFailures ?? 0) + 1;
+    const channelRetryAfterAt = failedAt + autonomousResearchFailureBackoffMs(consecutiveFailures);
+    this.autonomousResearchFailureStateByChannel.set(channelId, {
+      consecutiveFailures,
+      retryAfterAt: channelRetryAfterAt,
+    });
+    // A bounded global backoff protects a failing provider from being hit by
+    // every room in turn; the per-room backoff independently protects a bad
+    // query or repeatedly unreadable source family.
+    this.autonomousResearchGlobalConsecutiveFailures += 1;
+    const globalRetryAfterAt = failedAt + autonomousResearchFailureBackoffMs(
+      this.autonomousResearchGlobalConsecutiveFailures,
+    );
+    this.autonomousResearchGlobalRetryAfterAt = globalRetryAfterAt;
+    this.autonomousResearchDiagnostics.failed += 1;
+    this.autonomousResearchDiagnostics.lastFailure = {
+      channelId,
+      seedId: seed.id,
+      reason,
+      failedAt,
+      retryAfterAt: Math.max(channelRetryAfterAt, globalRetryAfterAt),
+      consecutiveFailures,
+    };
+    return false;
+  }
+
+  private recordAutonomousResearchSuccess(channelId: string): void {
+    const publishedAt = this.now();
+    this.lastAutonomousResearchSuccessAt = publishedAt;
+    this.lastAutonomousResearchSuccessAtByChannel.set(channelId, publishedAt);
+    this.autonomousResearchSuccessTimestamps.push(publishedAt);
+    this.autonomousResearchFailureStateByChannel.delete(channelId);
+    this.autonomousResearchGlobalRetryAfterAt = undefined;
+    this.autonomousResearchGlobalConsecutiveFailures = 0;
+    this.autonomousResearchDiagnostics.published += 1;
   }
 
   private async safelyReadAutonomousResult(
     channelId: string,
     seed: AutonomousResearchSeed,
-  ): Promise<ResearchPacket | undefined> {
+  ): Promise<AutonomousResearchReadOutcome> {
     const requesterId = `ambient-research:${channelId}`;
     const search = await this.researchBroker.research({
       query: seed.query,
@@ -3069,20 +3195,25 @@ export class SocialDirector {
       console.warn("Autonomous research lookup failed safely:", error instanceof Error ? error.message : error);
       return undefined;
     });
-    if (!search) return undefined;
+    if (!search) return { failureReason: "lookup_failed" };
     const recentUrls = this.recentPublishedUrlKeys();
     const safelyReadResults: ResearchPacket["results"] = [];
     let retrievedAt: string | undefined;
-    for (const result of search.results
+    let pageReadSucceeded = false;
+    let postReadFreshnessRejected = false;
+    const eligibleResults = search.results
       .filter((candidate) => {
         const urlKey = canonicalAutonomousResearchUrl(candidate.url);
         return Boolean(
           urlKey &&
           !recentUrls.has(urlKey) &&
-          autonomousResearchResultIsFresh(seed, candidate.publishedAt, this.now()),
+          (candidate.publishedAt === undefined ||
+            autonomousResearchResultIsFresh(seed, candidate.publishedAt, this.now())),
         );
       })
-      .slice(0, 4)) {
+      .slice(0, 4);
+    if (eligibleResults.length === 0) return { failureReason: "no_safe_fresh_result" };
+    for (const result of eligibleResults) {
       let url: URL;
       try {
         url = new URL(result.url);
@@ -3102,7 +3233,13 @@ export class SocialDirector {
       });
       const pageResult = page?.results.find((candidate) => candidate.id === "S1");
       if (!page || !pageResult || pageResult.url !== url.toString()) continue;
-      const publishedAtMs = result.publishedAt ? Date.parse(result.publishedAt) : Number.NaN;
+      pageReadSucceeded = true;
+      const candidatePublishedAt = result.publishedAt ?? pageResult.publishedAt;
+      if (!autonomousResearchResultIsFresh(seed, candidatePublishedAt, this.now())) {
+        postReadFreshnessRejected = true;
+        continue;
+      }
+      const publishedAtMs = candidatePublishedAt ? Date.parse(candidatePublishedAt) : Number.NaN;
       const publishedAt = Number.isFinite(publishedAtMs) && publishedAtMs <= this.now() + 5 * 60_000
         ? new Date(publishedAtMs).toISOString()
         : undefined;
@@ -3115,8 +3252,12 @@ export class SocialDirector {
       if (safelyReadResults.length >= 2) break;
     }
     return safelyReadResults.length > 0 && retrievedAt
-      ? { kind: "page", query: seed.query, retrievedAt, results: safelyReadResults }
-      : undefined;
+      ? { research: { kind: "page", query: seed.query, retrievedAt, results: safelyReadResults } }
+      : {
+        failureReason: pageReadSucceeded && postReadFreshnessRejected
+          ? "no_safe_fresh_result"
+          : "source_read_failed",
+      };
   }
 
   private async runAutonomousResearchConversation(
@@ -3126,7 +3267,7 @@ export class SocialDirector {
     thread: AmbientThreadState,
     seed: AutonomousResearchSeed,
   ): Promise<boolean> {
-    const now = this.now();
+    this.beginAutonomousResearchAttempt(channel.id, seed);
     const researchers = available.filter((persona) => persona.canResearch);
     const lead = selectAmbientLead(
       researchers,
@@ -3134,23 +3275,30 @@ export class SocialDirector {
       this.rng,
       getChannelProfile(channel.id)?.ambientMode ?? "discussion",
     );
-    if (!lead) return false;
+    if (!lead) return this.recordAutonomousResearchFailure(channel.id, seed, "no_researcher");
     const responderPool = available.filter((persona) => persona.id !== lead.id);
-    if (responderPool.length === 0) return false;
+    if (responderPool.length === 0) {
+      return this.recordAutonomousResearchFailure(channel.id, seed, "no_responder");
+    }
     const contrasting = responderPool.filter((persona) =>
       (lead.disagreement ?? 0) >= 0.65
         ? (persona.disagreement ?? 0) < 0.65
         : (persona.disagreement ?? 0) >= 0.65,
     );
     const responder = choose(contrasting.length > 0 ? contrasting : responderPool, this.rng);
-    this.reserveAutonomousResearchAttempt(channel.id, seed, now);
 
     this.setTyping(channel.id, lead.id, true);
     let research: ResearchPacket | undefined;
     let lines: GeneratedLine[] = [];
     try {
-      research = await this.safelyReadAutonomousResult(channel.id, seed);
-      if (!research || !this.autonomousResearchIsStillSafe(channel.id, epoch, [lead, responder], 2)) return false;
+      const readOutcome = await this.safelyReadAutonomousResult(channel.id, seed);
+      if (!readOutcome.research) {
+        return this.recordAutonomousResearchFailure(channel.id, seed, readOutcome.failureReason);
+      }
+      research = readOutcome.research;
+      if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead, responder], 2)) {
+        return this.recordAutonomousResearchFailure(channel.id, seed, "safety_gate_changed");
+      }
       const profile = getChannelProfile(channel.id);
       const mode = profile?.ambientMode ?? "discussion";
       const limits = ambientSceneWordLimits(lead, responder, false, mode);
@@ -3189,7 +3337,7 @@ export class SocialDirector {
       }, 4);
     } catch (error) {
       console.warn("Autonomous sourced conversation skipped:", error instanceof Error ? error.message : error);
-      return false;
+      return this.recordAutonomousResearchFailure(channel.id, seed, "generation_failed");
     } finally {
       this.setTyping(channel.id, lead.id, false);
     }
@@ -3200,20 +3348,21 @@ export class SocialDirector {
     const selectedSourceId = leadSourceIds.length === 1 && research?.results.some((result) => result.id === leadSourceIds[0])
       ? leadSourceIds[0]
       : undefined;
-    if (
-      !research ||
-      !leadLine ||
-      !responseLine ||
-      !selectedSourceId ||
-      responseLine.sourceIds.some((sourceId) => sourceId !== selectedSourceId) ||
-      !this.autonomousResearchIsStillSafe(channel.id, epoch, [lead, responder], 2)
-    ) return false;
+    if (!research || !leadLine || !responseLine) {
+      return this.recordAutonomousResearchFailure(channel.id, seed, "invalid_generated_lines");
+    }
+    if (!selectedSourceId || responseLine.sourceIds.some((sourceId) => sourceId !== selectedSourceId)) {
+      return this.recordAutonomousResearchFailure(channel.id, seed, "missing_single_source");
+    }
+    if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead, responder], 2)) {
+      return this.recordAutonomousResearchFailure(channel.id, seed, "safety_gate_changed");
+    }
     const selectedResearch: ResearchPacket = {
       ...research,
       results: research.results.filter((result) => result.id === selectedSourceId),
     };
     const preview = linkPreviewFromResearch(selectedResearch, selectedSourceId);
-    if (!preview) return false;
+    if (!preview) return this.recordAutonomousResearchFailure(channel.id, seed, "missing_preview");
 
     const leadSources = this.messageSources(selectedResearch, [selectedSourceId]);
     const leadMessage = this.postPublic(
@@ -3225,7 +3374,10 @@ export class SocialDirector {
       leadSources,
       preview,
     );
-    if (!leadMessage) return false;
+    if (!leadMessage) return this.recordAutonomousResearchFailure(channel.id, seed, "publication_failed");
+    // Success accounting begins only once a source-backed message is actually
+    // in room history. Everything before this point uses short retry backoff.
+    this.recordAutonomousResearchSuccess(channel.id);
     thread.seed = seed.discussionAngle;
     thread.debateBeat = true;
     thread.origin = "autonomous_research";
@@ -3235,7 +3387,17 @@ export class SocialDirector {
     this.setTyping(channel.id, responder.id, true);
     await delay(2_000 + this.rng() * 1_800);
     this.setTyping(channel.id, responder.id, false);
-    if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [responder], 1)) return true;
+    if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [responder], 1)) {
+      this.publishDirectorEvent({
+        trigger: "research",
+        summary: `${lead.name} shared one safely read source in #${channel.name}; the room changed before a follow-up.`,
+        considered: PERSONAS.length,
+        noticed: 1,
+        replied: 1,
+        reacted: 0,
+      });
+      return true;
+    }
     const responseSources = this.messageSources(
       selectedResearch,
       responseLine.sourceIds,
@@ -3337,23 +3499,37 @@ export class SocialDirector {
       const profile = getChannelProfile(channel.id);
       const ambientMode = profile?.ambientMode ?? "discussion";
       while (
-        this.autonomousResearchAttemptTimestamps[0] !== undefined &&
-        now - this.autonomousResearchAttemptTimestamps[0] >= 24 * 60 * 60_000
-      ) this.autonomousResearchAttemptTimestamps.shift();
+        this.autonomousResearchSuccessTimestamps[0] !== undefined &&
+        now - this.autonomousResearchSuccessTimestamps[0] >= 24 * 60 * 60_000
+      ) this.autonomousResearchSuccessTimestamps.shift();
+      if (
+        this.autonomousResearchGlobalRetryAfterAt !== undefined &&
+        now >= this.autonomousResearchGlobalRetryAfterAt
+      ) this.autonomousResearchGlobalRetryAfterAt = undefined;
+      let researchFailureState = this.autonomousResearchFailureStateByChannel.get(channel.id);
+      if (
+        researchFailureState &&
+        now - researchFailureState.retryAfterAt >= AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS
+      ) {
+        this.autonomousResearchFailureStateByChannel.delete(channel.id);
+        researchFailureState = undefined;
+      }
       const researchSeeds = profile?.autonomousResearchSeeds ?? [];
       const researchPolicy = this.autonomousResearchPolicy(channel.id);
       const startAutonomousResearch = researchSeeds.length > 0 && available.some((persona) => persona.canResearch) && shouldStartAutonomousResearch({
         enabled: researchPolicy.enabled,
         now,
-        lastGlobalAttemptAt: this.lastAutonomousResearchAt,
-        lastChannelAttemptAt: this.lastAutonomousResearchAtByChannel.get(channel.id),
+        lastGlobalSuccessAt: this.lastAutonomousResearchSuccessAt,
+        lastChannelSuccessAt: this.lastAutonomousResearchSuccessAtByChannel.get(channel.id),
+        globalRetryAfterAt: this.autonomousResearchGlobalRetryAfterAt,
+        channelRetryAfterAt: researchFailureState?.retryAfterAt,
         lastHumanActivityAt: this.lastHumanActivityAt,
         globalCooldownMs: researchPolicy.globalCooldownMs,
         channelCooldownMs: researchPolicy.channelCooldownMs,
         humanQuietMs: researchPolicy.humanQuietMs,
         queueDepth: lmHealth.queueDepth,
         availableMessageSlots: availableSlots,
-        dailyAttempts: this.autonomousResearchAttemptTimestamps.length,
+        dailySuccesses: this.autonomousResearchSuccessTimestamps.length,
         dailyCap: researchPolicy.dailyCap,
         voiceRoomActive: this.voiceRoomActive,
         freshThread: !hadLiveThread && thread.messageCount === 0,

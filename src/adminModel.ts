@@ -1,4 +1,5 @@
 import type {
+  AdminAutonomousResearchDiagnostics,
   AdminBanRecord,
   AdminBehaviorTuning,
   AdminChannelConfig,
@@ -79,6 +80,10 @@ const asOptionalString = (value: unknown): string | undefined => {
   return text || undefined;
 };
 const asBoolean = (value: unknown, fallback = false): boolean => typeof value === "boolean" ? value : fallback;
+const nonNegativeInteger = (value: unknown): number => {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+};
 
 export const clampAdminPercent = (value: unknown, fallback = 50): number => {
   const parsed = typeof value === "number" ? value : Number(value);
@@ -220,6 +225,35 @@ const normalizeVoiceOptions = (value: unknown, personas: AdminPersonaConfig[]): 
   };
 };
 
+const normalizeAutonomousResearchDiagnostics = (
+  value: unknown,
+): AdminAutonomousResearchDiagnostics | undefined => {
+  if (!isRecord(value)) return undefined;
+  const failure = asRecord(value.lastFailure);
+  const channelId = asOptionalString(failure.channelId);
+  const seedId = asOptionalString(failure.seedId);
+  const reason = asOptionalString(failure.reason);
+  const failedAt = nonNegativeInteger(failure.failedAt);
+  const retryAfterAt = nonNegativeInteger(failure.retryAfterAt);
+  return {
+    attempts: nonNegativeInteger(value.attempts),
+    published: nonNegativeInteger(value.published),
+    failed: nonNegativeInteger(value.failed),
+    ...(channelId && seedId && reason && failedAt > 0 && retryAfterAt > 0
+      ? {
+          lastFailure: {
+            channelId,
+            seedId,
+            reason,
+            failedAt,
+            retryAfterAt,
+            consecutiveFailures: Math.max(1, nonNegativeInteger(failure.consecutiveFailures)),
+          },
+        }
+      : {}),
+  };
+};
+
 export function normalizeAdminState(value: unknown): AdminStateSnapshot {
   const envelope = asRecord(value);
   const root = isRecord(envelope.state) ? envelope.state : envelope;
@@ -230,10 +264,13 @@ export function normalizeAdminState(value: unknown): AdminStateSnapshot {
     Object.entries(channelInput).map(([channelId, tuning]) => [channelId, normalizeAdminTuning(tuning, global)]),
   );
   const personas = asArray(root.personas).map(normalizePersona);
+  const automation = asRecord(root.automation);
+  const autonomousResearch = normalizeAutonomousResearchDiagnostics(automation.autonomousResearch);
   return {
     behavior: { global, channels: channelTunings },
     automation: {
-      autonomousLinkChannelIds: stringArray(asRecord(root.automation).autonomousLinkChannelIds),
+      autonomousLinkChannelIds: stringArray(automation.autonomousLinkChannelIds),
+      ...(autonomousResearch ? { autonomousResearch } : {}),
     },
     personas,
     channels: asArray(root.channels).map(normalizeChannel),

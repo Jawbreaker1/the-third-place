@@ -14,6 +14,22 @@ describe("admin model boundary", () => {
           global: { activity: 140, competence: 72.4, aggression: -5, explicitness: "61" },
           channels: { lobby: { activity: 42 } },
         },
+        automation: {
+          autonomousLinkChannelIds: ["lobby"],
+          autonomousResearch: {
+            attempts: 9.8,
+            published: 3,
+            failed: 6,
+            lastFailure: {
+              channelId: "lobby",
+              seedId: "lobby-news",
+              reason: "source_read_failed",
+              failedAt: 1_752_492_000_000,
+              retryAfterAt: 1_752_492_120_000,
+              consecutiveFailures: 2,
+            },
+          },
+        },
         personas: [{
           id: "ai-mira",
           identity: { name: "Mira", role: "regular" },
@@ -52,7 +68,22 @@ describe("admin model boundary", () => {
       aggression: 0,
       explicitness: 61,
     });
-    expect(snapshot.automation.autonomousLinkChannelIds).toEqual([]);
+    expect(snapshot.automation).toEqual({
+      autonomousLinkChannelIds: ["lobby"],
+      autonomousResearch: {
+        attempts: 9,
+        published: 3,
+        failed: 6,
+        lastFailure: {
+          channelId: "lobby",
+          seedId: "lobby-news",
+          reason: "source_read_failed",
+          failedAt: 1_752_492_000_000,
+          retryAfterAt: 1_752_492_120_000,
+          consecutiveFailures: 2,
+        },
+      },
+    });
     expect(snapshot.personas[0]).toMatchObject({
       id: "ai-mira",
       name: "Mira",

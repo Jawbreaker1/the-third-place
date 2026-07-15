@@ -832,6 +832,7 @@ app.use("/api/admin", createAdminRouter({
   state: adminState,
   configuredOrigins: adminOrigins,
   getHumans: adminHumans,
+  getAutonomousResearchDiagnostics: () => director.getAutonomousResearchDiagnostics(),
   kickHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, true),
   banHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, false),
   isSecure: (request) => request.secure || publicOrigin?.startsWith("https://") === true,

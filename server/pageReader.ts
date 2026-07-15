@@ -75,6 +75,12 @@ export interface ResolvePageReadTargetInput {
 export interface ExtractedPage {
   title: string;
   text: string;
+  /**
+   * A publisher-supplied, machine-readable publication instant. This is
+   * intentionally absent when metadata is vague, malformed or contradictory;
+   * callers with freshness requirements must continue to fail closed.
+   */
+  publishedAt?: string;
 }
 
 interface CachedRead {
@@ -92,6 +98,29 @@ const MAX_SEMANTIC_CANDIDATES = 64;
 const MAX_PAGE_INPUT_BYTES = 1024 * 1024;
 const MAX_PARSE_NODES = 20_000;
 const MAX_PARSE_DEPTH = 128;
+const MAX_JSON_LD_BYTES = 128 * 1024;
+const MAX_JSON_LD_BLOCKS = 12;
+const MAX_JSON_LD_ENTITIES = 64;
+const PUBLISHABLE_SCHEMA_TYPES = new Set([
+  "article",
+  "advertisercontentarticle",
+  "analysisnewsarticle",
+  "askpublicnewsarticle",
+  "backgroundnewsarticle",
+  "blogposting",
+  "discussionforumposting",
+  "liveblogposting",
+  "newsarticle",
+  "opinionnewsarticle",
+  "report",
+  "reportagenewsarticle",
+  "reviewnewsarticle",
+  "satiricalarticle",
+  "scholarlyarticle",
+  "socialmediaposting",
+  "techarticle",
+  "webpage",
+]);
 // Unicode labels are valid input to WHATWG URL and are canonicalized to
 // Punycode by the shared HTTPS validator. Limiting bare hosts to ASCII would
 // silently make link handling language-dependent even though explicit HTTPS
@@ -326,6 +355,169 @@ const pageDescription = (document: ParsedNode): string | undefined => {
   return undefined;
 };
 
+const machinePublicationDate = (raw: unknown): string | undefined => {
+  if (typeof raw !== "string") return undefined;
+  const value = stripDangerousTextControls(raw.normalize("NFKC")).trim();
+  if (value.length === 0 || value.length > 80) return undefined;
+
+  // Accept only timezone-independent calendar dates or ISO timestamps with an
+  // explicit offset. Natural-language dates and server-local timestamps are
+  // too ambiguous for a freshness security boundary.
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:\d{2}))?$/u.exec(value);
+  if (!match) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate()) return undefined;
+  if (match[4] !== undefined) {
+    const hour = Number(match[4]);
+    const minute = Number(match[5]);
+    const second = match[6] === undefined ? 0 : Number(match[6]);
+    if (hour > 23 || minute > 59 || second > 59) return undefined;
+    const offset = match[8];
+    if (offset && offset !== "Z") {
+      const offsetHour = Number(offset.slice(1, 3));
+      const offsetMinute = Number(offset.slice(4, 6));
+      if (offsetHour > 23 || offsetMinute > 59) return undefined;
+    }
+  }
+  const parsed = Date.parse(match[4] === undefined ? `${value}T00:00:00.000Z` : value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
+};
+
+const hasItemProp = (node: ParsedNode, expected: string): boolean =>
+  (attrsOf(node).itemprop ?? "")
+    .split(/\s+/u)
+    .some((value) => value.toLowerCase() === expected.toLowerCase());
+
+const collectNodes = (
+  root: ParsedNode,
+  predicate: (candidate: ParsedNode) => boolean,
+  limit: number,
+): ParsedNode[] => {
+  const matches: ParsedNode[] = [];
+  const stack: WalkEntry[] = [{ node: root, depth: 0 }];
+  let visited = 0;
+  while (stack.length > 0 && visited < MAX_TRAVERSAL_NODES && matches.length < limit) {
+    const current = stack.pop()!;
+    if (current.depth > MAX_TRAVERSAL_DEPTH) continue;
+    visited += 1;
+    if (predicate(current.node)) matches.push(current.node);
+    stack.push(...childEntries(current.node, current.depth + 1));
+  }
+  return matches;
+};
+
+const reconciledMachineDate = (values: readonly unknown[]): {
+  state: "missing" | "valid" | "ambiguous";
+  value?: string;
+} => {
+  const dates = new Set(values.flatMap((value) => machinePublicationDate(value) ?? []));
+  if (dates.size === 0) return { state: "missing" };
+  if (dates.size > 1) return { state: "ambiguous" };
+  return { state: "valid", value: [...dates][0] };
+};
+
+const nodeRawText = (root: ParsedNode, maxLength: number): string | undefined => {
+  const stack: WalkEntry[] = [{ node: root, depth: 0 }];
+  const parts: string[] = [];
+  let visited = 0;
+  let length = 0;
+  while (stack.length > 0 && visited < MAX_TRAVERSAL_NODES && length <= maxLength) {
+    const current = stack.pop()!;
+    if (current.depth > MAX_TRAVERSAL_DEPTH) continue;
+    visited += 1;
+    if (current.node.nodeName === "#text") {
+      const value = current.node.value ?? "";
+      parts.push(value);
+      length += value.length;
+      continue;
+    }
+    stack.push(...childEntries(current.node, current.depth + 1));
+  }
+  return length <= maxLength ? parts.join("") : undefined;
+};
+
+type JsonRecord = Record<string, unknown>;
+
+const jsonRecord = (value: unknown): JsonRecord | undefined =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : undefined;
+
+const jsonLdEntities = (value: unknown): JsonRecord[] => {
+  const roots = Array.isArray(value) ? value : [value];
+  const entities: JsonRecord[] = [];
+  for (const root of roots.slice(0, MAX_JSON_LD_ENTITIES)) {
+    const record = jsonRecord(root);
+    if (!record) continue;
+    entities.push(record);
+    if (Array.isArray(record["@graph"])) {
+      for (const graphValue of record["@graph"].slice(0, MAX_JSON_LD_ENTITIES - entities.length)) {
+        const graphRecord = jsonRecord(graphValue);
+        if (graphRecord) entities.push(graphRecord);
+      }
+    }
+    if (entities.length >= MAX_JSON_LD_ENTITIES) break;
+  }
+  return entities;
+};
+
+const jsonLdEntityCanBePublished = (entity: JsonRecord): boolean => {
+  const rawTypes = Array.isArray(entity["@type"]) ? entity["@type"] : [entity["@type"]];
+  return rawTypes.some((rawType) => {
+    if (typeof rawType !== "string") return false;
+    const localName = rawType.trim().split(/[\/#]/u).at(-1)?.toLowerCase() ?? "";
+    return PUBLISHABLE_SCHEMA_TYPES.has(localName);
+  });
+};
+
+const jsonLdPublicationDate = (document: ParsedNode): string | undefined => {
+  const scripts = collectNodes(document, (node) => {
+    if (node.tagName !== "script") return false;
+    return (attrsOf(node).type ?? "").split(";", 1)[0]?.trim().toLowerCase() === "application/ld+json";
+  }, MAX_JSON_LD_BLOCKS);
+  const values: unknown[] = [];
+  let totalBytes = 0;
+  for (const script of scripts) {
+    const raw = nodeRawText(script, MAX_JSON_LD_BYTES);
+    if (!raw) continue;
+    totalBytes += Buffer.byteLength(raw, "utf8");
+    if (totalBytes > MAX_JSON_LD_BYTES) break;
+    try {
+      for (const entity of jsonLdEntities(JSON.parse(raw))) {
+        // dateModified is deliberately not a substitute: an old article can
+        // be edited today while remaining stale for a publication-age rule.
+        if (
+          jsonLdEntityCanBePublished(entity) &&
+          Object.prototype.hasOwnProperty.call(entity, "datePublished")
+        ) values.push(entity.datePublished);
+      }
+    } catch {
+      // Invalid publisher metadata is inert and cannot weaken freshness.
+    }
+  }
+  return reconciledMachineDate(values).value;
+};
+
+const pagePublicationDate = (document: ParsedNode, contentRoot: ParsedNode = document): string | undefined => {
+  const tiers: unknown[][] = [
+    collectNodes(document, (node) => {
+      if (node.tagName !== "meta") return false;
+      const attrs = attrsOf(node);
+      return (attrs.property ?? attrs.name ?? "").toLowerCase() === "article:published_time";
+    }, 12).flatMap((node) => attrsOf(node).content ?? []),
+    collectNodes(document, (node) => node.tagName === "meta" && hasItemProp(node, "datePublished"), 12)
+      .flatMap((node) => attrsOf(node).content ?? []),
+    collectNodes(contentRoot, (node) => node.tagName === "time" && hasItemProp(node, "datePublished"), 12)
+      .flatMap((node) => attrsOf(node).datetime ?? []),
+  ];
+  for (const values of tiers) {
+    const direct = reconciledMachineDate(values);
+    if (direct.state === "ambiguous") return undefined;
+    if (direct.value) return direct.value;
+  }
+  return jsonLdPublicationDate(document);
+};
+
 const metadataPageFromHead = (raw: string, finalUrl: URL): ExtractedPage | undefined => {
   // This is an HTML structure boundary, never a natural-language classifier.
   const closingHead = /<\/head\s*>/iu.exec(raw);
@@ -334,9 +526,11 @@ const metadataPageFromHead = (raw: string, finalUrl: URL): ExtractedPage | undef
   if (!headDocument) return undefined;
   const text = pageDescription(headDocument);
   if (!text) return undefined;
+  const publishedAt = pagePublicationDate(headDocument);
   return {
     title: pageTitle(headDocument, headDocument) ?? finalUrl.hostname,
     text,
+    ...(publishedAt ? { publishedAt } : {}),
   };
 };
 
@@ -405,9 +599,11 @@ export const extractReadablePage = (
     ? extractedText
     : pageDescription(document);
   if (!text) return undefined;
+  const publishedAt = pagePublicationDate(document, root);
   return {
     title: pageTitle(document, root) ?? finalUrl.hostname,
     text,
+    ...(publishedAt ? { publishedAt } : {}),
   };
 };
 
@@ -607,6 +803,7 @@ export class PageReader {
             title: extracted.title,
             url: requestedUrl.toString(),
             snippet: extracted.text,
+            ...(extracted.publishedAt ? { publishedAt: extracted.publishedAt } : {}),
           },
         };
       });

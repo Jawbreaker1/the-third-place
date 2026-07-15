@@ -152,23 +152,37 @@ export const autonomousLinkPolicy = (frequency: number): AutonomousLinkPolicy =>
   }
   const belowBaseline = level < 50;
   const position = belowBaseline ? (level - 1) / 49 : (level - 50) / 50;
+  // Preserve the established 50/60 calibration, then make the explicitly
+  // selected upper range materially different. Even at 100, hard cooldowns,
+  // the rolling success cap and the director's global activity limits remain.
+  const upperPosition = level > 60 ? (level - 60) / 40 : undefined;
   return {
     enabled: true,
     chance: belowBaseline
       ? interpolate(0.015, 0.07, position)
-      : interpolate(0.07, 0.22, position),
+      : upperPosition === undefined
+        ? interpolate(0.07, 0.22, position)
+        : interpolate(0.10, 0.65, upperPosition),
     globalCooldownMs: Math.round((belowBaseline
       ? interpolate(60, 30, position)
-      : interpolate(30, 12, position)) * 60_000),
+      : upperPosition === undefined
+        ? interpolate(30, 12, position)
+        : interpolate(26.4, 5, upperPosition)) * 60_000),
     channelCooldownMs: Math.round((belowBaseline
       ? interpolate(240, 120, position)
-      : interpolate(120, 40, position)) * 60_000),
+      : upperPosition === undefined
+        ? interpolate(120, 40, position)
+        : interpolate(104, 20, upperPosition)) * 60_000),
     humanQuietMs: Math.round((belowBaseline
       ? interpolate(300, 180, position)
-      : interpolate(180, 75, position)) * 1_000),
+      : upperPosition === undefined
+        ? interpolate(180, 75, position)
+        : interpolate(159, 45, upperPosition)) * 1_000),
     dailyCap: Math.round(belowBaseline
       ? interpolate(2, 6, position)
-      : interpolate(6, 16, position)),
+      : upperPosition === undefined
+        ? interpolate(6, 16, position)
+        : interpolate(8, 36, upperPosition)),
   };
 };
 
