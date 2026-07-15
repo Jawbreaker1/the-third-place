@@ -48,6 +48,7 @@ import {
 import {
   CANDIDATE_REVIEW_TIMEOUT_MS,
   TURN_ANALYSIS_TIMEOUT_MS,
+  TURN_TRUST_THRESHOLDS,
   buildCandidateReviewResponseFormat,
   buildCandidateReviewSystemPrompt,
   buildCandidateReviewUserData,
@@ -101,8 +102,16 @@ const mergeVerifiedEvidencePlan = (
         source: "lm",
         failureReason: null,
       };
+  const recoveredLanguage = base.language.tag === "und" &&
+    verification.language.tag !== "und" &&
+    verification.language.confidence >= TURN_TRUST_THRESHOLDS.language
+    ? verification.language
+    : undefined;
   return {
     ...base,
+    ...(recoveredLanguage
+      ? { language: recoveredLanguage, responseLanguage: recoveredLanguage }
+      : {}),
     evidence: verified.evidence,
     capabilities: {
       ...base.capabilities,
@@ -177,6 +186,8 @@ export interface SceneCapabilityContext {
   /** The action that actually entered the typed executor, if any. */
   plannedAction: TurnCapability | null;
   executionStatus: "not_requested" | "succeeded" | "failed_temporary";
+  /** Registry-derived inventory fact; the prompt never infers this from capability IDs. */
+  externalEvidenceAvailable?: boolean;
 }
 
 export interface SceneRequest {
@@ -260,6 +271,8 @@ export interface SceneRequest {
   evidenceOutcome?: EvidenceOutcome;
   /** Server-owned capability truth shared unchanged by generation and review. */
   capabilityContext?: SceneCapabilityContext;
+  /** Trusted adapter-owned grounding contract; never sourced from transcript text. */
+  capabilityGroundingInstruction?: string;
   /** Trusted current-time result for a place the human explicitly requested; separate from resident-local time. */
   requestedClock?: LocalDateTimeResult;
   /** Server-owned publication policy; the current clock snapshot is attached when the queued scene starts. */
@@ -789,12 +802,8 @@ ${voiceOriginRule}
     : "";
 
   const evidenceOutcome = request.research ? "succeeded" : request.evidenceOutcome;
-  const evidenceAvailabilityRule = request.research?.kind === "weather"
-    ? "- Trusted server state supplied a typed weather forecast from the fixed forecast provider. Answer the requested place and time horizon only from freshResearch, include at least one concrete forecast detail, attach S1, and never claim that current weather or forecast data is unavailable."
-    : request.research?.kind === "page"
-    ? "- Trusted server state says the exact linked-page evidence in freshResearch was successfully fetched. Answer from it when relevant; never claim the page is inaccessible, external fetching is impossible, or the link is dead."
-    : request.research
-      ? "- Trusted server state says the freshResearch lookup succeeded. Use only supported results and source IDs; never claim that the lookup was unavailable or that external fetching is impossible."
+  const evidenceAvailabilityRule = request.research
+      ? `- Trusted server state supplied successful bounded grounding material in freshResearch. Retrieval success does not by itself prove that this material answers the exact request. ${request.capabilityGroundingInstruction ?? "Answer only from supported evidence and attach only source IDs that support the answer."} Never claim that this completed retrieval was unavailable.`
       : evidenceOutcome === "failed"
         ? "- Trusted server state says this specific evidence request returned no usable source. You may say that this attempt failed, but never turn it into a permanent claim that external pages or web lookups are inaccessible."
         : evidenceOutcome === "requested"
@@ -803,12 +812,9 @@ ${voiceOriginRule}
             ? "- Trusted server state marks the evidence request successful, but no evidence packet is present. Do not invent its contents or claim a permanent inability to access external pages or the web."
             : "";
 
-  const externalEvidenceCapabilityAvailable = Boolean(
-    request.capabilityContext?.available.some((capability) =>
-      capability === "read_url" || capability === "web_search" || capability === "weather_forecast"),
-  );
+  const externalEvidenceCapabilityAvailable = request.capabilityContext?.externalEvidenceAvailable === true;
   const capabilityAvailabilityRule = externalEvidenceCapabilityAvailable
-    ? "- trustedCapabilityContext is server-owned runtime truth. This turn's server can read public links, search the web and/or retrieve typed forecasts exactly as listed there. Never claim a permanent lack of internet, browser, link-reading, API, weather or live-data capability merely because the resident model itself has no tool. Only failed_temporary may be described as this specific attempt returning no usable evidence. If no execution result is supplied, do not pretend a lookup happened and do not guess a current fact."
+    ? "- trustedCapabilityContext is server-owned runtime truth. At least one listed capability can obtain external evidence in this turn. Never claim a permanent lack of internet, browser, link-reading, API or live-data capability merely because the resident model itself has no tool. Only failed_temporary may be described as this specific attempt returning no usable evidence. If no execution result is supplied, do not pretend a lookup happened and do not guess a current fact."
     : request.capabilityContext
       ? "- trustedCapabilityContext is server-owned runtime truth. Do not invent a capability absent from its available list or pretend an action ran when plannedAction is null."
       : "";
@@ -1799,13 +1805,16 @@ export class LmStudioClient {
         ].slice(-8).map((text) => text.slice(0, 500)),
       }];
     });
+    const reviewProfile = getChannelProfile(request.channelId ?? "");
     const parsed = candidateReviewInputSchema.safeParse({
       sceneKind: request.kind,
       room: {
         id: request.channelId?.slice(0, 128) ?? null,
         name: request.channelName.slice(0, 100),
         register: this.humanizerRegister(request) ?? null,
-        topic: getChannelProfile(request.channelId ?? "")?.topic.brief.slice(0, 500) ?? null,
+        topic: reviewProfile?.topic.brief.slice(0, 500) ?? null,
+        freshnessRule: reviewProfile?.topic.freshnessRule?.slice(0, 800) ?? null,
+        conversationGuidance: reviewProfile?.conversationGuidance?.slice(0, 1_600) ?? null,
       },
       behaviorTuning: {
         competence: request.behaviorTuning?.competence ?? DEFAULT_RUNTIME_BEHAVIOR_TUNING.competence,
@@ -1911,6 +1920,7 @@ export class LmStudioClient {
             discussed: request.capabilityContext.discussed,
             plannedAction: request.capabilityContext.plannedAction,
             executionStatus: request.capabilityContext.executionStatus,
+            externalEvidenceAvailable: request.capabilityContext.externalEvidenceAvailable ?? false,
           }
         : null,
       candidates,

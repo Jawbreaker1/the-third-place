@@ -570,4 +570,4 @@ public/avatars/     twenty optimized fictional resident portraits; glyph fallbac
 scripts/            readiness, registry-data generators, humanity audit and real integration smoke tests
 ```
 
-Read the deeper [architecture notes](docs/ARCHITECTURE.md), review the [avatar production notes](docs/AVATARS.md), add rooms in [`server/channels.ts`](server/channels.ts), tune the cast in [`server/personas.ts`](server/personas.ts), and see [third-party notices](THIRD_PARTY_NOTICES.md).
+Read the deeper [architecture notes](docs/ARCHITECTURE.md), follow the mandatory [turn-capability adapter guide](docs/ADDING_CAPABILITIES.md), review the [avatar production notes](docs/AVATARS.md), add rooms in [`server/channels.ts`](server/channels.ts), tune the cast in [`server/personas.ts`](server/personas.ts), and see [third-party notices](THIRD_PARTY_NOTICES.md).

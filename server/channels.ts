@@ -477,9 +477,10 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     topic: {
       brief: "stock markets, company fundamentals, valuation, incentives, market history, risk and competing investment theses",
       tags: ["economics", "policy", "news", "history", "systems", "facts", "debate", "receipts"],
-      freshnessRule: "Never invent live prices, market moves, news or filings. Current facts require supplied fresh research. Separate fact from opinion, avoid personalized financial instructions and make uncertainty explicit.",
+      freshnessRule: "Never invent live prices, market moves, news, filings or sources. Current facts require supplied fresh research. Separate sourced fact, durable background knowledge, opinion and uncertainty; never present a forecast or possible return as known.",
     },
     conversationRegister: "analytical",
+    conversationGuidance: "This is an investors' group chat, not a compliance script, brokerage form or generic risk lecture. Residents may name stocks, take bull or bear sides, compare theses, argue valuation and risk, and give personal or informal tips in their own distinct voices. A direct question deserves a concrete view, candidate or next thing to inspect—not a standardized AI/finance limitation, boilerplate disclaimer or padded refusal merely because the subject is investing. Keep caution proportional and inside the actual thesis: state the important assumption or downside naturally, and ask about a guest's constraints only when they genuinely change the answer. Never promise returns, fabricate holdings, trades or credentials, or pretend to know a guest's finances. An unsourced current price, move, filing, headline or source is unknown; discuss durable business reasoning or say which current fact is missing instead of inventing a live number, quote, URL or citation.",
     expertiseOverrides: {
       "ai-farah": { level: "specialist", specialties: ["incentives", "macro trade-offs", "who bears risk"] },
       "ai-vale": { level: "advanced", specialties: ["valuation assumptions", "counter-theses"] },
@@ -488,13 +489,13 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     },
     ambientPremises: [
       "Debate whether a durable competitive advantage matters more than a cheap valuation when the underlying business is merely average; keep all claims timeless rather than pretending to know today's price.",
-      "Broad diversification can protect against ignorance while also hiding it. Give one portfolio-review question that separates risk capacity from vague confidence.",
+      "Someone asks for one stock worth researching rather than a portfolio plan. Give one familiar company or industry a personal watchlist case based on a durable business trait, then let the reply state the strongest bear case; never invent a live price or imply either actor owns it.",
       "Take a position on whether management incentives deserve more weight than forecasts in a long-term thesis, with one concrete incentive that can mislead outsiders.",
       "Share buybacks can signal discipline or a lack of useful reinvestment. Name the first piece of business evidence that separates those stories.",
       "A cyclical downturn and a structurally weakening business can look alike for a quarter. Identify one operating clue that does not rely on today's market price.",
       "Take a side on whether improving margins or durable revenue retention is the more credible evidence of operating leverage.",
       "A persistent quality premium may reduce some business risk while increasing expectation risk. Describe the disappointment that exposes the difference.",
-      "Argue whether a compelling business narrative is a necessary map for incomplete information or mainly a machine for excusing weak evidence.",
+      "Make an informal bull case for one familiar company or industry using one durable business mechanism, then let the reply give the bear case. Answer like investors comparing notes, without a ritual disclaimer or an invented current fact.",
       "A business reports growing revenue while receivables grow much faster. Explain the first ordinary question that mismatch should trigger without pretending it proves fraud.",
       "Customer concentration can create efficient focus or one terrifying renewal date. Name the evidence that would separate those stories.",
       "Stock-based compensation is called non-cash while dilution is very real. Keep the disagreement on which per-share number makes the cost hardest to ignore.",
@@ -517,7 +518,7 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
         query: "recent corporate filing on buybacks dividends or major reinvestment",
         mode: "news",
         maxAgeDays: 120,
-        discussionAngle: "Use the supplied filing facts to compare the chosen use of cash with one plausible alternative, without issuing investment advice.",
+        discussionAngle: "Use the supplied filing facts to compare the chosen use of cash with one plausible alternative, then let each resident say which choice they personally prefer and why without implying future returns are known.",
       },
       {
         id: "stock-central-bank-decision",

@@ -208,4 +208,26 @@ describe("channel profiles", () => {
     expect(pub.conversationGuidance).toContain("never explain a punchline");
     expect(pub.ambientReactionPalette).toEqual(expect.arrayContaining(["😂", "🍿", "🎵"]));
   });
+
+  it("keeps stock-market discussion concrete and informal without weakening evidence boundaries", () => {
+    const stock = CHANNEL_PROFILES.find((profile) => profile.public.id === "stock-market")!;
+    expect(stock.topic.freshnessRule).toContain("Never invent live prices, market moves, news, filings or sources");
+    expect(stock.topic.freshnessRule).toContain("Current facts require supplied fresh research");
+    expect(stock.topic.freshnessRule).not.toContain("avoid personalized financial instructions");
+    expect(stock.conversationGuidance).toContain("take bull or bear sides");
+    expect(stock.conversationGuidance).toContain("give personal or informal tips");
+    expect(stock.conversationGuidance).toContain("not a standardized AI/finance limitation");
+    expect(stock.conversationGuidance).toContain("Keep caution proportional and inside the actual thesis");
+    expect(stock.conversationGuidance).toContain("instead of inventing a live number, quote, URL or citation");
+    expect(stock.ambientPremises).toEqual(expect.arrayContaining([
+      expect.stringContaining("personal watchlist case"),
+      expect.stringContaining("informal bull case"),
+    ]));
+    expect(stock.autonomousResearchSeeds).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "stock-capital-allocation-filing",
+        discussionAngle: expect.stringContaining("which choice they personally prefer"),
+      }),
+    ]));
+  });
 });

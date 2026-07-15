@@ -56,6 +56,8 @@ import {
   socketOriginAllowed,
 } from "./originPolicy.js";
 import { ResearchBroker } from "./researchBroker.js";
+import { PageReader } from "./pageReader.js";
+import { CapabilityRegistry } from "./capabilities/registry.js";
 import {
   ADMIN_JSON_BODY_LIMIT_BYTES,
   PUBLIC_JSON_BODY_LIMIT_BYTES,
@@ -587,8 +589,14 @@ const publishVoiceRoom = (room: VoiceRoomView): void => {
   io.to(voiceSocketRoom(room.id)).emit("voice:room:update", room);
   publishVoiceRooms();
 };
+const voiceCapabilityRegistry = new CapabilityRegistry({
+  pageReader: new PageReader(),
+  researchBroker,
+  weatherForecastProvider: null,
+});
 const voiceDirector = new VoiceDirector({
   runtime: voiceRooms,
+  capabilityRegistry: voiceCapabilityRegistry,
   lm,
   speech: voiceSpeech,
   actorChannels,

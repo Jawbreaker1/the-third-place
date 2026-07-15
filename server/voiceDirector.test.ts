@@ -5,8 +5,21 @@ import { setAdminPersonaVoiceMappings } from "./personaVoices.js";
 import { createFailClosedTurnAnalysis, type TurnAnalysis, type TurnAnalysisInput } from "./semanticRouter.js";
 import { mentionsPersona, routedLanguage, VoiceDirector, sanitizeSpokenLine, ttsModelSupportsLanguage } from "./voiceDirector.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
+import { CapabilityRegistry } from "./capabilities/registry.js";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
+const voiceCapabilityRegistry = (now: () => number = Date.now): CapabilityRegistry => new CapabilityRegistry({
+  pageReader: {
+    resolveTarget: () => undefined,
+    read: async () => undefined,
+  } as never,
+  researchBroker: {
+    research: async () => undefined,
+    researchSite: async () => undefined,
+  } as never,
+  weatherForecastProvider: null,
+  now,
+});
 const routedAnalysis = (
   languageTag = "sv-SE",
   options: {
@@ -106,6 +119,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
   const payloads: Array<Record<string, unknown>> = [];
   const director = new VoiceDirector({
     runtime,
+    capabilityRegistry: voiceCapabilityRegistry(),
     lm: {
       analyzeTurn: async (input) => {
         analysisInput = input;
@@ -409,6 +423,7 @@ describe("VoiceDirector", () => {
     let requestOwnerIds: string[] | undefined;
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: analyzeSwedish,
         generateScene: async (request) => {
@@ -463,6 +478,7 @@ describe("VoiceDirector", () => {
     const payloads: Array<Record<string, unknown>> = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: analyzeSwedish,
         generateScene: async () => [{ personaId: "ai-sana", content: "Absolut, jag hör dig.", source: "lm", sourceIds: [] }],
@@ -540,6 +556,7 @@ describe("VoiceDirector", () => {
     const relationUpdates: Array<{ humanId: string; personaId: string; familiarity?: number }> = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: async () => {
           callOrder.push("analyze");
@@ -620,6 +637,7 @@ describe("VoiceDirector", () => {
     const speeches: string[] = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: async (input) => {
           analysisInput = input;
@@ -706,6 +724,7 @@ describe("VoiceDirector", () => {
     const languageHints: Array<string | undefined> = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: async (input) => {
           analysisInputs.push(input);
@@ -759,6 +778,7 @@ describe("VoiceDirector", () => {
     const generatedBy: string[] = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: async () => routedAnalysis("de-DE", {
           addressedIds: ["ai-mira"],
@@ -821,6 +841,7 @@ describe("VoiceDirector", () => {
     const speeches: string[] = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: async (input) => {
           analysisInput = input;
@@ -883,6 +904,7 @@ describe("VoiceDirector", () => {
     const speeches: Array<Record<string, unknown>> = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: async (input) => {
           analysisInput = input;
@@ -935,6 +957,7 @@ describe("VoiceDirector", () => {
     const syntheses: Array<Record<string, unknown>> = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: async () => routedAnalysis("ja-JP"),
         generateScene: async () => [{ personaId: "ai-sana", content: "まず小さく試すのがいいと思う。", source: "lm", sourceIds: [] }],
@@ -1000,6 +1023,7 @@ describe("VoiceDirector", () => {
       const syntheses: Array<Record<string, unknown>> = [];
       const director = new VoiceDirector({
         runtime,
+        capabilityRegistry: voiceCapabilityRegistry(),
         lm: {
           analyzeTurn: async () => routedAnalysis("ja-JP", { addressedIds: [personaId] }),
           generateScene: async () => [{ personaId, content: "まず小さく試そう。", source: "lm", sourceIds: [] }],
@@ -1069,6 +1093,7 @@ describe("VoiceDirector", () => {
       const syntheses: Array<Record<string, unknown>> = [];
       const director = new VoiceDirector({
         runtime,
+        capabilityRegistry: voiceCapabilityRegistry(),
         lm: {
           analyzeTurn: async () => routedAnalysis("ja-JP", { addressedIds: [personaId] }),
           generateScene: async () => [{ personaId, content: "もちろん。", source: "lm", sourceIds: [] }],
@@ -1141,6 +1166,7 @@ describe("VoiceDirector", () => {
     let now = Date.parse("2026-07-14T12:00:00.000Z");
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(() => now),
       now: () => now,
       lm: {
         analyzeTurn: async (input) => {
@@ -1151,12 +1177,19 @@ describe("VoiceDirector", () => {
               need: "required",
               action: "local_datetime",
               confidence: 0.99,
+              goal: "heure actuelle en Suède",
               query: null,
               urlRef: null,
               searchMode: null,
               timeZone: "Europe/Stockholm",
               timeKind: "current_time",
               locationLabel: "Suède",
+            },
+            capabilities: {
+              ...routedAnalysis("fr-FR").capabilities,
+              discussed: ["local_datetime"],
+              requestKind: "execute",
+              confidence: 0.99,
             },
           };
         },
@@ -1198,6 +1231,120 @@ describe("VoiceDirector", () => {
     expect(String(speeches[0]?.text)).toContain("14:01:30");
   });
 
+  it("rejects untrusted or malformed voice capability plans before execution", async () => {
+    const valid = {
+      ...routedAnalysis("fr-FR"),
+      evidence: {
+        need: "required" as const,
+        action: "local_datetime" as const,
+        confidence: 0.99,
+        goal: "heure actuelle en Suède",
+        query: null,
+        urlRef: null,
+        searchMode: null,
+        timeZone: "Europe/Stockholm",
+        timeKind: "current_time" as const,
+        locationLabel: "Suède",
+      },
+      capabilities: {
+        ...routedAnalysis("fr-FR").capabilities,
+        discussed: ["local_datetime" as const],
+        requestKind: "execute" as const,
+        confidence: 0.99,
+      },
+    } as TurnAnalysis;
+    const cases: Array<{ name: string; analysis: TurnAnalysis }> = [
+      {
+        name: "low capability confidence",
+        analysis: {
+          ...valid,
+          capabilities: { ...valid.capabilities, confidence: 0.74 },
+        },
+      },
+      {
+        name: "undiscussed action",
+        analysis: {
+          ...valid,
+          capabilities: { ...valid.capabilities, discussed: [] },
+        },
+      },
+      {
+        name: "non-executing request kind",
+        analysis: {
+          ...valid,
+          capabilities: { ...valid.capabilities, requestKind: "availability" },
+        },
+      },
+      {
+        name: "foreign argument",
+        analysis: {
+          ...valid,
+          evidence: { ...valid.evidence, searchMode: "web" },
+        },
+      },
+    ];
+
+    for (const [index, testCase] of cases.entries()) {
+      const runtime = new VoiceRoomRuntime(["lobby"]);
+      const humanId = `human-invalid-capability-${index}`;
+      const socketId = `socket-invalid-capability-${index}`;
+      const created = runtime.createRoom("lobby", { socketId, memberId: humanId, name: "Léa" });
+      expect(created.ok, testCase.name).toBe(true);
+      if (!created.ok) continue;
+      expect(runtime.inviteBot(created.room.id, socketId, { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+      runtime.setBotState(created.room.id, "ai-sana", "listening");
+      const human = runtime.appendFinalTranscript(created.room.id, humanId, "Quelle heure est-il maintenant ?");
+      expect(human.ok, testCase.name).toBe(true);
+      if (!human.ok) continue;
+
+      const registry = voiceCapabilityRegistry(() => Date.parse("2026-07-14T12:00:00.000Z"));
+      const execute = vi.spyOn(registry, "execute");
+      let requestedClock: unknown;
+      let temporalPolicy: string | undefined;
+      let plannedAction: string | null | undefined;
+      let executionStatus: string | undefined;
+      const director = new VoiceDirector({
+        runtime,
+        capabilityRegistry: registry,
+        lm: {
+          analyzeTurn: async () => testCase.analysis,
+          generateScene: async (request) => {
+            requestedClock = request.requestedClock;
+            temporalPolicy = request.temporalPolicy;
+            plannedAction = request.capabilityContext?.plannedAction;
+            executionStatus = request.capabilityContext?.executionStatus;
+            return [{ personaId: "ai-sana", content: "Jag är inte säker på tiden.", source: "lm", sourceIds: [] }];
+          },
+        },
+        speech: {
+          capabilities: async () => ({
+            stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+            tts: { available: false, provider: "disabled", formats: [] },
+            normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+            browserFallbackAllowed: true,
+          }),
+          synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+        },
+        actorChannels: new ActorChannelRuntime(),
+        events: {
+          roomChanged: () => undefined,
+          transcriptFinal: () => undefined,
+          aiSpeech: () => undefined,
+          aiStop: () => undefined,
+        },
+      });
+
+      director.onHumanFinal(human.entry);
+      await settle();
+
+      expect(execute, testCase.name).not.toHaveBeenCalled();
+      expect(requestedClock, testCase.name).toBeUndefined();
+      expect(temporalPolicy, testCase.name).toBe("reactive_only");
+      expect(plannedAction, testCase.name).toBeNull();
+      expect(executionStatus, testCase.name).toBe("not_requested");
+    }
+  });
+
   it("aborts in-flight generation and resets thinking bots after a committed catalog edit", async () => {
     const runtime = new VoiceRoomRuntime(["lobby"]);
     const created = runtime.createRoom("lobby", { socketId: "socket-catalog-generation", memberId: "human-catalog-generation", name: "Alex" });
@@ -1215,6 +1362,7 @@ describe("VoiceDirector", () => {
     const aiStops: string[] = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: analyzeSwedish,
         generateScene: async (_request, _priority, signal) => {
@@ -1275,6 +1423,7 @@ describe("VoiceDirector", () => {
     const speeches: string[] = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: analyzeSwedish,
         generateScene: async () => [{ personaId: "ai-sana", content: "Det här är den gamla katalogversionen.", source: "lm", sourceIds: [] }],
@@ -1342,6 +1491,7 @@ describe("VoiceDirector", () => {
     const speeches: string[] = [];
     const director = new VoiceDirector({
       runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
         analyzeTurn: analyzeSwedish,
         generateScene: async (_request, _priority, signal) => {
@@ -1404,6 +1554,7 @@ describe("VoiceDirector", () => {
       let seenAuthors: string[] = [];
       const director = new VoiceDirector({
         runtime,
+        capabilityRegistry: voiceCapabilityRegistry(),
         floorSilenceMs: 650,
         hasPendingHumanIngest: () => ingestPending,
         lm: {

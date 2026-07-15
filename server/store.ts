@@ -439,10 +439,16 @@ export class RoomStore {
     replyToId?: string,
     generation?: "lm" | "fallback",
     sources?: MessageSource[],
+    linkPreview?: LinkPreview,
   ): ChatMessage | undefined {
     const thread = this.privateThreads.get(threadId);
     if (!thread || !thread.participantIds.includes(authorId)) return undefined;
-    const message = createMessage(threadId, authorId, content, { replyToId, generation, sources });
+    const message = createMessage(threadId, authorId, content, {
+      replyToId,
+      generation,
+      sources,
+      linkPreview,
+    });
     thread.messages.push(message);
     if (thread.messages.length > 160) thread.messages = thread.messages.slice(-120);
     return message;

@@ -5,7 +5,11 @@ import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { CHANNELS, getChannelProfile } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
-import { diegeticIdentityTurnPremise, type TranscriptLine } from "./lmStudio.js";
+import {
+  diegeticIdentityTurnPremise,
+  type SceneCapabilityContext,
+  type TranscriptLine,
+} from "./lmStudio.js";
 import type { SocialModelClient } from "./switchableModel.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import { mappedProviderVoiceForPersona, voiceProfileForPersona } from "./personaVoices.js";
@@ -16,8 +20,9 @@ import {
 } from "./semanticRouter.js";
 import type { VoiceRoomRuntime } from "./voiceRooms.js";
 import { ttsLanguageIsSupported, type VoiceSpeechService } from "./voiceSpeech.js";
-import { refreshLocalDateTime, resolveLocalDateTime } from "./timeResolver.js";
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
+import { CapabilityRegistry } from "./capabilities/registry.js";
+import { capabilitiesForMedium, type TurnCapability } from "./capabilities/catalog.js";
 
 export interface VoiceAiSpeechPayload {
   roomId: string;
@@ -49,6 +54,7 @@ export interface VoiceChannelRecentMessage {
 
 export interface VoiceDirectorOptions {
   runtime: VoiceRoomRuntime;
+  capabilityRegistry: CapabilityRegistry;
   lm: Pick<SocialModelClient, "analyzeTurn" | "generateScene"> & Partial<Pick<SocialModelClient, "rememberDeliveredLine">>;
   speech: Pick<VoiceSpeechService, "capabilities" | "synthesize">;
   actorChannels: ActorChannelRuntime;
@@ -96,6 +102,7 @@ const transcriptFor = (entries: VoiceTranscriptEntry[], personaId: string): Tran
 
 const MAX_ROUTER_RECENT_MESSAGES = 8;
 const VOICE_LANGUAGE_SWITCH_CONFIDENCE = 0.9;
+const VOICE_CAPABILITY_INVENTORY = capabilitiesForMedium("voice");
 type VoiceRouterRecentMessage = NonNullable<TurnAnalysisInput["recentMessages"]>[number];
 interface VoiceChannelContextSnapshot {
   establishedLanguage?: string;
@@ -128,6 +135,7 @@ const analysisInputFor = (
   room: VoiceRoomView,
   transcript: VoiceTranscriptEntry[],
   invited: Persona[],
+  availableCapabilities: readonly TurnCapability[],
   recentChannelMessages: readonly VoiceChannelRecentMessage[] = [],
 ): TurnAnalysisInput => {
   const channel = getChannelProfile(room.channelId);
@@ -175,9 +183,9 @@ const analysisInputFor = (
       name: persona.name,
       interests: persona.interests.slice(0, 16),
     })),
-    // Voice never fetches URLs or performs open web search. Server-clock facts
-    // are safe, bounded and useful in exactly the same languages as text chat.
-    availableCapabilities: ["local_datetime"],
+    // The medium-owned registry inventory is trusted runtime state. Voice
+    // never advertises capabilities outside that explicitly scoped list.
+    availableCapabilities: [...availableCapabilities],
     urlCandidates: [],
     ...(transportLanguageHint ? { transportLanguageHint } : {}),
   };
@@ -428,6 +436,18 @@ export class VoiceDirector {
     const invited = this.invitedPersonas(entry);
     if (invited.length === 0) return;
     const transcript = this.options.runtime.getTranscript(room.id);
+    const capabilityContext = {
+      medium: "voice" as const,
+      candidateSet: {
+        requestedAt: entry.endedAt,
+        candidates: [],
+      },
+      allowSearch: false,
+      inventory: VOICE_CAPABILITY_INVENTORY,
+      intent: entry.text,
+      requesterId: entry.speakerId,
+    };
+    const availableCapabilities = this.options.capabilityRegistry.available(capabilityContext);
     let analysis: TurnAnalysis | undefined;
     try {
       analysis = await this.options.lm.analyzeTurn(analysisInputFor(
@@ -435,6 +455,7 @@ export class VoiceDirector {
         room,
         transcript,
         invited,
+        availableCapabilities,
         channelContext.recentMessages,
       ));
     } catch (error) {
@@ -447,21 +468,37 @@ export class VoiceDirector {
       entry.language,
       this.establishedLanguage(room, transcript, channelContext.establishedLanguage),
     );
-    const localDateTime = analysis?.source === "lm" &&
-      trusted.evidenceTrusted &&
-      analysis.evidence.action === "local_datetime" &&
-      analysis.evidence.timeZone &&
-      analysis.evidence.locationLabel
-      ? resolveLocalDateTime({
-          timeZone: analysis.evidence.timeZone,
-          locationLabel: analysis.evidence.locationLabel,
-          languageTag: utteranceLanguage,
-          now: new Date(this.now()),
-        })
+    const invocation = analysis
+      ? this.options.capabilityRegistry.compile(analysis, capabilityContext)
       : undefined;
     const persona = this.selectPersona(entry, room, invited, analysis);
     if (!persona) return;
     this.setBotState(room.id, persona.id, "thinking");
+
+    const resolution = invocation
+      ? await this.options.capabilityRegistry.execute(invocation, entry.speakerId)
+      : undefined;
+    if (this.epochByRoom.get(room.id) !== epoch) return;
+    const capabilityScene = invocation && resolution
+      ? this.options.capabilityRegistry.sceneContract(invocation, resolution, { actorName: persona.name })
+      : undefined;
+    const plannedAction = invocation?.capability ?? null;
+    const sceneCapabilityContext: SceneCapabilityContext = {
+      available: [...availableCapabilities],
+      externalEvidenceAvailable: this.options.capabilityRegistry.hasExternalEvidence(availableCapabilities),
+      requestKind: trusted.capabilityTrusted && analysis?.source === "lm"
+        ? analysis.capabilities.requestKind
+        : "none",
+      discussed: trusted.capabilityTrusted && analysis?.source === "lm"
+        ? [...analysis.capabilities.discussed]
+        : [],
+      plannedAction,
+      executionStatus: plannedAction === null
+        ? "not_requested"
+        : resolution?.state === "grounding_available"
+          ? "succeeded"
+          : "failed_temporary",
+    };
 
     // Capture only the memory that predates this turn. Voice transcripts never
     // enter long-term memory; a completed exchange merely strengthens rapport.
@@ -486,9 +523,7 @@ export class VoiceDirector {
         trusted.moderationTrusted
           ? `moderationRisk=${trusted.moderation.risk}; moderationAction=${trusted.moderation.action}`
           : "",
-        localDateTime
-          ? "The latest utterance explicitly requests current date/time; answer from trustedTemporalContext.requestedClock without estimating."
-          : "",
+        capabilityScene?.premise ?? "",
       ].filter(Boolean);
       const semanticPremise = trustedSemanticFacts.length > 0
         ? `Trusted multilingual turn facts: ${trustedSemanticFacts.join(". ")}`
@@ -502,7 +537,9 @@ export class VoiceDirector {
           history: transcriptFor(this.options.runtime.getTranscript(room.id), persona.id),
           trigger: { author: entry.speakerName, content: entry.text, messageId: entry.id, createdAt: entry.endedAt },
           mustReplyIds: [persona.id],
-          requestOwnerIds: trusted.intentTrusted && trusted.replyExpected === "expected" ? [persona.id] : [],
+          requestOwnerIds: (trusted.intentTrusted && trusted.replyExpected === "expected") || invocation
+            ? [persona.id]
+            : [],
           languageHint: routedLanguageHint(utteranceLanguage),
           semanticContext: {
             ...(utteranceLanguage ? { languageTag: utteranceLanguage } : {}),
@@ -544,9 +581,14 @@ export class VoiceDirector {
             })),
           },
           ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
-          requestedClock: localDateTime,
-          temporalPolicy: localDateTime ? "direct_answer" : "reactive_only",
-          temporalSurfaceActorId: localDateTime ? persona.id : undefined,
+          research: capabilityScene?.research,
+          evidenceOutcome: capabilityScene?.evidenceOutcome,
+          capabilityContext: sceneCapabilityContext,
+          capabilityGroundingInstruction: capabilityScene?.groundingInstruction,
+          urlPublicationPolicy: capabilityScene?.urlPublicationPolicy,
+          requestedClock: capabilityScene?.requestedClock,
+          temporalPolicy: capabilityScene?.temporalPolicy ?? "reactive_only",
+          temporalSurfaceActorId: capabilityScene?.temporalPolicy ? persona.id : undefined,
           premise: `${persona.name} has joined an active multi-participant voice call. Answer the newest complete human utterance once, conversationally. The reply will be spoken aloud; do not narrate actions or produce another speaker. ${semanticPremise}`,
         },
         0,
@@ -560,9 +602,13 @@ export class VoiceDirector {
     } finally {
       if (this.generationAbortByRoom.get(room.id) === generationAbort) this.generationAbortByRoom.delete(room.id);
     }
-    if (!spoken && localDateTime) {
+    const capabilityFallback = this.options.capabilityRegistry.deterministicFallback(
+      resolution,
+      new Date(this.now()),
+    );
+    if (!spoken && capabilityFallback) {
       spoken = sanitizeSpokenLine(
-        refreshLocalDateTime(localDateTime, new Date(this.now())).fallbackText,
+        capabilityFallback.content,
         utteranceLanguage,
       );
     }

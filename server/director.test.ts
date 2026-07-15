@@ -17,14 +17,11 @@ import {
   classifiedLanguage,
   conductResponderIds,
   ensureEvidenceResponder,
-  evidenceFailureFallback,
   autonomousResearchFailureBackoffMs,
   autonomousResearchResultIsFresh,
   canonicalAutonomousResearchUrl,
   linkPreviewFromResearch,
   normalizeGeneratedMessageContent,
-  pageEvidenceAnswerContract,
-  researchPacketIsAnswerable,
   selectAutoSharedLinkCandidate,
   selectAmbientLead,
   selectAmbientSeed,
@@ -38,7 +35,6 @@ import {
   shouldStartAutonomousResearch,
   shouldSurfaceTemporalCue,
   shouldStartConsideredConversation,
-  sourceIdsForPageResponder,
   trailingAiMessageCount,
   type ConsideredConversationGate,
   type AmbientThreadState,
@@ -52,27 +48,52 @@ import {
   resolveBehaviorTuning,
   scaleAmbientDelay,
 } from "./behaviorTuning.js";
+import { CapabilityRegistry } from "./capabilities/registry.js";
 
-const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => ({
-  ...createFailClosedTurnAnalysis("disabled"),
-  source: "lm",
-  failureReason: null,
-  language: { tag: "sv", confidence: 0.99 },
-  intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.99 },
-  personas: { addressedIds: [], requestedReplyIds: [], relevantIds: [], addressConfidence: 0, relevanceConfidence: 0 },
-  social: { warmth: 0.2, hostility: 0, playfulness: 0, absurdity: 0, urgency: 0, energy: 0.3, pileOnRisk: 0, claimStrength: 0, confidence: 0.99 },
-  moderation: { risk: "none", action: "none", categories: [], confidence: 0.99 },
-  evidence: { need: "none", action: "none", confidence: 0.99, goal: null, query: null, urlRef: null, searchMode: null, timeZone: null, timeKind: null, locationLabel: null },
-  capabilities: {
-    discussed: [],
-    requestKind: "none",
-    asksAboutAcoustics: false,
-    asksAboutAiIdentity: false,
-    asksForList: false,
+const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => {
+  const evidence = overrides.evidence ?? {
+    need: "none" as const,
+    action: "none" as const,
     confidence: 0.99,
-  },
-  ...overrides,
-});
+    goal: null,
+    query: null,
+    urlRef: null,
+    searchMode: null,
+    timeZone: null,
+    timeKind: null,
+    locationLabel: null,
+  };
+  const capabilities = overrides.capabilities ?? (evidence.action === "none"
+    ? {
+        discussed: [],
+        requestKind: "none" as const,
+        asksAboutAcoustics: false,
+        asksAboutAiIdentity: false,
+        asksForList: false,
+        confidence: 0.99,
+      }
+    : {
+        discussed: [evidence.action],
+        requestKind: "execute" as const,
+        asksAboutAcoustics: false,
+        asksAboutAiIdentity: false,
+        asksForList: false,
+        confidence: 0.99,
+      });
+  return {
+    ...createFailClosedTurnAnalysis("disabled"),
+    source: "lm",
+    failureReason: null,
+    language: { tag: "sv", confidence: 0.99 },
+    intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.99 },
+    personas: { addressedIds: [], requestedReplyIds: [], relevantIds: [], addressConfidence: 0, relevanceConfidence: 0 },
+    social: { warmth: 0.2, hostility: 0, playfulness: 0, absurdity: 0, urgency: 0, energy: 0.3, pileOnRisk: 0, claimStrength: 0, confidence: 0.99 },
+    moderation: { risk: "none", action: "none", categories: [], confidence: 0.99 },
+    ...overrides,
+    evidence,
+    capabilities,
+  };
+};
 
 describe("social director", () => {
   it("selects only the first supported URL visibly present in the exact latest human text", () => {
@@ -158,28 +179,6 @@ describe("social director", () => {
     })).toBe(true);
   });
 
-  it("uses one source-agnostic evidence contract for every successful page read", () => {
-    const packet = (title: string, url: string) => ({
-      kind: "page" as const,
-      query: "read it",
-      retrievedAt: new Date().toISOString(),
-      results: [{ id: "S1", title, url, snippet: "A concrete supported detail from the page." }],
-    });
-    const contracts = [
-      packet("Market", "https://www.avanza.se/"),
-      packet("ゲームニュース", "https://example.jp/news"),
-      packet("Actualités", "https://example.fr/article"),
-    ].map((value) => pageEvidenceAnswerContract(value));
-    expect(new Set(contracts).size).toBe(1);
-    expect(contracts[0]).toContain("human's actual request");
-    expect(contracts[0]).toContain("concrete detail");
-  });
-
-  it("does not guess a Swedish or English sentence when an evidence attempt fails", () => {
-    expect(evidenceFailureFallback(true, "kan ni läsa länken?")).toBeUndefined();
-    expect(evidenceFailureFallback(false, "bitte prüfe die aktuellen Kurse")).toBeUndefined();
-  });
-
   it("augments only explicit root-site reads with the resolved multilingual goal", async () => {
     const human = {
       id: "guest-root-site",
@@ -222,27 +221,11 @@ describe("social director", () => {
     const researchSite = vi.fn()
       .mockResolvedValueOnce(sameSitePacket)
       .mockResolvedValueOnce(undefined);
-    const director = new SocialDirector(
-      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
-      new RoomStore("/tmp/director-root-site-augmentation-unused.json"),
-      {} as never,
-      new ActorChannelRuntime(),
-      { research: vi.fn(), researchSite } as never,
-      {
-        getRelation: vi.fn(() => undefined),
-        updateRelation: vi.fn(),
-        promptNote: vi.fn(() => undefined),
-        noteClassifiedMemoryFact: vi.fn(),
-      } as never,
-      () => [human, ...PERSONAS],
-      () => 1,
-      {
-        pageReader: {
-          resolveTarget,
-          read,
-        } as never,
-      },
-    );
+    const registry = new CapabilityRegistry({
+      pageReader: { resolveTarget, read } as never,
+      researchBroker: { research: vi.fn(), researchSite } as never,
+      weatherForecastProvider: null,
+    });
     const candidateSet = {
       requestedAt,
       candidates: [{
@@ -264,7 +247,7 @@ describe("social director", () => {
         goal,
         query: null,
         urlRef: "U1",
-        searchMode: null,
+        searchMode: "web",
         timeZone: null,
         timeKind: null,
         locationLabel: null,
@@ -278,52 +261,28 @@ describe("social director", () => {
         confidence: 0.99,
       },
     });
-    const internal = director as unknown as {
-      classifiedToolPlan: (
-        turn: TurnAnalysis,
-        candidates: typeof candidateSet,
-        rawIntent: string,
-        requesterId: string,
-      ) => {
-        pageReadRequest?: {
-          url?: URL;
-          requestedAt: string;
-          intent: string;
-          retry: boolean;
-          source: "message" | "reply" | "recent";
-          initiator?: "explicit" | "automatic";
-        };
-        siteResearch?: { goal: string; mode: "web" | "news" };
-      };
-      resolveRequestedEvidence: (
-        page: {
-          url?: URL;
-          requestedAt: string;
-          intent: string;
-          retry: boolean;
-          source: "message" | "reply" | "recent";
-          initiator?: "explicit" | "automatic";
-        } | undefined,
-        search: undefined,
-        requesterId: string,
-        site?: { goal: string; mode: "web" | "news" },
-      ) => Promise<typeof sameSitePacket | typeof rootPacket | typeof deepPacket | undefined>;
+    const compileContext = {
+      medium: "public" as const,
+      candidateSet,
+      allowSearch: true,
+      intent: "gå bara till sajten",
+      requesterId: human.id,
     };
-
-    const plan = internal.classifiedToolPlan(analysis, candidateSet, "gå bara till sajten", human.id);
+    const invocation = registry.compile(analysis, compileContext);
+    expect(invocation?.capability).toBe("read_url");
+    if (!invocation || invocation.capability !== "read_url") throw new Error("Expected read_url invocation");
     expect(resolveTarget).toHaveBeenCalledWith(expect.objectContaining({ intent: goal, retry: false }));
     resolveTarget.mockClear();
-    internal.classifiedToolPlan({
+    registry.compile({
       ...analysis,
       capabilities: { ...analysis.capabilities, requestKind: "correct_limitation" },
-    }, candidateSet, "gå bara till sajten", human.id);
+    }, compileContext);
     expect(resolveTarget).toHaveBeenCalledWith(expect.objectContaining({ intent: goal, retry: true }));
-    await expect(internal.resolveRequestedEvidence(
-      plan.pageReadRequest,
-      undefined,
-      human.id,
-      plan.siteResearch,
-    )).resolves.toEqual(deepPacket);
+
+    await expect(registry.execute(invocation, human.id)).resolves.toMatchObject({
+      state: "grounding_available",
+      research: deepPacket,
+    });
     expect(researchSite).toHaveBeenCalledWith({
       url: rootUrl,
       query: goal,
@@ -333,36 +292,30 @@ describe("social director", () => {
     });
     expect(read).toHaveBeenCalledTimes(1);
 
-    await expect(internal.resolveRequestedEvidence(
-      plan.pageReadRequest,
-      undefined,
-      human.id,
-      plan.siteResearch,
-    )).resolves.toEqual(rootPacket);
+    await expect(registry.execute(invocation, human.id)).resolves.toMatchObject({
+      state: "grounding_available",
+      research: rootPacket,
+    });
     expect(researchSite).toHaveBeenCalledTimes(2);
     expect(read).toHaveBeenCalledTimes(2);
 
     researchSite.mockClear();
     read.mockClear();
-    await expect(internal.resolveRequestedEvidence(
-      { ...plan.pageReadRequest!, url: articleUrl },
-      undefined,
-      human.id,
-      plan.siteResearch,
-    )).resolves.toEqual(deepPacket);
+    await expect(registry.execute({
+      ...invocation,
+      pageReadRequest: { ...invocation.pageReadRequest, url: articleUrl },
+    }, human.id)).resolves.toMatchObject({ state: "grounding_available", research: deepPacket });
     expect(researchSite).not.toHaveBeenCalled();
     expect(read).toHaveBeenCalledTimes(1);
 
     read.mockClear();
-    await expect(internal.resolveRequestedEvidence(
-      { ...plan.pageReadRequest!, initiator: "automatic" },
-      undefined,
-      human.id,
-      plan.siteResearch,
-    )).resolves.toEqual(rootPacket);
+    const automatic = registry.planAutomaticRead(invocation.pageReadRequest, goal);
+    await expect(registry.execute(automatic, human.id)).resolves.toMatchObject({
+      state: "grounding_available",
+      research: rootPacket,
+    });
     expect(researchSite).not.toHaveBeenCalled();
     expect(read).toHaveBeenCalledTimes(1);
-    director.stop();
   });
 
   it("preserves semantic news mode for structural root discovery and rejects root-only evidence", async () => {
@@ -450,22 +403,11 @@ describe("social director", () => {
       retry: retry === true,
       source: "message" as const,
     }));
-    const director = new SocialDirector(
-      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
-      new RoomStore("/tmp/director-structural-root-news-unused.json"),
-      {} as never,
-      new ActorChannelRuntime(),
-      { research: vi.fn(), researchSite } as never,
-      {
-        getRelation: vi.fn(() => undefined),
-        updateRelation: vi.fn(),
-        promptNote: vi.fn(() => undefined),
-        noteClassifiedMemoryFact: vi.fn(),
-      } as never,
-      () => [human, ...PERSONAS],
-      () => 1,
-      { pageReader: { resolveTarget, read } as never },
-    );
+    const registry = new CapabilityRegistry({
+      pageReader: { resolveTarget, read } as never,
+      researchBroker: { research: vi.fn(), researchSite } as never,
+      weatherForecastProvider: null,
+    });
     const candidateSet = {
       requestedAt,
       candidates: [{
@@ -502,54 +444,28 @@ describe("social director", () => {
         confidence: 0.99,
       },
     });
-    const internal = director as unknown as {
-      classifiedToolPlan: (
-        turn: TurnAnalysis,
-        candidates: typeof candidateSet,
-        rawIntent: string,
-        requesterId: string,
-      ) => {
-        pageReadRequest?: {
-          url?: URL;
-          requestedAt: string;
-          intent: string;
-          retry: boolean;
-          source: "message" | "reply" | "recent";
-        };
-        siteResearch?: { goal: string; mode: "web" | "news" };
-      };
-      resolveRequestedEvidence: (
-        page: {
-          url?: URL;
-          requestedAt: string;
-          intent: string;
-          retry: boolean;
-          source: "message" | "reply" | "recent";
-        } | undefined,
-        search: undefined,
-        requesterId: string,
-        site?: { goal: string; mode: "web" | "news" },
-      ) => Promise<unknown>;
-    };
+    const invocation = registry.compile(analysis, {
+      medium: "public",
+      candidateSet,
+      allowSearch: true,
+      intent: "inspect the supplied source",
+      requesterId: human.id,
+    });
+    expect(invocation?.capability).toBe("read_url");
+    if (!invocation || invocation.capability !== "read_url") throw new Error("Expected read_url invocation");
+    expect(invocation.siteResearch).toEqual({ goal, mode: "news" });
+    expect(invocation.pageReadRequest.retry).toBe(true);
 
-    const plan = internal.classifiedToolPlan(analysis, candidateSet, "inspect the supplied source", human.id);
-    expect(plan.siteResearch).toEqual({ goal, mode: "news" });
-    expect(plan.pageReadRequest?.retry).toBe(true);
-
-    await expect(internal.resolveRequestedEvidence(
-      plan.pageReadRequest,
-      undefined,
-      human.id,
-      plan.siteResearch,
-    )).resolves.toEqual(pageFallback);
+    await expect(registry.execute(invocation, human.id)).resolves.toMatchObject({
+      state: "grounding_available",
+      research: pageFallback,
+    });
     expect(read).toHaveBeenCalledTimes(1);
 
-    await expect(internal.resolveRequestedEvidence(
-      plan.pageReadRequest,
-      undefined,
-      human.id,
-      plan.siteResearch,
-    )).resolves.toEqual(specificPage);
+    await expect(registry.execute(invocation, human.id)).resolves.toMatchObject({
+      state: "grounding_available",
+      research: specificPage,
+    });
     expect(read).toHaveBeenCalledTimes(2);
     expect(researchSite).toHaveBeenCalledTimes(2);
     for (const [request] of researchSite.mock.calls) {
@@ -561,7 +477,6 @@ describe("social director", () => {
         cachePolicy: "bypass",
       });
     }
-    director.stop();
   });
 
   it("wires DM evidence fallbacks to the actual message source metadata", async () => {
@@ -681,6 +596,11 @@ describe("social director", () => {
       expect(sourced.reply.generation).toBe("lm");
       expect(sourced.reply.content).toContain("OMX Stockholm 30 (OMXS30)");
       expect(sourced.reply.sources).toEqual([{ title: "Avanza – Börsen idag", url: "https://www.avanza.se/" }]);
+      expect(sourced.reply.linkPreview).toMatchObject({
+        url: "https://www.avanza.se/",
+        title: "Avanza – Börsen idag",
+        displayHost: "www.avanza.se",
+      });
       expect(sourced.analyzerInput.urlCandidates).toEqual([{
         ref: "U1",
         source: "latest_message",
@@ -692,6 +612,7 @@ describe("social director", () => {
       expect(failed.reply.generation).toBe("lm");
       expect(failed.reply.content).toBe("Jag fick inte fram just den sidan den här gången.");
       expect(failed.reply.sources).toEqual([]);
+      expect(failed.reply.linkPreview).toBeUndefined();
       expect(failed.reply.content).not.toContain("bold thing");
     } finally {
       vi.useRealTimers();
@@ -776,8 +697,9 @@ describe("social director", () => {
     }
   });
 
-  it("supersedes a slow DM generation and never publishes its stale output", async () => {
+  it("supersedes a rejected DM generation without publishing a stale deterministic fallback", async () => {
     vi.useFakeTimers();
+    const deterministicFallback = vi.spyOn(CapabilityRegistry.prototype, "deterministicFallback");
     try {
       const human = {
         id: "guest-dm-supersede",
@@ -790,19 +712,14 @@ describe("social director", () => {
       const store = new RoomStore("/tmp/director-dm-supersede-unused.json");
       const thread = store.openDm(human.id, persona.id);
       const first = store.addDmMessage(thread.id, human.id, "old turn")!;
-      let resolveOld!: (lines: Array<{
-        personaId: string;
-        content: string;
-        source: "lm";
-        sourceIds: string[];
-      }>) => void;
+      let rejectOld!: (reason?: unknown) => void;
       const oldResult = new Promise<Array<{
         personaId: string;
         content: string;
         source: "lm";
         sourceIds: string[];
-      }>>((resolve) => {
-        resolveOld = resolve;
+      }>>((_resolve, reject) => {
+        rejectOld = reject;
       });
       let oldSignal: AbortSignal | undefined;
       const generateScene = vi.fn((request: {
@@ -824,7 +741,20 @@ describe("social director", () => {
         { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
         store,
         {
-          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          analyzeTurn: vi.fn(async () => classifiedTurn({
+            evidence: {
+              need: "required",
+              action: "local_datetime",
+              confidence: 0.99,
+              goal: "current time in Sweden",
+              query: null,
+              urlRef: null,
+              searchMode: null,
+              timeZone: "Europe/Stockholm",
+              timeKind: "current_time",
+              locationLabel: "Sweden",
+            },
+          })),
           generateScene,
           rememberDeliveredLine,
         } as never,
@@ -866,20 +796,18 @@ describe("social director", () => {
       expect(aiReplies).toHaveLength(1);
       expect(aiReplies[0]).toMatchObject({ content: "current output", replyToId: second.id });
 
-      resolveOld([{
-        personaId: persona.id,
-        content: "stale output",
-        source: "lm",
-        sourceIds: [],
-      }]);
+      rejectOld(new Error("stale generation failed"));
       await Promise.resolve();
       await Promise.resolve();
       aiReplies = store.getDmMessages(thread.id).filter((message) => message.authorId === persona.id);
       expect(aiReplies).toHaveLength(1);
-      expect(aiReplies[0]?.content).not.toBe("stale output");
+      expect(aiReplies[0]?.content).toBe("current output");
+      expect(aiReplies[0]?.generation).toBe("lm");
+      expect(deterministicFallback).toHaveBeenCalledTimes(1);
       expect(rememberDeliveredLine).toHaveBeenCalledTimes(1);
       director.stop();
     } finally {
+      deterministicFallback.mockRestore();
       vi.useRealTimers();
     }
   });
@@ -1036,17 +964,21 @@ describe("social director", () => {
       const generateScene = vi.fn(async (request: {
         selected: Array<(typeof PERSONAS)[number]>;
         mustReplyIds: string[];
+        requestOwnerIds: string[];
         research?: typeof packet;
         premise?: string;
         urlPublicationPolicy?: string;
-      }) => request.selected.map((persona, index) => ({
-        personaId: persona.id,
-        content: request.premise?.includes("actual request")
-          ? `Den explicita rollen ${index + 1} kommenterar hur testet återställer ett misslyckat steg.`
-          : "Det konkreta testet är att senare tillstånd måste överleva återhämtningen, inte bara nästa svar.",
-        source: "lm" as const,
-        sourceIds: [],
-      })));
+      }) => {
+        const explicitEvidence = request.premise?.includes("actual request") ?? false;
+        return request.selected.map((persona, index) => ({
+          personaId: persona.id,
+          content: explicitEvidence
+            ? `Den explicita rollen ${index + 1} kommenterar hur testet återställer ett misslyckat steg.`
+            : "Det konkreta testet är att senare tillstånd måste överleva återhämtningen, inte bara nästa svar.",
+          source: "lm" as const,
+          sourceIds: explicitEvidence ? ["S1"] : [],
+        }));
+      });
       const read = vi.fn(async () => packet);
       let queueDepth = 0;
       const pageReader = {
@@ -1180,8 +1112,17 @@ describe("social director", () => {
       const explicitScene = generateScene.mock.calls[1]![0];
       expect(explicitScene.selected.map((persona) => persona.id)).toEqual(expect.arrayContaining(["ai-mira", "ai-sana"]));
       expect(explicitScene.mustReplyIds).toEqual(expect.arrayContaining(["ai-mira", "ai-sana"]));
-      expect(store.getRecent("lobby", 20).filter((message) => message.authorId !== human.id))
-        .toHaveLength(1 + explicitScene.selected.length);
+      expect(explicitScene.requestOwnerIds).toHaveLength(1);
+      expect(explicitScene.selected.length).toBeGreaterThan(1);
+      const explicitReplies = store.getRecent("lobby", 20).filter((message) =>
+        message.authorId !== human.id && message.replyToId === explicit.id,
+      );
+      expect(explicitReplies).toHaveLength(1);
+      expect(explicitReplies[0]).toMatchObject({
+        authorId: explicitScene.requestOwnerIds[0],
+        sources: [{ title: "Concrete shared report", url: sourceUrl }],
+      });
+      expect(store.getRecent("lobby", 20).filter((message) => message.authorId !== human.id)).toHaveLength(2);
       expect(emit.mock.calls.some(([event, payload]) =>
         event === "typing:member" && payload?.active === true,
       )).toBe(true);
@@ -1383,6 +1324,96 @@ describe("social director", () => {
       expect(researchSite).not.toHaveBeenCalled();
       expect(store.getDmMessages(thread.id).at(-1)?.content).toBe("Klockan är 00:20 i Sverige.");
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the deterministic server-clock answer when current DM scene generation fails", async () => {
+    vi.useFakeTimers();
+    const fixedNow = Date.parse("2026-07-13T22:20:30.000Z");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const human = {
+        id: "guest-clock-fallback",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+      const store = new RoomStore("/tmp/director-clock-fallback-test-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const incoming = store.addDmMessage(
+        thread.id,
+        human.id,
+        "Vad är klockan i Sverige just nu?",
+      )!;
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        language: { tag: "sv", confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "local_datetime",
+          confidence: 0.99,
+          goal: "aktuell tid i Sverige",
+          query: null,
+          urlRef: null,
+          searchMode: null,
+          timeZone: "Europe/Stockholm",
+          timeKind: "current_time",
+          locationLabel: "Sverige",
+        },
+      }));
+      const generateScene = vi.fn(async () => {
+        throw new Error("model transport unavailable");
+      });
+      const research = vi.fn(async () => undefined);
+      const researchSite = vi.fn(async () => undefined);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeTurn, generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        { research, researchSite } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          pageReader: {
+            collectCandidates: vi.fn(() => ({
+              requestedAt: new Date(fixedNow).toISOString(),
+              candidates: [],
+            })),
+          } as never,
+          now: () => fixedNow,
+        },
+      );
+
+      const pending = director.onDirectMessage(incoming, human, persona);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(research).not.toHaveBeenCalled();
+      expect(researchSite).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        "DM scene failed; trying deterministic capability fallback:",
+        "model transport unavailable",
+      );
+      const reply = store.getDmMessages(thread.id).at(-1)!;
+      expect(reply).toMatchObject({
+        replyToId: incoming.id,
+        generation: "fallback",
+      });
+      expect(reply.content).toContain("Sverige (Europe/Stockholm):");
+      expect(reply.content).toContain("00:20:30");
+    } finally {
+      warn.mockRestore();
       vi.useRealTimers();
     }
   });
@@ -2338,15 +2369,36 @@ describe("social director", () => {
       retrievedAt: new Date().toISOString(),
       results: [{ id: "S1", title: "Example", url: "https://example.com", snippet: "evidence" }],
     };
-    expect(sourceIdsForPageResponder(pageResearch, [], true)).toEqual(["S1"]);
-    expect(sourceIdsForPageResponder(pageResearch, ["S1"], true)).toEqual(["S1"]);
-    expect(sourceIdsForPageResponder(pageResearch, [], false)).toEqual([]);
-    expect(sourceIdsForPageResponder(pageResearch, ["S1"], false)).toEqual([]);
-    expect(sourceIdsForPageResponder(pageResearch, ["S1"], false, true)).toEqual(["S1"]);
-    expect(sourceIdsForPageResponder({ ...pageResearch, kind: "search" }, [], true)).toEqual([]);
-    expect(researchPacketIsAnswerable(pageResearch)).toBe(true);
-    expect(researchPacketIsAnswerable({ ...pageResearch, kind: "search" })).toBe(false);
-    expect(researchPacketIsAnswerable({ ...pageResearch, results: [] })).toBe(false);
+    const registry = new CapabilityRegistry({
+      pageReader: {} as never,
+      researchBroker: {} as never,
+      weatherForecastProvider: null,
+    });
+    const invocation = registry.planAutomaticRead({
+      url: new URL("https://example.com"),
+      requestedAt: pageResearch.retrievedAt,
+      intent: pageResearch.query,
+      retry: false,
+      source: "message",
+    }, pageResearch.query);
+    const answerable = {
+      invocation,
+      state: "grounding_available" as const,
+      research: pageResearch,
+      responsePolicy: invocation.responsePolicy,
+      detail: "ok" as const,
+    };
+
+    expect(registry.sourceIds(answerable, [], true)).toEqual(["S1"]);
+    expect(registry.sourceIds(answerable, ["S1", "S2"], true)).toEqual(["S1"]);
+    expect(registry.sourceIds(answerable, ["S1"], false)).toEqual([]);
+    expect(registry.sourceIds({
+      invocation,
+      state: "retrieved_only",
+      responsePolicy: invocation.responsePolicy,
+      detail: "retrieved_without_grounding",
+    }, ["S1"], true)).toEqual([]);
+    expect(registry.sourceIds({ ...answerable, research: { ...pageResearch, results: [] } }, [], true)).toEqual([]);
   });
 
   it("always prioritises a directly mentioned quiet resident", () => {
@@ -4710,7 +4762,7 @@ describe("social director", () => {
         plannedAction: "weather_forecast",
         executionStatus: "succeeded",
       });
-      expect(scene.premise).toContain("typed seven-day forecast");
+      expect(scene.premise).toContain("validated structured forecast evidence");
       const reply = store.getRecent("lobby", 1)[0]!;
       expect(reply.replyToId).toBe(incoming.id);
       expect(reply.sources).toEqual([{

@@ -48,16 +48,18 @@ const resolve = (
   packet: ResearchPacket,
   pageReader: EvidencePageReader,
   semanticGoal = "Will temperatures become colder soon?",
+  retry = false,
 ) => resolveSearchEvidence({
   packet,
   semanticGoal,
   requesterId: "guest-1",
   now,
   pageReader,
+  retry,
 });
 
 describe("search evidence resolver", () => {
-  it("reads and merges the first two safe results into answerable page evidence", async () => {
+  it("reads and merges the first two safe results into bounded grounding evidence", async () => {
     const calls: Array<{ request: PageReadRequest; requesterId: string }> = [];
     const reader: EvidencePageReader = {
       read: vi.fn(async (request, requesterId) => {
@@ -73,7 +75,7 @@ describe("search evidence resolver", () => {
       `  هل ستنخفض الحرارة قريبًا؟${" x".repeat(200)}  `,
     );
 
-    expect(result).toMatchObject({ readiness: "answerable", attemptedPages: 2, readPages: 2 });
+    expect(result).toMatchObject({ readiness: "grounding_available", attemptedPages: 2, readPages: 2 });
     expect(result.packet.kind).toBe("page");
     expect(result.packet.query.length).toBeLessThanOrEqual(160);
     expect(result.packet.results).toEqual([
@@ -131,12 +133,12 @@ describe("search evidence resolver", () => {
       reader,
     );
 
-    expect(result).toMatchObject({ readiness: "answerable", attemptedPages: 2, readPages: 1 });
+    expect(result).toMatchObject({ readiness: "grounding_available", attemptedPages: 2, readPages: 1 });
     expect(result.packet.results).toHaveLength(1);
     expect(result.packet.results[0]).toMatchObject({ id: "S1", url: "https://weather.example.com/two" });
   });
 
-  it("expands a bounded same-site discovery result before treating it as answerable", async () => {
+  it("expands a bounded same-site discovery result before exposing grounding", async () => {
     const packet = searchPacket(["https://example.com/news/item-42"]);
     packet.search = {
       scope: "site",
@@ -160,7 +162,7 @@ describe("search evidence resolver", () => {
 
     const result = await resolve(packet, reader, "latest published item");
 
-    expect(result).toMatchObject({ readiness: "answerable", attemptedPages: 1, readPages: 1 });
+    expect(result).toMatchObject({ readiness: "grounding_available", attemptedPages: 1, readPages: 1 });
     expect(result.packet).toMatchObject({
       kind: "page",
       query: "latest published item",
@@ -251,21 +253,37 @@ describe("search evidence resolver", () => {
       reader,
     );
 
-    expect(result).toMatchObject({ readiness: "answerable", attemptedPages: 2, readPages: 1 });
+    expect(result).toMatchObject({ readiness: "grounding_available", attemptedPages: 2, readPages: 1 });
     expect(result.packet.results[0]?.url).toBe("https://weather.example.com/two");
   });
 
-  it("treats an existing page packet as answerable without another read", async () => {
+  it("propagates an explicit retry to every bounded page expansion", async () => {
+    const reader: EvidencePageReader = { read: vi.fn(async () => undefined) };
+
+    await resolve(
+      searchPacket(["https://weather.example.com/one", "https://weather.example.com/two"]),
+      reader,
+      "retry the same current request",
+      true,
+    );
+
+    expect(reader.read).toHaveBeenCalledTimes(2);
+    for (const [request] of vi.mocked(reader.read).mock.calls) {
+      expect(request).toMatchObject({ retry: true, initiator: "automatic" });
+    }
+  });
+
+  it("treats an existing page packet as grounding without another read", async () => {
     const reader: EvidencePageReader = { read: vi.fn(async () => undefined) };
     const packet = pagePacket("https://weather.example.com/forecast", 1);
 
     const result = await resolve(packet, reader);
 
-    expect(result).toMatchObject({ readiness: "answerable", attemptedPages: 0, readPages: 0 });
+    expect(result).toMatchObject({ readiness: "grounding_available", attemptedPages: 0, readPages: 0 });
     expect(reader.read).not.toHaveBeenCalled();
   });
 
-  it("does not call an empty or unsafe page packet answerable", async () => {
+  it("does not expose an empty or unsafe page packet as grounding", async () => {
     const reader: EvidencePageReader = { read: vi.fn(async () => undefined) };
     const packet = pagePacket("https://127.0.0.1/private", 1, { snippet: "" });
 

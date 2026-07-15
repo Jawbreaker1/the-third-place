@@ -31,18 +31,11 @@ import {
 } from "./lmStudio.js";
 import type { SocialModelClient } from "./switchableModel.js";
 import { createMessage, RoomStore } from "./store.js";
-import {
-  hasSpecificSiteResearchResults,
-  ResearchBroker,
-  type ResearchPacket,
-  type ResearchRequest,
-  type SearchMode,
-} from "./researchBroker.js";
+import { ResearchBroker } from "./researchBroker.js";
 import {
   PageReader,
   type PageReadCandidate,
   type PageReadCandidateSet,
-  type PageReadRequest,
 } from "./pageReader.js";
 import { assessCandidate, protectTechnicalFragments, restoreTechnicalFragments } from "./humanizer.js";
 import type { HumanMemory } from "./humanMemory.js";
@@ -55,7 +48,6 @@ import {
   type TurnCapability,
   type TurnAnalysisInput,
 } from "./semanticRouter.js";
-import { refreshLocalDateTime, resolveLocalDateTime, type LocalDateTimeResult } from "./timeResolver.js";
 import {
   ambientDebateChance,
   ambientRoomSelectionWeight,
@@ -71,11 +63,14 @@ import {
   DmTurnCoordinator,
   type DmTurn,
 } from "./dmTurnCoordinator.js";
-import { resolveSearchEvidence } from "./evidenceResolver.js";
 import {
-  WeatherForecastProvider,
-  type WeatherForecastResult,
-} from "./weatherForecast.js";
+  CapabilityRegistry,
+  type CapabilityInvocation,
+  type CapabilitySceneContract,
+  type EvidenceResolution,
+  type ResearchPacket,
+  type WeatherForecastCapabilityProvider,
+} from "./capabilities/registry.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -629,7 +624,7 @@ export interface SocialDirectorOptions {
   dmDebounceMs?: number;
   pageReader?: PageReader;
   /** Fixed-host typed forecast capability. `null` disables it explicitly in tests or deployments. */
-  weatherForecastProvider?: Pick<WeatherForecastProvider, "forecast"> | null;
+  weatherForecastProvider?: WeatherForecastCapabilityProvider | null;
   /** Live server-owned behavior settings; storage and authorization stay outside the director. */
   behaviorTuningProvider?: BehaviorTuningProvider;
 }
@@ -1185,125 +1180,6 @@ export function ensureEvidenceResponder(
     : { selected: deduplicated };
 }
 
-export function sourceIdsForPageResponder(
-  research: ResearchPacket | undefined,
-  sourceIds: readonly string[],
-  forcePageSource: boolean,
-  allowSelectedPageSources = false,
-): string[] {
-  if (research?.kind === "weather") {
-    return forcePageSource && research.results.some((result) => result.id === "S1") ? ["S1"] : [];
-  }
-  if (research?.kind === "page") {
-    if (forcePageSource && research.results.some((result) => result.id === "S1")) return ["S1"];
-    if (!allowSelectedPageSources) return [];
-  }
-  const available = new Set(research?.results.map((result) => result.id) ?? []);
-  return [...new Set(sourceIds)].filter((sourceId) => available.has(sourceId)).slice(0, 3);
-}
-
-const weatherCodeLabel = (code: number): string => ({
-  0: "clear sky",
-  1: "mainly clear",
-  2: "partly cloudy",
-  3: "overcast",
-  45: "fog",
-  48: "depositing rime fog",
-  51: "light drizzle",
-  53: "moderate drizzle",
-  55: "dense drizzle",
-  56: "light freezing drizzle",
-  57: "dense freezing drizzle",
-  61: "slight rain",
-  63: "moderate rain",
-  65: "heavy rain",
-  66: "light freezing rain",
-  67: "heavy freezing rain",
-  71: "slight snowfall",
-  73: "moderate snowfall",
-  75: "heavy snowfall",
-  77: "snow grains",
-  80: "slight rain showers",
-  81: "moderate rain showers",
-  82: "violent rain showers",
-  85: "slight snow showers",
-  86: "heavy snow showers",
-  95: "thunderstorm",
-  96: "thunderstorm with slight hail",
-  99: "thunderstorm with heavy hail",
-}[code] ?? `WMO weather code ${code}`);
-
-/** Converts already validated provider data into the one evidence format used by generation and review. */
-export function weatherForecastResearchPacket(forecast: WeatherForecastResult): ResearchPacket {
-  const place = [forecast.resolved.place, forecast.resolved.admin, forecast.resolved.country]
-    .filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index)
-    .join(", ");
-  const evidence = {
-    provider: forecast.provider,
-    resolvedLocation: {
-      label: place,
-      latitude: forecast.resolved.latitude,
-      longitude: forecast.resolved.longitude,
-      timezone: forecast.resolved.timezone,
-    },
-    units: forecast.units,
-    daily: forecast.daily.map((day) => ({
-      ...day,
-      weatherDescription: weatherCodeLabel(day.weatherCode),
-    })),
-    temperatureTrend: forecast.temperatureTrend,
-  };
-  return {
-    kind: "weather",
-    query: forecast.query,
-    retrievedAt: forecast.retrievedAt,
-    results: [{
-      id: "S1",
-      title: `7-day Open-Meteo forecast for ${place}`,
-      url: forecast.sourceUrl,
-      snippet: JSON.stringify(evidence),
-    }],
-  };
-}
-
-/** Search-result titles alone are retrieval metadata, not answer-bearing evidence. */
-export function researchPacketIsAnswerable(research: ResearchPacket | undefined): boolean {
-  return Boolean(
-    research &&
-    (research.kind === "page" || research.kind === "weather") &&
-    research.results.some((result) => result.id === "S1" && result.snippet.trim().length > 0),
-  );
-}
-
-export function pageEvidenceAnswerContract(_research?: ResearchPacket): string {
-  return "Answer the human's actual request with at least one concrete detail supported by the supplied page. A generic acknowledgement, capability statement or title-only reaction is not an answer. When asked to compare or choose, identify the relevant supplied item and explain the choice only from supplied evidence.";
-}
-
-export function sharedLinkDiscussionContract(): string {
-  return "Make one concise, natural comment on the shared page with at least one concrete detail supported by S1 and one room-relevant reaction, implication or question. A title-only summary, generic acknowledgement, capability statement or tooling narration is not a response.";
-}
-
-export function evidenceFailureFallback(
-  _pageRequested: boolean,
-  _languageOrContent = "",
-): undefined {
-  // A fixed Swedish/English failure sentence is itself a language heuristic.
-  // Required responders get one focused model retry in the classified turn's
-  // language; if that fails, silence is safer than an unrelated canned line.
-  return undefined;
-}
-
-interface ClassifiedToolPlan {
-  pageReadRequest?: PageReadRequest;
-  siteResearch?: {
-    goal: string;
-    mode: SearchMode;
-  };
-  searchRequest?: ResearchRequest;
-  weatherLocation?: string;
-  localDateTime?: LocalDateTimeResult;
-}
-
 interface CoordinatedDmInput {
   message: ChatMessage;
   human: Member;
@@ -1321,6 +1197,7 @@ interface CoordinatedDmReply {
   generation: "lm" | "fallback";
   sourceIds: string[];
   research?: ResearchPacket;
+  linkPreview?: LinkPreview;
 }
 
 interface AutoSharedLinkAttempt {
@@ -1477,7 +1354,7 @@ export class SocialDirector {
   private readonly autonomousResearchHumanQuietMsOverride?: number;
   private readonly autoSharedLinkDiscussionEnabled: boolean;
   private readonly pageReader: PageReader;
-  private readonly weatherForecastProvider?: Pick<WeatherForecastProvider, "forecast">;
+  private readonly capabilityRegistry: CapabilityRegistry;
   private readonly dmTurns: DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>;
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
   private lastAutonomousResearchSuccessAt?: number;
@@ -1498,11 +1375,12 @@ export class SocialDirector {
     this.rng = options.rng ?? Math.random;
     this.now = options.now ?? Date.now;
     this.pageReader = options.pageReader ?? new PageReader();
-    this.weatherForecastProvider = options.weatherForecastProvider === null
-      ? undefined
-      : options.weatherForecastProvider ?? (
-          process.env.WEATHER_ENABLED === "false" ? undefined : new WeatherForecastProvider({ now: this.now })
-        );
+    this.capabilityRegistry = new CapabilityRegistry({
+      pageReader: this.pageReader,
+      researchBroker: this.researchBroker,
+      weatherForecastProvider: options.weatherForecastProvider,
+      now: this.now,
+    });
     this.behaviorTuningProvider = options.behaviorTuningProvider;
     this.dmTurns = new DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>({
       debounceMs: options.dmDebounceMs,
@@ -1788,7 +1666,11 @@ export class SocialDirector {
     const uniqueRecent = [...new Map(recentPool.map((message) => [message.id, message])).values()]
       .slice(-12)
       .map((message) => this.classifierMessage(message));
-    const availableCapabilities = this.availableTurnCapabilities(input.candidateSet, input.allowSearch);
+    const availableCapabilities = this.availableTurnCapabilities(
+      input.candidateSet,
+      input.allowSearch,
+      input.medium,
+    );
     const latest = this.classifierMessage(input.latest);
     latest.content = boundedUntrustedText(input.latest.content, 4_000);
     const exactMentionIds = analyzeSocialSignals(input.latest.content, input.personas).mentionedIds;
@@ -1826,106 +1708,48 @@ export class SocialDirector {
   private availableTurnCapabilities(
     candidateSet: PageReadCandidateSet,
     allowSearch: boolean,
+    medium: "public" | "dm",
   ): TurnCapability[] {
-    const available: TurnCapability[] = ["local_datetime"];
-    if (this.weatherForecastProvider) available.push("weather_forecast");
-    if (process.env.LINK_READER_ENABLED !== "false" && candidateSet.candidates.length > 0) {
-      available.unshift("read_url");
-    }
-    if (allowSearch && process.env.RESEARCH_ENABLED === "true") available.push("web_search");
-    return available;
+    return this.capabilityRegistry.available({ medium, candidateSet, allowSearch });
   }
 
   private sceneCapabilityContext(input: {
     analysis: TurnAnalysis;
     available: TurnCapability[];
-    toolPlan: ClassifiedToolPlan;
-    research?: ResearchPacket;
+    invocation?: CapabilityInvocation;
+    resolution?: EvidenceResolution;
   }): SceneCapabilityContext {
     const trusted = projectTrustedTurnAnalysis(input.analysis);
-    const plannedAction: TurnCapability | null = input.toolPlan.pageReadRequest
-      ? "read_url"
-      : input.toolPlan.searchRequest
-        ? "web_search"
-        : input.toolPlan.weatherLocation
-          ? "weather_forecast"
-          : input.toolPlan.localDateTime
-            ? "local_datetime"
-            : null;
+    const plannedAction = input.invocation?.capability ?? null;
     return {
       available: [...input.available],
+      externalEvidenceAvailable: this.capabilityRegistry.hasExternalEvidence(input.available),
       requestKind: trusted.capabilityTrusted ? input.analysis.capabilities.requestKind : "none",
       discussed: trusted.capabilityTrusted ? [...input.analysis.capabilities.discussed] : [],
       plannedAction,
       executionStatus: plannedAction === null
         ? "not_requested"
-        : input.toolPlan.localDateTime || input.research
+        : input.resolution?.state === "grounding_available"
           ? "succeeded"
           : "failed_temporary",
     };
   }
 
-  private classifiedToolPlan(
+  private classifiedCapabilityInvocation(
     analysis: TurnAnalysis,
     candidateSet: PageReadCandidateSet,
     intent: string,
     requesterId: string,
-  ): ClassifiedToolPlan {
-    const trusted = projectTrustedTurnAnalysis(analysis);
-    if (!trusted.evidenceTrusted) return {};
-    if (analysis.evidence.action === "read_url" && analysis.evidence.urlRef) {
-      const resolvedIntent = analysis.evidence.goal ?? intent;
-      const pageReadRequest = this.pageReader.resolveTarget({
-        candidateSet,
-        targetRef: analysis.evidence.urlRef,
-        intent: resolvedIntent,
-        retry: trusted.capabilityTrusted && (
-          analysis.capabilities.requestKind === "retry" ||
-          analysis.capabilities.requestKind === "correct_limitation"
-        ),
-      });
-      return pageReadRequest
-        ? {
-            pageReadRequest,
-            ...(analysis.evidence.goal
-              ? { siteResearch: { goal: analysis.evidence.goal, mode: analysis.evidence.searchMode ?? "web" } }
-              : {}),
-          }
-        : {};
-    }
-    if (
-      analysis.evidence.action === "web_search" &&
-      analysis.evidence.query &&
-      analysis.evidence.searchMode
-    ) {
-      return {
-        searchRequest: {
-          query: analysis.evidence.query,
-          mode: analysis.evidence.searchMode,
-          requesterId,
-        },
-      };
-    }
-    if (
-      analysis.evidence.action === "weather_forecast" &&
-      analysis.evidence.locationLabel
-    ) {
-      return { weatherLocation: analysis.evidence.locationLabel };
-    }
-    if (
-      analysis.evidence.action === "local_datetime" &&
-      analysis.evidence.timeZone &&
-      analysis.evidence.locationLabel
-    ) {
-      const localDateTime = resolveLocalDateTime({
-        timeZone: analysis.evidence.timeZone,
-        locationLabel: analysis.evidence.locationLabel,
-        languageTag: classifiedLanguage(analysis),
-        now: new Date(this.now()),
-      });
-      return localDateTime ? { localDateTime } : {};
-    }
-    return {};
+    allowSearch: boolean,
+    medium: "public" | "dm",
+  ): CapabilityInvocation | undefined {
+    return this.capabilityRegistry.compile(analysis, {
+      medium,
+      candidateSet,
+      allowSearch,
+      intent,
+      requesterId,
+    });
   }
 
   private claimAutoSharedLinkMessage(messageId: string): boolean {
@@ -2074,79 +1898,6 @@ export class SocialDirector {
     }, 0);
   }
 
-  private async resolveRequestedEvidence(
-    pageReadRequest: PageReadRequest | undefined,
-    searchRequest: ResearchRequest | undefined,
-    requesterId: string,
-    siteResearch?: ClassifiedToolPlan["siteResearch"],
-    weatherLocation?: string,
-  ): Promise<ResearchPacket | undefined> {
-    if (weatherLocation) {
-      if (!this.weatherForecastProvider) return undefined;
-      const forecast = await this.weatherForecastProvider.forecast({
-        location: weatherLocation,
-        requesterId,
-      }).catch((error) => {
-        console.warn("Typed weather forecast failed safely:", error instanceof Error ? error.message : error);
-        return undefined;
-      });
-      return forecast ? weatherForecastResearchPacket(forecast) : undefined;
-    }
-    if (pageReadRequest) {
-      const pageUrl = pageReadRequest.url;
-      const explicitRootUrl = pageUrl &&
-        pageReadRequest.initiator !== "automatic" &&
-        pageUrl.pathname === "/" &&
-        pageUrl.search === "";
-      if (explicitRootUrl && siteResearch) {
-        const sameSite = await this.researchBroker.researchSite({
-          url: pageUrl,
-          query: siteResearch.goal,
-          mode: siteResearch.mode,
-          requesterId,
-          cachePolicy: pageReadRequest.retry ? "bypass" : "default",
-        }).catch((error) => {
-          console.warn("Bounded same-site lookup failed safely:", error instanceof Error ? error.message : error);
-          return undefined;
-        });
-        // A generic root hit proves only that the site exists. It does not
-        // answer a request to find current or specific material on that site.
-        // The broker supplies structural URL/date quality; semantic relevance
-        // remains the model reviewer's responsibility.
-        const quality = sameSite?.search?.site?.quality;
-        if (sameSite?.results.length && (!quality || hasSpecificSiteResearchResults(quality))) {
-          const expanded = await resolveSearchEvidence({
-            packet: sameSite,
-            semanticGoal: siteResearch.goal,
-            requesterId,
-            now: this.now(),
-            pageReader: this.pageReader,
-          });
-          if (expanded.readiness === "answerable") return expanded.packet;
-        }
-      }
-      const page = await this.pageReader.read(pageReadRequest, requesterId).catch((error) => {
-        console.warn("Exact linked-page read failed safely:", error instanceof Error ? error.message : error);
-        return undefined;
-      });
-      return page;
-    }
-    if (!searchRequest) return undefined;
-    const search = await this.researchBroker.research(searchRequest).catch((error) => {
-      console.warn("Fresh evidence lookup failed open:", error instanceof Error ? error.message : error);
-      return undefined;
-    });
-    if (!search) return undefined;
-    const expanded = await resolveSearchEvidence({
-      packet: search,
-      semanticGoal: searchRequest.query,
-      requesterId,
-      now: this.now(),
-      pageReader: this.pageReader,
-    });
-    return expanded.packet;
-  }
-
   async onDirectMessage(message: ChatMessage, human: Member, persona: Persona): Promise<void> {
     return new Promise<void>((resolve) => {
       try {
@@ -2199,13 +1950,17 @@ export class SocialDirector {
     });
     if (!turn.isCurrent()) return undefined;
 
-    const availableCapabilities = this.availableTurnCapabilities(candidateSet, Boolean(persona.canResearch));
+    const availableCapabilities = this.availableTurnCapabilities(candidateSet, Boolean(persona.canResearch), "dm");
     const trustedDmTurn = projectTrustedTurnAnalysis(analysis);
-    const toolPlan = this.classifiedToolPlan(analysis, candidateSet, combined, human.id);
-    const networkEvidenceRequested = Boolean(
-      toolPlan.pageReadRequest || toolPlan.searchRequest || toolPlan.weatherLocation,
+    const invocation = this.classifiedCapabilityInvocation(
+      analysis,
+      candidateSet,
+      combined,
+      human.id,
+      Boolean(persona.canResearch),
+      "dm",
     );
-    const evidenceExecutionRequested = networkEvidenceRequested || Boolean(toolPlan.localDateTime);
+    const evidenceExecutionRequested = Boolean(invocation);
     const dmRequestOwnerIds = (
       trustedDmTurn.intentTrusted && trustedDmTurn.replyExpected === "expected"
     ) || evidenceExecutionRequested
@@ -2218,92 +1973,70 @@ export class SocialDirector {
     );
     this.updateRelationship(persona.id, human.id, signals, 0.08);
 
-    let resolvedResearch: ResearchPacket | undefined;
-    if (networkEvidenceRequested) {
-      resolvedResearch = await this.resolveRequestedEvidence(
-        toolPlan.pageReadRequest,
-        toolPlan.searchRequest,
-        human.id,
-        toolPlan.siteResearch,
-        toolPlan.weatherLocation,
-      );
-    }
-    const research = researchPacketIsAnswerable(resolvedResearch) ? resolvedResearch : undefined;
-    const evidenceRetrieved = Boolean(resolvedResearch);
+    const resolution = invocation
+      ? await this.capabilityRegistry.execute(invocation, human.id)
+      : undefined;
+    const capabilityScene = invocation && resolution
+      ? this.capabilityRegistry.sceneContract(invocation, resolution, { actorName: persona.name })
+      : undefined;
+    const research = capabilityScene?.research;
     if (!turn.isCurrent()) return undefined;
 
-    const evidencePremise = toolPlan.localDateTime
-      ? `${persona.name} answers the requested current date/time from trustedTemporalContext.requestedClock; do not browse, estimate or cite a web source.`
-      : toolPlan.weatherLocation
-        ? research
-          ? `${persona.name} received the typed seven-day forecast for the server-resolved location. Answer the requested place and horizon from S1, include concrete values or a supported trend, and attach S1.`
-          : evidenceRetrieved
-            ? "The typed forecast attempt returned metadata but no answer-bearing forecast. In the human's classified language, report only that this attempt lacked usable forecast data; invent no weather values or cause."
-            : "The typed forecast attempt returned no validated result. In the human's classified language, report only this temporary result; invent no weather values or cause."
-        : toolPlan.pageReadRequest
-          ? research
-            ? research.kind === "search"
-              ? `${persona.name} ran the bounded same-site lookup resolved from the human's root-site request. Answer only from the supplied same-site results and cite only source IDs that support the answer.`
-              : `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
-            : "This specific server-bound linked-page attempt returned no readable evidence. In the human's classified language, say only that this attempt failed; do not invent a cause or claim a permanent inability."
-          : toolPlan.searchRequest
-            ? research
-              ? `${persona.name} deliberately ran the classified fresh lookup. Answer only from the supplied results and cite only source IDs that support the claim.`
-              : evidenceRetrieved
-                ? "The classified lookup returned result metadata but no safely readable answer-bearing page. In the human's classified language, report that bounded outcome briefly and invent no current facts."
-                : "This specific classified fresh lookup returned no usable evidence. In the human's classified language, say so briefly as a temporary result and invent no current facts."
-            : "";
-    const generated = await this.lm.generateScene(
-      {
-        kind: "dm",
-        responseRecoveryBudget: { retriesRemaining: 1 },
-        channelId: latest.channelId,
-        channelName: `private chat with ${human.name}`,
-        selected: [persona],
-        history: this.dmTranscript(latest.channelId),
-        trigger: { author: human.name, content: combined, messageId: latest.id, createdAt: latest.createdAt },
-        mustReplyIds: [persona.id],
-        requestOwnerIds: dmRequestOwnerIds,
-        relationshipNotes,
-        languageHint: classifiedLanguage(analysis),
-        semanticContext: semanticSceneContext(analysis),
-        actorChannelNotes: this.actorChannels.promptNotes([persona]),
-        research,
-        evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
-        capabilityContext: this.sceneCapabilityContext({
-          analysis,
-          available: availableCapabilities,
-          toolPlan,
+    let generated: GeneratedLine[] = [];
+    try {
+      generated = await this.lm.generateScene(
+        {
+          kind: "dm",
+          responseRecoveryBudget: { retriesRemaining: 1 },
+          channelId: latest.channelId,
+          channelName: `private chat with ${human.name}`,
+          selected: [persona],
+          history: this.dmTranscript(latest.channelId),
+          trigger: { author: human.name, content: combined, messageId: latest.id, createdAt: latest.createdAt },
+          mustReplyIds: [persona.id],
+          requestOwnerIds: dmRequestOwnerIds,
+          relationshipNotes,
+          languageHint: classifiedLanguage(analysis),
+          semanticContext: semanticSceneContext(analysis),
+          actorChannelNotes: this.actorChannels.promptNotes([persona]),
           research,
-        }),
-        urlPublicationPolicy: toolPlan.pageReadRequest || toolPlan.weatherLocation ? "server_card" : undefined,
-        requestedClock: toolPlan.localDateTime,
-        temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
-        temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
-        premise: [semanticFlagsPremise(analysis), evidencePremise].filter(Boolean).join(" ") || undefined,
-      },
-      0,
-      turn.signal,
-    );
+          evidenceOutcome: capabilityScene?.evidenceOutcome,
+          capabilityContext: this.sceneCapabilityContext({
+            analysis,
+            available: availableCapabilities,
+            invocation,
+            resolution,
+          }),
+          capabilityGroundingInstruction: capabilityScene?.groundingInstruction,
+          urlPublicationPolicy: capabilityScene?.urlPublicationPolicy,
+          requestedClock: capabilityScene?.requestedClock,
+          temporalPolicy: capabilityScene?.temporalPolicy ?? "reactive_only",
+          temporalSurfaceActorId: capabilityScene?.temporalPolicy ? persona.id : undefined,
+          premise: [semanticFlagsPremise(analysis), capabilityScene?.premise].filter(Boolean).join(" ") || undefined,
+        },
+        0,
+        turn.signal,
+      );
+    } catch (error) {
+      // A superseded turn must never manufacture or publish a late fallback.
+      // Current turns may still use deterministic capability output (the
+      // server clock today) when model generation itself is unavailable.
+      if (!turn.isCurrent()) return undefined;
+      console.warn("DM scene failed; trying deterministic capability fallback:", error instanceof Error ? error.message : error);
+    }
     if (!turn.isCurrent()) return undefined;
     const line = generated[0];
     const generatedReply = line ? normalizeGeneratedMessageContent(line.content) : undefined;
-    const content = generatedReply
-      ?? (toolPlan.localDateTime
-        ? refreshLocalDateTime(toolPlan.localDateTime, new Date(this.now())).fallbackText
-        : undefined);
+    const fallback = this.capabilityRegistry.deterministicFallback(resolution, new Date(this.now()));
+    const content = generatedReply ?? fallback?.content;
     if (!content || catalogEpoch !== this.catalogEpoch || !PERSONAS.some((candidate) => candidate.id === persona.id)) {
       if (turn.isCurrent()) for (const input of turn.messages) input.settle();
       return undefined;
     }
     const sourceIds = generatedReply
-      ? sourceIdsForPageResponder(
-          research,
-          line?.sourceIds ?? [],
-          Boolean(toolPlan.pageReadRequest || toolPlan.weatherLocation),
-          Boolean(toolPlan.searchRequest),
-        )
-      : [];
+      ? this.capabilityRegistry.sourceIds(resolution, line?.sourceIds ?? [], true)
+      : fallback?.sourceIds ?? [];
+    const linkCardSourceId = this.capabilityRegistry.linkCardSourceId(resolution, sourceIds);
     return {
       threadId: latest.channelId,
       replyToId: latest.id,
@@ -2314,6 +2047,9 @@ export class SocialDirector {
       generation: generatedReply ? "lm" : "fallback",
       sourceIds,
       research,
+      linkPreview: linkCardSourceId && research
+        ? linkPreviewFromResearch(research, linkCardSourceId)
+        : undefined,
     };
   }
 
@@ -2333,6 +2069,7 @@ export class SocialDirector {
         result.replyToId,
         result.generation,
         this.messageSources(result.research, result.sourceIds),
+        result.linkPreview,
       );
       if (!reply) return;
       const thread = this.store.openDm(result.human.id, result.persona.id);
@@ -2398,7 +2135,7 @@ export class SocialDirector {
       candidateSet,
       allowSearch: true,
     });
-    const availableCapabilities = this.availableTurnCapabilities(candidateSet, true);
+    const availableCapabilities = this.availableTurnCapabilities(candidateSet, true, "public");
     if (!burstIsCurrent()) {
       this.schedulePersistentMemory(messages, human);
       return;
@@ -2496,16 +2233,17 @@ export class SocialDirector {
       )[0];
       if (mostRelevant) selected = [mostRelevant];
     }
-    const classifiedToolPlan = this.classifiedToolPlan(analysis, candidateSet, combined, human.id);
-    let toolPlan = classifiedToolPlan;
+    const classifiedInvocation = this.classifiedCapabilityInvocation(
+      analysis,
+      candidateSet,
+      combined,
+      human.id,
+      true,
+      "public",
+    );
+    let invocation = classifiedInvocation;
     let autoSharedLinkAttempt: AutoSharedLinkAttempt | undefined;
-    if (
-      structuralAutoCandidate &&
-      !classifiedToolPlan.pageReadRequest &&
-      !classifiedToolPlan.searchRequest &&
-      !classifiedToolPlan.weatherLocation &&
-      !classifiedToolPlan.localDateTime
-    ) {
+    if (structuralAutoCandidate && !classifiedInvocation) {
       // A claimed passive link never falls through into an ungrounded normal
       // scene, even when a duplicate delivery or hard pacing gate rejects it.
       if (!this.claimAutoSharedLinkMessage(trigger.id)) {
@@ -2534,13 +2272,10 @@ export class SocialDirector {
         this.schedulePersistentMemory(messages, human);
         return;
       }
-      toolPlan = { pageReadRequest };
+      invocation = this.capabilityRegistry.planAutomaticRead(pageReadRequest, trigger.content);
     }
     try {
-      const networkEvidenceRequested = Boolean(
-        toolPlan.pageReadRequest || toolPlan.searchRequest || toolPlan.weatherLocation,
-      );
-    const evidenceRequested = networkEvidenceRequested || Boolean(toolPlan.localDateTime);
+    const evidenceRequested = Boolean(invocation);
     let evidenceResponder: Persona | undefined;
     if (evidenceRequested) {
       const evidenceSelection = ensureEvidenceResponder(
@@ -2548,7 +2283,7 @@ export class SocialDirector {
         candidates,
         signals.mentionedIds,
         attention,
-        Boolean(toolPlan.searchRequest),
+        invocation?.requiresResearchPersona ?? false,
       );
       selected = evidenceSelection.selected;
       evidenceResponder = evidenceSelection.responder;
@@ -2629,20 +2364,19 @@ export class SocialDirector {
     ];
     let lines: GeneratedLine[] = [];
     let research: ResearchPacket | undefined;
-    let evidenceRetrieved = false;
+    let capabilityResolution: EvidenceResolution | undefined;
+    let capabilityScene: CapabilitySceneContract | undefined;
     let evidencePremise = "";
     try {
-      if (networkEvidenceRequested) {
-        const resolvedResearch = await this.resolveRequestedEvidence(
-          toolPlan.pageReadRequest,
-          toolPlan.searchRequest,
-          human.id,
-          toolPlan.siteResearch,
-          toolPlan.weatherLocation,
-        );
-        evidenceRetrieved = Boolean(resolvedResearch);
-        research = researchPacketIsAnswerable(resolvedResearch) ? resolvedResearch : undefined;
-        if (autoSharedLinkAttempt && !research) {
+      if (invocation) {
+        capabilityResolution = await this.capabilityRegistry.execute(invocation, human.id);
+        capabilityScene = this.capabilityRegistry.sceneContract(invocation, capabilityResolution, {
+          actorName: evidenceResponder?.name ?? "The designated resident",
+          automatic: Boolean(autoSharedLinkAttempt),
+        });
+        research = capabilityScene.research;
+        evidencePremise = capabilityScene.premise;
+        if (capabilityScene.suppressResponse) {
           // Passive-link failures are intentionally silent. They never turn
           // into a search, a capability apology or an ungrounded normal reply.
           this.schedulePersistentMemory(messages, human);
@@ -2660,27 +2394,6 @@ export class SocialDirector {
           primaryTypingVisible = true;
         }
         if (research) triggerType = "research";
-        evidencePremise = toolPlan.weatherLocation
-          ? research
-            ? `${evidenceResponder?.name ?? "The designated resident"} received the typed seven-day forecast for the server-resolved location and alone answers the request. Use concrete supported values or the supplied trend from S1 and attach S1.`
-            : evidenceRetrieved
-              ? `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this forecast attempt returned metadata but no answer-bearing forecast. Nobody invents weather values or a cause.`
-              : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this typed forecast attempt returned no validated result. Treat it as temporary; nobody invents weather values or a cause.`
-          : toolPlan.pageReadRequest
-          ? research
-            ? autoSharedLinkAttempt
-              ? `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound page that the human just shared and is solely responsible for one grounded response. ${sharedLinkDiscussionContract()} Attach S1 to the response.`
-              : research.kind === "search"
-                ? `${evidenceResponder?.name ?? "The designated resident"} ran the bounded same-site lookup resolved from the human's root-site request and is solely responsible for the answer. Attach only source IDs that support each claim; result rank alone is never an answer.`
-                : `${evidenceResponder?.name ?? "The designated resident"} opened the exact server-bound linked page and is solely responsible for answering from the supplied page evidence. ${pageEvidenceAnswerContract(research)} Attach S1 to every message that relies on the page.`
-            : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific server-bound linked-page attempt returned no readable evidence. It is a temporary result; nobody guesses contents or invents a cause.`
-          : research
-            ? `${evidenceResponder?.name ?? "The designated resident"} ran the classifier's standalone fresh-data query and is responsible for the sourced answer. Attach only source IDs that support each claim; result rank alone is never an answer.`
-            : evidenceRetrieved
-              ? `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that the lookup returned result metadata but no safely readable answer-bearing page. Treat it as temporary and invent no current facts.`
-              : `${evidenceResponder?.name ?? "The designated resident"} alone reports in the human's classified language that this specific fresh lookup returned no usable source. Treat it as temporary and invent no current facts.`;
-      } else if (toolPlan.localDateTime) {
-        evidencePremise = `${evidenceResponder?.name ?? "The designated resident"} alone answers the requested current date/time from trustedTemporalContext.requestedClock. Do not browse, estimate or cite a web source.`;
       }
       const dissenter = selected.find((persona) => (persona.disagreement ?? 0) >= 0.65);
       const premise = [
@@ -2725,17 +2438,18 @@ export class SocialDirector {
           actorExpertiseNotes: this.actorChannels.expertiseNotes(selected, trigger.channelId),
           visualObservation,
           research,
-          evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+          evidenceOutcome: capabilityScene?.evidenceOutcome,
           capabilityContext: this.sceneCapabilityContext({
             analysis,
             available: availableCapabilities,
-            toolPlan,
-            research,
+            invocation,
+            resolution: capabilityResolution,
           }),
-          urlPublicationPolicy: toolPlan.pageReadRequest || toolPlan.weatherLocation ? "server_card" : undefined,
-          requestedClock: toolPlan.localDateTime,
-          temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
-          temporalSurfaceActorId: toolPlan.localDateTime ? evidenceResponder?.id : undefined,
+          capabilityGroundingInstruction: capabilityScene?.groundingInstruction,
+          urlPublicationPolicy: capabilityScene?.urlPublicationPolicy,
+          requestedClock: capabilityScene?.requestedClock,
+          temporalPolicy: capabilityScene?.temporalPolicy ?? "reactive_only",
+          temporalSurfaceActorId: capabilityScene?.temporalPolicy ? evidenceResponder?.id : undefined,
           premise: premise || undefined,
         },
         signals.mentionedIds.length ? 0 : 2,
@@ -2788,17 +2502,18 @@ export class SocialDirector {
             actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], trigger.channelId),
             visualObservation,
             research,
-            evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+            evidenceOutcome: capabilityScene?.evidenceOutcome,
             capabilityContext: this.sceneCapabilityContext({
               analysis,
               available: availableCapabilities,
-              toolPlan,
-              research,
+              invocation,
+              resolution: capabilityResolution,
             }),
-            urlPublicationPolicy: toolPlan.pageReadRequest || toolPlan.weatherLocation ? "server_card" : undefined,
-            requestedClock: toolPlan.localDateTime,
-            temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
-            temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
+            capabilityGroundingInstruction: capabilityScene?.groundingInstruction,
+            urlPublicationPolicy: capabilityScene?.urlPublicationPolicy,
+            requestedClock: capabilityScene?.requestedClock,
+            temporalPolicy: capabilityScene?.temporalPolicy ?? "reactive_only",
+            temporalSurfaceActorId: capabilityScene?.temporalPolicy ? persona.id : undefined,
             premise: [
               semanticFlagsPremise(analysis),
               evidencePremise,
@@ -2832,16 +2547,18 @@ export class SocialDirector {
       this.schedulePersistentMemory(messages, human);
       return;
     }
-    if ((networkEvidenceRequested && !research) || toolPlan.localDateTime) {
-      // A failed lookup or trusted clock answer has one owner. Do not let
-      // generic crowd lines turn a required factual turn into social noise.
+    if (this.capabilityRegistry.requiresDesignatedResponder(capabilityResolution)) {
+      // Capability answers have one designated owner. This also prevents an
+      // evidence-derived non-owner line from surviving after its citations are
+      // deliberately removed by the publication policy.
       lines = evidenceResponder
         ? lines.filter((line) => line.personaId === evidenceResponder.id)
         : [];
     }
-    const safeEvidenceFallback = toolPlan.localDateTime
-      ? { content: refreshLocalDateTime(toolPlan.localDateTime, new Date(this.now())).fallbackText, sourceIds: [] }
-      : undefined;
+    const safeEvidenceFallback = this.capabilityRegistry.deterministicFallback(
+      capabilityResolution,
+      new Date(this.now()),
+    );
     if (
       safeEvidenceFallback &&
       evidenceResponder &&
@@ -2892,15 +2609,14 @@ export class SocialDirector {
         (!ordinarySlotAvailable && !prioritySlotAvailable) ||
         (autoSharedLinkAttempt && this.voiceRoomActive)
       ) break;
-      const publishedSourceIds = sourceIdsForPageResponder(
-        research,
+      const publishedSourceIds = this.capabilityRegistry.sourceIds(
+        capabilityResolution,
         line.sourceIds,
-        Boolean(
-          (toolPlan.pageReadRequest || toolPlan.weatherLocation) &&
-          evidenceResponder?.id === line.personaId &&
-          (line.source === "lm" || line.sourceIds.includes("S1"))
-        ),
-        Boolean(toolPlan.searchRequest && evidenceResponder?.id === line.personaId),
+        evidenceResponder?.id === line.personaId,
+      );
+      const linkCardSourceId = this.capabilityRegistry.linkCardSourceId(
+        capabilityResolution,
+        publishedSourceIds,
       );
       const posted = this.postPublic(
         trigger.channelId,
@@ -2909,7 +2625,7 @@ export class SocialDirector {
         trigger.id,
         line.source,
         this.messageSources(research, publishedSourceIds),
-        publishedSourceIds[0] && research ? linkPreviewFromResearch(research, publishedSourceIds[0]) : undefined,
+        linkCardSourceId && research ? linkPreviewFromResearch(research, linkCardSourceId) : undefined,
       );
       if (posted) {
         publishedResponses.push(posted);
@@ -2939,7 +2655,7 @@ export class SocialDirector {
         }
       }
     }
-    if (autoSharedLinkAttempt && research?.kind === "page" && publishedResponses.length > 0) {
+    if (autoSharedLinkAttempt && research && publishedResponses.length > 0) {
       this.recordSuccessfulAutoSharedLink(autoSharedLinkAttempt);
     }
     if (burstIsCurrent()) {

@@ -16,7 +16,8 @@ const MAX_SEARCH_RESULTS = 5;
 const MAX_EXPANDED_PAGES = 2;
 const FUTURE_TIMESTAMP_TOLERANCE_MS = 5 * 60_000;
 
-export type EvidenceReadiness = "retrieved" | "answerable";
+/** A safe page was read; semantic relevance is still decided during review. */
+export type EvidenceReadiness = "retrieved" | "grounding_available";
 
 /** The deliberately small surface needed from PageReader. */
 export interface EvidencePageReader {
@@ -29,6 +30,8 @@ export interface ResolveSearchEvidenceInput {
   requesterId: string;
   now: number;
   pageReader: EvidencePageReader;
+  /** Explicit human retry/correction; bypasses PageReader's negative cache. */
+  retry?: boolean;
 }
 
 export interface ResolvedSearchEvidence {
@@ -177,7 +180,7 @@ export const resolveSearchEvidence = async (
   if (packetKind === "page") {
     return {
       packet: bounded,
-      readiness: bounded.results.length > 0 ? "answerable" : "retrieved",
+      readiness: bounded.results.length > 0 ? "grounding_available" : "retrieved",
       attemptedPages: 0,
       readPages: 0,
     };
@@ -197,7 +200,7 @@ export const resolveSearchEvidence = async (
   const request: PageReadRequest = {
     requestedAt,
     intent,
-    retry: false,
+    retry: input.retry === true,
     source: "message",
     initiator: "automatic",
   };
@@ -218,7 +221,7 @@ export const resolveSearchEvidence = async (
       retrievedAt,
       results,
     },
-    readiness: "answerable",
+    readiness: "grounding_available",
     attemptedPages,
     readPages: results.length,
   };

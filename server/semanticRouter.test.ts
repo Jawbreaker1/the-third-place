@@ -1077,13 +1077,13 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("participant/resident AI identity");
     expect(prompt).toContain("preserve the actual referent in the turn");
     expect(prompt).toContain("never reinterpret it as permission for a resident self-disclosure");
-    expect(prompt).toContain("An identity question alone is not a read/search/time/weather capability question");
+    expect(prompt).toContain("An identity question alone is not itself a server capability question");
     expect(prompt).toContain("Ordinary technical discussion of external AI systems is not a participant-identity question");
     expect(prompt).toContain("a source name or instruction to inspect it is not itself the information goal");
     expect(prompt).toContain("availableCapabilities is trusted server-owned runtime inventory");
     expect(prompt).toContain("never let a prior resident denial override the inventory");
     expect(prompt).toContain("g is a short standalone description of the exact information the guest wants");
-    expect(prompt).toContain("Preserve the guest's language and script");
+    expect(prompt).toContain("translating the provider query into English or another language is invalid");
     expect(prompt).toContain("availability alone never executes a tool");
     expect(prompt).toContain("select that available discussed capability as e.a");
     expect(prompt).toContain("weather_forecast: use for current conditions or a future weather forecast");
@@ -1196,6 +1196,11 @@ describe("strict multilingual evidence-plan verifier contract", () => {
 
     const directRetry = stockTurn("@mira kolla avanza!");
     expect(shouldVerifyEvidencePlan(directRetry, primarySummary())).toBe(true);
+    expect(shouldVerifyEvidencePlan(directRetry, primarySummary({
+      intent: { kind: "capability_question", replyExpected: "expected", confidence: 0.7 },
+      evidence: { action: "none", confidence: 1 },
+      capabilities: { discussed: ["web_search"], requestKind: "availability", confidence: 0.7 },
+    }))).toBe(true);
     expect(shouldVerifyEvidencePlan(directRetry, primarySummary({
       personas: { requestedReplyIds: [], addressedIds: ["ai-mira"], addressConfidence: 0.85 },
     }))).toBe(true);
@@ -1446,6 +1451,8 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       ],
     }), primarySummary());
     expect(parseEvidencePlanVerifierContent(JSON.stringify({
+      t: "ja",
+      tx: 0.99,
       v: "use_action",
       a: "local_datetime",
       r: "execute",
@@ -1460,6 +1467,8 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       l: "東京",
     }), japanese)).toMatchObject({ evidence: { goal: "東京の現在時刻", timeZone: "Asia/Tokyo" } });
     expect(parseEvidencePlanVerifierContent(JSON.stringify({
+      t: "ja",
+      tx: 0.99,
       v: "use_action",
       a: "local_datetime",
       r: "execute",
@@ -1478,6 +1487,8 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       capabilities: { discussed: ["web_search"], requestKind: "retry", confidence: 0.95 },
     }));
     expect(parseEvidencePlanVerifierContent(JSON.stringify({
+      t: "ar",
+      tx: 0.99,
       v: "use_action",
       a: "web_search",
       r: "retry",
@@ -1491,6 +1502,7 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       k: null,
       l: null,
     }), arabic)).toMatchObject({
+      language: { tag: "ar", confidence: 0.99 },
       evidence: { goal: "السعر الحالي للسهم", query: "السعر الحالي للسهم اليوم" },
     });
 
@@ -1612,7 +1624,7 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(properties.u.anyOf[0].enum).toEqual(["latest:0"]);
     expect(properties.d.maxItems).toBe(1);
     expect(format.json_schema.schema.required).toEqual([
-      "v", "a", "r", "d", "x", "g", "q", "u", "m", "z", "k", "l",
+      "t", "tx", "v", "a", "r", "d", "x", "g", "q", "u", "m", "z", "k", "l",
     ]);
     const weatherFormat = buildEvidencePlanVerifierResponseFormat(createEvidencePlanVerifierInput(
       stockTurn("明日の札幌の天気は？", {
@@ -1644,7 +1656,7 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(prompt).toContain("never capability truth");
     expect(prompt).toContain("structurally bounded action/confidence hint");
     expect(prompt).toContain("confidence just below the trust threshold");
-    expect(prompt).toContain("Preserve the guest's language and script");
+    expect(prompt).toContain("translating the query into English or another language is invalid");
     expect(prompt).toContain("never copy or search the candidate host/domain in g or q");
     expect(prompt).toContain("candidate context field path=/ marks a root page");
     expect(prompt).toContain("set m to news for actual news/current-events intent and otherwise web");
@@ -1841,6 +1853,7 @@ describe("multilingual batch candidate-review contract", () => {
       },
       capabilityContext: {
         available: ["weather_forecast"],
+        externalEvidenceAvailable: true,
         requestKind: "execute",
         discussed: ["weather_forecast"],
         plannedAction: "weather_forecast",
@@ -1852,7 +1865,10 @@ describe("multilingual batch candidate-review contract", () => {
       })),
     });
     expect(parsed.evidence.kind).toBe("weather");
-    expect(parsed.capabilityContext).toMatchObject({ plannedAction: "weather_forecast" });
+    expect(parsed.capabilityContext).toMatchObject({
+      externalEvidenceAvailable: true,
+      plannedAction: "weather_forecast",
+    });
   });
 
   it("carries trusted autonomous source-fit context and requires semantic rather than lexical matching", () => {
@@ -1880,6 +1896,7 @@ describe("multilingual batch candidate-review contract", () => {
     const base = reviewInput();
     const capabilityContext = {
       available: ["read_url", "web_search"] as const,
+      externalEvidenceAvailable: true,
       requestKind: "correct_limitation" as const,
       discussed: ["web_search"] as const,
       plannedAction: "web_search" as const,
@@ -2229,7 +2246,8 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("roomRecall.witnessPersonaIds");
     expect(prompt).toContain("A roomRecall anchor proves only that the row directly matched retrieval");
     expect(prompt).toContain("A context row proves only that it appeared nearby");
-    expect(prompt).toContain("capabilityContext lists read_url, web_search or weather_forecast");
+    expect(prompt).toContain("capabilityContext.externalEvidenceAvailable is true");
+    expect(prompt).toContain("validated structured evidence");
     expect(prompt).toContain("resident model having no personal tool is irrelevant");
     expect(prompt).toContain("unsupported_room_recall");
     expect(prompt).toContain("A non-witness may accurately say it checked retained room history");
