@@ -33,6 +33,10 @@ export type TemperatureTrendDirection = "cooler" | "warmer" | "steady";
 
 export interface WeatherForecastRequest {
   location: string;
+  /** Optional provider-facing fallback alias; `location` is always attempted first. */
+  lookupQuery?: string;
+  /** BCP-47 language used only to localize the fixed geocoder response. */
+  languageTag?: string;
   requesterId?: string;
 }
 
@@ -108,6 +112,17 @@ const boundedLocation = (raw: string): string | undefined => {
   return location;
 };
 
+const providerLanguage = (raw: string | undefined): string => {
+  if (!raw || raw.length > 35 || hasUnsafeControlOrFormat(raw)) return "en";
+  try {
+    const canonical = Intl.getCanonicalLocales(raw)[0];
+    const language = canonical ? new Intl.Locale(canonical).language?.toLocaleLowerCase("en-US") : undefined;
+    return language && language !== "und" && /^[a-z]{2,3}$/u.test(language) ? language : "en";
+  } catch {
+    return "en";
+  }
+};
+
 const boundedRequester = (raw: string | undefined): string => {
   const requester = stripDangerousTextControls((raw ?? "anonymous").normalize("NFKC"))
     .replace(/\s+/gu, " ")
@@ -128,32 +143,18 @@ const optionalProviderText = (maximum: number) => z.string()
   .refine((value) => !hasUnsafeControlOrFormat(value));
 
 const geocodingResultSchema = z.object({
-  id: z.number().int().nonnegative(),
   name: providerText(160),
   latitude: z.number().finite().min(-90).max(90),
   longitude: z.number().finite().min(-180).max(180),
-  elevation: z.number().finite().min(-500).max(10_000).optional(),
-  feature_code: z.string().regex(/^[A-Z0-9]{1,12}$/u).optional(),
   country_code: z.string().regex(/^[A-Z]{2}$/u).optional(),
-  admin1_id: z.number().int().nonnegative().optional(),
-  admin2_id: z.number().int().nonnegative().optional(),
-  admin3_id: z.number().int().nonnegative().optional(),
-  admin4_id: z.number().int().nonnegative().optional(),
-  timezone: z.string().trim().min(1).max(80),
-  population: z.number().int().nonnegative().optional(),
-  postcodes: z.array(providerText(32)).max(100).optional(),
-  country_id: z.number().int().nonnegative().optional(),
+  timezone: z.string().trim().min(1).max(80).optional(),
   country: providerText(160).optional(),
   admin1: optionalProviderText(160).optional(),
-  admin2: optionalProviderText(160).optional(),
-  admin3: optionalProviderText(160).optional(),
-  admin4: optionalProviderText(160).optional(),
-}).strict();
+});
 
 const geocodingResponseSchema = z.object({
   results: z.array(geocodingResultSchema).max(5).optional(),
-  generationtime_ms: z.number().finite().nonnegative().max(1_000_000).optional(),
-}).strict();
+});
 
 const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).refine((date) => {
   const parsed = new Date(`${date}T00:00:00.000Z`);
@@ -175,13 +176,7 @@ const sevenWeatherCodes = z.array(
 ).length(7);
 
 const forecastResponseSchema = z.object({
-  latitude: z.number().finite().min(-90).max(90),
-  longitude: z.number().finite().min(-180).max(180),
-  generationtime_ms: z.number().finite().nonnegative().max(1_000_000),
-  utc_offset_seconds: z.number().int().min(-86_400).max(86_400),
   timezone: z.string().trim().min(1).max(80),
-  timezone_abbreviation: providerText(32),
-  elevation: z.number().finite().min(-500).max(10_000),
   daily_units: z.object({
     time: z.literal("iso8601"),
     temperature_2m_max: z.literal("°C"),
@@ -189,7 +184,7 @@ const forecastResponseSchema = z.object({
     precipitation_probability_max: z.literal("%"),
     precipitation_sum: z.literal("mm"),
     weather_code: z.literal("wmo code"),
-  }).strict(),
+  }),
   daily: z.object({
     time: sevenDates,
     temperature_2m_max: sevenTemperatures,
@@ -197,11 +192,15 @@ const forecastResponseSchema = z.object({
     precipitation_probability_max: sevenProbabilities,
     precipitation_sum: sevenPrecipitationAmounts,
     weather_code: sevenWeatherCodes,
-  }).strict(),
-}).strict();
+  }),
+});
 
 type GeocodingResult = z.infer<typeof geocodingResultSchema>;
-type ResolvedGeocodingResult = GeocodingResult & { country: string; country_code: string };
+type ResolvedGeocodingResult = GeocodingResult & {
+  country: string;
+  country_code: string;
+  timezone: string;
+};
 type ForecastResponse = z.infer<typeof forecastResponseSchema>;
 
 const hasJsonContentType = (response: Response): boolean => {
@@ -236,30 +235,28 @@ const readBoundedJson = async (response: Response, maxBytes: number): Promise<un
   return JSON.parse(body) as unknown;
 };
 
-const supportedTimeZone = (value: string): boolean => {
+const canonicalTimeZone = (value: string): string | undefined => {
   try {
-    new Intl.DateTimeFormat("en", { timeZone: value }).format(new Date(0));
-    return true;
+    return new Intl.DateTimeFormat("en", { timeZone: value }).resolvedOptions().timeZone;
   } catch {
-    return false;
+    return undefined;
   }
 };
 
-const selectUnambiguousLocation = (
-  query: string,
+const selectRankedLocation = (
   results: readonly GeocodingResult[],
 ): ResolvedGeocodingResult | undefined => {
-  const usable = results.filter((candidate): candidate is ResolvedGeocodingResult =>
-    Boolean(candidate.country && candidate.country_code) && supportedTimeZone(candidate.timezone));
-  if (usable.length === 1) return usable[0];
-  const queryKey = unicodeCaselessKey(query);
-  const exact = usable.filter((candidate) => unicodeCaselessKey(candidate.name) === queryKey);
-  if (exact.length > 0) return exact.length === 1 ? exact[0] : undefined;
-  // Open-Meteo can localize the winning name (for example Göteborg to
-  // Gothenburg), so an exact comparison is not always available. Its ordered
-  // first result remains the deterministic resolution for otherwise fuzzy
-  // matches; repeated exact names above are treated as genuinely ambiguous.
-  return usable[0];
+  const candidate = results[0];
+  // Open-Meteo documents this collection as ranked. Preserve that order for
+  // exact, localized and fuzzy results. If the winner cannot be validated,
+  // fail closed instead of silently substituting a different place.
+  return candidate &&
+    candidate.country &&
+    candidate.country_code &&
+    candidate.timezone &&
+    canonicalTimeZone(candidate.timezone)
+    ? candidate as ResolvedGeocodingResult
+    : undefined;
 };
 
 const areConsecutiveDates = (dates: readonly string[]): boolean => dates.every((date, index) => {
@@ -356,7 +353,11 @@ export class WeatherForecastProvider {
   async forecast(request: WeatherForecastRequest): Promise<WeatherForecastResult | undefined> {
     const query = boundedLocation(request.location);
     if (!query) return undefined;
-    const key = unicodeCaselessKey(query);
+    // An optional model-authored fallback can never invalidate the primary,
+    // human-facing place query.
+    const lookupQuery = boundedLocation(request.lookupQuery ?? query) ?? query;
+    const language = providerLanguage(request.languageTag);
+    const key = [unicodeCaselessKey(query), unicodeCaselessKey(lookupQuery), language].join("\u0000");
     const now = this.now();
     if (!Number.isFinite(now)) return undefined;
     this.prune(now);
@@ -373,7 +374,7 @@ export class WeatherForecastProvider {
       return undefined;
     }
 
-    const pending = this.fetchForecast(query, now)
+    const pending = this.fetchForecast(query, lookupQuery, language, now)
       .catch(() => undefined)
       .finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, pending);
@@ -419,22 +420,16 @@ export class WeatherForecastProvider {
     }
   }
 
-  private async fetchForecast(query: string, requestedAt: number): Promise<WeatherForecastResult | undefined> {
-    const geocodingUrl = new URL(GEOCODING_PATH, GEOCODING_ORIGIN);
-    geocodingUrl.searchParams.set("name", query);
-    geocodingUrl.searchParams.set("count", "5");
-    geocodingUrl.searchParams.set("language", "en");
-    geocodingUrl.searchParams.set("format", "json");
-    const geocodingResponse = await this.fetchImpl(geocodingUrl, {
-      headers: { Accept: "application/json", "User-Agent": "TheThirdPlace/0.2" },
-      signal: AbortSignal.timeout(this.timeoutMs),
-      redirect: "error",
-    });
-    const geocoding = geocodingResponseSchema.safeParse(
-      await readBoundedJson(geocodingResponse, GEOCODING_MAX_BYTES),
-    );
-    if (!geocoding.success) return undefined;
-    const resolved = selectUnambiguousLocation(query, geocoding.data.results ?? []);
+  private async fetchForecast(
+    query: string,
+    lookupQuery: string,
+    language: string,
+    requestedAt: number,
+  ): Promise<WeatherForecastResult | undefined> {
+    let resolved = await this.fetchResolvedLocation(query, language);
+    if (!resolved && unicodeCaselessKey(lookupQuery) !== unicodeCaselessKey(query)) {
+      resolved = await this.fetchResolvedLocation(lookupQuery, language);
+    }
     if (!resolved) return undefined;
 
     const forecastUrl = new URL(FORECAST_PATH, FORECAST_ORIGIN);
@@ -451,7 +446,10 @@ export class WeatherForecastProvider {
     const forecast = forecastResponseSchema.safeParse(
       await readBoundedJson(forecastResponse, FORECAST_MAX_BYTES),
     );
-    if (!forecast.success || forecast.data.timezone !== resolved.timezone) return undefined;
+    if (
+      !forecast.success ||
+      canonicalTimeZone(forecast.data.timezone) !== canonicalTimeZone(resolved.timezone)
+    ) return undefined;
     const days = dailyRows(forecast.data);
     if (!days) return undefined;
 
@@ -478,5 +476,26 @@ export class WeatherForecastProvider {
       daily: days,
       temperatureTrend: temperatureTrend(days),
     });
+  }
+
+  private async fetchResolvedLocation(
+    lookupQuery: string,
+    language: string,
+  ): Promise<ResolvedGeocodingResult | undefined> {
+    const geocodingUrl = new URL(GEOCODING_PATH, GEOCODING_ORIGIN);
+    geocodingUrl.searchParams.set("name", lookupQuery);
+    geocodingUrl.searchParams.set("count", "5");
+    geocodingUrl.searchParams.set("language", language);
+    geocodingUrl.searchParams.set("format", "json");
+    const geocodingResponse = await this.fetchImpl(geocodingUrl, {
+      headers: { Accept: "application/json", "User-Agent": "TheThirdPlace/0.2" },
+      signal: AbortSignal.timeout(this.timeoutMs),
+      redirect: "error",
+    });
+    const geocoding = geocodingResponseSchema.safeParse(
+      await readBoundedJson(geocodingResponse, GEOCODING_MAX_BYTES),
+    );
+    if (!geocoding.success) return undefined;
+    return selectRankedLocation(geocoding.data.results ?? []);
   }
 }

@@ -5484,6 +5484,7 @@ describe("social director", () => {
 
       expect(forecast).toHaveBeenCalledWith({
         location: "Göteborg, Sverige",
+        languageTag: "ar",
         requesterId: human.id,
       });
       expect(research).not.toHaveBeenCalled();

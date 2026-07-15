@@ -438,14 +438,22 @@ Page title and body remain explicitly untrusted quoted evidence inside the JSON 
 WEATHER_ENABLED=false
 ```
 
-The multilingual router supplies one bounded location label—not a URL or general web-search query. The server sends that label to the fixed Open-Meteo geocoding endpoint, then requests exactly seven daily rows from the fixed forecast endpoint with the resolved coordinates and `timezone=auto`. Both calls require HTTPS, status 200, JSON media type, strict byte limits, a short timeout and exact schema validation. Per-guest and global request limits, a bounded cache and in-flight deduplication prevent the capability from becoming an open proxy or an unbounded weather client. Missing, malformed, unresolved exact-name ambiguity or internally inconsistent data fails closed.
+The multilingual router supplies a bounded human-facing location label—not a URL or general web-search query—and may separately supply a short canonical provider alias for the same place when another writing system needs one. The guest's trusted BCP-47 response language localizes the geocoder without language-specific application rules. The server always tries the human-facing label first; only zero usable results allow the alias fallback, so a model-suggested alias cannot replace an already resolved place. Router policy forbids an alias from dropping a region or country qualification merely to force a result; if no equivalent qualified alias is known, the request stays unresolved. The provider preserves Open-Meteo's [documented result ranking](https://open-meteo.com/en/docs/geocoding-api) after validating every consumed field, then requests exactly seven daily rows from the fixed forecast endpoint with the resolved coordinates and `timezone=auto`. The resolved place and country stay visible in the source card instead of being silently assumed.
+
+Every provider call requires HTTPS, status 200, JSON media type, strict byte limits, a short timeout and schema validation of every field the application consumes. Per-guest and global request limits, a bounded cache and in-flight deduplication prevent the capability from becoming an open proxy or an unbounded weather client. Missing, malformed, unresolvable or internally inconsistent data fails closed. There are no city lists, translated phrase tables or language-specific intent regexes in this path.
 
 The accepted packet contains the resolved place, country, administrative area when available, IANA time zone, latitude/longitude, daily maximum and minimum temperature, maximum precipitation probability, precipitation sum and WMO weather code. The server—not the dialogue model—also computes the final-day minus first-day mean-temperature change and labels only that bounded trend as `cooler`, `warmer` or `steady`. The model must ground its answer in those values, and the exact validated Open-Meteo forecast URL is attached as a server-owned source card.
 
-With the app and LM Studio running, exercise the complete private-chat route without adding a test message to a public room:
+With the app and LM Studio running, exercise the complete route with the original Stockholm lobby regression plus a Göteborg DM. This deliberately adds one clearly named test session and message to `#lobby`:
 
 ```bash
 APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:weather
+```
+
+The larger multilingual/provider-contract matrix adds Barcelona, Seattle, Ciudad de México and Sapporo cases. Individual IDs can be selected with `WEATHER_SMOKE_ONLY`:
+
+```bash
+WEATHER_SMOKE_MATRIX=true APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:weather
 ```
 
 This capability is external even when LM Studio is the active dialogue provider. The named location from the guest's request is sent server-side to Open-Meteo, and Open-Meteo sees the application server's public IP. The browser does not contact Open-Meteo directly. Do not send an address or other unnecessarily precise location when a city or region is sufficient, and review the [Open-Meteo terms](https://open-meteo.com/en/terms) before public or commercial deployment.

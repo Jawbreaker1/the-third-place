@@ -36,6 +36,15 @@ const cases = [
     check: (value) => value.evidence.action === "local_datetime" && value.evidence.timeZone?.startsWith("America/"),
   },
   {
+    id: "sv-stockholm-weather-regression",
+    text: "hur blir vädret i stockholm imorrn? shortsväder?",
+    capabilities: ["web_search", "local_datetime", "weather_forecast"],
+    check: (value) => value.evidence.action === "weather_forecast" &&
+      value.evidence.locationLabel?.toLocaleLowerCase().includes("stockholm") &&
+      value.capabilities.discussed.includes("weather_forecast") &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
     id: "sv-weather-forecast",
     text: "Kan någon kolla vädret i Göteborg? Kommer det bli kallare snart?",
     capabilities: ["web_search", "local_datetime", "weather_forecast"],

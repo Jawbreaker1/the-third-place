@@ -93,6 +93,9 @@ export interface LocalDateTimeInvocation extends CapabilityInvocationBase {
 export interface WeatherForecastInvocation extends CapabilityInvocationBase {
   capability: "weather_forecast";
   location: string;
+  /** Optional provider-compatible fallback alias; the human-facing location is attempted first. */
+  providerQuery?: string;
+  languageTag?: string;
 }
 
 export type CapabilityInvocation =
@@ -799,16 +802,22 @@ const weatherForecastAdapter: CapabilityAdapter<WeatherForecastInvocation> = {
   compile: (analysis) => {
     if (analysis.evidence.action !== "weather_forecast" || !analysis.evidence.locationLabel) return undefined;
     const base = baseInvocation("weather_forecast", analysis, primarySourcePolicy, false);
+    const languageTag = projectTrustedTurnAnalysis(analysis).languageTag;
+    const providerQuery = analysis.evidence.query?.trim();
     return base ? {
       ...base,
       capability: "weather_forecast",
       location: analysis.evidence.locationLabel,
+      ...(providerQuery ? { providerQuery } : {}),
+      ...(languageTag ? { languageTag } : {}),
     } : undefined;
   },
   execute: async (invocation, requesterId, runtime) => {
     if (!runtime.weatherForecastProvider) return failed(invocation, "invalid_target");
     const forecast = await runtime.weatherForecastProvider.forecast({
       location: invocation.location,
+      ...(invocation.providerQuery ? { lookupQuery: invocation.providerQuery } : {}),
+      ...(invocation.languageTag ? { languageTag: invocation.languageTag } : {}),
       requesterId,
     }).catch((error) => {
       console.warn("Typed forecast failed safely:", error instanceof Error ? error.message : error);

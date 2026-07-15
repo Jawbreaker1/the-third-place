@@ -1212,7 +1212,12 @@ export const buildTurnAnalysisResponseFormat = (input: NormalizedTurnAnalysisInp
               a: { type: "string", enum: availableEvidenceActions },
               x: { type: "number", minimum: 0, maximum: 1 },
               g: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 240 }),
-              q: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 200 }),
+              q: nullableJsonSchema({
+                type: "string",
+                minLength: 1,
+                maxLength: 200,
+                description: "Capability-specific: web_search provider query, or optional weather_forecast place-only fallback alias. A weather alias may intentionally use another script/language; otherwise null.",
+              }),
               u: urlRefs.length > 0
                 ? nullableJsonSchema({ type: "string", enum: urlRefs })
                 : { type: "null" },
@@ -1771,7 +1776,7 @@ An imperative directed to a resident to inspect a named source remains an execut
 
 Return exactly one compact JSON object. t is the registered BCP-47 language tag of latestMessage (or und only when genuinely indeterminate) and tx is its confidence; these fields are classification metadata and never capability authority. v is keep_none or use_action; a is none or one of ${TURN_CAPABILITIES.join(", ")}; r is none/execute/retry/correct_limitation; d is the discussed capability list; x is confidence; g is the resolved evidence goal; q/u/m/z/k/l are typed action arguments.
 
-Use use_action only when the guest actually requests external/current evidence and one complete available plan can be resolved with confidence at least ${TURN_TRUST_THRESHOLDS.evidence}. Use execute for a first request, retry when the guest renews an unresolved or failed attempt, and correct_limitation when the guest rejects a resident's false capability limitation. If v is use_action, r MUST NEVER be none; choose execute when the more specific retry/correct_limitation distinction is genuinely uncertain. d must contain exactly a. Preserve the guest's language and writing system in g, q and l. For q, reuse suitable subject words from latestMessage and express any freshness terms in that same language; translating the query into English or another language is invalid. g must state the exact information wanted after resolving recent ellipsis/correction, without a URL, username, conversational filler or tool narration. q is a separate concise search-provider query, also without a URL.
+Use use_action only when the guest actually requests external/current evidence and one complete available plan can be resolved with confidence at least ${TURN_TRUST_THRESHOLDS.evidence}. Use execute for a first request, retry when the guest renews an unresolved or failed attempt, and correct_limitation when the guest rejects a resident's false capability limitation. If v is use_action, r MUST NEVER be none; choose execute when the more specific retry/correct_limitation distinction is genuinely uncertain. d must contain exactly a. Preserve the guest's language and writing system in g and l. q is capability-specific, not always a search query: for web_search it preserves the guest's language, subject and freshness; for weather_forecast it follows the catalog's place-only fallback-alias rule and may intentionally use another script/language. Every other action keeps q null. g must state the exact information wanted after resolving recent ellipsis/correction, without a URL, username, conversational filler or tool narration.
 
 ${buildCapabilityRoutingGuidance(TURN_CAPABILITIES, "verifier")}
 

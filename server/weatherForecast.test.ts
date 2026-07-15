@@ -171,31 +171,208 @@ describe("structured weather forecast provider", () => {
       .resolves.toBeUndefined();
   });
 
-  it("rejects ambiguous and absent geocoding results without requesting a forecast", async () => {
-    for (const results of [
-      [],
-      [
-        geocodingResult({ name: "Göteborg" }),
-        geocodingResult({
-          id: 999,
-          name: "Göteborg",
-          latitude: 40.1,
-          longitude: -75.2,
-          country_code: "US",
-          country: "United States",
-        }),
-      ],
-    ]) {
-      const fetchImpl = vi.fn(async () => jsonResponse(geocodingPayload(results))) as unknown as typeof fetch;
-      const provider = new WeatherForecastProvider(fetchImpl);
-      await expect(provider.forecast({ location: "Göteborg" })).resolves.toBeUndefined();
-      expect(fetchImpl).toHaveBeenCalledTimes(1);
-    }
+  it("trusts the first validated exact result in the provider's ranked duplicate-name results", async () => {
+    const ranked = [
+      geocodingResult({
+        id: 2673730,
+        name: "Stockholm",
+        latitude: 59.32938,
+        longitude: 18.06871,
+        population: 1_515_017,
+        country: "Sweden",
+        country_code: "SE",
+      }),
+      geocodingResult({
+        id: 4979937,
+        name: "Stockholm",
+        latitude: 47.04226,
+        longitude: -68.13948,
+        population: 282,
+        country: "United States",
+        country_code: "US",
+        timezone: "America/New_York",
+      }),
+    ];
+    const fetchImpl = vi.fn(async (input: string | URL | Request) =>
+      new URL(String(input)).hostname === "geocoding-api.open-meteo.com"
+        ? jsonResponse(geocodingPayload(ranked))
+        : jsonResponse(forecastPayload())) as unknown as typeof fetch;
+    const provider = new WeatherForecastProvider(fetchImpl);
+
+    await expect(provider.forecast({ location: "Stockholm" })).resolves.toMatchObject({
+      query: "Stockholm",
+      resolved: {
+        place: "Stockholm",
+        country: "Sweden",
+        latitude: 59.32938,
+        longitude: 18.06871,
+      },
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it("rejects malformed geocoding envelopes and invalid location queries", async () => {
+  it("does not replace a localized first-ranked result with a later exact spelling", async () => {
+    const ranked = [
+      geocodingResult({
+        name: "Gothenburg",
+        latitude: 57.70716,
+        longitude: 11.96679,
+      }),
+      geocodingResult({
+        id: 999,
+        name: "Göteborg",
+        latitude: 40.1,
+        longitude: -75.2,
+        country_code: "US",
+        // Real geocoding result sets can contain lower-ranked physical
+        // features without country metadata; they must not invalidate a
+        // complete first-ranked place.
+        country: undefined,
+        timezone: "America/New_York",
+      }),
+    ];
+    const fetchImpl = (async (input: string | URL | Request) =>
+      new URL(String(input)).hostname === "geocoding-api.open-meteo.com"
+        ? jsonResponse(geocodingPayload(ranked))
+        : jsonResponse(forecastPayload())) as typeof fetch;
+
+    await expect(new WeatherForecastProvider(fetchImpl).forecast({
+      location: "Göteborg",
+      languageTag: "en",
+    })).resolves.toMatchObject({
+      resolved: {
+        place: "Gothenburg",
+        country: "Sweden",
+        latitude: 57.70716,
+        longitude: 11.96679,
+      },
+    });
+  });
+
+  it("rejects absent geocoding results without requesting a forecast", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(geocodingPayload([]))) as unknown as typeof fetch;
+    const provider = new WeatherForecastProvider(fetchImpl);
+    await expect(provider.forecast({ location: "Nowhere" })).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed instead of substituting a lower-ranked place when the winner is incomplete", async () => {
+    const results = [
+      geocodingResult({ country: undefined }),
+      geocodingResult({ name: "Lower-ranked complete place" }),
+    ];
+    const fetchImpl = vi.fn(async () => jsonResponse(geocodingPayload(results))) as unknown as typeof fetch;
+
+    await expect(new WeatherForecastProvider(fetchImpl).forecast({ location: "Gothenburg" }))
+      .resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a localized provider language and canonical lookup alias while preserving the display query", async () => {
+    const requested: URL[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      requested.push(url);
+      if (url.hostname === "geocoding-api.open-meteo.com") {
+        return url.searchParams.get("name") === "札幌"
+          ? jsonResponse(geocodingPayload([]))
+          : jsonResponse(geocodingPayload([geocodingResult({
+            id: 2128295,
+            name: "札幌市",
+            latitude: 43.06417,
+            longitude: 141.34694,
+            country_code: "JP",
+            country: "日本",
+            admin1: "北海道",
+            timezone: "Asia/Tokyo",
+          })]));
+      }
+      return jsonResponse({ ...forecastPayload(), timezone: "Japan" });
+    }) as typeof fetch;
+    const provider = new WeatherForecastProvider(fetchImpl);
+
+    const result = await provider.forecast({
+      location: "札幌",
+      lookupQuery: "Sapporo",
+      languageTag: "ja-JP",
+      requesterId: "human-ja",
+    });
+
+    expect(result).toMatchObject({
+      query: "札幌",
+      resolved: {
+        place: "札幌市",
+        country: "日本",
+        timezone: "Asia/Tokyo",
+      },
+    });
+    expect(requested.slice(0, 2).map((url) => Object.fromEntries(url.searchParams))).toEqual([
+      expect.objectContaining({ name: "札幌", language: "ja" }),
+      expect.objectContaining({ name: "Sapporo", language: "ja" }),
+    ]);
+  });
+
+  it("uses a model alias only as fallback and cannot replace a valid human-facing location", async () => {
+    const requested: URL[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      requested.push(url);
+      return url.hostname === "geocoding-api.open-meteo.com"
+        ? jsonResponse(geocodingPayload([geocodingResult({ name: "Göteborg" })]))
+        : jsonResponse(forecastPayload());
+    }) as typeof fetch;
+
+    await expect(new WeatherForecastProvider(fetchImpl).forecast({
+      location: "Göteborg",
+      lookupQuery: "Gothenburg",
+      languageTag: "sv",
+    })).resolves.toMatchObject({
+      query: "Göteborg",
+      resolved: { place: "Göteborg", country: "Sweden" },
+    });
+    expect(requested.filter((url) => url.hostname === "geocoding-api.open-meteo.com"))
+      .toHaveLength(1);
+    expect(requested[0]?.searchParams.get("name")).toBe("Göteborg");
+  });
+
+  it("ignores an invalid optional alias instead of invalidating a valid location", async () => {
+    const requested: URL[] = [];
+    const provider = new WeatherForecastProvider(successfulFetch(requested));
+
+    await expect(provider.forecast({
+      location: "Stockholm",
+      lookupQuery: "...",
+      languageTag: "sv",
+    })).resolves.toBeDefined();
+    expect(requested[0]?.searchParams.get("name")).toBe("Stockholm");
+    expect(requested).toHaveLength(2);
+  });
+
+  it("allows additive provider fields while validating all consumed fields", async () => {
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.hostname === "geocoding-api.open-meteo.com") {
+        return jsonResponse({
+          ...geocodingPayload([{ ...geocodingResult(), provider_added_field: { version: 2 } }]),
+          provider_added_envelope_field: true,
+        });
+      }
+      const forecast = forecastPayload();
+      return jsonResponse({
+        ...forecast,
+        provider_added_field: "safe",
+        daily_units: { ...forecast.daily_units, provider_added_unit: "index" },
+        daily: { ...forecast.daily, provider_added_series: [1, 2, 3, 4, 5, 6, 7] },
+      });
+    }) as typeof fetch;
+
+    await expect(new WeatherForecastProvider(fetchImpl).forecast({ location: "Göteborg" }))
+      .resolves.toBeDefined();
+  });
+
+  it("rejects malformed consumed geocoding fields and invalid location queries", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({
-      results: [{ ...geocodingResult(), unexpected: "field" }],
+      results: [{ ...geocodingResult(), latitude: "57.7" }],
       generationtime_ms: 0.1,
     })) as unknown as typeof fetch;
     const provider = new WeatherForecastProvider(fetchImpl);
@@ -242,6 +419,38 @@ describe("structured weather forecast provider", () => {
     expect(concurrent).toBe(first);
     expect(cached).toBe(first);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("keys cached and in-flight work by effective lookup query and provider language", async () => {
+    const requested: URL[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      requested.push(url);
+      if (url.hostname !== "geocoding-api.open-meteo.com") return jsonResponse(forecastPayload());
+      const name = url.searchParams.get("name");
+      return name === "札幌"
+        ? jsonResponse(geocodingPayload([]))
+        : jsonResponse(geocodingPayload([geocodingResult({ name })]));
+    }) as unknown as typeof fetch;
+    const provider = new WeatherForecastProvider(fetchImpl);
+
+    await provider.forecast({ location: "札幌", lookupQuery: "Sapporo", languageTag: "ja-JP" });
+    await provider.forecast({ location: "札幌", lookupQuery: "Sapporo", languageTag: "ja-JP" });
+    await provider.forecast({ location: "札幌", lookupQuery: "Sapporo", languageTag: "en-GB" });
+    await provider.forecast({ location: "札幌", lookupQuery: "Sapporo City", languageTag: "ja-JP" });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(9);
+    expect(requested.filter((url) => url.hostname === "geocoding-api.open-meteo.com").map((url) => ({
+      name: url.searchParams.get("name"),
+      language: url.searchParams.get("language"),
+    }))).toEqual([
+      { name: "札幌", language: "ja" },
+      { name: "Sapporo", language: "ja" },
+      { name: "札幌", language: "en" },
+      { name: "Sapporo", language: "en" },
+      { name: "札幌", language: "ja" },
+      { name: "Sapporo City", language: "ja" },
+    ]);
   });
 
   it("enforces both requester and global logical-request limits", async () => {

@@ -76,12 +76,16 @@ describe("declarative capability catalog", () => {
     { capability: "web_search", values: { q: "今日のニュース", m: "news" } },
     { capability: "market_snapshot", values: { l: "SE_OMXS30" } },
     { capability: "local_datetime", values: { z: "Asia/Tokyo", k: "current_time", l: "東京" } },
-    { capability: "weather_forecast", values: { l: "Ciudad de México" } },
+    { capability: "weather_forecast", values: { l: "札幌", q: "Sapporo" } },
   ])("accepts only the declared argument shape for $capability", ({ capability, values }) => {
     const valid = validateCapabilityArgumentShape(capability, { ...emptyArguments(), ...values });
     expect(valid).toEqual({ valid: true, missing: [], forbidden: [], conditional: [], invalidValue: [] });
 
-    const foreignField = capability === "web_search" ? { l: "extra" } : { q: "extra" };
+    const foreignField = capability === "web_search"
+      ? { l: "extra" }
+      : capability === "weather_forecast"
+        ? { m: "web" }
+        : { q: "extra" };
     const invalid = validateCapabilityArgumentShape(capability, {
       ...emptyArguments(),
       ...values,
@@ -90,6 +94,27 @@ describe("declarative capability catalog", () => {
     expect(invalid.valid).toBe(false);
     expect(invalid.forbidden).not.toEqual([]);
     expect(invalid.message).toBe(CAPABILITY_CATALOG[capability].validationMessage);
+  });
+
+  it("keeps weather display labels separate from an optional canonical geocoding alias", () => {
+    expect(validateCapabilityArgumentShape("weather_forecast", {
+      ...emptyArguments(),
+      l: "Stockholm",
+    }).valid).toBe(true);
+    expect(validateCapabilityArgumentShape("weather_forecast", {
+      ...emptyArguments(),
+      l: "Stockholm",
+      q: "Stockholm",
+    }).valid).toBe(true);
+    expect(validateCapabilityArgumentShape("weather_forecast", {
+      ...emptyArguments(),
+      l: "札幌",
+      q: "Sapporo",
+    }).valid).toBe(true);
+    expect(validateCapabilityArgumentShape("weather_forecast", {
+      ...emptyArguments(),
+      q: "Sapporo",
+    })).toMatchObject({ valid: false, missing: ["l"] });
   });
 
   it("accepts only canonical exact-index and fixed-basket market targets", () => {
@@ -145,7 +170,11 @@ describe("declarative capability catalog", () => {
   it("generates both router audiences from the selected static catalog entries", () => {
     const primary = buildCapabilityRoutingGuidance(["read_url", "weather_forecast"], "primary");
     expect(primary).toContain("- read_url: select exactly one opaque urlCandidates.ref");
-    expect(primary).toContain("- weather_forecast: use for current conditions");
+    expect(primary).toContain("- weather_forecast: use for a current-day or future daily weather forecast");
+    expect(primary).toContain("q is optional and may contain only a short canonical geocoding alias");
+    expect(primary).toContain("local/non-Latin-script place name");
+    expect(primary).toContain("Never drop or weaken a region/country qualification");
+    expect(primary).toContain("q is never a weather search query");
     expect(primary).not.toContain("- web_search:");
 
     const verifier = buildCapabilityRoutingGuidance(["web_search", "local_datetime"], "verifier");

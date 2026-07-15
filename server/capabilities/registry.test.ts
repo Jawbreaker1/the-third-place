@@ -229,6 +229,9 @@ interface AnalysisOverrides {
   timeZone?: string | null;
   timeKind?: TurnAnalysis["evidence"]["timeKind"];
   locationLabel?: string | null;
+  languageTag?: string;
+  responseLanguageTag?: string;
+  languageConfidence?: number;
 }
 
 const analysisFor = (
@@ -240,8 +243,14 @@ const analysisFor = (
     ...fallback,
     source: overrides.source ?? "lm",
     failureReason: null,
-    language: { tag: "sv", confidence: 0.99 },
-    responseLanguage: { tag: "sv", confidence: 0.99 },
+    language: {
+      tag: overrides.languageTag ?? "sv",
+      confidence: overrides.languageConfidence ?? 0.99,
+    },
+    responseLanguage: {
+      tag: overrides.responseLanguageTag ?? overrides.languageTag ?? "sv",
+      confidence: overrides.languageConfidence ?? 0.99,
+    },
     evidence: {
       ...fallback.evidence,
       need: "required",
@@ -755,7 +764,11 @@ describe("capability registry contract", () => {
     const success = await registry.execute(invocation, "guest-1");
     const failure = await registry.execute(invocation, "guest-1");
 
-    expect(weather.forecast).toHaveBeenNthCalledWith(1, { location: "G\u00f6teborg", requesterId: "guest-1" });
+    expect(weather.forecast).toHaveBeenNthCalledWith(1, {
+      location: "G\u00f6teborg",
+      languageTag: "sv",
+      requesterId: "guest-1",
+    });
     expect(success).toMatchObject({
       state: "grounding_available",
       research: { kind: "weather", results: [{ id: "S1", title: expect.stringContaining("G\u00f6teborg") }] },
@@ -770,6 +783,63 @@ describe("capability registry contract", () => {
     expect(failure).not.toHaveProperty("research");
     expect(researchBroker.research).not.toHaveBeenCalled();
     expect(researchBroker.researchSite).not.toHaveBeenCalled();
+  });
+
+  it("compiles optional weather aliases without replacing the display location and propagates trusted language", async () => {
+    const weather = { forecast: vi.fn(async () => forecast) };
+    const { registry } = createHarness({ weather });
+
+    const plain = registry.compile(analysisFor("weather_forecast", {
+      locationLabel: "Stockholm",
+      query: null,
+    }), compileContext())!;
+    expect(plain).toMatchObject({
+      capability: "weather_forecast",
+      location: "Stockholm",
+      languageTag: "sv",
+    });
+    expect(plain).not.toHaveProperty("providerQuery");
+
+    const simpleAlias = registry.compile(analysisFor("weather_forecast", {
+      locationLabel: "Stockholm",
+      query: "Stockholm",
+    }), compileContext())!;
+    expect(simpleAlias).toMatchObject({
+      capability: "weather_forecast",
+      location: "Stockholm",
+      providerQuery: "Stockholm",
+      languageTag: "sv",
+    });
+
+    const nativeLabel = registry.compile(analysisFor("weather_forecast", {
+      locationLabel: "札幌",
+      query: "Sapporo",
+      languageTag: "ja",
+      responseLanguageTag: "ja",
+    }), compileContext())!;
+    expect(nativeLabel).toMatchObject({
+      capability: "weather_forecast",
+      location: "札幌",
+      providerQuery: "Sapporo",
+      languageTag: "ja",
+    });
+
+    const untrustedLanguage = registry.compile(analysisFor("weather_forecast", {
+      locationLabel: "Stockholm",
+      query: null,
+      languageTag: "sv",
+      responseLanguageTag: "sv",
+      languageConfidence: 0.69,
+    }), compileContext())!;
+    expect(untrustedLanguage).not.toHaveProperty("languageTag");
+
+    await registry.execute(nativeLabel, "guest-ja");
+    expect(weather.forecast).toHaveBeenCalledWith({
+      location: "札幌",
+      lookupQuery: "Sapporo",
+      languageTag: "ja",
+      requesterId: "guest-ja",
+    });
   });
 
   it("resolves and refreshes a deterministic server clock without sources", async () => {
