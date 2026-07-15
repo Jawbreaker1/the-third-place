@@ -501,7 +501,7 @@ describe("multilingual semantic router contract", () => {
     expect(JSON.stringify(hint)).not.toContain("secret");
   });
 
-  it("canonicalizes harmless read_url union noise only for a known opaque target", () => {
+  it("canonicalizes harmless read_url union noise while preserving a root same-site mode", () => {
     const compact = {
       l: "sv",
       lx: 0.99,
@@ -540,9 +540,25 @@ describe("multilingual semantic router contract", () => {
         goal: "vad webbplatsen aiai3d handlar om",
         query: null,
         urlRef: "latest:0",
-        searchMode: null,
+        searchMode: "web",
       },
     });
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compact,
+      e: { ...compact.e, m: "news" },
+    }), knownTarget)).toMatchObject({ evidence: { searchMode: "news" } });
+
+    const deepTarget = input({
+      urlCandidates: [{
+        ref: "latest:0",
+        source: "latest_message",
+        context: "host=aiai3d.io; path=/portfolio; source=message",
+      }],
+    });
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compact,
+      e: { ...compact.e, m: "news" },
+    }), deepTarget)).toMatchObject({ evidence: { searchMode: null } });
     expect(parseTurnAnalysisContent(JSON.stringify({
       ...compact,
       e: { ...compact.e, g: "https://aiai3d.io/portfolio" },
@@ -557,6 +573,45 @@ describe("multilingual semantic router contract", () => {
         e: { ...compact.e, g: goal },
       }), knownTarget)).toBeUndefined();
     }
+  });
+
+  it("accepts descriptive read_url discovery mode only for a structural root candidate", () => {
+    const rootRead = modelOutput();
+    rootRead.evidence = {
+      need: "required",
+      action: "read_url",
+      confidence: 0.98,
+      goal: "senaste nyheterna på webbplatsen",
+      query: null,
+      urlRef: "latest:0",
+      searchMode: "news",
+      timeZone: null,
+      timeKind: null,
+      locationLabel: null,
+    };
+    rootRead.capabilities = {
+      ...rootRead.capabilities,
+      discussed: ["read_url"],
+      requestKind: "execute",
+    };
+    const rootTarget = input({
+      urlCandidates: [{
+        ref: "latest:0",
+        source: "latest_message",
+        context: "host=example.com; path=/; source=message",
+      }],
+    });
+    const deepTarget = input({
+      urlCandidates: [{
+        ref: "latest:0",
+        source: "latest_message",
+        context: "host=example.com; path=/news/today; source=message",
+      }],
+    });
+
+    expect(parseTurnAnalysisContent(JSON.stringify(rootRead), rootTarget))
+      .toMatchObject({ evidence: { action: "read_url", searchMode: "news" } });
+    expect(parseTurnAnalysisContent(JSON.stringify(rootRead), deepTarget)).toBeUndefined();
   });
 
   it("does not turn a relevant specialist into an addressed reply target", () => {
@@ -844,6 +899,9 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("valid IANA time-zone name");
     expect(prompt).toContain("Never output, reconstruct or copy a URL");
     expect(prompt).toContain("the candidate host is never a provider query");
+    expect(prompt).toContain("candidate context field path=/ marks a root page");
+    expect(prompt).toContain("set m to news for actual news/current-events intent and otherwise web");
+    expect(prompt).toContain("For a non-root exact/deep page");
     expect(prompt).toContain("real external link or reachable destination requested as the deliverable itself");
     expect(prompt).toContain("even when grammatically negative or rhetorical");
     expect(prompt).toContain("never select a tool while leaving c.d empty or c.r none");
@@ -1248,8 +1306,29 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       m: "web",
     }), verifierInput)).toMatchObject({
       capabilities: { requestKind: "execute" },
-      evidence: { goal: "sidans viktigaste uppgift på example", searchMode: null },
+      evidence: { goal: "sidans viktigaste uppgift på example", searchMode: "web" },
     });
+    const rootNews = parseEvidencePlanVerifierContent(
+      JSON.stringify({ ...valid, m: "news" }),
+      verifierInput,
+    );
+    expect(projectEvidencePlanVerification(rootNews)).toMatchObject({
+      decision: "use_action",
+      evidence: { action: "read_url", searchMode: "news" },
+    });
+
+    const deepVerifierInput = createEvidencePlanVerifierInput(stockTurn("kolla länken", {
+      availableCapabilities: ["read_url"],
+      urlCandidates: [{
+        ref: "latest:0",
+        source: "latest_message",
+        context: "host=example.com; path=/news/today; source=message",
+      }],
+    }), primarySummary());
+    expect(parseEvidencePlanVerifierContent(
+      JSON.stringify({ ...valid, m: "news" }),
+      deepVerifierInput,
+    )).toMatchObject({ evidence: { action: "read_url", searchMode: null } });
     expect(parseEvidencePlanVerifierContent(
       JSON.stringify({ ...valid, r: "none", g: "sidans viktigaste uppgift på example.com", m: "web" }),
       verifierInput,
@@ -1312,6 +1391,9 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(prompt).toContain("confidence just below the trust threshold");
     expect(prompt).toContain("Preserve the guest's language and script");
     expect(prompt).toContain("never copy or search the candidate host/domain in g or q");
+    expect(prompt).toContain("candidate context field path=/ marks a root page");
+    expect(prompt).toContain("set m to news for actual news/current-events intent and otherwise web");
+    expect(prompt).toContain("For a non-root exact/deep page");
     expect(prompt).toContain("self-contained question, social or creative request, passive link");
     expect(prompt).toContain("pure capability-availability question");
     expect(prompt).toContain("explicit instruction not to execute");

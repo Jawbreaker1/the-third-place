@@ -321,6 +321,7 @@ describe("social director", () => {
       query: goal,
       mode: "web",
       requesterId: human.id,
+      cachePolicy: "default",
     });
     expect(read).not.toHaveBeenCalled();
 
@@ -353,6 +354,192 @@ describe("social director", () => {
     )).resolves.toEqual(rootPacket);
     expect(researchSite).not.toHaveBeenCalled();
     expect(read).toHaveBeenCalledTimes(1);
+    director.stop();
+  });
+
+  it("preserves semantic news mode for structural root discovery and rejects root-only evidence", async () => {
+    const human = {
+      id: "guest-structural-root",
+      name: "Guest",
+      kind: "human" as const,
+      status: "online" as const,
+      avatar: { color: "#123", accent: "#456", glyph: "G" },
+    };
+    const rootUrl = new URL("https://example.test/");
+    const deepUrl = new URL("https://example.test/items/42");
+    const requestedAt = "2026-07-15T10:00:00.000Z";
+    const goal = "latest published items";
+    const quality = (
+      classification: "root_only" | "fresh_results",
+      rootResultCount: number,
+      deepLinkResultCount: number,
+      freshResultCount: number,
+    ) => ({
+      classification,
+      resultCount: rootResultCount + deepLinkResultCount,
+      rootResultCount,
+      deepLinkResultCount,
+      datedResultCount: freshResultCount,
+      freshResultCount,
+    });
+    const rootOnlyPacket = {
+      kind: "search" as const,
+      query: `site:example.test ${goal}`,
+      retrievedAt: requestedAt,
+      results: [{ id: "S1", title: "Example", url: rootUrl.toString(), snippet: "General landing page." }],
+      search: {
+        scope: "site" as const,
+        requestedMode: "news" as const,
+        providerMode: "web" as const,
+        site: { host: "example.test", quality: quality("root_only", 1, 0, 0) },
+      },
+    };
+    const specificPacket = {
+      kind: "search" as const,
+      query: `site:example.test ${goal}`,
+      retrievedAt: requestedAt,
+      results: [{
+        id: "S1",
+        title: "Specific item",
+        url: deepUrl.toString(),
+        snippet: "A concrete recent item.",
+        publishedAt: "2026-07-15T09:30:00.000Z",
+      }],
+      search: {
+        scope: "site" as const,
+        requestedMode: "news" as const,
+        providerMode: "web" as const,
+        site: { host: "example.test", quality: quality("fresh_results", 0, 1, 1) },
+      },
+    };
+    const pageFallback = {
+      kind: "page" as const,
+      query: goal,
+      retrievedAt: requestedAt,
+      results: [{ id: "S1", title: "Example root", url: rootUrl.toString(), snippet: "Readable root content." }],
+    };
+    const researchSite = vi.fn()
+      .mockResolvedValueOnce(rootOnlyPacket)
+      .mockResolvedValueOnce(specificPacket);
+    const read = vi.fn(async () => pageFallback);
+    const resolveTarget = vi.fn(({ intent, retry }: { intent: string; retry?: boolean }) => ({
+      url: rootUrl,
+      requestedAt,
+      intent,
+      retry: retry === true,
+      source: "message" as const,
+    }));
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-structural-root-news-unused.json"),
+      {} as never,
+      new ActorChannelRuntime(),
+      { research: vi.fn(), researchSite } as never,
+      {
+        getRelation: vi.fn(() => undefined),
+        updateRelation: vi.fn(),
+        promptNote: vi.fn(() => undefined),
+        noteClassifiedMemoryFact: vi.fn(),
+      } as never,
+      () => [human, ...PERSONAS],
+      () => 1,
+      { pageReader: { resolveTarget, read } as never },
+    );
+    const candidateSet = {
+      requestedAt,
+      candidates: [{
+        id: "U1" as const,
+        raw: rootUrl.toString(),
+        url: rootUrl,
+        supported: true,
+        source: "message" as const,
+        messageId: "root-message",
+        authorId: human.id,
+        createdAt: requestedAt,
+      }],
+    };
+    const analysis = classifiedTurn({
+      intent: { kind: "other", isQuestion: false, replyExpected: "optional", confidence: 0 },
+      evidence: {
+        need: "required",
+        action: "read_url",
+        confidence: 0.99,
+        goal,
+        query: null,
+        urlRef: "U1",
+        searchMode: "news",
+        timeZone: null,
+        timeKind: null,
+        locationLabel: null,
+      },
+      capabilities: {
+        discussed: ["read_url"],
+        requestKind: "retry",
+        asksAboutAcoustics: false,
+        asksAboutAiIdentity: false,
+        asksForList: false,
+        confidence: 0.99,
+      },
+    });
+    const internal = director as unknown as {
+      classifiedToolPlan: (
+        turn: TurnAnalysis,
+        candidates: typeof candidateSet,
+        rawIntent: string,
+        requesterId: string,
+      ) => {
+        pageReadRequest?: {
+          url?: URL;
+          requestedAt: string;
+          intent: string;
+          retry: boolean;
+          source: "message" | "reply" | "recent";
+        };
+        siteResearch?: { goal: string; mode: "web" | "news" };
+      };
+      resolveRequestedEvidence: (
+        page: {
+          url?: URL;
+          requestedAt: string;
+          intent: string;
+          retry: boolean;
+          source: "message" | "reply" | "recent";
+        } | undefined,
+        search: undefined,
+        requesterId: string,
+        site?: { goal: string; mode: "web" | "news" },
+      ) => Promise<unknown>;
+    };
+
+    const plan = internal.classifiedToolPlan(analysis, candidateSet, "inspect the supplied source", human.id);
+    expect(plan.siteResearch).toEqual({ goal, mode: "news" });
+    expect(plan.pageReadRequest?.retry).toBe(true);
+
+    await expect(internal.resolveRequestedEvidence(
+      plan.pageReadRequest,
+      undefined,
+      human.id,
+      plan.siteResearch,
+    )).resolves.toEqual(pageFallback);
+    expect(read).toHaveBeenCalledTimes(1);
+
+    await expect(internal.resolveRequestedEvidence(
+      plan.pageReadRequest,
+      undefined,
+      human.id,
+      plan.siteResearch,
+    )).resolves.toEqual(specificPacket);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(researchSite).toHaveBeenCalledTimes(2);
+    for (const [request] of researchSite.mock.calls) {
+      expect(request).toEqual({
+        url: rootUrl,
+        query: goal,
+        mode: "news",
+        requesterId: human.id,
+        cachePolicy: "bypass",
+      });
+    }
     director.stop();
   });
 
@@ -485,6 +672,312 @@ describe("social director", () => {
       expect(failed.reply.content).toBe("Jag fick inte fram just den sidan den här gången.");
       expect(failed.reply.sources).toEqual([]);
       expect(failed.reply.content).not.toContain("bold thing");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("combines rapid DM messages in order and replies once to the latest message", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-dm-burst",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-juno")!;
+      const store = new RoomStore("/tmp/director-dm-burst-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const first = store.addDmMessage(thread.id, human.id, "first part")!;
+      const second = store.addDmMessage(thread.id, human.id, "second part")!;
+      const analyzeTurn = vi.fn(async () => classifiedTurn());
+      const generateScene = vi.fn(async (request: {
+        trigger: { content: string; messageId: string };
+        history: Array<{ content: string }>;
+        requestOwnerIds: string[];
+      }) => [{
+        personaId: persona.id,
+        content: "one combined answer",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const rememberDeliveredLine = vi.fn();
+      const emit = vi.fn();
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        { analyzeTurn, generateScene, rememberDeliveredLine } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          dmDebounceMs: 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const firstPending = director.onDirectMessage(first, human, persona);
+      const secondPending = director.onDirectMessage(second, human, persona);
+      await vi.runAllTimersAsync();
+      await Promise.all([firstPending, secondPending]);
+      director.stop();
+
+      expect(analyzeTurn).toHaveBeenCalledTimes(1);
+      const analyzerInput = analyzeTurn.mock.calls[0]![0];
+      expect(analyzerInput.latestMessage.id).toBe(second.id);
+      expect(analyzerInput.latestMessage.content).toBe("second part");
+      expect(analyzerInput.recentMessages.map((message: { id: string }) => message.id)).toContain(first.id);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(generateScene.mock.calls[0]![0].trigger).toMatchObject({
+        content: "first part\nsecond part",
+        messageId: second.id,
+      });
+      const aiReplies = store.getDmMessages(thread.id).filter((message) => message.authorId === persona.id);
+      expect(aiReplies).toHaveLength(1);
+      expect(aiReplies[0]).toMatchObject({
+        content: "one combined answer",
+        replyToId: second.id,
+      });
+      expect(rememberDeliveredLine).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("supersedes a slow DM generation and never publishes its stale output", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-dm-supersede",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-juno")!;
+      const store = new RoomStore("/tmp/director-dm-supersede-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const first = store.addDmMessage(thread.id, human.id, "old turn")!;
+      let resolveOld!: (lines: Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>) => void;
+      const oldResult = new Promise<Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>>((resolve) => {
+        resolveOld = resolve;
+      });
+      let oldSignal: AbortSignal | undefined;
+      const generateScene = vi.fn((request: {
+        trigger: { content: string; messageId: string };
+      }, _priority: number, signal?: AbortSignal) => {
+        if (generateScene.mock.calls.length === 1) {
+          oldSignal = signal;
+          return oldResult;
+        }
+        return Promise.resolve([{
+          personaId: persona.id,
+          content: "current output",
+          source: "lm" as const,
+          sourceIds: [],
+        }]);
+      });
+      const rememberDeliveredLine = vi.fn();
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine,
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          dmDebounceMs: 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const firstPending = director.onDirectMessage(first, human, persona);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(oldSignal?.aborted).toBe(false);
+
+      const second = store.addDmMessage(thread.id, human.id, "new turn")!;
+      const secondPending = director.onDirectMessage(second, human, persona);
+      expect(oldSignal?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.all([firstPending, secondPending]);
+
+      expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(generateScene.mock.calls[1]![0].trigger).toMatchObject({
+        content: "old turn\nnew turn",
+        messageId: second.id,
+      });
+      let aiReplies = store.getDmMessages(thread.id).filter((message) => message.authorId === persona.id);
+      expect(aiReplies).toHaveLength(1);
+      expect(aiReplies[0]).toMatchObject({ content: "current output", replyToId: second.id });
+
+      resolveOld([{
+        personaId: persona.id,
+        content: "stale output",
+        source: "lm",
+        sourceIds: [],
+      }]);
+      await Promise.resolve();
+      await Promise.resolve();
+      aiReplies = store.getDmMessages(thread.id).filter((message) => message.authorId === persona.id);
+      expect(aiReplies).toHaveLength(1);
+      expect(aiReplies[0]?.content).not.toBe("stale output");
+      expect(rememberDeliveredLine).toHaveBeenCalledTimes(1);
+      director.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps verifier-recovered DM and public evidence responders as the sole request owner", async () => {
+    vi.useFakeTimers();
+    const fixedNow = Date.parse("2026-07-15T10:20:30.000Z");
+    try {
+      const human = {
+        id: "guest-recovered-evidence-owner",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+      const recoveredEvidenceTurn = classifiedTurn({
+        // This is the shape produced when the independent evidence verifier
+        // recovers an executable plan from an invalid primary classification:
+        // evidence is trusted, while the fail-closed primary intent is not.
+        intent: { kind: "other", isQuestion: false, replyExpected: "optional", confidence: 0 },
+        evidence: {
+          need: "required",
+          action: "local_datetime",
+          confidence: 0.99,
+          goal: "current community time",
+          query: null,
+          urlRef: null,
+          searchMode: null,
+          timeZone: "Europe/Stockholm",
+          timeKind: "current_time",
+          locationLabel: "community host",
+        },
+        capabilities: {
+          discussed: ["local_datetime"],
+          requestKind: "execute",
+          asksAboutAcoustics: false,
+          asksAboutAiIdentity: false,
+          asksForList: false,
+          confidence: 0.99,
+        },
+      });
+      const store = new RoomStore("/tmp/director-recovered-evidence-owner-unused.json");
+      const requests: Array<{
+        kind: string;
+        selected: Array<(typeof PERSONAS)[number]>;
+        mustReplyIds: string[];
+        requestOwnerIds: string[];
+        semanticContext?: { intentTrusted?: boolean };
+        temporalSurfaceActorId?: string;
+      }> = [];
+      const generateScene = vi.fn(async (request: {
+        kind: string;
+        selected: Array<(typeof PERSONAS)[number]>;
+        mustReplyIds: string[];
+        requestOwnerIds: string[];
+        semanticContext?: { intentTrusted?: boolean };
+        temporalSurfaceActorId?: string;
+      }) => {
+        requests.push(request);
+        const owner = request.requestOwnerIds[0] ?? request.selected[0]!.id;
+        return [{
+          personaId: owner,
+          content: "The trusted clock has an answer.",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => recoveredEvidenceTurn),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => fixedNow,
+          rng: () => 0.99,
+          dmDebounceMs: 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(fixedNow).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const thread = store.openDm(human.id, persona.id);
+      const dmMessage = store.addDmMessage(thread.id, human.id, "answer with trusted evidence")!;
+      const dmPending = director.onDirectMessage(dmMessage, human, persona);
+      await vi.runAllTimersAsync();
+      await dmPending;
+
+      const publicMessage = createMessage("lobby", human.id, "@Mira answer with trusted evidence");
+      store.addPublicMessage(publicMessage);
+      const publicPending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof publicMessage>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([publicMessage], human);
+      await vi.runAllTimersAsync();
+      await publicPending;
+      director.stop();
+
+      expect(requests.map((request) => request.kind)).toEqual(["dm", "public"]);
+      for (const request of requests) {
+        expect(request.semanticContext?.intentTrusted).toBe(false);
+        expect(request.requestOwnerIds).toEqual([persona.id]);
+        expect(request.requestOwnerIds).toHaveLength(1);
+        expect(request.mustReplyIds).toContain(persona.id);
+        expect(request.temporalSurfaceActorId).toBe(persona.id);
+      }
     } finally {
       vi.useRealTimers();
     }

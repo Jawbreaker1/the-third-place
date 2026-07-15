@@ -189,6 +189,12 @@ export interface SceneRequest {
   wordLimits?: Record<string, { minimum: number; maximum: number }>;
   /** Mutable per-event budget shared by primary and focused retries; never serialized to the model. */
   humanizerBudget?: { repairsRemaining: number };
+  /**
+   * Mutable per-turn budget for one fully reviewed recovery generation. It is
+   * shared with any director-level focused pass so a missing required actor
+   * cannot create an unbounded retry ladder. Never serialized to the model.
+   */
+  responseRecoveryBudget?: { retriesRemaining: number };
   channelId?: string;
   channelName: string;
   selected: Persona[];
@@ -1076,12 +1082,16 @@ export class LmStudioClient {
     return true;
   }
 
-  private dropQueuedStalePublicScenes(channelId: string, reason: string): void {
+  private dropQueuedStaleScenes(
+    channelId: string,
+    kind: "public" | "dm",
+    reason: string,
+  ): void {
     const retained: QueueItem[] = [];
     for (const item of this.queue) {
       if (
         item.type === "scene" &&
-        item.request.kind === "public" &&
+        item.request.kind === kind &&
         item.request.channelId === channelId
       ) {
         item.reject(new Error(reason));
@@ -1092,25 +1102,55 @@ export class LmStudioClient {
     this.queue = retained;
   }
 
+  private dropQueuedStaleTurnAnalyses(
+    channelId: string,
+    medium: "public" | "dm",
+    reason: string,
+  ): void {
+    const retained: QueueItem[] = [];
+    for (const item of this.queue) {
+      if (
+        item.type === "turn-analysis" &&
+        item.input.medium === medium &&
+        item.input.channel.id === channelId
+      ) item.reject(new Error(reason));
+      else retained.push(item);
+    }
+    this.queue = retained;
+  }
+
   private enqueueTurnAnalysis(input: NormalizedTurnAnalysisInput): Promise<TurnAnalysis> {
     if (!this.enabled) return Promise.resolve(createFailClosedTurnAnalysis("disabled"));
 
-    const stalePublicReason = "Stale public generation yielded to a newer same-channel turn";
-    if (input.medium === "public") {
-      this.dropQueuedStalePublicScenes(input.channel.id, stalePublicReason);
+    const liveTextMedium = input.medium === "public" || input.medium === "dm"
+      ? input.medium
+      : undefined;
+    const staleLiveReason = liveTextMedium
+      ? `Stale ${liveTextMedium} generation yielded to a newer same-channel turn`
+      : "";
+    if (liveTextMedium) {
+      this.dropQueuedStaleScenes(input.channel.id, liveTextMedium, staleLiveReason);
+      this.dropQueuedStaleTurnAnalyses(input.channel.id, liveTextMedium, staleLiveReason);
     }
     if (this.activeScene?.request.kind === "ambient") {
       this.activeSceneAbort?.abort(new Error("Ambient generation yielded to semantic turn analysis"));
     } else if (
-      input.medium === "public" &&
-      this.activeScene?.request.kind === "public" &&
+      liveTextMedium &&
+      this.activeScene?.request.kind === liveTextMedium &&
       this.activeScene.request.channelId === input.channel.id
     ) {
       // A newer public message advances the director's per-channel epoch, so
       // the active scene can no longer be published. Abort that provably stale
       // work immediately; otherwise it can occupy the single local model long
       // enough for the newer turn router to hit its own hard deadline.
-      this.activeSceneAbort?.abort(new Error(stalePublicReason));
+      this.activeSceneAbort?.abort(new Error(staleLiveReason));
+    }
+    if (
+      liveTextMedium &&
+      this.activeTurnAnalysis?.input.medium === liveTextMedium &&
+      this.activeTurnAnalysis.input.channel.id === input.channel.id
+    ) {
+      this.activeTurnAnalysisAbort?.abort(new Error(staleLiveReason));
     }
     this.abortActiveMemoryAnalysis("Persistent memory yielded to semantic turn analysis");
     if (this.queue.length >= 8) {
@@ -1589,23 +1629,41 @@ export class LmStudioClient {
         console.warn("Candidate review unavailable; applying publication fallback:", error instanceof Error ? error.message : error);
       }
     }
-    if (reviewUnavailable) return [];
-    const humanizedLines = await this.humanizeSceneLines(request, lines, model, signal, semanticReviews);
+    // Never publish unreviewed text. A first-pass reviewer outage may still use
+    // the same bounded, fully reviewed recovery path as a rejected/empty
+    // required response; a second outage in that recovery remains fail-closed.
+    if (reviewUnavailable && !allowRequestOwnerRetry) return [];
+    const humanizedLines = reviewUnavailable
+      ? []
+      : await this.humanizeSceneLines(request, lines, model, signal, semanticReviews);
 
     const deliveredIds = new Set(humanizedLines.map((line) => line.personaId));
-    const missingOwnerIds = explicitRequestOwnerIds(request).filter((personaId) => !deliveredIds.has(personaId));
+    const explicitOwnerIds = explicitRequestOwnerIds(request);
+    const soleRequiredDmIds = request.kind === "dm" && request.selected.length === 1
+      ? request.selected
+          .filter((persona) => request.mustReplyIds?.includes(persona.id))
+          .map((persona) => persona.id)
+      : [];
+    const missingRequiredIds = [...new Set([...explicitOwnerIds, ...soleRequiredDmIds])]
+      .filter((personaId) => !deliveredIds.has(personaId));
     let result = humanizedLines;
-    if (allowRequestOwnerRetry && missingOwnerIds.length > 0) {
-      const missingOwners = request.selected.filter((persona) => missingOwnerIds.includes(persona.id));
-      const ownerNames = missingOwners.map((persona) => persona.name).join(", ");
-      const completionPremise = `${ownerNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: complete the actual triggering request in this message now. An offer, promise, progress report, permission request or adjacent substitute is not completion. Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.`;
+    const recoveryBudget = request.responseRecoveryBudget ?? { retriesRemaining: 1 };
+    if (allowRequestOwnerRetry && recoveryBudget.retriesRemaining > 0 && missingRequiredIds.length > 0) {
+      recoveryBudget.retriesRemaining -= 1;
+      const missingActors = request.selected.filter((persona) => missingRequiredIds.includes(persona.id));
+      const retryOwnerIds = missingRequiredIds.filter((personaId) => explicitOwnerIds.includes(personaId));
+      const actorNames = missingActors.map((persona) => persona.name).join(", ");
+      const completionPremise = retryOwnerIds.length > 0
+        ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: complete the actual triggering request in this message now. An offer, promise, progress report, permission request or adjacent substitute is not completion. Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.`
+        : `${actorNames || "The sole selected resident"} is the only resident in this direct conversation and the first candidate did not survive review. This is the one bounded full-scene recovery: respond directly and relevantly to the complete triggering turn now, preserving the supplied transcript and evidence. Do not change subject merely to produce a line and do not invent an explicit request that the human did not make.`;
       try {
         const retryLines = await this.perform(
           {
             ...request,
-            selected: missingOwners,
-            mustReplyIds: missingOwnerIds,
-            requestOwnerIds: missingOwnerIds,
+            selected: missingActors,
+            mustReplyIds: missingRequiredIds,
+            requestOwnerIds: retryOwnerIds,
+            responseRecoveryBudget: recoveryBudget,
             premise: [request.premise, completionPremise].filter(Boolean).join(" "),
           },
           signal,
@@ -1621,7 +1679,7 @@ export class LmStudioClient {
       } catch (error) {
         if (signal?.aborted) throw signal.reason ?? error;
         console.warn(
-          "Explicit request-owner retry failed; preserving accepted scene lines:",
+          "Required-response recovery failed; preserving accepted scene lines:",
           error instanceof Error ? error.message : error,
         );
       }

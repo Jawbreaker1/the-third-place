@@ -32,6 +32,7 @@ import {
 import type { SocialModelClient } from "./switchableModel.js";
 import { createMessage, RoomStore } from "./store.js";
 import {
+  hasSpecificSiteResearchResults,
   ResearchBroker,
   type ResearchPacket,
   type ResearchRequest,
@@ -66,6 +67,10 @@ import {
 } from "./behaviorTuning.js";
 import type { AdminBehaviorTuning } from "../shared/adminTypes.js";
 import { recallChannelHistory } from "./channelRecall.js";
+import {
+  DmTurnCoordinator,
+  type DmTurn,
+} from "./dmTurnCoordinator.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -615,6 +620,8 @@ export interface SocialDirectorOptions {
   autonomousResearchChannelCooldownMs?: number;
   autonomousResearchHumanQuietMs?: number;
   autoSharedLinkDiscussionEnabled?: boolean;
+  /** Structural DM burst window; no message text is inspected by this coordinator. */
+  dmDebounceMs?: number;
   pageReader?: PageReader;
   /** Live server-owned behavior settings; storage and authorization stay outside the director. */
   behaviorTuningProvider?: BehaviorTuningProvider;
@@ -1210,6 +1217,25 @@ interface ClassifiedToolPlan {
   localDateTime?: LocalDateTimeResult;
 }
 
+interface CoordinatedDmInput {
+  message: ChatMessage;
+  human: Member;
+  persona: Persona;
+  settle: () => void;
+}
+
+interface CoordinatedDmReply {
+  threadId: string;
+  replyToId: string;
+  human: Member;
+  persona: Persona;
+  catalogEpoch: number;
+  content: string;
+  generation: "lm" | "fallback";
+  sourceIds: string[];
+  research?: ResearchPacket;
+}
+
 interface AutoSharedLinkAttempt {
   successfulChannelUrlKey: string;
 }
@@ -1364,6 +1390,7 @@ export class SocialDirector {
   private readonly autonomousResearchHumanQuietMsOverride?: number;
   private readonly autoSharedLinkDiscussionEnabled: boolean;
   private readonly pageReader: PageReader;
+  private readonly dmTurns: DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>;
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
   private lastAutonomousResearchSuccessAt?: number;
   private autonomousResearchGlobalRetryAfterAt?: number;
@@ -1384,6 +1411,21 @@ export class SocialDirector {
     this.now = options.now ?? Date.now;
     this.pageReader = options.pageReader ?? new PageReader();
     this.behaviorTuningProvider = options.behaviorTuningProvider;
+    this.dmTurns = new DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>({
+      debounceMs: options.dmDebounceMs,
+      generate: (turn) => this.generateDirectTurn(turn),
+      publish: (result, turn) => this.publishDirectTurn(result, turn),
+      onTypingChange: (threadId, active) => {
+        const participants: readonly string[] = this.store.getDmParticipants(threadId) ?? [];
+        const persona = PERSONAS.find((candidate) => participants.includes(candidate.id));
+        const humanId = participants.find((id) => id !== persona?.id);
+        if (persona && humanId) this.setTyping(threadId, persona.id, active, [`user:${humanId}`], false);
+      },
+      onError: (error, turn) => {
+        for (const input of turn.messages) input.settle();
+        console.warn("DM turn failed:", error instanceof Error ? error.message : error);
+      },
+    });
     this.ambientHumanQuietMs = Math.max(30_000, options.ambientHumanQuietMs ?? 90_000);
     const envChance = Number.parseFloat(process.env.AI_CONSIDERED_CHANCE ?? "0.2");
     this.consideredConversationChance = clamp(
@@ -1435,6 +1477,7 @@ export class SocialDirector {
     this.ambientTimer = undefined;
     for (const burst of this.pendingBursts.values()) clearTimeout(burst.timer);
     this.pendingBursts.clear();
+    this.dmTurns.dispose();
   }
 
   getEvents(): DirectorEvent[] {
@@ -1453,6 +1496,7 @@ export class SocialDirector {
   /** Invalidates every in-flight scene after a live channel/persona catalog edit. */
   reconcileCatalog(): void {
     this.catalogEpoch += 1;
+    this.dmTurns.cancelAll();
     const channelIds = new Set([
       ...CHANNELS.map((channel) => channel.id),
       ...this.channelEpoch.keys(),
@@ -1748,7 +1792,7 @@ export class SocialDirector {
         ? {
             pageReadRequest,
             ...(analysis.evidence.goal
-              ? { siteResearch: { goal: analysis.evidence.goal, mode: "web" as const } }
+              ? { siteResearch: { goal: analysis.evidence.goal, mode: analysis.evidence.searchMode ?? "web" } }
               : {}),
           }
         : {};
@@ -1946,11 +1990,17 @@ export class SocialDirector {
           query: siteResearch.goal,
           mode: siteResearch.mode,
           requesterId,
+          cachePolicy: pageReadRequest.retry ? "bypass" : "default",
         }).catch((error) => {
           console.warn("Bounded same-site lookup failed safely:", error instanceof Error ? error.message : error);
           return undefined;
         });
-        if (sameSite?.results.length) return sameSite;
+        // A generic root hit proves only that the site exists. It does not
+        // answer a request to find current or specific material on that site.
+        // The broker supplies structural URL/date quality; semantic relevance
+        // remains the model reviewer's responsibility.
+        const quality = sameSite?.search?.site?.quality;
+        if (sameSite?.results.length && (!quality || hasSpecificSiteResearchResults(quality))) return sameSite;
       }
       const page = await this.pageReader.read(pageReadRequest, requesterId).catch((error) => {
         console.warn("Exact linked-page read failed safely:", error instanceof Error ? error.message : error);
@@ -1966,150 +2016,194 @@ export class SocialDirector {
   }
 
   async onDirectMessage(message: ChatMessage, human: Member, persona: Persona): Promise<void> {
+    return new Promise<void>((resolve) => {
+      try {
+        this.dmTurns.enqueue(message.channelId, {
+          message,
+          human,
+          persona,
+          settle: resolve,
+        });
+      } catch (error) {
+        console.warn("DM turn could not be queued:", error instanceof Error ? error.message : error);
+        resolve();
+      }
+    });
+  }
+
+  private async generateDirectTurn(
+    turn: DmTurn<CoordinatedDmInput>,
+  ): Promise<CoordinatedDmReply | undefined> {
+    const latestInput = turn.messages.at(-1);
+    if (!latestInput) return undefined;
+    const { human, persona } = latestInput;
+    const messages = turn.messages.map((input) => input.message);
+    const latest = latestInput.message;
+    const combined = messages.map((message) => message.content).join("\n");
     const catalogEpoch = this.catalogEpoch;
     this.lastHumanActivityAt = this.now();
-    // Snapshot prior-visit context before recording this turn. Updating first
-    // would make an old relation look current and intentionally hide it from
-    // the privacy-bounded promptNote filter.
     const relationshipNotes = this.relationshipNotes([persona], human);
-    this.publishDirectorEvent({
-      trigger: "dm",
-      summary: `${persona.name} prioritised a direct message from ${human.name}.`,
-      considered: 1,
-      noticed: 1,
-      replied: 1,
-      reacted: 0,
-    });
-    this.setTyping(message.channelId, persona.id, true, [`user:${human.id}`]);
-    let line: GeneratedLine | undefined;
-    let research: ResearchPacket | undefined;
-    const dmMessages = this.store.getDmMessages(message.channelId);
-    const replyTarget = message.replyToId
-      ? dmMessages.find((candidate) => candidate.id === message.replyToId)
-      : undefined;
+    const dmMessages = this.store.getDmMessages(latest.channelId);
+    const replyById = new Map(dmMessages.map((message) => [message.id, message]));
+    const replyTarget = latest.replyToId ? replyById.get(latest.replyToId) : undefined;
     const candidateSet = this.pageReader.collectCandidates({
-      messages: [message],
+      messages,
       requesterId: human.id,
       recentMessages: dmMessages.slice(-120),
-      replyTargetFor: () => replyTarget,
+      replyTargetFor: (message) => message.replyToId ? replyById.get(message.replyToId) : undefined,
       now: this.now(),
     });
     const analysis = await this.analyzeHumanTurn({
       medium: "dm",
-      turnId: `dm:${message.id}`,
-      channelId: message.channelId,
-      latest: message,
-      burst: [message],
+      turnId: `dm:${latest.id}:${turn.token.epoch}`,
+      channelId: latest.channelId,
+      latest,
+      burst: messages,
       recent: dmMessages,
       replyTarget,
       personas: [persona],
       candidateSet,
       allowSearch: Boolean(persona.canResearch),
     });
+    if (!turn.isCurrent()) return undefined;
+
     const availableCapabilities = this.availableTurnCapabilities(candidateSet, Boolean(persona.canResearch));
     const trustedDmTurn = projectTrustedTurnAnalysis(analysis);
-    const dmRequestOwnerIds = trustedDmTurn.intentTrusted && trustedDmTurn.replyExpected === "expected"
+    const toolPlan = this.classifiedToolPlan(analysis, candidateSet, combined, human.id);
+    const networkEvidenceRequested = Boolean(toolPlan.pageReadRequest || toolPlan.searchRequest);
+    const evidenceExecutionRequested = networkEvidenceRequested || Boolean(toolPlan.localDateTime);
+    const dmRequestOwnerIds = (
+      trustedDmTurn.intentTrusted && trustedDmTurn.replyExpected === "expected"
+    ) || evidenceExecutionRequested
       ? [persona.id]
       : [];
-    const signals = socialSignalsFromTurnAnalysis(analysis, [], analyzeSocialSignals(message.content, [persona]));
+    const signals = socialSignalsFromTurnAnalysis(
+      analysis,
+      [],
+      analyzeSocialSignals(combined, [persona]),
+    );
     this.updateRelationship(persona.id, human.id, signals, 0.08);
-    const toolPlan = this.classifiedToolPlan(analysis, candidateSet, message.content, human.id);
-    const networkEvidenceRequested = Boolean(toolPlan.pageReadRequest || toolPlan.searchRequest);
-    try {
-      if (networkEvidenceRequested) {
-        research = await this.resolveRequestedEvidence(
-          toolPlan.pageReadRequest,
-          toolPlan.searchRequest,
-          human.id,
-          toolPlan.siteResearch,
-        );
-      }
-      const evidencePremise = toolPlan.localDateTime
-        ? `${persona.name} answers the requested current date/time from trustedTemporalContext.requestedClock; do not browse, estimate or cite a web source.`
-        : toolPlan.pageReadRequest
-          ? research
-            ? research.kind === "search"
-              ? `${persona.name} ran the bounded same-site lookup resolved from the human's root-site request. Answer only from the supplied same-site results and cite only source IDs that support the answer.`
-              : `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
-            : "This specific server-bound linked-page attempt returned no readable evidence. In the human's classified language, say only that this attempt failed; do not invent a cause or claim a permanent inability."
-          : toolPlan.searchRequest
-            ? research
-              ? `${persona.name} deliberately ran the classified fresh lookup. Answer only from the supplied results and cite only source IDs that support the claim.`
-              : "This specific classified fresh lookup returned no usable evidence. In the human's classified language, say so briefly as a temporary result and invent no current facts."
-            : "";
-      const generated = await this.lm.generateScene(
-        {
-          kind: "dm",
-          channelId: message.channelId,
-          channelName: `private chat with ${human.name}`,
-          selected: [persona],
-          history: this.dmTranscript(message.channelId),
-          trigger: { author: human.name, content: message.content, messageId: message.id, createdAt: message.createdAt },
-          mustReplyIds: [persona.id],
-          requestOwnerIds: dmRequestOwnerIds,
-          relationshipNotes,
-          languageHint: classifiedLanguage(analysis),
-          semanticContext: semanticSceneContext(analysis),
-          actorChannelNotes: this.actorChannels.promptNotes([persona]),
-          research,
-          evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
-          capabilityContext: this.sceneCapabilityContext({
-            analysis,
-            available: availableCapabilities,
-            toolPlan,
-            research,
-          }),
-          urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
-          requestedClock: toolPlan.localDateTime,
-          temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
-          temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
-          premise: [semanticFlagsPremise(analysis), evidencePremise].filter(Boolean).join(" ") || undefined,
-        },
-        0,
-      );
-      line = generated[0];
-    } catch (error) {
-      console.warn("DM scene failed:", error instanceof Error ? error.message : error);
-    } finally {
-      this.setTyping(message.channelId, persona.id, false, [`user:${human.id}`]);
-    }
 
-    await delay(clamp(persona.latency[0] * 0.35, 500, 2_300));
-    const generatedReply = line
-      ? normalizeGeneratedMessageContent(line.content)
-      : undefined;
-    const replyText = generatedReply
+    let research: ResearchPacket | undefined;
+    if (networkEvidenceRequested) {
+      research = await this.resolveRequestedEvidence(
+        toolPlan.pageReadRequest,
+        toolPlan.searchRequest,
+        human.id,
+        toolPlan.siteResearch,
+      );
+    }
+    if (!turn.isCurrent()) return undefined;
+
+    const evidencePremise = toolPlan.localDateTime
+      ? `${persona.name} answers the requested current date/time from trustedTemporalContext.requestedClock; do not browse, estimate or cite a web source.`
+      : toolPlan.pageReadRequest
+        ? research
+          ? research.kind === "search"
+            ? `${persona.name} ran the bounded same-site lookup resolved from the human's root-site request. Answer only from the supplied same-site results and cite only source IDs that support the answer.`
+            : `${persona.name} opened the exact server-bound linked page at the human's request. Answer from the supplied page evidence and attach S1 when the answer uses it. ${pageEvidenceAnswerContract(research)}`
+          : "This specific server-bound linked-page attempt returned no readable evidence. In the human's classified language, say only that this attempt failed; do not invent a cause or claim a permanent inability."
+        : toolPlan.searchRequest
+          ? research
+            ? `${persona.name} deliberately ran the classified fresh lookup. Answer only from the supplied results and cite only source IDs that support the claim.`
+            : "This specific classified fresh lookup returned no usable evidence. In the human's classified language, say so briefly as a temporary result and invent no current facts."
+          : "";
+    const generated = await this.lm.generateScene(
+      {
+        kind: "dm",
+        responseRecoveryBudget: { retriesRemaining: 1 },
+        channelId: latest.channelId,
+        channelName: `private chat with ${human.name}`,
+        selected: [persona],
+        history: this.dmTranscript(latest.channelId),
+        trigger: { author: human.name, content: combined, messageId: latest.id, createdAt: latest.createdAt },
+        mustReplyIds: [persona.id],
+        requestOwnerIds: dmRequestOwnerIds,
+        relationshipNotes,
+        languageHint: classifiedLanguage(analysis),
+        semanticContext: semanticSceneContext(analysis),
+        actorChannelNotes: this.actorChannels.promptNotes([persona]),
+        research,
+        evidenceOutcome: networkEvidenceRequested ? (research ? "succeeded" : "failed") : undefined,
+        capabilityContext: this.sceneCapabilityContext({
+          analysis,
+          available: availableCapabilities,
+          toolPlan,
+          research,
+        }),
+        urlPublicationPolicy: toolPlan.pageReadRequest ? "server_card" : undefined,
+        requestedClock: toolPlan.localDateTime,
+        temporalPolicy: toolPlan.localDateTime ? "direct_answer" : "reactive_only",
+        temporalSurfaceActorId: toolPlan.localDateTime ? persona.id : undefined,
+        premise: [semanticFlagsPremise(analysis), evidencePremise].filter(Boolean).join(" ") || undefined,
+      },
+      0,
+      turn.signal,
+    );
+    if (!turn.isCurrent()) return undefined;
+    const line = generated[0];
+    const generatedReply = line ? normalizeGeneratedMessageContent(line.content) : undefined;
+    const content = generatedReply
       ?? (toolPlan.localDateTime
         ? refreshLocalDateTime(toolPlan.localDateTime, new Date(this.now())).fallbackText
         : undefined);
-    if (!replyText || catalogEpoch !== this.catalogEpoch) return;
-    // Admin catalog edits may complete while the model is generating. A
-    // removed resident must never reappear through a late DM publication.
-    if (!PERSONAS.some((candidate) => candidate.id === persona.id)) return;
-    const replySourceIds = generatedReply
-      ? sourceIdsForPageResponder(
-          research,
-          line?.sourceIds ?? [],
-          Boolean(toolPlan.pageReadRequest),
-        )
+    if (!content || catalogEpoch !== this.catalogEpoch || !PERSONAS.some((candidate) => candidate.id === persona.id)) {
+      if (turn.isCurrent()) for (const input of turn.messages) input.settle();
+      return undefined;
+    }
+    const sourceIds = generatedReply
+      ? sourceIdsForPageResponder(research, line?.sourceIds ?? [], Boolean(toolPlan.pageReadRequest))
       : [];
-    const reply = this.store.addDmMessage(
-      message.channelId,
-      persona.id,
-      replyText,
-      message.id,
-      generatedReply ? "lm" : "fallback",
-      this.messageSources(research, replySourceIds),
-    );
-    if (!reply) return;
-    const thread = this.store.openDm(human.id, persona.id);
-    this.io.to(`user:${human.id}`).emit("dm:update", { thread, message: reply });
-    this.lm.rememberDeliveredLine(persona.id, replyText, {
-      kind: "dm",
-      channelId: message.channelId,
-      channelName: `private chat with ${human.name}`,
-    });
-    this.lastSpoke.set(persona.id, this.now());
+    return {
+      threadId: latest.channelId,
+      replyToId: latest.id,
+      human,
+      persona,
+      catalogEpoch,
+      content,
+      generation: generatedReply ? "lm" : "fallback",
+      sourceIds,
+      research,
+    };
+  }
+
+  private publishDirectTurn(
+    result: CoordinatedDmReply,
+    turn: DmTurn<CoordinatedDmInput>,
+  ): void {
+    try {
+      if (
+        result.catalogEpoch !== this.catalogEpoch ||
+        !PERSONAS.some((candidate) => candidate.id === result.persona.id)
+      ) return;
+      const reply = this.store.addDmMessage(
+        result.threadId,
+        result.persona.id,
+        result.content,
+        result.replyToId,
+        result.generation,
+        this.messageSources(result.research, result.sourceIds),
+      );
+      if (!reply) return;
+      const thread = this.store.openDm(result.human.id, result.persona.id);
+      this.io.to(`user:${result.human.id}`).emit("dm:update", { thread, message: reply });
+      this.lm.rememberDeliveredLine(result.persona.id, result.content, {
+        kind: "dm",
+        channelId: result.threadId,
+        channelName: `private chat with ${result.human.name}`,
+      });
+      this.lastSpoke.set(result.persona.id, this.now());
+      this.publishDirectorEvent({
+        trigger: "dm",
+        summary: `${result.persona.name} answered a direct turn from ${result.human.name}.`,
+        considered: 1,
+        noticed: 1,
+        replied: 1,
+        reacted: 0,
+      });
+    } finally {
+      for (const input of turn.messages) input.settle();
+    }
   }
 
   private async handleHumanBurst(
@@ -2333,7 +2427,8 @@ export class SocialDirector {
     const recallAnswerer = historyResponseRequired
       ? recallResponder ?? selected[0]
       : recallResponder;
-    const requestOwner = responseExpected
+    const classifiedEvidenceMustAnswer = evidenceRequested && !autoSharedLinkAttempt;
+    const requestOwner = responseExpected || classifiedEvidenceMustAnswer
       ? evidenceRequested && evidenceResponder
         ? evidenceResponder
         : signals.mentionedIds.length === 0 && recallResponder
@@ -2365,6 +2460,7 @@ export class SocialDirector {
     }
     const generatedAt = this.now();
     const humanizerBudget = { repairsRemaining: 1 };
+    const responseRecoveryBudget = { retriesRemaining: 1 };
     const conductIds = conductResponderIds(selected, signals);
     const requiredIds = [
       ...new Set([
@@ -2448,6 +2544,7 @@ export class SocialDirector {
         {
           kind: "public",
           humanizerBudget,
+          responseRecoveryBudget,
           channelId: trigger.channelId,
           channelName: CHANNELS.find((channel) => channel.id === trigger.channelId)?.name ?? trigger.channelId,
           selected,
@@ -2498,12 +2595,19 @@ export class SocialDirector {
       if (!burstIsCurrent()) break;
       const persona = selected.find((candidate) => candidate.id === requiredId);
       if (!persona) continue;
+      const focusedOwnsRequest = requestOwnerIds.includes(persona.id);
+      // The model client consumes this same budget when its primary scene
+      // needs a full reviewed owner recovery. Do not create a second retry
+      // ladder in the director after that bounded attempt has already run.
+      if (focusedOwnsRequest && responseRecoveryBudget.retriesRemaining <= 0) continue;
+      if (focusedOwnsRequest) responseRecoveryBudget.retriesRemaining -= 1;
       this.setTyping(trigger.channelId, persona.id, true);
       try {
         const focused = await this.lm.generateScene(
           {
             kind: "public",
             humanizerBudget,
+            responseRecoveryBudget,
             channelId: trigger.channelId,
             channelName: CHANNELS.find((channel) => channel.id === trigger.channelId)?.name ?? trigger.channelId,
             selected: [persona],
@@ -2511,7 +2615,7 @@ export class SocialDirector {
             roomRecall: roomRecallFor([persona]),
             trigger: { author: human.name, content: combined, messageId: trigger.id, createdAt: trigger.createdAt },
             mustReplyIds: [persona.id],
-            requestOwnerIds: [],
+            requestOwnerIds: focusedOwnsRequest ? [persona.id] : [],
             relationshipNotes: { [persona.id]: relationshipNotes[persona.id]! },
             languageHint: classifiedLanguage(analysis),
             semanticContext: semanticSceneContext(analysis),
@@ -3908,10 +4012,16 @@ export class SocialDirector {
     }));
   }
 
-  private setTyping(channelId: string, memberId: string, active: boolean, rooms = ["public"]): void {
+  private setTyping(
+    channelId: string,
+    memberId: string,
+    active: boolean,
+    rooms = ["public"],
+    expire = true,
+  ): void {
     const payload: TypingMemberPayload = { channelId, memberId, active };
     for (const room of rooms) this.io.to(room).emit("typing:member", payload);
-    if (active) {
+    if (active && expire) {
       setTimeout(() => {
         const expiry: TypingMemberPayload = { channelId, memberId, active: false };
         for (const room of rooms) this.io.to(room).emit("typing:member", expiry);

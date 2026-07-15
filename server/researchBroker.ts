@@ -15,6 +15,7 @@ export interface ResearchPacket {
   query: string;
   retrievedAt: string;
   results: ResearchResult[];
+  search?: ResearchSearchMetadata;
 }
 
 interface CachedResearch {
@@ -23,25 +24,124 @@ interface CachedResearch {
 }
 
 export type SearchMode = "news" | "web";
+export type SearchScope = "generic" | "site";
+export type ResearchCachePolicy = "default" | "bypass";
+
+export type SiteResearchQualityClass = "empty" | "root_only" | "deep_links" | "fresh_results";
+
+export interface SiteResearchQuality {
+  classification: SiteResearchQualityClass;
+  resultCount: number;
+  rootResultCount: number;
+  deepLinkResultCount: number;
+  datedResultCount: number;
+  freshResultCount: number;
+}
+
+export interface ResearchSearchMetadata {
+  scope: SearchScope;
+  /** The semantic mode requested by the caller, retained across provider fallback. */
+  requestedMode: SearchMode;
+  /** The fixed provider endpoint that actually supplied the returned results. */
+  providerMode: SearchMode;
+  site?: {
+    host: string;
+    quality: SiteResearchQuality;
+  };
+}
+
+export interface SiteResearchPacket extends ResearchPacket {
+  kind: "search";
+  search: ResearchSearchMetadata & {
+    scope: "site";
+    site: {
+      host: string;
+      quality: SiteResearchQuality;
+    };
+  };
+}
 
 export interface ResearchRequest {
   query: string;
   mode: SearchMode;
   requesterId?: string;
+  /** Explicit retries may bypass a completed cache entry while retaining normal rate limits. */
+  cachePolicy?: ResearchCachePolicy;
 }
 
 export interface SiteResearchRequest extends ResearchRequest {
   url: URL;
 }
 
-type SearchScope = "generic" | "site";
 type HtmlNode = DefaultTreeAdapterTypes.Node;
 type HtmlElement = DefaultTreeAdapterTypes.Element;
+
+const DEFAULT_SITE_FRESHNESS_WINDOW_MS = 45 * 24 * 60 * 60_000;
 
 const canonicalWwwHost = (host: string): string => host.startsWith("www.") ? host.slice(4) : host;
 
 const isSameCanonicalSiteHost = (candidate: string, requested: string): boolean =>
   candidate === requested || canonicalWwwHost(candidate) === canonicalWwwHost(requested);
+
+/**
+ * Structural site-result assessment only. It deliberately does not inspect
+ * words, brands or domain-specific URL fragments. A caller can distinguish a
+ * generic root hit from navigable deep links and provider-dated fresh results
+ * without turning the transport broker into another intent classifier.
+ */
+export const assessSiteResearchQuality = (
+  requestedUrl: URL,
+  results: readonly Pick<ResearchResult, "url" | "publishedAt">[],
+  options: { now?: number; freshnessWindowMs?: number } = {},
+): SiteResearchQuality => {
+  const requestedHost = requestedUrl.hostname.toLocaleLowerCase().replace(/\.$/u, "");
+  const now = options.now ?? Date.now();
+  const freshnessWindowMs = Math.max(0, options.freshnessWindowMs ?? DEFAULT_SITE_FRESHNESS_WINDOW_MS);
+  let rootResultCount = 0;
+  let deepLinkResultCount = 0;
+  let datedResultCount = 0;
+  let freshResultCount = 0;
+
+  for (const result of results) {
+    try {
+      const parsed = new URL(result.url);
+      const resultHost = parsed.hostname.toLocaleLowerCase().replace(/\.$/u, "");
+      if (!isSameCanonicalSiteHost(resultHost, requestedHost)) continue;
+      if (parsed.pathname === "/" && parsed.search === "") rootResultCount += 1;
+      else deepLinkResultCount += 1;
+    } catch {
+      continue;
+    }
+    if (!result.publishedAt) continue;
+    const publishedAt = Date.parse(result.publishedAt);
+    if (!Number.isFinite(publishedAt)) continue;
+    datedResultCount += 1;
+    const age = now - publishedAt;
+    // A small clock-skew allowance avoids rejecting provider timestamps that
+    // are only a few minutes ahead, while far-future dates never count as fresh.
+    if (age >= -5 * 60_000 && age <= freshnessWindowMs) freshResultCount += 1;
+  }
+
+  const resultCount = rootResultCount + deepLinkResultCount;
+  const classification: SiteResearchQualityClass = resultCount === 0
+    ? "empty"
+    : freshResultCount > 0
+      ? "fresh_results"
+      : deepLinkResultCount > 0
+        ? "deep_links"
+        : "root_only";
+  return {
+    classification,
+    resultCount,
+    rootResultCount,
+    deepLinkResultCount,
+    datedResultCount,
+    freshResultCount,
+  };
+};
+
+export const hasSpecificSiteResearchResults = (quality: SiteResearchQuality): boolean =>
+  quality.deepLinkResultCount > 0 || quality.freshResultCount > 0;
 
 // This is a transport boundary, not an intent parser. The semantic router owns
 // the wording and mode; the broker only keeps the provider request bounded and
@@ -216,17 +316,29 @@ export class ResearchBroker {
     if (process.env.RESEARCH_ENABLED !== "true") return undefined;
     const query = boundedQuery(request.query);
     if (!query) return undefined;
-    return this.researchQuery(query, request.mode, request.requesterId ?? "anonymous", "generic");
+    return this.researchQuery(
+      query,
+      request.mode,
+      request.requesterId ?? "anonymous",
+      "generic",
+      request.cachePolicy ?? "default",
+    );
   }
 
-  async researchSite(request: SiteResearchRequest): Promise<ResearchPacket | undefined> {
+  async researchSite(request: SiteResearchRequest): Promise<SiteResearchPacket | undefined> {
     if (process.env.RESEARCH_ENABLED !== "true") return undefined;
     const { url } = request;
     if (url.protocol !== "https:" || !url.hostname.includes(".")) return undefined;
     const topic = boundedQuery(request.query);
     const host = url.hostname.toLocaleLowerCase().replace(/\.$/u, "");
     const query = `site:${host}${topic ? ` ${topic}` : ""}`.slice(0, 160);
-    const packet = await this.researchQuery(query, request.mode, request.requesterId ?? "anonymous", "site");
+    const packet = await this.researchQuery(
+      query,
+      request.mode,
+      request.requesterId ?? "anonymous",
+      "site",
+      request.cachePolicy ?? "default",
+    );
     if (!packet) return undefined;
     const results = packet.results
       .filter((result) => {
@@ -238,7 +350,21 @@ export class ResearchBroker {
         }
       })
       .map((result, index) => ({ ...result, id: `S${index + 1}` }));
-    return results.length > 0 ? { ...packet, results } : undefined;
+    if (results.length === 0) return undefined;
+    return {
+      ...packet,
+      kind: "search",
+      results,
+      search: {
+        scope: "site",
+        requestedMode: request.mode,
+        providerMode: packet.search?.providerMode ?? request.mode,
+        site: {
+          host,
+          quality: assessSiteResearchQuality(url, results),
+        },
+      },
+    };
   }
 
   private async researchQuery(
@@ -246,21 +372,28 @@ export class ResearchBroker {
     mode: SearchMode,
     requesterId: string,
     scope: SearchScope,
+    cachePolicy: ResearchCachePolicy,
   ): Promise<ResearchPacket | undefined> {
     const key = `${scope}:${mode}:${unicodeCaselessKey(query)}`;
     this.pruneCache();
-    const cached = this.cache.get(key);
-    if (cached && cached.expiresAt > Date.now()) {
+    if (cachePolicy === "bypass") {
+      // A retry must not resurrect the result it was explicitly retrying.
       this.cache.delete(key);
-      this.cache.set(key, cached);
-      return cached.packet;
+    } else {
+      const cached = this.cache.get(key);
+      if (cached && cached.expiresAt > Date.now()) {
+        this.cache.delete(key);
+        this.cache.set(key, cached);
+        return cached.packet;
+      }
     }
-    const existing = this.inFlight.get(key);
+    const inFlightKey = `${cachePolicy}:${key}`;
+    const existing = this.inFlight.get(inFlightKey);
     if (existing) return existing;
     if (!this.reserveRequest(requesterId)) return undefined;
 
-    const request = this.search(query, mode, scope).finally(() => this.inFlight.delete(key));
-    this.inFlight.set(key, request);
+    const request = this.search(query, mode, scope).finally(() => this.inFlight.delete(inFlightKey));
+    this.inFlight.set(inFlightKey, request);
     const packet = await request;
     if (packet) {
       this.cache.set(key, { packet, expiresAt: Date.now() + 10 * 60_000 });
@@ -375,6 +508,7 @@ export class ResearchBroker {
   }
 
   private async search(query: string, mode: SearchMode, scope: SearchScope): Promise<ResearchPacket | undefined> {
+    let providerMode = mode;
     let parsedResults = mode === "web"
       ? scope === "generic"
         ? await this.searchDuckDuckGoHtml(query)
@@ -386,13 +520,20 @@ export class ResearchBroker {
     // bounded query. Transport, media-type and body-bound errors throw above
     // and therefore never trigger this fallback.
     if (mode === "news" && parsedResults.length === 0) {
+      providerMode = "web";
       parsedResults = scope === "generic"
         ? await this.searchDuckDuckGoHtml(query)
         : await this.searchBingRss(query, "web", mode, 10);
     }
     if (parsedResults.length === 0) return undefined;
     const results = parsedResults.map((result, index) => ({ id: `S${index + 1}`, ...result }));
-    return { kind: "search", query, retrievedAt: new Date().toISOString(), results };
+    return {
+      kind: "search",
+      query,
+      retrievedAt: new Date().toISOString(),
+      results,
+      search: { scope, requestedMode: mode, providerMode },
+    };
   }
 
 }

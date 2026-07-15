@@ -1,5 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { ResearchBroker } from "./researchBroker.js";
+import {
+  ResearchBroker,
+  assessSiteResearchQuality,
+  hasSpecificSiteResearchResults,
+} from "./researchBroker.js";
 
 const duckRedirect = (target: string): string =>
   `//duckduckgo.com/l/?uddg=${encodeURIComponent(target)}&amp;rut=fixture`;
@@ -246,6 +250,30 @@ describe("research broker", () => {
     expect(rejected).toBeUndefined();
   });
 
+  it("bypasses and replaces a completed cache entry for an explicit retry", async () => {
+    let fetches = 0;
+    const broker = new ResearchBroker((async () => {
+      fetches += 1;
+      return new Response(duckHtml(duckResult({
+        title: `Provider result ${fetches}`,
+        url: `https://example.com/result-${fetches}`,
+        snippet: `Fresh provider evidence from request ${fetches}.`,
+      })), { status: 200, headers: { "content-type": "text/html" } });
+    }) as typeof fetch);
+    const request = { query: "same retry target", mode: "web" as const, requesterId: "retry-cache" };
+
+    const first = await broker.research(request);
+    const cached = await broker.research(request);
+    const retried = await broker.research({ ...request, cachePolicy: "bypass" });
+    const cachedRetry = await broker.research(request);
+
+    expect(fetches).toBe(2);
+    expect(cached).toBe(first);
+    expect(first?.results[0]?.title).toBe("Provider result 1");
+    expect(retried?.results[0]?.title).toBe("Provider result 2");
+    expect(cachedRetry).toBe(retried);
+  });
+
   it("stays local when research is disabled", async () => {
     let fetches = 0;
     const broker = new ResearchBroker((async () => {
@@ -281,6 +309,60 @@ describe("research broker", () => {
     expect(parsedRequest.searchParams.get("q")).toBe("site:worldofwarcraft.blizzard.com 最も重要な更新");
     expect(packet?.kind).toBe("search");
     expect(packet?.results).toHaveLength(1);
+    expect(packet?.search).toMatchObject({
+      scope: "site",
+      requestedMode: "news",
+      providerMode: "news",
+      site: {
+        host: "worldofwarcraft.blizzard.com",
+        quality: {
+          resultCount: 1,
+          rootResultCount: 0,
+          deepLinkResultCount: 1,
+          datedResultCount: 1,
+        },
+      },
+    });
+  });
+
+  it("preserves requested news mode when an empty site-news feed falls back to site-web", async () => {
+    const requested: URL[] = [];
+    const emptyNews = `<?xml version="1.0"?><rss><channel><title>News</title></channel></rss>`;
+    const webRss = `<?xml version="1.0"?><rss><channel><item>
+      <title>Detailed release</title>
+      <link>https://docs.example.com/releases/42</link>
+      <description>A concrete release page from the requested site.</description>
+    </item></channel></rss>`;
+    const broker = new ResearchBroker((async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      requested.push(url);
+      return new Response(url.pathname === "/news/search" ? emptyNews : webRss, {
+        status: 200,
+        headers: { "content-type": "application/rss+xml" },
+      });
+    }) as typeof fetch);
+
+    const packet = await broker.researchSite({
+      query: "最新リリース",
+      mode: "news",
+      url: new URL("https://docs.example.com/"),
+      requesterId: "site-mode-fallback",
+    });
+
+    expect(requested.map((url) => url.pathname)).toEqual(["/news/search", "/search"]);
+    expect(requested.map((url) => url.searchParams.get("q"))).toEqual([
+      "site:docs.example.com 最新リリース",
+      "site:docs.example.com 最新リリース",
+    ]);
+    expect(packet?.search).toMatchObject({
+      scope: "site",
+      requestedMode: "news",
+      providerMode: "web",
+      site: {
+        host: "docs.example.com",
+        quality: { classification: "deep_links", deepLinkResultCount: 1 },
+      },
+    });
   });
 
   it("keeps same-site fallback attribution on the exact host, not a lookalike suffix", async () => {
@@ -366,6 +448,47 @@ describe("research broker", () => {
       title: "Tesla on Avanza",
       url: "https://www.avanza.se/aktier/tesla",
     })]);
+    expect(packet?.search).toMatchObject({
+      scope: "site",
+      requestedMode: "web",
+      providerMode: "web",
+      site: {
+        quality: { classification: "deep_links", deepLinkResultCount: 1 },
+      },
+    });
+  });
+
+  it("classifies site result quality structurally without inspecting language or brand terms", () => {
+    const site = new URL("https://例子.中国/");
+    const rootOnly = assessSiteResearchQuality(site, [{ url: "https://例子.中国/" }], {
+      now: Date.parse("2026-07-15T12:00:00.000Z"),
+    });
+    const freshDeepLink = assessSiteResearchQuality(site, [{
+      url: "https://例子.中国/路径/42",
+      publishedAt: "2026-07-14T12:00:00.000Z",
+    }], {
+      now: Date.parse("2026-07-15T12:00:00.000Z"),
+      freshnessWindowMs: 7 * 24 * 60 * 60_000,
+    });
+
+    expect(rootOnly).toEqual({
+      classification: "root_only",
+      resultCount: 1,
+      rootResultCount: 1,
+      deepLinkResultCount: 0,
+      datedResultCount: 0,
+      freshResultCount: 0,
+    });
+    expect(hasSpecificSiteResearchResults(rootOnly)).toBe(false);
+    expect(freshDeepLink).toEqual({
+      classification: "fresh_results",
+      resultCount: 1,
+      rootResultCount: 0,
+      deepLinkResultCount: 1,
+      datedResultCount: 1,
+      freshResultCount: 1,
+    });
+    expect(hasSpecificSiteResearchResults(freshDeepLink)).toBe(true);
   });
 
   it("enforces provider transport metadata and response byte bounds", async () => {

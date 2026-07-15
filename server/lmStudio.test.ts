@@ -44,6 +44,16 @@ const turnInput = (turnId = "turn-analysis-1"): NormalizedTurnAnalysisInput => t
   availableCapabilities: ["read_url", "web_search", "local_datetime"],
 });
 
+const dmTurnInput = (
+  turnId: string,
+  channelId = "dm:human-jaw-b:ai-mira",
+): NormalizedTurnAnalysisInput => turnAnalysisInputSchema.parse({
+  ...turnInput(turnId),
+  medium: "dm",
+  channel: { id: channelId, name: "private chat with Mira" },
+  mechanicalAddressedPersonaIds: ["ai-mira"],
+});
+
 const turnAnalysisCompletion = (overrides: Record<string, unknown> = {}) => jsonResponse({
   choices: [{
     message: {
@@ -365,6 +375,91 @@ describe("LM Studio one-pass semantic turn analysis", () => {
 
     await expect(staleScene).rejects.toThrow("newer same-channel turn");
     await expect(newerTurn).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "read_url" },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("preempts a stale same-thread DM scene for the newer DM turn analysis", async () => {
+    let startedScene: (() => void) | undefined;
+    const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        startedScene?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const channelId = "dm:human-jaw-b:ai-mira";
+    const lm = new LmStudioClient();
+    const staleScene = lm.generateScene({
+      kind: "dm",
+      channelId,
+      channelName: "private chat with Jaw_B",
+      selected: [mira],
+      history: [],
+      mustReplyIds: [mira.id],
+    }, 0);
+    await sceneStarted;
+
+    const newerTurn = lm.analyzeTurn(dmTurnInput("newer-dm-after-scene", channelId));
+
+    await expect(staleScene).rejects.toThrow("newer same-channel turn");
+    await expect(newerTurn).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "read_url" },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("aborts a stale active same-thread DM analysis when a newer DM turn arrives", async () => {
+    let startedAnalysis: (() => void) | undefined;
+    const analysisStarted = new Promise<void>((resolve) => { startedAnalysis = resolve; });
+    let firstAbortReason: unknown;
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        startedAnalysis?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => {
+            firstAbortReason = init?.signal?.reason;
+            reject(firstAbortReason ?? new DOMException("aborted", "AbortError"));
+          };
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+    const channelId = "dm:human-jaw-b:ai-mira";
+    const lm = new LmStudioClient();
+    const staleAnalysis = lm.analyzeTurn(dmTurnInput("stale-dm-analysis", channelId));
+    await analysisStarted;
+
+    const newerAnalysis = lm.analyzeTurn(dmTurnInput("newer-dm-analysis", channelId));
+
+    await expect(staleAnalysis).resolves.toMatchObject({
+      source: "fallback",
+      failureReason: "timeout",
+      evidence: { action: "none" },
+    });
+    expect(firstAbortReason).toMatchObject({
+      message: expect.stringContaining("newer same-channel turn"),
+    });
+    await expect(newerAnalysis).resolves.toMatchObject({
       source: "lm",
       failureReason: null,
       evidence: { action: "read_url" },
@@ -1109,6 +1204,271 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(bodies[1].messages[0].content).toContain("diegetic_identity_break");
     expect(JSON.parse(bodies[2].messages[1].content).premise).toContain("one bounded full-scene retry");
     expect(bodies[2].messages[0].content).toContain("ordinary human community members");
+  });
+
+  it("recovers one rejected ordinary sole-resident DM without manufacturing request ownership", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const irrelevant = "Jag funderar mest på om det blir regn i helgen.";
+    const recovered = "Okej, jag tappade tråden. Jag blev distraherad och svarade slarvigt.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) return completionResponse([{ personaId: mira.id, content: irrelevant }]);
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["irrelevant_to_turn"],
+          rewriteInstruction: "Svara direkt på varför du verkade frånvarande.",
+        }]);
+      }
+      if (bodies.length === 3) return completionResponse([{ personaId: mira.id, content: recovered }]);
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "dm",
+      channelId: "dm:jaw-b:mira",
+      channelName: "private chat with Jaw_B",
+      selected: [mira],
+      history: [{
+        author: "Jaw_B",
+        kind: "human",
+        content: "Hallå?",
+        createdAt: "2026-07-15T11:40:00.000Z",
+      }],
+      trigger: {
+        author: "Jaw_B",
+        content: "Men du svarade inte. Vad är ditt problem?",
+        messageId: "dm-ordinary-1",
+        createdAt: "2026-07-15T11:41:00.000Z",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([recovered]);
+    expect(bodies).toHaveLength(4);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    const recoveryScene = JSON.parse(bodies[2].messages[1].content);
+    const recoveryReview = JSON.parse(bodies[3].messages[1].content);
+    expect(firstReview.candidates).toEqual([
+      expect.objectContaining({ personaId: mira.id, mustReply: true, mustFulfillRequest: false }),
+    ]);
+    expect(recoveryScene).toMatchObject({
+      requiredActorIds: [mira.id],
+      explicitRequestOwnerIds: [],
+      triggeringEvent: { content: "Men du svarade inte. Vad är ditt problem?" },
+    });
+    expect(recoveryScene.premise).toContain("one bounded full-scene recovery");
+    expect(recoveryReview.candidates).toEqual([
+      expect.objectContaining({ personaId: mira.id, mustReply: true, mustFulfillRequest: false }),
+    ]);
+  });
+
+  it("keeps explicit sole-DM ownership true throughout its one reviewed retry", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const evasion = "Jag kan kanske hitta på något senare.";
+    const fulfilled = "Vad blir blötare ju mer det torkar? En handduk.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) return completionResponse([{ personaId: mira.id, content: evasion }]);
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["unfulfilled_explicit_request"],
+          rewriteInstruction: "Ge den efterfrågade gåtan nu.",
+        }]);
+      }
+      if (bodies.length === 3) return completionResponse([{ personaId: mira.id, content: fulfilled }]);
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "dm",
+      channelId: "dm:jaw-b:mira",
+      channelName: "private chat with Jaw_B",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Jaw_B",
+        content: "Mira, ge mig en gåta nu.",
+        messageId: "dm-riddle-request-1",
+        createdAt: "2026-07-15T11:42:00.000Z",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([fulfilled]);
+    expect(bodies).toHaveLength(4);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    const retryScene = JSON.parse(bodies[2].messages[1].content);
+    const retryReview = JSON.parse(bodies[3].messages[1].content);
+    expect(firstReview.candidates).toEqual([
+      expect.objectContaining({ personaId: mira.id, mustReply: true, mustFulfillRequest: true }),
+    ]);
+    expect(retryScene.explicitRequestOwnerIds).toEqual([mira.id]);
+    expect(retryScene.premise).toContain("one bounded full-scene retry");
+    expect(retryReview.candidates).toEqual([
+      expect.objectContaining({ personaId: mira.id, mustReply: true, mustFulfillRequest: true }),
+    ]);
+  });
+
+  it("publishes only the reviewed recovery when the first sole-DM reviewer is unavailable", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const unreviewed = "Det första utkastet får aldrig publiceras.";
+    const reviewed = "Sorry, jag tappade fokus en sekund. Vad menade du med problemet?";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) return completionResponse([{ personaId: mira.id, content: unreviewed }]);
+      if (bodies.length === 2) return jsonResponse({ choices: [{ message: { content: "{}" } }] });
+      if (bodies.length === 3) return completionResponse([{ personaId: mira.id, content: reviewed }]);
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "dm",
+      channelId: "dm:jaw-b:mira",
+      channelName: "private chat with Jaw_B",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "Hallå, är du kvar?", messageId: "dm-review-outage-1" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [],
+      semanticContext: { languageTag: "sv", intentTrusted: true, replyExpected: "expected" },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([reviewed]);
+    expect(lines.map((line) => line.content)).not.toContain(unreviewed);
+    expect(bodies).toHaveLength(4);
+    const recoveryReview = JSON.parse(bodies[3].messages[1].content);
+    expect(recoveryReview.candidates).toEqual([
+      expect.objectContaining({ personaId: mira.id, mustReply: true, mustFulfillRequest: false }),
+    ]);
+  });
+
+  it("fails closed after two unavailable sole-DM reviews without exceeding one recovery", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length % 2 === 1
+        ? completionResponse([{
+            personaId: mira.id,
+            content: bodies.length === 1 ? "Första orecenserade utkastet." : "Andra orecenserade utkastet.",
+          }])
+        : jsonResponse({ choices: [{ message: { content: "{}" } }] });
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "dm",
+      channelId: "dm:jaw-b:mira",
+      channelName: "private chat with Jaw_B",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "Hallå?", messageId: "dm-review-outage-2" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [],
+      semanticContext: { languageTag: "sv", intentTrusted: true, replyExpected: "expected" },
+    });
+
+    expect(lines).toEqual([]);
+    expect(bodies).toHaveLength(4);
+  });
+
+  it("keeps a safe sole-DM under-target line without launching full-scene recovery", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const safe = "Den filmen är faktiskt ganska överskattad.";
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: mira.id, content: safe }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "medium",
+            issues: ["behavior_intensity_under_target"],
+            rewriteInstruction: "Gör den tilldelade skärpan tydlig utan personangrepp.",
+          }]);
+    }));
+
+    const lines = await new LmStudioClient({
+      behaviorTuningProvider: () => ({
+        activity: 50,
+        autonomousLinkFrequency: 60,
+        competence: 50,
+        aggression: 100,
+        explicitness: 100,
+      }),
+    }).generateScene({
+      kind: "dm",
+      channelId: "dm:jaw-b:mira",
+      channelName: "private chat with Jaw_B",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "Den filmen var rätt överskattad.", messageId: "dm-intensity-1" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [],
+      humanizerBudget: { repairsRemaining: 0 },
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([safe]);
+    expect(call).toBe(2);
   });
 
   it.each([
