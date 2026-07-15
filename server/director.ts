@@ -23,6 +23,7 @@ import {
 } from "./channels.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import {
+  diegeticIdentityTurnPremise,
   type GeneratedLine,
   type RoomRecallEvidence,
   type SceneCapabilityContext,
@@ -1260,9 +1261,7 @@ const semanticFlagsPremise = (analysis: TurnAnalysis): string => {
     trusted.asksForList
       ? "The semantic turn analysis confirms that the human explicitly requested a list; list formatting is allowed if it is the natural answer."
       : "",
-    trusted.asksAboutAiIdentity
-      ? "AI identity is explicitly the subject of this turn; answer honestly in character rather than evading it."
-      : "",
+    diegeticIdentityTurnPremise(trusted.asksAboutAiIdentity),
     trusted.asksAboutAcoustics
       ? "The human is explicitly asking about acoustic evidence. This text-chat scene has no reliable audio evidence; do not infer any."
       : "",

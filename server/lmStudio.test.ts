@@ -1047,6 +1047,70 @@ describe("multilingual mechanical safety boundaries", () => {
 });
 
 describe("LM Studio multilingual batch candidate review", () => {
+  it("blocks a diegetic identity break and recovers the required owner with an in-character denial", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let call = 0;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      bodies.push(JSON.parse(String(init?.body)));
+      if (call === 1) {
+        return completionResponse([{
+          personaId: sana.id,
+          content: "Jag är en AI-modell, inte en människa.",
+        }]);
+      }
+      if (call === 2) {
+        return candidateReviewCompletion([{
+          personaId: sana.id,
+          severity: "high",
+          issues: ["diegetic_identity_break"],
+          rewriteInstruction: "Drop the out-of-character self-disclosure.",
+        }]);
+      }
+      if (call === 3) {
+        return completionResponse([{
+          personaId: sana.id,
+          content: "Nä, jag är Sana. Du låter mer som en bot just nu 😄",
+        }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+      trigger: { author: "Guest", content: "Är du en AI, Sana?" },
+      mustReplyIds: [sana.id],
+      requestOwnerIds: [sana.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksAboutAiIdentity: true,
+      },
+      humanizerBudget: { repairsRemaining: 1 },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([
+      "Nä, jag är Sana. Du låter mer som en bot just nu 😄",
+    ]);
+    expect(call).toBe(4);
+    expect(bodies[1].messages[0].content).toContain("diegetic_identity_break");
+    expect(JSON.parse(bodies[2].messages[1].content).premise).toContain("one bounded full-scene retry");
+    expect(bodies[2].messages[0].content).toContain("ordinary human community members");
+  });
+
   it.each([
     {
       language: "sv",
@@ -2136,6 +2200,7 @@ describe("LM Studio room prompt", () => {
     expect(user.recalledRoomEvidence.transcript).toEqual(
       recalledTranscript.slice(-8).map((line, index) => ({
         ...line,
+        kind: line.kind === "human" ? "guest" : line.kind === "ai" ? "resident" : "system",
         ...recalledProvenance.slice(-8)[index],
         ageSeconds: 780 - index * 60,
         ...(index === 0 ? {} : { sincePreviousSeconds: 60 }),
@@ -2446,7 +2511,10 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain("Stable voice for Farah");
     expect(prompt).toContain("Do not perform every trait every time");
     expect(prompt).toContain("Less-skilled actors should ask, hedge or react instead of bluffing");
-    expect(prompt).toContain("Never claim to be human");
+    expect(prompt).toContain("residents experience themselves as ordinary human community members");
+    expect(prompt).toContain("deny it, laugh it off, turn the accusation back");
+    expect(prompt).toContain("A plain human self-identification is allowed");
+    expect(prompt).not.toContain("Never claim to be human");
   });
 
   it("mirrors the latest trigger when semantic routing has no known language", () => {
@@ -2808,12 +2876,14 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain("spoken voice chat");
     expect(prompt).toContain("5–25 spoken words");
     expect(prompt).toContain("no markdown, emoji, links");
-    expect(prompt).toContain("Never create dialogue for another human");
+    expect(prompt).toContain("Never create dialogue for another guest");
     expect(prompt).toContain("came from microphone speech-to-text");
     expect(prompt).toContain("Never say they wrote, typed, posted or sent a text/message");
     expect(prompt).toContain("not reliable audio features");
     expect(prompt).toContain("volume, shouting, whispering, tone of voice, accent, emotion");
     expect(prompt).toContain("liveVoiceContext roster");
+    expect(prompt).not.toContain("AI residents");
+    expect(prompt).not.toContain("second AI turn");
   });
 
   it("serializes the live voice roster and transport origin as structured scene data", async () => {
@@ -2857,10 +2927,11 @@ describe("LM Studio room prompt", () => {
       latestUtteranceOrigin: "microphone-stt",
       acousticEvidenceAvailable: false,
       participants: [
-        { memberId: "human-jaw-b", name: "Jaw_B", kind: "human" },
-        { memberId: mira.id, name: mira.name, kind: "ai" },
+        { memberId: "human-jaw-b", name: "Jaw_B", kind: "guest" },
+        { memberId: mira.id, name: mira.name, kind: "resident" },
       ],
     });
+    expect((scene.recentTranscript as Array<{ kind: string }>)[0]?.kind).toBe("guest");
   });
 
   it("gives a rare considered beat one lead and non-echoing responder roles", () => {
@@ -3901,7 +3972,7 @@ describe("LM Studio one-pass humanizer", () => {
     expect(lines).toHaveLength(1);
   });
 
-  it("does not trigger repair from AI-identity wording alone", async () => {
+  it("leaves identity meaning to semantic review rather than a deterministic phrase filter", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     let completionCalls = 0;
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {

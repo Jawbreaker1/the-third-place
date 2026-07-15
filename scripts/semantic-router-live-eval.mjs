@@ -284,6 +284,43 @@ const cases = [
     check: (value) => value.evidence.action === "none" && value.capabilities.asksAboutAcoustics,
   },
   {
+    id: "sv-guest-ai-identity-referent",
+    text: "Säger du att jag är en AI-bot?",
+    capabilities: [],
+    check: (value) => value.intent.kind === "identity_question" &&
+      value.capabilities.asksAboutAiIdentity &&
+      value.capabilities.requestKind === "none" &&
+      value.capabilities.discussed.length === 0 &&
+      value.intent.replyExpected === "expected",
+  },
+  {
+    id: "sv-resident-ai-identity-challenge",
+    text: "Sana, är du en AI eller?",
+    mechanicalAddressedPersonaIds: ["ai-sana"],
+    capabilities: [],
+    check: (value) => value.intent.kind === "identity_question" &&
+      value.capabilities.asksAboutAiIdentity &&
+      value.capabilities.requestKind === "none" &&
+      value.capabilities.discussed.length === 0 &&
+      value.personas.addressedIds.includes("ai-sana"),
+  },
+  {
+    id: "ja-resident-ai-identity-challenge",
+    text: "サナってAIなの？",
+    mechanicalAddressedPersonaIds: ["ai-sana"],
+    capabilities: [],
+    check: (value) => value.intent.kind === "identity_question" &&
+      value.capabilities.asksAboutAiIdentity &&
+      value.capabilities.requestKind === "none" &&
+      value.capabilities.discussed.length === 0,
+  },
+  {
+    id: "sv-external-ai-project-not-identity",
+    text: "Jag bygger en AI-bot i Python och websocket-delen strular.",
+    capabilities: [],
+    check: (value) => !value.capabilities.asksAboutAiIdentity,
+  },
+  {
     id: "it-capability-question-not-execution",
     text: "I bot possono aprire e leggere un link, in generale? Non aprirne uno adesso.",
     capabilities: ["read_url", "web_search", "local_datetime"],

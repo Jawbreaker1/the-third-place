@@ -244,7 +244,6 @@ describe("humanizer false-positive guardrails", () => {
   it("does not use language-specific identity regex in the deterministic layer", () => {
     const text = "Som en AI-karaktär bor jag här i kanalen, men jag tänker inte låtsas vara människa.";
     expect(assessCandidate({ personaId: "ai-a", text }).reasonCodes).not.toContain("ai_meta_language");
-    expect(assessCandidate({ personaId: "ai-a", text, allowAiIdentity: true }).reasonCodes).not.toContain("ai_meta_language");
     expect(assessCandidate({ personaId: "ai-a", text: "Jag kan inte känna igen loggan på den bilden." }).reasonCodes)
       .not.toContain("ai_meta_language");
     expect(assessCandidate({ personaId: "ai-a", text: "I can't feel the latency in that trace." }).reasonCodes)

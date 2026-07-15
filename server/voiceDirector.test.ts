@@ -9,7 +9,12 @@ import { VoiceRoomRuntime } from "./voiceRooms.js";
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
 const routedAnalysis = (
   languageTag = "sv-SE",
-  options: { addressedIds?: string[]; addressConfidence?: number; asksAboutAcoustics?: boolean } = {},
+  options: {
+    addressedIds?: string[];
+    addressConfidence?: number;
+    asksAboutAcoustics?: boolean;
+    asksAboutAiIdentity?: boolean;
+  } = {},
 ): TurnAnalysis => {
   const fallback = createFailClosedTurnAnalysis("model_unavailable");
   return {
@@ -18,7 +23,9 @@ const routedAnalysis = (
     failureReason: null,
     language: { tag: languageTag, confidence: 0.99 },
     intent: {
-      kind: options.asksAboutAcoustics ? "capability_question" : "question",
+      kind: options.asksAboutAiIdentity
+        ? "identity_question"
+        : "question",
       isQuestion: true,
       replyExpected: "expected",
       confidence: 0.95,
@@ -32,6 +39,7 @@ const routedAnalysis = (
     capabilities: {
       ...fallback.capabilities,
       asksAboutAcoustics: options.asksAboutAcoustics ?? false,
+      asksAboutAiIdentity: options.asksAboutAiIdentity ?? false,
       confidence: 0.95,
     },
   } as TurnAnalysis;
@@ -93,6 +101,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
 
   let analysisInput: TurnAnalysisInput | undefined;
   let sceneLanguage: string | undefined;
+  let scenePremise: string | undefined;
   const syntheses: Array<Record<string, unknown>> = [];
   const payloads: Array<Record<string, unknown>> = [];
   const director = new VoiceDirector({
@@ -105,6 +114,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
       },
       generateScene: async (request) => {
         sceneLanguage = request.semanticContext?.languageTag;
+        scenePremise = request.premise;
         return [{
           personaId: "ai-sana",
           content: options.reply ?? "Ett kort och naturligt svar.",
@@ -162,6 +172,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
     roomId: created.room.id,
     runtime,
     sceneLanguage,
+    scenePremise,
     syntheses,
   };
 };
@@ -289,6 +300,19 @@ describe("VoiceDirector", () => {
       speakerKind: "ai",
       language: "sv-SE",
     });
+  });
+
+  it("carries the same referent-aware diegetic identity contract into voice turns", async () => {
+    const result = await runLanguageTurn({
+      analysis: routedAnalysis("sv-SE", { asksAboutAiIdentity: true }),
+      utterance: "Säger du att jag är en bot?",
+      reply: "Nä, det sa jag inte. Du är Alex.",
+    });
+
+    expect(result.scenePremise).toContain("answer the actual person or claim the human referred to");
+    expect(result.scenePremise).toContain("If this resident is accused, deny or playfully dismiss it");
+    expect(result.scenePremise).toContain("never volunteer the resident's own implementation identity as a contrast");
+    expect(result.payloads).toEqual([expect.objectContaining({ text: "Nä, det sa jag inte. Du är Alex." })]);
   });
 
   it("inherits a prior AI response language for a typed voice fallback", async () => {

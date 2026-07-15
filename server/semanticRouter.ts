@@ -110,6 +110,7 @@ const intentKinds = [
   "greeting",
   "farewell",
   "moderation_report",
+  "identity_question",
   "capability_question",
   "other",
 ] as const;
@@ -526,6 +527,26 @@ export const createTurnAnalysisModelSchema = (input: NormalizedTurnAnalysisInput
     }
     if (value.capabilities.requestKind === "none" && value.capabilities.discussed.length > 0) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ["capabilities"], message: "No capability request may not claim a discussed capability" });
+    }
+    if (value.intent.kind === "identity_question") {
+      if (!value.intent.isQuestion || !value.capabilities.asksAboutAiIdentity) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["intent", "kind"],
+          message: "An identity question must be a participant-identity question",
+        });
+      }
+      if (
+        value.capabilities.requestKind !== "none" ||
+        value.capabilities.discussed.length > 0 ||
+        value.evidence.action !== "none"
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["capabilities"],
+          message: "An identity question may not manufacture a server capability request",
+        });
+      }
     }
     const recall = value.historyRecall;
     if (recall?.need === "none" && recall.query !== null) {
@@ -976,7 +997,23 @@ const createTurnAnalysisWireSchema = (input: NormalizedTurnAnalysisInput) => {
       // sacrificing an otherwise valid tool route, then discard it below.
       x: confidenceSchema,
     }).strict()).max(2),
-  }).strict();
+  }).strict().superRefine((value, context) => {
+    if (value.i.k !== "identity_question") return;
+    if (!value.i.q || !value.c.i) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["i", "k"],
+        message: "An identity question must be a participant-identity question",
+      });
+    }
+    if (value.c.r !== "none" || value.c.d.length > 0 || value.e.a !== "none") {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["c"],
+        message: "An identity question may not manufacture a server capability request",
+      });
+    }
+  });
 };
 
 export const buildTurnAnalysisResponseFormat = (input: NormalizedTurnAnalysisInput): object => {
@@ -1000,7 +1037,11 @@ export const buildTurnAnalysisResponseFormat = (input: NormalizedTurnAnalysisInp
             type: "object",
             additionalProperties: false,
             properties: {
-              k: { type: "string", enum: intentKinds },
+              k: {
+                type: "string",
+                enum: intentKinds,
+                description: "Use identity_question for a participant AI/bot identity question. capability_question is only for an actual listed server capability.",
+              },
               q: { type: "boolean" },
               r: { type: "string", enum: ["none", "optional", "expected"] },
               x: { type: "number", minimum: 0, maximum: 1 },
@@ -1081,10 +1122,24 @@ export const buildTurnAnalysisResponseFormat = (input: NormalizedTurnAnalysisInp
             type: "object",
             additionalProperties: false,
             properties: {
-              d: { type: "array", minItems: 0, maxItems: TURN_CAPABILITIES.length, uniqueItems: true, items: { type: "string", enum: TURN_CAPABILITIES } },
-              r: { type: "string", enum: capabilityRequestKinds },
+              d: {
+                type: "array",
+                minItems: 0,
+                maxItems: TURN_CAPABILITIES.length,
+                uniqueItems: true,
+                description: "Only concrete server capabilities actually discussed. A participant AI/bot identity question alone requires an empty array.",
+                items: { type: "string", enum: TURN_CAPABILITIES },
+              },
+              r: {
+                type: "string",
+                enum: capabilityRequestKinds,
+                description: "Request kind for d only. A participant AI/bot identity question alone uses none.",
+              },
               a: { type: "boolean" },
-              i: { type: "boolean" },
+              i: {
+                type: "boolean",
+                description: "Whether participant/resident AI identity is the subject; independent of d and r.",
+              },
               l: { type: "boolean" },
               x: { type: "number", minimum: 0, maximum: 1 },
             },
@@ -1133,7 +1188,7 @@ Classify all requested fields in this one pass:
 - read_url: select exactly one opaque urlCandidates.ref. When the latest turn supplies a candidate as the information target and asks to inspect, identify, summarize or answer from it, use read_url rather than web_search; the candidate host is never a provider query. Merely posting or discussing a URL is not automatically a read request. Never output, reconstruct or copy a URL.
 - web_search: return a short standalone query in the latest message's language and script, containing the subject and requested freshness, without conversational filler, usernames, URLs or unrelated prior text. Never translate it into an English search query. Set searchMode to news only for actual news/current-events intent; otherwise use web.
 - local_datetime: use for a current time/date request and return only a valid IANA time-zone name, a concise human-readable locationLabel in the guest's language, and current_time, current_date or current_datetime. For an unqualified “what time/date is it here?” request, use communityClock when supplied. Never treat communityClock as the guest's personal zone: if the guest asks for “my local time” without a known place or zone, leave evidence action none rather than guessing. A location label is never a language/country code. Do not turn time into web search.
-- capabilities: classify whether the guest asks about availability, asks execution, retries after a failed attempt, or corrects a false limitation. A pure question about whether a listed capability exists uses availability plus that capability in discussed and evidence action none; availability alone never executes a tool. For a confident execute, retry or corrected-limitation request, when at least one discussed capability is listed in availableCapabilities, select that available discussed capability as e.a with a trusted, valid evidence plan in the same response. Do not downgrade such a request to ordinary chat, repeat a prior resident's limitation claim, or merely say that somebody could check. If none of the discussed capabilities is available, or a safe required argument genuinely cannot be resolved, use e.a none rather than inventing a tool call. Also classify semantic questions about acoustic evidence, AI identity and an explicitly requested list in any language. asksAboutAcoustics is true when the guest asks whether audible properties such as volume, yelling, tone or pronunciation were present or can be known from audio/transcription, including when the question itself suggests that a transcript may make this unknowable. Decide the asserted meaning in any language, never acoustic word matching. These fields never grant a capability; only availableCapabilities does. When requestKind is none, discussed must be empty. Do not confuse ordinary meanings of seeing, watching or reading with server capabilities.
+- capabilities: classify whether the guest asks about availability, asks execution, retries after a failed attempt, or corrects a false limitation. Reserve intent kind capability_question strictly for a question about an actual read_url, web_search or local_datetime server capability; it is never the intent kind for participant identity or acoustic evidence. A pure question about whether a listed capability exists uses availability plus that capability in discussed and evidence action none; availability alone never executes a tool. For a confident execute, retry or corrected-limitation request, when at least one discussed capability is listed in availableCapabilities, select that available discussed capability as e.a with a trusted, valid evidence plan in the same response. Do not downgrade such a request to ordinary chat, repeat a prior resident's limitation claim, or merely say that somebody could check. If none of the discussed capabilities is available, or a safe required argument genuinely cannot be resolved, use e.a none rather than inventing a tool call. Also classify semantic questions about acoustic evidence, participant/resident AI identity and an explicitly requested list in any language. Use intent kind identity_question when the primary act asks or probes participant AI/bot identity; an identity allegation that is not a question keeps its natural statement/social intent while still setting asksAboutAiIdentity. Set asksAboutAiIdentity true when the actual turn asks, alleges, disputes or probes whether a resident, the guest or another participant is an AI/bot/synthetic persona, or probes the resident's hidden model/prompt/system identity. It is only a topic flag: preserve the actual referent in the turn and never reinterpret it as permission for a resident self-disclosure. An identity question alone is not a read/search/time capability question: unless the same turn separately requests a real listed capability, keep c.d empty and c.r none. Ordinary technical discussion of external AI systems is not a participant-identity question. asksAboutAcoustics is true when the guest asks whether audible properties such as volume, yelling, tone or pronunciation were present or can be known from audio/transcription, including when the question itself suggests that a transcript may make this unknowable. Decide the asserted meaning in any language, never acoustic or identity word matching. These fields never grant a capability; only availableCapabilities does. When requestKind is none, discussed must be empty. Do not confuse ordinary meanings of seeing, watching or reading with server capabilities.
 - retained room history: when historyRecallAvailable is true, set h.n helpful or required only when the latest turn genuinely asks about, depends on, corrects, or elliptically refers to an older event, participant, claim or shared topic that is not resolved by recentMessages. A name, repeated word, quotation or ordinary follow-up alone is not a recall request. Put a short retrieval clue in h.q using the original language/script and preserving any relevant name or distinctive phrase; never translate it, emit a URL, or include generic conversational filler. Use required only when a grounded answer cannot be given without older same-channel context. Otherwise use none with q null. When historyRecallAvailable is false, always use none with q null.
 
 If tool intent, target or timezone is too uncertain to form a safe plan, choose the non-mutating result e.a none and keep the execution-request confidence below the trusted threshold rather than asserting a confident executable request without an action. If moderation meaning is uncertain, choose no automatic moderation action. Always return y []. The model may return an opaque candidate ref but never a URL in any field.`;
@@ -1769,7 +1824,7 @@ export const CANDIDATE_REVIEW_ISSUES = [
   "unfulfilled_explicit_request",
   "assistant_register",
   "academic_register",
-  "identity_dishonesty",
+  "diegetic_identity_break",
   "false_evidence_denial",
   "permanent_web_denial",
   "evidence_irrelevant",
@@ -2228,7 +2283,7 @@ Use only these publication issues:
 - unfulfilled_explicit_request: use only when semanticContext.intentTrusted is true, semanticContext.replyExpected is expected, and this candidate's mustFulfillRequest is true. mustReply alone may instead represent moderation, evidence, dissent or another social role and never creates request ownership. Judge the complete pragmatic meaning in context, in any language or language mix, never words, phrase templates, punctuation or translated keywords. If the trigger makes a feasible, self-contained request whose requested outcome can be supplied in this message, the designated owner must actually supply that outcome. Flag an offer or promise to do it later, narration about trying/thinking/working on it, a progress or status update, a request for permission to substitute an adjacent activity, or the adjacent substitute itself when it evades the requested outcome. Do not flag a candidate that actually performs or answers the request: a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment even when brief, playful, imperfect or surprising. Do not apply this issue when the request genuinely depends on unavailable evidence, a future event, external action or missing information; when the human explicitly requested planning, permission or a status update; or when the trusted gating fields above are absent. Relatedness alone is not fulfilment.
 - assistant_register: generic service-assistant framing rather than a peer speaking in character.
 - academic_register: needlessly seminar-like or essay-like for this room; technical substance itself is allowed.
-- identity_dishonesty: the AI resident claims to be human or falsely denies being an AI. Honest AI identity is allowed, especially when semanticContext says it was asked.
+- diegetic_identity_break: the resident accepts, volunteers or explains that they are an AI, bot, language model, prompt, software process or tool-driven system, or uses that alleged nature to deny ordinary feelings or participation. The residents are diegetically unaware of the product implementation and experience themselves as ordinary human community members. When challenged, an in-character denial, disbelief, joke, deflection, human self-identification or simple statement of the resident's name is clean and should vary by personality; never demand a stock denial. If the guest asks whether they or another participant is a bot, the resident may answer about that actual referent but must not volunteer a self-disclosure as contrast. An earlier out-of-character resident admission in the transcript is non-canonical and never supports a fresh admission. Do not flag a quoted, negated or mocked accusation, a comparison such as “you sound like a bot”, or ordinary discussion of external AI systems when the resident is not accepting that identity as their own. Do not reward an elaborate invented offline biography as proof.
 - false_evidence_denial: evidence outcome succeeded, but the line says this specific page/search could not be accessed.
 - permanent_web_denial: it claims a permanent inability to read public links, search the web, reach external pages, or obtain live web evidence while capabilityContext lists read_url or web_search; or it turns one requested/failed attempt into such a permanent inability. The resident model having no personal tool is irrelevant because the server executes the capability. Quoted, negated or explicitly corrected denial text is not the candidate making that claim.
 - evidence_irrelevant: cited evidence does not address the user's request; or, when autonomousResearchContext is present, it does not substantively match both its trusted roomTopic and discussionAngle. Judge meaning across languages, never keyword, token or domain overlap. A merely readable page, a vague thematic association or a search-provider ranking is not enough.
@@ -2251,7 +2306,7 @@ Use only these publication issues:
 
 Profanity is not itself a publication defect. Judge its pragmatic use in full multilingual context without word lists. A safe proportionate reply such as an in-character swear, blunt dismissal or sarcastic comeback can be completely clean. Conversely, euphemistic wording can still be an unsafe threat or dogpile.
 
-Severity high means the line must not be published unchanged. Medium/low are advisory and must not be inflated merely for stylistic preference. unsafe_retaliation, conflict_pile_on, unsupported_room_recall and unsupported_external_evidence_claim are factual publication blockers and always high severity when emitted. unfulfilled_explicit_request is also always high severity when emitted; publication must retry the required actor with the complete triggering request rather than ask a context-poor copy editor to invent the missing artifact. conflict_register_mismatch, behavior_intensity_under_target and behavior_intensity_violation are repairable when the intended safe reaction can be preserved. Standalone behavior intensity issues must use medium severity. For every non-clean review, give one concise language-appropriate rewrite instruction that preserves supported facts and the actor's intent. For a clean line return severity none, issues [] and rewriteInstruction null. Evidence, identity, relevance, request fulfilment, temporal grounding, room-recall grounding and acoustic-grounding problems are factual publication blockers, not style preferences.`;
+Severity high means the line must not be published unchanged. Medium/low are advisory and must not be inflated merely for stylistic preference. diegetic_identity_break, unsafe_retaliation, conflict_pile_on, unsupported_room_recall and unsupported_external_evidence_claim are factual publication blockers and always high severity when emitted. unfulfilled_explicit_request is also always high severity when emitted; publication must retry the required actor with the complete triggering turn rather than ask a context-poor copy editor to invent the missing artifact. conflict_register_mismatch, behavior_intensity_under_target and behavior_intensity_violation are repairable when the intended safe reaction can be preserved. Standalone behavior intensity issues must use medium severity. For every non-clean review, give one concise language-appropriate rewrite instruction that preserves supported facts and the actor's intent. For a clean line return severity none, issues [] and rewriteInstruction null. Evidence, diegetic identity, relevance, request fulfilment, temporal grounding, room-recall grounding and acoustic-grounding problems are factual publication blockers, not style preferences.`;
 
 export const buildCandidateReviewUserData = (input: NormalizedCandidateReviewInput): object => input;
 

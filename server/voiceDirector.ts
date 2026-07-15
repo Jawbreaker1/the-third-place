@@ -5,7 +5,7 @@ import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { CHANNELS, getChannelProfile } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
-import type { TranscriptLine } from "./lmStudio.js";
+import { diegeticIdentityTurnPremise, type TranscriptLine } from "./lmStudio.js";
 import type { SocialModelClient } from "./switchableModel.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import { mappedProviderVoiceForPersona, voiceProfileForPersona } from "./personaVoices.js";
@@ -479,6 +479,7 @@ export class VoiceDirector {
         trusted.capabilityTrusted
           ? `asksAboutAcoustics=${trusted.asksAboutAcoustics}`
           : "",
+        diegeticIdentityTurnPremise(trusted.asksAboutAiIdentity),
         trusted.interactionTrusted
           ? `interaction=${trusted.interaction.kind}; targetScope=${trusted.interaction.targetScope}; reactionNeed=${trusted.interaction.reactionNeed}; coarseness=${trusted.interaction.coarseness}; mutualBanterConfidence=${trusted.interaction.mutualBanterConfidence}`
           : "",

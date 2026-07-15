@@ -162,6 +162,7 @@ describe("multilingual semantic router contract", () => {
     expect(format.json_schema.schema.required).toEqual(expect.arrayContaining(["rl", "rlx", "b"]));
     expect(properties.s.required).toEqual(expect.arrayContaining(["p", "u", "o"]));
     expect(properties.b.properties.r.enum).toEqual(["none", "optional", "required"]);
+    expect(properties.i.properties.k.enum).toContain("identity_question");
     expect(properties.h.properties.n.enum).toEqual(["none", "helpful", "required"]);
     expect(format.json_schema.schema.required).toContain("h");
 
@@ -262,6 +263,42 @@ describe("multilingual semantic router contract", () => {
       evidence: { need: "none", action: "none", goal: null },
       capabilities: { discussed: ["web_search"], requestKind: "availability" },
     });
+  });
+
+  it("keeps participant identity questions structurally separate from server capabilities", () => {
+    const identity = modelOutput();
+    identity.intent = { kind: "identity_question", isQuestion: true, replyExpected: "expected", confidence: 0.99 };
+    identity.evidence = {
+      need: "none",
+      action: "none",
+      confidence: 0.99,
+      goal: null,
+      query: null,
+      urlRef: null,
+      searchMode: null,
+      timeZone: null,
+      timeKind: null,
+      locationLabel: null,
+    };
+    identity.capabilities = {
+      ...identity.capabilities,
+      discussed: [],
+      requestKind: "none",
+      asksAboutAiIdentity: true,
+      confidence: 0.99,
+    };
+
+    expect(parseTurnAnalysisContent(JSON.stringify(identity), input())).toMatchObject({
+      intent: { kind: "identity_question" },
+      capabilities: { discussed: [], requestKind: "none", asksAboutAiIdentity: true },
+    });
+
+    identity.capabilities = {
+      ...identity.capabilities,
+      discussed: ["read_url"],
+      requestKind: "availability",
+    };
+    expect(parseTurnAnalysisContent(JSON.stringify(identity), input())).toBeUndefined();
   });
 
   it.each(["execute", "retry", "correct_limitation"] as const)(
@@ -746,6 +783,33 @@ describe("multilingual semantic router contract", () => {
     expect(parseTurnAnalysisContent(JSON.stringify(compact), input())?.capabilities.discussed).toEqual([]);
   });
 
+  it("rejects a compact identity route that leaks into capability metadata", () => {
+    const compact = {
+      l: "sv",
+      lx: 0.99,
+      rl: "sv",
+      rlx: 0.99,
+      i: { k: "identity_question", q: true, r: "expected", x: 0.99 },
+      p: { a: ["ai-sana"], r: [], v: ["ai-sana"], x: 0.99, y: 0.99 },
+      s: { w: 0.4, h: 0, p: 0.2, a: 0, u: 0, e: 0.3, o: 0, c: 0.2, x: 0.95 },
+      b: { k: "ordinary", t: "room", r: "none", c: 0, m: 0, x: 0.95 },
+      m: { r: "none", a: "none", c: [], x: 0.99 },
+      e: { a: "none", x: 0.99, g: null, q: null, u: null, m: null, z: null, k: null, l: null },
+      c: { d: [], r: "none", a: false, i: true, l: false, x: 0.99 },
+      h: { n: "none", q: null, x: 0.99 },
+      y: [],
+    };
+
+    expect(parseTurnAnalysisContent(JSON.stringify(compact), input())).toMatchObject({
+      intent: { kind: "identity_question" },
+      capabilities: { discussed: [], requestKind: "none", asksAboutAiIdentity: true },
+    });
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compact,
+      c: { ...compact.c, d: ["read_url"], r: "availability" },
+    }), input())).toBeUndefined();
+  });
+
   it("normalizes a contradictory no-reaction bit after a directed-act classification", () => {
     const compact = {
       l: "en",
@@ -783,6 +847,11 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("real external link or reachable destination requested as the deliverable itself");
     expect(prompt).toContain("even when grammatically negative or rhetorical");
     expect(prompt).toContain("never select a tool while leaving c.d empty or c.r none");
+    expect(prompt).toContain("participant/resident AI identity");
+    expect(prompt).toContain("preserve the actual referent in the turn");
+    expect(prompt).toContain("never reinterpret it as permission for a resident self-disclosure");
+    expect(prompt).toContain("An identity question alone is not a read/search/time capability question");
+    expect(prompt).toContain("Ordinary technical discussion of external AI systems is not a participant-identity question");
     expect(prompt).toContain("a source name or instruction to inspect it is not itself the information goal");
     expect(prompt).toContain("availableCapabilities is trusted server-owned runtime inventory");
     expect(prompt).toContain("never let a prior resident denial override the inventory");
@@ -791,7 +860,7 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("availability alone never executes a tool");
     expect(prompt).toContain("select that available discussed capability as e.a");
     expect(prompt).toContain("including when the question itself suggests that a transcript may make this unknowable");
-    expect(prompt).toContain("never acoustic word matching");
+    expect(prompt).toContain("never acoustic or identity word matching");
     expect(prompt).toContain("quoted/reporting speech from endorsement");
     expect(prompt).toContain("A reporter explicitly asking to flag or report a message/person uses intent moderation_report and action report");
     expect(prompt).toContain("Always return y []");
@@ -1564,6 +1633,8 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviews.items.properties.issues.items.enum).toContain("gratuitous_time_reference");
     expect(reviews.items.properties.issues.items.enum).toContain("unfulfilled_explicit_request");
     expect(reviews.items.properties.issues.items.enum).toContain("unsupported_external_evidence_claim");
+    expect(reviews.items.properties.issues.items.enum).toContain("diegetic_identity_break");
+    expect(reviews.items.properties.issues.items.enum).not.toContain("identity_dishonesty");
   });
 
   it("accepts quoted multilingual discussion as clean and rejects missing or duplicate persona reviews", () => {
@@ -1797,6 +1868,11 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("visibleAffect true permits one genuine feeling");
     expect(prompt).toContain("informal fragment, lowercase opening, letter elongation, brief self-correction, rough orthography, harmless typo, mild profanity");
     expect(prompt).toContain("Do not formalize or copy-edit such permitted texture");
+    expect(prompt).toContain("diegetic_identity_break");
+    expect(prompt).toContain("residents are diegetically unaware of the product implementation");
+    expect(prompt).toContain("in-character denial, disbelief, joke, deflection, human self-identification");
+    expect(prompt).toContain("never demand a stock denial");
+    expect(prompt).not.toContain("Honest AI identity is allowed");
   });
 
   it("separates fallback-safe under-target intensity from non-fallback violations", () => {

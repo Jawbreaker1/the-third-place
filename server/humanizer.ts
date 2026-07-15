@@ -74,8 +74,6 @@ export interface AssessCandidateInput {
   register?: HumanizerRegister;
   /** Set this when a structured answer was explicitly requested by a human. */
   allowList?: boolean;
-  /** Set only when the human explicitly asks about the resident's AI identity. */
-  allowAiIdentity?: boolean;
 }
 
 export type ProtectedFragmentKind = "fenced-code" | "inline-code" | "url";
