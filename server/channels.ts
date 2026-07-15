@@ -113,6 +113,18 @@ export interface ChannelProfile {
    */
   ambientPremiseFamilies?: string[];
   autonomousResearchSeeds?: AutonomousResearchSeed[];
+  /**
+   * Trusted scheduling preference for source-backed ambient threads. This is
+   * content-blind and combines with (but never overrides) the Admin frequency
+   * control, global caps, quiet time, voice exclusion and room activity.
+   */
+  autonomousResearchPriority?: number;
+  /**
+   * Optional typed event/source stream for a room. The identifier selects a
+   * fixed server-owned adapter; channel names and message wording never route
+   * this path.
+   */
+  marketPulseSourceSet?: "global_markets";
 }
 
 export const CHANNEL_PROFILES: ChannelProfile[] = [
@@ -508,24 +520,52 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     autonomousResearchSeeds: [
       {
         id: "stock-earnings-margin-surprise",
-        query: "recent company earnings report with an unexpected margin change",
+        query: "latest company earnings report with an unexpected margin change",
         mode: "news",
-        maxAgeDays: 60,
+        maxAgeDays: 14,
         discussionAngle: "Separate the documented cause from the market reaction, then debate whether the margin change looks durable or temporary.",
       },
       {
         id: "stock-capital-allocation-filing",
-        query: "recent corporate filing on buybacks dividends or major reinvestment",
+        query: "latest corporate filing on buybacks dividends or major reinvestment",
         mode: "news",
-        maxAgeDays: 120,
+        maxAgeDays: 21,
         discussionAngle: "Use the supplied filing facts to compare the chosen use of cash with one plausible alternative, then let each resident say which choice they personally prefer and why without implying future returns are known.",
       },
       {
         id: "stock-central-bank-decision",
         query: "latest central bank policy decision and stated economic rationale",
         mode: "news",
-        maxAgeDays: 60,
+        maxAgeDays: 7,
         discussionAngle: "Pick one stated trade-off and discuss which kind of business would feel it first, while keeping forecasts explicitly uncertain.",
+      },
+      {
+        id: "stock-global-index-divergence",
+        query: "latest session major global stock indexes strongest and weakest regions",
+        mode: "news",
+        maxAgeDays: 2,
+        discussionAngle: "Use the supplied figures to compare one clearly stronger and one clearly weaker market, then debate whether the difference looks macro-driven or market-specific without inventing causality.",
+      },
+      {
+        id: "stock-market-moving-company-event",
+        query: "latest market moving public company announcement earnings guidance acquisition or regulatory decision",
+        mode: "news",
+        maxAgeDays: 3,
+        discussionAngle: "Anchor the discussion in the announced fact and the documented market response, then give one bull and one bear interpretation without pretending either is settled.",
+      },
+      {
+        id: "stock-economic-data-surprise",
+        query: "latest official inflation employment or growth data release market reaction",
+        mode: "news",
+        maxAgeDays: 7,
+        discussionAngle: "Separate the released number from the reported market reaction and argue which assumption about rates or earnings the release actually challenges.",
+      },
+      {
+        id: "stock-sector-rotation",
+        query: "latest stock market sector rotation leaders laggards and reported catalyst",
+        mode: "news",
+        maxAgeDays: 3,
+        discussionAngle: "Pick one leading and one lagging sector from the supplied evidence and debate whether the move reflects changing fundamentals or positioning, without claiming an unsupported cause.",
       },
       {
         id: "stock-accounting-quality",
@@ -534,6 +574,8 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
         discussionAngle: "Extract one concrete accounting signal and let the room disagree about when it is a warning versus ordinary business mechanics.",
       },
     ],
+    autonomousResearchPriority: 1.8,
+    marketPulseSourceSet: "global_markets",
   },
   {
     public: {

@@ -37,6 +37,10 @@ describe("channel profiles", () => {
         expect(profile.ambientPremiseFamilies.every((family) => /^[a-z0-9-]{3,48}$/.test(family))).toBe(true);
         expect(new Set(profile.ambientPremiseFamilies).size).toBeGreaterThanOrEqual(8);
       }
+      if (profile.autonomousResearchPriority !== undefined) {
+        expect(profile.autonomousResearchPriority, profile.public.id).toBeGreaterThanOrEqual(0.25);
+        expect(profile.autonomousResearchPriority, profile.public.id).toBeLessThanOrEqual(4);
+      }
       expect(CONVERSATION_REGISTERS[profile.conversationRegister].guidance.length).toBeGreaterThan(40);
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
     }
@@ -74,6 +78,11 @@ describe("channel profiles", () => {
     }
     expect(new Set(allIds).size).toBe(allIds.length);
     expect(new Set(allQueries).size).toBe(allQueries.length);
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "stock-market")?.autonomousResearchPriority)
+      .toBeGreaterThan(1);
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "stock-market")?.marketPulseSourceSet)
+      .toBe("global_markets");
+    expect(CHANNEL_PROFILES.filter((profile) => profile.marketPulseSourceSet)).toHaveLength(1);
     const pubSeedIds = CHANNEL_PROFILES.find((profile) => profile.public.id === "the-pub")!
       .autonomousResearchSeeds!.map((seed) => seed.id);
     expect(pubSeedIds).toEqual(expect.arrayContaining([

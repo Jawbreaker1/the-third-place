@@ -2057,7 +2057,7 @@ export const candidateReviewInputSchema = z.object({
   }).strict().nullable().default(null),
   evidence: z.object({
     outcome: z.enum(["none", "requested", "succeeded", "failed"]),
-    kind: z.enum(["search", "page", "weather"]).nullable(),
+    kind: z.enum(["search", "page", "weather", "market"]).nullable(),
     query: boundedText(300).nullable(),
     results: z.array(z.object({
       id: safeId,

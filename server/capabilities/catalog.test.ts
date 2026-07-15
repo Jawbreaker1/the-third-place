@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MARKET_TARGET_IDS } from "../marketData/catalog.js";
 import {
   CAPABILITY_ARGUMENT_FIELDS,
   CAPABILITY_CATALOG,
@@ -73,7 +74,7 @@ describe("declarative capability catalog", () => {
     values: Partial<CapabilityArgumentValues>;
   }>([
     { capability: "web_search", values: { q: "今日のニュース", m: "news" } },
-    { capability: "market_snapshot", values: { l: "OMXS30" } },
+    { capability: "market_snapshot", values: { l: "SE_OMXS30" } },
     { capability: "local_datetime", values: { z: "Asia/Tokyo", k: "current_time", l: "東京" } },
     { capability: "weather_forecast", values: { l: "Ciudad de México" } },
   ])("accepts only the declared argument shape for $capability", ({ capability, values }) => {
@@ -91,14 +92,23 @@ describe("declarative capability catalog", () => {
     expect(invalid.message).toBe(CAPABILITY_CATALOG[capability].validationMessage);
   });
 
-  it("rejects provider identifiers outside a capability's declarative fixed set", () => {
+  it("accepts only canonical exact-index and fixed-basket market targets", () => {
+    expect(CAPABILITY_CATALOG.market_snapshot.arguments.allowedStringValues?.l).toEqual(MARKET_TARGET_IDS);
     expect(validateCapabilityArgumentShape("market_snapshot", {
       ...emptyArguments(),
-      l: "NASDAQ",
+      l: "OMXS30",
     })).toMatchObject({ valid: false, invalidValue: ["l"] });
     expect(validateCapabilityArgumentShape("market_snapshot", {
       ...emptyArguments(),
       l: "DJUS",
+    })).toMatchObject({ valid: false, invalidValue: ["l"] });
+    expect(validateCapabilityArgumentShape("market_snapshot", {
+      ...emptyArguments(),
+      l: "US_DJIA",
+    }).valid).toBe(true);
+    expect(validateCapabilityArgumentShape("market_snapshot", {
+      ...emptyArguments(),
+      l: "GLOBAL_MAJOR",
     }).valid).toBe(true);
   });
 
@@ -142,5 +152,12 @@ describe("declarative capability catalog", () => {
     expect(verifier).toContain("- web_search: requires q and m");
     expect(verifier).toContain("- local_datetime: requires a valid IANA z");
     expect(verifier).toContain("Retain the guest request's language and writing system");
+
+    const market = buildCapabilityRoutingGuidance(["market_snapshot"], "primary");
+    expect(market).toContain("SE_OMXS30: Sweden's OMX Stockholm 30");
+    expect(market).toContain("US_DJIA: the United States Dow Jones Industrial Average");
+    expect(market).toContain("GLOBAL_MAJOR: a bounded cross-region overview");
+    expect(market).toContain("rest of the world or other world markets performed");
+    expect(market).toContain("Individual equities, market news, history, causes");
   });
 });

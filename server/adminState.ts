@@ -375,7 +375,11 @@ const runtimeChannelFromConfig = (
   // A built-in research lookup is trusted configuration for its original
   // topic. Reusing it after a complete topic replacement would silently post
   // evidence about the former room subject.
-  if (topicReplaced) delete profile.autonomousResearchSeeds;
+  if (topicReplaced) {
+    delete profile.autonomousResearchSeeds;
+    delete profile.autonomousResearchPriority;
+    delete profile.marketPulseSourceSet;
+  }
   return profile;
 };
 

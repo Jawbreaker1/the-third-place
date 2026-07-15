@@ -11,8 +11,8 @@ export interface ResearchResult {
 }
 
 export interface ResearchPacket {
-  /** Trusted server evidence transport; `weather` is produced only by the typed forecast provider. */
-  kind?: "search" | "page" | "weather";
+  /** Trusted server evidence transport; structured kinds come only from typed fixed-provider services. */
+  kind?: "search" | "page" | "weather" | "market";
   query: string;
   retrievedAt: string;
   results: ResearchResult[];

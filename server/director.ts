@@ -71,6 +71,15 @@ import {
   type ResearchPacket,
   type WeatherForecastCapabilityProvider,
 } from "./capabilities/registry.js";
+import type { MarketSnapshot } from "./marketData/types.js";
+import type { MarketSnapshotService } from "./marketData/service.js";
+import type {
+  MarketPulseCandidate,
+  MarketPulseCoordinator,
+  MarketPulseFeedCandidate,
+  MarketPulseMovementCandidate,
+  ValidatedMarketObservation,
+} from "./marketPulse.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -625,6 +634,13 @@ export interface SocialDirectorOptions {
   pageReader?: PageReader;
   /** Fixed-host typed forecast capability. `null` disables it explicitly in tests or deployments. */
   weatherForecastProvider?: WeatherForecastCapabilityProvider | null;
+  /** Provider-neutral typed market snapshots shared by direct turns and MarketPulse. */
+  marketSnapshotProvider?: Pick<MarketSnapshotService, "snapshot"> | null;
+  /** Fixed-source market event coordinator. `null` disables autonomous market events. */
+  marketPulseCoordinator?: Pick<
+    MarketPulseCoordinator,
+    "pollOfficialFeeds" | "evaluateMarketObservations"
+  > | null;
   /** Live server-owned behavior settings; storage and authorization stay outside the director. */
   behaviorTuningProvider?: BehaviorTuningProvider;
 }
@@ -754,6 +770,40 @@ export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boo
   return gate.rng() < clamp(gate.chance, 0, 1);
 }
 
+export interface PrioritizedAutonomousResearchPolicy {
+  chance: number;
+  channelCooldownMs: number;
+  selectionKey: number;
+}
+
+/**
+ * Applies a bounded, declarative room preference without granting execution
+ * authority or bypassing any global/admin safety gate. A priority of one is
+ * neutral; zero is intentionally not a kill switch because the Admin link
+ * frequency already owns that unambiguous control.
+ */
+export function prioritizeAutonomousResearch(
+  chance: number,
+  channelCooldownMs: number,
+  priority: number | undefined,
+  random: number,
+): PrioritizedAutonomousResearchPolicy {
+  const weight = clamp(
+    typeof priority === "number" && Number.isFinite(priority) ? priority : 1,
+    0.25,
+    4,
+  );
+  const boundedChance = clamp(chance, 0, 1);
+  const boundedRandom = clamp(random, Number.EPSILON, 1);
+  return {
+    chance: 1 - (1 - boundedChance) ** weight,
+    channelCooldownMs: Math.max(60_000, Math.round(channelCooldownMs / Math.sqrt(weight))),
+    // Weighted random ordering lets preferred rooms win more often without
+    // making any room a permanent monopoly when several are eligible.
+    selectionKey: boundedRandom ** (1 / weight),
+  };
+}
+
 /** Short exponential retry delay, always below the normal success cooldown. */
 export function autonomousResearchFailureBackoffMs(consecutiveFailures: number): number {
   const exponent = Math.max(0, Math.min(2, Math.floor(consecutiveFailures) - 1));
@@ -824,6 +874,81 @@ export function canonicalAutonomousResearchUrl(value: string): string | undefine
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Converts only already-validated provider observations into the narrower
+ * MarketPulse contract. No room wording, locale or model output participates.
+ */
+export function marketPulseObservationsFromSnapshot(
+  snapshot: MarketSnapshot,
+): ValidatedMarketObservation[] {
+  return snapshot.observations.flatMap((observation) => {
+    if (observation.freshness.status === "stale") return [];
+    return [{
+      validated: true as const,
+      providerId: observation.provider.id,
+      instrumentId: observation.indexId,
+      displayName: observation.displayName,
+      region: observation.region,
+      sessionId: observation.tradingDate,
+      sessionChangePercent: observation.changePercent,
+      observedAt: observation.freshness.observedAt,
+      sourceUrl: observation.provider.sourceUrl,
+      sourceTitle: `${observation.displayName} latest reported index data`,
+      breadthEligible: true,
+    }];
+  });
+}
+
+export function autonomousResearchSeedForMarketPulse(
+  candidate: MarketPulseCandidate,
+): AutonomousResearchSeed {
+  if (candidate.origin === "official_feed") {
+    return {
+      id: `market-pulse-feed:${candidate.id}`.slice(0, 180),
+      query: `${candidate.providerLabel} official market release`.slice(0, 180),
+      mode: "news",
+      maxAgeDays: 3,
+      discussionAngle: "Use one concrete fact from the supplied official release and disagree about its practical market relevance without inventing a price reaction or causal story.",
+    };
+  }
+  return {
+    id: `market-pulse-move:${candidate.id}`.slice(0, 180),
+    query: "validated major equity-index movement",
+    mode: "news",
+    maxAgeDays: 1,
+    discussionAngle: "Discuss the supplied latest-reported index move as a fact, then give two different interpretations of what would be worth checking next. Do not invent a cause, headline or trade recommendation.",
+  };
+}
+
+const compactMarketNumber = (value: number): string =>
+  Number.parseFloat(value.toFixed(Math.abs(value) >= 100 ? 2 : 4)).toString();
+
+/** One exact provider row is enough for an alert without falsely attributing a broad causal story. */
+export function marketMovementResearchPacket(
+  candidate: MarketPulseMovementCandidate,
+): ResearchPacket | undefined {
+  const observation = [...candidate.observations]
+    .sort((left, right) => Math.abs(right.sessionChangePercent) - Math.abs(left.sessionChangePercent))[0];
+  if (!observation) return undefined;
+  const direction = observation.sessionChangePercent > 0 ? "up" : "down";
+  return {
+    kind: "market",
+    query: "validated major equity-index movement",
+    retrievedAt: candidate.detectedAt,
+    results: [{
+      id: "S1",
+      title: observation.sourceTitle,
+      url: observation.sourceUrl,
+      snippet: [
+        `${observation.displayName} was latest reported ${direction} ${compactMarketNumber(Math.abs(observation.sessionChangePercent))}% versus the previous close.`,
+        `Observation time: ${observation.observedAt}. Trading session: ${observation.sessionId}.`,
+        `This structured provider observation does not establish why the move happened.`,
+      ].join(" "),
+      publishedAt: observation.observedAt,
+    }],
+  };
 }
 
 export function linkPreviewFromResearch(
@@ -1361,6 +1486,11 @@ export class SocialDirector {
   private readonly autoSharedLinkDiscussionEnabled: boolean;
   private readonly pageReader: PageReader;
   private readonly capabilityRegistry: CapabilityRegistry;
+  private readonly marketSnapshotProvider?: Pick<MarketSnapshotService, "snapshot">;
+  private readonly marketPulseCoordinator?: Pick<
+    MarketPulseCoordinator,
+    "pollOfficialFeeds" | "evaluateMarketObservations"
+  >;
   private readonly dmTurns: DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>;
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
   private lastAutonomousResearchSuccessAt?: number;
@@ -1385,8 +1515,11 @@ export class SocialDirector {
       pageReader: this.pageReader,
       researchBroker: this.researchBroker,
       weatherForecastProvider: options.weatherForecastProvider,
+      marketSnapshotProvider: options.marketSnapshotProvider,
       now: this.now,
     });
+    this.marketSnapshotProvider = options.marketSnapshotProvider ?? undefined;
+    this.marketPulseCoordinator = options.marketPulseCoordinator ?? undefined;
     this.behaviorTuningProvider = options.behaviorTuningProvider;
     this.dmTurns = new DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>({
       debounceMs: options.dmDebounceMs,
@@ -2783,6 +2916,214 @@ export class SocialDirector {
     };
   }
 
+  /**
+   * Research is selected across all eligible rooms before ordinary ambient
+   * room scoring. This prevents a source-oriented room from losing every
+   * opportunity merely because unrelated chatter won the first room lottery.
+   */
+  private async maybeRunAutonomousResearch(
+    now: number,
+    globalTuning: AdminBehaviorTuning,
+    queueDepth: number,
+  ): Promise<boolean> {
+    while (
+      this.autonomousResearchSuccessTimestamps[0] !== undefined &&
+      now - this.autonomousResearchSuccessTimestamps[0] >= 24 * 60 * 60_000
+    ) this.autonomousResearchSuccessTimestamps.shift();
+    if (
+      this.autonomousResearchGlobalRetryAfterAt !== undefined &&
+      now >= this.autonomousResearchGlobalRetryAfterAt
+    ) this.autonomousResearchGlobalRetryAfterAt = undefined;
+
+    const availableMessageSlots = Math.min(
+      2,
+      this.availableAutonomousMessageSlots(now, globalTuning.activity),
+    );
+    if (availableMessageSlots < 2) return false;
+
+    const eligibleCandidates = CHANNELS.flatMap((channel) => {
+      const profile = getChannelProfile(channel.id);
+      const seeds = profile?.autonomousResearchSeeds ?? [];
+      const channelTuning = this.channelBehaviorTuning(channel.id, globalTuning);
+      if (
+        seeds.length === 0 ||
+        channelTuning.activity === 0 ||
+        now - (this.lastHumanMessageAtByChannel.get(channel.id) ?? 0) <= this.ambientHumanQuietMs ||
+        !this.ambientChannelIsAvailable(channel.id, now) ||
+        this.ambientThreads.has(channel.id)
+      ) return [];
+
+      let failureState = this.autonomousResearchFailureStateByChannel.get(channel.id);
+      if (
+        failureState &&
+        now - failureState.retryAfterAt >= AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS
+      ) {
+        this.autonomousResearchFailureStateByChannel.delete(channel.id);
+        failureState = undefined;
+      }
+      const available = this.actorChannels
+        .candidatesFor(channel.id)
+        .filter(
+          (persona) =>
+            persona.id !== "ai-runa" &&
+            persona.id !== "ai-robin" &&
+            now - (this.lastSpoke.get(persona.id) ?? 0) > persona.cooldownMs,
+        );
+      if (available.length < 2 || !available.some((persona) => persona.canResearch)) return [];
+
+      const basePolicy = this.autonomousResearchPolicy(channel.id);
+      const prioritized = prioritizeAutonomousResearch(
+        basePolicy.chance,
+        basePolicy.channelCooldownMs,
+        profile?.autonomousResearchPriority,
+        this.rng(),
+      );
+      return [{ channel, profile, seeds, available, failureState, basePolicy, prioritized }];
+    });
+
+    // A validated exceptional move gets deterministic attention once the
+    // ordinary safety/capacity gates are open. Its shorter cooldown is still
+    // proportional to the Admin frequency and persistent session high-water
+    // prevents the same episode from reopening on every poll.
+    for (const candidate of eligibleCandidates
+      .filter((item) => item.profile?.marketPulseSourceSet === "global_markets")
+      .sort((left, right) => right.prioritized.selectionKey - left.prioritized.selectionKey)) {
+      const exceptionalGate = shouldStartAutonomousResearch({
+        enabled: candidate.basePolicy.enabled && Boolean(this.marketPulseCoordinator && this.marketSnapshotProvider),
+        now,
+        lastGlobalSuccessAt: this.lastAutonomousResearchSuccessAt,
+        lastChannelSuccessAt: this.lastAutonomousResearchSuccessAtByChannel.get(candidate.channel.id),
+        globalRetryAfterAt: this.autonomousResearchGlobalRetryAfterAt,
+        channelRetryAfterAt: candidate.failureState?.retryAfterAt,
+        lastHumanActivityAt: this.lastHumanActivityAt,
+        globalCooldownMs: Math.max(3 * 60_000, Math.round(candidate.basePolicy.globalCooldownMs * 0.25)),
+        channelCooldownMs: Math.max(10 * 60_000, Math.round(candidate.prioritized.channelCooldownMs * 0.25)),
+        humanQuietMs: candidate.basePolicy.humanQuietMs,
+        queueDepth,
+        availableMessageSlots,
+        dailySuccesses: this.autonomousResearchSuccessTimestamps.length,
+        dailyCap: candidate.basePolicy.dailyCap,
+        voiceRoomActive: this.voiceRoomActive,
+        freshThread: true,
+        availableActors: candidate.available.length,
+        chance: 1,
+        rng: this.rng,
+      });
+      if (!exceptionalGate) continue;
+      const movement = await this.detectExceptionalMarketMovement();
+      const research = movement ? marketMovementResearchPacket(movement) : undefined;
+      if (!movement || !research) continue;
+      const thread = this.getOrStartAmbientThread(candidate.channel.id, now);
+      if (!thread || thread.messageCount !== 0) continue;
+      const seed = autonomousResearchSeedForMarketPulse(movement);
+      this.lastAmbientChannelId = candidate.channel.id;
+      const epoch = this.channelEpoch.get(candidate.channel.id) ?? 0;
+      const published = await this.runAutonomousResearchConversation(
+        candidate.channel,
+        epoch,
+        candidate.available,
+        thread,
+        seed,
+        { research },
+      );
+      if (!published && thread.messageCount === 0) this.abandonAmbientThread(candidate.channel.id, thread);
+      return true;
+    }
+
+    const candidates = eligibleCandidates.filter((candidate) =>
+      shouldStartAutonomousResearch({
+        enabled: candidate.basePolicy.enabled,
+        now,
+        lastGlobalSuccessAt: this.lastAutonomousResearchSuccessAt,
+        lastChannelSuccessAt: this.lastAutonomousResearchSuccessAtByChannel.get(candidate.channel.id),
+        globalRetryAfterAt: this.autonomousResearchGlobalRetryAfterAt,
+        channelRetryAfterAt: candidate.failureState?.retryAfterAt,
+        lastHumanActivityAt: this.lastHumanActivityAt,
+        globalCooldownMs: candidate.basePolicy.globalCooldownMs,
+        channelCooldownMs: candidate.prioritized.channelCooldownMs,
+        humanQuietMs: candidate.basePolicy.humanQuietMs,
+        queueDepth,
+        availableMessageSlots,
+        dailySuccesses: this.autonomousResearchSuccessTimestamps.length,
+        dailyCap: candidate.basePolicy.dailyCap,
+        voiceRoomActive: this.voiceRoomActive,
+        freshThread: true,
+        availableActors: candidate.available.length,
+        chance: candidate.prioritized.chance,
+        rng: this.rng,
+      }),
+    ).sort((a, b) => b.prioritized.selectionKey - a.prioritized.selectionKey);
+
+    for (const candidate of candidates) {
+      const thread = this.getOrStartAmbientThread(candidate.channel.id, now);
+      if (!thread || thread.messageCount !== 0) continue;
+      const recentSeeds = this.recentAutonomousResearchSeedsByChannel.get(candidate.channel.id) ?? [];
+      let seed: AutonomousResearchSeed | undefined;
+      let preparedOutcome: AutonomousResearchReadOutcome | undefined;
+      if (getChannelProfile(candidate.channel.id)?.marketPulseSourceSet === "global_markets") {
+        const pulse = await this.prepareMarketPulseConversation(candidate.channel.id);
+        seed = pulse?.seed;
+        preparedOutcome = pulse?.outcome;
+      }
+      seed ??= selectAutonomousResearchSeed(candidate.seeds, recentSeeds, this.rng);
+      if (!seed) {
+        this.abandonAmbientThread(candidate.channel.id, thread);
+        continue;
+      }
+      this.lastAmbientChannelId = candidate.channel.id;
+      const epoch = this.channelEpoch.get(candidate.channel.id) ?? 0;
+      const published = await this.runAutonomousResearchConversation(
+        candidate.channel,
+        epoch,
+        candidate.available,
+        thread,
+        seed,
+        preparedOutcome,
+      );
+      if (!published && thread.messageCount === 0) {
+        this.abandonAmbientThread(candidate.channel.id, thread);
+      }
+      // One bounded network/generation attempt per ambient tick, successful or
+      // not. Failures own their own short backoff and must not cascade rooms.
+      return true;
+    }
+    return false;
+  }
+
+  private async prepareMarketPulseConversation(
+    channelId: string,
+  ): Promise<{ seed: AutonomousResearchSeed; outcome: AutonomousResearchReadOutcome } | undefined> {
+    if (!this.marketPulseCoordinator) return undefined;
+    try {
+      const feed = (await this.marketPulseCoordinator.pollOfficialFeeds())[0];
+      if (!feed) return undefined;
+      const seed = autonomousResearchSeedForMarketPulse(feed);
+      return {
+        seed,
+        outcome: await this.safelyReadMarketPulseFeedCandidate(channelId, seed, feed),
+      };
+    } catch (error) {
+      console.warn("Official market pulse unavailable safely:", error instanceof Error ? error.message : error);
+      return undefined;
+    }
+  }
+
+  private async detectExceptionalMarketMovement(): Promise<MarketPulseMovementCandidate | undefined> {
+    if (!this.marketPulseCoordinator || !this.marketSnapshotProvider) return undefined;
+    try {
+      const snapshot = await this.marketSnapshotProvider.snapshot({ targetId: "GLOBAL_MAJOR" });
+      const movements = await this.marketPulseCoordinator.evaluateMarketObservations(
+        marketPulseObservationsFromSnapshot(snapshot),
+      );
+      return movements
+        .filter((candidate) => candidate.priority === "exceptional")
+        .sort((left, right) => right.severityBand - left.severityBand)[0];
+    } catch (error) {
+      console.warn("Structured market pulse unavailable safely:", error instanceof Error ? error.message : error);
+      return undefined;
+    }
+  }
+
   private ambientChannelIsAvailable(channelId: string, now: number): boolean {
     const backoffUntil = this.ambientBackoffUntilByChannel.get(channelId);
     if (backoffUntil !== undefined) {
@@ -3255,12 +3596,57 @@ export class SocialDirector {
       };
   }
 
+  private async safelyReadMarketPulseFeedCandidate(
+    channelId: string,
+    seed: AutonomousResearchSeed,
+    candidate: MarketPulseFeedCandidate,
+  ): Promise<AutonomousResearchReadOutcome> {
+    const canonicalCandidate = canonicalAutonomousResearchUrl(candidate.url);
+    if (!canonicalCandidate || this.recentPublishedUrlKeys().has(canonicalCandidate)) {
+      return { failureReason: "no_safe_fresh_result" };
+    }
+    if (!autonomousResearchResultIsFresh(seed, candidate.publishedAt, this.now())) {
+      return { failureReason: "no_safe_fresh_result" };
+    }
+    let url: URL;
+    try {
+      url = new URL(candidate.url);
+    } catch {
+      return { failureReason: "source_read_failed" };
+    }
+    const requesterId = `ambient-research:${channelId}`;
+    const page = await this.pageReader.read({
+      url,
+      requestedAt: new Date(this.now()).toISOString(),
+      intent: seed.discussionAngle,
+      retry: false,
+      source: "message",
+      initiator: "automatic",
+    }, requesterId).catch((error) => {
+      console.warn("Official market source read failed safely:", error instanceof Error ? error.message : error);
+      return undefined;
+    });
+    const pageResult = page?.results.find((result) => result.id === "S1");
+    if (!page || !pageResult || !canonicalAutonomousResearchUrl(pageResult.url)) {
+      return { failureReason: "source_read_failed" };
+    }
+    return {
+      research: {
+        kind: "page",
+        query: seed.query,
+        retrievedAt: page.retrievedAt,
+        results: [{ ...pageResult, id: "S1", publishedAt: candidate.publishedAt }],
+      },
+    };
+  }
+
   private async runAutonomousResearchConversation(
     channel: (typeof CHANNELS)[number],
     epoch: number,
     available: Persona[],
     thread: AmbientThreadState,
     seed: AutonomousResearchSeed,
+    preparedOutcome?: AutonomousResearchReadOutcome,
   ): Promise<boolean> {
     this.beginAutonomousResearchAttempt(channel.id, seed);
     const researchers = available.filter((persona) => persona.canResearch);
@@ -3286,7 +3672,7 @@ export class SocialDirector {
     let research: ResearchPacket | undefined;
     let lines: GeneratedLine[] = [];
     try {
-      const readOutcome = await this.safelyReadAutonomousResult(channel.id, seed);
+      const readOutcome = preparedOutcome ?? await this.safelyReadAutonomousResult(channel.id, seed);
       if (!readOutcome.research) {
         return this.recordAutonomousResearchFailure(channel.id, seed, readOutcome.failureReason);
       }
@@ -3297,6 +3683,9 @@ export class SocialDirector {
       const profile = getChannelProfile(channel.id);
       const mode = profile?.ambientMode ?? "discussion";
       const limits = ambientSceneWordLimits(lead, responder, false, mode);
+      const evidenceIntroduction = research.kind === "market"
+        ? `A trusted typed market provider supplied one latest-reported observation for this server-authored angle: “${seed.discussionAngle}”. Treat its level/change and absolute timestamp as evidence, but do not invent a cause, related headline, market-open state or future move.`
+        : `A trusted server-side lookup and safe page read found candidate sources for this server-authored angle: “${seed.discussionAngle}”.`;
       lines = await this.lm.generateScene({
         kind: "ambient",
         channelId: channel.id,
@@ -3304,7 +3693,7 @@ export class SocialDirector {
         selected: [lead, responder],
         history: this.ambientTranscript(channel.id, 18),
         premise: [
-          `A trusted server-side lookup and safe page read found candidate sources for this server-authored angle: “${seed.discussionAngle}”.`,
+          evidenceIntroduction,
           `${lead.name} chooses exactly one supplied source ID, shares one concrete supported detail from it and immediately adds a personal take; a title-only reaction, vague hype or capability statement is invalid.`,
           `${responder.name} answers that exact detail with one distinct consequence, objection or genuinely specific question instead of merely agreeing or opening another topic.`,
           "Both lines must stay on the same chosen source. Keep this to two natural peer messages. Do not announce that a search happened, explain tooling, or invite the whole room to answer.",
@@ -3431,6 +3820,7 @@ export class SocialDirector {
       const now = this.now();
       const globalTuning = this.globalBehaviorTuning();
       if (globalTuning.activity === 0) return;
+      if (await this.maybeRunAutonomousResearch(now, globalTuning, lmHealth.queueDepth)) return;
       const channelTunings = new Map(
         CHANNELS.map((candidate) => [
           candidate.id,
@@ -3471,7 +3861,6 @@ export class SocialDirector {
         .sort((a, b) => b.score - a.score)[0]?.candidate;
       if (!channel) return;
       this.lastAmbientChannelId = channel.id;
-      const hadLiveThread = this.ambientThreads.has(channel.id);
       const thread = this.getOrStartAmbientThread(channel.id, now);
       if (!thread) return;
       const epoch = this.channelEpoch.get(channel.id) ?? 0;
@@ -3493,54 +3882,6 @@ export class SocialDirector {
       if (available.length < 1) return;
       const profile = getChannelProfile(channel.id);
       const ambientMode = profile?.ambientMode ?? "discussion";
-      while (
-        this.autonomousResearchSuccessTimestamps[0] !== undefined &&
-        now - this.autonomousResearchSuccessTimestamps[0] >= 24 * 60 * 60_000
-      ) this.autonomousResearchSuccessTimestamps.shift();
-      if (
-        this.autonomousResearchGlobalRetryAfterAt !== undefined &&
-        now >= this.autonomousResearchGlobalRetryAfterAt
-      ) this.autonomousResearchGlobalRetryAfterAt = undefined;
-      let researchFailureState = this.autonomousResearchFailureStateByChannel.get(channel.id);
-      if (
-        researchFailureState &&
-        now - researchFailureState.retryAfterAt >= AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS
-      ) {
-        this.autonomousResearchFailureStateByChannel.delete(channel.id);
-        researchFailureState = undefined;
-      }
-      const researchSeeds = profile?.autonomousResearchSeeds ?? [];
-      const researchPolicy = this.autonomousResearchPolicy(channel.id);
-      const startAutonomousResearch = researchSeeds.length > 0 && available.some((persona) => persona.canResearch) && shouldStartAutonomousResearch({
-        enabled: researchPolicy.enabled,
-        now,
-        lastGlobalSuccessAt: this.lastAutonomousResearchSuccessAt,
-        lastChannelSuccessAt: this.lastAutonomousResearchSuccessAtByChannel.get(channel.id),
-        globalRetryAfterAt: this.autonomousResearchGlobalRetryAfterAt,
-        channelRetryAfterAt: researchFailureState?.retryAfterAt,
-        lastHumanActivityAt: this.lastHumanActivityAt,
-        globalCooldownMs: researchPolicy.globalCooldownMs,
-        channelCooldownMs: researchPolicy.channelCooldownMs,
-        humanQuietMs: researchPolicy.humanQuietMs,
-        queueDepth: lmHealth.queueDepth,
-        availableMessageSlots: availableSlots,
-        dailySuccesses: this.autonomousResearchSuccessTimestamps.length,
-        dailyCap: researchPolicy.dailyCap,
-        voiceRoomActive: this.voiceRoomActive,
-        freshThread: !hadLiveThread && thread.messageCount === 0,
-        availableActors: available.length,
-        chance: researchPolicy.chance,
-        rng: this.rng,
-      });
-      if (startAutonomousResearch) {
-        const recentResearchSeeds = this.recentAutonomousResearchSeedsByChannel.get(channel.id) ?? [];
-        const researchSeed = selectAutonomousResearchSeed(researchSeeds, recentResearchSeeds, this.rng);
-        const published = researchSeed
-          ? await this.runAutonomousResearchConversation(channel, epoch, available, thread, researchSeed)
-          : false;
-        if (!published && thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
-        return;
-      }
       const startConsidered = thread.messageCount === 0 && available.length >= 2 && shouldStartConsideredConversation({
         now,
         lastStartedAt: this.lastConsideredConversationAt,

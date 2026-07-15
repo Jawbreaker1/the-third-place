@@ -7,11 +7,20 @@ import type {
 import type { ResearchBroker, ResearchPacket } from "../researchBroker.js";
 import { createFailClosedTurnAnalysis, type TurnAnalysis } from "../semanticRouter.js";
 import type { WeatherForecastResult } from "../weatherForecast.js";
+import {
+  MARKET_INDEX_CATALOG,
+  isMarketIndexId,
+  marketIndexIdsForTarget,
+  type MarketIndexId,
+  type MarketTargetId,
+} from "../marketData/catalog.js";
+import type { MarketObservation, MarketSnapshot } from "../marketData/types.js";
 import { TURN_CAPABILITIES, type TurnCapability } from "./catalog.js";
 import {
   CapabilityRegistry,
   type CapabilityCompileContext,
   type EvidenceResolution,
+  type MarketSnapshotCapabilityProvider,
   type WeatherForecastCapabilityProvider,
 } from "./registry.js";
 
@@ -138,6 +147,76 @@ const forecast: WeatherForecastResult = {
   },
 };
 
+const marketObservation = (
+  indexId: MarketIndexId,
+  providerId = "test-market",
+): MarketObservation => {
+  const definition = MARKET_INDEX_CATALOG[indexId];
+  const observedAt = NOW - 60 * 60_000;
+  const level = 3_150;
+  const previousClose = 3_100;
+  return {
+    indexId,
+    displayName: definition.displayName,
+    shortName: definition.shortName,
+    region: definition.region,
+    countryCode: definition.countryCode,
+    exchangeTimeZone: definition.exchangeTimeZone,
+    tradingDate: "2026-07-15",
+    currency: definition.currency,
+    level,
+    previousClose,
+    change: level - previousClose,
+    changePercent: (level - previousClose) / previousClose * 100,
+    changeBasis: "previous_close",
+    freshness: {
+      status: "recent",
+      observedAt: new Date(observedAt).toISOString(),
+      ageMs: NOW - observedAt,
+    },
+    provider: {
+      id: providerId,
+      experimental: false,
+      sourceUrl: `https://example.com/markets/${indexId}`,
+      retrievedAt: new Date(NOW).toISOString(),
+    },
+  };
+};
+
+const marketSnapshot = (
+  targetId: MarketTargetId,
+  availableIds: readonly MarketIndexId[] = marketIndexIdsForTarget(targetId),
+): MarketSnapshot => {
+  const requestedIndexIds = marketIndexIdsForTarget(targetId);
+  const observations = requestedIndexIds
+    .filter((id) => availableIds.includes(id))
+    .map((id) => marketObservation(id));
+  const missingIndexIds = requestedIndexIds.filter((id) => !availableIds.includes(id));
+  return {
+    targetId,
+    targetKind: isMarketIndexId(targetId) ? "index" : "basket",
+    retrievedAt: new Date(NOW).toISOString(),
+    requestedIndexIds,
+    observations,
+    missingIndexIds,
+    coverage: {
+      requested: requestedIndexIds.length,
+      available: observations.length,
+      ratio: observations.length / requestedIndexIds.length,
+      complete: observations.length === requestedIndexIds.length,
+      recent: observations.length,
+      previousSession: 0,
+      stale: 0,
+    },
+    providerAttempts: [{
+      providerId: "test-market",
+      status: observations.length === requestedIndexIds.length ? "complete" : observations.length ? "partial" : "failed",
+      requested: requestedIndexIds.length,
+      accepted: observations.length,
+    }],
+  };
+};
+
 interface AnalysisOverrides {
   goal?: string | null;
   evidenceConfidence?: number;
@@ -183,7 +262,7 @@ const analysisFor = (
       locationLabel: overrides.locationLabel === undefined
         ? action === "local_datetime" ? "Stockholm"
           : action === "weather_forecast" ? "G\u00f6teborg"
-            : action === "market_snapshot" ? "OMXS30"
+            : action === "market_snapshot" ? "SE_OMXS30"
               : null
         : overrides.locationLabel,
     },
@@ -209,6 +288,8 @@ const compileContext = (
 
 const createHarness = (options: {
   resolveTarget?: PageReadRequest;
+  defaultMarket?: boolean;
+  market?: MarketSnapshotCapabilityProvider | null;
   weather?: WeatherForecastCapabilityProvider | null;
 } = {}) => {
   const pageReader = {
@@ -222,6 +303,7 @@ const createHarness = (options: {
   const registry = new CapabilityRegistry({
     pageReader: pageReader as unknown as PageReader,
     researchBroker: researchBroker as unknown as Pick<ResearchBroker, "research" | "researchSite">,
+    marketSnapshotProvider: options.defaultMarket ? undefined : options.market === undefined ? null : options.market,
     weatherForecastProvider: options.weather === undefined ? null : options.weather,
     now: () => NOW,
   });
@@ -238,7 +320,10 @@ describe("capability registry contract", () => {
     vi.stubEnv("LINK_READER_ENABLED", "true");
     vi.stubEnv("RESEARCH_ENABLED", "true");
     const weather = { forecast: vi.fn(async () => forecast) };
-    const { registry } = createHarness({ weather });
+    const market: MarketSnapshotCapabilityProvider = {
+      snapshot: vi.fn(async ({ targetId }) => marketSnapshot(targetId)),
+    };
+    const { registry } = createHarness({ market, weather });
 
     expect(registry.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual(TURN_CAPABILITIES);
     expect(registry.hasExternalEvidence(TURN_CAPABILITIES)).toBe(true);
@@ -253,12 +338,26 @@ describe("capability registry contract", () => {
     vi.stubEnv("LINK_READER_ENABLED", "false");
     vi.stubEnv("RESEARCH_ENABLED", "false");
     expect(registry.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual([
+      "market_snapshot",
       "local_datetime",
       "weather_forecast",
     ]);
 
+    const defaultMarket = createHarness({ defaultMarket: true }).registry;
+    expect(defaultMarket.available({ medium: "public", candidateSet: emptyCandidateSet(), allowSearch: false })).toEqual([
+      "market_snapshot",
+      "local_datetime",
+    ]);
+
     const noWeather = createHarness({ weather: null }).registry;
     expect(noWeather.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual(["local_datetime"]);
+
+    vi.stubEnv("MARKET_SNAPSHOT_ENABLED", "false");
+    const disabledMarket = createHarness({ market, weather }).registry;
+    expect(disabledMarket.available({ medium: "public", candidateSet: candidateSet(), allowSearch: true })).toEqual([
+      "local_datetime",
+      "weather_forecast",
+    ]);
   });
 
   it("caps availability and compilation to a medium-owned capability inventory", () => {
@@ -286,82 +385,151 @@ describe("capability registry contract", () => {
     expect(registry.compile(analysisFor("weather_forecast"), voiceContext)).toBeUndefined();
   });
 
-  it("executes a narrow headline-index snapshot through the registered structured page provider", async () => {
-    vi.stubEnv("LINK_READER_ENABLED", "true");
-    const { registry, pageReader } = createHarness();
-    const sourceUrl = "https://www.avanza.se/borsen-idag.html";
-    pageReader.read.mockResolvedValue(pagePacket(sourceUrl, [{
-      id: "S1",
-      title: "Avanza market overview",
-      url: sourceUrl,
-      snippet: JSON.stringify({
-        sourceKind: "market_overview",
-        retrievedAt: new Date(NOW).toISOString(),
-        scope: "headline indexes only; not individual equities",
-        indexes: [
-          {
-            name: "OMX Stockholm 30",
-            symbol: "OMXS30",
-            level: 3150.86,
-            dailyChangePercent: -0.38,
-            updatedLocalTime: "17:30",
-            updatedAt: "2026-07-15T15:30:00.000Z",
-          },
-          {
-            name: "Dow Jones U.S. Index",
-            symbol: "DJUS",
-            level: 1834.44,
-            dailyChangePercent: 0,
-            updatedLocalTime: "19:20",
-            updatedAt: "2026-07-15T17:20:00.000Z",
-          },
-        ],
-      }),
-    }]));
+  it("executes canonical exact-index and fixed-basket snapshots without using PageReader", async () => {
+    vi.stubEnv("LINK_READER_ENABLED", "false");
+    const market: MarketSnapshotCapabilityProvider = {
+      snapshot: vi.fn(async ({ targetId }) => marketSnapshot(targetId)),
+    };
+    const { registry, pageReader } = createHarness({ market });
 
     const invocation = registry.compile(analysisFor("market_snapshot"), compileContext())!;
     expect(invocation).toMatchObject({
       capability: "market_snapshot",
-      marketLabel: "OMXS30",
+      marketTargetId: "SE_OMXS30",
       requiresResearchPersona: false,
+      responsePolicy: { citations: "model_selected", maxSources: 3 },
     });
     expect(registry.compile(
-      analysisFor("market_snapshot", { locationLabel: "NASDAQ" }),
+      analysisFor("market_snapshot", { locationLabel: "OMXS30" }),
       compileContext(),
     )).toBeUndefined();
+
     const resolution = await registry.execute(invocation, "guest-1");
-    expect(pageReader.read).toHaveBeenCalledWith(expect.objectContaining({
-      url: new URL(sourceUrl),
-      initiator: "automatic",
-      retry: false,
-    }), "guest-1");
+    expect(pageReader.read).not.toHaveBeenCalled();
+    expect(market.snapshot).toHaveBeenCalledWith({ targetId: "SE_OMXS30" });
     expect(resolution).toMatchObject({
       state: "grounding_available",
-      research: { results: [{ url: sourceUrl }] },
+      research: {
+        kind: "market",
+        query: "SE_OMXS30",
+        results: [{
+          id: "S1",
+          url: "https://example.com/markets/SE_OMXS30",
+          publishedAt: new Date(NOW - 60 * 60_000).toISOString(),
+        }],
+      },
     });
-    const selectedEvidence = JSON.parse(
+    const exactEvidence = JSON.parse(
       resolution.state === "grounding_available" ? resolution.research!.results[0]!.snippet : "{}",
     );
-    expect(selectedEvidence.indexes).toEqual([expect.objectContaining({ symbol: "OMXS30" })]);
+    expect(exactEvidence).toMatchObject({
+      sourceKind: "market_snapshot",
+      target: { id: "SE_OMXS30", kind: "index" },
+      coverage: { requested: 1, available: 1, complete: true },
+      observation: {
+        indexId: "SE_OMXS30",
+        changeBasis: "previous_close",
+        freshness: { status: "recent", observedAt: new Date(NOW - 60 * 60_000).toISOString() },
+        provider: { id: "test-market", experimental: false },
+      },
+    });
+    expect(exactEvidence.observation.provider).not.toHaveProperty("sourceUrl");
     expect(registry.sceneContract(invocation, resolution, { actorName: "Vale" })).toMatchObject({
       evidenceOutcome: "succeeded",
       urlPublicationPolicy: "server_card",
-      premise: expect.stringContaining("validated structured headline-index snapshot"),
+      premise: expect.stringContaining("provider-neutral validated market snapshot"),
     });
 
-    const missing = registry.compile(
-      analysisFor("market_snapshot", { locationLabel: "DJUS" }),
+    const basketInvocation = registry.compile(
+      analysisFor("market_snapshot", { locationLabel: "GLOBAL_MAJOR" }),
       compileContext(),
     )!;
-    pageReader.read.mockResolvedValueOnce(pagePacket(sourceUrl, [{
-      id: "S1",
-      title: "Avanza market overview",
-      url: sourceUrl,
-      snippet: JSON.stringify({ ...selectedEvidence, indexes: selectedEvidence.indexes }),
-    }]));
-    await expect(registry.execute(missing, "guest-2")).resolves.toMatchObject({
+    const basketResolution = await registry.execute(basketInvocation, "guest-2");
+    expect(basketResolution).toMatchObject({
+      state: "grounding_available",
+      research: { kind: "market", results: expect.arrayContaining([expect.objectContaining({ id: "S1" })]) },
+    });
+    if (basketResolution.state !== "grounding_available" || !basketResolution.research) {
+      throw new Error("expected grounded basket evidence");
+    }
+    expect(basketResolution.research.results).toHaveLength(8);
+    expect(JSON.parse(basketResolution.research.results[0]!.snippet)).toMatchObject({
+      target: { id: "GLOBAL_MAJOR", kind: "basket" },
+      coverage: { requested: 8, available: 8, complete: true },
+      missingIndexIds: [],
+    });
+
+    const retryInvocation = registry.compile(
+      analysisFor("market_snapshot", { requestKind: "retry" }),
+      compileContext(),
+    )!;
+    await registry.execute(retryInvocation, "guest-3");
+    expect(market.snapshot).toHaveBeenLastCalledWith({ targetId: "SE_OMXS30", cachePolicy: "bypass" });
+  });
+
+  it("fails closed when a typed market provider returns no rows or a mismatched target", async () => {
+    const market: MarketSnapshotCapabilityProvider = {
+      snapshot: vi.fn(async ({ targetId }) => marketSnapshot(targetId, [])),
+    };
+    const { registry } = createHarness({ market });
+    const invocation = registry.compile(analysisFor("market_snapshot"), compileContext())!;
+    await expect(registry.execute(invocation, "guest-empty")).resolves.toMatchObject({
       state: "failed_temporary",
       detail: "empty",
+    });
+
+    market.snapshot = vi.fn(async () => marketSnapshot("US_SP500"));
+    await expect(registry.execute(invocation, "guest-mismatch")).resolves.toMatchObject({
+      state: "failed_temporary",
+      detail: "empty",
+    });
+  });
+
+  it("removes stale rows and requires representative basket coverage", async () => {
+    const stale = marketSnapshot("SE_OMXS30");
+    const staleObservation = stale.observations[0]!;
+    const staleSnapshot: MarketSnapshot = {
+      ...stale,
+      observations: [{
+        ...staleObservation,
+        freshness: {
+          status: "stale",
+          observedAt: new Date(NOW - 5 * 24 * 60 * 60_000).toISOString(),
+          ageMs: 5 * 24 * 60 * 60_000,
+        },
+      }],
+      coverage: { ...stale.coverage, recent: 0, stale: 1 },
+    };
+    const market: MarketSnapshotCapabilityProvider = { snapshot: vi.fn(async () => staleSnapshot) };
+    const { registry } = createHarness({ market });
+    const exactInvocation = registry.compile(analysisFor("market_snapshot"), compileContext())!;
+    await expect(registry.execute(exactInvocation, "guest-stale")).resolves.toMatchObject({
+      state: "failed_temporary",
+      detail: "empty",
+    });
+
+    const globalIds = marketIndexIdsForTarget("GLOBAL_MAJOR");
+    market.snapshot = vi.fn(async () => marketSnapshot("GLOBAL_MAJOR", globalIds.slice(0, 4)));
+    const basketInvocation = registry.compile(
+      analysisFor("market_snapshot", { locationLabel: "GLOBAL_MAJOR" }),
+      compileContext(),
+    )!;
+    await expect(registry.execute(basketInvocation, "guest-thin-basket")).resolves.toMatchObject({
+      state: "failed_temporary",
+      detail: "empty",
+    });
+
+    market.snapshot = vi.fn(async () => marketSnapshot("GLOBAL_MAJOR", globalIds.slice(0, 5)));
+    const grounded = await registry.execute(basketInvocation, "guest-covered-basket");
+    expect(grounded).toMatchObject({
+      state: "grounding_available",
+      research: { results: expect.any(Array) },
+    });
+    if (grounded.state !== "grounding_available" || !grounded.research) throw new Error("expected market evidence");
+    expect(grounded.research.results).toHaveLength(5);
+    expect(JSON.parse(grounded.research.results[0]!.snippet)).toMatchObject({
+      coverage: { requested: 8, available: 5, complete: false, stale: 0 },
+      missingIndexIds: globalIds.slice(5),
     });
   });
 

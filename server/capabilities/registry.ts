@@ -1,4 +1,3 @@
-import { z } from "zod";
 import {
   hasSpecificSiteResearchResults,
   type ResearchBroker,
@@ -12,6 +11,16 @@ import {
   type PageReader,
 } from "../pageReader.js";
 import { resolveSearchEvidence } from "../evidenceResolver.js";
+import {
+  MARKET_INDEX_CATALOG,
+  isMarketIndexId,
+  isMarketTargetId,
+  marketIndexIdsForTarget,
+  type MarketTargetId,
+} from "../marketData/catalog.js";
+import { MarketSnapshotService } from "../marketData/service.js";
+import type { MarketSnapshot } from "../marketData/types.js";
+import { YahooChartMarketDataProvider } from "../marketData/providers/yahooChart.js";
 import {
   refreshLocalDateTime,
   resolveLocalDateTime,
@@ -36,6 +45,7 @@ import {
 
 export type { ResearchPacket } from "../researchBroker.js";
 export type WeatherForecastCapabilityProvider = Pick<WeatherForecastProvider, "forecast">;
+export type MarketSnapshotCapabilityProvider = Pick<MarketSnapshotService, "snapshot">;
 
 export type CapabilityExecutionRequestKind = "execute" | "retry" | "correct_limitation";
 export type EvidenceResolutionState = "grounding_available" | "retrieved_only" | "failed_temporary";
@@ -69,7 +79,7 @@ export interface WebSearchInvocation extends CapabilityInvocationBase {
 
 export interface MarketSnapshotInvocation extends CapabilityInvocationBase {
   capability: "market_snapshot";
-  marketLabel: string;
+  marketTargetId: MarketTargetId;
 }
 
 export interface LocalDateTimeInvocation extends CapabilityInvocationBase {
@@ -152,6 +162,7 @@ export interface CapabilityCompileContext extends CapabilityAvailabilityContext 
 interface CapabilityRuntimeDependencies {
   pageReader: PageReader;
   researchBroker: Pick<ResearchBroker, "research" | "researchSite">;
+  marketSnapshotProvider?: MarketSnapshotCapabilityProvider;
   weatherForecastProvider?: WeatherForecastCapabilityProvider;
   now: () => number;
 }
@@ -159,6 +170,7 @@ interface CapabilityRuntimeDependencies {
 export interface CapabilityRegistryOptions {
   pageReader: PageReader;
   researchBroker: Pick<ResearchBroker, "research" | "researchSite">;
+  marketSnapshotProvider?: MarketSnapshotCapabilityProvider | null;
   weatherForecastProvider?: WeatherForecastCapabilityProvider | null;
   now?: () => number;
 }
@@ -265,6 +277,13 @@ const selectedSourcePolicy: CapabilityResponsePolicy = Object.freeze({
   maxSources: 3,
 });
 
+const marketSourcePolicy: CapabilityResponsePolicy = Object.freeze({
+  owner: "designated_responder",
+  citations: "model_selected",
+  linkCard: "selected",
+  maxSources: 3,
+});
+
 const boundedSiteSourcePolicy: CapabilityResponsePolicy = Object.freeze({
   owner: "designated_responder",
   citations: "model_selected",
@@ -344,6 +363,50 @@ export const weatherForecastEvidencePacket = (forecast: WeatherForecastResult): 
     }],
   };
 };
+
+/** Converts provider-neutral validated market observations into inert evidence rows. */
+export const marketSnapshotEvidencePacket = (snapshot: MarketSnapshot): ResearchPacket => ({
+  kind: "market",
+  query: snapshot.targetId,
+  retrievedAt: snapshot.retrievedAt,
+  results: snapshot.observations.slice(0, 8).map((observation, index) => ({
+    id: `S${index + 1}`,
+    title: `${observation.displayName} latest reported market snapshot`,
+    url: observation.provider.sourceUrl,
+    publishedAt: observation.freshness.observedAt,
+    snippet: JSON.stringify({
+      sourceKind: "market_snapshot",
+      target: {
+        id: snapshot.targetId,
+        kind: snapshot.targetKind,
+      },
+      snapshotRetrievedAt: snapshot.retrievedAt,
+      coverage: snapshot.coverage,
+      missingIndexIds: snapshot.missingIndexIds,
+      observation: {
+        indexId: observation.indexId,
+        displayName: observation.displayName,
+        shortName: observation.shortName,
+        region: observation.region,
+        countryCode: observation.countryCode,
+        exchangeTimeZone: observation.exchangeTimeZone,
+        tradingDate: observation.tradingDate,
+        currency: observation.currency,
+        level: observation.level,
+        previousClose: observation.previousClose,
+        change: observation.change,
+        changePercent: observation.changePercent,
+        changeBasis: observation.changeBasis,
+        freshness: observation.freshness,
+        provider: {
+          id: observation.provider.id,
+          experimental: observation.provider.experimental,
+          retrievedAt: observation.provider.retrievedAt,
+        },
+      },
+    }),
+  })),
+});
 
 const groundingAvailable = (
   invocation: CapabilityInvocation,
@@ -535,93 +598,147 @@ const webSearchAdapter: CapabilityAdapter<WebSearchInvocation> = {
   },
 };
 
-const MARKET_OVERVIEW_URL = new URL("https://www.avanza.se/borsen-idag.html");
-const marketOverviewEvidenceSchema = z.object({
-  sourceKind: z.literal("market_overview"),
-  retrievedAt: z.string().datetime(),
-  scope: z.literal("headline indexes only; not individual equities"),
-  indexes: z.array(z.object({
-    name: z.string().min(1).max(100),
-    symbol: z.string().min(1).max(24),
-    level: z.number().finite().positive().max(1_000_000_000),
-    dailyChangePercent: z.number().finite().min(-100).max(100),
-    updatedLocalTime: z.string().min(4).max(8),
-    updatedAt: z.string().datetime(),
-  }).strict()).max(8),
-}).strict();
+const exactStringArray = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((value, index) => value === right[index]);
 
-const selectMarketSnapshot = (
-  packet: ResearchPacket | undefined,
-  symbol: string,
-): ResearchPacket | undefined => {
-  if (packet?.kind !== "page") return undefined;
-  const source = packet.results.find((result) =>
-    result.id === "S1" && result.url === MARKET_OVERVIEW_URL.toString());
-  if (!source) return undefined;
-  let raw: unknown;
-  try {
-    raw = JSON.parse(source.snippet);
-  } catch {
-    return undefined;
-  }
-  const parsed = marketOverviewEvidenceSchema.safeParse(raw);
-  if (!parsed.success) return undefined;
-  const selected = parsed.data.indexes.find((index) => index.symbol === symbol);
-  if (!selected) return undefined;
+const snapshotMatchesTarget = (snapshot: MarketSnapshot, targetId: MarketTargetId): boolean => {
+  if (snapshot.targetId !== targetId || !Number.isFinite(Date.parse(snapshot.retrievedAt))) return false;
+  const expected = marketIndexIdsForTarget(targetId);
+  if (!exactStringArray(snapshot.requestedIndexIds, expected)) return false;
+  if (snapshot.targetKind !== (expected.length === 1 ? "index" : "basket")) return false;
+  const observedIds = snapshot.observations.map((observation) => observation.indexId);
+  if (
+    new Set(observedIds).size !== observedIds.length ||
+    observedIds.some((id) => !isMarketIndexId(id) || !expected.includes(id))
+  ) return false;
+  const missing = expected.filter((id) => !observedIds.includes(id));
+  if (!exactStringArray(snapshot.missingIndexIds, missing)) return false;
+  const freshnessCounts = {
+    recent: snapshot.observations.filter((item) => item.freshness.status === "recent").length,
+    previousSession: snapshot.observations.filter((item) => item.freshness.status === "previous_session").length,
+    stale: snapshot.observations.filter((item) => item.freshness.status === "stale").length,
+  };
+  if (
+    snapshot.coverage.requested !== expected.length ||
+    snapshot.coverage.available !== snapshot.observations.length ||
+    snapshot.coverage.ratio !== snapshot.observations.length / expected.length ||
+    snapshot.coverage.complete !== (snapshot.observations.length === expected.length) ||
+    snapshot.coverage.recent !== freshnessCounts.recent ||
+    snapshot.coverage.previousSession !== freshnessCounts.previousSession ||
+    snapshot.coverage.stale !== freshnessCounts.stale
+  ) return false;
+  return snapshot.observations.every((observation) => {
+    const definition = MARKET_INDEX_CATALOG[observation.indexId];
+    const observedAt = Date.parse(observation.freshness.observedAt);
+    const providerRetrievedAt = Date.parse(observation.provider.retrievedAt);
+    let sourceUrl: URL;
+    try {
+      sourceUrl = new URL(observation.provider.sourceUrl);
+    } catch {
+      return false;
+    }
+    const expectedChange = observation.level - observation.previousClose;
+    const expectedPercent = expectedChange / observation.previousClose * 100;
+    return observation.displayName === definition.displayName &&
+      observation.shortName === definition.shortName &&
+      observation.region === definition.region &&
+      observation.countryCode === definition.countryCode &&
+      observation.exchangeTimeZone === definition.exchangeTimeZone &&
+      observation.currency === definition.currency &&
+      observation.changeBasis === "previous_close" &&
+      Number.isFinite(observation.level) && observation.level > 0 &&
+      Number.isFinite(observation.previousClose) && observation.previousClose > 0 &&
+      Number.isFinite(observation.change) &&
+      Number.isFinite(observation.changePercent) && Math.abs(observation.changePercent) <= 100 &&
+      Math.abs(observation.change - expectedChange) <= Math.max(1e-8, Math.abs(expectedChange) * 1e-8) &&
+      Math.abs(observation.changePercent - expectedPercent) <= Math.max(1e-8, Math.abs(expectedPercent) * 1e-8) &&
+      Number.isFinite(observedAt) && Number.isFinite(providerRetrievedAt) &&
+      Number.isFinite(observation.freshness.ageMs) && observation.freshness.ageMs >= 0 &&
+      ["recent", "previous_session", "stale"].includes(observation.freshness.status) &&
+      /^\d{4}-\d{2}-\d{2}$/u.test(observation.tradingDate) &&
+      /^[a-z0-9][a-z0-9._-]{1,63}$/u.test(observation.provider.id) &&
+      sourceUrl.protocol === "https:" && !sourceUrl.username && !sourceUrl.password && !sourceUrl.search;
+  });
+};
+
+/**
+ * Stale rows are structurally valid provider output but not answer-bearing
+ * current evidence. Baskets also need bounded breadth so one surviving row is
+ * never presented as a regional or global overview.
+ */
+const usableMarketSnapshot = (snapshot: MarketSnapshot): MarketSnapshot | undefined => {
+  const observations = snapshot.observations.filter((item) => item.freshness.status !== "stale");
+  const minimumAvailable = snapshot.targetKind === "index"
+    ? 1
+    : Math.max(2, Math.ceil(snapshot.requestedIndexIds.length * 0.6));
+  if (observations.length < minimumAvailable) return undefined;
+  if (
+    snapshot.targetId === "GLOBAL_MAJOR" &&
+    new Set(observations.map((item) => item.region)).size < 2
+  ) return undefined;
+  const observedIds = new Set(observations.map((item) => item.indexId));
+  const missingIndexIds = snapshot.requestedIndexIds.filter((id) => !observedIds.has(id));
+  const recent = observations.filter((item) => item.freshness.status === "recent").length;
+  const previousSession = observations.filter((item) => item.freshness.status === "previous_session").length;
   return {
-    ...packet,
-    results: [{
-      ...source,
-      snippet: JSON.stringify({ ...parsed.data, indexes: [selected] }),
-    }],
+    ...snapshot,
+    observations,
+    missingIndexIds,
+    coverage: {
+      requested: snapshot.requestedIndexIds.length,
+      available: observations.length,
+      ratio: observations.length / snapshot.requestedIndexIds.length,
+      complete: observations.length === snapshot.requestedIndexIds.length,
+      recent,
+      previousSession,
+      stale: 0,
+    },
   };
 };
 
 const marketSnapshotAdapter: CapabilityAdapter<MarketSnapshotInvocation> = {
   id: "market_snapshot",
-  available: () =>
-    process.env.LINK_READER_ENABLED !== "false" &&
-    process.env.MARKET_SNAPSHOT_ENABLED !== "false",
+  available: (_context, runtime) => Boolean(runtime.marketSnapshotProvider),
   compile: (analysis) => {
     if (
       analysis.evidence.action !== "market_snapshot" ||
-      !analysis.evidence.locationLabel
+      !isMarketTargetId(analysis.evidence.locationLabel)
     ) return undefined;
-    const base = baseInvocation("market_snapshot", analysis, primarySourcePolicy, false);
+    const base = baseInvocation("market_snapshot", analysis, marketSourcePolicy, false);
     return base ? {
       ...base,
       capability: "market_snapshot",
-      marketLabel: analysis.evidence.locationLabel,
+      marketTargetId: analysis.evidence.locationLabel,
     } : undefined;
   },
-  execute: async (invocation, requesterId, runtime) => {
-    const packet = await runtime.pageReader.read({
-      url: MARKET_OVERVIEW_URL,
-      requestedAt: new Date(runtime.now()).toISOString(),
-      intent: invocation.goal,
-      retry: invocation.requestKind !== "execute",
-      source: "message",
-      initiator: "automatic",
-    }, requesterId).catch((error) => {
+  execute: async (invocation, _requesterId, runtime) => {
+    if (!runtime.marketSnapshotProvider) return failed(invocation, "invalid_target");
+    const snapshot = await runtime.marketSnapshotProvider.snapshot({
+      targetId: invocation.marketTargetId,
+      ...(invocation.requestKind === "execute" ? {} : { cachePolicy: "bypass" as const }),
+    }).catch((error) => {
       console.warn("Typed market snapshot failed safely:", error instanceof Error ? error.message : error);
       return undefined;
     });
-    const selectedPacket = selectMarketSnapshot(packet, invocation.marketLabel);
-    return selectedPacket && packetHasPrimaryContent(selectedPacket)
-      ? groundingAvailable(invocation, selectedPacket)
+    if (!snapshot || !snapshotMatchesTarget(snapshot, invocation.marketTargetId)) return failed(invocation, "empty");
+    const usable = usableMarketSnapshot(snapshot);
+    if (!usable) return failed(invocation, "empty");
+    const packet = marketSnapshotEvidencePacket(usable);
+    return packetHasPrimaryContent(packet)
+      ? groundingAvailable(invocation, packet)
       : failed(invocation, "empty");
   },
   scene: (invocation, resolution, context) => {
     const success = resolution.state === "grounding_available" && resolution.research;
-    const groundingInstruction = "Answer only for the specifically requested headline index from the single-row validated structured market snapshot in freshResearch. Describe it as the provider's latest reported level and reported session change, include the exact absolute updatedAt date/time (the local display time may be added), preserve the sign and attach the primary server-issued source ID. Do not claim that the market is open or that the observation belongs to the current calendar day unless the supplied absolute timestamp proves it. The packet's declared scope is not a whole-world survey; do not generalize it, give advice or invent absent instruments.";
+    const groundingInstruction = "Answer only from the validated structured market rows in freshResearch. Describe every number as the provider's latest reported observation and preserve its previous_close basis, sign, absolute observedAt, tradingDate, exchangeTimeZone and freshness status. Attach the exact server-issued source ID for every index value or move you mention. For a basket, explicitly respect coverage.available/coverage.requested and missingIndexIds; never describe partial coverage as the whole region or world, and keep the concise answer to at most three representative supplied rows. Different exchanges can have different observation times and trading dates: never imply they share one session, that a market is open, or that all rows mean “today”. Report levels and moves only; do not invent news, causal explanations, forecasts, advice or absent instruments.";
     return {
       ...(success ? { research: resolution.research } : {}),
       evidenceOutcome: success ? "succeeded" : "failed",
       ...(success ? { urlPublicationPolicy: "server_card" as const } : {}),
       groundingInstruction,
       premise: success
-        ? `${context.actorName} received a validated structured headline-index snapshot and alone answers the requested latest index-report question. ${groundingInstruction}`
-        : `${context.actorName} alone reports in the human's classified language that the requested headline-index snapshot did not return a usable current value this time. Treat it as temporary, avoid implementation jargon and invent no market values.`,
+        ? `${context.actorName} received a provider-neutral validated market snapshot and alone answers the requested index or basket question. ${groundingInstruction}`
+        : `${context.actorName} alone reports in the human's classified language that this requested market snapshot returned no validated observation this time. Treat it as temporary, avoid implementation jargon and invent no market values or causes.`,
       externalEvidence: true,
       suppressResponse: false,
       responsePolicy: resolution.responsePolicy,
@@ -756,6 +873,13 @@ export class CapabilityRegistry {
     this.runtime = {
       pageReader: options.pageReader,
       researchBroker: options.researchBroker,
+      marketSnapshotProvider: process.env.MARKET_SNAPSHOT_ENABLED === "false" ||
+        options.marketSnapshotProvider === null
+        ? undefined
+        : options.marketSnapshotProvider ?? new MarketSnapshotService({
+            providers: [new YahooChartMarketDataProvider()],
+            now,
+          }),
       weatherForecastProvider: options.weatherForecastProvider === null
         ? undefined
         : options.weatherForecastProvider ?? (

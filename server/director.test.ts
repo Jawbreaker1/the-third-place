@@ -21,7 +21,10 @@ import {
   autonomousResearchResultIsFresh,
   canonicalAutonomousResearchUrl,
   linkPreviewFromResearch,
+  marketMovementResearchPacket,
+  marketPulseObservationsFromSnapshot,
   normalizeGeneratedMessageContent,
+  prioritizeAutonomousResearch,
   selectAutoSharedLinkCandidate,
   selectAmbientLead,
   selectAmbientSeed,
@@ -49,6 +52,8 @@ import {
   scaleAmbientDelay,
 } from "./behaviorTuning.js";
 import { CapabilityRegistry } from "./capabilities/registry.js";
+import type { MarketObservation, MarketSnapshot } from "./marketData/types.js";
+import type { MarketPulseMovementCandidate } from "./marketPulse.js";
 
 const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => {
   const evidence = overrides.evidence ?? {
@@ -96,6 +101,326 @@ const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => 
 };
 
 describe("social director", () => {
+  it("bridges only non-stale typed market observations and preserves provider/session metadata", () => {
+    const observedAt = "2026-07-15T13:42:00.000Z";
+    const current: MarketObservation = {
+      indexId: "US_SP500",
+      displayName: "S&P 500",
+      shortName: "S&P 500",
+      region: "americas",
+      countryCode: "US",
+      exchangeTimeZone: "America/New_York",
+      tradingDate: "2026-07-15",
+      currency: "USD",
+      level: 6_210,
+      previousClose: 6_400,
+      change: -190,
+      changePercent: -2.96875,
+      changeBasis: "previous_close",
+      freshness: { status: "recent", observedAt, ageMs: 18_000 },
+      provider: {
+        id: "typed-provider-alpha",
+        experimental: false,
+        sourceUrl: "https://data.example.test/indexes/us-sp500",
+        retrievedAt: "2026-07-15T13:42:18.000Z",
+      },
+    };
+    const stale: MarketObservation = {
+      ...current,
+      indexId: "SE_OMXS30",
+      displayName: "OMX Stockholm 30",
+      shortName: "OMXS30",
+      region: "europe",
+      countryCode: "SE",
+      exchangeTimeZone: "Europe/Stockholm",
+      tradingDate: "2026-07-03",
+      currency: "SEK",
+      freshness: {
+        status: "stale",
+        observedAt: "2026-07-03T15:30:00.000Z",
+        ageMs: 12 * 24 * 60 * 60_000,
+      },
+      provider: {
+        id: "typed-provider-stale",
+        experimental: false,
+        sourceUrl: "https://data.example.test/indexes/se-omxs30",
+        retrievedAt: "2026-07-15T13:42:18.000Z",
+      },
+    };
+    const snapshot: MarketSnapshot = {
+      targetId: "GLOBAL_MAJOR",
+      targetKind: "basket",
+      retrievedAt: "2026-07-15T13:42:18.000Z",
+      requestedIndexIds: ["US_SP500", "SE_OMXS30"],
+      observations: [stale, current],
+      missingIndexIds: [],
+      coverage: {
+        requested: 2,
+        available: 2,
+        ratio: 1,
+        complete: true,
+        recent: 1,
+        previousSession: 0,
+        stale: 1,
+      },
+      providerAttempts: [{
+        providerId: "typed-provider-alpha",
+        status: "complete",
+        requested: 2,
+        accepted: 2,
+      }],
+    };
+
+    expect(marketPulseObservationsFromSnapshot(snapshot)).toEqual([{
+      validated: true,
+      providerId: "typed-provider-alpha",
+      instrumentId: "US_SP500",
+      displayName: "S&P 500",
+      region: "americas",
+      sessionId: "2026-07-15",
+      sessionChangePercent: -2.96875,
+      observedAt,
+      sourceUrl: "https://data.example.test/indexes/us-sp500",
+      sourceTitle: "S&P 500 latest reported index data",
+      breadthEligible: true,
+    }]);
+  });
+
+  it("grounds a movement packet in the strongest latest-reported previous-close observation without inventing a cause", () => {
+    const candidate: MarketPulseMovementCandidate = {
+      origin: "validated_market_observation",
+      priority: "exceptional",
+      id: "broad-down-2026-07-15-band-5",
+      detectedAt: "2026-07-15T14:05:00.000Z",
+      direction: "down",
+      scope: "broad_market",
+      severityBand: 5,
+      observations: [
+        {
+          providerId: "provider-weaker",
+          instrumentId: "SE_OMXS30",
+          displayName: "OMX Stockholm 30",
+          region: "europe",
+          sessionId: "2026-07-15",
+          sessionChangePercent: -2.4,
+          observedAt: "2026-07-15T14:01:00.000Z",
+          sourceUrl: "https://markets.example.test/se-omxs30",
+          sourceTitle: "OMXS30 latest report",
+        },
+        {
+          providerId: "provider-strongest",
+          instrumentId: "JP_NIKKEI225",
+          displayName: "Nikkei 225",
+          region: "asia_pacific",
+          sessionId: "2026-07-15",
+          sessionChangePercent: -5.125,
+          observedAt: "2026-07-15T06:02:00.000Z",
+          sourceUrl: "https://markets.example.test/jp-nikkei225",
+          sourceTitle: "Nikkei 225 latest report",
+        },
+      ],
+    };
+
+    const packet = marketMovementResearchPacket(candidate);
+    expect(packet).toMatchObject({
+      kind: "market",
+      query: "validated major equity-index movement",
+      retrievedAt: candidate.detectedAt,
+      results: [{
+        title: "Nikkei 225 latest report",
+        url: "https://markets.example.test/jp-nikkei225",
+        publishedAt: "2026-07-15T06:02:00.000Z",
+      }],
+    });
+    expect(packet?.results[0]?.snippet).toContain(
+      "Nikkei 225 was latest reported down 5.125% versus the previous close.",
+    );
+    expect(packet?.results[0]?.snippet).toContain(
+      "Observation time: 2026-07-15T06:02:00.000Z. Trading session: 2026-07-15.",
+    );
+    expect(packet?.results[0]?.snippet).toContain(
+      "This structured provider observation does not establish why the move happened.",
+    );
+    expect(packet?.results[0]?.snippet).not.toContain("OMX Stockholm 30");
+  });
+
+  it("attempts an injected exceptional market pulse before ordinary lookup and keeps Admin frequency zero as a provider kill switch", async () => {
+    const now = Date.parse("2026-07-15T14:30:00.000Z");
+    const observation: MarketObservation = {
+      indexId: "US_SP500",
+      displayName: "S&P 500",
+      shortName: "S&P 500",
+      region: "americas",
+      countryCode: "US",
+      exchangeTimeZone: "America/New_York",
+      tradingDate: "2026-07-15",
+      currency: "USD",
+      level: 6_080,
+      previousClose: 6_400,
+      change: -320,
+      changePercent: -5,
+      changeBasis: "previous_close",
+      freshness: {
+        status: "recent",
+        observedAt: "2026-07-15T14:29:00.000Z",
+        ageMs: 60_000,
+      },
+      provider: {
+        id: "typed-market-provider",
+        experimental: false,
+        sourceUrl: "https://markets.example.test/us-sp500",
+        retrievedAt: "2026-07-15T14:30:00.000Z",
+      },
+    };
+    const snapshot: MarketSnapshot = {
+      targetId: "GLOBAL_MAJOR",
+      targetKind: "basket",
+      retrievedAt: "2026-07-15T14:30:00.000Z",
+      requestedIndexIds: ["US_SP500"],
+      observations: [observation],
+      missingIndexIds: [],
+      coverage: {
+        requested: 1,
+        available: 1,
+        ratio: 1,
+        complete: true,
+        recent: 1,
+        previousSession: 0,
+        stale: 0,
+      },
+      providerAttempts: [{
+        providerId: "typed-market-provider",
+        status: "complete",
+        requested: 1,
+        accepted: 1,
+      }],
+    };
+    const exceptional: MarketPulseMovementCandidate = {
+      origin: "validated_market_observation",
+      priority: "exceptional",
+      id: "us-sp500-2026-07-15-band-5",
+      detectedAt: "2026-07-15T14:30:00.000Z",
+      direction: "down",
+      scope: "single_index",
+      severityBand: 5,
+      observations: [{
+        providerId: "typed-market-provider",
+        instrumentId: "US_SP500",
+        displayName: "S&P 500",
+        region: "americas",
+        sessionId: "2026-07-15",
+        sessionChangePercent: -5,
+        observedAt: "2026-07-15T14:29:00.000Z",
+        sourceUrl: "https://markets.example.test/us-sp500",
+        sourceTitle: "S&P 500 latest reported index data",
+      }],
+    };
+    const actorChannels = new ActorChannelRuntime();
+    const stockActors = actorChannels.candidatesFor("stock-market");
+    vi.spyOn(actorChannels, "candidatesFor").mockImplementation((channelId) =>
+      channelId === "stock-market" ? stockActors : []);
+    const snapshotProvider = { snapshot: vi.fn(async () => snapshot) };
+    const evaluateMarketObservations = vi.fn(async () => [exceptional]);
+    const pollOfficialFeeds = vi.fn(async () => []);
+    const ordinaryLookup = vi.fn();
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-exceptional-market-priority-unused.json"),
+      { health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
+      actorChannels,
+      { research: ordinaryLookup } as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        autonomousResearchEnabled: true,
+        autonomousResearchChance: 1,
+        autonomousResearchHumanQuietMs: 15_000,
+        marketSnapshotProvider: snapshotProvider,
+        marketPulseCoordinator: { evaluateMarketObservations, pollOfficialFeeds },
+      },
+    );
+    const runExceptional = vi.fn(async (..._args: unknown[]) => true);
+    (director as unknown as { runAutonomousResearchConversation: typeof runExceptional })
+      .runAutonomousResearchConversation = runExceptional;
+    const invoke = (subject: SocialDirector, frequency: number) =>
+      (subject as unknown as {
+        maybeRunAutonomousResearch: (
+          at: number,
+          tuning: { activity: number; autonomousLinkFrequency: number; competence: number; aggression: number; explicitness: number },
+          queueDepth: number,
+        ) => Promise<boolean>;
+      }).maybeRunAutonomousResearch(now, {
+        activity: 50,
+        autonomousLinkFrequency: frequency,
+        competence: 50,
+        aggression: 25,
+        explicitness: 50,
+      }, 0);
+
+    expect(await invoke(director, 60)).toBe(true);
+    expect(snapshotProvider.snapshot).toHaveBeenCalledWith({ targetId: "GLOBAL_MAJOR" });
+    expect(evaluateMarketObservations).toHaveBeenCalledWith([expect.objectContaining({
+      validated: true,
+      providerId: "typed-market-provider",
+      instrumentId: "US_SP500",
+      sessionId: "2026-07-15",
+      observedAt: "2026-07-15T14:29:00.000Z",
+    })]);
+    expect(runExceptional).toHaveBeenCalledTimes(1);
+    expect(runExceptional.mock.calls[0]?.[4]).toMatchObject({
+      id: `market-pulse-move:${exceptional.id}`,
+    });
+    expect(runExceptional.mock.calls[0]?.[5]).toMatchObject({
+      research: {
+        kind: "market",
+        results: [expect.objectContaining({ url: "https://markets.example.test/us-sp500" })],
+      },
+    });
+    expect(pollOfficialFeeds).not.toHaveBeenCalled();
+    expect(ordinaryLookup).not.toHaveBeenCalled();
+    director.stop();
+
+    const disabledSnapshot = vi.fn(async () => snapshot);
+    const disabledEvaluate = vi.fn(async () => [exceptional]);
+    const disabledPoll = vi.fn(async () => []);
+    const disabledDirector = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-disabled-market-pulse-unused.json"),
+      { health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
+      actorChannels,
+      { research: vi.fn() } as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        autonomousResearchEnabled: true,
+        marketSnapshotProvider: { snapshot: disabledSnapshot },
+        marketPulseCoordinator: {
+          evaluateMarketObservations: disabledEvaluate,
+          pollOfficialFeeds: disabledPoll,
+        },
+        behaviorTuningProvider: () => ({
+          activity: 50,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+
+    expect(await invoke(disabledDirector, 0)).toBe(false);
+    expect(disabledSnapshot).not.toHaveBeenCalled();
+    expect(disabledEvaluate).not.toHaveBeenCalled();
+    expect(disabledPoll).not.toHaveBeenCalled();
+    disabledDirector.stop();
+  });
+
   it("selects only the first supported URL visibly present in the exact latest human text", () => {
     const humanId = "guest-link-scope";
     const trigger = createMessage(
@@ -3226,6 +3551,68 @@ describe("social director", () => {
     expect(shouldStartAutonomousResearch({ ...base, channelRetryAfterAt: base.now + 1 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, lastHumanActivityAt: base.now - 89_999 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, rng: () => 0.1 })).toBe(false);
+  });
+
+  it("applies declarative research priority without bypassing the Admin kill switch", () => {
+    const neutral = prioritizeAutonomousResearch(0.2, 40 * 60_000, 1, 0.5);
+    expect(neutral.chance).toBeCloseTo(0.2);
+    expect(neutral.channelCooldownMs).toBe(40 * 60_000);
+    expect(neutral.selectionKey).toBe(0.5);
+
+    const preferred = prioritizeAutonomousResearch(0.2, 40 * 60_000, 1.8, 0.5);
+    expect(preferred.chance).toBeGreaterThan(neutral.chance);
+    expect(preferred.channelCooldownMs).toBeLessThan(neutral.channelCooldownMs);
+    expect(preferred.selectionKey).toBeGreaterThan(neutral.selectionKey);
+
+    const disabled = prioritizeAutonomousResearch(0, 40 * 60_000, 4, 0.99);
+    expect(disabled.chance).toBe(0);
+  });
+
+  it("selects eligible sourced room work before ordinary ambient room scoring", async () => {
+    const now = Date.parse("2026-07-15T12:00:00.000Z");
+    const actorChannels = new ActorChannelRuntime();
+    const stockActors = actorChannels.candidatesFor("stock-market");
+    vi.spyOn(actorChannels, "candidatesFor").mockImplementation((channelId) =>
+      channelId === "stock-market" ? stockActors : []);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-priority-research-unused.json"),
+      { health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
+      actorChannels,
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        autonomousResearchEnabled: true,
+        autonomousResearchChance: 1,
+        autonomousResearchHumanQuietMs: 15_000,
+      },
+    );
+    const run = vi.fn(async (_channel: { id: string }) => true);
+    (director as unknown as { runAutonomousResearchConversation: typeof run })
+      .runAutonomousResearchConversation = run;
+
+    const attempted = await (director as unknown as {
+      maybeRunAutonomousResearch: (
+        at: number,
+        tuning: { activity: number; autonomousLinkFrequency: number; competence: number; aggression: number; explicitness: number },
+        queueDepth: number,
+      ) => Promise<boolean>;
+    }).maybeRunAutonomousResearch(now, {
+      activity: 50,
+      autonomousLinkFrequency: 60,
+      competence: 50,
+      aggression: 25,
+      explicitness: 50,
+    }, 0);
+
+    expect(attempted).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]?.[0]).toMatchObject({ id: "stock-market" });
+    director.stop();
   });
 
   it("maps autonomous-link frequency onto a bounded cadence with the former cadence at 50", () => {

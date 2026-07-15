@@ -138,6 +138,22 @@ describe("persistent admin overlay state", () => {
     expect(store.snapshot().automation.autonomousLinkChannelIds).not.toContain("ai-lab");
   });
 
+  it("drops a built-in research priority when an admin replaces that room's trusted topic", async () => {
+    const store = makeStore();
+    await store.load();
+    const current = store.snapshot().channels.find((channel) => channel.id === "stock-market")!;
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "stock-market")?.autonomousResearchPriority)
+      .toBeGreaterThan(1);
+    await store.updateChannel("stock-market", {
+      ...current,
+      topic: "a completely different administrator-authored room topic",
+    });
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "stock-market")?.autonomousResearchPriority)
+      .toBeUndefined();
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "stock-market")?.marketPulseSourceSet)
+      .toBeUndefined();
+  });
+
   it("rolls runtime arrays back when atomic persistence fails", async () => {
     const persist = vi.fn(async () => { throw new Error("disk unavailable"); });
     const store = makeStore(persist);

@@ -66,7 +66,7 @@ const cases = [
     channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
     capabilities: ["web_search", "market_snapshot", "local_datetime"],
     check: (value) => value.evidence.action === "market_snapshot" &&
-      value.evidence.locationLabel === "OMXS30" &&
+      value.evidence.locationLabel === "SE_OMXS30" &&
       value.capabilities.discussed.includes("market_snapshot") &&
       value.intent.kind !== "capability_question" &&
       ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
@@ -77,7 +77,34 @@ const cases = [
     channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
     capabilities: ["web_search", "market_snapshot", "local_datetime"],
     check: (value) => value.evidence.action === "market_snapshot" &&
-      value.evidence.locationLabel === "OMXS30" &&
+      value.evidence.locationLabel === "SE_OMXS30" &&
+      value.capabilities.discussed.includes("market_snapshot"),
+  },
+  {
+    id: "de-dax40-snapshot",
+    text: "Wie steht der DAX heute? Bitte den zuletzt gemeldeten Stand und die Veränderung zur letzten Sitzung prüfen.",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "market_snapshot" &&
+      value.evidence.locationLabel === "DE_DAX40" &&
+      value.capabilities.discussed.includes("market_snapshot"),
+  },
+  {
+    id: "ja-nikkei225-snapshot",
+    text: "日経平均株価の直近の値と前日比を確認してくれる？",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "market_snapshot" &&
+      value.evidence.locationLabel === "JP_NIKKEI225" &&
+      value.capabilities.discussed.includes("market_snapshot"),
+  },
+  {
+    id: "en-djia-snapshot",
+    text: "Can someone check the latest Dow Jones Industrial Average level and its change from the previous close?",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "market_snapshot" &&
+      value.evidence.locationLabel === "US_DJIA" &&
       value.capabilities.discussed.includes("market_snapshot"),
   },
   {
@@ -89,16 +116,35 @@ const cases = [
       { id: "sv-global-market-2", authorId: "ai-mira", authorName: "Mira", content: "OMX Stockholm 30 är ned 0,38 procent i den senaste rapporteringen." },
     ],
     capabilities: ["web_search", "market_snapshot", "local_datetime"],
-    check: (value) => value.evidence.action === "web_search" &&
-      value.evidence.query?.toLocaleLowerCase().includes("värld") &&
-      value.evidence.query?.toLocaleLowerCase().includes("idag") &&
-      value.capabilities.discussed.includes("web_search"),
+    check: (value) => value.evidence.action === "market_snapshot" &&
+      value.evidence.locationLabel === "GLOBAL_MAJOR" &&
+      value.capabilities.discussed.includes("market_snapshot"),
   },
   {
     id: "es-current-market",
     text: "¿Alguien puede buscar la cotización actual de Telefónica?",
     capabilities: ["web_search", "market_snapshot", "local_datetime"],
-    check: (value) => value.evidence.action === "web_search" && value.evidence.query?.toLocaleLowerCase().includes("telefónica"),
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.query?.toLocaleLowerCase().includes("telefónica") &&
+      value.capabilities.discussed.includes("web_search"),
+  },
+  {
+    id: "de-dax-latest-news",
+    text: "Was sind die neuesten Nachrichten zum DAX und welche Unternehmen bewegen ihn heute?",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.query?.toLocaleLowerCase().includes("dax") &&
+      value.capabilities.discussed.includes("web_search"),
+  },
+  {
+    id: "sv-omxs30-causal-analysis",
+    text: "Varför föll OMXS30 idag, och vilka nyheter låg bakom rörelsen?",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.query?.toLocaleLowerCase().includes("omxs30") &&
+      value.capabilities.discussed.includes("web_search"),
   },
   {
     id: "sv-screenshot-current-tesla",

@@ -1,3 +1,11 @@
+import {
+  MARKET_BASKET_CATALOG,
+  MARKET_BASKET_IDS,
+  MARKET_INDEX_CATALOG,
+  MARKET_INDEX_IDS,
+  MARKET_TARGET_IDS,
+} from "../marketData/catalog.js";
+
 export const CAPABILITY_ARGUMENT_FIELDS = ["q", "u", "m", "z", "k", "l"] as const;
 
 export type CapabilityArgumentField = (typeof CAPABILITY_ARGUMENT_FIELDS)[number];
@@ -24,7 +32,7 @@ export interface CapabilityArgumentContract {
    * bounded semantic value elsewhere. This never creates an action.
    */
   recoverFromGoal?: Readonly<Partial<Record<CapabilityArgumentField, true>>>;
-  /** Fixed provider identifiers accepted for otherwise free-form wire fields. */
+  /** Fixed canonical identifiers accepted for otherwise free-form wire fields. */
   allowedStringValues?: Readonly<Partial<Record<CapabilityArgumentField, readonly string[]>>>;
 }
 
@@ -45,6 +53,11 @@ interface CapabilityCatalogDefinition {
   routingGuidance: CapabilityRoutingGuidance;
   validationMessage: string;
 }
+
+const marketTargetRoutingMap = [
+  ...MARKET_INDEX_IDS.map((id) => `${id}: ${MARKET_INDEX_CATALOG[id].semanticDescription}`),
+  ...MARKET_BASKET_IDS.map((id) => `${id}: ${MARKET_BASKET_CATALOG[id].semanticDescription}`),
+].join("; ");
 
 /**
  * The keys of this object are the single source of truth for capability IDs.
@@ -89,13 +102,13 @@ const capabilityDefinitions = {
     arguments: {
       required: ["l"],
       allowed: ["l"],
-      allowedStringValues: { l: ["OMXS30", "DJUS"] },
+      allowedStringValues: { l: MARKET_TARGET_IDS },
     },
     routingGuidance: {
-      primary: "use only for the latest reported numeric level and provider-reported session change of one specifically named headline equity index supported by the server snapshot: OMXS30 or DJUS. Put the resolved official symbol in l and keep q/u/m/z/k null. A common informal name may be resolved semantically to its official symbol, but never invent a symbol. A normal request to check one of these values is an execution question or request, not a capability-availability question. This snapshot is not individual-equity data, a whole-world market survey, news, history, a forecast, advice or analysis; use web_search for those.",
-      verifier: "market_snapshot requires exactly one supported official headline-index symbol, OMXS30 or DJUS, in l with q/u/m/z/k null. Use it only for that index's latest reported numeric level or provider-reported session change. A normal request to check one of these values is an execution question or request, not a capability-availability question. Keep broad/global surveys, individual equities, news, historical questions, forecasts, advice and analysis on web_search, and keep none if the requested index cannot be resolved safely.",
+      primary: `use only for the latest reported numeric level and previous-close change of one supported headline equity index, or a bounded current overview of one registered market basket. Put exactly one canonical target ID in l and keep q/u/m/z/k null. Resolve common multilingual market wording semantically to the intended registered target, but never invent an ID or equate the Dow Jones Industrial Average with the broader Dow Jones U.S. Index. GLOBAL_MAJOR is the bounded major-world-index overview; a contextual follow-up asking how the rest of the world or other world markets performed after one index move maps to GLOBAL_MAJOR when it asks for current performance and does not ask for news or causes. Regional basket IDs are bounded overviews, not every exchange or security in that region. A normal request to check one of these values is an execution question or request, not a capability-availability question. Individual equities, market news, history, causes, forecasts, advice and analysis remain web_search. Registered targets: ${marketTargetRoutingMap}.`,
+      verifier: `market_snapshot requires exactly one registered canonical exact-index or fixed-basket ID in l with q/u/m/z/k null. Use it only for latest reported index levels and previous-close changes, including a bounded global or regional overview when the matching basket is explicitly or contextually intended. A follow-up asking how the rest of the world or other world markets performed after one supplied index move uses GLOBAL_MAJOR unless it asks for news or causes. Resolve wording semantically across languages; never invent an ID, map a company/security to an index, or treat DJIA as the broader DJUS index. Keep individual equities, news, historical questions, causal explanations, forecasts, advice and analysis on web_search, and keep none if the target cannot be resolved safely. Registered targets: ${marketTargetRoutingMap}.`,
     },
-    validationMessage: "market_snapshot requires only one supported official headline-index symbol",
+    validationMessage: "market_snapshot requires only one registered canonical index or basket target",
   },
   local_datetime: {
     routingClass: "narrow_structured",

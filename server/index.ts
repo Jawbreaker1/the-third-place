@@ -58,6 +58,13 @@ import {
 import { ResearchBroker } from "./researchBroker.js";
 import { PageReader } from "./pageReader.js";
 import { CapabilityRegistry } from "./capabilities/registry.js";
+import { MarketSnapshotService } from "./marketData/service.js";
+import { YahooChartMarketDataProvider } from "./marketData/providers/yahooChart.js";
+import {
+  JsonFileMarketPulseStateStore,
+  MarketPulseCoordinator,
+} from "./marketPulse.js";
+import { safeMarketPulseFeedFetcher } from "./marketPulseFetch.js";
 import {
   ADMIN_JSON_BODY_LIMIT_BYTES,
   PUBLIC_JSON_BODY_LIMIT_BYTES,
@@ -568,6 +575,19 @@ const getHealth = (): ServerHealth => ({
   onlineHumans: onlineHumanCount(),
   aiPace: PACE,
 });
+const marketSnapshotProvider = process.env.MARKET_SNAPSHOT_ENABLED === "false"
+  ? null
+  : new MarketSnapshotService({
+      providers: [new YahooChartMarketDataProvider()],
+    });
+const marketPulseCoordinator = process.env.MARKET_PULSE_ENABLED === "false"
+  ? null
+  : new MarketPulseCoordinator(
+      safeMarketPulseFeedFetcher,
+      new JsonFileMarketPulseStateStore(
+        resolve(process.env.MARKET_PULSE_STATE_PATH ?? "./data/market-pulse-state.json"),
+      ),
+    );
 const director = new SocialDirector(
   io,
   store,
@@ -577,7 +597,11 @@ const director = new SocialDirector(
   humanMemory,
   getMembers,
   onlineHumanCount,
-  { behaviorTuningProvider },
+  {
+    behaviorTuningProvider,
+    marketSnapshotProvider,
+    marketPulseCoordinator,
+  },
 );
 
 const voiceSocketRoom = (roomId: string) => `voice:${roomId}`;
@@ -593,6 +617,7 @@ const voiceCapabilityRegistry = new CapabilityRegistry({
   pageReader: new PageReader(),
   researchBroker,
   weatherForecastProvider: null,
+  marketSnapshotProvider: null,
 });
 const voiceDirector = new VoiceDirector({
   runtime: voiceRooms,

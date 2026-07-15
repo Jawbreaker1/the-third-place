@@ -15,6 +15,12 @@ export interface SafeHttpsFetchPolicy {
   acceptedMediaTypes: readonly string[];
   acceptHeader: string;
   userAgent: string;
+  /**
+   * Fixed-provider aliases that are known to label an identity body with a
+   * nonstandard Content-Encoding value. Real compression codings are always
+   * rejected because this primitive never decompresses response bodies.
+   */
+  identityContentEncodingAliases?: readonly string[];
   /** Reject redirects whose destination has a different origin from the requested URL. */
   sameOriginRedirectsOnly?: boolean;
   /** Permit only the bare-host <-> www-host variant while redirect confinement is active. */
@@ -73,6 +79,7 @@ const BLOCKED_HOSTS = new Set([
   "test",
 ]);
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const REAL_CONTENT_ENCODINGS = new Set(["br", "compress", "deflate", "gzip"]);
 
 const headerValue = (value: string | string[] | undefined): string =>
   Array.isArray(value) ? value.join(",") : (value ?? "");
@@ -92,6 +99,16 @@ const normalizedPolicy = (policy: SafeHttpsFetchPolicy): SafeHttpsFetchPolicy =>
   acceptedMediaTypes: [...new Set(policy.acceptedMediaTypes.map((value) => value.trim().toLocaleLowerCase()).filter(Boolean))],
   acceptHeader: policy.acceptHeader.slice(0, 512),
   userAgent: policy.userAgent.slice(0, 160),
+  ...(policy.identityContentEncodingAliases
+    ? {
+        identityContentEncodingAliases: [...new Set(policy.identityContentEncodingAliases
+          .map((value) => value.trim().toLocaleLowerCase())
+          .filter((value) =>
+            /^[a-z0-9._+-]{1,96}$/u.test(value) &&
+            !REAL_CONTENT_ENCODINGS.has(value),
+          ))].slice(0, 4),
+      }
+    : {}),
   ...(policy.sameOriginRedirectsOnly === true ? { sameOriginRedirectsOnly: true } : {}),
   ...(policy.allowCanonicalWwwRedirect === true ? { allowCanonicalWwwRedirect: true } : {}),
   ...(policy.stopAfterAsciiSequence && /^[\x20-\x7e]{1,64}$/u.test(policy.stopAfterAsciiSequence)
@@ -217,6 +234,10 @@ export const responseCanBeRead = (
 ): boolean => {
   const mediaType = responseMediaType(contentType);
   const encoding = contentEncoding.trim().toLocaleLowerCase();
+  const identityEncoding = !encoding || encoding === "identity" || (
+    !REAL_CONTENT_ENCODINGS.has(encoding) &&
+    Boolean(policy.identityContentEncodingAliases?.includes(encoding))
+  );
   const boundedEarlyStop = Boolean(policy.stopAfterAsciiSequence) || (
     policy.oversizedHtmlHeadFallback === true &&
     (mediaType === "text/html" || mediaType === "application/xhtml+xml")
@@ -230,7 +251,7 @@ export const responseCanBeRead = (
     status >= 200 &&
     status < 300 &&
     policy.acceptedMediaTypes.includes(mediaType) &&
-    (!encoding || encoding === "identity") &&
+    identityEncoding &&
     validLength
   );
 };

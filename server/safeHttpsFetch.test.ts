@@ -123,6 +123,14 @@ describe("safe HTTPS fetch", () => {
     expect(responseCanBeRead(200, "text/html; charset=utf-8", "identity", 100, policy)).toBe(true);
     expect(responseCanBeRead(200, "application/not-text/html", "", 100, policy)).toBe(false);
     expect(responseCanBeRead(200, "text/html", "gzip", 100, policy)).toBe(false);
+    expect(responseCanBeRead(200, "text/html", "Provider.UTF8", 100, {
+      ...policy,
+      identityContentEncodingAliases: ["provider.utf8"],
+    })).toBe(true);
+    expect(responseCanBeRead(200, "text/html", "gzip", 100, {
+      ...policy,
+      identityContentEncodingAliases: ["gzip"],
+    })).toBe(false);
     expect(responseCanBeRead(200, "text/html", "", 1_025, policy)).toBe(false);
     expect(responseCanBeRead(200, "text/html", "", 4_000_000, {
       ...policy,
