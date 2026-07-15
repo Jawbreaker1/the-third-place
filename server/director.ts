@@ -2275,6 +2275,9 @@ export class SocialDirector {
       invocation = this.capabilityRegistry.planAutomaticRead(pageReadRequest, trigger.content);
     }
     try {
+    const automaticReadResponseRequired = Boolean(
+      autoSharedLinkAttempt && (deterministicAddressedIds.length > 0 || responseExpected),
+    );
     const evidenceRequested = Boolean(invocation);
     let evidenceResponder: Persona | undefined;
     if (evidenceRequested) {
@@ -2315,8 +2318,8 @@ export class SocialDirector {
     const recallAnswerer = historyResponseRequired
       ? recallResponder ?? selected[0]
       : recallResponder;
-    const classifiedEvidenceMustAnswer = evidenceRequested && !autoSharedLinkAttempt;
-    const requestOwner = responseExpected || classifiedEvidenceMustAnswer
+    const evidenceMustAnswer = evidenceRequested && (!autoSharedLinkAttempt || automaticReadResponseRequired);
+    const requestOwner = responseExpected || evidenceMustAnswer
       ? evidenceRequested && evidenceResponder
         ? evidenceResponder
         : signals.mentionedIds.length === 0 && recallResponder
@@ -2373,6 +2376,7 @@ export class SocialDirector {
         capabilityScene = this.capabilityRegistry.sceneContract(invocation, capabilityResolution, {
           actorName: evidenceResponder?.name ?? "The designated resident",
           automatic: Boolean(autoSharedLinkAttempt),
+          failureReplyRequired: automaticReadResponseRequired,
         });
         research = capabilityScene.research;
         evidencePremise = capabilityScene.premise;
@@ -2384,7 +2388,7 @@ export class SocialDirector {
         }
         if (
           autoSharedLinkAttempt &&
-          (!burstIsCurrent() || this.voiceRoomActive || !this.canSpeak())
+          (!burstIsCurrent() || this.voiceRoomActive || (!this.canSpeak() && !automaticReadResponseRequired))
         ) {
           this.schedulePersistentMemory(messages, human);
           return;
@@ -2601,7 +2605,7 @@ export class SocialDirector {
       const ordinarySlotAvailable = this.canSpeak();
       const prioritySlotAvailable = !ordinarySlotAvailable &&
         !priorityReplyPublished &&
-        !autoSharedLinkAttempt &&
+        (!autoSharedLinkAttempt || automaticReadResponseRequired) &&
         required.has(persona.id) &&
         this.canUsePriorityHumanReply();
       if (

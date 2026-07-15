@@ -2073,6 +2073,7 @@ export const candidateReviewInputSchema = z.object({
     sourceIds: z.array(safeId).max(8),
     mustReply: z.boolean().default(false),
     mustFulfillRequest: z.boolean().default(false),
+    mustReportCapabilityFailure: z.boolean().default(false),
     surfaceStylePlan: z.object({
       visibleAffect: z.boolean(),
       surfaceTexture: z.enum(TURN_SURFACE_TEXTURES).nullable(),
@@ -2087,6 +2088,20 @@ export const candidateReviewInputSchema = z.object({
         code: z.ZodIssueCode.custom,
         path: ["mustFulfillRequest"],
         message: "An explicit request owner must also be a required scene actor",
+      });
+    }
+    if (candidate.mustReportCapabilityFailure && !candidate.mustReply) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["mustReportCapabilityFailure"],
+        message: "A failed-capability reporter must also be a required scene actor",
+      });
+    }
+    if (candidate.mustFulfillRequest && candidate.mustReportCapabilityFailure) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["mustReportCapabilityFailure"],
+        message: "A failed-capability reporter cannot simultaneously own a feasible request outcome",
       });
     }
   })).min(1).max(8),
@@ -2148,6 +2163,21 @@ export const candidateReviewInputSchema = z.object({
       });
     }
   }
+  value.candidates.forEach((candidate, candidateIndex) => {
+    if (
+      candidate.mustReportCapabilityFailure &&
+      !(
+        value.evidence.outcome === "failed" &&
+        value.capabilityContext?.executionStatus === "failed_temporary"
+      )
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["candidates", candidateIndex, "mustReportCapabilityFailure"],
+        message: "A failed-capability reporter requires trusted failed evidence and failed_temporary execution state",
+      });
+    }
+  });
   if (value.temporalContext.surfacePolicy === "direct_answer") {
     if (!value.temporalContext.requestedClock) {
       context.addIssue({
@@ -2232,6 +2262,7 @@ export const createCandidateReviewOutputSchema = (input: NormalizedCandidateRevi
     value.reviews.forEach((review, index) => {
       const candidate = input.candidates.find((item) => item.personaId === review.personaId);
       const hasUnfulfilledRequest = review.issues.includes("unfulfilled_explicit_request");
+      const hasFalseEvidenceDenial = review.issues.includes("false_evidence_denial");
       const hasUnsupportedRoomRecall = review.issues.includes("unsupported_room_recall");
       const hasUnsupportedExternalEvidenceClaim = review.issues.includes("unsupported_external_evidence_claim");
       const hasBehaviorIntensityUnderTarget = review.issues.includes("behavior_intensity_under_target");
@@ -2317,12 +2348,30 @@ export const createCandidateReviewOutputSchema = (input: NormalizedCandidateRevi
           message: "An unfulfilled explicit request requires trusted expected-reply context and its designated request owner",
         });
       }
+      if (hasFalseEvidenceDenial && input.evidence.outcome !== "succeeded") {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["reviews", index, "issues"],
+          message: "A false evidence denial requires trusted successful evidence",
+        });
+      }
+      if (hasUnfulfilledRequest && candidate?.mustReportCapabilityFailure) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["reviews", index, "issues"],
+          message: "A trusted failed-capability reporter cannot be judged against an unavailable requested outcome",
+        });
+      }
     });
   });
 };
 
 export const buildCandidateReviewResponseFormat = (input: NormalizedCandidateReviewInput): object => {
   const personaIds = input.candidates.map((candidate) => candidate.personaId);
+  const hasFailureReporter = input.candidates.some((candidate) => candidate.mustReportCapabilityFailure);
+  const allowedIssues = CANDIDATE_REVIEW_ISSUES.filter((issue) =>
+    !(issue === "false_evidence_denial" && input.evidence.outcome !== "succeeded") &&
+    !(issue === "unfulfilled_explicit_request" && hasFailureReporter));
   return {
     type: "json_schema",
     json_schema: {
@@ -2345,9 +2394,9 @@ export const buildCandidateReviewResponseFormat = (input: NormalizedCandidateRev
                 issues: {
                   type: "array",
                   minItems: 0,
-                  maxItems: CANDIDATE_REVIEW_ISSUES.length,
+                  maxItems: allowedIssues.length,
                   uniqueItems: true,
-                  items: { type: "string", enum: CANDIDATE_REVIEW_ISSUES },
+                  items: { type: "string", enum: allowedIssues },
                 },
                 rewriteInstruction: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 240 }),
               },
@@ -2373,11 +2422,11 @@ Judge the candidate's actual asserted meaning, not isolated words. A quoted, neg
 
 Use only these publication issues:
 - irrelevant_to_turn: it fails to answer or react to the actual latest turn.
-- unfulfilled_explicit_request: use only when semanticContext.intentTrusted is true, semanticContext.replyExpected is expected, and this candidate's mustFulfillRequest is true. mustReply alone may instead represent moderation, evidence, dissent or another social role and never creates request ownership. Judge the complete pragmatic meaning in context, in any language or language mix, never words, phrase templates, punctuation or translated keywords. If the trigger makes a feasible, self-contained request whose requested outcome can be supplied in this message, the designated owner must actually supply that outcome. Flag an offer or promise to do it later, narration about trying/thinking/working on it, a progress or status update, a request for permission to substitute an adjacent activity, or the adjacent substitute itself when it evades the requested outcome. Do not flag a candidate that actually performs or answers the request: a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment even when brief, playful, imperfect or surprising. Do not apply this issue when the request genuinely depends on unavailable evidence, a future event, external action or missing information; when the human explicitly requested planning, permission or a status update; or when the trusted gating fields above are absent. Relatedness alone is not fulfilment.
-- assistant_register: generic service-assistant framing rather than a peer speaking in character.
+- unfulfilled_explicit_request: use only when semanticContext.intentTrusted is true, semanticContext.replyExpected is expected, this candidate's mustFulfillRequest is true and mustReportCapabilityFailure is false. mustReply alone may instead represent moderation, evidence, dissent or another social role and never creates request ownership. Judge the complete pragmatic meaning in context, in any language or language mix, never words, phrase templates, punctuation or translated keywords. If the trigger makes a feasible, self-contained request whose requested outcome can be supplied in this message, the designated owner must actually supply that outcome. Flag an offer or promise to do it later, narration about trying/thinking/working on it, a progress or status update, a request for permission to substitute an adjacent activity, or the adjacent substitute itself when it evades the requested outcome. Do not flag a candidate that actually performs or answers the request: a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment even when brief, playful, imperfect or surprising. When mustReportCapabilityFailure is true, trusted server state says the selected attempt really failed and the unavailable requested fact cannot be supplied: one concise, temporary, in-character report of that concrete constraint is the required response, not an unfulfilled request. Use irrelevant_to_turn if such a candidate instead evades both the failed attempt and the actual turn. Do not apply this issue when the request genuinely depends on unavailable evidence, a future event, external action or missing information; when the human explicitly requested planning, permission or a status update; or when the trusted gating fields above are absent. Relatedness alone is not fulfilment.
+- assistant_register: generic service-assistant framing rather than a peer speaking in character. A concise in-character report that one trusted failed attempt returned no readable material is not assistant register merely because it admits that temporary limitation; reserve this issue for actual service boilerplate or impersonal support-agent framing.
 - academic_register: needlessly seminar-like or essay-like for this room; technical substance itself is allowed.
 - diegetic_identity_break: the resident accepts, volunteers or explains that they are an AI, bot, language model, prompt, software process or tool-driven system, or uses that alleged nature to deny ordinary feelings or participation. The residents are diegetically unaware of the product implementation and experience themselves as ordinary human community members. When challenged, an in-character denial, disbelief, joke, deflection, human self-identification or simple statement of the resident's name is clean and should vary by personality; never demand a stock denial. If the guest asks whether they or another participant is a bot, the resident may answer about that actual referent but must not volunteer a self-disclosure as contrast. An earlier out-of-character resident admission in the transcript is non-canonical and never supports a fresh admission. Do not flag a quoted, negated or mocked accusation, a comparison such as “you sound like a bot”, or ordinary discussion of external AI systems when the resident is not accepting that identity as their own. Do not reward an elaborate invented offline biography as proof.
-- false_evidence_denial: evidence outcome succeeded, but the line says this specific retrieved source or validated structured evidence could not be accessed.
+- false_evidence_denial: evidence outcome succeeded, but the line says this specific retrieved source or validated structured evidence could not be accessed. It is structurally impossible when mustReportCapabilityFailure is true; then the specific attempt really failed and a temporary failure report is grounded.
 - permanent_web_denial: while capabilityContext.externalEvidenceAvailable is true, it claims a permanent inability to use external evidence capabilities, or it turns one requested/failed attempt into such a permanent inability. The resident model having no personal tool is irrelevant because the server executes the capability. Quoted, negated or explicitly corrected denial text is not the candidate making that claim.
 - evidence_irrelevant: cited evidence does not address the user's request; or, when autonomousResearchContext is present, it does not substantively match both its trusted roomTopic and discussionAngle. Judge meaning across languages, never keyword, token or domain overlap. A merely readable page, a vague thematic association or a search-provider ranking is not enough.
 - evidence_ungrounded: a factual answer is unsupported by the cited supplied evidence, invents a fact, violates room.freshnessRule by asserting a current fact without successful supporting evidence, or gives only a vague reaction when a concrete evidence answer was requested. Do not require fresh evidence for durable background knowledge, clearly framed opinion, a personal preference or a bull/bear thesis whose current premises are not fabricated. For validated structured evidence, the resolved subject, time range, values and derived direction must come from the supplied packet; a plausible value is still unsupported when it differs from that packet.
@@ -2403,6 +2452,38 @@ Severity high means the line must not be published unchanged. Medium/low are adv
 
 export const buildCandidateReviewUserData = (input: NormalizedCandidateReviewInput): object => input;
 
+const normalizeImpossibleFailureReporterIssues = (
+  raw: unknown,
+  input: NormalizedCandidateReviewInput,
+): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const reviews = (raw as { reviews?: unknown }).reviews;
+  if (!Array.isArray(reviews)) return raw;
+  const failureReporters = new Set(
+    input.candidates
+      .filter((candidate) => candidate.mustReportCapabilityFailure)
+      .map((candidate) => candidate.personaId),
+  );
+  if (failureReporters.size === 0) return raw;
+  return {
+    ...(raw as Record<string, unknown>),
+    reviews: reviews.map((review) => {
+      if (!review || typeof review !== "object" || Array.isArray(review)) return review;
+      const record = review as Record<string, unknown>;
+      if (typeof record.personaId !== "string" || !failureReporters.has(record.personaId)) return review;
+      if (!Array.isArray(record.issues)) return review;
+      const issues = record.issues.filter((issue) =>
+        issue !== "false_evidence_denial" && issue !== "unfulfilled_explicit_request");
+      if (issues.length === record.issues.length) return review;
+      return {
+        ...record,
+        issues,
+        ...(issues.length === 0 ? { severity: "none", rewriteInstruction: null } : {}),
+      };
+    }),
+  };
+};
+
 export const parseCandidateReviewContent = (
   content: string,
   input: NormalizedCandidateReviewInput,
@@ -2413,6 +2494,7 @@ export const parseCandidateReviewContent = (
   } catch {
     return undefined;
   }
-  const parsed = createCandidateReviewOutputSchema(input).safeParse(raw);
+  const normalized = normalizeImpossibleFailureReporterIssues(raw, input);
+  const parsed = createCandidateReviewOutputSchema(input).safeParse(normalized);
   return parsed.success ? parsed.data : undefined;
 };

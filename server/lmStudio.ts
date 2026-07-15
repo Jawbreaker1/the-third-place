@@ -318,6 +318,12 @@ const explicitRequestOwnerIds = (request: SceneRequest): string[] => {
   );
 };
 
+const failedCapabilityReporterIds = (request: SceneRequest): string[] =>
+  request.evidenceOutcome === "failed" &&
+  request.capabilityContext?.executionStatus === "failed_temporary"
+    ? explicitRequestOwnerIds(request)
+    : [];
+
 // Internal repair markers are transport syntax, not natural-language meaning.
 // Match both concrete per-actor tokens and the generic marker shape that an LM
 // might copy from a prompt. Exact user-authored literals remain publishable via
@@ -1762,6 +1768,8 @@ export class LmStudioClient {
           sceneClock.instant,
         )[0]
       : undefined;
+    const requestOwnerIds = new Set(explicitRequestOwnerIds(request));
+    const failureReporterIds = new Set(failedCapabilityReporterIds(request));
     const candidates = lines.flatMap((line) => {
       const persona = request.selected.find((candidate) => candidate.id === line.personaId);
       if (!persona) return [];
@@ -1781,7 +1789,8 @@ export class LmStudioClient {
         content: line.content.slice(0, 500),
         sourceIds: line.sourceIds,
         mustReply: request.mustReplyIds?.includes(line.personaId) ?? false,
-        mustFulfillRequest: explicitRequestOwnerIds(request).includes(line.personaId),
+        mustFulfillRequest: requestOwnerIds.has(line.personaId) && !failureReporterIds.has(line.personaId),
+        mustReportCapabilityFailure: failureReporterIds.has(line.personaId),
         surfaceStylePlan: {
           visibleAffect: surfaceStyle.visibleAffect,
           surfaceTexture: surfaceStyle.surfaceTexture ?? null,
@@ -2198,6 +2207,7 @@ export class LmStudioClient {
     if (lines.length === 0) return [];
     const reviewed = this.reviewSceneLines(request, lines, semanticReviews);
     const rejected = reviewed.filter((entry) => !entry.assessment.acceptable);
+    const failureReporterIds = new Set(failedCapabilityReporterIds(request));
     const acceptedByPersona = new Map(
       reviewed
         .filter((entry) => entry.assessment.acceptable)
@@ -2207,7 +2217,10 @@ export class LmStudioClient {
       rejected.flatMap((entry) => {
         const intensityOnly = entry.semanticReview?.issues.length === 1 &&
           entry.semanticReview.issues[0] === "behavior_intensity_under_target";
-        if (!intensityOnly) return [];
+        const failedReportStyleOnly = failureReporterIds.has(entry.line.personaId) &&
+          entry.semanticReview?.issues.length === 1 &&
+          entry.semanticReview.issues[0] === "assistant_register";
+        if (!intensityOnly && !failedReportStyleOnly) return [];
         const withoutSemanticReview = this.applyMechanicalContract(
           request,
           entry.line,
@@ -2229,14 +2242,17 @@ export class LmStudioClient {
       const codes = rejected
         .map((entry) => `${entry.persona.id}:${entry.assessment.reasonCodes.join("+")}`)
         .join(", ");
-      // Evidence is available only to the full scene generation, not to the
-      // style-only repair prompt. Never rewrite a researched line without that
-      // packet: it could change the claim or create an answer under a stale or
-      // missing citation. The director can retry a required responder with the
-      // complete evidence instead.
+      // Successful evidence is available only to the full scene generation,
+      // not to the style-only repair prompt. Never rewrite a researched line
+      // without that packet: it could change the claim or create an answer
+      // under a stale or missing citation. A designated failed-capability
+      // reporter has no evidence packet to lose and may receive one style-only
+      // repair; the repaired output is still semantically reviewed below.
       const evidenceScene = Boolean(request.research || request.evidenceOutcome || request.requestedClock);
       const repairable = rejected.filter((entry) =>
-        !evidenceScene &&
+        (!evidenceScene || (
+          request.evidenceOutcome === "failed" && failureReporterIds.has(entry.line.personaId)
+        )) &&
         entry.line.sourceIds.length === 0 &&
         !entry.semanticReview?.issues.some((issue) => NON_REPAIRABLE_CANDIDATE_ISSUES.has(issue))
       );
@@ -2292,10 +2308,12 @@ export class LmStudioClient {
       }
     }
 
-    // Under-expressing an intensity target is presentation, not safety or truth.
-    // If its single bounded rewrite is unavailable, preserve an otherwise safe
+    // Under-expressing an intensity target and assistant-style phrasing on a
+    // trusted failed-capability report are presentation, not safety or truth.
+    // If the bounded rewrite is unavailable, preserve an otherwise safe
     // original instead of making the room mysteriously silent. Over-intensity,
-    // targeted abuse and every other issue remain fail-closed.
+    // unsupported claims, permanent denials and every other issue remain
+    // fail-closed.
     for (const [personaId, line] of safeStyleFallbacks) {
       if (!acceptedByPersona.has(personaId)) acceptedByPersona.set(personaId, line);
     }

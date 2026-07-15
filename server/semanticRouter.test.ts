@@ -1836,6 +1836,30 @@ const explicitRequestReviewInput = (options: {
   });
 };
 
+const failedCapabilityReviewInput = (): NormalizedCandidateReviewInput => {
+  const base = explicitRequestReviewInput({
+    trigger: "Kannst du diese Seite lesen?",
+    candidate: "Hm, die Seite ließ sich bei diesem Versuch nicht öffnen.",
+  });
+  return candidateReviewInputSchema.parse({
+    ...base,
+    evidence: { outcome: "failed", kind: null, query: null, results: [] },
+    capabilityContext: {
+      available: ["read_url"],
+      externalEvidenceAvailable: true,
+      requestKind: "execute",
+      discussed: ["read_url"],
+      plannedAction: "read_url",
+      executionStatus: "failed_temporary",
+    },
+    candidates: [{
+      ...base.candidates[0],
+      mustFulfillRequest: false,
+      mustReportCapabilityFailure: true,
+    }],
+  });
+};
+
 describe("multilingual batch candidate-review contract", () => {
   it("accepts typed weather evidence for grounding review", () => {
     const base = reviewInput();
@@ -2022,6 +2046,12 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviews.items.properties.issues.items.enum).toContain("unsupported_external_evidence_claim");
     expect(reviews.items.properties.issues.items.enum).toContain("diegetic_identity_break");
     expect(reviews.items.properties.issues.items.enum).not.toContain("identity_dishonesty");
+
+    const failedFormat = buildCandidateReviewResponseFormat(failedCapabilityReviewInput()) as any;
+    const failedIssues = failedFormat.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
+    expect(failedIssues).not.toContain("false_evidence_denial");
+    expect(failedIssues).not.toContain("unfulfilled_explicit_request");
+    expect(failedIssues).toContain("permanent_web_denial");
   });
 
   it("accepts quoted multilingual discussion as clean and rejects missing or duplicate persona reviews", () => {
@@ -2174,6 +2204,69 @@ describe("multilingual batch candidate-review contract", () => {
     }), request)).toBeUndefined();
   });
 
+  it("normalizes impossible failed-capability review issues without hiding valid blockers", () => {
+    const failed = failedCapabilityReviewInput();
+    const falseDenial = {
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "high",
+        issues: ["false_evidence_denial"],
+        rewriteInstruction: "Behaupte nicht, dass die erfolgreiche Quelle fehlte.",
+      }],
+    };
+    const unfulfilled = {
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "high",
+        issues: ["unfulfilled_explicit_request"],
+        rewriteInstruction: "Liefere den nicht verfügbaren Seiteninhalt trotzdem.",
+      }],
+    };
+    const permanentStillBlocks = {
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "high",
+        issues: ["false_evidence_denial", "permanent_web_denial"],
+        rewriteInstruction: "Beschränke die Aussage auf diesen fehlgeschlagenen Versuch.",
+      }],
+    };
+
+    expect(parseCandidateReviewContent(JSON.stringify(falseDenial), failed)).toEqual({
+      reviews: [{ personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null }],
+    });
+    expect(parseCandidateReviewContent(JSON.stringify(unfulfilled), failed)).toEqual({
+      reviews: [{ personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null }],
+    });
+    expect(parseCandidateReviewContent(JSON.stringify(permanentStillBlocks), failed)).toEqual({
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "high",
+        issues: ["permanent_web_denial"],
+        rewriteInstruction: "Beschränke die Aussage auf diesen fehlgeschlagenen Versuch.",
+      }],
+    });
+  });
+
+  it("accepts failed-capability reporters only under matching trusted server state", () => {
+    const failed = failedCapabilityReviewInput();
+    expect(failed.candidates[0]).toMatchObject({
+      mustReply: true,
+      mustFulfillRequest: false,
+      mustReportCapabilityFailure: true,
+    });
+    expect(candidateReviewInputSchema.safeParse({
+      ...failed,
+      evidence: { outcome: "none", kind: null, query: null, results: [] },
+    }).success).toBe(false);
+    expect(candidateReviewInputSchema.safeParse({
+      ...failed,
+      candidates: [{
+        ...failed.candidates[0],
+        mustFulfillRequest: true,
+      }],
+    }).success).toBe(false);
+  });
+
   it("rejects the request-fulfilment issue without every trusted server gate", () => {
     const blocked = {
       reviews: [{
@@ -2242,6 +2335,9 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("the designated owner must actually supply that outcome");
     expect(prompt).toContain("mustReply alone may instead represent moderation, evidence, dissent or another social role");
     expect(prompt).toContain("a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment");
+    expect(prompt).toContain("mustReportCapabilityFailure is true");
+    expect(prompt).toContain("one concise, temporary, in-character report of that concrete constraint is the required response");
+    expect(prompt).toContain("not assistant register merely because it admits that temporary limitation");
     expect(prompt).toContain("Relatedness alone is not fulfilment");
     expect(prompt).toContain("roomRecall.witnessPersonaIds");
     expect(prompt).toContain("A roomRecall anchor proves only that the row directly matched retrieval");

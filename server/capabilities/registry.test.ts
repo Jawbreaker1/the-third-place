@@ -674,6 +674,19 @@ describe("capability registry contract", () => {
     });
     expect(silentFailure).not.toHaveProperty("urlPublicationPolicy");
 
+    const requiredFailure = registry.sceneContract(
+      failedResolution.invocation,
+      failedResolution,
+      { actorName: "Mira", failureReplyRequired: true },
+    );
+    expect(requiredFailure).toMatchObject({
+      evidenceOutcome: "failed",
+      suppressResponse: false,
+      premise: expect.stringContaining("returned no readable evidence"),
+    });
+    expect(requiredFailure).not.toHaveProperty("research");
+    expect(requiredFailure).not.toHaveProperty("urlPublicationPolicy");
+
     const emptyGoal = registry.planAutomaticRead(pageRequest(root), "   ");
     expect(emptyGoal.goal).toBe("shared page");
     const otherRead = registry.planAutomaticRead(

@@ -1132,9 +1132,10 @@ describe("social director", () => {
     }
   });
 
-  it("keeps an unreadable automatic shared link completely silent", async () => {
+  it("keeps an optional unreadable shared link silent but reports a failed attempt to an exact addressee", async () => {
     vi.useFakeTimers();
     try {
+      let now = Date.parse("2026-07-15T16:00:00.000Z");
       const human = {
         id: "guest-auto-link-failure",
         name: "Guest",
@@ -1151,26 +1152,38 @@ describe("social director", () => {
       const search = vi.fn(async () => undefined);
       const analyzeTurn = vi.fn(async () => createFailClosedTurnAnalysis("timeout"));
       const pageReader = {
-        collectCandidates: vi.fn(() => ({
-          requestedAt: incoming.createdAt,
-          candidates: [{
-            id: "U1" as const,
-            raw: incoming.content,
-            url: new URL(incoming.content),
-            supported: true,
-            source: "message" as const,
-            messageId: incoming.id,
-            authorId: human.id,
-            createdAt: incoming.createdAt,
-          }],
-        })),
-        resolveTarget: vi.fn(() => ({
-          url: new URL(incoming.content),
-          requestedAt: incoming.createdAt,
-          intent: incoming.content,
-          retry: false,
-          source: "message" as const,
-        })),
+        collectCandidates: vi.fn((input: { messages: typeof incoming[] }) => {
+          const latest = input.messages.at(-1)!;
+          const raw = latest.content.match(/https:\/\/\S+/u)?.[0];
+          return {
+            requestedAt: latest.createdAt,
+            candidates: raw ? [{
+              id: "U1" as const,
+              raw,
+              url: new URL(raw),
+              supported: true,
+              source: "message" as const,
+              messageId: latest.id,
+              authorId: human.id,
+              createdAt: latest.createdAt,
+            }] : [],
+          };
+        }),
+        resolveTarget: vi.fn((input: {
+          candidateSet: { requestedAt: string; candidates: Array<{ id: string; url?: URL; source: "message" }> };
+          targetRef: string;
+          intent: string;
+          retry: boolean;
+        }) => {
+          const candidate = input.candidateSet.candidates.find((item) => item.id === input.targetRef);
+          return candidate?.url ? {
+            url: candidate.url,
+            requestedAt: input.candidateSet.requestedAt,
+            intent: input.intent,
+            retry: input.retry,
+            source: candidate.source,
+          } : undefined;
+        }),
         read,
       };
       const director = new SocialDirector(
@@ -1192,7 +1205,12 @@ describe("social director", () => {
         } as never,
         () => [human, ...PERSONAS],
         () => 1,
-        { pageReader: pageReader as never, autoSharedLinkDiscussionEnabled: true, rng: () => 0.99 },
+        {
+          pageReader: pageReader as never,
+          autoSharedLinkDiscussionEnabled: true,
+          rng: () => 0.99,
+          now: () => now,
+        },
       );
       await (director as unknown as {
         handleHumanBurst: (items: typeof incoming[], member: typeof human) => Promise<void>;
@@ -1205,6 +1223,57 @@ describe("social director", () => {
       expect(emit.mock.calls.some(([event, payload]) =>
         event === "typing:member" && payload?.active === true,
       )).toBe(false);
+
+      now += 61_000;
+      const mentioned = createMessage(
+        "lobby",
+        human.id,
+        "@Mira kan du kolla https://example.com/still-unreadable",
+      );
+      store.addPublicMessage(mentioned);
+      const assertMentionedFailureScene = (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        requestOwnerIds: string[];
+        evidenceOutcome?: string;
+        premise?: string;
+        research?: unknown;
+      }): void => {
+        expect(request.selected.map((persona) => persona.id)).toEqual(["ai-mira"]);
+        expect(request.requestOwnerIds).toEqual(["ai-mira"]);
+        expect(request.evidenceOutcome).toBe("failed");
+        expect(request.premise).toContain("returned no readable evidence");
+        expect(request.research).toBeUndefined();
+      };
+      generateScene.mockImplementationOnce(async (request) => {
+        assertMentionedFailureScene(request);
+        return [];
+      });
+      generateScene.mockImplementationOnce(async (request) => {
+        assertMentionedFailureScene(request);
+        expect(request.premise).toContain("owns the human's explicit request");
+        return [{
+          personaId: "ai-mira",
+          content: "Hm, jag kommer inte åt just den sidan nu.",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const mentionedPending = (director as unknown as {
+        handleHumanBurst: (items: typeof incoming[], member: typeof human) => Promise<void>;
+      }).handleHumanBurst([mentioned], human);
+      await vi.runAllTimersAsync();
+      await mentionedPending;
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(read.mock.calls[1]?.[0]).toMatchObject({ initiator: "automatic" });
+      expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(search).not.toHaveBeenCalled();
+      expect(store.getRecent("lobby", 10).at(-1)).toMatchObject({
+        authorId: "ai-mira",
+        content: "Hm, jag kommer inte åt just den sidan nu.",
+        replyToId: mentioned.id,
+      });
+      expect(store.getRecent("lobby", 10).at(-1)).not.toHaveProperty("linkPreview");
+      expect(store.getRecent("lobby", 10).at(-1)).toMatchObject({ sources: [] });
 
       analyzeTurn.mockResolvedValueOnce(classifiedTurn({
         intent: { kind: "statement", isQuestion: false, replyExpected: "optional", confidence: 0.99 },
@@ -1234,9 +1303,9 @@ describe("social director", () => {
       }).handleHumanBurst([explicit], human);
       await vi.runAllTimersAsync();
       await explicitPending;
-      expect(read).toHaveBeenCalledTimes(2);
-      expect(read.mock.calls[1]?.[0]).not.toMatchObject({ initiator: "automatic" });
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(read.mock.calls[2]?.[0]).not.toMatchObject({ initiator: "automatic" });
+      expect(generateScene).toHaveBeenCalledTimes(3);
       expect(search).not.toHaveBeenCalled();
       expect(store.getRecent("lobby", 10).at(-1)).toMatchObject({
         content: "Jag fick inte fram just den sidan den här gången.",

@@ -124,7 +124,7 @@ export interface CapabilitySceneContract {
   groundingInstruction: string;
   premise: string;
   externalEvidence: boolean;
-  /** Automatic passive-link failures never become spoken capability errors. */
+  /** Whether this failed passive event may stay silent under trusted response-obligation policy. */
   suppressResponse: boolean;
   responsePolicy: CapabilityResponsePolicy;
 }
@@ -159,6 +159,12 @@ export interface CapabilityRegistryOptions {
 interface CapabilityPresentationContext {
   actorName: string;
   automatic?: boolean;
+  /**
+   * Server-owned social obligation from an exact address/reply or trusted
+   * semantic response decision. Adapters may use it only to decide whether a
+   * real failed attempt should be surfaced; it grants no execution authority.
+   */
+  failureReplyRequired?: boolean;
 }
 
 interface CapabilityAdapter<I extends CapabilityInvocation = CapabilityInvocation> {
@@ -455,7 +461,7 @@ const readUrlAdapter: CapabilityAdapter<ReadUrlInvocation> = {
       groundingInstruction,
       premise,
       externalEvidence: true,
-      suppressResponse: Boolean(automatic && !success),
+      suppressResponse: Boolean(automatic && !success && !context.failureReplyRequired),
       responsePolicy: resolution.responsePolicy,
     };
   },

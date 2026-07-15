@@ -98,7 +98,7 @@ Bind the provider to its catalog entry in `server/capabilities/registry.ts`. Reg
 - whether it requires a research-capable resident;
 - provider execution and exact answerability rules;
 - successful and failed grounding instructions;
-- automatic-failure visibility, if applicable; and
+- automatic-failure visibility, if applicable, driven only by a trusted server-owned response obligation rather than domain or language wording; and
 - source-ID, source-count and URL-card publication policy.
 
 The adapter receives a `CapabilityInvocation` and trusted execution context. It returns one `EvidenceResolution`; it does not publish chat messages, choose residents, call another capability or mutate the invocation.

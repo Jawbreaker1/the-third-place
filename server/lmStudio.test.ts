@@ -1973,6 +1973,199 @@ describe("LM Studio multilingual batch candidate review", () => {
     });
   });
 
+  it.each([
+    {
+      languageTag: "sv",
+      line: "Hm, kommer inte åt just den sidan nu.",
+      impossibleIssue: "false_evidence_denial",
+    },
+    {
+      languageTag: "es",
+      line: "Hm, esa página no se abrió esta vez.",
+      impossibleIssue: "unfulfilled_explicit_request",
+    },
+  ])("keeps a truthful failed-capability report when review invents $impossibleIssue", async ({
+    languageTag,
+    line,
+    impossibleIssue,
+  }) => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: line, sourceIds: [] }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "high",
+            issues: [impossibleIssue],
+            rewriteInstruction: "Do not reject a truthful temporary failure report.",
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "Kan du läsa länken?" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      evidenceOutcome: "failed",
+      capabilityContext: {
+        available: ["read_url"],
+        externalEvidenceAvailable: true,
+        requestKind: "execute",
+        discussed: ["read_url"],
+        plannedAction: "read_url",
+        executionStatus: "failed_temporary",
+      },
+      semanticContext: {
+        languageTag,
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((candidate) => candidate.content)).toEqual([line]);
+    expect(bodies).toHaveLength(2);
+    const reviewPayload = JSON.parse(bodies[1].messages[1].content);
+    expect(reviewPayload.candidates[0]).toMatchObject({
+      mustReply: true,
+      mustFulfillRequest: false,
+      mustReportCapabilityFailure: true,
+      sourceIds: [],
+    });
+    const allowedIssues = bodies[1].response_format.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
+    expect(allowedIssues).not.toContain("false_evidence_denial");
+    expect(allowedIssues).not.toContain("unfulfilled_explicit_request");
+  });
+
+  it("repairs assistant-like phrasing on a failed-capability report and accepts the temporary constraint", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    const original = "Jag får tyvärr inte upp sidan just nu.";
+    const repaired = "Hm, sidan går inte att öppna för mig nu.";
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) return completionResponse([{ personaId: mira.id, content: original }]);
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["assistant_register"],
+          rewriteInstruction: "Säg det som en kort spontan kommentar i din egen röst.",
+        }]);
+      }
+      if (bodies.length === 3) return completionResponse([{ personaId: mira.id, content: repaired }]);
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "high",
+        issues: ["unfulfilled_explicit_request"],
+        rewriteInstruction: "Leverera sidans innehåll trots att försöket misslyckades.",
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "@Mira, kan du kolla länken?" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      evidenceOutcome: "failed",
+      capabilityContext: {
+        available: ["read_url"],
+        externalEvidenceAvailable: true,
+        requestKind: "execute",
+        discussed: ["read_url"],
+        plannedAction: "read_url",
+        executionStatus: "failed_temporary",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((candidate) => candidate.content)).toEqual([repaired]);
+    expect(bodies).toHaveLength(4);
+  });
+
+  it("preserves an otherwise safe failed-capability report if its assistant-style repair is rejected again", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    const original = "Hm, sidan gick inte att öppna den här gången.";
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      if (call === 1) return completionResponse([{ personaId: mira.id, content: original }]);
+      if (call === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["assistant_register"],
+          rewriteInstruction: "Gör felrapporten mer vardaglig.",
+        }]);
+      }
+      if (call === 3) return completionResponse([{ personaId: mira.id, content: "Näh, får inte upp den just nu." }]);
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "high",
+        issues: ["assistant_register"],
+        rewriteInstruction: "Behåll innebörden men gör rösten mer personlig.",
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Jaw_B", content: "@Mira, kolla sidan" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      evidenceOutcome: "failed",
+      capabilityContext: {
+        available: ["read_url"],
+        externalEvidenceAvailable: true,
+        requestKind: "execute",
+        discussed: ["read_url"],
+        plannedAction: "read_url",
+        executionStatus: "failed_temporary",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((candidate) => candidate.content)).toEqual([original]);
+    expect(call).toBe(4);
+  });
+
   it("drops an incorrectly grounded elapsed-time claim without a style-repair call", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
