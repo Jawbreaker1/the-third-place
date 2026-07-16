@@ -2,7 +2,9 @@ import type { ServerHealth, VisualObservation } from "../shared/types.js";
 import type {
   GeneratedLine,
   LmStudioClient,
+  SceneGenerationExecutionOptions,
   SceneRequest,
+  TurnAnalysisExecutionOptions,
 } from "./lmStudio.js";
 import type { ModelProviderId } from "./modelBackend.js";
 import type { MemoryAnalysis, MemoryAnalysisInput, TurnAnalysis, TurnAnalysisInput } from "./semanticRouter.js";
@@ -10,9 +12,14 @@ import type { MemoryAnalysis, MemoryAnalysisInput, TurnAnalysis, TurnAnalysisInp
 export interface SocialModelClient {
   probe(): Promise<ServerHealth["model"]>;
   health(overrideLabel?: string): ServerHealth["model"];
-  analyzeTurn(input: TurnAnalysisInput): Promise<TurnAnalysis>;
+  analyzeTurn(input: TurnAnalysisInput, execution?: TurnAnalysisExecutionOptions): Promise<TurnAnalysis>;
   analyzeMemoryTurn(input: MemoryAnalysisInput): Promise<MemoryAnalysis>;
-  generateScene(request: SceneRequest, priority?: number, signal?: AbortSignal): Promise<GeneratedLine[]>;
+  generateScene(
+    request: SceneRequest,
+    priority?: number,
+    signal?: AbortSignal,
+    execution?: SceneGenerationExecutionOptions,
+  ): Promise<GeneratedLine[]>;
   analyzeImage(image: Buffer, caption?: string, priority?: number): Promise<VisualObservation>;
   rememberDeliveredLine(
     personaId: string,
@@ -66,16 +73,24 @@ export class SwitchableSocialModel implements SocialModelClient {
     return { ...this.clients[this.active].health(overrideLabel), provider: this.active };
   }
 
-  async analyzeTurn(input: TurnAnalysisInput): Promise<TurnAnalysis> {
-    return await this.guarded((client) => client.analyzeTurn(input));
+  async analyzeTurn(
+    input: TurnAnalysisInput,
+    execution?: TurnAnalysisExecutionOptions,
+  ): Promise<TurnAnalysis> {
+    return await this.guarded((client) => client.analyzeTurn(input, execution));
   }
 
   async analyzeMemoryTurn(input: MemoryAnalysisInput): Promise<MemoryAnalysis> {
     return await this.guarded((client) => client.analyzeMemoryTurn(input));
   }
 
-  async generateScene(request: SceneRequest, priority = 2, signal?: AbortSignal): Promise<GeneratedLine[]> {
-    return await this.guarded((client) => client.generateScene(request, priority, signal));
+  async generateScene(
+    request: SceneRequest,
+    priority = 2,
+    signal?: AbortSignal,
+    execution?: SceneGenerationExecutionOptions,
+  ): Promise<GeneratedLine[]> {
+    return await this.guarded((client) => client.generateScene(request, priority, signal, execution));
   }
 
   async analyzeImage(image: Buffer, caption = "", priority = 1): Promise<VisualObservation> {

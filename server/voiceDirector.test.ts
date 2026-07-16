@@ -85,6 +85,7 @@ interface LanguageTurnOptions {
     createdAt: string;
   }>;
   reply?: string;
+  reviewedOutputLanguage?: { tag: string; confidence: number };
   onAnalyze?: () => void;
 }
 
@@ -134,6 +135,9 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
           content: options.reply ?? "Ett kort och naturligt svar.",
           source: "lm",
           sourceIds: [],
+          ...(options.reviewedOutputLanguage
+            ? { reviewedOutputLanguage: options.reviewedOutputLanguage }
+            : {}),
         }];
       },
     },
@@ -146,7 +150,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
           model: "generic-multilingual",
           formats: ["mp3"],
           defaultVoice: "provider-default",
-          supportedLanguages: ["sv", "en", "ja"],
+          supportedLanguages: ["sv", "en", "ja", "pt"],
         },
         normalizer: { available: true, maxInputBytes: 1, maxDurationMs: 1 },
         browserFallbackAllowed: false,
@@ -269,6 +273,53 @@ describe("VoiceDirector", () => {
     expect(routedLanguage(analysis, stt, established)).toBe(expected);
   });
 
+  it("uses a trusted reviewer language only when routing has no established language", async () => {
+    const result = await runLanguageTurn({
+      analysis: createFailClosedTurnAnalysis("invalid_output"),
+      utterance: "Café ou chá?",
+      transcriptLanguage: "und",
+      reply: "Café, sem pensar duas vezes.",
+      reviewedOutputLanguage: { tag: "pt-br", confidence: 0.8 },
+    });
+
+    expect(result.sceneLanguage).toBeUndefined();
+    expect(result.syntheses).toEqual([expect.objectContaining({ language: "pt-BR" })]);
+    expect(result.payloads).toEqual([expect.objectContaining({ language: "pt-BR" })]);
+    expect(result.runtime.getTranscript(result.roomId).at(-1)?.language).toBe("pt-BR");
+  });
+
+  it.each([
+    { name: "low confidence", reviewedOutputLanguage: { tag: "pt-BR", confidence: 0.79 } },
+    { name: "unregistered tag", reviewedOutputLanguage: { tag: "zz-ZZ", confidence: 0.99 } },
+    { name: "undetermined tag", reviewedOutputLanguage: { tag: "und", confidence: 0.99 } },
+  ])("fails closed for $name in forged reviewer metadata", async ({ reviewedOutputLanguage }) => {
+    const result = await runLanguageTurn({
+      analysis: createFailClosedTurnAnalysis("invalid_output"),
+      utterance: "Hm?",
+      transcriptLanguage: "und",
+      reply: "Café, sem pensar duas vezes.",
+      reviewedOutputLanguage,
+    });
+
+    expect(result.syntheses).toEqual([]);
+    expect(result.payloads[0]).not.toHaveProperty("language");
+    expect(result.runtime.getTranscript(result.roomId).at(-1)?.language).toBeUndefined();
+  });
+
+  it("fails closed before TTS when a provider returns output in another reviewed language", async () => {
+    const result = await runLanguageTurn({
+      analysis: languageAnalysis("sv-SE", 0.99, "sv-SE", 0.99),
+      utterance: "Kaffe eller te?",
+      reply: "Kaffe, lätt.",
+      reviewedOutputLanguage: { tag: "pt-BR", confidence: 0.99 },
+    });
+
+    expect(result.sceneLanguage).toBe("sv-SE");
+    expect(result.syntheses).toEqual([]);
+    expect(result.payloads).toEqual([]);
+    expect(result.runtime.getTranscript(result.roomId).at(-1)?.speakerKind).toBe("human");
+  });
+
   it("anchors a first short mistagged microphone turn to its channel and supplies bounded public context", async () => {
     const recentChannelMessages = Array.from({ length: 12 }, (_, index) => ({
       id: `public-${index}`,
@@ -300,13 +351,13 @@ describe("VoiceDirector", () => {
 
     expect(result.analysisInput?.transportLanguageHint).toBe("sr");
     expect(result.analysisInput?.recentMessages.map((message) => message.id)).toEqual(
-      Array.from({ length: 8 }, (_, index) => `public-${index + 4}`),
+      Array.from({ length: 3 }, (_, index) => `public-${index + 9}`),
     );
     expect(result.analysisInput?.recentMessages.at(-1)).toMatchObject({
       authorName: "S".repeat(80),
       content: expect.stringMatching(/^svensk kanaltext /u),
     });
-    expect(result.analysisInput?.recentMessages.at(-1)?.content).toHaveLength(1_200);
+    expect(result.analysisInput?.recentMessages.at(-1)?.content).toHaveLength(480);
     expect(result.sceneLanguage).toBe("sv-SE");
     expect(result.syntheses).toEqual([expect.objectContaining({ language: "sv-SE" })]);
     expect(result.payloads).toEqual([expect.objectContaining({ language: "sv-SE" })]);
@@ -553,13 +604,15 @@ describe("VoiceDirector", () => {
 
     const callOrder: string[] = [];
     let sceneRelationshipNotes: Record<string, string> | undefined;
+    let routerInput: TurnAnalysisInput | undefined;
     const relationUpdates: Array<{ humanId: string; personaId: string; familiarity?: number }> = [];
     const director = new VoiceDirector({
       runtime,
       capabilityRegistry: voiceCapabilityRegistry(),
       lm: {
-        analyzeTurn: async () => {
+        analyzeTurn: async (input) => {
           callOrder.push("analyze");
+          routerInput = input;
           return routedAnalysis();
         },
         generateScene: async (request) => {
@@ -608,12 +661,22 @@ describe("VoiceDirector", () => {
     expect(sceneRelationshipNotes).toEqual({
       "ai-sana": "Fallible prior memory: Kim has visited before; keep recognition subtle.",
     });
+    expect(routerInput?.personaCandidates[0]).toMatchObject({
+      id: "ai-sana",
+      voiceRelationshipContext: "Fallible prior memory: Kim has visited before; keep recognition subtle.",
+    });
+    expect(routerInput?.personaCandidates[0]?.voiceReplyProfile).toContain("Live room calibration:");
+    expect(routerInput?.personaCandidates[0]?.voiceReplyProfile?.length).toBeLessThanOrEqual(650);
+    expect(routerInput?.voiceParticipantRoster).toEqual([
+      expect.objectContaining({ id: "human-memory", kind: "human" }),
+      expect.objectContaining({ id: "ai-sana", kind: "ai" }),
+    ]);
     expect(relationUpdates).toEqual([{
       humanId: "human-memory",
       personaId: "ai-sana",
       familiarity: 0.45,
     }]);
-    expect(callOrder).toEqual(["analyze", "promptNote", "getRelation", "generate", "updateRelation"]);
+    expect(callOrder).toEqual(["promptNote", "analyze", "getRelation", "generate", "updateRelation"]);
   });
 
   it("routes an acoustic question semantically and supplies trusted voice transport context", async () => {
@@ -1347,6 +1410,246 @@ describe("VoiceDirector", () => {
       expect(executionStatus, testCase.name).toBe("not_requested");
     }
   });
+
+  it("shows the sole invited resident as thinking while semantic routing is still in flight", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", {
+      socketId: "socket-early-thinking",
+      memberId: "human-early-thinking",
+      name: "Alex",
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-early-thinking", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const human = runtime.appendFinalTranscript(created.room.id, "human-early-thinking", "Kaffe eller te?");
+    expect(human.ok).toBe(true);
+    if (!human.ok) return;
+
+    let analysisStarted!: () => void;
+    const started = new Promise<void>((resolve) => { analysisStarted = resolve; });
+    let releaseAnalysis!: () => void;
+    const analysis = new Promise<TurnAnalysis>((resolve) => {
+      releaseAnalysis = () => resolve(routedAnalysis());
+    });
+    const director = new VoiceDirector({
+      runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
+      lm: {
+        analyzeTurn: async () => {
+          analysisStarted();
+          return await analysis;
+        },
+        generateScene: async () => [{
+          personaId: "ai-sana",
+          content: "Kaffe, helt klart.",
+          source: "lm",
+          sourceIds: [],
+        }],
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: () => undefined,
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(human.entry);
+    await started;
+    expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState)
+      .toBe("thinking");
+    releaseAnalysis();
+    await settle();
+  });
+
+  it("cancels a superseded room router immediately and schedules only the newest reply as its continuation", async () => {
+    const runtime = new VoiceRoomRuntime(["lobby"]);
+    const created = runtime.createRoom("lobby", {
+      socketId: "socket-router-cancel",
+      memberId: "human-router-cancel",
+      name: "Alex",
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(runtime.inviteBot(created.room.id, "socket-router-cancel", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    runtime.setBotState(created.room.id, "ai-sana", "listening");
+    const first = runtime.appendFinalTranscript(created.room.id, "human-router-cancel", "Första frågan.");
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    let markFirstStarted: (() => void) | undefined;
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    let firstSignal: AbortSignal | undefined;
+    const analysisScopes: unknown[] = [];
+    const generationScopes: unknown[] = [];
+    const generatedTriggers: string[] = [];
+    let analysisCount = 0;
+    const director = new VoiceDirector({
+      runtime,
+      capabilityRegistry: voiceCapabilityRegistry(),
+      lm: {
+        analyzeTurn: async (_input, execution) => {
+          analysisCount += 1;
+          analysisScopes.push(execution?.supersessionScope);
+          if (analysisCount === 1) {
+            firstSignal = execution?.signal;
+            markFirstStarted?.();
+            return await new Promise<TurnAnalysis>((resolve) => {
+              const cancelled = () => resolve(createFailClosedTurnAnalysis("transport_error"));
+              if (execution?.signal?.aborted) cancelled();
+              else execution?.signal?.addEventListener("abort", cancelled, { once: true });
+            });
+          }
+          return routedAnalysis("sv-SE", { addressedIds: ["ai-sana"] });
+        },
+        generateScene: async (request, _priority, _signal, execution) => {
+          generatedTriggers.push(request.trigger?.content ?? "");
+          generationScopes.push(execution?.continuationOf);
+          return [{
+            personaId: "ai-sana",
+            content: "Jag svarar på den senaste frågan.",
+            source: "lm",
+            sourceIds: [],
+          }];
+        },
+      },
+      speech: {
+        capabilities: async () => ({
+          stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+          tts: { available: false, provider: "disabled", formats: [] },
+          normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+          browserFallbackAllowed: true,
+        }),
+        synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+      },
+      actorChannels: new ActorChannelRuntime(),
+      events: {
+        roomChanged: () => undefined,
+        transcriptFinal: () => undefined,
+        aiSpeech: () => undefined,
+        aiStop: () => undefined,
+      },
+    });
+
+    director.onHumanFinal(first.entry);
+    await firstStarted;
+    const second = runtime.appendFinalTranscript(created.room.id, "human-router-cancel", "Nej, den här frågan i stället.");
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    director.onHumanFinal(second.entry);
+
+    await vi.waitFor(() => expect(generatedTriggers).toHaveLength(1));
+    expect(firstSignal?.aborted).toBe(true);
+    expect(analysisScopes).toEqual([
+      { kind: "voice-room", id: created.room.id },
+      { kind: "voice-room", id: created.room.id },
+    ]);
+    expect(generatedTriggers).toEqual(["Nej, den här frågan i stället."]);
+    expect(generationScopes).toEqual([{ kind: "voice-room", id: created.room.id }]);
+  });
+
+  it.each(["invite", "remove"] as const)(
+    "invalidating an in-flight route after a bot %s resets every remaining bot to listening",
+    async (mutation) => {
+      const runtime = new VoiceRoomRuntime(["lobby"]);
+      const socketId = `socket-routing-${mutation}`;
+      const created = runtime.createRoom("lobby", {
+        socketId,
+        memberId: `human-routing-${mutation}`,
+        name: "Alex",
+      });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      expect(runtime.inviteBot(created.room.id, socketId, { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+      runtime.setBotState(created.room.id, "ai-sana", "listening");
+      if (mutation === "remove") {
+        expect(runtime.inviteBot(created.room.id, socketId, { personaId: "ai-mira", name: "Mira" }).ok).toBe(true);
+        runtime.setBotState(created.room.id, "ai-mira", "listening");
+      }
+      const human = runtime.appendFinalTranscript(
+        created.room.id,
+        `human-routing-${mutation}`,
+        mutation === "remove" ? "@Sana kaffe eller te?" : "Kaffe eller te?",
+      );
+      expect(human.ok).toBe(true);
+      if (!human.ok) return;
+
+      let analysisStarted!: () => void;
+      const started = new Promise<void>((resolve) => { analysisStarted = resolve; });
+      let releaseAnalysis!: () => void;
+      const pendingAnalysis = new Promise<TurnAnalysis>((resolve) => {
+        releaseAnalysis = () => resolve(routedAnalysis("sv-SE", { addressedIds: ["ai-sana"] }));
+      });
+      const generateScene = vi.fn(async () => [{
+        personaId: "ai-sana",
+        content: "Kaffe, helt klart.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new VoiceDirector({
+        runtime,
+        capabilityRegistry: voiceCapabilityRegistry(),
+        lm: {
+          analyzeTurn: async () => {
+            analysisStarted();
+            return await pendingAnalysis;
+          },
+          generateScene,
+        },
+        speech: {
+          capabilities: async () => ({
+            stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+            tts: { available: false, provider: "disabled", formats: [] },
+            normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+            browserFallbackAllowed: true,
+          }),
+          synthesize: async () => { throw new Error("must not synthesize"); },
+        },
+        actorChannels: new ActorChannelRuntime(),
+        events: {
+          roomChanged: () => undefined,
+          transcriptFinal: () => undefined,
+          aiSpeech: () => undefined,
+          aiStop: () => undefined,
+        },
+      });
+
+      director.onHumanFinal(human.entry);
+      await started;
+      expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState)
+        .toBe("thinking");
+
+      if (mutation === "invite") {
+        expect(runtime.inviteBot(created.room.id, socketId, { personaId: "ai-mira", name: "Mira" }).ok).toBe(true);
+        runtime.setBotState(created.room.id, "ai-mira", "listening");
+      } else {
+        expect(runtime.removeBot(created.room.id, socketId, "ai-mira").ok).toBe(true);
+      }
+      director.invalidateRoom(created.room.id);
+
+      const currentBots = runtime.getRoom(created.room.id)?.participants.filter((participant) => participant.kind === "ai") ?? [];
+      expect(currentBots).not.toHaveLength(0);
+      expect(currentBots.every((participant) => participant.botState === "listening")).toBe(true);
+
+      releaseAnalysis();
+      await settle();
+      expect(generateScene).not.toHaveBeenCalled();
+      expect(runtime.getRoom(created.room.id)?.participants
+        .filter((participant) => participant.kind === "ai")
+        .every((participant) => participant.botState === "listening")).toBe(true);
+    },
+  );
 
   it("aborts in-flight generation and resets thinking bots after a committed catalog edit", async () => {
     const runtime = new VoiceRoomRuntime(["lobby"]);

@@ -745,9 +745,12 @@ const sttVadConfig = (env: NodeJS.ProcessEnv): SttVadConfig | undefined => {
   return {
     command,
     modelPath,
-    threshold: clampNumber(env.STT_VAD_THRESHOLD, 0.5, 0, 1),
-    // Keep very short acknowledgements while still rejecting incidental noise.
-    minSpeechMs: clampInteger(env.STT_VAD_MIN_SPEECH_MS, 100, 100, 120),
+    // A slightly firmer neural threshold plus Silero's own 250 ms speech
+    // minimum rejects keyboard/fan bursts before Whisper can hallucinate a
+    // fluent phrase. This remains acoustic and language-independent: decoded
+    // words never participate in the decision.
+    threshold: clampNumber(env.STT_VAD_THRESHOLD, 0.6, 0.05, 0.95),
+    minSpeechMs: clampInteger(env.STT_VAD_MIN_SPEECH_MS, 250, 150, 1_000),
     timeoutMs: clampInteger(env.STT_VAD_TIMEOUT_MS, 5_000, 250, 30_000),
   };
 };
@@ -994,8 +997,6 @@ class SttVadPreflight {
           String(this.config.threshold),
           "--vad-min-speech-duration-ms",
           String(this.config.minSpeechMs),
-          "--vad-min-silence-duration-ms",
-          "100",
           "--file",
           audioPath,
         ],

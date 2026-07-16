@@ -319,9 +319,13 @@ describe("optional Silero STT preflight", () => {
         expect(options).toMatchObject({ timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
         expect(args).toContain("--no-prints");
         expect(args.slice(args.indexOf("--vad-threshold"), args.indexOf("--vad-threshold") + 2))
-          .toEqual(["--vad-threshold", "0.5"]);
+          .toEqual(["--vad-threshold", "0.6"]);
         expect(args.slice(args.indexOf("--vad-min-speech-duration-ms"), args.indexOf("--vad-min-speech-duration-ms") + 2))
-          .toEqual(["--vad-min-speech-duration-ms", "100"]);
+          .toEqual(["--vad-min-speech-duration-ms", "250"]);
+        // whisper.cpp 1.9.1 wires the long min-silence option to the wrong
+        // config field and can overwrite min-speech. Its default is already
+        // 100 ms, so omitting it preserves the intended acoustic gate.
+        expect(args).not.toContain("--vad-min-silence-duration-ms");
         const audioPath = args[args.indexOf("--file") + 1]!;
         expect(await readFile(audioPath)).toEqual(normalizedBody);
         return Buffer.from("Detected 0 speech segments:\n");

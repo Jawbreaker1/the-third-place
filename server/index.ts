@@ -646,6 +646,7 @@ const voiceDirector = new VoiceDirector({
   speech: voiceSpeech,
   actorChannels,
   humanMemory,
+  behaviorTuningProvider,
   establishedChannelLanguage: (channelId) => director.trustedLanguageForChannel(channelId),
   recentChannelMessages: (channelId) => store.getRecent(channelId, 6)
     .filter((message) => !message.system && Boolean(message.content.trim()))
@@ -1487,7 +1488,9 @@ io.on("connection", (socket) => {
     if (result.ok) result = voiceRooms.setBotState(parsed.data.roomId, persona.id, "listening");
     if (result.ok) {
       voiceDirector.invalidateRoom(parsed.data.roomId);
-      publishVoiceRoom(result.room);
+      // Invalidation resets any obsolete thinking/speaking state. Publish the
+      // post-invalidation runtime snapshot, never the stale mutation result.
+      publishVoiceRoom(voiceRooms.getRoom(parsed.data.roomId) ?? result.room);
     }
     acknowledge?.(result);
   });
@@ -1502,7 +1505,7 @@ io.on("connection", (socket) => {
     const result = voiceRooms.removeBot(parsed.data.roomId, socket.id, parsed.data.personaId);
     if (result.ok) {
       voiceDirector.invalidateRoom(parsed.data.roomId);
-      publishVoiceRoom(result.room);
+      publishVoiceRoom(voiceRooms.getRoom(parsed.data.roomId) ?? result.room);
     }
     acknowledge?.(result);
   });

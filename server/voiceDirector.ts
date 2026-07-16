@@ -3,10 +3,12 @@ import { speechTimingUnits, truncateSpokenText } from "../shared/spokenText.js";
 import { containsExactMention } from "../shared/unicodeBoundaries.js";
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
+import { resolveBehaviorTuning, type BehaviorTuningProvider } from "./behaviorTuning.js";
 import { CHANNELS, getChannelProfile } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
 import {
   diegeticIdentityTurnPremise,
+  type ModelWorkScope,
   type SceneCapabilityContext,
   type TranscriptLine,
 } from "./lmStudio.js";
@@ -14,6 +16,7 @@ import type { SocialModelClient } from "./switchableModel.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import { mappedProviderVoiceForPersona, voiceProfileForPersona } from "./personaVoices.js";
 import {
+  CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE,
   projectTrustedTurnAnalysis,
   type TurnAnalysis,
   type TurnAnalysisInput,
@@ -71,6 +74,8 @@ export interface VoiceDirectorOptions {
   establishedChannelLanguage?: (channelId: string) => string | undefined;
   /** Bounded public-channel context lets the semantic router understand the conversation a voice room continues. */
   recentChannelMessages?: (channelId: string) => readonly VoiceChannelRecentMessage[];
+  /** Live admin calibration shared with scene generation and the sole-resident router draft. */
+  behaviorTuningProvider?: BehaviorTuningProvider;
 }
 
 export const mentionsPersona = containsExactMention;
@@ -102,7 +107,8 @@ const transcriptFor = (entries: VoiceTranscriptEntry[], personaId: string): Tran
       utteranceOrigin: entry.utteranceOrigin,
     }));
 
-const MAX_ROUTER_RECENT_MESSAGES = 8;
+const MAX_ROUTER_RECENT_MESSAGES = 6;
+const MAX_ROUTER_CHANNEL_MESSAGES = 3;
 const VOICE_LANGUAGE_SWITCH_CONFIDENCE = 0.9;
 const VOICE_CAPABILITY_INVENTORY = capabilitiesForMedium("voice");
 type VoiceRouterRecentMessage = NonNullable<TurnAnalysisInput["recentMessages"]>[number];
@@ -115,7 +121,7 @@ const boundedRecentMessage = (message: VoiceChannelRecentMessage): VoiceRouterRe
   id: message.id.slice(0, 128),
   authorId: message.authorId.slice(0, 128),
   authorName: message.authorName.slice(0, 80),
-  content: message.content.slice(0, 1_200),
+  content: message.content.slice(0, 480),
   createdAt: message.createdAt,
 });
 
@@ -132,6 +138,27 @@ const compareRecentMessages = (left: VoiceRouterRecentMessage, right: VoiceRoute
   return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
 };
 
+const compactVoiceReplyProfile = (
+  persona: Persona,
+  expertiseNote: string | undefined,
+  tuning: ReturnType<typeof resolveBehaviorTuning>["effective"],
+): string => [
+  `Live room calibration: competence ${tuning.competence}/100, aggression ${tuning.aggression}/100, explicitness ${tuning.explicitness}/100.`,
+  expertiseNote ? `Room expertise: ${expertiseNote.slice(0, 120)}` : "",
+  `Voice: ${persona.prompt.slice(0, 230)}`,
+  `Natural length ${persona.style.typicalWords[0]}–${Math.min(25, persona.style.typicalWords[1])} words; casing ${persona.style.casing}; punctuation ${persona.style.punctuation}; correction ${persona.style.correctionMode}; disagreement ${persona.style.disagreementMode}.`.slice(0, 170),
+  persona.style.avoidPhrases.length > 0
+    ? `Avoid stock phrases: ${persona.style.avoidPhrases.join(", ").slice(0, 90)}.`
+    : "",
+  persona.connections ? `Known dynamics: ${persona.connections.slice(0, 70)}` : "",
+].filter(Boolean).join(" ").slice(0, 650);
+
+interface SoleVoiceDraftContext {
+  replyProfile: string;
+  relationshipContext?: string;
+  participants: TurnAnalysisInput["voiceParticipantRoster"];
+}
+
 const analysisInputFor = (
   entry: VoiceTranscriptEntry,
   room: VoiceRoomView,
@@ -139,6 +166,7 @@ const analysisInputFor = (
   invited: Persona[],
   availableCapabilities: readonly TurnCapability[],
   recentChannelMessages: readonly VoiceChannelRecentMessage[] = [],
+  soleDraftContext?: SoleVoiceDraftContext,
 ): TurnAnalysisInput => {
   const channel = getChannelProfile(room.channelId);
   const transportLanguageHint = canonicalRegisteredLanguageTag(entry.language);
@@ -150,11 +178,20 @@ const analysisInputFor = (
       id: candidate.id,
       authorId: candidate.speakerId,
       authorName: candidate.speakerName.slice(0, 80),
-      content: candidate.text.slice(0, 1_200),
+      content: candidate.text.slice(0, 800),
       createdAt: candidate.endedAt,
     }));
+  const recentChannelContext = recentChannelMessages
+    .map(boundedRecentMessage)
+    .filter((candidate) => candidate.id !== entry.id)
+    .filter((candidate) => {
+      const timestamp = messageTimestamp(candidate);
+      return timestamp !== undefined && (!Number.isFinite(latestTimestamp) || timestamp <= latestTimestamp);
+    })
+    .sort(compareRecentMessages)
+    .slice(-MAX_ROUTER_CHANNEL_MESSAGES);
   const recentMessages = [
-    ...recentChannelMessages.map(boundedRecentMessage),
+    ...recentChannelContext,
     ...recentVoiceMessages,
   ]
     .filter((candidate) => candidate.id !== entry.id)
@@ -184,7 +221,16 @@ const analysisInputFor = (
       id: persona.id,
       name: persona.name,
       interests: persona.interests.slice(0, 16),
+      ...(invited.length === 1 && soleDraftContext
+        ? {
+            voiceReplyProfile: soleDraftContext.replyProfile,
+            ...(soleDraftContext.relationshipContext
+              ? { voiceRelationshipContext: soleDraftContext.relationshipContext.slice(0, 600) }
+              : {}),
+          }
+        : {}),
     })),
+    voiceParticipantRoster: soleDraftContext?.participants ?? [],
     // The medium-owned registry inventory is trusted runtime state. Voice
     // never advertises capabilities outside that explicitly scoped list.
     availableCapabilities: [...availableCapabilities],
@@ -230,6 +276,11 @@ export const routedLanguage = (
 const routedLanguageHint = (language: string | undefined): string =>
   language ?? "infer and mirror the language of the latest human utterance directly";
 
+const voiceRoomWorkScope = (roomId: string): ModelWorkScope => ({
+  kind: "voice-room",
+  id: roomId,
+});
+
 /** Server TTS is allowed only for provider-declared BCP-47 ranges. */
 export const ttsModelSupportsLanguage = (
   supportedLanguages: readonly string[] | undefined,
@@ -240,6 +291,7 @@ export class VoiceDirector {
   private readonly epochByRoom = new Map<string, number>();
   private readonly establishedLanguageByRoom = new Map<string, string>();
   private readonly lastSpokeAtByPersona = new Map<string, number>();
+  private readonly analysisAbortByRoom = new Map<string, AbortController>();
   private readonly speechAbortByRoom = new Map<string, AbortController>();
   private readonly generationAbortByRoom = new Map<string, AbortController>();
   private readonly pendingResponseTimerByRoom = new Map<string, ReturnType<typeof setTimeout>>();
@@ -253,7 +305,6 @@ export class VoiceDirector {
     if (entry.speakerKind !== "human" || !entry.final || !entry.trigger.eligible || entry.trigger.source !== "human-final") return;
     const channelContext = this.snapshotChannelContext(entry);
     const epoch = this.invalidateRoom(entry.roomId);
-    this.resetBotsToListening(entry.roomId);
     const floorSilenceMs = Math.max(0, this.options.floorSilenceMs ?? 0);
     if (floorSilenceMs === 0) {
       void this.respond(entry, epoch, channelContext);
@@ -266,6 +317,8 @@ export class VoiceDirector {
     const pending = this.pendingResponseTimerByRoom.get(roomId);
     if (pending) clearTimeout(pending);
     this.pendingResponseTimerByRoom.delete(roomId);
+    this.analysisAbortByRoom.get(roomId)?.abort(new Error("Voice turn superseded"));
+    this.analysisAbortByRoom.delete(roomId);
     this.generationAbortByRoom.get(roomId)?.abort(new Error("Voice turn superseded"));
     this.generationAbortByRoom.delete(roomId);
     this.speechAbortByRoom.get(roomId)?.abort(new Error("Voice turn superseded"));
@@ -273,6 +326,10 @@ export class VoiceDirector {
     const epoch = (this.epochByRoom.get(roomId) ?? 0) + 1;
     this.epochByRoom.set(roomId, epoch);
     this.options.events.aiStop({ roomId });
+    // Invalidating a turn is also the lifecycle boundary for its visible
+    // state. Any async continuation now belongs to an obsolete epoch and can
+    // no longer clean up the resident it marked as thinking/speaking.
+    this.resetBotsToListening(roomId);
     return epoch;
   }
 
@@ -285,7 +342,6 @@ export class VoiceDirector {
     for (const roomId of new Set(roomIds)) {
       if (!this.options.runtime.getRoom(roomId)) continue;
       this.invalidateRoom(roomId);
-      this.resetBotsToListening(roomId);
     }
   }
 
@@ -293,6 +349,8 @@ export class VoiceDirector {
     const pending = this.pendingResponseTimerByRoom.get(roomId);
     if (pending) clearTimeout(pending);
     this.pendingResponseTimerByRoom.delete(roomId);
+    this.analysisAbortByRoom.get(roomId)?.abort(new Error("Voice room closed"));
+    this.analysisAbortByRoom.delete(roomId);
     this.generationAbortByRoom.get(roomId)?.abort(new Error("Voice room closed"));
     this.generationAbortByRoom.delete(roomId);
     this.speechAbortByRoom.get(roomId)?.abort(new Error("Voice room closed"));
@@ -425,10 +483,44 @@ export class VoiceDirector {
     epoch: number,
     channelContext: VoiceChannelContextSnapshot,
   ): Promise<void> {
+    const latencyStartedAt = performance.now();
+    let analysisFinishedAt = latencyStartedAt;
+    let capabilityFinishedAt = latencyStartedAt;
+    let sceneFinishedAt = latencyStartedAt;
     const room = this.options.runtime.getRoom(entry.roomId);
     if (!room) return;
     const invited = this.invitedPersonas(entry);
     if (invited.length === 0) return;
+    // When ownership is already unambiguous, expose the real pending state
+    // while semantic routing runs instead of leaving several seconds of dead
+    // air. With multiple unaddressed residents we wait for the semantic router
+    // so the UI never advertises the wrong speaker.
+    const earlyPersona = invited.length === 1
+      ? invited[0]
+      : invited.find((persona) => explicitlyMentionsPersona(entry.text, persona.name));
+    if (earlyPersona) this.setBotState(room.id, earlyPersona.id, "thinking");
+    const solePersona = invited.length === 1 ? invited[0] : undefined;
+    const soleRelationshipNote = solePersona
+      ? this.options.humanMemory?.promptNote(entry.speakerId, solePersona.id)
+      : undefined;
+    const behaviorTuning = resolveBehaviorTuning(
+      this.options.behaviorTuningProvider,
+      room.channelId,
+    ).effective;
+    const soleExpertiseNote = solePersona
+      ? this.options.actorChannels.expertiseNotes([solePersona], room.channelId)[solePersona.id]
+      : undefined;
+    const soleDraftContext: SoleVoiceDraftContext | undefined = solePersona
+      ? {
+          replyProfile: compactVoiceReplyProfile(solePersona, soleExpertiseNote, behaviorTuning),
+          ...(soleRelationshipNote ? { relationshipContext: soleRelationshipNote } : {}),
+          participants: room.participants.map((participant) => ({
+            id: participant.memberId,
+            name: participant.name,
+            kind: participant.kind,
+          })),
+        }
+      : undefined;
     const transcript = this.options.runtime.getTranscript(room.id);
     const capabilityContext = {
       medium: "voice" as const,
@@ -443,6 +535,8 @@ export class VoiceDirector {
     };
     const availableCapabilities = this.options.capabilityRegistry.available(capabilityContext);
     let analysis: TurnAnalysis | undefined;
+    const analysisAbort = new AbortController();
+    this.analysisAbortByRoom.set(room.id, analysisAbort);
     try {
       analysis = await this.options.lm.analyzeTurn(analysisInputFor(
         entry,
@@ -451,13 +545,24 @@ export class VoiceDirector {
         invited,
         availableCapabilities,
         channelContext.recentMessages,
-      ));
+        soleDraftContext,
+      ), {
+        supersessionScope: voiceRoomWorkScope(room.id),
+        signal: analysisAbort.signal,
+      });
     } catch (error) {
-      console.warn("Voice semantic analysis unavailable; using neutral routing:", error instanceof Error ? error.message : error);
+      if (!analysisAbort.signal.aborted) {
+        console.warn("Voice semantic analysis unavailable; using neutral routing:", error instanceof Error ? error.message : error);
+      }
+    } finally {
+      if (this.analysisAbortByRoom.get(room.id) === analysisAbort) {
+        this.analysisAbortByRoom.delete(room.id);
+      }
     }
+    analysisFinishedAt = performance.now();
     if (this.epochByRoom.get(room.id) !== epoch) return;
     const trusted = projectTrustedTurnAnalysis(analysis);
-    const utteranceLanguage = routedLanguage(
+    let utteranceLanguage = routedLanguage(
       analysis,
       entry.language,
       this.establishedLanguage(room, transcript, channelContext.establishedLanguage),
@@ -466,12 +571,21 @@ export class VoiceDirector {
       ? this.options.capabilityRegistry.compile(analysis, capabilityContext)
       : undefined;
     const persona = this.selectPersona(entry, room, invited, analysis);
-    if (!persona) return;
-    this.setBotState(room.id, persona.id, "thinking");
+    if (!persona) {
+      if (earlyPersona && this.isCurrent(room.id, epoch, earlyPersona.id)) {
+        this.setBotState(room.id, earlyPersona.id, "listening");
+      }
+      return;
+    }
+    if (earlyPersona && earlyPersona.id !== persona.id && this.isCurrent(room.id, epoch, earlyPersona.id)) {
+      this.setBotState(room.id, earlyPersona.id, "listening");
+    }
+    if (earlyPersona?.id !== persona.id) this.setBotState(room.id, persona.id, "thinking");
 
     const resolution = invocation
       ? await this.options.capabilityRegistry.execute(invocation, entry.speakerId)
       : undefined;
+    capabilityFinishedAt = performance.now();
     if (this.epochByRoom.get(room.id) !== epoch) return;
     const capabilityScene = invocation && resolution
       ? this.options.capabilityRegistry.sceneContract(invocation, resolution, { actorName: persona.name })
@@ -496,8 +610,12 @@ export class VoiceDirector {
 
     // Capture only the memory that predates this turn. Voice transcripts never
     // enter long-term memory; a completed exchange merely strengthens rapport.
-    const relationshipNote = this.options.humanMemory?.promptNote(entry.speakerId, persona.id);
+    const relationshipNote = solePersona?.id === persona.id
+      ? soleRelationshipNote
+      : this.options.humanMemory?.promptNote(entry.speakerId, persona.id);
     const previousRelation = this.options.humanMemory?.getRelation(entry.speakerId, persona.id);
+    const actorChannelNotes = this.options.actorChannels.promptNotes([persona], room.channelId);
+    const actorExpertiseNotes = this.options.actorChannels.expertiseNotes([persona], room.channelId);
 
     let spoken = "";
     const generationAbort = new AbortController();
@@ -566,8 +684,9 @@ export class VoiceDirector {
             asksAboutAiIdentity: trusted.asksAboutAiIdentity,
             asksAboutAcoustics: trusted.asksAboutAcoustics,
           },
-          actorChannelNotes: this.options.actorChannels.promptNotes([persona], room.channelId),
-          actorExpertiseNotes: this.options.actorChannels.expertiseNotes([persona], room.channelId),
+          actorChannelNotes,
+          actorExpertiseNotes,
+          behaviorTuning,
           voiceContext: {
             latestSpeakerId: entry.speakerId,
             latestUtteranceOrigin: entry.utteranceOrigin,
@@ -594,8 +713,31 @@ export class VoiceDirector {
         },
         0,
         generationAbort.signal,
+        { continuationOf: voiceRoomWorkScope(room.id) },
       );
-      spoken = sanitizeSpokenLine(generated.find((line) => line.personaId === persona.id)?.content ?? "", utteranceLanguage);
+      const generatedLine = generated.find((line) => line.personaId === persona.id);
+      const reviewedOutputLanguage = generatedLine?.reviewedOutputLanguage &&
+        generatedLine.reviewedOutputLanguage.confidence >= CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE
+        ? canonicalRegisteredLanguageTag(generatedLine.reviewedOutputLanguage.tag)
+        : undefined;
+      const outputLanguageConflictsWithRoute = Boolean(
+        utteranceLanguage &&
+        reviewedOutputLanguage &&
+        primaryLanguage(utteranceLanguage) !== primaryLanguage(reviewedOutputLanguage),
+      );
+      if (
+        !utteranceLanguage &&
+        reviewedOutputLanguage
+      ) {
+        utteranceLanguage = reviewedOutputLanguage;
+      }
+      // The normal LM client rejects and retries this mismatch during semantic
+      // review. Recheck at the voice boundary as defence in depth for alternate
+      // providers: never feed text known to be another language into the
+      // routed voice or persist it under false language metadata.
+      spoken = outputLanguageConflictsWithRoute
+        ? ""
+        : sanitizeSpokenLine(generatedLine?.content ?? "", utteranceLanguage);
     } catch (error) {
       if (!generationAbort.signal.aborted) {
         console.warn("Voice scene used fallback:", error instanceof Error ? error.message : error);
@@ -603,6 +745,7 @@ export class VoiceDirector {
     } finally {
       if (this.generationAbortByRoom.get(room.id) === generationAbort) this.generationAbortByRoom.delete(room.id);
     }
+    sceneFinishedAt = performance.now();
     const capabilityFallback = this.options.capabilityRegistry.deterministicFallback(
       resolution,
       new Date(this.now()),
@@ -688,6 +831,17 @@ export class VoiceDirector {
       } : {}),
       ...(audio ? { audioUrl: `/api/voice/audio/${encodeURIComponent(audio.id)}?roomId=${encodeURIComponent(room.id)}`, mimeType: audio.mimeType } : {}),
     });
+    if (process.env.VOICE_LATENCY_LOG === "true") {
+      const finishedAt = performance.now();
+      console.info(JSON.stringify({
+        event: "voice_latency",
+        analysisMs: Math.round(analysisFinishedAt - latencyStartedAt),
+        capabilityMs: Math.round(capabilityFinishedAt - analysisFinishedAt),
+        sceneAndReviewMs: Math.round(sceneFinishedAt - capabilityFinishedAt),
+        ttsAndPublishMs: Math.round(finishedAt - sceneFinishedAt),
+        totalMs: Math.round(finishedAt - latencyStartedAt),
+      }));
+    }
 
     const estimatedSpeakingMs = Math.max(
       1_200,

@@ -55,6 +55,22 @@ const connect = async (cookie) => {
   return { socket, snapshot };
 };
 
+const waitForModelIdle = async (timeoutMs = 120_000) => {
+  const deadline = Date.now() + timeoutMs;
+  let idleSince;
+  while (Date.now() < deadline) {
+    const health = await fetch(`${baseUrl}/api/health`).then((response) => response.json());
+    if ((health.model?.queueDepth ?? 1) === 0) {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= 500) return;
+    } else {
+      idleSince = undefined;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("Model queue did not become idle before the voice latency measurement");
+};
+
 const sockets = [];
 let roomId;
 let noiseIgnored = false;
@@ -103,6 +119,11 @@ try {
   const invited = await emitAck(a.socket, "voice:bot:invite", { roomId, personaId: "ai-sana" });
   assert.ok(invited.room.participants.some((participant) => participant.memberId === "ai-sana" && participant.kind === "ai"));
 
+  // Joining the public server can legitimately schedule welcome work. Keep it
+  // out of the live-turn latency number so this smoke measures voice itself,
+  // while the production queue still retains its normal preemption tests.
+  await waitForModelIdle();
+
   if (process.env.VOICE_NOISE_FIXTURE) {
     const form = new FormData();
     form.append("audio", new Blob([await readFile(process.env.VOICE_NOISE_FIXTURE)], { type: "audio/wav" }), "noise.wav");
@@ -121,7 +142,9 @@ try {
   // The room ID and exact human transcript already correlate this isolated
   // run. Do not inject a machine marker into the conversational meaning: this
   // live-model smoke should exercise an ordinary, self-contained spoken turn.
-  const typedTurn = "Sana, välj kaffe eller te och motivera valet med en kort mening.";
+  const typedTurn = process.env.VOICE_SMOKE_TURN?.trim() ||
+    "Sana, välj kaffe eller te och motivera valet med en kort mening.";
+  assert.ok(typedTurn.length <= 2_000, "VOICE_SMOKE_TURN exceeds the live voice text limit");
   const humanTranscriptPromise = waitForEvent(
     b.socket,
     "voice:transcript:final",
@@ -213,8 +236,10 @@ try {
     aiTranscript: aiTranscript.text,
     aiSpeech: {
       text: aiSpeech.text,
+      language: aiSpeech.language,
       serverAudio: Boolean(aiSpeech.audioUrl),
       mimeType: aiSpeech.mimeType,
+      browserFallbackAllowed: aiSpeech.browserFallbackAllowed,
       turnToAiSpeechMs,
       turnToThinkingMs: thinkingAt === undefined ? null : Math.round(thinkingAt - turnStartedAt),
       thinkingToSpeechMs: thinkingAt === undefined ? null : Math.round((speakingAt ?? performance.now()) - thinkingAt),

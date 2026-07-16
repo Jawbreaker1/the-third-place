@@ -39,9 +39,35 @@ describe("SwitchableSocialModel", () => {
 
     expect(lmstudio.analyzeTurn).toHaveBeenCalledOnce();
     expect(lmstudio.analyzeMemoryTurn).toHaveBeenCalledOnce();
-    expect(lmstudio.generateScene).toHaveBeenCalledWith({ kind: "ambient" }, 7, undefined);
+    expect(lmstudio.generateScene).toHaveBeenCalledWith({ kind: "ambient" }, 7, undefined, undefined);
     expect(lmstudio.analyzeImage).toHaveBeenCalledWith(Buffer.from("image"), "caption", 3);
     expect(codex.analyzeTurn).not.toHaveBeenCalled();
+  });
+
+  it("forwards server-private voice cancellation and continuation metadata to the active client", async () => {
+    const lmstudio = fakeClient("local-gemma");
+    const codex = fakeClient("gpt-5.6-luna");
+    const model = new SwitchableSocialModel({ lmstudio, codex });
+    const controller = new AbortController();
+    const scope = { kind: "voice-room" as const, id: "voice-runtime-room-1" };
+    const turn = { turnId: "voice-turn" } as never;
+    const scene = { kind: "voice" } as never;
+
+    await model.analyzeTurn(turn, { supersessionScope: scope, signal: controller.signal });
+    await model.generateScene(scene, 0, controller.signal, { continuationOf: scope });
+
+    expect(lmstudio.analyzeTurn).toHaveBeenCalledWith(turn, {
+      supersessionScope: scope,
+      signal: controller.signal,
+    });
+    expect(lmstudio.generateScene).toHaveBeenCalledWith(
+      scene,
+      0,
+      controller.signal,
+      { continuationOf: scope },
+    );
+    expect(codex.analyzeTurn).not.toHaveBeenCalled();
+    expect(codex.generateScene).not.toHaveBeenCalled();
   });
 
   it("cancels the previous provider and rejects an old in-flight result after switching", async () => {

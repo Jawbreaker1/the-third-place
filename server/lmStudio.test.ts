@@ -6,11 +6,13 @@ import {
   deriveSceneBehaviorStylePlan,
   LmStudioClient,
   sanitizeObservationText,
+  type GeneratedLine,
   type SceneRequest,
 } from "./lmStudio.js";
 import { PERSONAS } from "./personas.js";
 import {
   buildTurnAnalysisSystemPrompt,
+  buildVoiceCandidateReviewSystemPrompt,
   buildVoiceTurnAnalysisSystemPrompt,
   turnAnalysisInputSchema,
   type NormalizedTurnAnalysisInput,
@@ -88,16 +90,35 @@ const voiceTurnInput = (turnId = "voice-analysis-1"): NormalizedTurnAnalysisInpu
     transportLanguageHint: "sv",
   });
 
-const voiceTurnAnalysisCompletion = () => jsonResponse({
-  choices: [{
-    message: {
-      content: JSON.stringify({
+const soleVoiceTurnInput = (turnId = "voice-draft-1"): NormalizedTurnAnalysisInput =>
+  turnAnalysisInputSchema.parse({
+    ...voiceTurnInput(turnId),
+    latestMessage: {
+      id: `${turnId}-message`,
+      authorId: "human-jaw-b",
+      authorName: "Jaw_B",
+      content: "Kaffe eller te, Sana?",
+    },
+    recentMessages: [],
+    personaCandidates: [{
+      id: "ai-sana",
+      name: "Sana",
+      interests: ["programming", "coffee"],
+      voiceReplyProfile: "Sana is concise, warm and lightly teasing. Use casual Swedish speech.",
+    }],
+    mechanicalAddressedPersonaIds: ["ai-sana"],
+  });
+
+const voiceTurnAnalysisPayload = (
+  personaId = "ai-mira",
+  draft: { p: string; t: string } | null = null,
+) => ({
         l: "sv",
         lx: 0.99,
         rl: "sv",
         rlx: 0.99,
         i: { k: "statement", q: false, r: "optional", x: 0.97 },
-        p: { a: [], r: [], v: ["ai-mira"], x: 0, y: 0.9 },
+        p: { a: [], r: [], v: [personaId], x: 0, y: 0.9 },
         s: { w: 0.5, h: 0, p: 0.4, a: 0, u: 0, e: 0.4, o: 0, c: 0.1, x: 0.96 },
         b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 0.97 },
         m: { r: "none", a: "none", c: [], x: 0.99 },
@@ -118,9 +139,61 @@ const voiceTurnAnalysisCompletion = () => jsonResponse({
         c: { d: [], r: "none", a: false, i: false, l: false, x: 0.99 },
         h: { n: "none", q: null, x: 1 },
         y: [],
-      }),
-    },
+        d: draft,
+      });
+
+const voiceTurnAnalysisCompletion = (
+  personaId = "ai-mira",
+  draft: { p: string; t: string } | null = null,
+) => jsonResponse({
+  choices: [{
+    message: { content: JSON.stringify(voiceTurnAnalysisPayload(personaId, draft)) },
   }],
+});
+
+const ordinarySoleVoiceScene = (
+  input: NormalizedTurnAnalysisInput,
+  persona = PERSONAS.find((candidate) => candidate.id === "ai-sana")!,
+): SceneRequest => ({
+  kind: "voice",
+  channelId: input.channel.id,
+  channelName: input.channel.name,
+  selected: [persona],
+  history: [],
+  trigger: {
+    author: input.latestMessage.authorName,
+    content: input.latestMessage.content,
+    messageId: input.latestMessage.id,
+  },
+  mustReplyIds: [persona.id],
+  responseRecoveryIds: [persona.id],
+  semanticContext: {
+    languageTag: "sv",
+    intentTrusted: true,
+    replyExpected: "expected",
+    asksForList: false,
+    asksAboutAiIdentity: false,
+    asksAboutAcoustics: false,
+  },
+  voiceContext: {
+    latestSpeakerId: input.latestMessage.authorId,
+    latestUtteranceOrigin: "microphone-stt",
+    acousticEvidenceAvailable: false,
+    participants: [
+      { memberId: input.latestMessage.authorId, name: input.latestMessage.authorName, kind: "human" },
+      { memberId: persona.id, name: persona.name, kind: "ai" },
+    ],
+  },
+  capabilityContext: {
+    available: ["local_datetime"],
+    requestKind: "none",
+    discussed: [],
+    plannedAction: null,
+    executionStatus: "not_requested",
+    externalEvidenceAvailable: false,
+  },
+  temporalPolicy: "reactive_only",
+  humanizerBudget: { repairsRemaining: 0 },
 });
 
 const turnAnalysisCompletion = (overrides: Record<string, unknown> = {}) => jsonResponse({
@@ -214,9 +287,15 @@ const candidateReviewCompletion = (reviews: Array<{
   severity: "none" | "low" | "medium" | "high";
   issues: string[];
   rewriteInstruction: string | null;
+  outputLanguage?: { tag: string; confidence: number };
 }>) => jsonResponse({
   choices: [{ message: { content: JSON.stringify({ reviews }) } }],
 });
+
+const voiceCandidateReviewCompletion = (
+  reviews: Parameters<typeof candidateReviewCompletion>[0],
+  outputLanguage = { tag: "sv", confidence: 0.99 },
+) => candidateReviewCompletion(reviews.map((review) => ({ ...review, outputLanguage })));
 
 const originalCandidateReviewSetting = process.env.CANDIDATE_REVIEW_ENABLED;
 
@@ -299,11 +378,12 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionBody).toMatchObject({
       temperature: 0,
       reasoning_effort: "none",
-      max_tokens: 600,
+      max_tokens: 720,
       response_format: { type: "json_schema", json_schema: { strict: true } },
     });
     expect(completionBody.response_format.json_schema.schema.properties.e.properties.a.enum)
       .toEqual(["none", "local_datetime"]);
+    expect(completionBody.response_format.json_schema.schema.properties.d).toEqual({ type: "null" });
     const userData = JSON.parse(completionBody.messages[1].content);
     expect(userData).toMatchObject({
       medium: "voice",
@@ -313,6 +393,333 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       communityClock: { timeZone: "Europe/Stockholm", locationLabel: "The Third Place" },
     });
     expect(userData.recentMessages).toHaveLength(1);
+  });
+
+  it("co-produces a sole-resident voice draft and still independently reviews it in two model calls", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const input = soleVoiceTurnInput();
+    const draft = "Kaffe, lätt. Te känns som en reservplan idag.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? voiceTurnAnalysisCompletion(sana.id, { p: sana.id, t: draft })
+        : voiceCandidateReviewCompletion([{
+            personaId: sana.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+          }]);
+    }));
+
+    const lm = new LmStudioClient({
+      communityTimeZone: "Europe/Stockholm",
+      communityLocationLabel: "The Third Place",
+    });
+    await expect(lm.analyzeTurn(input)).resolves.toMatchObject({
+      source: "lm",
+      evidence: { action: "none" },
+      capabilities: { requestKind: "none", discussed: [] },
+    });
+    await expect(lm.generateScene(ordinarySoleVoiceScene(input, sana))).resolves.toEqual([expect.objectContaining({
+      personaId: sana.id,
+      content: draft,
+      source: "lm",
+      reviewedOutputLanguage: { tag: "sv", confidence: 0.99 },
+    })]);
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].messages[0].content).toBe(buildVoiceTurnAnalysisSystemPrompt());
+    expect(bodies[1].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
+    expect(JSON.parse(bodies[1].messages[1].content).candidates).toEqual([
+      expect.objectContaining({ personaId: sana.id, content: draft }),
+    ]);
+  });
+
+  it("keeps a capability-free routed draft when unrelated router projection fails, but still requires review", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const input = soleVoiceTurnInput("voice-draft-router-projection-fallback");
+    const draft = "Kaffe, lätt. Jag behöver något som faktiskt väcker mig.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        const payload = voiceTurnAnalysisPayload(sana.id, { p: sana.id, t: draft });
+        // The compact wire shape is valid, but this unrelated retained-history
+        // contradiction makes the descriptive routing projection fail closed.
+        payload.h = { n: "none", q: "irrelevant stale clue", x: 0.9 };
+        return jsonResponse({ choices: [{ message: { content: JSON.stringify(payload) } }] });
+      }
+      return voiceCandidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lm = new LmStudioClient();
+    await expect(lm.analyzeTurn(input)).resolves.toMatchObject({
+      source: "fallback",
+      failureReason: "invalid_output",
+      evidence: { action: "none" },
+    });
+    await expect(lm.generateScene(ordinarySoleVoiceScene(input, sana))).resolves.toEqual([
+      expect.objectContaining({
+        personaId: sana.id,
+        content: draft,
+        reviewedOutputLanguage: { tag: "sv", confidence: 0.99 },
+      }),
+    ]);
+    expect(bodies).toHaveLength(3);
+    expect(bodies[2].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
+  });
+
+  it("consumes a rejected routed voice draft before one full-scene reviewed recovery", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const input = soleVoiceTurnInput("voice-draft-recovery");
+    const routedDraft = "Jag kan prata om servrar i stället.";
+    const recovered = "Kaffe, utan tvekan. Te får vänta till ikväll.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) return voiceTurnAnalysisCompletion(sana.id, { p: sana.id, t: routedDraft });
+      if (bodies.length === 2) {
+        return voiceCandidateReviewCompletion([{
+          personaId: sana.id,
+          severity: "high",
+          issues: ["irrelevant_to_turn"],
+          rewriteInstruction: "Answer the coffee-or-tea question itself.",
+        }]);
+      }
+      if (bodies.length === 3) return completionResponse([{ personaId: sana.id, content: recovered }]);
+      return voiceCandidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lm = new LmStudioClient();
+    await lm.analyzeTurn(input);
+    await expect(lm.generateScene(ordinarySoleVoiceScene(input, sana))).resolves.toEqual([
+      expect.objectContaining({
+        personaId: sana.id,
+        content: recovered,
+        reviewedOutputLanguage: { tag: "sv", confidence: 0.99 },
+      }),
+    ]);
+
+    expect(bodies).toHaveLength(4);
+    expect(bodies[0].response_format.json_schema.name).toBe("multilingual_turn_router_v2");
+    expect(bodies[1].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
+    expect(bodies[2].response_format.json_schema.name).toBe("social_scene");
+    expect(bodies[3].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
+  });
+
+  it("recovers a routed voice draft whose reviewed output language conflicts with the trusted route", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const input = soleVoiceTurnInput("voice-language-mismatch-recovery");
+    const routedDraft = "Sim, café. Sem pensar duas vezes.";
+    const recovered = "Kaffe, utan tvekan. Det passar mig bättre på morgonen.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) return voiceTurnAnalysisCompletion(sana.id, { p: sana.id, t: routedDraft });
+      if (bodies.length === 2) {
+        return voiceCandidateReviewCompletion([{
+          personaId: sana.id,
+          severity: "high",
+          issues: ["output_language_mismatch"],
+          rewriteInstruction: "Svara på svenska utan att byta hela svarets språk.",
+        }], { tag: "pt", confidence: 0.99 });
+      }
+      if (bodies.length === 3) return completionResponse([{ personaId: sana.id, content: recovered }]);
+      return voiceCandidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lm = new LmStudioClient();
+    await lm.analyzeTurn(input);
+    await expect(lm.generateScene(ordinarySoleVoiceScene(input, sana))).resolves.toEqual([
+      expect.objectContaining({
+        personaId: sana.id,
+        content: recovered,
+        reviewedOutputLanguage: { tag: "sv", confidence: 0.99 },
+      }),
+    ]);
+    expect(bodies).toHaveLength(4);
+  });
+
+  it("publishes a clean voice line but withholds low-confidence reviewer language metadata", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return completionCalls === 1
+        ? completionResponse([{ personaId: sana.id, content: "Sim, café. Sem pensar duas vezes." }])
+        : candidateReviewCompletion([{
+            personaId: sana.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            outputLanguage: { tag: "pt-BR", confidence: 0.55 },
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      ...ordinarySoleVoiceScene(soleVoiceTurnInput("voice-low-output-language"), sana),
+      trigger: { author: "Alex", content: "Café ou chá?" },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: sana.id,
+      content: "Sim, café. Sem pensar duas vezes.",
+    })]);
+    expect(lines[0]).not.toHaveProperty("reviewedOutputLanguage");
+  });
+
+  it("rejects a microphone turn described as written text and recovers with a reviewed spoken reply", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const input = turnAnalysisInputSchema.parse({
+      ...soleVoiceTurnInput("voice-written-medium-recovery"),
+      latestMessage: {
+        id: "voice-written-medium-recovery-message",
+        authorId: "human-jaw-b",
+        authorName: "Jaw_B",
+        content: "Jag pratar ju, jag skriver inte, Sana.",
+      },
+    });
+    const routedDraft = "Vi läser ju vad du skriver.";
+    const recovered = "Ja, du pratar. Jag uttryckte mig klumpigt.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) return voiceTurnAnalysisCompletion(sana.id, { p: sana.id, t: routedDraft });
+      if (bodies.length === 2) {
+        return voiceCandidateReviewCompletion([{
+          personaId: sana.id,
+          severity: "high",
+          issues: ["written_medium_illusion"],
+          rewriteInstruction: "Treat this microphone-origin turn as spoken, not typed text.",
+        }]);
+      }
+      if (bodies.length === 3) return completionResponse([{ personaId: sana.id, content: recovered }]);
+      return voiceCandidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lm = new LmStudioClient();
+    await lm.analyzeTurn(input);
+    await expect(lm.generateScene(ordinarySoleVoiceScene(input, sana))).resolves.toEqual([
+      expect.objectContaining({ personaId: sana.id, content: recovered }),
+    ]);
+
+    expect(bodies).toHaveLength(4);
+    expect(JSON.parse(bodies[1].messages[1].content).voiceFacts).toMatchObject({
+      latestUtteranceOrigin: "microphone-stt",
+    });
+    expect(bodies[1].response_format.json_schema.schema.properties.reviews.items.properties.issues.items.enum)
+      .toContain("written_medium_illusion");
+    expect(bodies[3].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
+  });
+
+  it("discards a co-produced acknowledgement for a capability turn and grounds a normal voice scene", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const input = turnAnalysisInputSchema.parse({
+      ...soleVoiceTurnInput("voice-clock-draft"),
+      latestMessage: {
+        id: "voice-clock-draft-message",
+        authorId: "human-jaw-b",
+        authorName: "Jaw_B",
+        content: "Vad är klockan i Sverige just nu, Sana?",
+      },
+    });
+    const clock = resolveLocalDateTime({
+      timeZone: "Europe/Stockholm",
+      locationLabel: "Sverige",
+      languageTag: "sv",
+      now: new Date("2026-07-16T13:20:00.000Z"),
+    })!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return jsonResponse({
+          choices: [{ message: { content: JSON.stringify({
+            ...voiceTurnAnalysisPayload(sana.id, { p: sana.id, t: "Jag kollar tiden nu." }),
+            i: { k: "question", q: true, r: "expected", x: 0.99 },
+            p: { a: [sana.id], r: [sana.id], v: [sana.id], x: 0.99, y: 0.99 },
+            e: {
+              a: "local_datetime", x: 0.99, g: "aktuell tid i Sverige", q: null, u: null, m: null,
+              z: "Europe/Stockholm", k: "current_time", l: "Sverige", c: null, w: null, f: null,
+            },
+            c: { d: ["local_datetime"], r: "execute", a: false, i: false, l: false, x: 0.99 },
+          }) } }],
+        });
+      }
+      if (bodies.length === 2) {
+        return completionResponse([{ personaId: sana.id, content: `Klockan är ${clock.formatted}.` }]);
+      }
+      return voiceCandidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lm = new LmStudioClient({ now: () => Date.parse("2026-07-16T13:20:00.000Z") });
+    await expect(lm.analyzeTurn(input)).resolves.toMatchObject({ evidence: { action: "local_datetime" } });
+    await expect(lm.generateScene({
+      ...ordinarySoleVoiceScene(input, sana),
+      capabilityContext: {
+        available: ["local_datetime"],
+        requestKind: "execute",
+        discussed: ["local_datetime"],
+        plannedAction: "local_datetime",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: false,
+      },
+      capabilityGroundingInstruction: "Use the trusted requested clock exactly.",
+      requestedClock: clock,
+      temporalPolicy: "direct_answer",
+      temporalSurfaceActorId: sana.id,
+    })).resolves.toEqual([expect.objectContaining({ personaId: sana.id })]);
+
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0].response_format.json_schema.name).toBe("multilingual_turn_router_v2");
+    expect(bodies[1].response_format.json_schema.name).toBe("social_scene");
+    expect(bodies[2].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
   });
 
   it("runs persistent memory as a separate strict multilingual pass and deduplicates it", async () => {
@@ -620,6 +1027,125 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionCalls).toBe(2);
   });
 
+  it("cancels a stale active voice router only when a newer turn has the same room scope", async () => {
+    let startedAnalysis: (() => void) | undefined;
+    const analysisStarted = new Promise<void>((resolve) => { startedAnalysis = resolve; });
+    let firstAbortReason: unknown;
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        startedAnalysis?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => {
+            firstAbortReason = init?.signal?.reason;
+            reject(firstAbortReason ?? new DOMException("aborted", "AbortError"));
+          };
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return voiceTurnAnalysisCompletion("ai-mira");
+    }));
+
+    const lm = new LmStudioClient();
+    const scope = { kind: "voice-room" as const, id: "voice-room-a" };
+    const stale = lm.analyzeTurn(voiceTurnInput("stale-voice-route"), {
+      supersessionScope: scope,
+    });
+    await analysisStarted;
+
+    const current = lm.analyzeTurn(voiceTurnInput("current-voice-route"), {
+      supersessionScope: scope,
+    });
+
+    await expect(stale).resolves.toMatchObject({
+      source: "fallback",
+      failureReason: "timeout",
+    });
+    expect(firstAbortReason).toMatchObject({
+      message: expect.stringContaining("newer turn in room voice-room-a"),
+    });
+    await expect(current).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      personas: { relevantIds: ["ai-mira"] },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("drops a queued superseded voice router without disturbing the active router in another room", async () => {
+    let releaseActive: ((response: Response) => void) | undefined;
+    const activeResponse = new Promise<Response>((resolve) => { releaseActive = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) return await activeResponse;
+      return voiceTurnAnalysisCompletion("ai-mira");
+    }));
+
+    const lm = new LmStudioClient();
+    const roomB = lm.analyzeTurn(voiceTurnInput("active-room-b"), {
+      supersessionScope: { kind: "voice-room", id: "voice-room-b" },
+    });
+    await vi.waitFor(() => expect(completionCalls).toBe(1));
+    const staleRoomA = lm.analyzeTurn(voiceTurnInput("queued-stale-room-a"), {
+      supersessionScope: { kind: "voice-room", id: "voice-room-a" },
+    });
+    const currentRoomA = lm.analyzeTurn(voiceTurnInput("queued-current-room-a"), {
+      supersessionScope: { kind: "voice-room", id: "voice-room-a" },
+    });
+
+    await expect(staleRoomA).resolves.toMatchObject({
+      source: "fallback",
+      failureReason: "transport_error",
+    });
+    expect(completionCalls).toBe(1);
+    releaseActive?.(voiceTurnAnalysisCompletion("ai-mira"));
+    await expect(roomB).resolves.toMatchObject({ source: "lm", failureReason: null });
+    await expect(currentRoomA).resolves.toMatchObject({ source: "lm", failureReason: null });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("keeps voice routers isolated when separate rooms share one text channel", async () => {
+    let releaseFirst: ((response: Response) => void) | undefined;
+    const firstResponse = new Promise<Response>((resolve) => { releaseFirst = resolve; });
+    let firstAborted = false;
+    let completionCalls = 0;
+    const requestBodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      requestBodies.push(String(init?.body));
+      if (completionCalls === 1) {
+        init?.signal?.addEventListener("abort", () => { firstAborted = true; }, { once: true });
+        return await firstResponse;
+      }
+      return voiceTurnAnalysisCompletion("ai-mira");
+    }));
+
+    const lm = new LmStudioClient();
+    // Both semantic inputs intentionally retain channel.id=lobby. Only the
+    // internal runtime room scope distinguishes these simultaneous calls.
+    const roomA = lm.analyzeTurn(voiceTurnInput("shared-channel-room-a"), {
+      supersessionScope: { kind: "voice-room", id: "voice-room-a" },
+    });
+    await vi.waitFor(() => expect(completionCalls).toBe(1));
+    const roomB = lm.analyzeTurn(voiceTurnInput("shared-channel-room-b"), {
+      supersessionScope: { kind: "voice-room", id: "voice-room-b" },
+    });
+
+    expect(firstAborted).toBe(false);
+    releaseFirst?.(voiceTurnAnalysisCompletion("ai-mira"));
+    await expect(roomA).resolves.toMatchObject({ source: "lm", failureReason: null });
+    await expect(roomB).resolves.toMatchObject({ source: "lm", failureReason: null });
+    expect(firstAborted).toBe(false);
+    expect(completionCalls).toBe(2);
+    expect(requestBodies.every((body) => !body.includes("voice-room-a") && !body.includes("voice-room-b"))).toBe(true);
+  });
+
   it("drops an already queued stale same-channel public scene without interrupting another room", async () => {
     let startedScene: (() => void) | undefined;
     const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
@@ -700,6 +1226,136 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     await expect(ambient).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
     await expect(analysis).resolves.toMatchObject({ source: "lm", evidence: { action: "read_url" } });
     expect(completionCalls).toBe(2);
+  });
+
+  it("hands a completed voice router turn to its scene before queued ambient work", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "false";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let releaseAnalysis: ((response: Response) => void) | undefined;
+    const analysisResponse = new Promise<Response>((resolve) => { releaseAnalysis = resolve; });
+    const callKinds: string[] = [];
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      callKinds.push(system.includes("spoken voice chat") ? "voice" : system.includes("semantic router") ? "router" : "ambient");
+      if (completionCalls === 1) return await analysisResponse;
+      return completionResponse([{ personaId: sana.id, content: completionCalls === 2 ? "voice first" : "ambient after" }]);
+    }));
+
+    const lm = new LmStudioClient();
+    const input = soleVoiceTurnInput("voice-handoff");
+    const analysis = lm.analyzeTurn(input);
+    const live = analysis.then(() => lm.generateScene(ordinarySoleVoiceScene(input, sana), 0));
+    const ambient = lm.generateScene({
+      kind: "ambient",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+    }, 4);
+
+    releaseAnalysis?.(voiceTurnAnalysisCompletion(sana.id, { p: sana.id, t: "voice first" }));
+    await expect(live).resolves.toEqual([expect.objectContaining({ content: "voice first" })]);
+    await expect(ambient).resolves.toEqual([expect.objectContaining({ content: "ambient after" })]);
+    expect(callKinds).toEqual(["router", "voice", "ambient"]);
+  });
+
+  it("hands each completed voice route to its reply before routing an arbitrary newer-room burst", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "false";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const callKinds: string[] = [];
+    let voiceCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      if (system.includes("semantic router")) {
+        callKinds.push("router");
+        return voiceTurnAnalysisCompletion(sana.id, { p: sana.id, t: "ett kort svar" });
+      }
+      voiceCalls += 1;
+      callKinds.push("voice");
+      return completionResponse([{
+        personaId: sana.id,
+        content: voiceCalls === 1 ? "första rummets svar" : "andra rummets svar",
+      }]);
+    }));
+
+    const lm = new LmStudioClient();
+    const inputA = soleVoiceTurnInput("fair-voice-room-a");
+    const inputB = soleVoiceTurnInput("fair-voice-room-b");
+    const scopeA = { kind: "voice-room" as const, id: "voice-room-a" };
+    const scopeB = { kind: "voice-room" as const, id: "voice-room-b" };
+    const analysisA = lm.analyzeTurn(inputA, { supersessionScope: scopeA });
+    const liveA = analysisA.then(() => lm.generateScene(
+      ordinarySoleVoiceScene(inputA, sana),
+      0,
+      undefined,
+      { continuationOf: scopeA },
+    ));
+    const analysisB = lm.analyzeTurn(inputB, { supersessionScope: scopeB });
+    const liveB = analysisB.then(() => lm.generateScene(
+      ordinarySoleVoiceScene(inputB, sana),
+      0,
+      undefined,
+      { continuationOf: scopeB },
+    ));
+
+    await expect(liveA).resolves.toEqual([expect.objectContaining({ content: "första rummets svar" })]);
+    await expect(liveB).resolves.toEqual([expect.objectContaining({ content: "andra rummets svar" })]);
+    expect(callKinds).toEqual(["router", "voice", "router", "voice"]);
+  });
+
+  it("atomically hands a completed voice route to one reply when all eight queued slots are full", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "false";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let releaseFirst: ((response: Response) => void) | undefined;
+    const firstResponse = new Promise<Response>((resolve) => { releaseFirst = resolve; });
+    const callKinds: string[] = [];
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      callKinds.push(system.includes("spoken voice chat") ? "voice" : "router");
+      if (completionCalls === 1) return await firstResponse;
+      if (system.includes("spoken voice chat")) {
+        return completionResponse([{ personaId: sana.id, content: "första rummets svar" }]);
+      }
+      return voiceTurnAnalysisCompletion(sana.id, { p: sana.id, t: "ett senare svar" });
+    }));
+
+    const lm = new LmStudioClient();
+    const inputA = soleVoiceTurnInput("full-queue-handoff-a");
+    const scopeA = { kind: "voice-room" as const, id: "full-queue-room-a" };
+    let duplicateContinuation: Promise<GeneratedLine[]> | undefined;
+    const analysisA = lm.analyzeTurn(inputA, { supersessionScope: scopeA });
+    const liveA = analysisA.then(() => {
+      const request = ordinarySoleVoiceScene(inputA, sana);
+      const first = lm.generateScene(request, 0, undefined, { continuationOf: scopeA });
+      duplicateContinuation = lm.generateScene(request, 0, undefined, { continuationOf: scopeA });
+      void duplicateContinuation.catch(() => undefined);
+      return first;
+    });
+    await vi.waitFor(() => expect(completionCalls).toBe(1));
+
+    const queuedAnalyses = Array.from({ length: 8 }, (_, index) => {
+      const input = soleVoiceTurnInput(`full-queue-handoff-${index + 1}`);
+      return lm.analyzeTurn(input, {
+        supersessionScope: { kind: "voice-room", id: `full-queue-room-${index + 1}` },
+      });
+    });
+
+    releaseFirst?.(voiceTurnAnalysisCompletion(sana.id, { p: sana.id, t: "första rummets svar" }));
+    await expect(liveA).resolves.toEqual([expect.objectContaining({ content: "första rummets svar" })]);
+    await vi.waitFor(() => expect(duplicateContinuation).toBeDefined());
+    await expect(duplicateContinuation!).rejects.toThrow("queue is full");
+    await Promise.all(queuedAnalyses);
+    expect(callKinds.slice(0, 3)).toEqual(["router", "voice", "router"]);
   });
 
   it("rejects URL leakage even when the bounded typed verifier is also invalid", async () => {
@@ -1563,7 +2219,7 @@ describe("LM Studio multilingual batch candidate review", () => {
         return completionResponse([{ personaId: sana.id, content: "Jag funderar mest på om det blir regn i helgen." }]);
       }
       if (bodies.length === 2) {
-        return candidateReviewCompletion([{
+        return voiceCandidateReviewCompletion([{
           personaId: sana.id,
           severity: "high",
           issues: ["irrelevant_to_turn"],
@@ -1573,7 +2229,7 @@ describe("LM Studio multilingual batch candidate review", () => {
       if (bodies.length === 3) {
         return completionResponse([{ personaId: sana.id, content: "Jag väljer te, mest för att kaffe gör mig alldeles för rastlös." }]);
       }
-      return candidateReviewCompletion([{
+      return voiceCandidateReviewCompletion([{
         personaId: sana.id,
         severity: "none",
         issues: [],
@@ -3465,7 +4121,7 @@ describe("LM Studio room prompt", () => {
           ]);
         }
         if (bodies.length === 2) {
-          return candidateReviewCompletion([
+          const reviews = [
             { personaId: sana.id, severity: "none", issues: [], rewriteInstruction: null },
             {
               personaId: mira.id,
@@ -3473,14 +4129,20 @@ describe("LM Studio room prompt", () => {
               issues: ["unfulfilled_explicit_request"],
               rewriteInstruction: "Give the requested riddle now.",
             },
-          ]);
+          ] as Parameters<typeof candidateReviewCompletion>[0];
+          return kind === "voice"
+            ? voiceCandidateReviewCompletion(reviews, { tag: "en", confidence: 0.99 })
+            : candidateReviewCompletion(reviews);
         }
         if (bodies.length === 3) {
           return completionResponse([{ personaId: mira.id, content: fulfilled }]);
         }
-        return candidateReviewCompletion([
+        const reviews = [
           { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
-        ]);
+        ] as Parameters<typeof candidateReviewCompletion>[0];
+        return kind === "voice"
+          ? voiceCandidateReviewCompletion(reviews, { tag: "en", confidence: 0.99 })
+          : candidateReviewCompletion(reviews);
       }));
 
       const history = [{
@@ -4006,6 +4668,7 @@ describe("LM Studio room prompt", () => {
         ],
       },
     });
+    expect(prompt.length).toBeLessThan(10_000);
     expect(prompt).toContain("spoken voice chat");
     expect(prompt).toContain("5–25 spoken words");
     expect(prompt).toContain("no markdown, emoji, links");
@@ -4055,6 +4718,7 @@ describe("LM Studio room prompt", () => {
 
     const userContent = completionBody?.messages.find((message) => message.role === "user")?.content ?? "{}";
     const scene = JSON.parse(userContent) as Record<string, unknown>;
+    expect(completionBody).toMatchObject({ max_tokens: 800, reasoning_effort: "none" });
     expect(scene.liveVoiceContext).toEqual({
       latestSpeakerId: "human-jaw-b",
       latestUtteranceOrigin: "microphone-stt",
@@ -4065,6 +4729,95 @@ describe("LM Studio room prompt", () => {
       ],
     });
     expect((scene.recentTranscript as Array<{ kind: string }>)[0]?.kind).toBe("guest");
+  });
+
+  it("retries one non-empty truncated voice JSON completion before publication", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (bodies.length === 1) {
+        return jsonResponse({ choices: [{ message: { content: '{"messages":[' } }] });
+      }
+      return completionResponse([{ personaId: mira.id, content: "Kaffe. Jag vaknar faktiskt av det." }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "voice",
+      channelId: "lobby",
+      channelName: "lobby voice",
+      selected: [mira],
+      history: [],
+      mustReplyIds: [mira.id],
+      responseRecoveryIds: [mira.id],
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["Kaffe. Jag vaknar faktiskt av det."]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({ max_tokens: 800, reasoning_effort: "none" });
+    expect(bodies[1]).toMatchObject({ max_tokens: 1080, reasoning_effort: "none" });
+  });
+
+  it("drops optional voice reasoning control on the bounded compatibility retry", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (bodies.length === 1) return new Response("optional controls unsupported", { status: 422 });
+      return completionResponse([{ personaId: mira.id, content: "Te. Mindre dramatik, samma värme." }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "voice",
+      channelId: "lobby",
+      channelName: "lobby voice",
+      selected: [mira],
+      history: [],
+      mustReplyIds: [mira.id],
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["Te. Mindre dramatik, samma värme."]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({ reasoning_effort: "none", response_format: expect.any(Object) });
+    expect(bodies[1]).not.toHaveProperty("reasoning_effort");
+    expect(bodies[1]).not.toHaveProperty("response_format");
+  });
+
+  it("keeps the enlarged malformed-response retry in voice compatibility mode", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (bodies.length === 1) return new Response("optional controls unsupported", { status: 400 });
+      if (bodies.length === 2) {
+        return jsonResponse({ choices: [{ message: { content: '{"messages":[' } }] });
+      }
+      return completionResponse([{ personaId: mira.id, content: "Kaffe. Det hinner före eftertanken." }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "voice",
+      channelId: "lobby",
+      channelName: "lobby voice",
+      selected: [mira],
+      history: [],
+      mustReplyIds: [mira.id],
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["Kaffe. Det hinner före eftertanken."]);
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0]).toMatchObject({ max_tokens: 800, reasoning_effort: "none", response_format: expect.any(Object) });
+    expect(bodies[1]).toMatchObject({ max_tokens: 800 });
+    expect(bodies[2]).toMatchObject({ max_tokens: 1080 });
+    for (const body of bodies.slice(1)) {
+      expect(body).not.toHaveProperty("reasoning_effort");
+      expect(body).not.toHaveProperty("response_format");
+    }
   });
 
   it("gives a rare considered beat one lead and non-echoing responder roles", () => {
