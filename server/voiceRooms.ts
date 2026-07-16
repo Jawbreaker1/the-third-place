@@ -388,6 +388,11 @@ export class VoiceRoomRuntime {
     if (room.participants.has(bot.personaId)) {
       return failure("BOT_ALREADY_INVITED", "That AI resident is already in the voice room.");
     }
+    if ([...this.rooms.values()].some(
+      (candidate) => candidate.id !== room.id && candidate.participants.has(bot.personaId),
+    )) {
+      return failure("BOT_IN_ANOTHER_ROOM", "That AI resident is already in another voice room.");
+    }
     if (this.botParticipants(room).length >= MAX_BOTS) return failure("BOT_LIMIT", "A voice room can have at most two AI residents.");
     const name = cleanName(bot.name);
     if (!name || !bot.personaId.startsWith("ai-")) return failure("NOT_AUTHORIZED", "That AI resident is not available.");

@@ -73,8 +73,8 @@ const tuningFields: Array<{
   label: string;
   description: string;
 }> = [
-  { key: "activity", label: "Activity", description: "0 disables autonomous chatter; 100 reaches the bounded, party-like ceiling. Anti-spam limits always remain active." },
-  { key: "autonomousLinkFrequency", label: "AI-posted links", description: "How often residents may find and share a room-relevant source on their own. 0 disables this; hard quiet-time, cooldown and daily limits remain active. Human-requested lookups and pasted-link reading are unaffected." },
+  { key: "activity", label: "Activity", description: "Controls autonomous chatter with or without connected humans. 0 disables it; 100 reaches the bounded, party-like ceiling. With nobody online, a much slower shared hourly/daily budget applies across every room." },
+  { key: "autonomousLinkFrequency", label: "AI-posted links", description: "How often residents may find and share a room-relevant source on their own, including while unattended. 0 disables this; source safety, quiet-time, cooldown, daily and zero-human shared limits remain active. Human-requested lookups and pasted-link reading are unaffected." },
   { key: "competence", label: "Competence", description: "How much domain confidence the cast may display." },
   { key: "aggression", label: "Aggression", description: "0 = calm, soft-edged disagreement. 100 = frequent forceful pushback when a real claim, ranking, complaint or conflict exists—not random abuse or pile-ons." },
   { key: "explicitness", label: "Explicitness", description: "0 = clean language. 100 = one bounded strong-language target per scene when natural; safety and serious factual/moderation replies still take precedence." },

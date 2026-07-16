@@ -117,7 +117,7 @@ export interface ChannelProfile {
   /**
    * Trusted scheduling preference for source-backed ambient threads. This is
    * content-blind and combines with (but never overrides) the Admin frequency
-   * control, global caps, quiet time, voice exclusion and room activity.
+   * control, global caps, quiet time, idle model capacity and room activity.
    */
   autonomousResearchPriority?: number;
   /** Content-blind room-selection weight; Admin activity 0 still disables the room completely. */

@@ -11,7 +11,6 @@ const openGate = (overrides: Partial<HumanReactionResponseGate> = {}): HumanReac
   modelConnected: true,
   queueDepth: 0,
   availableMessageSlots: 1,
-  voiceRoomActive: false,
   alreadyInFlight: false,
   responseChance: 0.7,
   rng: () => 0.2,
@@ -27,7 +26,6 @@ describe("human reaction response gate", () => {
     ["disconnected model", { modelConnected: false }],
     ["queued model work", { queueDepth: 1 }],
     ["exhausted message budget", { availableMessageSlots: 0 }],
-    ["active voice room", { voiceRoomActive: true }],
     ["same resident already generating", { alreadyInFlight: true }],
   ] as const)("rejects %s", (_label, overrides) => {
     expect(shouldStartHumanReactionResponse(openGate(overrides))).toBe(false);

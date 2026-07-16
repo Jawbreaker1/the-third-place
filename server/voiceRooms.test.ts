@@ -167,6 +167,21 @@ describe("voice room runtime", () => {
     expect(runtime.getSocketIdForMember(created.room.id, "ai-sana")).toBeUndefined();
   });
 
+  it("keeps one AI resident in at most one simultaneous voice room", () => {
+    const runtime = runtimeFactory();
+    const lobby = runtime.createRoom("lobby", human(1));
+    const lab = runtime.createRoom("ai-lab", human(2));
+    if (!lobby.ok || !lab.ok) throw new Error("create failed");
+
+    expect(runtime.inviteBot(lobby.room.id, "socket-1", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+    expect(runtime.inviteBot(lab.room.id, "socket-2", { personaId: "ai-sana", name: "Sana" })).toMatchObject({
+      ok: false,
+      code: "BOT_IN_ANOTHER_ROOM",
+    });
+    expect(runtime.removeBot(lobby.room.id, "socket-1", "ai-sana").ok).toBe(true);
+    expect(runtime.inviteBot(lab.room.id, "socket-2", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+  });
+
   it("updates human self-state and lets a room human remove an invited bot", () => {
     const runtime = runtimeFactory();
     const created = runtime.createRoom("lobby", human(1));

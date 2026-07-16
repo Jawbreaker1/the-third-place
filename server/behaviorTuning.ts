@@ -83,6 +83,78 @@ export const scaleAmbientDelay = (delayMs: number, activity: number): number => 
   return Math.max(1_000, Math.round(delayMs * factor));
 };
 
+export interface UnattendedAmbientPolicy {
+  enabled: boolean;
+  /** Minimum distance between successful autonomous publications, across the server. */
+  minimumGapMs: number;
+  /** Minimum distance between unattended work attempts, including rejected generations. */
+  attemptCooldownMs: number;
+  hourlyCap: number;
+  dailyCap: number;
+}
+
+const interpolateAnchored = (
+  level: number,
+  low: number,
+  middle: number,
+  high: number,
+): number => level <= 50
+  ? interpolate(low, middle, (level - 1) / 49)
+  : interpolate(middle, high, (level - 50) / 50);
+
+/**
+ * Maps the existing Activity control onto a deliberately slower, server-wide
+ * zero-human budget. It is content- and language-blind: the ambient planner
+ * still decides what happens, while this policy only bounds unattended cost
+ * and publication volume.
+ */
+export const unattendedAmbientPolicy = (activity: number): UnattendedAmbientPolicy => {
+  const level = percent(activity, DEFAULT_RUNTIME_BEHAVIOR_TUNING.activity);
+  if (level === 0) {
+    return {
+      enabled: false,
+      minimumGapMs: 20 * 60_000,
+      attemptCooldownMs: 10 * 60_000,
+      hourlyCap: 0,
+      dailyCap: 0,
+    };
+  }
+  const minimumGapMs = Math.round(interpolateAnchored(level, 20, 6, 3) * 60_000);
+  const hourlyCap = Math.max(1, Math.round(interpolateAnchored(level, 1, 3, 6)));
+  return {
+    enabled: true,
+    minimumGapMs,
+    attemptCooldownMs: Math.max(minimumGapMs, Math.round(60 * 60_000 / (hourlyCap * 2))),
+    hourlyCap,
+    // Match the sustained hourly rate so a healthy 24/7 room never spends the
+    // final hours of a day behind a prematurely exhausted daily bucket.
+    dailyCap: hourlyCap * 24,
+  };
+};
+
+export interface UnattendedAmbientCapacityGate {
+  now: number;
+  policy: UnattendedAmbientPolicy;
+  /** Latest successful autonomous text publication, attended or unattended. */
+  lastAutonomousPublicationAt?: number;
+  /** Successful unattended publication timestamps retained by the room store. */
+  unattendedPublicationTimestamps: readonly number[];
+}
+
+/** Pure rolling-window gate used both before work and immediately before commit. */
+export const hasUnattendedAmbientCapacity = (gate: UnattendedAmbientCapacityGate): boolean => {
+  if (!gate.policy.enabled) return false;
+  if (
+    gate.lastAutonomousPublicationAt !== undefined &&
+    gate.now - gate.lastAutonomousPublicationAt < gate.policy.minimumGapMs
+  ) return false;
+  const inDay = gate.unattendedPublicationTimestamps.filter(
+    (timestamp) => timestamp <= gate.now && gate.now - timestamp < 24 * 60 * 60_000,
+  );
+  if (inDay.length >= gate.policy.dailyCap) return false;
+  return inDay.filter((timestamp) => gate.now - timestamp < 60 * 60_000).length < gate.policy.hourlyCap;
+};
+
 export const ambientRoomSelectionWeight = (score: number, activity: number): number => {
   const level = percent(activity, DEFAULT_RUNTIME_BEHAVIOR_TUNING.activity);
   if (level === 0) return Number.NEGATIVE_INFINITY;

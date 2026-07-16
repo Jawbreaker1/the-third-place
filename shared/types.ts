@@ -278,6 +278,7 @@ export type VoiceErrorCode =
   | "NOT_IN_ROOM"
   | "NOT_AUTHORIZED"
   | "BOT_ALREADY_INVITED"
+  | "BOT_IN_ANOTHER_ROOM"
   | "BOT_LIMIT"
   | "INVALID_SIGNAL"
   | "STALE_REVISION"

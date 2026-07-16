@@ -89,6 +89,31 @@ describe("room history", () => {
     await store.flush();
   });
 
+  it("keeps private autonomous accounting after visible history trimming and reload", async () => {
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath);
+    const tracked = createMessage("lobby", "ai-mira", "tracked unattended post");
+    store.addPublicMessage(tracked, { kind: "ambient", attendance: "unattended" });
+    for (let index = 0; index < 650; index += 1) {
+      store.addPublicMessage(createMessage("lobby", "human-busy", `busy ${index}`));
+    }
+
+    expect(store.getMessage(tracked.id)).toBeUndefined();
+    expect(store.getAutonomousPublicationHistory()).toEqual([expect.objectContaining({
+      messageId: tracked.id,
+      attendance: "unattended",
+    })]);
+    expect(tracked).not.toHaveProperty("autonomousPublication");
+    await store.flush();
+
+    const restored = new RoomStore(filePath);
+    await restored.load();
+    expect(restored.getAutonomousPublicationHistory()).toEqual([expect.objectContaining({
+      messageId: tracked.id,
+      attendance: "unattended",
+    })]);
+  });
+
   it("serializes overlapping flushes and atomically leaves the latest state on disk", async () => {
     const filePath = tempStorePath();
     const store = new RoomStore(filePath);

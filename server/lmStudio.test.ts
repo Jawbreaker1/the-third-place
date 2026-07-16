@@ -3961,7 +3961,7 @@ describe("LM Studio one-pass humanizer", () => {
     await expect(generation).rejects.toThrow("new human speech superseded this turn");
   });
 
-  it("preempts a running ambient generation when live conversation enters the queue", async () => {
+  it("preempts a running ambient generation when a voice turn enters the queue", async () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     let releaseStarted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => { releaseStarted = resolve; });
@@ -3987,9 +3987,9 @@ describe("LM Studio one-pass humanizer", () => {
     }, 4);
     await started;
     const live = lm.generateScene({
-      kind: "public",
+      kind: "voice",
       channelId: "lobby",
-      channelName: "lobby",
+      channelName: "lobby voice",
       selected: [sana],
       history: [],
       mustReplyIds: [sana.id],

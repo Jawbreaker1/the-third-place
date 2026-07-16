@@ -17,6 +17,16 @@ import type {
 interface PersistedState {
   version: 1;
   messages: ChatMessage[];
+  /** Server-only autonomous accounting; never serialized in public messages. */
+  autonomousPublications?: AutonomousPublicationRecord[];
+}
+
+export interface AutonomousPublicationRecord {
+  messageId: string;
+  channelId: string;
+  createdAt: string;
+  kind: "ambient" | "research";
+  attendance: "attended" | "unattended";
 }
 
 interface PrivateThread {
@@ -28,6 +38,7 @@ interface PrivateThread {
 const minuteAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 const PUBLIC_HISTORY_HARD_LIMIT = 600;
 const PUBLIC_HISTORY_TRIM_TO = 500;
+const AUTONOMOUS_ACCOUNTING_RETENTION_MS = 48 * 60 * 60_000;
 export interface HistoryPosition {
   createdAt: string;
   id: string;
@@ -35,6 +46,16 @@ export interface HistoryPosition {
 
 const compareMessages = (a: Pick<ChatMessage, "createdAt" | "id">, b: Pick<ChatMessage, "createdAt" | "id">): number =>
   a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+
+const isAutonomousPublicationRecord = (value: unknown): value is AutonomousPublicationRecord => {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<AutonomousPublicationRecord>;
+  return typeof record.messageId === "string" && record.messageId.length > 0 &&
+    typeof record.channelId === "string" && record.channelId.length > 0 &&
+    typeof record.createdAt === "string" && Number.isFinite(Date.parse(record.createdAt)) &&
+    (record.kind === "ambient" || record.kind === "research") &&
+    (record.attendance === "attended" || record.attendance === "unattended");
+};
 
 const seedMessages = (): ChatMessage[] => [
   {
@@ -292,6 +313,7 @@ export const createMessage = (
     system?: boolean;
     authorSnapshot?: Member;
     generation?: "lm" | "fallback";
+    createdAt?: string;
     sources?: MessageSource[];
     linkPreview?: LinkPreview;
     attachments?: ImageAttachment[];
@@ -309,6 +331,7 @@ export const createMessage = (
 export class RoomStore {
   private readonly filePath: string;
   private messages: ChatMessage[] = [];
+  private autonomousPublications: AutonomousPublicationRecord[] = [];
   private readonly privateThreads = new Map<string, PrivateThread>();
   private persistTimer?: NodeJS.Timeout;
   private writeQueue: Promise<void> = Promise.resolve();
@@ -328,6 +351,10 @@ export class RoomStore {
       const parsed = JSON.parse(raw) as PersistedState;
       const builtInScene = seedMessages();
       this.messages = Array.isArray(parsed.messages) && parsed.messages.length > 0 ? parsed.messages : builtInScene;
+      this.autonomousPublications = Array.isArray(parsed.autonomousPublications)
+        ? parsed.autonomousPublications.filter(isAutonomousPublicationRecord)
+        : [];
+      this.pruneAutonomousPublications();
       const populatedChannels = new Set(this.messages.map((message) => message.channelId));
       const missingChannelSeeds = builtInScene.filter((message) => !populatedChannels.has(message.channelId));
       if (missingChannelSeeds.length > 0) this.messages.push(...missingChannelSeeds);
@@ -337,12 +364,29 @@ export class RoomStore {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") console.warn("Could not read room state; starting from the built-in scene.", error);
       this.messages = seedMessages();
+      this.autonomousPublications = [];
       await this.flush();
     }
   }
 
   getAllMessages(): ChatMessage[] {
     return [...this.messages].sort(compareMessages);
+  }
+
+  getAutonomousPublicationHistory(): AutonomousPublicationRecord[] {
+    return this.autonomousPublications.map((record) => ({ ...record }));
+  }
+
+  private pruneAutonomousPublications(referenceAt = Date.now()): void {
+    const at = Number.isFinite(referenceAt) ? referenceAt : Date.now();
+    const recent = this.autonomousPublications
+      .filter((record) => at - Date.parse(record.createdAt) <= AUTONOMOUS_ACCOUNTING_RETENTION_MS)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.messageId.localeCompare(right.messageId));
+    const latest = recent.at(-1);
+    const retained = recent.filter(
+      (record) => record.attendance === "unattended" || record.kind === "research" || record === latest,
+    );
+    this.autonomousPublications = [...new Map(retained.map((record) => [record.messageId, record])).values()];
   }
 
   getRecent(channelId: string, limit = 30): ChatMessage[] {
@@ -369,8 +413,20 @@ export class RoomStore {
     return { channelId, messages: channelMessages.slice(start, end), hasMore: start > 0 };
   }
 
-  addPublicMessage(message: ChatMessage): ChatMessage[] {
+  addPublicMessage(
+    message: ChatMessage,
+    autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+  ): ChatMessage[] {
     this.messages.push(message);
+    if (autonomousPublication) {
+      this.autonomousPublications.push({
+        messageId: message.id,
+        channelId: message.channelId,
+        createdAt: message.createdAt,
+        ...autonomousPublication,
+      });
+      this.pruneAutonomousPublications(Date.parse(message.createdAt));
+    }
     let removed: ChatMessage[] = [];
     const inChannel = this.messages.filter((candidate) => candidate.channelId === message.channelId);
     if (inChannel.length > PUBLIC_HISTORY_HARD_LIMIT) {
@@ -501,7 +557,11 @@ export class RoomStore {
     // snapshot winning a rename race.
     this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
-      const payload: PersistedState = { version: 1, messages: this.messages };
+      const payload: PersistedState = {
+        version: 1,
+        messages: this.messages,
+        autonomousPublications: this.autonomousPublications,
+      };
       const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
       try {
         await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");

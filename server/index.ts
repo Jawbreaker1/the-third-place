@@ -620,8 +620,13 @@ const director = new SocialDirector(
 
 const voiceSocketRoom = (roomId: string) => `voice:${roomId}`;
 const publishVoiceRooms = (): void => {
-  io.to("public").emit("voice:rooms:update", voiceRooms.listRooms());
-  director.setVoiceRoomActive(voiceRooms.listRooms().length > 0);
+  const rooms = voiceRooms.listRooms();
+  io.to("public").emit("voice:rooms:update", rooms);
+  director.setActiveVoicePersonaIds(
+    rooms.flatMap((room) => room.participants
+      .filter((participant) => participant.kind === "ai")
+      .map((participant) => participant.memberId)),
+  );
 };
 const publishVoiceRoom = (room: VoiceRoomView): void => {
   io.to(voiceSocketRoom(room.id)).emit("voice:room:update", room);

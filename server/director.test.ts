@@ -478,7 +478,6 @@ describe("social director", () => {
       modelConnected: true,
       queueDepth: 0,
       availableMessageSlots: 1,
-      voiceRoomActive: false,
     };
     expect(shouldStartAutoSharedLinkDiscussion(base)).toBe(true);
     for (const override of [
@@ -488,7 +487,6 @@ describe("social director", () => {
       { modelConnected: false },
       { queueDepth: 1 },
       { availableMessageSlots: 0 },
-      { voiceRoomActive: true },
       { lastRequesterAttemptAt: now - 59_999 },
       { lastChannelAttemptAt: now - 59_999 },
       { lastOriginAttemptAt: now - 59_999 },
@@ -3034,6 +3032,211 @@ describe("social director", () => {
     expect(humanTriggeredTail.store.addPublicMessage).not.toHaveBeenCalled();
   });
 
+  it("keeps bounded public text alive with zero humans and an unrelated voice room", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = Date.parse("2026-07-16T09:00:00.000Z");
+      vi.setSystemTime(now);
+      let queueDepth = 0;
+      const store = new RoomStore(`/tmp/director-unattended-${process.pid}-${Math.random()}.json`);
+      const voicePersona = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      let generatedTurns = 0;
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+      }) => {
+        generatedTurns += 1;
+        return [{
+          personaId: request.selected[0]!.id,
+          content: `En lugn offline-tråd med konkret krok nummer ${generatedTurns}.`,
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+        },
+      );
+      director.setActiveVoicePersonaIds([voicePersona.id]);
+      director.noteHumanVoiceActivity("football-talk");
+      const runAmbient = (director as unknown as { runAmbient: () => Promise<void> }).runAmbient.bind(director);
+
+      await runAmbient();
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const posted = store.getAllMessages().at(-1)!;
+      expect(posted.authorId).not.toBe(voicePersona.id);
+      expect(store.getAutonomousPublicationHistory()).toEqual([expect.objectContaining({
+        messageId: posted.id,
+        kind: "ambient",
+        attendance: "unattended",
+      })]);
+
+      // A fast scheduler tick cannot create an unattended burst.
+      await runAmbient();
+      expect(generateScene).toHaveBeenCalledTimes(1);
+
+      // The rolling gap expires and unattended life resumes.
+      now += 6 * 60_000;
+      vi.setSystemTime(now);
+      await runAmbient();
+      expect(generateScene).toHaveBeenCalledTimes(2);
+
+      // Even after another offline gap, actual queued voice/live model work wins.
+      now += 6 * 60_000;
+      vi.setSystemTime(now);
+      queueDepth = 1;
+      await runAmbient();
+      expect(generateScene).toHaveBeenCalledTimes(2);
+
+      queueDepth = 0;
+      await runAmbient();
+      expect(generateScene).toHaveBeenCalledTimes(3);
+
+      // Default Activity sustains three unattended publications per rolling hour.
+      now += 6 * 60_000;
+      vi.setSystemTime(now);
+      await runAmbient();
+      expect(generateScene).toHaveBeenCalledTimes(3);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("restores the unattended publication budget from persisted room history", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = Date.parse("2026-07-16T10:00:00.000Z");
+      vi.setSystemTime(now);
+      const statePath = `/tmp/director-unattended-restart-${process.pid}-${Math.random()}.json`;
+      const firstStore = new RoomStore(statePath);
+      const generateFirst = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => [{
+        personaId: request.selected[0]!.id,
+        content: "Det här inlägget ska räknas även efter en riktig store-reload.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const makeDirector = (store: RoomStore, generateScene: typeof generateFirst) => new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+        },
+      );
+      const first = makeDirector(firstStore, generateFirst);
+      await (first as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+      expect(generateFirst).toHaveBeenCalledTimes(1);
+      await firstStore.flush();
+      first.stop();
+
+      now += 60_000;
+      vi.setSystemTime(now);
+      const restoredStore = new RoomStore(statePath);
+      await restoredStore.load();
+      const generateAfterRestart = vi.fn(generateFirst.getMockImplementation()!);
+      const restored = makeDirector(restoredStore, generateAfterRestart);
+      restored.start();
+      await (restored as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+      expect(generateAfterRestart).not.toHaveBeenCalled();
+      restored.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("restores recent offline-human quiet time before the first unattended tick", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-16T10:30:00.000Z");
+      vi.setSystemTime(now);
+      const statePath = `/tmp/director-human-quiet-restart-${process.pid}-${Math.random()}.json`;
+      const store = new RoomStore(statePath);
+      const recentHuman = createMessage("lobby", "human-recent", "Jag kommer tillbaka strax.", {
+        createdAt: new Date(now - 30_000).toISOString(),
+        authorSnapshot: {
+          id: "human-recent",
+          name: "Recent guest",
+          kind: "human",
+          status: "offline",
+          avatar: { color: "#123", accent: "#456", glyph: "R" },
+        },
+      });
+      store.addPublicMessage(recentHuman);
+      await store.flush();
+
+      const restoredStore = new RoomStore(statePath);
+      await restoredStore.load();
+      const generateScene = vi.fn(async () => []);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        restoredStore,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "lobby" ? 50 : 0,
+            autonomousLinkFrequency: 60,
+            competence: 50,
+            aggression: 25,
+            explicitness: 50,
+          }),
+        },
+      );
+      director.start();
+      await (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+      expect(generateScene).not.toHaveBeenCalled();
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("does not recruit the moderator for ordinary banter", () => {
     const signals = analyzeSocialSignals("pineapple pizza is obviously the best");
     const selected = selectResponders(PERSONAS, signals, new Map(), Date.now(), () => 0.5);
@@ -3230,7 +3433,6 @@ describe("social director", () => {
       chance: 0.1,
       queueDepth: 0,
       availableMessageSlots: 1,
-      voiceRoomActive: false,
       alreadyInFlight: false,
       rng: () => 0.099,
     };
@@ -3239,7 +3441,7 @@ describe("social director", () => {
     expect(shouldStartConsideredConversation({ ...base, rng: () => 0.1 })).toBe(false);
   });
 
-  it("blocks considered beats before rolling when people, voice, queue, spam limits or another beat intervene", () => {
+  it("blocks considered beats before rolling when people, queue, spam limits or another beat intervene", () => {
     const now = 2_000_000;
     let rolls = 0;
     const base: ConsideredConversationGate = {
@@ -3251,7 +3453,6 @@ describe("social director", () => {
       chance: 1,
       queueDepth: 0,
       availableMessageSlots: 1,
-      voiceRoomActive: false,
       alreadyInFlight: false,
       rng: () => {
         rolls += 1;
@@ -3259,7 +3460,6 @@ describe("social director", () => {
       },
     };
     const blocked: Partial<ConsideredConversationGate>[] = [
-      { voiceRoomActive: true },
       { alreadyInFlight: true },
       { queueDepth: 1 },
       { availableMessageSlots: 0 },
@@ -3533,7 +3733,6 @@ describe("social director", () => {
       availableMessageSlots: 1,
       dailySuccesses: 0,
       dailyCap: 6,
-      voiceRoomActive: false,
       freshThread: true,
       availableActors: 2,
       chance: 0.1,
@@ -3542,7 +3741,6 @@ describe("social director", () => {
     expect(shouldStartAutonomousResearch(base)).toBe(true);
     expect(shouldStartAutonomousResearch({ ...base, enabled: false })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, freshThread: false })).toBe(false);
-    expect(shouldStartAutonomousResearch({ ...base, voiceRoomActive: true })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, queueDepth: 1 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, availableMessageSlots: 0 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, dailySuccesses: 6 })).toBe(false);
@@ -3901,7 +4099,6 @@ describe("social director", () => {
         availableMessageSlots: 2,
         dailySuccesses: 0,
         dailyCap: 6,
-        voiceRoomActive: false,
         freshThread: true,
         availableActors: 2,
         chance: 1,
@@ -3934,7 +4131,6 @@ describe("social director", () => {
         availableMessageSlots: 2,
         dailySuccesses: 0,
         dailyCap: 6,
-        voiceRoomActive: false,
         freshThread: true,
         availableActors: 2,
         chance: 1,
@@ -4241,7 +4437,6 @@ describe("social director", () => {
         availableMessageSlots: 2,
         dailySuccesses: accounting.autonomousResearchSuccessTimestamps.length,
         dailyCap: 36,
-        voiceRoomActive: false,
         freshThread: true,
         availableActors: 2,
         chance: 1,
@@ -5380,9 +5575,9 @@ describe("social director", () => {
     queueDepth = 1;
     expect(safe()).toBe(false);
     queueDepth = 0;
-    director.setVoiceRoomActive(true);
+    director.setActiveVoicePersonaIds([actor.id]);
     expect(safe()).toBe(false);
-    director.setVoiceRoomActive(false);
+    director.setActiveVoicePersonaIds([]);
     internals.lastHumanActivityAt = now;
     expect(safe()).toBe(false);
     internals.lastHumanActivityAt = undefined;
@@ -5399,7 +5594,7 @@ describe("social director", () => {
     expect(safe()).toBe(false);
   });
 
-  it("cancels an autonomous source publication if voice activity begins during the safe read", async () => {
+  it("cancels an autonomous source publication if same-channel voice speech begins during the safe read", async () => {
     vi.useFakeTimers();
     try {
       const now = Date.parse("2026-07-14T14:30:00.000Z");
@@ -5470,7 +5665,7 @@ describe("social director", () => {
       await Promise.resolve();
       await Promise.resolve();
       expect(read).toHaveBeenCalledTimes(1);
-      director.setVoiceRoomActive(true);
+      director.noteHumanVoiceActivity(channel.id);
       resolveRead?.(pagePacket);
       expect(await pending).toBe(false);
       expect(generateScene).not.toHaveBeenCalled();
@@ -5543,6 +5738,67 @@ describe("social director", () => {
       await pending;
       expect(store.getAllMessages()).toEqual([]);
       expect(internals.ambientTimer).toBeUndefined();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops an in-flight autonomous line when its resident joins voice before commit", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-14T15:30:00.000Z");
+      let selectedId = "";
+      let resolveScene: ((lines: Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>) => void) | undefined;
+      const generateScene = vi.fn((request: { selected: Array<(typeof PERSONAS)[number]> }) => {
+        selectedId = request.selected[0]!.id;
+        return new Promise<Array<{
+          personaId: string;
+          content: string;
+          source: "lm";
+          sourceIds: string[];
+        }>>((resolve) => { resolveScene = resolve; });
+      });
+      const store = new RoomStore("/tmp/director-voice-participant-race-unused.json");
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+        },
+      );
+      const pending = (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+      await Promise.resolve();
+      expect(selectedId).not.toBe("");
+      director.setActiveVoicePersonaIds([selectedId]);
+      resolveScene?.([{
+        personaId: selectedId,
+        content: "Det här ska inte dyka upp i text medan samma person sitter i voice.",
+        source: "lm",
+        sourceIds: [],
+      }]);
+      await pending;
+      expect(store.getAllMessages()).toEqual([]);
+      director.stop();
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
