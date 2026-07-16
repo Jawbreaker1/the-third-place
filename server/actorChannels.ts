@@ -165,6 +165,18 @@ export class ActorChannelRuntime {
     });
   }
 
+  /**
+   * Ambient scheduling starts from the stable room subscription, not the
+   * actor's momentary focus. Otherwise a busy conversation in one room can
+   * drain attention elsewhere until those rooms no longer have anyone able to
+   * create the very activity that would draw attention back.
+   */
+  autonomousCandidatesFor(channelId: string): Persona[] {
+    return this.personas.filter((persona) =>
+      this.states.get(persona.id)?.subscribedChannels.includes(channelId),
+    );
+  }
+
   affinity(personaId: string, channelId: string): number {
     return this.states.get(personaId)?.attentionByChannel[channelId] ?? 0.2;
   }

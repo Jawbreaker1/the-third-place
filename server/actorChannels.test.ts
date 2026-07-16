@@ -23,6 +23,25 @@ describe("actor channel runtime", () => {
     expect(runtime.expertise("ai-pixel", "world-of-warcraft")).toEqual(before);
   });
 
+  it("keeps stable room subscriptions eligible for autonomous recovery after focus moves elsewhere", () => {
+    const runtime = new ActorChannelRuntime();
+    const actor = PERSONAS.find((persona) => {
+      const subscriptions = runtime.snapshot(persona.id)?.subscribedChannels ?? [];
+      return persona.id !== "ai-runa" &&
+        subscriptions.includes("lobby") &&
+        subscriptions.includes("ai-programming");
+    });
+    expect(actor).toBeDefined();
+    expect(runtime.candidatesFor("ai-programming").map((persona) => persona.id)).toContain(actor!.id);
+
+    for (let index = 0; index < 20; index += 1) {
+      runtime.markSpoke(actor!.id, "lobby", `lobby-${index}`);
+    }
+
+    expect(runtime.candidatesFor("ai-programming").map((persona) => persona.id)).not.toContain(actor!.id);
+    expect(runtime.autonomousCandidatesFor("ai-programming").map((persona) => persona.id)).toContain(actor!.id);
+  });
+
   it("calibrates specialists and basic residents differently in the trusted expertise notes", () => {
     const runtime = new ActorChannelRuntime();
     const farah = PERSONAS.find((persona) => persona.id === "ai-farah")!;

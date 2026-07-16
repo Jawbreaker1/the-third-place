@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import {
+  BackgroundWorkPreemptedError,
   buildSceneSystemPrompt,
   deriveSceneBehaviorStylePlan,
   LmStudioClient,
@@ -585,7 +586,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     await ambientStarted;
 
     const analysis = lm.analyzeTurn(turnInput("preempt-ambient"));
-    await expect(ambient).rejects.toThrow();
+    await expect(ambient).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
     await expect(analysis).resolves.toMatchObject({ source: "lm", evidence: { action: "read_url" } });
     expect(completionCalls).toBe(2);
   });
@@ -3995,7 +3996,7 @@ describe("LM Studio one-pass humanizer", () => {
       mustReplyIds: [sana.id],
     }, 0);
 
-    await expect(ambient).rejects.toThrow();
+    await expect(ambient).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
     await expect(live).resolves.toEqual([expect.objectContaining({ personaId: sana.id })]);
     expect(completionCalls).toBe(2);
   });

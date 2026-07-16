@@ -417,6 +417,24 @@ const reviewedRecoveryPolicy = (
   return "";
 };
 
+/**
+ * A low-priority scene was deliberately displaced by live work. This is a
+ * scheduler outcome, not a model/provider failure, so callers may preserve the
+ * room episode and retry after the shared queue becomes free.
+ */
+export class BackgroundWorkPreemptedError extends Error {
+  readonly code = "BACKGROUND_WORK_PREEMPTED";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "BackgroundWorkPreemptedError";
+  }
+}
+
+export const isBackgroundWorkPreemptedError = (
+  error: unknown,
+): error is BackgroundWorkPreemptedError => error instanceof BackgroundWorkPreemptedError;
+
 interface SceneQueueItem {
   type: "scene";
   id: number;
@@ -1129,7 +1147,11 @@ export class LmStudioClient {
     }
     if (index < 0) return false;
     const [dropped] = this.queue.splice(index, 1);
-    dropped?.reject(new Error(reason));
+    dropped?.reject(
+      dropped.type === "scene" && dropped.request.kind === "ambient"
+        ? new BackgroundWorkPreemptedError(reason)
+        : new Error(reason),
+    );
     return true;
   }
 
@@ -1184,7 +1206,9 @@ export class LmStudioClient {
       this.dropQueuedStaleTurnAnalyses(input.channel.id, liveTextMedium, staleLiveReason);
     }
     if (this.activeScene?.request.kind === "ambient") {
-      this.activeSceneAbort?.abort(new Error("Ambient generation yielded to semantic turn analysis"));
+      this.activeSceneAbort?.abort(
+        new BackgroundWorkPreemptedError("Ambient generation yielded to semantic turn analysis"),
+      );
     } else if (
       liveTextMedium &&
       this.activeScene?.request.kind === liveTextMedium &&
@@ -1252,7 +1276,9 @@ export class LmStudioClient {
         this.activeScene?.request.kind === "ambient" &&
         priority < this.activeScene.priority
       ) {
-        this.activeSceneAbort?.abort(new Error("Ambient generation yielded to live conversation"));
+        this.activeSceneAbort?.abort(
+          new BackgroundWorkPreemptedError("Ambient generation yielded to live conversation"),
+        );
       }
       if (priority < 4) this.abortActiveMemoryAnalysis("Persistent memory yielded to live conversation");
       if (this.queue.length >= 8) {
@@ -1358,7 +1384,12 @@ export class LmStudioClient {
           item.resolve(await this.performMemoryAnalysis(item.input, abort.signal, item.deadlineAt));
         }
       } catch (error) {
-        item.reject(error);
+        const typedPreemption = item.type === "scene" &&
+          item.request.kind === "ambient" &&
+          isBackgroundWorkPreemptedError(this.activeSceneAbort?.signal.reason)
+          ? this.activeSceneAbort.signal.reason
+          : undefined;
+        item.reject(typedPreemption ?? error);
       } finally {
         if (this.activeScene?.id === item.id) {
           this.activeScene = undefined;

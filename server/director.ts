@@ -24,7 +24,9 @@ import {
 } from "./channels.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import {
+  BackgroundWorkPreemptedError,
   diegeticIdentityTurnPremise,
+  isBackgroundWorkPreemptedError,
   type GeneratedLine,
   type RoomRecallEvidence,
   type SceneCapabilityContext,
@@ -126,6 +128,8 @@ const AUTO_SHARED_LINK_GLOBAL_LIMIT = 4;
 const AUTO_SHARED_LINK_STATE_LIMIT = 1_000;
 const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_BASE_MS = 60_000;
 const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS = 4 * 60_000;
+const AMBIENT_BUSY_RETRY_MIN_MS = 4_000;
+const AMBIENT_BUSY_RETRY_MAX_MS = 8_000;
 const HUMAN_REACTION_STATE_LIMIT = 1_000;
 const HUMAN_REACTION_DEBOUNCE_MS = 700;
 const HUMAN_REACTION_HUMAN_COOLDOWN_MS = 24_000;
@@ -670,7 +674,7 @@ export function consideredConversationWordLimits(
 export interface ConsideredConversationGate {
   now: number;
   lastStartedAt?: number;
-  lastHumanActivityAt?: number;
+  lastChannelHumanActivityAt?: number;
   cooldownMs: number;
   humanQuietMs: number;
   chance: number;
@@ -842,7 +846,7 @@ export interface AutonomousResearchGate {
   lastChannelAttemptAt?: number;
   globalRetryAfterAt?: number;
   channelRetryAfterAt?: number;
-  lastHumanActivityAt?: number;
+  lastChannelHumanActivityAt?: number;
   globalCooldownMs: number;
   channelCooldownMs: number;
   humanQuietMs: number;
@@ -876,7 +880,10 @@ export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boo
   if (gate.channelRetryAfterAt !== undefined && gate.now < gate.channelRetryAfterAt) return false;
   if (lastGlobalSuccessAt !== undefined && gate.now - lastGlobalSuccessAt < gate.globalCooldownMs) return false;
   if (lastChannelSuccessAt !== undefined && gate.now - lastChannelSuccessAt < gate.channelCooldownMs) return false;
-  if (gate.lastHumanActivityAt !== undefined && gate.now - gate.lastHumanActivityAt < gate.humanQuietMs) return false;
+  if (
+    gate.lastChannelHumanActivityAt !== undefined &&
+    gate.now - gate.lastChannelHumanActivityAt < gate.humanQuietMs
+  ) return false;
   return gate.rng() < clamp(gate.chance, 0, 1);
 }
 
@@ -929,12 +936,18 @@ export type AutonomousResearchFailureReason =
   | "lookup_failed"
   | "no_safe_fresh_result"
   | "source_read_failed"
-  | "safety_gate_changed"
   | "generation_failed"
   | "invalid_generated_lines"
   | "missing_single_source"
   | "missing_preview"
   | "publication_failed";
+
+class AutonomousResearchDeferredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AutonomousResearchDeferredError";
+  }
+}
 
 export interface AutonomousResearchDiagnostics {
   attempts: number;
@@ -1172,7 +1185,10 @@ export function shouldStartConsideredConversation(gate: ConsideredConversationGa
     return false;
   }
   if (gate.lastStartedAt !== undefined && gate.now - gate.lastStartedAt < gate.cooldownMs) return false;
-  if (gate.lastHumanActivityAt !== undefined && gate.now - gate.lastHumanActivityAt < gate.humanQuietMs) return false;
+  if (
+    gate.lastChannelHumanActivityAt !== undefined &&
+    gate.now - gate.lastChannelHumanActivityAt < gate.humanQuietMs
+  ) return false;
   return gate.rng() < clamp(gate.chance, 0, 1);
 }
 
@@ -1552,6 +1568,7 @@ export class SocialDirector {
   private readonly lastHumanReactionTurnAtByMessage = new Map<string, number>();
   private readonly directorEvents: DirectorEvent[] = [];
   private readonly aiTimestamps: number[] = [];
+  private readonly autonomousAiTimestamps: number[] = [];
   private readonly priorityHumanReplyTimestamps: number[] = [];
   private readonly handledHumanImageIds = new Set<string>();
   private readonly ambientThreads = new Map<string, AmbientThreadState>();
@@ -1589,7 +1606,6 @@ export class SocialDirector {
   private consideredConversationInFlight = false;
   private autoSharedLinkDiscussionInFlight = false;
   private lastConsideredConversationAt?: number;
-  private lastHumanActivityAt?: number;
   private lastWelcomeTemporalCueAt?: number;
   private lastAmbientTemporalCueAt?: number;
   private readonly rng: () => number;
@@ -1747,7 +1763,6 @@ export class SocialDirector {
       if (!Number.isFinite(timestamp) || timestamp > now) continue;
       const authorKind = knownMemberKinds.get(message.authorId) ?? message.authorSnapshot?.kind;
       if (!message.system && authorKind === "human") {
-        this.lastHumanActivityAt = Math.max(this.lastHumanActivityAt ?? 0, timestamp);
         this.lastHumanMessageAtByChannel.set(
           message.channelId,
           Math.max(this.lastHumanMessageAtByChannel.get(message.channelId) ?? 0, timestamp),
@@ -1851,7 +1866,6 @@ export class SocialDirector {
     const catalogEpoch = this.catalogEpoch;
     const returning = options.returning === true;
     const arrivalAt = this.now();
-    this.lastHumanActivityAt = arrivalAt;
     this.lastHumanMessageAtByChannel.set("lobby", arrivalAt);
     this.invalidateAmbientChannel("lobby", "human_preempted");
     const candidates = PERSONAS.filter((persona) => persona.warmth > 0.7 && persona.id !== "ai-runa");
@@ -1963,7 +1977,6 @@ export class SocialDirector {
     )) return;
 
     const now = this.now();
-    this.lastHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(event.channelId, now);
     this.invalidateAmbientChannel(event.channelId, "human_preempted");
 
@@ -2160,7 +2173,6 @@ export class SocialDirector {
 
   private noteHumanChannelEvent(message: ChatMessage): void {
     const now = this.now();
-    this.lastHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(message.channelId, now);
     const epoch = this.invalidateAmbientChannel(message.channelId, "human_preempted");
     this.actorChannels.noteChannelEvent(message);
@@ -2468,7 +2480,6 @@ export class SocialDirector {
     const latest = latestInput.message;
     const combined = messages.map((message) => message.content).join("\n");
     const catalogEpoch = this.catalogEpoch;
-    this.lastHumanActivityAt = this.now();
     const relationshipNotes = this.relationshipNotes([persona], human);
     const dmMessages = this.store.getDmMessages(latest.channelId);
     const replyById = new Map(dmMessages.map((message) => [message.id, message]));
@@ -3295,6 +3306,11 @@ export class SocialDirector {
     this.ambientTimer = setTimeout(() => void this.runAmbient(), wait);
   }
 
+  private ambientBusyRetryDelayMs(): number {
+    return AMBIENT_BUSY_RETRY_MIN_MS +
+      this.rng() * (AMBIENT_BUSY_RETRY_MAX_MS - AMBIENT_BUSY_RETRY_MIN_MS);
+  }
+
   private globalBehaviorTuning(): AdminBehaviorTuning {
     return resolveBehaviorTuning(this.behaviorTuningProvider).global;
   }
@@ -3375,7 +3391,7 @@ export class SocialDirector {
         failureState = undefined;
       }
       const available = this.actorChannels
-        .candidatesFor(channel.id)
+        .autonomousCandidatesFor(channel.id)
         .filter(
           (persona) =>
             persona.id !== "ai-runa" &&
@@ -3409,7 +3425,7 @@ export class SocialDirector {
         lastChannelSuccessAt: this.lastAutonomousResearchSuccessAtByChannel.get(candidate.channel.id),
         globalRetryAfterAt: this.autonomousResearchGlobalRetryAfterAt,
         channelRetryAfterAt: candidate.failureState?.retryAfterAt,
-        lastHumanActivityAt: this.lastHumanActivityAt,
+        lastChannelHumanActivityAt: this.lastHumanMessageAtByChannel.get(candidate.channel.id),
         globalCooldownMs: Math.max(3 * 60_000, Math.round(candidate.basePolicy.globalCooldownMs * 0.25)),
         channelCooldownMs: Math.max(10 * 60_000, Math.round(candidate.prioritized.channelCooldownMs * 0.25)),
         humanQuietMs: candidate.basePolicy.humanQuietMs,
@@ -3451,7 +3467,7 @@ export class SocialDirector {
         lastChannelSuccessAt: this.lastAutonomousResearchSuccessAtByChannel.get(candidate.channel.id),
         globalRetryAfterAt: this.autonomousResearchGlobalRetryAfterAt,
         channelRetryAfterAt: candidate.failureState?.retryAfterAt,
-        lastHumanActivityAt: this.lastHumanActivityAt,
+        lastChannelHumanActivityAt: this.lastHumanMessageAtByChannel.get(candidate.channel.id),
         globalCooldownMs: candidate.basePolicy.globalCooldownMs,
         channelCooldownMs: candidate.prioritized.channelCooldownMs,
         humanQuietMs: candidate.basePolicy.humanQuietMs,
@@ -3896,6 +3912,7 @@ export class SocialDirector {
     const globalTuning = this.globalBehaviorTuning();
     const channelTuning = this.channelBehaviorTuning(channelId, globalTuning);
     const researchPolicy = this.autonomousResearchPolicy(channelId);
+    const lastChannelHumanActivityAt = this.lastHumanMessageAtByChannel.get(channelId);
     if (
       this.stopped ||
       !researchPolicy.enabled ||
@@ -3904,11 +3921,11 @@ export class SocialDirector {
       epoch !== (this.channelEpoch.get(channelId) ?? 0) ||
       this.lm.health().queueDepth !== 0 ||
       this.availableAutonomousMessageSlots(now, globalTuning.activity) < requiredSlots ||
-      (this.lastHumanActivityAt !== undefined &&
-        now - this.lastHumanActivityAt < researchPolicy.humanQuietMs)
+      (lastChannelHumanActivityAt !== undefined &&
+        now - lastChannelHumanActivityAt < researchPolicy.humanQuietMs)
     ) return false;
     const availableIds = new Set(
-      this.actorChannels.candidatesFor(channelId)
+      this.actorChannels.autonomousCandidatesFor(channelId)
         .filter((persona) => !this.activeVoicePersonaIds.has(persona.id))
         .map((persona) => persona.id),
     );
@@ -4185,7 +4202,9 @@ export class SocialDirector {
       }
       research = readOutcome.research;
       if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1)) {
-        return this.recordAutonomousResearchFailure(channel.id, seed, "safety_gate_changed");
+        throw new AutonomousResearchDeferredError(
+          "Autonomous research yielded because its publication gates changed",
+        );
       }
       const limits = ambientSceneWordLimits(lead, undefined, false, mode);
       const evidenceIntroduction = research.kind === "market"
@@ -4227,6 +4246,15 @@ export class SocialDirector {
         temporalPolicy: "ambient_silent",
       }, 4);
     } catch (error) {
+      if (
+        isBackgroundWorkPreemptedError(error) ||
+        error instanceof AutonomousResearchDeferredError
+      ) {
+        if (this.ambientThreads.get(channel.id) === thread) {
+          this.ambientThreads.delete(channel.id);
+        }
+        throw error;
+      }
       console.warn("Autonomous sourced conversation skipped:", error instanceof Error ? error.message : error);
       return this.recordAutonomousResearchFailure(channel.id, seed, "generation_failed");
     } finally {
@@ -4245,7 +4273,12 @@ export class SocialDirector {
       return this.recordAutonomousResearchFailure(channel.id, seed, "missing_single_source");
     }
     if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1)) {
-      return this.recordAutonomousResearchFailure(channel.id, seed, "safety_gate_changed");
+      if (this.ambientThreads.get(channel.id) === thread) {
+        this.ambientThreads.delete(channel.id);
+      }
+      throw new AutonomousResearchDeferredError(
+        "Autonomous research yielded because its publication gates changed",
+      );
     }
     const selectedResearch: ResearchPacket = {
       ...research,
@@ -4304,14 +4337,15 @@ export class SocialDirector {
 
   private async runAmbient(): Promise<void> {
     let ownsConsideredLease = false;
+    let nextScheduleDelayMs: number | undefined;
     try {
       if (this.stopped) return;
       const lmHealth = this.lm.health();
-      if (
-        !lmHealth.connected ||
-        lmHealth.queueDepth > 0 ||
-        this.consideredConversationInFlight
-      ) return;
+      if (!lmHealth.connected) return;
+      if (lmHealth.queueDepth > 0 || this.consideredConversationInFlight) {
+        nextScheduleDelayMs = this.ambientBusyRetryDelayMs();
+        return;
+      }
       const now = this.now();
       const globalTuning = this.globalBehaviorTuning();
       if (globalTuning.activity === 0) return;
@@ -4375,7 +4409,7 @@ export class SocialDirector {
       const autonomousSlots = this.availableAutonomousMessageSlots(now, globalTuning.activity);
       if (autonomousSlots < 1) return;
       const available = this.actorChannels
-        .candidatesFor(channel.id)
+        .autonomousCandidatesFor(channel.id)
         .filter(
           (persona) =>
             persona.id !== "ai-runa" &&
@@ -4400,7 +4434,7 @@ export class SocialDirector {
         shouldStartConsideredConversation({
           now,
           lastStartedAt: this.lastConsideredConversationAt,
-          lastHumanActivityAt: this.lastHumanActivityAt,
+          lastChannelHumanActivityAt: this.lastHumanMessageAtByChannel.get(channel.id),
           cooldownMs: this.consideredConversationCooldownMs,
           humanQuietMs: this.consideredConversationHumanQuietMs,
           chance: this.consideredConversationChance,
@@ -4544,6 +4578,7 @@ export class SocialDirector {
       };
       const generationTypingLease = this.acquireTyping(channel.id, first.id);
       let lines: GeneratedLine[] = [];
+      let backgroundPreempted = false;
       try {
         lines = await this.lm.generateScene(
           {
@@ -4584,11 +4619,17 @@ export class SocialDirector {
           4,
         );
       } catch (error) {
-        console.warn("Ambient scene skipped:", error instanceof Error ? error.message : error);
+        if (isBackgroundWorkPreemptedError(error)) {
+          backgroundPreempted = true;
+          nextScheduleDelayMs = this.ambientBusyRetryDelayMs();
+        } else {
+          console.warn("Ambient scene skipped:", error instanceof Error ? error.message : error);
+        }
       } finally {
         generationTypingLease.release();
       }
       if (epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
+      if (backgroundPreempted) return;
       const leadLine = lines.find((line) => line.personaId === first.id);
       if (!leadLine) {
         if (pendingBeat) {
@@ -4638,7 +4679,7 @@ export class SocialDirector {
       } finally {
         publicationTypingLease.release();
       }
-      const reactors = this.actorChannels.candidatesFor(channel.id).filter(
+      const reactors = this.actorChannels.autonomousCandidatesFor(channel.id).filter(
         (candidate) => candidate.id !== first.id && !this.activeVoicePersonaIds.has(candidate.id),
       );
       const reactor = reactors.length > 0 ? choose(reactors, this.rng) : undefined;
@@ -4677,9 +4718,18 @@ export class SocialDirector {
         replied: 1,
         reacted: reactor ? 1 : 0,
       });
+    } catch (error) {
+      if (
+        isBackgroundWorkPreemptedError(error) ||
+        error instanceof AutonomousResearchDeferredError
+      ) {
+        nextScheduleDelayMs = this.ambientBusyRetryDelayMs();
+      } else {
+        console.warn("Ambient scheduler skipped:", error instanceof Error ? error.message : error);
+      }
     } finally {
       if (ownsConsideredLease) this.consideredConversationInFlight = false;
-      if (!this.stopped) this.scheduleAmbient();
+      if (!this.stopped) this.scheduleAmbient(nextScheduleDelayMs);
     }
   }
 
@@ -4752,7 +4802,19 @@ export class SocialDirector {
     this.io.to("public").emit("message:new", message);
     this.io.to("public").emit("presence:update", { members: this.getMembers() });
     this.lastSpoke.set(persona.id, now);
+    while (this.aiTimestamps[0] !== undefined && now - this.aiTimestamps[0] > 60_000) {
+      this.aiTimestamps.shift();
+    }
     this.aiTimestamps.push(now);
+    if (autonomousKind) {
+      while (
+        this.autonomousAiTimestamps[0] !== undefined &&
+        now - this.autonomousAiTimestamps[0] > 60_000
+      ) {
+        this.autonomousAiTimestamps.shift();
+      }
+      this.autonomousAiTimestamps.push(now);
+    }
     return message;
   }
 
@@ -4777,15 +4839,22 @@ export class SocialDirector {
     now = this.now(),
     activity = this.globalBehaviorTuning().activity,
   ): number {
-    while (this.aiTimestamps[0] && now - this.aiTimestamps[0] > 60_000) this.aiTimestamps.shift();
-    const recentTwelve = this.aiTimestamps.filter((timestamp) => now - timestamp < 12_000).length;
+    while (
+      this.autonomousAiTimestamps[0] !== undefined &&
+      now - this.autonomousAiTimestamps[0] > 60_000
+    ) {
+      this.autonomousAiTimestamps.shift();
+    }
+    const recentTwelve = this.autonomousAiTimestamps
+      .filter((timestamp) => now - timestamp < 12_000)
+      .length;
     const pace = process.env.AI_PACE;
     const basePerMinute = pace === "calm" ? 7 : pace === "party" ? 12 : 10;
     const limits = autonomousActivityLimits(basePerMinute, activity);
     return Math.max(
       0,
       Math.min(
-        limits.perMinute - this.aiTimestamps.length,
+        limits.perMinute - this.autonomousAiTimestamps.length,
         limits.perTwelveSeconds - recentTwelve,
       ),
     );

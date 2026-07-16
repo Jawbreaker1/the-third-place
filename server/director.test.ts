@@ -44,6 +44,7 @@ import {
   type AmbientThreadState,
 } from "./director.js";
 import { CHANNELS, type AutonomousResearchSeed } from "./channels.js";
+import { BackgroundWorkPreemptedError } from "./lmStudio.js";
 import { createFailClosedTurnAnalysis, type TurnAnalysis } from "./semanticRouter.js";
 import {
   ambientRoomSelectionWeight,
@@ -317,8 +318,8 @@ describe("social director", () => {
       }],
     };
     const actorChannels = new ActorChannelRuntime();
-    const stockActors = actorChannels.candidatesFor("stock-market");
-    vi.spyOn(actorChannels, "candidatesFor").mockImplementation((channelId) =>
+    const stockActors = actorChannels.autonomousCandidatesFor("stock-market");
+    vi.spyOn(actorChannels, "autonomousCandidatesFor").mockImplementation((channelId) =>
       channelId === "stock-market" ? stockActors : []);
     const snapshotProvider = { snapshot: vi.fn(async () => snapshot) };
     const evaluateMarketObservations = vi.fn(async () => [exceptional]);
@@ -3032,6 +3033,140 @@ describe("social director", () => {
     expect(humanTriggeredTail.store.addPublicMessage).not.toHaveBeenCalled();
   });
 
+  it("retries a busy shared model queue after four seconds instead of the normal ambient interval", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-16T08:30:00.000Z");
+      vi.setSystemTime(now);
+      let queueDepth = 1;
+      const health = vi.fn(() => ({ connected: true, queueDepth }));
+      const generateScene = vi.fn(async () => []);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        new RoomStore(`/tmp/director-busy-retry-${process.pid}-${Math.random()}.json`),
+        { health, generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "ai-programming" ? 50 : 0,
+            autonomousLinkFrequency: 0,
+            competence: 50,
+            aggression: 25,
+            explicitness: 50,
+          }),
+        },
+      );
+      const runAmbient = (director as unknown as { runAmbient: () => Promise<void> }).runAmbient.bind(director);
+
+      await runAmbient();
+      expect(health).toHaveBeenCalledTimes(1);
+      expect(generateScene).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(health).toHaveBeenCalledTimes(1);
+      queueDepth = 0;
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(health).toHaveBeenCalledTimes(2);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves an ambient episode across live-work preemption and publishes it on the short retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-16T08:45:00.000Z");
+      vi.setSystemTime(now);
+      let attempts = 0;
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+      }) => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new BackgroundWorkPreemptedError("ambient yielded to a live turn");
+        }
+        return [{
+          personaId: request.selected[0]!.id,
+          content: "Samma tråd fortsätter med en konkret detalj efter den korta pausen.",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const store = new RoomStore(`/tmp/director-preempted-episode-${process.pid}-${Math.random()}.json`);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "ai-programming" ? 50 : 0,
+            autonomousLinkFrequency: 0,
+            competence: 50,
+            aggression: 25,
+            explicitness: 50,
+          }),
+        },
+      );
+      const internals = director as unknown as {
+        runAmbient: () => Promise<void>;
+        ambientThreads: Map<string, AmbientThreadState>;
+        ambientBackoffUntilByChannel: Map<string, number>;
+      };
+
+      await internals.runAmbient();
+      const retained = internals.ambientThreads.get("ai-programming");
+      expect(retained).toBeDefined();
+      expect(retained?.messageCount).toBe(0);
+      expect(retained?.closeReason).toBeUndefined();
+      expect(internals.ambientBackoffUntilByChannel.has("ai-programming")).toBe(false);
+      expect(store.getRecent("ai-programming", 10)).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(internals.ambientThreads.get("ai-programming")).toBe(retained);
+      expect(retained?.messageCount).toBe(1);
+      expect(retained?.closeReason).toBeUndefined();
+      expect(internals.ambientBackoffUntilByChannel.has("ai-programming")).toBe(false);
+      expect(store.getRecent("ai-programming", 10)).toEqual([
+        expect.objectContaining({ content: "Samma tråd fortsätter med en konkret detalj efter den korta pausen." }),
+      ]);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps bounded public text alive with zero humans and an unrelated voice room", async () => {
     vi.useFakeTimers();
     try {
@@ -3427,7 +3562,7 @@ describe("social director", () => {
     const base: ConsideredConversationGate = {
       now,
       lastStartedAt: now - 600_000,
-      lastHumanActivityAt: now - 75_000,
+      lastChannelHumanActivityAt: now - 75_000,
       cooldownMs: 600_000,
       humanQuietMs: 75_000,
       chance: 0.1,
@@ -3447,7 +3582,7 @@ describe("social director", () => {
     const base: ConsideredConversationGate = {
       now,
       lastStartedAt: now - 600_000,
-      lastHumanActivityAt: now - 75_000,
+      lastChannelHumanActivityAt: now - 75_000,
       cooldownMs: 600_000,
       humanQuietMs: 75_000,
       chance: 1,
@@ -3464,13 +3599,69 @@ describe("social director", () => {
       { queueDepth: 1 },
       { availableMessageSlots: 0 },
       { lastStartedAt: now - 599_999 },
-      { lastHumanActivityAt: now - 74_999 },
+      { lastChannelHumanActivityAt: now - 74_999 },
     ];
 
     for (const override of blocked) {
       expect(shouldStartConsideredConversation({ ...base, ...override })).toBe(false);
     }
     expect(rolls).toBe(0);
+  });
+
+  it("keeps a considered idle conversation running in another room while a human writes in Lobby", async () => {
+    const now = Date.parse("2026-07-16T13:00:00.000Z");
+    const generateScene = vi.fn(async () => []);
+    const human = {
+      id: "guest-channel-local-considered",
+      name: "Guest",
+      kind: "human" as const,
+      status: "online" as const,
+      avatar: { color: "#123", accent: "#456", glyph: "G" },
+    };
+    const store = new RoomStore(`/tmp/director-channel-local-considered-${process.pid}-${Math.random()}.json`);
+    const lobbyMessage = createMessage("lobby", human.id, "Jag skriver aktivt här i Lobby.", {
+      createdAt: new Date(now).toISOString(),
+    });
+    store.addPublicMessage(lobbyMessage);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => [human, ...PERSONAS],
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        consideredConversationChance: 1,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "ai-programming" ? 50 : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+
+    director.onHumanMessage(lobbyMessage, human);
+    await (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+
+    expect(generateScene).toHaveBeenCalledTimes(1);
+    expect(generateScene).toHaveBeenCalledWith(expect.objectContaining({
+      channelId: "ai-programming",
+      conversationMode: "considered",
+      consideredRole: "lead",
+    }), 4);
+    director.stop();
   });
 
   it("pairs distinct relevant residents and gives the responder a non-echo role", () => {
@@ -3748,7 +3939,10 @@ describe("social director", () => {
     expect(shouldStartAutonomousResearch({ ...base, lastChannelSuccessAt: base.now - 119_999 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, globalRetryAfterAt: base.now + 1 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, channelRetryAfterAt: base.now + 1 })).toBe(false);
-    expect(shouldStartAutonomousResearch({ ...base, lastHumanActivityAt: base.now - 89_999 })).toBe(false);
+    expect(shouldStartAutonomousResearch({
+      ...base,
+      lastChannelHumanActivityAt: base.now - 89_999,
+    })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, rng: () => 0.1 })).toBe(false);
   });
 
@@ -3767,51 +3961,64 @@ describe("social director", () => {
     expect(disabled.chance).toBe(0);
   });
 
-  it("selects eligible sourced room work before ordinary ambient room scoring", async () => {
+  it("keeps autonomous research room-local while another room is active, but pauses the active room", async () => {
     const now = Date.parse("2026-07-15T12:00:00.000Z");
-    const actorChannels = new ActorChannelRuntime();
-    const stockActors = actorChannels.candidatesFor("stock-market");
-    vi.spyOn(actorChannels, "candidatesFor").mockImplementation((channelId) =>
-      channelId === "stock-market" ? stockActors : []);
-    const director = new SocialDirector(
-      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
-      new RoomStore("/tmp/director-priority-research-unused.json"),
-      { health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
-      actorChannels,
-      {} as never,
-      {} as never,
-      () => PERSONAS,
-      () => 1,
-      {
-        now: () => now,
-        rng: () => 0,
-        autonomousResearchEnabled: true,
-        autonomousResearchChance: 1,
-        autonomousResearchHumanQuietMs: 15_000,
-      },
-    );
-    const run = vi.fn(async (_channel: { id: string }) => true);
-    (director as unknown as { runAutonomousResearchConversation: typeof run })
-      .runAutonomousResearchConversation = run;
-
-    const attempted = await (director as unknown as {
-      maybeRunAutonomousResearch: (
-        at: number,
-        tuning: { activity: number; autonomousLinkFrequency: number; competence: number; aggression: number; explicitness: number },
-        queueDepth: number,
-      ) => Promise<boolean>;
-    }).maybeRunAutonomousResearch(now, {
+    const tuning = {
       activity: 50,
       autonomousLinkFrequency: 60,
       competence: 50,
       aggression: 25,
       explicitness: 50,
-    }, 0);
+    };
+    const invoke = (director: SocialDirector) => (director as unknown as {
+      maybeRunAutonomousResearch: (
+        at: number,
+        tuning: { activity: number; autonomousLinkFrequency: number; competence: number; aggression: number; explicitness: number },
+        queueDepth: number,
+      ) => Promise<boolean>;
+    }).maybeRunAutonomousResearch(now, tuning, 0);
+    const makeDirector = (suffix: string) => {
+      const actorChannels = new ActorChannelRuntime();
+      const stockActors = actorChannels.autonomousCandidatesFor("stock-market");
+      vi.spyOn(actorChannels, "autonomousCandidatesFor").mockImplementation((channelId) =>
+        channelId === "stock-market" ? stockActors : []);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        new RoomStore(`/tmp/director-priority-research-${suffix}-${process.pid}.json`),
+        { health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
+        actorChannels,
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0,
+          autonomousResearchEnabled: true,
+          autonomousResearchChance: 1,
+          autonomousResearchHumanQuietMs: 15_000,
+        },
+      );
+      const run = vi.fn(async (_channel: { id: string }) => true);
+      (director as unknown as { runAutonomousResearchConversation: typeof run })
+        .runAutonomousResearchConversation = run;
+      return { director, run };
+    };
+
+    const otherRoomActive = makeDirector("other-room-active");
+    otherRoomActive.director.noteHumanVoiceActivity("lobby");
+    const attempted = await invoke(otherRoomActive.director);
 
     expect(attempted).toBe(true);
-    expect(run).toHaveBeenCalledTimes(1);
-    expect(run.mock.calls[0]?.[0]).toMatchObject({ id: "stock-market" });
-    director.stop();
+    expect(otherRoomActive.run).toHaveBeenCalledTimes(1);
+    expect(otherRoomActive.run.mock.calls[0]?.[0]).toMatchObject({ id: "stock-market" });
+    otherRoomActive.director.stop();
+
+    const sameRoomActive = makeDirector("same-room-active");
+    sameRoomActive.director.noteHumanVoiceActivity("stock-market");
+    expect(await invoke(sameRoomActive.director)).toBe(false);
+    expect(sameRoomActive.run).not.toHaveBeenCalled();
+    sameRoomActive.director.stop();
   });
 
   it("maps autonomous-link frequency onto a bounded cadence with the former cadence at 50", () => {
@@ -4146,6 +4353,150 @@ describe("social director", () => {
     }
   });
 
+  it("treats autonomous research preemption as neutral and allows a clean retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-16T09:15:00.000Z");
+      vi.setSystemTime(now);
+      const channel = CHANNELS.find((candidate) => candidate.id === "ai-programming")!;
+      const actorChannels = new ActorChannelRuntime();
+      const available = actorChannels
+        .autonomousCandidatesFor(channel.id)
+        .filter((persona) => persona.id !== "ai-runa" && persona.id !== "ai-robin");
+      const research = {
+        kind: "page" as const,
+        query: "background preemption recovery",
+        retrievedAt: new Date(now).toISOString(),
+        results: [{
+          id: "S1",
+          title: "Background retry contract",
+          url: "https://example.com/background-retry",
+          snippet: "A displaced background task can retry without being counted as a provider failure.",
+        }],
+      };
+      const seed: AutonomousResearchSeed = {
+        id: "background-preemption",
+        query: research.query,
+        mode: "web",
+        discussionAngle: "Discuss why displaced background work should preserve provider health.",
+      };
+      let generationAttempt = 0;
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+      }) => {
+        generationAttempt += 1;
+        if (generationAttempt === 1) {
+          throw new BackgroundWorkPreemptedError("research yielded to live conversation");
+        }
+        return [{
+          personaId: request.selected[0]!.id,
+          content: "Det är rimligt: en avbruten bakgrundskörning säger inget om källans kvalitet.",
+          source: "lm" as const,
+          sourceIds: ["S1"],
+        }];
+      });
+      const store = new RoomStore(`/tmp/director-research-preemption-${process.pid}-${Math.random()}.json`);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        actorChannels,
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0,
+          autonomousResearchEnabled: true,
+        },
+      );
+      const newThread = (): AmbientThreadState => ({
+        seed: "unused until the research seed is committed",
+        messageCount: 0,
+        participantIds: [],
+        debateBeat: false,
+        languageHint: "sv",
+        openedAt: now,
+        updatedAt: now,
+      });
+      const internals = director as unknown as {
+        runAutonomousResearchConversation: (
+          room: typeof channel,
+          epoch: number,
+          candidates: typeof PERSONAS,
+          state: AmbientThreadState,
+          researchSeed: AutonomousResearchSeed,
+          prepared: { research: typeof research },
+        ) => Promise<boolean>;
+        recordAutonomousResearchFailure: (
+          channelId: string,
+          researchSeed: AutonomousResearchSeed,
+          reason: "lookup_failed",
+        ) => false;
+        ambientThreads: Map<string, AmbientThreadState>;
+        autonomousResearchFailureStateByChannel: Map<string, {
+          consecutiveFailures: number;
+          retryAfterAt: number;
+        }>;
+        autonomousResearchGlobalRetryAfterAt?: number;
+        autonomousResearchGlobalConsecutiveFailures: number;
+      };
+
+      internals.recordAutonomousResearchFailure(channel.id, seed, "lookup_failed");
+      const diagnosticsBefore = director.getAutonomousResearchDiagnostics();
+      const channelFailureBefore = { ...internals.autonomousResearchFailureStateByChannel.get(channel.id)! };
+      const globalRetryBefore = internals.autonomousResearchGlobalRetryAfterAt;
+      const globalFailuresBefore = internals.autonomousResearchGlobalConsecutiveFailures;
+      const firstThread = newThread();
+      internals.ambientThreads.set(channel.id, firstThread);
+
+      await expect(internals.runAutonomousResearchConversation(
+        channel,
+        0,
+        available,
+        firstThread,
+        seed,
+        { research },
+      )).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
+
+      expect(store.getRecent(channel.id, 10)).toEqual([]);
+      expect(director.getAutonomousResearchDiagnostics()).toEqual({
+        ...diagnosticsBefore,
+        attempts: diagnosticsBefore.attempts + 1,
+      });
+      expect(internals.autonomousResearchFailureStateByChannel.get(channel.id)).toEqual(channelFailureBefore);
+      expect(internals.autonomousResearchGlobalRetryAfterAt).toBe(globalRetryBefore);
+      expect(internals.autonomousResearchGlobalConsecutiveFailures).toBe(globalFailuresBefore);
+
+      const retryThread = newThread();
+      internals.ambientThreads.set(channel.id, retryThread);
+      await expect(internals.runAutonomousResearchConversation(
+        channel,
+        0,
+        available,
+        retryThread,
+        seed,
+        { research },
+      )).resolves.toBe(true);
+      expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(store.getRecent(channel.id, 10)).toEqual([
+        expect.objectContaining({
+          content: "Det är rimligt: en avbruten bakgrundskörning säger inget om källans kvalitet.",
+          sources: [expect.objectContaining({ url: "https://example.com/background-retry" })],
+        }),
+      ]);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("reports the effective global retry time after failures move between rooms", () => {
     const now = Date.parse("2026-07-14T11:00:00.000Z");
     const director = new SocialDirector(
@@ -4230,6 +4581,97 @@ describe("social director", () => {
     }).postPublic("side-quests", mira, "En ny konkret detalj om filtret.", prior.id);
     expect(posted).toBeUndefined();
     expect(store.getRecent("side-quests", 10)).toEqual([prior]);
+  });
+
+  it("does not charge a human-triggered AI reply to autonomous publication pacing", () => {
+    const now = Date.parse("2026-07-16T13:30:00.000Z");
+    const human = {
+      id: "guest-autonomous-pacing",
+      name: "Guest",
+      kind: "human" as const,
+      status: "online" as const,
+      avatar: { color: "#123", accent: "#456", glyph: "G" },
+    };
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+    const store = new RoomStore(`/tmp/director-autonomous-pacing-${process.pid}-${Math.random()}.json`);
+    const incoming = createMessage("lobby", human.id, "Kan någon svara på det här?");
+    store.addPublicMessage(incoming);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      { rememberDeliveredLine: vi.fn() } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => [human, ...PERSONAS],
+      () => 1,
+      { now: () => now },
+    );
+    const internals = director as unknown as {
+      postPublic: (
+        channelId: string,
+        persona: typeof mira,
+        content: string,
+        replyToId?: string,
+        generation?: "lm" | "fallback",
+        sources?: [],
+        linkPreview?: undefined,
+        autonomousKind?: "ambient" | "research",
+      ) => ReturnType<typeof createMessage> | undefined;
+      availableMessageSlots: (at: number) => number;
+      availableAutonomousMessageSlots: (at: number, activity: number) => number;
+      aiTimestamps: number[];
+      autonomousAiTimestamps: number[];
+    };
+    const initialAutonomousSlots = internals.availableAutonomousMessageSlots(now, 50);
+
+    expect(internals.postPublic(
+      "lobby",
+      mira,
+      "Ja, jag svarar på din fråga nu.",
+      incoming.id,
+    )).toBeDefined();
+    expect(internals.aiTimestamps).toEqual([now]);
+    expect(internals.autonomousAiTimestamps).toEqual([]);
+    expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(initialAutonomousSlots);
+
+    // Direct, human-triggered traffic may fill the ordinary public limiter,
+    // but it must not make every unrelated room look autonomously saturated.
+    internals.aiTimestamps.push(now, now);
+    expect(internals.availableMessageSlots(now)).toBe(0);
+    expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(initialAutonomousSlots);
+
+    expect(internals.postPublic(
+      "lobby",
+      sana,
+      "En separat självstartad tanke hör hemma i den autonoma budgeten.",
+      undefined,
+      "lm",
+      [],
+      undefined,
+      "ambient",
+    )).toBeDefined();
+    expect(internals.aiTimestamps).toEqual([now, now, now, now]);
+    expect(internals.autonomousAiTimestamps).toEqual([now]);
+    expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(initialAutonomousSlots - 1);
+
+    // The autonomous limiter itself remains a hard cross-room spam bound.
+    internals.autonomousAiTimestamps.push(now, now);
+    expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(0);
+    expect(internals.postPublic(
+      "lobby",
+      vale,
+      "Det här autonoma inlägget ska stoppas av den autonoma budgeten.",
+      undefined,
+      "lm",
+      [],
+      undefined,
+      "ambient",
+    )).toBeUndefined();
+    expect(internals.aiTimestamps).toHaveLength(4);
+    director.stop();
   });
 
   it("assigns one accountable resident to an unaddressed expected request and requires completion now", async () => {
@@ -5552,9 +5994,9 @@ describe("social director", () => {
         channelCooldownMs: number;
         dailyCap: number;
       };
-      lastHumanActivityAt?: number;
+      lastHumanMessageAtByChannel: Map<string, number>;
       lastSpoke: Map<string, number>;
-      aiTimestamps: number[];
+      autonomousAiTimestamps: number[];
     };
     const safe = () => internals.autonomousResearchIsStillSafe("lobby", 0, [actor], 1);
     expect(internals.autonomousResearchPolicy("lobby")).toMatchObject({
@@ -5578,12 +6020,12 @@ describe("social director", () => {
     director.setActiveVoicePersonaIds([actor.id]);
     expect(safe()).toBe(false);
     director.setActiveVoicePersonaIds([]);
-    internals.lastHumanActivityAt = now;
+    internals.lastHumanMessageAtByChannel.set("lobby", now);
     expect(safe()).toBe(false);
-    internals.lastHumanActivityAt = undefined;
-    internals.aiTimestamps.push(now, now, now);
+    internals.lastHumanMessageAtByChannel.delete("lobby");
+    internals.autonomousAiTimestamps.push(now, now, now);
     expect(safe()).toBe(false);
-    internals.aiTimestamps.length = 0;
+    internals.autonomousAiTimestamps.length = 0;
     internals.lastSpoke.set(actor.id, now);
     expect(safe()).toBe(false);
     internals.lastSpoke.delete(actor.id);
@@ -5648,7 +6090,7 @@ describe("social director", () => {
         openedAt: now,
         updatedAt: now,
       };
-      const pending = (director as unknown as {
+      const internals = director as unknown as {
         runAutonomousResearchConversation: (
           room: typeof channel,
           epoch: number,
@@ -5656,7 +6098,10 @@ describe("social director", () => {
           state: AmbientThreadState,
           seed: AutonomousResearchSeed,
         ) => Promise<boolean>;
-      }).runAutonomousResearchConversation(channel, 0, available, thread, {
+        autonomousResearchFailureStateByChannel: Map<string, unknown>;
+        autonomousResearchGlobalRetryAfterAt?: number;
+      };
+      const pending = internals.runAutonomousResearchConversation(channel, 0, available, thread, {
         id: "delayed",
         query: "delayed research",
         mode: "web",
@@ -5667,9 +6112,16 @@ describe("social director", () => {
       expect(read).toHaveBeenCalledTimes(1);
       director.noteHumanVoiceActivity(channel.id);
       resolveRead?.(pagePacket);
-      expect(await pending).toBe(false);
+      await expect(pending).rejects.toMatchObject({ name: "AutonomousResearchDeferredError" });
       expect(generateScene).not.toHaveBeenCalled();
       expect(store.getRecent("ai-programming", 10)).toEqual([]);
+      expect(director.getAutonomousResearchDiagnostics()).toEqual({
+        attempts: 1,
+        published: 0,
+        failed: 0,
+      });
+      expect(internals.autonomousResearchFailureStateByChannel.size).toBe(0);
+      expect(internals.autonomousResearchGlobalRetryAfterAt).toBeUndefined();
       director.stop();
     } finally {
       vi.clearAllTimers();
