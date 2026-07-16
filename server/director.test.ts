@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
+import { AmbientEpisodeLedger, MemoryAmbientEpisodePersistence } from "./ambientEpisodeLedger.js";
 import { PERSONAS } from "./personas.js";
 import { createMessage, RoomStore } from "./store.js";
 import {
@@ -3228,7 +3229,7 @@ describe("social director", () => {
       humanQuietMs: 75_000,
       chance: 0.1,
       queueDepth: 0,
-      availableMessageSlots: 2,
+      availableMessageSlots: 1,
       voiceRoomActive: false,
       alreadyInFlight: false,
       rng: () => 0.099,
@@ -3249,7 +3250,7 @@ describe("social director", () => {
       humanQuietMs: 75_000,
       chance: 1,
       queueDepth: 0,
-      availableMessageSlots: 2,
+      availableMessageSlots: 1,
       voiceRoomActive: false,
       alreadyInFlight: false,
       rng: () => {
@@ -3261,7 +3262,7 @@ describe("social director", () => {
       { voiceRoomActive: true },
       { alreadyInFlight: true },
       { queueDepth: 1 },
-      { availableMessageSlots: 1 },
+      { availableMessageSlots: 0 },
       { lastStartedAt: now - 599_999 },
       { lastHumanActivityAt: now - 74_999 },
     ];
@@ -3529,7 +3530,7 @@ describe("social director", () => {
       channelCooldownMs: 120_000,
       humanQuietMs: 90_000,
       queueDepth: 0,
-      availableMessageSlots: 2,
+      availableMessageSlots: 1,
       dailySuccesses: 0,
       dailyCap: 6,
       voiceRoomActive: false,
@@ -3543,7 +3544,7 @@ describe("social director", () => {
     expect(shouldStartAutonomousResearch({ ...base, freshThread: false })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, voiceRoomActive: true })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, queueDepth: 1 })).toBe(false);
-    expect(shouldStartAutonomousResearch({ ...base, availableMessageSlots: 1 })).toBe(false);
+    expect(shouldStartAutonomousResearch({ ...base, availableMessageSlots: 0 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, dailySuccesses: 6 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, lastGlobalSuccessAt: base.now - 59_999 })).toBe(false);
     expect(shouldStartAutonomousResearch({ ...base, lastChannelSuccessAt: base.now - 119_999 })).toBe(false);
@@ -4091,7 +4092,6 @@ describe("social director", () => {
       }).handleHumanBurst([incoming], human);
       await vi.runAllTimersAsync();
       await pending;
-      director.stop();
 
       expect(generateScene).toHaveBeenCalledTimes(1);
       const request = generateScene.mock.calls[0]![0];
@@ -4103,8 +4103,9 @@ describe("social director", () => {
         ambientThreads: Map<string, AmbientThreadState>;
       }).ambientThreads.get("lobby")).toMatchObject({
         origin: "human_topic",
-        messageCount: 2,
+        messageCount: 1,
       });
+      director.stop();
     } finally {
       vi.useRealTimers();
     }
@@ -4160,12 +4161,6 @@ describe("social director", () => {
           {
             personaId: request.selected[0]!.id,
             content: "Det intressanta är återställningen efter verktygsfelet, inte den snygga sluttexten.",
-            source: "lm" as const,
-            sourceIds: ["S2"],
-          },
-          {
-            personaId: request.selected[1]!.id,
-            content: "Ja, men mäter den också om nästa steg är rätt av rätt anledning?",
             source: "lm" as const,
             sourceIds: ["S2"],
           },
@@ -4279,7 +4274,7 @@ describe("social director", () => {
         4,
       );
       const messages = store.getRecent("ai-programming", 10);
-      expect(messages).toHaveLength(2);
+      expect(messages).toHaveLength(1);
       expect(messages[0]?.linkPreview?.url).toBe(sourceUrl);
       expect(messages[0]?.sources).toEqual([{
         title: "A practical recovery benchmark",
@@ -4287,11 +4282,13 @@ describe("social director", () => {
         publishedAt: "2026-07-13T09:00:00.000Z",
       }]);
       expect(messages[0]?.content).not.toContain("https://");
-      expect(messages[1]?.replyToId).toBe(messages[0]?.id);
-      expect(messages[1]?.authorId).not.toBe(messages[0]?.authorId);
       expect(thread).toMatchObject({
         origin: "autonomous_research",
-        messageCount: 2,
+        messageCount: 1,
+        pendingBeat: {
+          kind: "research_response",
+          attempts: 0,
+        },
         research: {
           kind: "page",
           results: [{ id: "S2", url: sourceUrl, publishedAt: "2026-07-13T09:00:00.000Z" }],
@@ -4462,7 +4459,6 @@ describe("social director", () => {
         .filter((entry) => entry.payload.active)
         .map((entry) => entry.payload.memberId);
       expect(new Set(activeIds)).toEqual(new Set([selectedIds[0]]));
-      expect(activeIds).not.toContain(selectedIds[1]);
 
       const activeAtEnd = new Set<string>();
       for (const { payload } of typingEvents) {
@@ -4639,7 +4635,7 @@ describe("social director", () => {
       await vi.advanceTimersByTimeAsync(10_000);
       await pending;
 
-      expect(selectedIds).toHaveLength(2);
+      expect(selectedIds).toHaveLength(1);
       const typingEvents = emitted.filter((entry) => entry.event === "typing:member") as Array<{
         event: string;
         payload: { memberId: string; active: boolean };
@@ -4648,7 +4644,6 @@ describe("social director", () => {
         .filter((entry) => entry.payload.active)
         .map((entry) => entry.payload.memberId);
       expect(new Set(activeIds)).toEqual(new Set([selectedIds[0]]));
-      expect(activeIds).not.toContain(selectedIds[1]);
       const activeAtEnd = new Set<string>();
       for (const { payload } of typingEvents) {
         if (payload.active) activeAtEnd.add(payload.memberId);
@@ -4661,6 +4656,464 @@ describe("social director", () => {
           .map((entry) => (entry.payload as { authorId: string }).authorId),
       ).toEqual([selectedIds[0]]);
       director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("publishes one atomic ambient turn per tick and derives the next turn and typing only from the committed post", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = Date.parse("2026-07-15T17:20:00.000Z");
+      vi.setSystemTime(now);
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+      const store = new RoomStore("/tmp/director-ambient-atomic-ticks-unused.json");
+      const emitted: Array<{ event: string; payload: unknown }> = [];
+      const emit = vi.fn((event: string, payload: unknown) => emitted.push({ event, payload }));
+      const requests: Array<{
+        selectedIds: string[];
+        history: Array<{ author: string; content: string }>;
+        ambientAction: { kind: string; turnIndex: number; targetMessageId?: string };
+      }> = [];
+      const acceptedLines = [
+        "Första publicerade tanken har en konkret krok som nästa person kan ta vidare.",
+        "Just den kroken blir intressant om man testar den mot ett verkligt motexempel.",
+      ];
+      const discardedDraft = "DRAFT SOM ALDRIG FÅR BLI HISTORIK";
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        history: Array<{ author: string; content: string }>;
+        ambientAction: { kind: string; turnIndex: number; targetMessageId?: string };
+      }) => {
+        const tick = requests.length;
+        const selected = request.selected[0]!;
+        requests.push({
+          selectedIds: request.selected.map((persona) => persona.id),
+          history: request.history.map((line) => ({ author: line.author, content: line.content })),
+          ambientAction: { ...request.ambientAction },
+        });
+        const unselected = selected.id === mira.id ? vale : mira;
+        return [
+          {
+            personaId: selected.id,
+            content: acceptedLines[tick]!,
+            source: "lm" as const,
+            sourceIds: [],
+          },
+          {
+            personaId: unselected.id,
+            content: discardedDraft,
+            source: "lm" as const,
+            sourceIds: [],
+          },
+        ];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime([mira, vale]),
+        {} as never,
+        {} as never,
+        () => [mira, vale],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.25,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "lobby" ? 50 : 0,
+            competence: 50,
+            aggression: 25,
+            explicitness: 50,
+          }),
+        },
+      );
+      const thread: AmbientThreadState = {
+        seed: "Test one committed ambient action at a time.",
+        seedKey: "lobby:test-atomic-ticks",
+        semanticFamily: "test-atomic-ticks",
+        episodeId: "episode-test-atomic-ticks",
+        causalRootId: "episode-test-atomic-ticks",
+        messageCount: 0,
+        participantIds: [],
+        actionHistory: [],
+        shape: { minimumMessages: 3, softTargetMessages: 4, hardMaximumMessages: 5 },
+        hasOpenHook: true,
+        debateBeat: false,
+        languageHint: "sv",
+        origin: "room_seed",
+        openedAt: now,
+        updatedAt: now,
+      };
+      const internals = director as unknown as {
+        runAmbient: () => Promise<void>;
+        ambientThreads: Map<string, AmbientThreadState>;
+      };
+      internals.ambientThreads.set("lobby", thread);
+
+      await internals.runAmbient();
+      const afterFirstTick = store.getRecent("lobby", 10);
+      expect(afterFirstTick).toHaveLength(1);
+      expect(afterFirstTick[0]?.content).toBe(acceptedLines[0]);
+      expect(afterFirstTick.some((message) => message.content === discardedDraft)).toBe(false);
+
+      now += 90_000;
+      vi.setSystemTime(now);
+      await internals.runAmbient();
+
+      const messages = store.getRecent("lobby", 10);
+      expect(requests).toHaveLength(2);
+      expect(requests.every((request) => request.selectedIds.length === 1)).toBe(true);
+      expect(messages).toHaveLength(2);
+      expect(messages.map((message) => message.content)).toEqual(acceptedLines);
+      expect(messages.some((message) => message.content === discardedDraft)).toBe(false);
+      expect(requests[1]?.selectedIds[0]).not.toBe(requests[0]?.selectedIds[0]);
+      expect(requests[1]?.history.map((line) => line.content)).toContain(acceptedLines[0]);
+      expect(requests[1]?.history.map((line) => line.content)).not.toContain(discardedDraft);
+      expect(requests[1]?.ambientAction).toMatchObject({
+        turnIndex: 1,
+        targetMessageId: messages[0]?.id,
+      });
+      expect(messages[1]?.replyToId).toBe(messages[0]?.id);
+
+      const typingEvents = emitted.filter((entry) => entry.event === "typing:member") as Array<{
+        event: string;
+        payload: { channelId: string; memberId: string; active: boolean };
+      }>;
+      expect(new Set(
+        typingEvents.filter(({ payload }) => payload.active).map(({ payload }) => payload.memberId),
+      )).toEqual(new Set(requests.flatMap((request) => request.selectedIds)));
+      const activeByChannel = new Map<string, Set<string>>();
+      const transitions = new Map<string, { active: number; inactive: number }>();
+      for (const { payload } of typingEvents) {
+        const active = activeByChannel.get(payload.channelId) ?? new Set<string>();
+        const key = `${payload.channelId}:${payload.memberId}`;
+        const count = transitions.get(key) ?? { active: 0, inactive: 0 };
+        if (payload.active) {
+          expect(active.has(payload.memberId)).toBe(false);
+          active.add(payload.memberId);
+          count.active += 1;
+        } else {
+          expect(active.has(payload.memberId)).toBe(true);
+          active.delete(payload.memberId);
+          count.inactive += 1;
+        }
+        activeByChannel.set(payload.channelId, active);
+        transitions.set(key, count);
+        expect(active.size).toBeLessThanOrEqual(1);
+      }
+      expect([...activeByChannel.values()].every((active) => active.size === 0)).toBe(true);
+      expect([...transitions.values()].every((count) => count.active > 0 && count.active === count.inactive)).toBe(true);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a published autonomous research lead and its bounded source packet when the queued responder is reviewed away", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = Date.parse("2026-07-15T18:00:00.000Z");
+      vi.setSystemTime(now);
+      const channel = CHANNELS.find((candidate) => candidate.id === "ai-programming")!;
+      const store = new RoomStore("/tmp/director-research-atomic-continuation-unused.json");
+      const actorChannels = new ActorChannelRuntime();
+      const persistence = new MemoryAmbientEpisodePersistence();
+      const ledger = new AmbientEpisodeLedger({ persistence, now: () => now, persistDelayMs: 60_000 });
+      await ledger.load();
+      const sourceUrl = "https://example.com/agent-recovery";
+      const research = {
+        kind: "page" as const,
+        query: "agent recovery after tool failure",
+        retrievedAt: new Date(now).toISOString(),
+        results: [{
+          id: "S1",
+          title: "Agent recovery benchmark",
+          url: sourceUrl,
+          snippet: "The benchmark checks whether later state remains correct after a failed tool step.",
+          publishedAt: "2026-07-15T10:00:00.000Z",
+        }],
+      };
+      const requests: Array<{
+        selectedIds: string[];
+        history: Array<{ content: string }>;
+        ambientAction: { kind: string; turnIndex: number; targetMessageId?: string };
+        research?: unknown;
+      }> = [];
+      let openingLeadId: string | undefined;
+      const reviewedAwayDraft = "Detta utkast tillhör inte den ansvariga fortsättaren.";
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        history: Array<{ content: string }>;
+        ambientAction: { kind: string; turnIndex: number; targetMessageId?: string };
+        research?: unknown;
+      }) => {
+        requests.push({
+          selectedIds: request.selected.map((persona) => persona.id),
+          history: request.history.map((line) => ({ content: line.content })),
+          ambientAction: { ...request.ambientAction },
+          research: request.research === undefined ? undefined : structuredClone(request.research),
+        });
+        if (requests.length === 1) {
+          openingLeadId = request.selected[0]!.id;
+          return [{
+            personaId: openingLeadId,
+            content: "Det viktiga i testet är att senare tillstånd fortfarande är korrekt efter verktygsfelet.",
+            source: "lm" as const,
+            sourceIds: ["S1"],
+          }];
+        }
+        return [{
+          personaId: openingLeadId!,
+          content: reviewedAwayDraft,
+          source: "lm" as const,
+          sourceIds: ["S1"],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        actorChannels,
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.2,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: true,
+          ambientTemporalCueChance: 0,
+          ambientEpisodeLedger: ledger,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === channel.id ? 60 : 0,
+            autonomousLinkFrequency: 100,
+            competence: 50,
+            aggression: 25,
+            explicitness: 50,
+          }),
+        },
+      );
+      const available = actorChannels
+        .candidatesFor(channel.id)
+        .filter((persona) => persona.id !== "ai-runa" && persona.id !== "ai-robin");
+      const thread: AmbientThreadState = {
+        seed: "unused until the research seed is committed",
+        messageCount: 0,
+        participantIds: [],
+        debateBeat: false,
+        languageHint: "sv",
+        openedAt: now,
+        updatedAt: now,
+      };
+      const internals = director as unknown as {
+        runAmbient: () => Promise<void>;
+        ambientThreads: Map<string, AmbientThreadState>;
+        runAutonomousResearchConversation: (
+          room: typeof channel,
+          epoch: number,
+          candidates: typeof PERSONAS,
+          state: AmbientThreadState,
+          seed: AutonomousResearchSeed,
+          prepared: { research: typeof research },
+        ) => Promise<boolean>;
+      };
+      internals.ambientThreads.set(channel.id, thread);
+      expect(await internals.runAutonomousResearchConversation(
+        channel,
+        0,
+        available,
+        thread,
+        {
+          id: "agent-recovery-regression",
+          query: research.query,
+          mode: "web",
+          maxAgeDays: 7,
+          discussionAngle: "Discuss what a recovery benchmark should prove after a failed tool step.",
+        },
+        { research },
+      )).toBe(true);
+
+      const lead = store.getRecent(channel.id, 10)[0]!;
+      const boundedResearch = structuredClone(thread.research!);
+      expect(store.getRecent(channel.id, 10)).toHaveLength(1);
+      expect(lead.sources).toEqual([{
+        title: "Agent recovery benchmark",
+        url: sourceUrl,
+        publishedAt: "2026-07-15T10:00:00.000Z",
+      }]);
+      expect(thread).toMatchObject({
+        messageCount: 1,
+        lastMessageId: lead.id,
+        pendingBeat: { kind: "research_response", attempts: 0 },
+      });
+      expect(ledger.current(channel.id)).toMatchObject({
+        messageIds: [lead.id],
+        sourceUrls: [sourceUrl],
+        status: "current",
+      });
+
+      now += 120_000;
+      vi.setSystemTime(now);
+      await internals.runAmbient();
+
+      expect(requests).toHaveLength(2);
+      expect(requests[1]?.selectedIds).toHaveLength(1);
+      expect(requests[1]?.selectedIds[0]).not.toBe(openingLeadId);
+      expect(requests[1]?.ambientAction).toMatchObject({
+        kind: "source_followup",
+        turnIndex: 1,
+        targetMessageId: lead.id,
+      });
+      expect(requests[1]?.history.map((line) => line.content)).toContain(lead.content);
+      expect(requests[1]?.history.map((line) => line.content)).not.toContain(reviewedAwayDraft);
+      expect(requests[1]?.research).toEqual(boundedResearch);
+      expect(requests[1]?.research).toMatchObject({
+        results: [{ id: "S1", url: sourceUrl }],
+      });
+      expect(store.getRecent(channel.id, 10)).toEqual([lead]);
+      expect(thread).toMatchObject({ closeReason: "model_rejected", messageCount: 1 });
+      expect(thread.pendingBeat).toBeUndefined();
+      expect(ledger.current(channel.id)).toBeUndefined();
+      expect(ledger.recent(channel.id, 1)[0]).toMatchObject({
+        messageIds: [lead.id],
+        sourceUrls: [sourceUrl],
+        status: "closed",
+        closeReason: "model_rejected",
+      });
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("mutates an injected memory episode ledger only after publication and closes it on human preemption", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-15T18:30:00.000Z");
+      vi.setSystemTime(now);
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+      const persistence = new MemoryAmbientEpisodePersistence();
+      const ledger = new AmbientEpisodeLedger({ persistence, now: () => now, persistDelayMs: 60_000 });
+      await ledger.load();
+      const openEpisode = vi.spyOn(ledger, "openEpisode");
+      const makeHarness = (mode: "empty" | "rejected" | "published", suffix: string) => {
+        const store = new RoomStore(`/tmp/director-memory-ledger-${suffix}-unused.json`);
+        const generateScene = vi.fn(async (request: {
+          selected: Array<(typeof PERSONAS)[number]>;
+        }) => {
+          if (mode === "empty") return [];
+          const selected = request.selected[0]!;
+          const alternate = selected.id === mira.id ? vale : mira;
+          return [{
+            personaId: mode === "rejected" ? alternate.id : selected.id,
+            content: mode === "rejected"
+              ? "Det här utkastet saknar den valda ansvariga avsändaren."
+              : "Den här konkreta posten är första tillåtna ledger-mutationen.",
+            source: "lm" as const,
+            sourceIds: [],
+          }];
+        });
+        const director = new SocialDirector(
+          { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+          store,
+          {
+            health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+            generateScene,
+            rememberDeliveredLine: vi.fn(),
+          } as never,
+          new ActorChannelRuntime([mira, vale]),
+          {} as never,
+          {} as never,
+          () => [mira, vale],
+          () => 1,
+          {
+            now: () => now,
+            rng: () => 0.25,
+            consideredConversationChance: 0,
+            autonomousResearchEnabled: false,
+            ambientTemporalCueChance: 0,
+            ambientEpisodeLedger: ledger,
+            behaviorTuningProvider: (channelId) => ({
+              activity: channelId === undefined || channelId === "lobby" ? 50 : 0,
+              competence: 50,
+              aggression: 25,
+              explicitness: 50,
+            }),
+          },
+        );
+        return { director, store };
+      };
+
+      const empty = makeHarness("empty", "empty");
+      await (empty.director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+      expect(empty.store.getRecent("lobby", 10)).toEqual([]);
+      expect(openEpisode).not.toHaveBeenCalled();
+      expect(ledger.current("lobby")).toBeUndefined();
+      expect(ledger.recent("lobby")).toEqual([]);
+      empty.director.stop();
+
+      const rejected = makeHarness("rejected", "rejected");
+      await (rejected.director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+      expect(rejected.store.getRecent("lobby", 10)).toEqual([]);
+      expect(openEpisode).not.toHaveBeenCalled();
+      expect(ledger.current("lobby")).toBeUndefined();
+      expect(ledger.recent("lobby")).toEqual([]);
+      rejected.director.stop();
+
+      const published = makeHarness("published", "published");
+      const publishedInternals = published.director as unknown as {
+        runAmbient: () => Promise<void>;
+        noteHumanChannelEvent: (message: ReturnType<typeof createMessage>) => void;
+      };
+      await publishedInternals.runAmbient();
+      const aiMessage = published.store.getRecent("lobby", 10)[0]!;
+      const current = ledger.current("lobby")!;
+      expect(openEpisode).toHaveBeenCalledTimes(1);
+      expect(current).toMatchObject({
+        status: "current",
+        messageIds: [aiMessage.id],
+        participantIds: [aiMessage.authorId],
+      });
+
+      const humanMessage = createMessage("lobby", "guest-ledger-preemption", "Nu tar en människa över ämnet.");
+      published.store.addPublicMessage(humanMessage);
+      publishedInternals.noteHumanChannelEvent(humanMessage);
+      expect(ledger.current("lobby")).toBeUndefined();
+      expect(ledger.recent("lobby", 1)[0]).toMatchObject({
+        id: current.id,
+        status: "closed",
+        closeReason: "human_preempted",
+        messageIds: [aiMessage.id],
+      });
+
+      await ledger.flush();
+      const restored = new AmbientEpisodeLedger({ persistence, now: () => now, persistDelayMs: 60_000 });
+      await restored.load();
+      expect(restored.current("lobby")).toBeUndefined();
+      expect(restored.recent("lobby", 1)[0]).toMatchObject({
+        id: current.id,
+        closeReason: "human_preempted",
+        messageIds: [aiMessage.id],
+      });
+      published.director.stop();
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

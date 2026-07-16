@@ -4844,6 +4844,67 @@ describe("LM Studio one-pass humanizer", () => {
     expect(call).toBe(2);
   });
 
+  it("reviews a typed autonomous market pulse through the same source-fit contract", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const farah = PERSONAS.find((persona) => persona.id === "ai-farah")!;
+    let call = 0;
+    let reviewPayload: Record<string, any> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      if (call === 1) {
+        return completionResponse([{
+          personaId: farah.id,
+          content: "S&P 500 var senast rapporterad upp 3,2 procent; jag hade kollat om rörelsen faktiskt bar brett innan jag drog stora slutsatser.",
+          sourceIds: ["S1"],
+        }]);
+      }
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+      reviewPayload = JSON.parse(body.messages[1]!.content) as Record<string, any>;
+      return candidateReviewCompletion([{
+        personaId: farah.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [farah],
+      history: [],
+      research: {
+        kind: "market",
+        query: "validated major equity-index movement",
+        retrievedAt: "2026-07-15T14:30:00.000Z",
+        results: [{
+          id: "S1",
+          title: "S&P 500 latest reported observation",
+          url: "https://markets.example.test/us-sp500",
+          snippet: "S&P 500 was latest reported up 3.2% versus the previous close at 2026-07-15T14:29:00.000Z. The observation does not establish why the move happened.",
+          publishedAt: "2026-07-15T14:29:00.000Z",
+        }],
+      },
+      autonomousResearchContext: {
+        seedId: "market-pulse-move-sp500",
+        roomTopic: "markets, businesses, risk and respectfully incompatible theses",
+        discussionAngle: "Discuss the latest-reported index move and what would be worth checking next without inventing a cause.",
+      },
+      urlPublicationPolicy: "server_card",
+    });
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.sourceIds).toEqual(["S1"]);
+    expect(reviewPayload).toMatchObject({
+      sceneKind: "ambient",
+      autonomousResearchContext: { seedId: "market-pulse-move-sp500" },
+      evidence: { outcome: "succeeded", kind: "market", results: [{ id: "S1" }] },
+    });
+    expect(call).toBe(2);
+  });
+
   it("does not lexical-classify a denial when candidate review is explicitly disabled", async () => {
     const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
     let completionCalls = 0;

@@ -39,6 +39,7 @@ import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { SocialDirector } from "./director.js";
+import { AmbientEpisodeLedger } from "./ambientEpisodeLedger.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
 import { fetchRemoteImage, ImageStore, ImageStoreError } from "./imageStore.js";
 import { HUMAN_MEMORY_DEFAULTS, HumanMemoryStore } from "./humanMemory.js";
@@ -422,6 +423,8 @@ const io = new Server(httpServer, {
 
 const store = new RoomStore();
 const humanMemory = new HumanMemoryStore();
+const ambientEpisodeLedger = new AmbientEpisodeLedger();
+await ambientEpisodeLedger.load();
 let adminState!: AdminStateStore;
 const behaviorTuningProvider = (channelId?: string) => adminState?.behaviorTuning(channelId);
 const lmStudioBackend = new LmStudioBackend();
@@ -611,6 +614,7 @@ const director = new SocialDirector(
     marketSnapshotProvider,
     footballCompetitionProvider,
     marketPulseCoordinator,
+    ambientEpisodeLedger,
   },
 );
 
@@ -1780,7 +1784,13 @@ const shutdown = async (signal: string) => {
   clearInterval(healthInterval);
   director.stop();
   io.close();
-  await Promise.all([store.flush(), humanMemory.flush(), adminState.flush(), modelProviders.close()]);
+  await Promise.all([
+    store.flush(),
+    humanMemory.flush(),
+    ambientEpisodeLedger.flush(),
+    adminState.flush(),
+    modelProviders.close(),
+  ]);
   httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5_000).unref();
 };

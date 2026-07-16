@@ -3,6 +3,7 @@ import {
   CHANNEL_PROFILES,
   CHANNELS,
   CONVERSATION_REGISTERS,
+  defineAmbientPremiseCatalog,
   type ChannelProfile,
 } from "./channels.js";
 import { PERSONAS, type Persona } from "./personas.js";
@@ -40,11 +41,18 @@ describe("channel profiles", () => {
       expect(profile.topic.tags.length).toBeGreaterThan(2);
       expect(profile.ambientPremises.length).toBeGreaterThanOrEqual(profile.public.id === "the-pub" ? 20 : 16);
       expect(new Set(profile.ambientPremises.map(normalizedContentKey)).size).toBe(profile.ambientPremises.length);
-      if (profile.ambientPremiseFamilies) {
-        expect(profile.ambientPremiseFamilies).toHaveLength(profile.ambientPremises.length);
-        expect(profile.ambientPremiseFamilies.every((family) => /^[a-z0-9-]{3,48}$/.test(family))).toBe(true);
-        expect(new Set(profile.ambientPremiseFamilies).size).toBeGreaterThanOrEqual(8);
+      expect(profile.ambientPremiseFamilies, profile.public.id).toBeDefined();
+      const premiseFamilies = profile.ambientPremiseFamilies!;
+      expect(premiseFamilies, profile.public.id).toHaveLength(profile.ambientPremises.length);
+      expect(premiseFamilies.every((family) => /^[a-z0-9-]{3,48}$/.test(family)), profile.public.id).toBe(true);
+      const familyCounts = new Map<string, number>();
+      for (const family of premiseFamilies) {
+        familyCounts.set(family, (familyCounts.get(family) ?? 0) + 1);
       }
+      expect(familyCounts.size, profile.public.id).toBeGreaterThanOrEqual(
+        Math.ceil(profile.ambientPremises.length * 0.75),
+      );
+      expect(Math.max(...familyCounts.values()), profile.public.id).toBeLessThanOrEqual(2);
       if (profile.autonomousResearchPriority !== undefined) {
         expect(profile.autonomousResearchPriority, profile.public.id).toBeGreaterThanOrEqual(0.25);
         expect(profile.autonomousResearchPriority, profile.public.id).toBeLessThanOrEqual(4);
@@ -58,6 +66,18 @@ describe("channel profiles", () => {
     }
     const allPremises = CHANNEL_PROFILES.flatMap((profile) => profile.ambientPremises.map(normalizedContentKey));
     expect(new Set(allPremises).size).toBe(allPremises.length);
+  });
+
+  it("projects atomic ambient catalogue entries without losing their association", () => {
+    const catalogue = defineAmbientPremiseCatalog([
+      ["first-family", "First premise"],
+      ["second-family", "Second premise"],
+    ]);
+
+    expect(catalogue).toEqual({
+      ambientPremiseFamilies: ["first-family", "second-family"],
+      ambientPremises: ["First premise", "Second premise"],
+    });
   });
 
   it("defines bounded, stable and non-repeating autonomous research starters", () => {

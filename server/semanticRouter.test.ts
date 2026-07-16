@@ -2047,6 +2047,44 @@ const failedCapabilityReviewInput = (): NormalizedCandidateReviewInput => {
 };
 
 describe("multilingual batch candidate-review contract", () => {
+  it("accepts only structurally valid one-action ambient contracts", () => {
+    const base = reviewInput();
+    const ambientBase = {
+      ...base,
+      sceneKind: "ambient" as const,
+      trigger: null,
+      evidence: { outcome: "none" as const, kind: null, query: null, results: [] },
+      candidates: [{ ...base.candidates[0], sourceIds: [] }],
+      ambientAction: {
+        episodeId: "episode-1",
+        causalRootId: "episode-1",
+        semanticFamily: "community-rituals",
+        kind: "open_topic" as const,
+        turnIndex: 0,
+        targetMessageId: null,
+        openHook: true,
+        previousActions: [],
+      },
+    };
+
+    expect(candidateReviewInputSchema.safeParse(ambientBase).success).toBe(true);
+    expect(candidateReviewInputSchema.safeParse({
+      ...ambientBase,
+      ambientAction: {
+        ...ambientBase.ambientAction,
+        kind: "advance_claim",
+        turnIndex: 1,
+        previousActions: ["open_topic"],
+      },
+    }).success).toBe(false);
+    expect(candidateReviewInputSchema.safeParse({
+      ...ambientBase,
+      sceneKind: "public",
+    }).success).toBe(false);
+    expect(buildCandidateReviewSystemPrompt()).toContain("ambient_action_mismatch");
+    expect(buildCandidateReviewSystemPrompt()).toContain("A terse fragment, joke, dry disagreement or pointed question is clean");
+  });
+
   it("accepts typed weather evidence for grounding review", () => {
     const base = reviewInput();
     const parsed = candidateReviewInputSchema.parse({
@@ -2091,6 +2129,17 @@ describe("multilingual batch candidate-review contract", () => {
     const autonomousBase = { ...base, sceneKind: "ambient" as const, trigger: null };
     const parsed = candidateReviewInputSchema.parse({ ...autonomousBase, autonomousResearchContext });
     expect(parsed.autonomousResearchContext).toEqual(autonomousResearchContext);
+    const marketParsed = candidateReviewInputSchema.parse({
+      ...autonomousBase,
+      evidence: {
+        outcome: "succeeded",
+        kind: "market",
+        query: "validated major equity-index movement",
+        results: [{ id: "S1", title: "S&P 500", snippet: "Latest reported move from a typed provider." }],
+      },
+      autonomousResearchContext,
+    });
+    expect(marketParsed.evidence.kind).toBe("market");
     expect(reviewInput().autonomousResearchContext).toBeNull();
     expect(candidateReviewInputSchema.safeParse({
       ...autonomousBase,

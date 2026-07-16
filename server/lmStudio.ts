@@ -26,6 +26,7 @@ import {
   type ProtectedFragment,
 } from "./humanizer.js";
 import type { Persona } from "./personas.js";
+import type { AmbientActionContract } from "./ambientActionPlanner.js";
 import { LmStudioBackend } from "./lmStudioBackend.js";
 import type { ModelBackend } from "./modelBackend.js";
 import { ModelBackendError } from "./modelBackend.js";
@@ -192,6 +193,8 @@ export interface SceneCapabilityContext {
 
 export interface SceneRequest {
   kind: SceneKind;
+  /** Trusted one-action ambient contract. Omitted for every human, DM and voice turn. */
+  ambientAction?: AmbientActionContract;
   conversationMode?: "quick" | "considered";
   /** Explicit phase for sequential considered beats; omitted keeps the legacy combined-scene contract. */
   consideredRole?: "lead" | "response";
@@ -365,6 +368,7 @@ const NON_REPAIRABLE_CANDIDATE_ISSUES = new Set<CandidateReviewIssue>([
   "incorrect_temporal_claim",
   "unsafe_retaliation",
   "conflict_pile_on",
+  "ambient_action_mismatch",
 ]);
 
 const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonCode> = {
@@ -390,6 +394,7 @@ const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonC
   behavior_intensity_violation: "style_contract",
   unsafe_retaliation: "room_contract",
   conflict_pile_on: "room_contract",
+  ambient_action_mismatch: "room_contract",
   self_repetition: "near_duplicate_self",
   peer_echo: "near_duplicate_peer",
 };
@@ -815,6 +820,12 @@ export const buildSceneSystemPrompt = (request: SceneRequest): string => {
 - Any other selected actor stays at ${consideredResponseLimit.minimum}–${consideredResponseLimit.maximum} words and must add a genuinely different move: a counterexample, pointed question, practical consequence or respectful challenge. Never paraphrase the lead.
 - Preserve each actor's ordinary voice and hard maximum. Keep it conversational rather than essay-like: no thesis framing, balanced mini-debate, conclusion paragraph, headings, numbered structure or generic invitation for everyone to share their thoughts.`
     : "";
+  const ambientActionRules = request.kind === "ambient" && request.ambientAction
+    ? `
+- This generation is one atomic ambient action, not a complete multi-person scene. Only the selected resident may speak.
+- trustedAmbientAction.kind is the exact conversational move to perform against the live episode. Follow its target and keep the semantic family; do not restart the setup, jump to an unrelated topic, paraphrase the previous line or close an open hook with generic agreement.
+- A short fragment, blunt countertake or pointed question is valid when it genuinely performs the move. Do not pad it into an explanation merely to sound substantive.`
+    : "";
 
   const latestVoiceOrigin = request.voiceContext?.latestUtteranceOrigin;
   const voiceOriginRule = latestVoiceOrigin === "typed-voice-fallback"
@@ -888,7 +899,7 @@ ${temporalPolicyRule}`
 The deterministic director already chose the only actors you may write:
 ${cards}
 
-Rules:${consideredRules}
+Rules:${consideredRules}${ambientActionRules}
 - Write as the characters, never about them. Preserve sharply different voices.
 - Room register changes formality, not personality. Do not give every actor the same polished house voice, slang, fragments or verbal tics.
 - Keep each ${request.kind === "voice" ? "spoken turn" : "message"} natural and chat-sized: ${request.kind === "voice" ? "5–25 spoken words" : request.conversationMode === "considered" ? "follow the rare considered-beat limits above" : "normally 4–35 words"}.${voiceRules}${temporalRules}
@@ -1894,6 +1905,18 @@ export class LmStudioClient {
           }
         : null,
       premise: request.premise?.slice(0, 1_000) ?? null,
+      ambientAction: request.ambientAction
+        ? {
+            episodeId: request.ambientAction.episodeId,
+            causalRootId: request.ambientAction.causalRootId,
+            semanticFamily: request.ambientAction.semanticFamily,
+            kind: request.ambientAction.kind,
+            turnIndex: request.ambientAction.turnIndex,
+            targetMessageId: request.ambientAction.targetMessageId ?? null,
+            openHook: request.ambientAction.openHook,
+            previousActions: request.ambientAction.previousActions,
+          }
+        : null,
       semanticContext: {
         // `languageHint` is a human-readable generation direction, not
         // machine metadata (ambient scenes intentionally use full phrases).
@@ -2747,6 +2770,7 @@ export class LmStudioClient {
       : request.trigger ?? null;
     return {
       sceneType: request.kind,
+      trustedAmbientAction: request.ambientAction ?? null,
       conversationMode: request.conversationMode ?? "quick",
       consideredRole: request.consideredRole ?? "combined",
       consideredResponseRole: request.consideredResponseRole ?? null,

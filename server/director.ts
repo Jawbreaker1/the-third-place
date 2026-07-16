@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Server } from "socket.io";
 import type {
   ChatMessage,
@@ -84,6 +84,16 @@ import type {
   MarketPulseMovementCandidate,
   ValidatedMarketObservation,
 } from "./marketPulse.js";
+import {
+  ambientActionInstruction,
+  decideAmbientAction,
+  sampleAmbientEpisodeShape,
+  type AmbientActionContract,
+  type AmbientActionDecision,
+  type AmbientActionKind,
+  type AmbientEpisodeShape,
+} from "./ambientActionPlanner.js";
+import type { AmbientEpisodeLedger } from "./ambientEpisodeLedger.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -340,32 +350,71 @@ interface PendingBurst {
   timer: NodeJS.Timeout;
 }
 
-const AMBIENT_THREAD_MAX_MESSAGES = 4;
+const AMBIENT_THREAD_MAX_MESSAGES = 8;
 const AMBIENT_THREAD_COOLDOWN_MS = 8 * 60_000;
-const AMBIENT_THREAD_IDLE_EXPIRY_MS = 3 * 60_000;
+const AMBIENT_THREAD_IDLE_EXPIRY_MS = 12 * 60_000;
 const AMBIENT_RECENT_SEED_WINDOW = 6;
 const AMBIENT_FAILURE_BACKOFF_MS = 60_000;
 const AMBIENT_ALTERNATE_WAIT_MS = 30_000;
-// A live thread gets the next autonomous slot before a brand-new room topic;
-// the four-message cap and global publication budget still prevent monopolies.
+// A live episode remains easier to resume than a fresh topic, but a bounded
+// pause between actions lets other rooms breathe instead of producing one
+// mechanically complete mini-scene at a time.
 const AMBIENT_THREAD_CONTINUITY_BONUS = 4.5;
 
 export interface AmbientThreadState {
   seed: string;
+  /** Stable server-authored keys; no transcript text is treated as taxonomy. */
+  seedKey?: string;
+  semanticFamily?: string;
+  episodeId?: string;
+  causalRootId?: string;
   messageCount: number;
   lastMessageId?: string;
   lastAuthorId?: string;
   participantIds: string[];
+  actionHistory?: AmbientActionKind[];
+  shape?: AmbientEpisodeShape;
+  hasOpenHook?: boolean;
+  nextEligibleAt?: number;
+  pendingBeat?: {
+    kind: "considered_response" | "research_response";
+    preferredActorId?: string;
+    responseRole?: ConsideredResponseRole;
+    attempts: number;
+  };
+  closedAt?: number;
+  closeReason?: "natural" | "budget" | "human_preempted" | "model_rejected" | "expired" | "catalog_changed" | "stopped";
   /** Chosen once for the whole thread so disagreement survives more than one scheduler tick. */
   debateBeat: boolean;
   languageHint: string;
   languageTag?: string;
   /** Bounded, server-read evidence retained only for this short-lived thread. */
   research?: ResearchPacket;
+  /** Trusted in-memory source-fit contract retained for later research beats. */
+  autonomousResearchContext?: {
+    seedId: string;
+    roomTopic: string;
+    discussionAngle: string;
+  };
   origin?: "room_seed" | "human_topic" | "autonomous_research";
   openedAt: number;
   updatedAt: number;
 }
+
+const ambientThreadOrigin = (thread: AmbientThreadState) => thread.origin ?? "room_seed";
+
+const fallbackAmbientShape = (thread: AmbientThreadState): AmbientEpisodeShape => ({
+  minimumMessages: Math.min(3, Math.max(1, thread.messageCount + 1)),
+  softTargetMessages: Math.min(6, Math.max(2, thread.messageCount + 2)),
+  hardMaximumMessages: Math.min(8, Math.max(3, thread.messageCount + 3)),
+});
+
+const ambientThreadHardMaximum = (thread: AmbientThreadState): number =>
+  thread.shape?.hardMaximumMessages ?? AMBIENT_THREAD_MAX_MESSAGES;
+
+/** Exact-seed identity without persisting prompt prose or depending on list order. */
+const ambientSeedKey = (channelId: string, seed: string): string =>
+  `${channelId}:seed-${createHash("sha256").update(seed.normalize("NFC"), "utf8").digest("hex").slice(0, 16)}`;
 
 /**
  * Selects a room-authored premise without immediately cycling through the same
@@ -533,6 +582,7 @@ export function ambientConversationPremise(
   continuation = false,
   debateBeat = false,
   mode: AmbientMode = "discussion",
+  action?: AmbientActionKind,
 ): string {
   const wordLimits = ambientSceneWordLimits(lead, responder, continuation, mode);
   const leadLimit = wordLimits[lead.id]!;
@@ -547,7 +597,7 @@ export function ambientConversationPremise(
         ? `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words with one countertake, adjacent recommendation, punchline or incompatible concrete preference. Keep it table-talk blunt or playful; do not politely agree, summarize or declare a formal debate.`
         : `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words with one distinct move: a countertake, adjacent recommendation, punchline, groan or genuine specific question.`
       : "";
-    return `${opening} ${leadRole} ${responseRole} Do not recap, broadly agree, offer advice or an assistant-style overview, explain a punchline, introduce alcohol, perform the room's Friday mood or invite the whole room to answer. Exactly the selected residents speak in order; short fragments and silence remain valid.`.replace(/\s+/g, " ").trim();
+    return `${opening} ${leadRole} ${responseRole} ${action ? ambientActionInstruction(action, mode) : ""} Do not recap, broadly agree, offer advice or an assistant-style overview, explain a punchline, introduce alcohol, perform the room's Friday mood or invite the whole room to answer. Exactly the selected residents speak in order; short fragments and silence remain valid.`.replace(/\s+/g, " ").trim();
   }
   if (mode === "casual") {
     const opening = continuation
@@ -559,7 +609,7 @@ export function ambientConversationPremise(
         ? `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words with one ordinary, specific counterexample or competing preference. Do not soften it into agreement, summarize, or use debate-club language.`
         : `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words with a different reaction, counterexample, small tangent or genuine question. Do not summarize.`
       : "";
-    return `${opening} ${leadRole} ${responseRole} One thought per message. No miniature essay, panel-discussion language, generic room invitation or assistant-style overview. Exactly the selected residents speak in order; fragments and silence remain valid.`.replace(/\s+/g, " ").trim();
+    return `${opening} ${leadRole} ${responseRole} ${action ? ambientActionInstruction(action, mode) : ""} One thought per message. No miniature essay, panel-discussion language, generic room invitation or assistant-style overview. Exactly the selected residents speak in order; fragments and silence remain valid.`.replace(/\s+/g, " ").trim();
   }
   const opening = continuation
     ? `Continue only the unresolved thread built from this exact seed: “${seed}”. Do not switch topics or extend an unrelated metaphor from older history.`
@@ -572,7 +622,7 @@ export function ambientConversationPremise(
       ? `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words, acknowledges the strongest point, then supplies one specific counterexample or hidden cost. Do not simply agree.`
       : `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words and advances the same issue with one new consequence, example or precise unresolved question. Do not summarize.`
     : "";
-  return `${opening} ${leadRole} ${responseRole} No generic room invitation, filler about the chat being quiet, assistant-style overview or broad “what do you think?” ending. Exactly the selected residents speak in order.`.replace(/\s+/g, " ").trim();
+  return `${opening} ${leadRole} ${responseRole} ${action ? ambientActionInstruction(action, mode) : ""} No generic room invitation, filler about the chat being quiet, assistant-style overview or broad “what do you think?” ending. Exactly the selected residents speak in order.`.replace(/\s+/g, " ").trim();
 }
 
 export type ConsideredResponseRole = "challenge" | "example" | "question";
@@ -668,6 +718,8 @@ export interface SocialDirectorOptions {
   > | null;
   /** Live server-owned behavior settings; storage and authorization stay outside the director. */
   behaviorTuningProvider?: BehaviorTuningProvider;
+  /** Loaded, bounded semantic episode metadata. Chat history remains owned by RoomStore. */
+  ambientEpisodeLedger?: AmbientEpisodeLedger;
 }
 
 export interface HumanReactionResponseGate {
@@ -821,7 +873,7 @@ export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boo
     !gate.freshThread ||
     gate.voiceRoomActive ||
     gate.queueDepth > 0 ||
-    gate.availableMessageSlots < 2 ||
+    gate.availableMessageSlots < 1 ||
     gate.availableActors < 2 ||
     dailySuccesses >= gate.dailyCap
   ) return false;
@@ -1121,7 +1173,7 @@ export function shouldSurfaceTemporalCue(gate: TemporalCueGate): boolean {
  * deterministic in tests rather than relying on real timers.
  */
 export function shouldStartConsideredConversation(gate: ConsideredConversationGate): boolean {
-  if (gate.voiceRoomActive || gate.alreadyInFlight || gate.queueDepth > 0 || gate.availableMessageSlots < 2) {
+  if (gate.voiceRoomActive || gate.alreadyInFlight || gate.queueDepth > 0 || gate.availableMessageSlots < 1) {
     return false;
   }
   if (gate.lastStartedAt !== undefined && gate.now - gate.lastStartedAt < gate.cooldownMs) return false;
@@ -1579,6 +1631,7 @@ export class SocialDirector {
     rooms: readonly string[];
   }>();
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
+  private readonly ambientEpisodeLedger?: AmbientEpisodeLedger;
   private lastAutonomousResearchSuccessAt?: number;
   private autonomousResearchGlobalRetryAfterAt?: number;
   private autonomousResearchGlobalConsecutiveFailures = 0;
@@ -1614,6 +1667,7 @@ export class SocialDirector {
     this.marketSnapshotProvider = options.marketSnapshotProvider ?? undefined;
     this.marketPulseCoordinator = options.marketPulseCoordinator ?? undefined;
     this.behaviorTuningProvider = options.behaviorTuningProvider;
+    this.ambientEpisodeLedger = options.ambientEpisodeLedger;
     this.dmTurns = new DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>({
       debounceMs: options.dmDebounceMs,
       generate: (turn) => this.generateDirectTurn(turn),
@@ -1697,6 +1751,8 @@ export class SocialDirector {
     this.humanReactionResponsesInFlight.clear();
     this.dmTurns.dispose();
     this.typingLeases.clearAll();
+    for (const thread of this.ambientThreads.values()) this.closeAmbientThread(thread, "stopped");
+    this.ambientThreads.clear();
   }
 
   getEvents(): DirectorEvent[] {
@@ -1728,6 +1784,7 @@ export class SocialDirector {
     for (const channelId of channelIds) {
       this.channelEpoch.set(channelId, (this.channelEpoch.get(channelId) ?? 0) + 1);
     }
+    for (const thread of this.ambientThreads.values()) this.closeAmbientThread(thread, "catalog_changed");
     this.ambientThreads.clear();
     this.ambientBackoffUntilByChannel.clear();
     this.recentAmbientSeedsByChannel.clear();
@@ -1736,6 +1793,11 @@ export class SocialDirector {
   }
 
   setVoiceRoomActive(active: boolean): void {
+    if (active && !this.voiceRoomActive) {
+      for (const channelId of [...this.ambientThreads.keys()]) {
+        this.invalidateAmbientChannel(channelId, "human_preempted");
+      }
+    }
     this.voiceRoomActive = active;
   }
 
@@ -1748,8 +1810,7 @@ export class SocialDirector {
     const now = this.now();
     this.lastHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(channelId, now);
-    this.ambientThreads.delete(channelId);
-    this.channelEpoch.set(channelId, (this.channelEpoch.get(channelId) ?? 0) + 1);
+    this.invalidateAmbientChannel(channelId, "human_preempted");
   }
 
   async welcome(human: Member, options: { returning?: boolean; languageHint?: string } = {}): Promise<void> {
@@ -1758,8 +1819,7 @@ export class SocialDirector {
     const arrivalAt = this.now();
     this.lastHumanActivityAt = arrivalAt;
     this.lastHumanMessageAtByChannel.set("lobby", arrivalAt);
-    this.ambientThreads.delete("lobby");
-    this.channelEpoch.set("lobby", (this.channelEpoch.get("lobby") ?? 0) + 1);
+    this.invalidateAmbientChannel("lobby", "human_preempted");
     const candidates = PERSONAS.filter((persona) => persona.warmth > 0.7 && persona.id !== "ai-runa");
     const persona = choose(candidates);
     const temporalWelcome = shouldSurfaceTemporalCue({
@@ -1871,7 +1931,7 @@ export class SocialDirector {
     const now = this.now();
     this.lastHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(event.channelId, now);
-    this.ambientThreads.delete(event.channelId);
+    this.invalidateAmbientChannel(event.channelId, "human_preempted");
 
     const pendingKey = `${event.channelId}:${event.messageId}:${human.id}`;
     const existing = this.pendingHumanReactions.get(pendingKey);
@@ -2069,10 +2129,8 @@ export class SocialDirector {
     const now = this.now();
     this.lastHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(message.channelId, now);
-    this.ambientThreads.delete(message.channelId);
+    const epoch = this.invalidateAmbientChannel(message.channelId, "human_preempted");
     this.actorChannels.noteChannelEvent(message);
-    const epoch = (this.channelEpoch.get(message.channelId) ?? 0) + 1;
-    this.channelEpoch.set(message.channelId, epoch);
     this.humanMessageEpochById.set(message.id, epoch);
     while (this.humanMessageEpochById.size > 1_000) {
       const oldest = this.humanMessageEpochById.keys().next().value as string | undefined;
@@ -3260,10 +3318,10 @@ export class SocialDirector {
     ) this.autonomousResearchGlobalRetryAfterAt = undefined;
 
     const availableMessageSlots = Math.min(
-      2,
+      1,
       this.availableAutonomousMessageSlots(now, globalTuning.activity),
     );
-    if (availableMessageSlots < 2) return false;
+    if (availableMessageSlots < 1) return false;
 
     const eligibleCandidates = CHANNELS.flatMap((channel) => {
       const profile = getChannelProfile(channel.id);
@@ -3389,7 +3447,21 @@ export class SocialDirector {
         seed = pulse?.seed;
         preparedOutcome = pulse?.outcome;
       }
-      seed ??= selectAutonomousResearchSeed(candidate.seeds, recentSeeds, this.rng);
+      const persistedResearchEpisode = this.ambientEpisodeLedger?.current(candidate.channel.id);
+      const eligibleResearchSeeds = candidate.seeds.filter((researchSeed) => {
+        const semanticKey = `research:${researchSeed.id}`;
+        const matchesCurrent = Boolean(
+          persistedResearchEpisode && (
+            unicodeCaselessKey(persistedResearchEpisode.semanticKey) === unicodeCaselessKey(semanticKey) ||
+            unicodeCaselessKey(persistedResearchEpisode.semanticFamily) === unicodeCaselessKey(semanticKey)
+          ),
+        );
+        return !matchesCurrent && !(this.ambientEpisodeLedger?.isCoolingDown(candidate.channel.id, {
+          semanticKey,
+          semanticFamily: semanticKey,
+        }) ?? false);
+      });
+      seed ??= selectAutonomousResearchSeed(eligibleResearchSeeds, recentSeeds, this.rng);
       if (!seed) {
         this.abandonAmbientThread(candidate.channel.id, thread);
         continue;
@@ -3456,8 +3528,14 @@ export class SocialDirector {
     }
     const thread = this.ambientThreads.get(channelId);
     if (thread) {
-      if (thread.messageCount < AMBIENT_THREAD_MAX_MESSAGES) {
+      if (thread.closedAt !== undefined) {
+        if (now - thread.closedAt < AMBIENT_THREAD_COOLDOWN_MS) return false;
+        this.ambientThreads.delete(channelId);
+      } else if (thread.nextEligibleAt !== undefined && now < thread.nextEligibleAt) {
+        return false;
+      } else if (thread.messageCount < ambientThreadHardMaximum(thread)) {
         if (now - thread.updatedAt <= AMBIENT_THREAD_IDLE_EXPIRY_MS) return true;
+        this.closeAmbientThread(thread, "expired");
         this.ambientThreads.delete(channelId);
       }
       if (now - thread.updatedAt < AMBIENT_THREAD_COOLDOWN_MS) return false;
@@ -3481,7 +3559,9 @@ export class SocialDirector {
   private getOrStartAmbientThread(channelId: string, now: number): AmbientThreadState | undefined {
     const existing = this.ambientThreads.get(channelId);
     if (existing) {
-      return existing.messageCount < AMBIENT_THREAD_MAX_MESSAGES && now - existing.updatedAt <= AMBIENT_THREAD_IDLE_EXPIRY_MS
+      return existing.closedAt === undefined &&
+        existing.messageCount < ambientThreadHardMaximum(existing) &&
+        now - existing.updatedAt <= AMBIENT_THREAD_IDLE_EXPIRY_MS
         ? existing
         : undefined;
     }
@@ -3489,13 +3569,34 @@ export class SocialDirector {
     const profile = getChannelProfile(channelId) ?? getChannelProfile("lobby");
     if (!profile || profile.ambientPremises.length === 0) return undefined;
     const recentSeeds = this.recentAmbientSeedsByChannel.get(channelId) ?? [];
+    const persistedCurrent = this.ambientEpisodeLedger?.current(channelId);
+    const eligibleSeeds = profile.ambientPremises.flatMap((premise, index) => {
+      const semanticKey = ambientSeedKey(channelId, premise);
+      const semanticFamily = profile.ambientPremiseFamilies?.[index] ?? `unclassified-${semanticKey.slice(-16)}`;
+      const sameAsPersistedCurrent = Boolean(
+        persistedCurrent && (
+          unicodeCaselessKey(persistedCurrent.semanticKey) === unicodeCaselessKey(semanticKey) ||
+          unicodeCaselessKey(persistedCurrent.semanticFamily) === unicodeCaselessKey(semanticFamily)
+        ),
+      );
+      const coolingDown = this.ambientEpisodeLedger?.isCoolingDown(channelId, {
+        semanticKey,
+        semanticFamily,
+      }) ?? false;
+      return sameAsPersistedCurrent || coolingDown
+        ? []
+        : [{ premise, semanticKey, semanticFamily }];
+    });
+    if (eligibleSeeds.length === 0) return undefined;
     const seed = selectAmbientSeed(
-      profile.ambientPremises,
+      eligibleSeeds.map((candidate) => candidate.premise),
       recentSeeds,
       this.rng,
-      profile.ambientPremiseFamilies,
+      eligibleSeeds.map((candidate) => candidate.semanticFamily),
     );
     if (!seed) return undefined;
+    const selectedSeed = eligibleSeeds.find((candidate) => candidate.premise === seed)!;
+    const episodeId = randomUUID();
     const recent = this.store.getRecent(channelId, 80);
     const languageTag = this.lastTrustedLanguageByChannel.get(channelId);
     const baseDebateChance = profile.ambientMode === "banter" ? 0.08 : profile.ambientMode === "casual" ? 0.14 : 0.28;
@@ -3503,11 +3604,26 @@ export class SocialDirector {
       baseDebateChance,
       this.channelBehaviorTuning(channelId).aggression,
     );
+    const debateBeat = this.rng() < debateChance;
+    const shape = sampleAmbientEpisodeShape({
+      origin: "room_seed",
+      mode: profile.ambientMode ?? "discussion",
+      debateBeat,
+      rng: this.rng,
+    });
     const thread: AmbientThreadState = {
       seed,
+      seedKey: selectedSeed.semanticKey,
+      semanticFamily: selectedSeed.semanticFamily,
+      episodeId,
+      causalRootId: episodeId,
       messageCount: 0,
       participantIds: [],
-      debateBeat: this.rng() < debateChance,
+      actionHistory: [],
+      shape,
+      hasOpenHook: shape.minimumMessages > 1,
+      nextEligibleAt: now,
+      debateBeat,
       languageHint: languageTag ?? ambientLanguageHint(recent),
       ...(languageTag ? { languageTag } : {}),
       origin: "room_seed",
@@ -3515,20 +3631,154 @@ export class SocialDirector {
       updatedAt: now,
     };
     this.ambientThreads.set(channelId, thread);
-    this.recentAmbientSeedsByChannel.set(
-      channelId,
-      [...recentSeeds, seed].slice(-AMBIENT_RECENT_SEED_WINDOW),
-    );
     return thread;
   }
 
-  private recordAmbientPost(thread: AmbientThreadState, message: ChatMessage): void {
+  private ambientSourceUrls(messages: readonly ChatMessage[]): string[] {
+    return [...new Set(messages.flatMap((message) => [
+      ...(message.sources ?? []).map((source) => source.url),
+      ...(message.linkPreview ? [message.linkPreview.url] : []),
+    ]))];
+  }
+
+  /**
+   * Commits only publication-derived semantic metadata. A selected seed,
+   * model attempt or rejected candidate can never consume durable novelty.
+   */
+  private commitAmbientPublication(
+    thread: AmbientThreadState,
+    message: ChatMessage,
+    action?: AmbientActionDecision,
+  ): void {
+    const ledger = this.ambientEpisodeLedger;
+    if (!ledger || !thread.episodeId || !thread.seedKey || !thread.semanticFamily) return;
+    const operationId = `publish:${message.id}`;
+    const hook = action?.keepsHookOpen
+      ? [{
+          id: `hook-${message.id}`,
+          semanticKey: action.kind,
+          sourceMessageIds: [message.id],
+          createdAt: this.now(),
+        }]
+      : [];
+    const existing = ledger.episode(thread.episodeId);
+    if (!existing) {
+      ledger.openEpisode({
+        id: thread.episodeId,
+        channelId: message.channelId,
+        semanticFamily: thread.semanticFamily,
+        semanticKey: thread.seedKey,
+        sourceKind: ambientThreadOrigin(thread),
+        causalRootId: thread.causalRootId ?? thread.episodeId,
+        sourceUrls: this.ambientSourceUrls([message]),
+        hooks: hook,
+        participantIds: [message.authorId],
+        witnessIds: thread.participantIds,
+        messageIds: [message.id],
+        openedAt: thread.openedAt,
+        operationId,
+      });
+      return;
+    }
+    if (existing.status !== "current") return;
+    const openHookIds = existing.hooks
+      .filter((candidate) => candidate.status === "open")
+      .map((candidate) => candidate.id);
+    ledger.updateEpisode(thread.episodeId, {
+      sourceUrls: this.ambientSourceUrls([message]),
+      hooks: hook,
+      resolveHookIds: openHookIds,
+      participantIds: [message.authorId],
+      witnessIds: thread.participantIds,
+      messageIds: [message.id],
+      activityAt: this.now(),
+      operationId,
+    });
+  }
+
+  private commitHumanTopicEpisode(
+    thread: AmbientThreadState,
+    messages: readonly ChatMessage[],
+  ): void {
+    const ledger = this.ambientEpisodeLedger;
+    const last = messages.at(-1);
+    if (
+      !ledger || !last || !thread.episodeId || !thread.seedKey || !thread.semanticFamily ||
+      ledger.episode(thread.episodeId)
+    ) return;
+    ledger.openEpisode({
+      id: thread.episodeId,
+      channelId: last.channelId,
+      semanticFamily: thread.semanticFamily,
+      semanticKey: thread.seedKey,
+      sourceKind: "human_topic",
+      causalRootId: thread.causalRootId ?? thread.episodeId,
+      sourceUrls: this.ambientSourceUrls(messages),
+      hooks: [{
+        id: `hook-${last.id}`,
+        semanticKey: "human_topic_continuation",
+        sourceMessageIds: [last.id],
+        createdAt: this.now(),
+      }],
+      participantIds: thread.participantIds,
+      witnessIds: thread.participantIds,
+      messageIds: messages.map((message) => message.id),
+      openedAt: thread.openedAt,
+      operationId: `human-topic:${thread.episodeId}`,
+    });
+  }
+
+  private recordAmbientPost(
+    thread: AmbientThreadState,
+    message: ChatMessage,
+    action?: AmbientActionDecision,
+  ): void {
+    const firstPublication = thread.messageCount === 0;
     thread.messageCount += 1;
     thread.lastMessageId = message.id;
     thread.lastAuthorId = message.authorId;
     if (!thread.participantIds.includes(message.authorId)) thread.participantIds.push(message.authorId);
+    if (action) {
+      thread.actionHistory = [...(thread.actionHistory ?? []), action.kind].slice(-AMBIENT_THREAD_MAX_MESSAGES);
+      thread.hasOpenHook = action.keepsHookOpen;
+    }
     thread.updatedAt = this.now();
+    thread.nextEligibleAt = thread.updatedAt + 24_000 + this.rng() * 52_000;
     this.ambientBackoffUntilByChannel.delete(message.channelId);
+    if (firstPublication && ambientThreadOrigin(thread) === "room_seed") {
+      const recentSeeds = this.recentAmbientSeedsByChannel.get(message.channelId) ?? [];
+      this.recentAmbientSeedsByChannel.set(
+        message.channelId,
+        [...recentSeeds, thread.seed].slice(-AMBIENT_RECENT_SEED_WINDOW),
+      );
+    }
+    this.commitAmbientPublication(thread, message, action);
+  }
+
+  private closeAmbientThread(
+    thread: AmbientThreadState,
+    reason: NonNullable<AmbientThreadState["closeReason"]>,
+  ): void {
+    if (thread.closedAt !== undefined) return;
+    const now = this.now();
+    thread.closedAt = now;
+    thread.closeReason = reason;
+    thread.updatedAt = now;
+    thread.nextEligibleAt = undefined;
+    if (thread.episodeId) this.ambientEpisodeLedger?.closeEpisode(thread.episodeId, reason, { closedAt: now });
+  }
+
+  /** One structural preemption path for text, image, reaction, voice and catalog events. */
+  private invalidateAmbientChannel(
+    channelId: string,
+    reason: NonNullable<AmbientThreadState["closeReason"]>,
+  ): number {
+    const thread = this.ambientThreads.get(channelId);
+    if (thread) this.closeAmbientThread(thread, reason);
+    this.ambientThreads.delete(channelId);
+    const epoch = (this.channelEpoch.get(channelId) ?? 0) + 1;
+    this.channelEpoch.set(channelId, epoch);
+    return epoch;
   }
 
   private abandonAmbientThread(
@@ -3566,39 +3816,44 @@ export class SocialDirector {
     const retainedResearch = boundedThreadResearch(input.research, now);
     const last = input.posted.at(-1)!;
     const participantIds = [...new Set(input.posted.map((message) => message.authorId))];
-    this.ambientThreads.set(input.trigger.channelId, {
+    const episodeId = randomUUID();
+    const messageCount = Math.min(AMBIENT_THREAD_MAX_MESSAGES - 1, input.posted.length);
+    const mode = getChannelProfile(input.trigger.channelId)?.ambientMode ?? "discussion";
+    const debateBeat = input.signals.claimStrength >= 0.28;
+    const shape = sampleAmbientEpisodeShape({
+      origin: "human_topic",
+      mode,
+      debateBeat,
+      alreadyPublished: messageCount,
+      rng: this.rng,
+    });
+    const thread: AmbientThreadState = {
       // This is trusted framing only; the human's actual untrusted words remain
       // in transcript data and are never interpolated into a system premise.
       seed: "Continue the latest unresolved human-started topic from the supplied transcript.",
-      messageCount: Math.max(2, Math.min(AMBIENT_THREAD_MAX_MESSAGES, input.posted.length)),
+      seedKey: `human:${input.trigger.id}`,
+      semanticFamily: "human-started-topic",
+      episodeId,
+      causalRootId: input.trigger.id,
+      messageCount,
       lastMessageId: last.id,
       lastAuthorId: last.authorId,
       participantIds,
-      debateBeat: input.signals.claimStrength >= 0.28,
+      actionHistory: Array.from({ length: messageCount }, () => "advance_claim" as const),
+      shape,
+      hasOpenHook: true,
+      nextEligibleAt: now + 28_000 + this.rng() * 54_000,
+      debateBeat,
       languageHint: languageTag ?? "the language used in the latest human-authored message",
       ...(languageTag ? { languageTag } : {}),
       ...(retainedResearch ? { research: retainedResearch } : {}),
       origin: "human_topic",
       openedAt: now,
       updatedAt: now,
-    });
+    };
+    this.ambientThreads.set(input.trigger.channelId, thread);
+    this.commitHumanTopicEpisode(thread, input.posted);
     this.ambientBackoffUntilByChannel.delete(input.trigger.channelId);
-  }
-
-  private consideredConversationIsStillSafe(channelId: string, epoch: number, requiredSlots: number): boolean {
-    const now = this.now();
-    const globalTuning = this.globalBehaviorTuning();
-    const channelTuning = this.channelBehaviorTuning(channelId, globalTuning);
-    return (
-      globalTuning.activity > 0 &&
-      channelTuning.activity > 0 &&
-      !this.voiceRoomActive &&
-      epoch === (this.channelEpoch.get(channelId) ?? 0) &&
-      this.lm.health().queueDepth === 0 &&
-      (this.lastHumanActivityAt === undefined ||
-        now - this.lastHumanActivityAt >= this.consideredConversationHumanQuietMs) &&
-      this.availableAutonomousMessageSlots(now, globalTuning.activity) >= requiredSlots
-    );
   }
 
   private autonomousResearchIsStillSafe(
@@ -3646,150 +3901,6 @@ export class SocialDirector {
     return { temporalPolicy: "ambient_optional", temporalSurfaceActorId: actorId };
   }
 
-  private async runConsideredConversation(
-    channel: (typeof CHANNELS)[number],
-    epoch: number,
-    plan: ConsideredConversationPlan,
-    thread: AmbientThreadState,
-  ): Promise<void> {
-    const channelProfile = getChannelProfile(channel.id);
-    const ambientMode = channelProfile?.ambientMode ?? "discussion";
-    const register = channelProfile?.conversationRegister ?? "everyday";
-    const consideredLimits = consideredConversationWordLimits(plan, register);
-    const leadWordLimit = consideredLimits.lead;
-    const responseWordLimit = consideredLimits.response;
-    const temporalCue = this.ambientTemporalCue(plan.lead.id);
-    this.consideredConversationInFlight = true;
-    this.lastConsideredConversationAt = this.now();
-    const leadGenerationTypingLease = this.acquireTyping(channel.id, plan.lead.id);
-    let leadLine: GeneratedLine | undefined;
-    let responseLine: GeneratedLine | undefined;
-    try {
-      try {
-        const history = this.ambientTranscript(channel.id, 18);
-        const leadLines = await this.lm.generateScene(
-          {
-            kind: "ambient",
-            conversationMode: "considered",
-            consideredRole: "lead",
-            channelId: channel.id,
-            channelName: channel.name,
-            selected: [plan.lead],
-            history,
-            premise: consideredConversationLeadPremise(plan, thread.seed, ambientMode, leadWordLimit),
-            mustReplyIds: [plan.lead.id],
-            wordLimits: { [plan.lead.id]: leadWordLimit },
-            languageHint: thread.languageHint,
-            semanticContext: thread.languageTag ? {
-              languageTag: thread.languageTag,
-              asksForList: false,
-              asksAboutAiIdentity: false,
-              asksAboutAcoustics: false,
-            } : undefined,
-            actorChannelNotes: this.actorChannels.promptNotes([plan.lead], channel.id),
-            actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.lead], channel.id),
-            ...temporalCue,
-          },
-          4,
-        );
-        leadLine = leadLines.find((line) => line.personaId === plan.lead.id);
-        if (leadLine) {
-          const responseLines = await this.lm.generateScene(
-            {
-              kind: "ambient",
-              conversationMode: "considered",
-              consideredRole: "response",
-              consideredResponseRole: plan.responseRole,
-              channelId: channel.id,
-              channelName: channel.name,
-              selected: [plan.responder],
-              history: [
-                ...history,
-                {
-                  author: plan.lead.name,
-                  kind: "ai",
-                  content: leadLine.content,
-                  createdAt: new Date(this.now()).toISOString(),
-                },
-              ],
-              premise: consideredConversationResponsePremise(plan, ambientMode, responseWordLimit),
-              mustReplyIds: [plan.responder.id],
-              wordLimits: { [plan.responder.id]: responseWordLimit },
-              languageHint: thread.languageHint,
-              semanticContext: thread.languageTag ? {
-                languageTag: thread.languageTag,
-                asksForList: false,
-                asksAboutAiIdentity: false,
-                asksAboutAcoustics: false,
-              } : undefined,
-              actorChannelNotes: this.actorChannels.promptNotes([plan.responder], channel.id),
-              actorExpertiseNotes: this.actorChannels.expertiseNotes([plan.responder], channel.id),
-              temporalPolicy: "ambient_silent",
-            },
-            4,
-          );
-          responseLine = responseLines.find((line) => line.personaId === plan.responder.id);
-        }
-      } catch (error) {
-        console.warn("Considered ambient scene skipped:", error instanceof Error ? error.message : error);
-      } finally {
-        leadGenerationTypingLease.release();
-      }
-
-      // A shallow fallback would undermine the point of this rare beat. If the
-      // model cannot produce both distinct turns, leave the room quiet instead.
-      if (!leadLine || !responseLine || !this.consideredConversationIsStillSafe(channel.id, epoch, 2)) return;
-
-      const leadPublicationTypingLease = this.acquireTyping(channel.id, plan.lead.id);
-      let leadMessage: ChatMessage | undefined;
-      try {
-        leadMessage = this.postPublic(
-          channel.id,
-          plan.lead,
-          leadLine.content,
-          thread.lastMessageId,
-          leadLine.source,
-        );
-      } finally {
-        leadPublicationTypingLease.release();
-      }
-      if (!leadMessage) return;
-      this.recordAmbientPost(thread, leadMessage);
-
-      let responsePosted = false;
-      const responseTypingLease = this.acquireTyping(channel.id, plan.responder.id);
-      try {
-        await delay(3_200 + this.rng() * 2_800);
-        if (this.consideredConversationIsStillSafe(channel.id, epoch, 1)) {
-          const responseMessage = this.postPublic(
-            channel.id,
-            plan.responder,
-            responseLine.content,
-            leadMessage.id,
-            responseLine.source,
-          );
-          responsePosted = Boolean(responseMessage);
-          if (responseMessage) this.recordAmbientPost(thread, responseMessage);
-        }
-      } finally {
-        responseTypingLease.release();
-      }
-      this.publishDirectorEvent({
-        trigger: "ambient",
-        summary: responsePosted
-          ? `${plan.lead.name} opened a considered thread in #${channel.name}; ${plan.responder.name} added a distinct ${plan.responseRole}.`
-          : `${plan.lead.name} opened a considered thread in #${channel.name}, then the room yielded to human activity.`,
-        considered: PERSONAS.length,
-        noticed: responsePosted ? 2 : 1,
-        replied: responsePosted ? 2 : 1,
-        reacted: 0,
-      });
-    } finally {
-      leadGenerationTypingLease.release();
-      this.consideredConversationInFlight = false;
-    }
-  }
-
   private recentPublishedUrlKeys(): Set<string> {
     return new Set(
       CHANNELS.flatMap((channel) => this.store.getRecent(channel.id, 160)).flatMap((message) => [
@@ -3799,10 +3910,8 @@ export class SocialDirector {
     );
   }
 
-  private beginAutonomousResearchAttempt(channelId: string, seed: AutonomousResearchSeed): void {
+  private beginAutonomousResearchAttempt(): void {
     this.autonomousResearchDiagnostics.attempts += 1;
-    const recent = this.recentAutonomousResearchSeedsByChannel.get(channelId) ?? [];
-    this.recentAutonomousResearchSeedsByChannel.set(channelId, [...recent, seed.id].slice(-2));
   }
 
   private recordAutonomousResearchFailure(
@@ -3838,7 +3947,7 @@ export class SocialDirector {
     return false;
   }
 
-  private recordAutonomousResearchSuccess(channelId: string): void {
+  private recordAutonomousResearchSuccess(channelId: string, seedId?: string): void {
     const publishedAt = this.now();
     this.lastAutonomousResearchSuccessAt = publishedAt;
     this.lastAutonomousResearchSuccessAtByChannel.set(channelId, publishedAt);
@@ -3847,6 +3956,10 @@ export class SocialDirector {
     this.autonomousResearchGlobalRetryAfterAt = undefined;
     this.autonomousResearchGlobalConsecutiveFailures = 0;
     this.autonomousResearchDiagnostics.published += 1;
+    if (seedId) {
+      const recent = this.recentAutonomousResearchSeedsByChannel.get(channelId) ?? [];
+      this.recentAutonomousResearchSeedsByChannel.set(channelId, [...recent, seedId].slice(-2));
+    }
   }
 
   private async safelyReadAutonomousResult(
@@ -3979,7 +4092,7 @@ export class SocialDirector {
     seed: AutonomousResearchSeed,
     preparedOutcome?: AutonomousResearchReadOutcome,
   ): Promise<boolean> {
-    this.beginAutonomousResearchAttempt(channel.id, seed);
+    this.beginAutonomousResearchAttempt();
     const researchers = available.filter((persona) => persona.canResearch);
     const lead = selectAmbientLead(
       researchers,
@@ -3998,6 +4111,36 @@ export class SocialDirector {
         : (persona.disagreement ?? 0) >= 0.65,
     );
     const responder = choose(contrasting.length > 0 ? contrasting : responderPool, this.rng);
+    const profile = getChannelProfile(channel.id);
+    const mode = profile?.ambientMode ?? "discussion";
+    thread.shape = sampleAmbientEpisodeShape({
+      origin: "autonomous_research",
+      mode,
+      debateBeat: true,
+      alreadyPublished: thread.messageCount,
+      rng: this.rng,
+    });
+    thread.episodeId ??= randomUUID();
+    thread.causalRootId ??= thread.episodeId;
+    thread.seedKey = `research:${seed.id}`;
+    thread.semanticFamily = `research:${seed.id}`;
+    thread.actionHistory ??= [];
+    thread.hasOpenHook = true;
+    const openingAction: AmbientActionDecision = {
+      kind: "open_topic",
+      continueEpisode: true,
+      replyToLatest: false,
+      keepsHookOpen: true,
+    };
+    const ambientAction: AmbientActionContract = {
+      episodeId: thread.episodeId,
+      causalRootId: thread.causalRootId,
+      semanticFamily: thread.semanticFamily,
+      kind: openingAction.kind,
+      turnIndex: thread.messageCount,
+      openHook: true,
+      previousActions: thread.actionHistory,
+    };
 
     const leadGenerationTypingLease = this.acquireTyping(channel.id, lead.id);
     let research: ResearchPacket | undefined;
@@ -4008,28 +4151,28 @@ export class SocialDirector {
         return this.recordAutonomousResearchFailure(channel.id, seed, readOutcome.failureReason);
       }
       research = readOutcome.research;
-      if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead, responder], 2)) {
+      if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1)) {
         return this.recordAutonomousResearchFailure(channel.id, seed, "safety_gate_changed");
       }
-      const profile = getChannelProfile(channel.id);
-      const mode = profile?.ambientMode ?? "discussion";
-      const limits = ambientSceneWordLimits(lead, responder, false, mode);
+      const limits = ambientSceneWordLimits(lead, undefined, false, mode);
       const evidenceIntroduction = research.kind === "market"
         ? `A trusted typed market provider supplied one latest-reported observation for this server-authored angle: “${seed.discussionAngle}”. Treat its level/change and absolute timestamp as evidence, but do not invent a cause, related headline, market-open state or future move.`
         : `A trusted server-side lookup and safe page read found candidate sources for this server-authored angle: “${seed.discussionAngle}”.`;
       lines = await this.lm.generateScene({
         kind: "ambient",
+        ambientAction,
         channelId: channel.id,
         channelName: channel.name,
-        selected: [lead, responder],
+        selected: [lead],
         history: this.ambientTranscript(channel.id, 18),
         premise: [
           evidenceIntroduction,
           `${lead.name} chooses exactly one supplied source ID, shares one concrete supported detail from it and immediately adds a personal take; a title-only reaction, vague hype or capability statement is invalid.`,
-          `${responder.name} answers that exact detail with one distinct consequence, objection or genuinely specific question instead of merely agreeing or opening another topic.`,
-          "Both lines must stay on the same chosen source. Keep this to two natural peer messages. Do not announce that a search happened, explain tooling, or invite the whole room to answer.",
+          "This tick publishes only that source-backed opening. Leave one concrete implication, disagreement or question for another resident to pick up later from actual room history.",
+          "Do not announce that a search happened, explain tooling, copy a URL, or invite the whole room to answer.",
+          ambientActionInstruction("open_topic", mode),
         ].join(" "),
-        mustReplyIds: [lead.id, responder.id],
+        mustReplyIds: [lead.id],
         wordLimits: limits,
         languageHint: thread.languageHint,
         semanticContext: thread.languageTag ? {
@@ -4038,8 +4181,8 @@ export class SocialDirector {
           asksAboutAiIdentity: false,
           asksAboutAcoustics: false,
         } : undefined,
-        actorChannelNotes: this.actorChannels.promptNotes([lead, responder], channel.id),
-        actorExpertiseNotes: this.actorChannels.expertiseNotes([lead, responder], channel.id),
+        actorChannelNotes: this.actorChannels.promptNotes([lead], channel.id),
+        actorExpertiseNotes: this.actorChannels.expertiseNotes([lead], channel.id),
         research,
         autonomousResearchContext: {
           seedId: seed.id,
@@ -4058,18 +4201,17 @@ export class SocialDirector {
     }
 
     const leadLine = lines.find((line) => line.personaId === lead.id);
-    const responseLine = lines.find((line) => line.personaId === responder.id);
     const leadSourceIds = leadLine ? [...new Set(leadLine.sourceIds)] : [];
     const selectedSourceId = leadSourceIds.length === 1 && research?.results.some((result) => result.id === leadSourceIds[0])
       ? leadSourceIds[0]
       : undefined;
-    if (!research || !leadLine || !responseLine) {
+    if (!research || !leadLine) {
       return this.recordAutonomousResearchFailure(channel.id, seed, "invalid_generated_lines");
     }
-    if (!selectedSourceId || responseLine.sourceIds.some((sourceId) => sourceId !== selectedSourceId)) {
+    if (!selectedSourceId) {
       return this.recordAutonomousResearchFailure(channel.id, seed, "missing_single_source");
     }
-    if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead, responder], 2)) {
+    if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1)) {
       return this.recordAutonomousResearchFailure(channel.id, seed, "safety_gate_changed");
     }
     const selectedResearch: ResearchPacket = {
@@ -4098,56 +4240,36 @@ export class SocialDirector {
     if (!leadMessage) return this.recordAutonomousResearchFailure(channel.id, seed, "publication_failed");
     // Success accounting begins only once a source-backed message is actually
     // in room history. Everything before this point uses short retry backoff.
-    this.recordAutonomousResearchSuccess(channel.id);
+    this.recordAutonomousResearchSuccess(channel.id, seed.id);
     thread.seed = seed.discussionAngle;
     thread.debateBeat = true;
     thread.origin = "autonomous_research";
     thread.research = boundedThreadResearch(selectedResearch, this.now());
-    this.recordAmbientPost(thread, leadMessage);
-
-    const responseTypingLease = this.acquireTyping(channel.id, responder.id);
-    let responseMessage: ChatMessage | undefined;
-    try {
-      await delay(2_000 + this.rng() * 1_800);
-      if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [responder], 1)) {
-        this.publishDirectorEvent({
-          trigger: "research",
-          summary: `${lead.name} shared one safely read source in #${channel.name}; the room changed before a follow-up.`,
-          considered: PERSONAS.length,
-          noticed: 1,
-          replied: 1,
-          reacted: 0,
-        });
-        return true;
-      }
-      const responseSources = this.messageSources(
-        selectedResearch,
-        responseLine.sourceIds,
-      );
-      responseMessage = this.postPublic(
-        channel.id,
-        responder,
-        responseLine.content,
-        leadMessage.id,
-        responseLine.source,
-        responseSources,
-      );
-    } finally {
-      responseTypingLease.release();
-    }
-    if (responseMessage) this.recordAmbientPost(thread, responseMessage);
+    thread.autonomousResearchContext = {
+      seedId: seed.id,
+      roomTopic: profile?.topic.brief ?? channel.description,
+      discussionAngle: seed.discussionAngle,
+    };
+    this.recordAmbientPost(thread, leadMessage, openingAction);
+    thread.pendingBeat = {
+      kind: "research_response",
+      preferredActorId: responder.id,
+      attempts: 0,
+    };
+    thread.hasOpenHook = true;
     this.publishDirectorEvent({
       trigger: "research",
-      summary: `${lead.name} shared one safely read source in #${channel.name}; ${responder.name} answered the same point.`,
+      summary: `${lead.name} shared one safely read source in #${channel.name}; a grounded follow-up was queued for a later room tick.`,
       considered: PERSONAS.length,
-      noticed: responseMessage ? 2 : 1,
-      replied: responseMessage ? 2 : 1,
+      noticed: 1,
+      replied: 1,
       reacted: 0,
     });
     return true;
   }
 
   private async runAmbient(): Promise<void> {
+    let ownsConsideredLease = false;
     try {
       if (this.stopped) return;
       const lmHealth = this.lm.health();
@@ -4189,8 +4311,9 @@ export class SocialDirector {
                 rotated: this.lastAmbientChannelId !== candidate.id,
                 hasLiveThread: Boolean(
                   liveThread &&
+                  liveThread.closedAt === undefined &&
                   liveThread.messageCount > 0 &&
-                  liveThread.messageCount < AMBIENT_THREAD_MAX_MESSAGES &&
+                  liveThread.messageCount < ambientThreadHardMaximum(liveThread) &&
                   now - liveThread.updatedAt <= AMBIENT_THREAD_IDLE_EXPIRY_MS
                 ),
                 random: this.rng(),
@@ -4205,13 +4328,8 @@ export class SocialDirector {
       const thread = this.getOrStartAmbientThread(channel.id, now);
       if (!thread) return;
       const epoch = this.channelEpoch.get(channel.id) ?? 0;
-      const remainingThreadSlots = AMBIENT_THREAD_MAX_MESSAGES - thread.messageCount;
-      const availableSlots = Math.min(
-        2,
-        remainingThreadSlots,
-        this.availableAutonomousMessageSlots(now, globalTuning.activity),
-      );
-      if (availableSlots < 1) return;
+      const autonomousSlots = this.availableAutonomousMessageSlots(now, globalTuning.activity);
+      if (autonomousSlots < 1) return;
       const available = this.actorChannels
         .candidatesFor(channel.id)
         .filter(
@@ -4223,19 +4341,30 @@ export class SocialDirector {
       if (available.length < 1) return;
       const profile = getChannelProfile(channel.id);
       const ambientMode = profile?.ambientMode ?? "discussion";
-      const startConsidered = thread.messageCount === 0 && available.length >= 2 && shouldStartConsideredConversation({
-        now,
-        lastStartedAt: this.lastConsideredConversationAt,
-        lastHumanActivityAt: this.lastHumanActivityAt,
-        cooldownMs: this.consideredConversationCooldownMs,
-        humanQuietMs: this.consideredConversationHumanQuietMs,
-        chance: this.consideredConversationChance,
-        queueDepth: lmHealth.queueDepth,
-        availableMessageSlots: availableSlots,
-        voiceRoomActive: this.voiceRoomActive,
-        alreadyInFlight: this.consideredConversationInFlight,
-        rng: this.rng,
-      });
+      thread.shape ??= fallbackAmbientShape(thread);
+      thread.episodeId ??= randomUUID();
+      thread.causalRootId ??= thread.episodeId;
+      thread.semanticFamily ??= "legacy-thread";
+      thread.actionHistory ??= [];
+      thread.hasOpenHook ??= thread.shape.minimumMessages > thread.messageCount;
+      if (thread.messageCount > 0 && !thread.lastMessageId) {
+        this.closeAmbientThread(thread, "model_rejected");
+        return;
+      }
+      const startConsidered = !thread.pendingBeat && thread.messageCount === 0 && available.length >= 2 &&
+        shouldStartConsideredConversation({
+          now,
+          lastStartedAt: this.lastConsideredConversationAt,
+          lastHumanActivityAt: this.lastHumanActivityAt,
+          cooldownMs: this.consideredConversationCooldownMs,
+          humanQuietMs: this.consideredConversationHumanQuietMs,
+          chance: this.consideredConversationChance,
+          queueDepth: lmHealth.queueDepth,
+          availableMessageSlots: autonomousSlots,
+          voiceRoomActive: this.voiceRoomActive,
+          alreadyInFlight: this.consideredConversationInFlight,
+          rng: this.rng,
+        });
       const consideredPlan = startConsidered
         ? selectConsideredConversation(
             available,
@@ -4246,9 +4375,50 @@ export class SocialDirector {
           )
         : undefined;
       if (consideredPlan) {
-        const before = thread.messageCount;
-        await this.runConsideredConversation(channel, epoch, consideredPlan, thread);
-        if (before === 0 && thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
+        thread.shape = {
+          minimumMessages: Math.max(2, thread.shape.minimumMessages),
+          softTargetMessages: Math.max(3, thread.shape.softTargetMessages),
+          hardMaximumMessages: Math.max(4, thread.shape.hardMaximumMessages),
+        };
+        thread.hasOpenHook = true;
+      }
+      const pendingBeat = thread.pendingBeat;
+      if (consideredPlan || pendingBeat?.kind === "considered_response") {
+        this.consideredConversationInFlight = true;
+        ownsConsideredLease = true;
+      }
+      const pendingKind: AmbientActionKind | undefined = pendingBeat?.kind === "research_response"
+        ? "source_followup"
+        : pendingBeat?.responseRole === "challenge"
+          ? "countertake"
+          : pendingBeat?.responseRole === "question"
+            ? "pointed_question"
+            : pendingBeat
+              ? "specific_example"
+              : undefined;
+      const action: AmbientActionDecision = pendingKind
+        ? {
+            kind: pendingKind,
+            continueEpisode: true,
+            replyToLatest: true,
+            keepsHookOpen: true,
+          }
+        : decideAmbientAction({
+            messageCount: thread.messageCount,
+            shape: thread.shape,
+            origin: ambientThreadOrigin(thread),
+            mode: ambientMode,
+            debateBeat: thread.debateBeat,
+            hasResearch: Boolean(thread.research),
+            hasOpenHook: thread.hasOpenHook,
+            previousActions: thread.actionHistory,
+            rng: this.rng,
+          });
+      if (!action.continueEpisode) {
+        this.closeAmbientThread(
+          thread,
+          thread.messageCount >= thread.shape.hardMaximumMessages ? "budget" : "natural",
+        );
         return;
       }
       const withoutLastAuthor = available.filter((persona) => persona.id !== thread.lastAuthorId);
@@ -4258,57 +4428,100 @@ export class SocialDirector {
       }
       const alternatePool = withoutLastAuthor;
       const returningParticipants = alternatePool.filter((persona) => thread.participantIds.includes(persona.id));
-      const firstPool = returningParticipants.length > 0 ? returningParticipants : alternatePool;
-      const first = selectAmbientLead(
-        firstPool,
-        (personaId) => this.actorChannels.affinity(personaId, channel.id),
-        this.rng,
-        ambientMode,
-      );
-      if (!first) return;
-      const participantSeconds = available.filter(
-        (persona) => persona.id !== first.id && thread.participantIds.includes(persona.id),
-      );
-      const possibleSeconds = participantSeconds.length > 0
-        ? participantSeconds
-        : available.filter((persona) => persona.id !== first.id);
-      const debateBeat = thread.debateBeat;
-      const dissenters = possibleSeconds.filter((persona) =>
-        (first.disagreement ?? 0) >= 0.65
-          ? (persona.disagreement ?? 0) < 0.65
-          : (persona.disagreement ?? 0) >= 0.65,
-      );
-      const second = possibleSeconds.length > 0
-        ? debateBeat && dissenters.length > 0
-          ? choose(dissenters, this.rng)
-          : choose(possibleSeconds, this.rng)
+      const baseFirstPool = returningParticipants.length > 0 ? returningParticipants : alternatePool;
+      const previousPersona = thread.lastAuthorId
+        ? PERSONAS.find((persona) => persona.id === thread.lastAuthorId)
         : undefined;
-      const selected = availableSlots >= 2 && second && this.rng() < 0.78 ? [first, second] : [first];
+      const counterPool = action.kind === "countertake" && previousPersona
+        ? baseFirstPool.filter((persona) =>
+            ((persona.disagreement ?? 0) >= 0.65) !== ((previousPersona.disagreement ?? 0) >= 0.65)
+          )
+        : [];
+      const firstPool = counterPool.length > 0 ? counterPool : baseFirstPool;
+      const preferredPendingActor = pendingBeat?.preferredActorId
+        ? firstPool.find((persona) => persona.id === pendingBeat.preferredActorId)
+        : undefined;
+      const first = consideredPlan?.lead ?? preferredPendingActor ?? selectAmbientLead(
+          firstPool,
+          (personaId) => this.actorChannels.affinity(personaId, channel.id),
+          this.rng,
+          ambientMode,
+        );
+      if (!first) return;
+      const selected = [first];
       const temporalCue = this.ambientTemporalCue(first.id);
-      const premise = ambientConversationPremise(
-        thread.seed,
-        first,
-        selected[1],
-        thread.messageCount > 0,
-        debateBeat && selected.length > 1,
-        ambientMode,
-      );
-      const wordLimits = ambientSceneWordLimits(first, selected[1], thread.messageCount > 0, ambientMode);
-      // The lead owns this ambient generation. A possible second actor is only
-      // a candidate and must not appear to compose unless its reviewed line is
-      // later staged for publication.
+      const register = profile?.conversationRegister ?? "everyday";
+      const pendingConsideredPlan = pendingBeat?.kind === "considered_response" && previousPersona
+        ? {
+            lead: previousPersona,
+            responder: first,
+            responseRole: pendingBeat.responseRole ?? "example",
+          }
+        : undefined;
+      const consideredLimits = consideredPlan
+        ? consideredConversationWordLimits(consideredPlan, register)
+        : pendingConsideredPlan
+          ? consideredConversationWordLimits(pendingConsideredPlan, register)
+          : undefined;
+      const premise = consideredPlan
+        ? consideredConversationLeadPremise(
+            consideredPlan,
+            thread.seed,
+            ambientMode,
+            consideredLimits?.lead,
+          )
+        : pendingConsideredPlan
+          ? `${consideredConversationResponsePremise(
+              pendingConsideredPlan,
+              ambientMode,
+              consideredLimits?.response,
+            )} ${ambientActionInstruction(action.kind, ambientMode)}`
+          : ambientConversationPremise(
+              thread.seed,
+              first,
+              undefined,
+              thread.messageCount > 0,
+              thread.debateBeat,
+              ambientMode,
+              action.kind,
+            );
+      const wordLimits = consideredLimits
+        ? { [first.id]: consideredPlan ? consideredLimits.lead : consideredLimits.response }
+        : ambientSceneWordLimits(first, undefined, thread.messageCount > 0, ambientMode);
+      const ambientAction: AmbientActionContract = {
+        episodeId: thread.episodeId,
+        causalRootId: thread.causalRootId,
+        semanticFamily: thread.semanticFamily,
+        kind: action.kind,
+        turnIndex: thread.messageCount,
+        ...(action.replyToLatest && thread.lastMessageId ? { targetMessageId: thread.lastMessageId } : {}),
+        openHook: thread.hasOpenHook,
+        previousActions: thread.actionHistory,
+      };
       const generationTypingLease = this.acquireTyping(channel.id, first.id);
       let lines: GeneratedLine[] = [];
       try {
         lines = await this.lm.generateScene(
           {
             kind: "ambient",
+            ambientAction,
+            ...(consideredPlan
+              ? { conversationMode: "considered" as const, consideredRole: "lead" as const }
+              : pendingConsideredPlan
+                ? {
+                    conversationMode: "considered" as const,
+                    consideredRole: "response" as const,
+                    consideredResponseRole: pendingConsideredPlan.responseRole,
+                  }
+                : {}),
+            humanizerBudget: { repairsRemaining: 1 },
             channelId: channel.id,
             channelName: channel.name,
             selected,
             history: this.ambientTranscript(channel.id, 18),
             premise,
             wordLimits,
+            mustReplyIds: [first.id],
             languageHint: thread.languageHint,
             semanticContext: thread.languageTag ? {
               languageTag: thread.languageTag,
@@ -4320,6 +4533,8 @@ export class SocialDirector {
             actorExpertiseNotes: this.actorChannels.expertiseNotes(selected, channel.id),
             research: thread.research,
             evidenceOutcome: thread.research ? "succeeded" : undefined,
+            autonomousResearchContext: thread.autonomousResearchContext,
+            urlPublicationPolicy: thread.autonomousResearchContext ? "server_card" : undefined,
             ...temporalCue,
           },
           4,
@@ -4332,77 +4547,89 @@ export class SocialDirector {
       if (epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
       const leadLine = lines.find((line) => line.personaId === first.id);
       if (!leadLine) {
+        if (pendingBeat) {
+          pendingBeat.attempts += 1;
+          if (pendingBeat.attempts >= 1) {
+            thread.pendingBeat = undefined;
+            this.closeAmbientThread(thread, "model_rejected");
+          }
+        }
         if (thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
+        else if (!pendingBeat) this.closeAmbientThread(thread, "model_rejected");
         return;
       }
-      const orderedLines = [
-        leadLine,
-        ...selected
-          .slice(1)
-          .map((persona) => lines.find((line) => line.personaId === persona.id))
-          .filter((line): line is GeneratedLine => Boolean(line)),
-      ].slice(0, availableSlots);
-      const postedMessages: Array<{ message: ChatMessage; persona: Persona }> = [];
-      for (const [index, line] of orderedLines.entries()) {
-        const persona = selected.find((candidate) => candidate.id === line.personaId);
-        if (!persona || !this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) break;
-        const publicationTypingLease = this.acquireTyping(channel.id, persona.id);
-        try {
-          if (index > 0) await delay(2_000 + this.rng() * 2_500);
-          if (!this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) break;
-          const posted = this.postPublic(
-            channel.id,
-            persona,
-            line.content,
-            thread.lastMessageId,
-            line.source,
-            this.messageSources(thread.research, line.sourceIds),
-          );
-          if (!posted) {
-            if (index === 0) {
-              if (thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
-              break;
-            }
-            continue;
-          }
-          this.recordAmbientPost(thread, posted);
-          postedMessages.push({ message: posted, persona });
-          if (postedMessages.length === 1) {
-            const reactors = this.actorChannels.candidatesFor(channel.id).filter((candidate) => !selected.includes(candidate));
-            const reactor = reactors.length > 0 ? choose(reactors, this.rng) : undefined;
-            if (reactor) {
-              setTimeout(() => {
-                const reaction = this.store.togglePublicReaction(
-                  channel.id,
-                  posted.id,
-                  choose(profile?.ambientReactionPalette ?? ["👀", "😂", "🤔", "✨"], this.rng),
-                  reactor.id,
-                  true,
-                );
-                if (reaction) {
-                  this.io.to("public").emit("reaction:update", {
-                    messageId: posted.id,
-                    channelId: channel.id,
-                    reaction,
-                  });
-                }
-              }, 900 + this.rng() * 1_600);
-            }
-          }
-        } finally {
-          publicationTypingLease.release();
+      if (!this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
+      const publicationTypingLease = this.acquireTyping(channel.id, first.id);
+      let posted: ChatMessage | undefined;
+      try {
+        if (!this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
+        posted = this.postPublic(
+          channel.id,
+          first,
+          leadLine.content,
+          action.replyToLatest ? thread.lastMessageId : undefined,
+          leadLine.source,
+          this.messageSources(thread.research, leadLine.sourceIds),
+        );
+        if (!posted) {
+          if (thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
+          else this.closeAmbientThread(thread, "model_rejected");
+          return;
         }
+        this.recordAmbientPost(thread, posted, action);
+        if (pendingBeat && thread.pendingBeat === pendingBeat) thread.pendingBeat = undefined;
+        if (consideredPlan) {
+          thread.pendingBeat = {
+            kind: "considered_response",
+            preferredActorId: consideredPlan.responder.id,
+            responseRole: consideredPlan.responseRole,
+            attempts: 0,
+          };
+          thread.hasOpenHook = true;
+          this.lastConsideredConversationAt = this.now();
+        }
+        if (thread.messageCount >= thread.shape.hardMaximumMessages) this.closeAmbientThread(thread, "budget");
+      } finally {
+        publicationTypingLease.release();
       }
-      if (postedMessages.length === 0) return;
+      const reactors = this.actorChannels.candidatesFor(channel.id).filter((candidate) => candidate.id !== first.id);
+      const reactor = reactors.length > 0 ? choose(reactors, this.rng) : undefined;
+      if (reactor && posted) {
+        const reactionEpoch = epoch;
+        const postedId = posted.id;
+        setTimeout(() => {
+          if (
+            this.stopped ||
+            reactionEpoch !== (this.channelEpoch.get(channel.id) ?? 0) ||
+            !this.store.getMessage(postedId)
+          ) return;
+          this.actorChannels.markRead(reactor.id, channel.id, postedId);
+          const reaction = this.store.togglePublicReaction(
+            channel.id,
+            postedId,
+            choose(profile?.ambientReactionPalette ?? ["👀", "😂", "🤔", "✨"], this.rng),
+            reactor.id,
+            true,
+          );
+          if (reaction) {
+            this.io.to("public").emit("reaction:update", {
+              messageId: postedId,
+              channelId: channel.id,
+              reaction,
+            });
+          }
+        }, 900 + this.rng() * 1_600);
+      }
       this.publishDirectorEvent({
         trigger: "ambient",
-        summary: `${postedMessages.map(({ persona }) => persona.name).join(" + ")} advanced one bounded thread in #${channel.name}.`,
+        summary: `${first.name} performed one ${action.kind} action in #${channel.name}; the episode remains scheduler-owned.`,
         considered: PERSONAS.length,
-        noticed: Math.min(PERSONAS.length, postedMessages.length + 1),
-        replied: postedMessages.length,
-        reacted: 1,
+        noticed: Math.min(PERSONAS.length, reactor ? 2 : 1),
+        replied: 1,
+        reacted: reactor ? 1 : 0,
       });
     } finally {
+      if (ownsConsideredLease) this.consideredConversationInFlight = false;
       if (!this.stopped) this.scheduleAmbient();
     }
   }

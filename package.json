@@ -24,9 +24,12 @@
     "smoke:football": "node scripts/football-smoke.mjs",
     "smoke:history-links": "node scripts/history-link-smoke.mjs",
     "audit:humanity": "node scripts/humanity-audit.mjs",
+    "audit:ambient": "node --import tsx scripts/ambient-audit.mjs",
     "eval:humanity": "node --import tsx scripts/humanity-live-eval.mjs",
+    "eval:ambient": "node --import tsx scripts/ambient-live-eval.mjs",
     "eval:semantics": "node --import tsx scripts/semantic-router-live-eval.mjs",
-    "test:audit:humanity": "node --test scripts/humanity-audit.node-test.mjs"
+    "test:audit:humanity": "node --test scripts/humanity-audit.node-test.mjs",
+    "test:audit:ambient": "node --import tsx --test scripts/ambient-audit.node-test.mjs"
   },
   "dependencies": {
     "busboy": "^1.6.0",
