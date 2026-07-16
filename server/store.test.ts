@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import { createMessage, RoomStore } from "./store.js";
 import { CHANNELS } from "./channels.js";
@@ -77,8 +77,44 @@ describe("room history", () => {
     await store.flush();
   });
 
+  it("persists private conversations across a restart without exposing them as public history", async () => {
+    const filePath = tempStorePath();
+    const first = new RoomStore(filePath);
+    await first.load();
+    const thread = first.openDm("human-johan", "ai-mira");
+    const humanMessage = first.addDmMessage(thread.id, "human-johan", "Minns du det här efter omstart?");
+    const residentMessage = first.addDmMessage(thread.id, "ai-mira", "Japp, den här tråden ligger kvar.", humanMessage?.id, "lm");
+    expect(residentMessage).toBeDefined();
+    await first.flush();
+
+    const restored = new RoomStore(filePath);
+    await restored.load();
+    expect(restored.openDm("human-johan", "ai-mira").messages.map((message) => message.content)).toEqual([
+      "Minns du det här efter omstart?",
+      "Japp, den här tråden ligger kvar.",
+    ]);
+    expect(restored.getAllMessages().some((message) => message.channelId === thread.id)).toBe(false);
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ version: 2 });
+  });
+
+  it("restricts a legacy room-state file before it can contain persisted DMs", async () => {
+    const filePath = tempStorePath();
+    await writeFile(filePath, JSON.stringify({ version: 1, messages: [
+      createMessage("lobby", "human-returning", "legacy history"),
+    ] }), "utf8");
+    await chmod(filePath, 0o644);
+
+    const restored = new RoomStore(filePath);
+    await restored.load();
+
+    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+  });
+
   it("retains quiet-channel history when a different channel becomes busy", async () => {
-    const store = tempStore();
+    const store = new RoomStore(tempStorePath(), {
+      publicHistoryHardLimit: 600,
+      publicHistoryTrimTo: 500,
+    });
     store.addPublicMessage(createMessage("ai-lab", "ai-zed", "keep me"));
     for (let index = 0; index <= 600; index += 1) {
       store.addPublicMessage(createMessage("lobby", "ai-mira", `busy ${index}`));
@@ -91,7 +127,8 @@ describe("room history", () => {
 
   it("keeps private autonomous accounting after visible history trimming and reload", async () => {
     const filePath = tempStorePath();
-    const store = new RoomStore(filePath);
+    const retention = { publicHistoryHardLimit: 600, publicHistoryTrimTo: 500 };
+    const store = new RoomStore(filePath, retention);
     const tracked = createMessage("lobby", "ai-mira", "tracked unattended post");
     store.addPublicMessage(tracked, { kind: "ambient", attendance: "unattended" });
     for (let index = 0; index < 650; index += 1) {
@@ -106,7 +143,7 @@ describe("room history", () => {
     expect(tracked).not.toHaveProperty("autonomousPublication");
     await store.flush();
 
-    const restored = new RoomStore(filePath);
+    const restored = new RoomStore(filePath, retention);
     await restored.load();
     expect(restored.getAutonomousPublicationHistory()).toEqual([expect.objectContaining({
       messageId: tracked.id,
@@ -132,7 +169,7 @@ describe("room history", () => {
       version: number;
       messages: Array<{ id: string }>;
     };
-    expect(persisted.version).toBe(1);
+    expect(persisted.version).toBe(2);
     expect(persisted.messages.map((message) => message.id)).toEqual(expectedIds);
 
     const temporaryPrefix = `${basename(filePath)}.`;

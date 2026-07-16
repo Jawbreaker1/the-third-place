@@ -10,12 +10,14 @@ import {
 } from "./adminAuth.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
 import { ModelProviderManagerError, type AdminLlmProviderControl } from "./modelProviderManager.js";
+import type { SocialMemoryAdmin } from "./socialMemoryAdmin.js";
 
 const loginSchema = z.object({ password: z.string().min(1).max(1_024) }).strict();
 const moderationSchema = z.object({ reason: z.string().min(1).max(240).optional() }).strict();
 const idParam = z.string().min(1).max(100);
 const providerPatchSchema = z.object({ activeProvider: z.enum(["lmstudio", "codex"]) }).strict();
 const emptyBodySchema = z.object({}).strict();
+const memoryPatchSchema = z.object({ pinned: z.boolean() }).strict();
 
 export interface AdminRouterDependencies {
   auth: AdminAuthManager;
@@ -29,6 +31,10 @@ export interface AdminRouterDependencies {
   now?: () => number;
   llmProviders?: AdminLlmProviderControl;
   onLlmProviderChanged?: () => Promise<void> | void;
+  socialMemory?: Pick<
+    SocialMemoryAdmin,
+    "getOverview" | "getActorDetail" | "setMemoryPinned" | "deleteMemory" | "resetRelationship"
+  >;
 }
 
 const sendError = (response: Response, error: unknown): void => {
@@ -299,6 +305,80 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
     try {
       await dependencies.state.removeBan(idParam.parse(request.params.memberId));
       response.json({ ok: true, state: stateResponse() });
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.get("/memory", (_request, response) => {
+    if (!dependencies.socialMemory) {
+      response.status(503).json({ ok: false, error: "Social memory administration is unavailable." });
+      return;
+    }
+    response.json(dependencies.socialMemory.getOverview());
+  });
+
+  router.get("/memory/actors/:id", (request, response) => {
+    if (!dependencies.socialMemory) {
+      response.status(503).json({ ok: false, error: "Social memory administration is unavailable." });
+      return;
+    }
+    const parsedId = idParam.safeParse(request.params.id);
+    const detail = parsedId.success ? dependencies.socialMemory.getActorDetail(parsedId.data) : undefined;
+    if (!detail) {
+      response.status(404).json({ ok: false, error: "That memory actor was not found." });
+      return;
+    }
+    response.json(detail);
+  });
+
+  router.patch("/memory/items/:id", (request, response, next) => {
+    if (!dependencies.socialMemory) {
+      response.status(503).json({ ok: false, error: "Social memory administration is unavailable." });
+      return;
+    }
+    try {
+      const id = idParam.parse(request.params.id);
+      const patch = memoryPatchSchema.parse(request.body);
+      if (!dependencies.socialMemory.setMemoryPinned(id, patch.pinned)) {
+        response.status(404).json({ ok: false, error: "That memory item was not found or already had that state." });
+        return;
+      }
+      response.status(204).end();
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.delete("/memory/items/:id", (request, response, next) => {
+    if (!dependencies.socialMemory) {
+      response.status(503).json({ ok: false, error: "Social memory administration is unavailable." });
+      return;
+    }
+    try {
+      if (!dependencies.socialMemory.deleteMemory(idParam.parse(request.params.id))) {
+        response.status(404).json({ ok: false, error: "That memory item was not found." });
+        return;
+      }
+      response.status(204).end();
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.delete("/memory/relationships/:ownerId/:subjectId", (request, response, next) => {
+    if (!dependencies.socialMemory) {
+      response.status(503).json({ ok: false, error: "Social memory administration is unavailable." });
+      return;
+    }
+    try {
+      const ownerId = idParam.parse(request.params.ownerId);
+      const subjectId = idParam.parse(request.params.subjectId);
+      if (!dependencies.socialMemory.resetRelationship(ownerId, subjectId)) {
+        response.status(404).json({ ok: false, error: "That directed relationship was not found." });
+        return;
+      }
+      response.status(204).end();
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }
     }

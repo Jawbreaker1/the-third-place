@@ -9,6 +9,9 @@ import {
 import type {
   AdminBehaviorTuning,
   AdminChannelConfig,
+  AdminMemoryActorDetail,
+  AdminMemoryOverview,
+  AdminMemoryRelationship,
   AdminPersonaConfig,
   AdminPersonaCore,
   AdminStateSnapshot,
@@ -21,15 +24,20 @@ import {
   deleteAdminBan,
   deleteAdminChannel,
   deleteAdminCodexSession,
+  deleteAdminMemoryItem,
+  deleteAdminMemoryRelationship,
   deleteAdminPersona,
   deleteAdminSession,
   getAdminLlmState,
+  getAdminMemory,
+  getAdminMemoryActor,
   getAdminSession,
   getAdminState,
   moderateAdminHuman,
   patchAdminBehavior,
   patchAdminChannel,
   patchAdminLlmProvider,
+  patchAdminMemoryItem,
   patchAdminPersona,
   startAdminCodexLogin,
 } from "./adminApi";
@@ -50,7 +58,7 @@ import {
   personaVoiceChoices,
 } from "./adminModel";
 
-type AdminSection = "overview" | "provider" | "residents" | "rooms" | "humans";
+type AdminSection = "overview" | "provider" | "residents" | "memory" | "rooms" | "humans";
 type AuthPhase = "checking" | "signed-out" | "signed-in";
 type Notice = { tone: "success" | "error"; message: string };
 type ConfirmRequest = {
@@ -64,6 +72,7 @@ const sections: Array<{ id: AdminSection; label: string; hint: string }> = [
   { id: "overview", label: "Overview", hint: "Live controls" },
   { id: "provider", label: "AI provider", hint: "Gemma or GPT" },
   { id: "residents", label: "Residents", hint: "Identity & voice" },
+  { id: "memory", label: "Memory", hint: "Social continuity" },
   { id: "rooms", label: "Rooms", hint: "Topics & seeds" },
   { id: "humans", label: "Humans", hint: "Moderation" },
 ];
@@ -177,6 +186,46 @@ function EmptyState({ title, children }: { title: string; children: ReactNode })
       <strong>{title}</strong>
       <span>{children}</span>
     </div>
+  );
+}
+
+const memoryLabel = (value: string): string => value.replaceAll("_", " ").replaceAll("-", " ");
+
+const formatMemoryScore = (value: number): string => {
+  if (!Number.isFinite(value)) return "—";
+  const normalized = Math.abs(value) <= 1 ? value * 100 : value;
+  return `${Math.round(normalized)}%`;
+};
+
+function MemorySourceIds({ eventIds, messageIds }: { eventIds: string[]; messageIds: string[] }) {
+  const sources = [
+    ...eventIds.map((id) => ({ prefix: "event", id })),
+    ...messageIds.map((id) => ({ prefix: "message", id })),
+  ];
+  if (!sources.length) return <span className="admin-memory-no-source">No retained source IDs</span>;
+  return (
+    <div className="admin-memory-sources" aria-label="Memory provenance source IDs">
+      {sources.slice(0, 8).map((source) => (
+        <code key={`${source.prefix}:${source.id}`} title={source.id}>{source.prefix}: {source.id}</code>
+      ))}
+      {sources.length > 8 && <span>+{sources.length - 8} more</span>}
+    </div>
+  );
+}
+
+function RelationshipScores({ relationship }: { relationship: AdminMemoryRelationship }) {
+  return (
+    <dl className="admin-memory-relation-scores">
+      {([
+        ["Familiarity", relationship.familiarity],
+        ["Warmth", relationship.warmth],
+        ["Trust", relationship.trust],
+        ["Respect", relationship.respect],
+        ["Friction", relationship.friction],
+      ] as const).map(([label, value]) => (
+        <div key={label}><dt>{label}</dt><dd>{formatMemoryScore(value)}</dd></div>
+      ))}
+    </dl>
   );
 }
 
@@ -296,6 +345,13 @@ export default function AdminApp() {
   const [channelDraft, setChannelDraft] = useState<AdminChannelConfig>();
   const [channelSeedText, setChannelSeedText] = useState("");
   const [newChannel, setNewChannel] = useState(false);
+  const [memoryOverview, setMemoryOverview] = useState<AdminMemoryOverview>();
+  const [memoryOverviewLoading, setMemoryOverviewLoading] = useState(false);
+  const [memoryOverviewError, setMemoryOverviewError] = useState<string>();
+  const [selectedMemoryActorId, setSelectedMemoryActorId] = useState("");
+  const [memoryDetail, setMemoryDetail] = useState<AdminMemoryActorDetail>();
+  const [memoryDetailLoading, setMemoryDetailLoading] = useState(false);
+  const [memoryDetailError, setMemoryDetailError] = useState<string>();
 
   const installSnapshot = (next: AdminStateSnapshot) => {
     setSnapshot(next);
@@ -415,6 +471,94 @@ export default function AdminApp() {
     }
   };
 
+  const refreshMemoryInspector = async (actorId = selectedMemoryActorId): Promise<void> => {
+    setMemoryOverviewLoading(true);
+    setMemoryOverviewError(undefined);
+    if (actorId) {
+      setMemoryDetailLoading(true);
+      setMemoryDetailError(undefined);
+    }
+    try {
+      const [nextOverview, nextDetail] = await Promise.all([
+        getAdminMemory(),
+        actorId ? getAdminMemoryActor(actorId) : Promise.resolve(undefined),
+      ]);
+      setMemoryOverview(nextOverview);
+      const nextActorId = nextOverview.actors.some((actor) => actor.id === actorId)
+        ? actorId
+        : nextOverview.actors[0]?.id ?? "";
+      setSelectedMemoryActorId(nextActorId);
+      if (!nextActorId) {
+        setMemoryDetail(undefined);
+      } else if (nextActorId === actorId) {
+        setMemoryDetail(nextDetail);
+      }
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setAuthPhase("signed-out");
+      }
+      const message = mutationErrorMessage(error);
+      setMemoryOverviewError(message);
+      if (actorId) setMemoryDetailError(message);
+      throw error;
+    } finally {
+      setMemoryOverviewLoading(false);
+      setMemoryDetailLoading(false);
+    }
+  };
+
+  const runMemoryMutation = async (
+    key: string,
+    successMessage: string,
+    operation: () => Promise<void>,
+  ): Promise<boolean> => {
+    setBusy(key);
+    setNotice(undefined);
+    try {
+      await operation();
+      await refreshMemoryInspector();
+      setNotice({ tone: "success", message: successMessage });
+      return true;
+    } catch (error) {
+      setNotice({ tone: "error", message: mutationErrorMessage(error) });
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  useEffect(() => {
+    if (section !== "memory" || memoryOverview !== undefined || memoryOverviewLoading) return;
+    void refreshMemoryInspector().catch(() => undefined);
+    // The first visit lazily loads this private, potentially larger inspector.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [memoryOverview, section]);
+
+  useEffect(() => {
+    if (section !== "memory" || !selectedMemoryActorId) return;
+    if (memoryDetail?.actor.id === selectedMemoryActorId) return;
+    let active = true;
+    setMemoryDetailLoading(true);
+    setMemoryDetailError(undefined);
+    void getAdminMemoryActor(selectedMemoryActorId)
+      .then((next) => {
+        if (active) setMemoryDetail(next);
+      })
+      .catch((error) => {
+        if (!active) return;
+        if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+          setSnapshot(null);
+          setAuthPhase("signed-out");
+        }
+        setMemoryDetailError(mutationErrorMessage(error));
+      })
+      .finally(() => {
+        if (active) setMemoryDetailLoading(false);
+      });
+    return () => { active = false; };
+  }, [memoryDetail?.actor.id, section, selectedMemoryActorId]);
+
   const login = async (event: FormEvent) => {
     event.preventDefault();
     setBusy("login");
@@ -448,6 +592,11 @@ export default function AdminApp() {
       setLlmState(undefined);
       setLlmError(undefined);
       setCodexLogin(undefined);
+      setMemoryOverview(undefined);
+      setMemoryDetail(undefined);
+      setSelectedMemoryActorId("");
+      setMemoryOverviewError(undefined);
+      setMemoryDetailError(undefined);
       setPassword("");
       setAuthPhase("signed-out");
     } catch (error) {
@@ -1241,6 +1390,263 @@ export default function AdminApp() {
     </div>
   );
 
+  const memory = (
+    <>
+      {!memoryOverview && memoryOverviewLoading && (
+        <section className="admin-card admin-memory-loading" aria-live="polite">
+          <span className="admin-spinner" /><strong>Loading social memory…</strong>
+        </section>
+      )}
+      {!memoryOverview && memoryOverviewError && !memoryOverviewLoading && (
+        <section className="admin-card">
+          <EmptyState title="Memory inspector is unavailable">
+            {memoryOverviewError}
+          </EmptyState>
+          <div className="admin-card-actions">
+            <button
+              className="admin-button primary"
+              onClick={() => { void refreshMemoryInspector().catch(() => undefined); }}
+              type="button"
+            >Retry</button>
+          </div>
+        </section>
+      )}
+      {memoryOverview && (
+        <>
+          {memoryOverviewError && <div className="admin-provider-warning" role="alert">{memoryOverviewError}</div>}
+          <section className="admin-memory-stat-grid" aria-label="Persistent social memory totals">
+            <div className="admin-stat"><span>Actors</span><strong>{memoryOverview.stats.actors}</strong><small>Residents and known humans</small></div>
+            <div className="admin-stat"><span>Memories</span><strong>{memoryOverview.stats.memories}</strong><small>Subjective retained items</small></div>
+            <div className="admin-stat"><span>Relations</span><strong>{memoryOverview.stats.relationships}</strong><small>Directed social views</small></div>
+            <div className="admin-stat"><span>Open loops</span><strong>{memoryOverview.stats.openLoops}</strong><small>Promises and unresolved threads</small></div>
+            <div className="admin-stat"><span>Audit</span><strong>{memoryOverview.stats.auditEntries}</strong><small>Provenance changes</small></div>
+          </section>
+          {!memoryOverview.actors.length ? (
+            <section className="admin-card">
+              <EmptyState title="No social memory yet">Actors will appear after the memory system observes a durable, source-backed social event.</EmptyState>
+            </section>
+          ) : (
+            <div className="admin-editor-layout admin-memory-layout">
+              <aside className="admin-list-card" aria-label="Memory actors">
+                <div className="admin-list-header">
+                  <div><p className="admin-kicker">Perspectives</p><h2>Actors</h2></div>
+                  <span className="admin-count-badge">{memoryOverview.actors.length}</span>
+                </div>
+                <div className="admin-entity-list">
+                  {memoryOverview.actors.map((actor) => (
+                    <button
+                      aria-current={selectedMemoryActorId === actor.id ? "true" : undefined}
+                      className={selectedMemoryActorId === actor.id ? "active" : ""}
+                      key={actor.id}
+                      onClick={() => {
+                        setSelectedMemoryActorId(actor.id);
+                        setMemoryDetail(undefined);
+                        setMemoryDetailError(undefined);
+                      }}
+                      type="button"
+                    >
+                      <span className={`admin-avatar-chip ${actor.kind}`}>{actor.name.slice(0, 1).toLocaleUpperCase() || "?"}</span>
+                      <span>
+                        <strong>{actor.name}</strong>
+                        <small>{actor.memoryCount} memories · {actor.openLoopCount} open</small>
+                      </span>
+                      <i>{actor.kind === "resident" ? "AI" : "H"}</i>
+                    </button>
+                  ))}
+                </div>
+              </aside>
+              <section aria-busy={memoryDetailLoading} className="admin-card admin-editor-card admin-memory-detail">
+                {memoryDetailLoading && !memoryDetail && (
+                  <div className="admin-memory-loading" aria-live="polite"><span className="admin-spinner" /><strong>Loading this perspective…</strong></div>
+                )}
+                {memoryDetailError && !memoryDetailLoading && !memoryDetail && (
+                  <>
+                    <EmptyState title="This actor could not be loaded">{memoryDetailError}</EmptyState>
+                    <div className="admin-card-actions">
+                      <button
+                        className="admin-button primary"
+                        onClick={() => {
+                          setMemoryDetail(undefined);
+                          setMemoryDetailError(undefined);
+                          setMemoryDetailLoading(true);
+                          void getAdminMemoryActor(selectedMemoryActorId)
+                            .then(setMemoryDetail)
+                            .catch((error) => {
+                              if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+                                setSnapshot(null);
+                                setAuthPhase("signed-out");
+                              }
+                              setMemoryDetailError(mutationErrorMessage(error));
+                            })
+                            .finally(() => setMemoryDetailLoading(false));
+                        }}
+                        type="button"
+                      >Retry actor</button>
+                    </div>
+                  </>
+                )}
+                {memoryDetail && (
+                  <>
+                    <div className="admin-card-heading admin-memory-actor-heading">
+                      <div>
+                        <p className="admin-kicker">{memoryDetail.actor.kind} perspective</p>
+                        <h2>{memoryDetail.actor.name}</h2>
+                        <code>{memoryDetail.actor.id}</code>
+                      </div>
+                      <div className="admin-memory-actor-counts">
+                        <span><strong>{memoryDetail.ownedMemories.length}</strong> owned memories</span>
+                        <span><strong>{memoryDetail.outgoingRelationships.length}</strong> outward views</span>
+                        <span><strong>{memoryDetail.incomingRelationships.length}</strong> incoming views</span>
+                      </div>
+                    </div>
+
+                    <section className="admin-memory-block" aria-labelledby="owned-memory-title">
+                      <div className="admin-memory-block-heading"><div><p className="admin-kicker">Subjective recall</p><h3 id="owned-memory-title">Owned memories</h3></div><span>{memoryDetail.ownedMemories.length}</span></div>
+                      {memoryDetail.ownedMemories.length ? (
+                        <div className="admin-memory-items">
+                          {memoryDetail.ownedMemories.map((item) => (
+                            <article className={`admin-memory-item ${item.pinned ? "pinned" : ""}`} key={item.id}>
+                              <header>
+                                <div className="admin-memory-tags">
+                                  <span>{memoryLabel(item.kind)}</span>
+                                  {item.pinned && <span className="pinned">Pinned</span>}
+                                </div>
+                                <div className="admin-row-actions">
+                                  <button
+                                    className="admin-button subtle compact"
+                                    disabled={Boolean(busy)}
+                                    onClick={() => { void runMemoryMutation(
+                                      `pin-memory-${item.id}`,
+                                      item.pinned ? "Memory unpinned." : "Memory pinned.",
+                                      () => patchAdminMemoryItem(item.id, { pinned: !item.pinned }),
+                                    ); }}
+                                    type="button"
+                                  >{item.pinned ? "Unpin" : "Pin"}</button>
+                                  <button
+                                    className="admin-button danger-quiet compact"
+                                    disabled={Boolean(busy)}
+                                    onClick={() => setConfirm({
+                                      title: "Forget this memory?",
+                                      message: `This removes only ${memoryDetail.actor.name}'s subjective memory. Its source messages and audit provenance remain intact.`,
+                                      confirmLabel: "Forget memory",
+                                      action: () => runMemoryMutation(
+                                        `delete-memory-${item.id}`,
+                                        "The subjective memory was removed.",
+                                        () => deleteAdminMemoryItem(item.id),
+                                      ),
+                                    })}
+                                    type="button"
+                                  >Forget</button>
+                                </div>
+                              </header>
+                              <p>{item.summary}</p>
+                              <dl className="admin-memory-metadata">
+                                <div><dt>Scope</dt><dd>{memoryLabel(item.scope)}</dd></div>
+                                <div><dt>Perspective</dt><dd>{memoryLabel(item.perspective)}</dd></div>
+                                <div><dt>Confidence</dt><dd>{formatMemoryScore(item.confidence)}</dd></div>
+                                <div><dt>Salience</dt><dd>{formatMemoryScore(item.salience)}</dd></div>
+                              </dl>
+                              <MemorySourceIds eventIds={item.sourceEventIds ?? []} messageIds={item.sourceMessageIds ?? []} />
+                              <footer>
+                                <span>Created {formatDateTime(item.createdAt)}</span>
+                                <span>Updated {formatDateTime(item.updatedAt)}</span>
+                                {item.expiresAt && <span>Expires {formatDateTime(item.expiresAt)}</span>}
+                              </footer>
+                            </article>
+                          ))}
+                        </div>
+                      ) : <EmptyState title="No owned memories">This actor has no retained subjective memories.</EmptyState>}
+                    </section>
+
+                    <section className="admin-memory-block" aria-labelledby="relations-title">
+                      <div className="admin-memory-block-heading"><div><p className="admin-kicker">Directed, never symmetric</p><h3 id="relations-title">Relationships</h3></div></div>
+                      <div className="admin-memory-relation-columns">
+                        {([
+                          ["Outgoing", memoryDetail.outgoingRelationships, "How this actor sees others"],
+                          ["Incoming", memoryDetail.incomingRelationships, "How others see this actor"],
+                        ] as const).map(([title, relationships, description]) => (
+                          <div className="admin-memory-relation-column" key={title}>
+                            <div><strong>{title}</strong><small>{description}</small></div>
+                            {relationships.length ? relationships.map((relationship) => (
+                              <article className="admin-memory-relation" key={`${relationship.ownerId}:${relationship.subjectId}`}>
+                                <header>
+                                  <div>
+                                    <strong>{relationship.ownerName || relationship.ownerId} <span aria-hidden="true">→</span> {relationship.subjectName || relationship.subjectId}</strong>
+                                    <small>{relationship.ownerId} → {relationship.subjectId}</small>
+                                  </div>
+                                  <button
+                                    className="admin-button danger-quiet compact"
+                                    disabled={Boolean(busy)}
+                                    onClick={() => setConfirm({
+                                      title: "Reset this directed relationship?",
+                                      message: `Only ${relationship.ownerName || relationship.ownerId}'s view of ${relationship.subjectName || relationship.subjectId} will be reset. The reverse relationship is independent.`,
+                                      confirmLabel: "Reset relationship",
+                                      action: () => runMemoryMutation(
+                                        `delete-relationship-${relationship.ownerId}-${relationship.subjectId}`,
+                                        "The directed relationship was reset.",
+                                        () => deleteAdminMemoryRelationship(relationship.ownerId, relationship.subjectId),
+                                      ),
+                                    })}
+                                    type="button"
+                                  >Reset</button>
+                                </header>
+                                <RelationshipScores relationship={relationship} />
+                                <footer>Updated {formatDateTime(relationship.updatedAt)}</footer>
+                              </article>
+                            )) : <p className="admin-memory-inline-empty">No {title.toLocaleLowerCase()} relationships.</p>}
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+
+                    <section className="admin-memory-block" aria-labelledby="open-loops-title">
+                      <div className="admin-memory-block-heading"><div><p className="admin-kicker">Unfinished social business</p><h3 id="open-loops-title">Open loops</h3></div><span>{memoryDetail.openLoops.length}</span></div>
+                      {memoryDetail.openLoops.length ? (
+                        <div className="admin-memory-simple-list">
+                          {memoryDetail.openLoops.map((loop) => (
+                            <article key={loop.id}>
+                              <header><strong>{memoryLabel(loop.kind)}</strong><span>{memoryLabel(loop.status)}</span></header>
+                              <p>{loop.summary}</p>
+                              {loop.subjectIds.length > 0 && <small>Subjects: {loop.subjectIds.join(", ")}</small>}
+                              <MemorySourceIds eventIds={loop.sourceEventIds ?? []} messageIds={loop.sourceMessageIds ?? []} />
+                              <footer>Updated {formatDateTime(loop.updatedAt)}</footer>
+                            </article>
+                          ))}
+                        </div>
+                      ) : <EmptyState title="No open loops">No promise, conflict or follow-up is waiting on this actor.</EmptyState>}
+                    </section>
+
+                    <section className="admin-memory-block" aria-labelledby="memory-audit-title">
+                      <div className="admin-memory-block-heading"><div><p className="admin-kicker">Why this state exists</p><h3 id="memory-audit-title">Audit provenance</h3></div><span>{memoryDetail.audit.length}</span></div>
+                      {memoryDetail.audit.length ? (
+                        <div className="admin-memory-audit-list">
+                          {memoryDetail.audit.map((entry) => (
+                            <article key={entry.id}>
+                              <span className="admin-memory-audit-action">{memoryLabel(entry.action)}</span>
+                              <div>
+                                <strong>{entry.summary}</strong>
+                                <small>{memoryLabel(entry.entityType)} · {entry.entityId}{entry.actorId ? ` · actor ${entry.actorId}` : ""}</small>
+                                <MemorySourceIds eventIds={entry.sourceEventIds ?? []} messageIds={entry.sourceMessageIds ?? []} />
+                              </div>
+                              <time dateTime={entry.createdAt}>{formatDateTime(entry.createdAt)}</time>
+                            </article>
+                          ))}
+                        </div>
+                      ) : <EmptyState title="No audit entries">There is no retained provenance for this actor yet.</EmptyState>}
+                    </section>
+                  </>
+                )}
+                {!selectedMemoryActorId && !memoryDetailLoading && !memoryDetailError && (
+                  <EmptyState title="No actor selected">Choose an actor to inspect their memories and relationships.</EmptyState>
+                )}
+              </section>
+            </div>
+          )}
+        </>
+      )}
+    </>
+  );
+
   const sectionTitle = sections.find((entry) => entry.id === section)!;
   return (
     <div className="admin-root">
@@ -1278,7 +1684,13 @@ export default function AdminApp() {
               onClick={() => {
                 setBusy("refresh");
                 setNotice(undefined);
-                void refreshState().then(() => setNotice({ tone: "success", message: "Admin state refreshed." })).catch((error) => setNotice({ tone: "error", message: mutationErrorMessage(error) })).finally(() => setBusy(null));
+                const refresh = section === "memory"
+                  ? refreshMemoryInspector()
+                  : refreshState().then(() => undefined);
+                void refresh
+                  .then(() => setNotice({ tone: "success", message: section === "memory" ? "Memory inspector refreshed." : "Admin state refreshed." }))
+                  .catch((error) => setNotice({ tone: "error", message: mutationErrorMessage(error) }))
+                  .finally(() => setBusy(null));
               }}
               type="button"
             >{busy === "refresh" ? "Refreshing…" : "Refresh"}</button>
@@ -1289,6 +1701,7 @@ export default function AdminApp() {
           {section === "overview" && overview}
           {section === "provider" && provider}
           {section === "residents" && residents}
+          {section === "memory" && memory}
           {section === "rooms" && rooms}
           {section === "humans" && humans}
         </div>

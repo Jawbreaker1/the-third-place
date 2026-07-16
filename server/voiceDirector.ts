@@ -26,6 +26,8 @@ import { ttsLanguageIsSupported, type VoiceSpeechService } from "./voiceSpeech.j
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 import { CapabilityRegistry } from "./capabilities/registry.js";
 import { capabilitiesForMedium, type TurnCapability } from "./capabilities/catalog.js";
+import type { SocialMemoryCoordinator } from "./socialMemoryCoordinator.js";
+import type { SocialMemoryScope } from "./socialMemory.js";
 
 export interface VoiceAiSpeechPayload {
   roomId: string;
@@ -63,6 +65,7 @@ export interface VoiceDirectorOptions {
   actorChannels: ActorChannelRuntime;
   events: VoiceDirectorEvents;
   humanMemory?: Pick<HumanMemory, "promptNote" | "getRelation" | "updateRelation">;
+  socialMemory?: Pick<SocialMemoryCoordinator, "promptNote" | "enqueueDeliveredEpisode">;
   now?: () => number;
   /** Quiet floor after the latest completed human turn; production uses this to coalesce overlapping speakers. */
   floorSilenceMs?: number;
@@ -94,6 +97,17 @@ const sanitizeSpokenLine = (value: string, language?: string): string => {
     .trim();
   return truncateSpokenText(cleaned, { language, maxWords: 25, maxGraphemes: 240 });
 };
+
+const combinedRelationshipNote = (...notes: Array<string | undefined>): string | undefined => {
+  const combined = notes.filter((note): note is string => Boolean(note?.trim())).join("\n").slice(0, 1_200);
+  return combined || undefined;
+};
+
+const voiceSocialScope = (room: VoiceRoomView): SocialMemoryScope => ({
+  kind: "voice",
+  roomId: room.id,
+  participantIds: room.participants.map((participant) => participant.memberId).sort(),
+});
 
 const transcriptFor = (entries: VoiceTranscriptEntry[], personaId: string): TranscriptLine[] =>
   entries
@@ -501,7 +515,10 @@ export class VoiceDirector {
     if (earlyPersona) this.setBotState(room.id, earlyPersona.id, "thinking");
     const solePersona = invited.length === 1 ? invited[0] : undefined;
     const soleRelationshipNote = solePersona
-      ? this.options.humanMemory?.promptNote(entry.speakerId, solePersona.id)
+      ? combinedRelationshipNote(
+          this.options.humanMemory?.promptNote(entry.speakerId, solePersona.id),
+          this.options.socialMemory?.promptNote(solePersona.id, entry.speakerId, voiceSocialScope(room)),
+        )
       : undefined;
     const behaviorTuning = resolveBehaviorTuning(
       this.options.behaviorTuningProvider,
@@ -608,11 +625,14 @@ export class VoiceDirector {
           : "failed_temporary",
     };
 
-    // Capture only the memory that predates this turn. Voice transcripts never
-    // enter long-term memory; a completed exchange merely strengthens rapport.
+    // Capture only memory that predates this turn for generation. A delivered
+    // voice exchange is classified asynchronously after it reaches transcript.
     const relationshipNote = solePersona?.id === persona.id
       ? soleRelationshipNote
-      : this.options.humanMemory?.promptNote(entry.speakerId, persona.id);
+      : combinedRelationshipNote(
+          this.options.humanMemory?.promptNote(entry.speakerId, persona.id),
+          this.options.socialMemory?.promptNote(persona.id, entry.speakerId, voiceSocialScope(room)),
+        );
     const previousRelation = this.options.humanMemory?.getRelation(entry.speakerId, persona.id);
     const actorChannelNotes = this.options.actorChannels.promptNotes([persona], room.channelId);
     const actorExpertiseNotes = this.options.actorChannels.expertiseNotes([persona], room.channelId);
@@ -815,6 +835,7 @@ export class VoiceDirector {
     this.lastSpokeAtByPersona.set(persona.id, this.now());
     this.setBotState(room.id, persona.id, "speaking");
     this.options.events.transcriptFinal(appended.entry);
+    this.captureDeliveredVoiceEpisode(room, entry, appended.entry);
     this.options.events.aiSpeech({
       roomId: room.id,
       memberId: persona.id,
@@ -851,6 +872,58 @@ export class VoiceDirector {
       if (this.isCurrent(room.id, epoch, persona.id)) this.setBotState(room.id, persona.id, "listening");
     }, estimatedSpeakingMs);
     timer.unref();
+  }
+
+  private captureDeliveredVoiceEpisode(
+    room: VoiceRoomView,
+    humanEntry: VoiceTranscriptEntry,
+    residentEntry: VoiceTranscriptEntry,
+  ): void {
+    const coordinator = this.options.socialMemory;
+    if (!coordinator) return;
+    const participants = room.participants.map((participant) => ({
+      id: participant.memberId,
+      kind: participant.kind === "ai" ? "resident" as const : "human" as const,
+      displayName: participant.name,
+    }));
+    const eligibleResidentOwners = room.participants.flatMap((participant) => {
+      if (participant.kind !== "ai") return [];
+      const witnessedMessageIds = [
+        ...(humanEntry.heardByPersonaIds.includes(participant.memberId) ? [humanEntry.id] : []),
+        ...(residentEntry.speakerId === participant.memberId || residentEntry.heardByPersonaIds.includes(participant.memberId)
+          ? [residentEntry.id]
+          : []),
+      ];
+      if (witnessedMessageIds.length === 0) return [];
+      const persona = PERSONAS.find((candidate) => candidate.id === participant.memberId);
+      return [{
+        residentId: participant.memberId,
+        witnessedMessageIds,
+        appraisalNote: (persona?.prompt ?? `${participant.name} is a participant in this voice room.`).slice(0, 480),
+      }];
+    });
+    if (eligibleResidentOwners.length === 0) return;
+    const profile = getChannelProfile(room.channelId);
+    void coordinator.enqueueDeliveredEpisode({
+      episodeId: `voice_${humanEntry.id}_${residentEntry.id}`,
+      origin: "human",
+      scope: voiceSocialScope(room),
+      channel: {
+        name: profile?.public.name ?? room.channelId,
+        ...(profile?.topic.brief ? { topic: profile.topic.brief } : {}),
+      },
+      participants,
+      messages: [humanEntry, residentEntry].map((entry) => ({
+        id: entry.id,
+        authorId: entry.speakerId,
+        authorKind: entry.speakerKind === "ai" ? "resident" as const : "human" as const,
+        content: entry.text,
+        createdAt: entry.endedAt,
+      })),
+      eligibleResidentOwners,
+    }).catch((error) => {
+      console.warn("Voice social memory capture failed safely:", error instanceof Error ? error.message : error);
+    });
   }
 }
 

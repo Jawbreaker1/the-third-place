@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type {
   ChatMessage,
@@ -15,8 +15,10 @@ import type {
 } from "../shared/types.js";
 
 interface PersistedState {
-  version: 1;
+  version: 1 | 2;
   messages: ChatMessage[];
+  /** Private conversations stay server-only and are never included in room snapshots. */
+  privateThreads?: PrivateThread[];
   /** Server-only autonomous accounting; never serialized in public messages. */
   autonomousPublications?: AutonomousPublicationRecord[];
 }
@@ -36,9 +38,42 @@ interface PrivateThread {
 }
 
 const minuteAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
-const PUBLIC_HISTORY_HARD_LIMIT = 600;
-const PUBLIC_HISTORY_TRIM_TO = 500;
+const boundedRetention = (raw: string | undefined, fallback: number, minimum: number, maximum: number): number => {
+  const parsed = Number.parseInt(raw ?? "", 10);
+  return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback;
+};
+const DEFAULT_PUBLIC_HISTORY_HARD_LIMIT = boundedRetention(
+  process.env.PUBLIC_HISTORY_HARD_LIMIT,
+  10_000,
+  600,
+  100_000,
+);
+const DEFAULT_PUBLIC_HISTORY_TRIM_TO = boundedRetention(
+  process.env.PUBLIC_HISTORY_TRIM_TO,
+  9_000,
+  500,
+  DEFAULT_PUBLIC_HISTORY_HARD_LIMIT - 1,
+);
+const DEFAULT_DM_HISTORY_HARD_LIMIT = boundedRetention(
+  process.env.DM_HISTORY_HARD_LIMIT,
+  2_000,
+  160,
+  20_000,
+);
+const DEFAULT_DM_HISTORY_TRIM_TO = boundedRetention(
+  process.env.DM_HISTORY_TRIM_TO,
+  1_800,
+  120,
+  DEFAULT_DM_HISTORY_HARD_LIMIT - 1,
+);
 const AUTONOMOUS_ACCOUNTING_RETENTION_MS = 48 * 60 * 60_000;
+
+export interface RoomStoreOptions {
+  publicHistoryHardLimit?: number;
+  publicHistoryTrimTo?: number;
+  dmHistoryHardLimit?: number;
+  dmHistoryTrimTo?: number;
+}
 export interface HistoryPosition {
   createdAt: string;
   id: string;
@@ -55,6 +90,34 @@ const isAutonomousPublicationRecord = (value: unknown): value is AutonomousPubli
     typeof record.createdAt === "string" && Number.isFinite(Date.parse(record.createdAt)) &&
     (record.kind === "ambient" || record.kind === "research") &&
     (record.attendance === "attended" || record.attendance === "unattended");
+};
+
+const boundedLimit = (value: number | undefined, fallback: number, minimum: number, maximum: number): number =>
+  Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, Math.floor(value!))) : fallback;
+
+const restorePrivateThread = (value: unknown, hardLimit: number): PrivateThread | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Partial<PrivateThread>;
+  if (!Array.isArray(record.participantIds) || record.participantIds.length !== 2) return undefined;
+  const participantIds = record.participantIds.filter(
+    (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0 && candidate.length <= 100,
+  );
+  if (participantIds.length !== 2 || participantIds[0] === participantIds[1]) return undefined;
+  participantIds.sort();
+  const canonicalId = `dm:${participantIds.join(":")}`;
+  if (record.id !== canonicalId || !Array.isArray(record.messages)) return undefined;
+  const participants = new Set(participantIds);
+  const messages = record.messages.filter((message): message is ChatMessage => {
+    if (!message || typeof message !== "object") return false;
+    const candidate = message as Partial<ChatMessage>;
+    return typeof candidate.id === "string" && candidate.id.length > 0 && candidate.id.length <= 100 &&
+      candidate.channelId === canonicalId &&
+      typeof candidate.authorId === "string" && participants.has(candidate.authorId) &&
+      typeof candidate.content === "string" && candidate.content.length <= 500 &&
+      typeof candidate.createdAt === "string" && Number.isFinite(Date.parse(candidate.createdAt)) &&
+      Array.isArray(candidate.reactions);
+  }).slice(-hardLimit);
+  return { id: canonicalId, participantIds: participantIds as [string, string], messages };
 };
 
 const seedMessages = (): ChatMessage[] => [
@@ -330,6 +393,10 @@ export const createMessage = (
 
 export class RoomStore {
   private readonly filePath: string;
+  private readonly publicHistoryHardLimit: number;
+  private readonly publicHistoryTrimTo: number;
+  private readonly dmHistoryHardLimit: number;
+  private readonly dmHistoryTrimTo: number;
   private messages: ChatMessage[] = [];
   private autonomousPublications: AutonomousPublicationRecord[] = [];
   private readonly privateThreads = new Map<string, PrivateThread>();
@@ -337,8 +404,35 @@ export class RoomStore {
   private writeQueue: Promise<void> = Promise.resolve();
   private removalHandler?: (messages: ChatMessage[]) => void;
 
-  constructor(filePath = resolve(process.cwd(), process.env.ROOM_STATE_PATH ?? "data/room-state.json")) {
+  constructor(
+    filePath = resolve(process.cwd(), process.env.ROOM_STATE_PATH ?? "data/room-state.json"),
+    options: RoomStoreOptions = {},
+  ) {
     this.filePath = filePath;
+    this.publicHistoryHardLimit = boundedLimit(
+      options.publicHistoryHardLimit,
+      DEFAULT_PUBLIC_HISTORY_HARD_LIMIT,
+      600,
+      100_000,
+    );
+    this.publicHistoryTrimTo = boundedLimit(
+      options.publicHistoryTrimTo,
+      Math.min(DEFAULT_PUBLIC_HISTORY_TRIM_TO, this.publicHistoryHardLimit - 1),
+      500,
+      this.publicHistoryHardLimit - 1,
+    );
+    this.dmHistoryHardLimit = boundedLimit(
+      options.dmHistoryHardLimit,
+      DEFAULT_DM_HISTORY_HARD_LIMIT,
+      160,
+      20_000,
+    );
+    this.dmHistoryTrimTo = boundedLimit(
+      options.dmHistoryTrimTo,
+      Math.min(DEFAULT_DM_HISTORY_TRIM_TO, this.dmHistoryHardLimit - 1),
+      120,
+      this.dmHistoryHardLimit - 1,
+    );
   }
 
   onMessagesRemoved(handler: (messages: ChatMessage[]) => void): void {
@@ -354,17 +448,28 @@ export class RoomStore {
       this.autonomousPublications = Array.isArray(parsed.autonomousPublications)
         ? parsed.autonomousPublications.filter(isAutonomousPublicationRecord)
         : [];
+      this.privateThreads.clear();
+      for (const candidate of Array.isArray(parsed.privateThreads) ? parsed.privateThreads : []) {
+        const restored = restorePrivateThread(candidate, this.dmHistoryHardLimit);
+        if (restored) this.privateThreads.set(restored.id, restored);
+      }
       this.pruneAutonomousPublications();
       const populatedChannels = new Set(this.messages.map((message) => message.channelId));
       const missingChannelSeeds = builtInScene.filter((message) => !populatedChannels.has(message.channelId));
       if (missingChannelSeeds.length > 0) this.messages.push(...missingChannelSeeds);
-      this.trimAllChannels(PUBLIC_HISTORY_HARD_LIMIT);
+      this.trimAllChannels(this.publicHistoryHardLimit);
+      // Version 2 also contains private DM history. Tighten permissions on a
+      // legacy state file immediately, even when this startup needs no write.
+      await chmod(this.filePath, 0o600).catch((error) => {
+        console.warn("Could not restrict room-state file permissions.", error);
+      });
       if (missingChannelSeeds.length > 0) await this.flush();
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") console.warn("Could not read room state; starting from the built-in scene.", error);
       this.messages = seedMessages();
       this.autonomousPublications = [];
+      this.privateThreads.clear();
       await this.flush();
     }
   }
@@ -429,8 +534,8 @@ export class RoomStore {
     }
     let removed: ChatMessage[] = [];
     const inChannel = this.messages.filter((candidate) => candidate.channelId === message.channelId);
-    if (inChannel.length > PUBLIC_HISTORY_HARD_LIMIT) {
-      const removeIds = new Set(inChannel.slice(0, inChannel.length - PUBLIC_HISTORY_TRIM_TO).map((candidate) => candidate.id));
+    if (inChannel.length > this.publicHistoryHardLimit) {
+      const removeIds = new Set(inChannel.slice(0, inChannel.length - this.publicHistoryTrimTo).map((candidate) => candidate.id));
       removed = this.messages.filter((candidate) => removeIds.has(candidate.id));
       this.messages = this.messages.filter((candidate) => !removeIds.has(candidate.id));
       if (removed.length > 0) this.removalHandler?.(removed);
@@ -497,6 +602,7 @@ export class RoomStore {
     if (!thread) {
       thread = { id, participantIds, messages: [] };
       this.privateThreads.set(id, thread);
+      this.schedulePersist();
     }
     return { id, peerId, messages: [...thread.messages], unread: 0 };
   }
@@ -530,7 +636,10 @@ export class RoomStore {
       linkPreview,
     });
     thread.messages.push(message);
-    if (thread.messages.length > 160) thread.messages = thread.messages.slice(-120);
+    if (thread.messages.length > this.dmHistoryHardLimit) {
+      thread.messages = thread.messages.slice(-this.dmHistoryTrimTo);
+    }
+    this.schedulePersist();
     return message;
   }
 
@@ -543,9 +652,11 @@ export class RoomStore {
   }
 
   forgetDmParticipant(memberId: string): void {
+    let changed = false;
     for (const [threadId, thread] of this.privateThreads) {
-      if (thread.participantIds.includes(memberId)) this.privateThreads.delete(threadId);
+      if (thread.participantIds.includes(memberId)) changed = this.privateThreads.delete(threadId) || changed;
     }
+    if (changed) this.schedulePersist();
   }
 
   async flush(): Promise<void> {
@@ -558,13 +669,14 @@ export class RoomStore {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
       const payload: PersistedState = {
-        version: 1,
+        version: 2,
         messages: this.messages,
+        privateThreads: [...this.privateThreads.values()],
         autonomousPublications: this.autonomousPublications,
       };
       const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
       try {
-        await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+        await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
         await rename(tempPath, this.filePath);
       } catch (error) {
         await unlink(tempPath).catch((cleanupError: NodeJS.ErrnoException) => {

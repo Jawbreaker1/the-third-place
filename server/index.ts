@@ -78,6 +78,9 @@ import { installSpaHosting } from "./spaHosting.js";
 import { createMessage, type HistoryPosition, RoomStore } from "./store.js";
 import { VoiceDirector } from "./voiceDirector.js";
 import { preferredRequestLanguage } from "./requestLanguage.js";
+import { SocialMemoryStore } from "./socialMemory.js";
+import { SocialMemoryAdmin } from "./socialMemoryAdmin.js";
+import { SocialMemoryCoordinator } from "./socialMemoryCoordinator.js";
 import { VoiceIngestGate, VoiceIngestGateError, type VoiceIngestRelease } from "./voiceIngestGate.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
 import { VoiceSpeechError, VoiceSpeechService } from "./voiceSpeech.js";
@@ -423,6 +426,9 @@ const io = new Server(httpServer, {
 
 const store = new RoomStore();
 const humanMemory = new HumanMemoryStore();
+const socialMemoryStore = new SocialMemoryStore({
+  filePath: resolve(process.env.SOCIAL_MEMORY_PATH ?? "./data/social-memory.sqlite"),
+});
 const ambientEpisodeLedger = new AmbientEpisodeLedger();
 await ambientEpisodeLedger.load();
 let adminState!: AdminStateStore;
@@ -436,6 +442,14 @@ const codexClient = new LmStudioClient({
   timeoutMs: Number.parseInt(process.env.CODEX_TIMEOUT_MS ?? "120000", 10),
 });
 const lm = new SwitchableSocialModel({ lmstudio: lmStudioClient, codex: codexClient });
+const socialMemory = new SocialMemoryCoordinator(lm, socialMemoryStore, {
+  onError: (error, episodeId) => {
+    console.warn(
+      `Social memory episode ${episodeId} failed safely:`,
+      error instanceof Error ? error.message : error,
+    );
+  },
+});
 const modelProviders = new ModelProviderManager(lm, codexBackend);
 await modelProviders.load();
 const researchBroker = new ResearchBroker();
@@ -481,13 +495,16 @@ const voiceRooms = new VoiceRoomRuntime(
   },
 );
 const sessions = new Map<string, HumanSession>();
-const synchronizeOfflineSessionsWithMemory = (): void => {
+const synchronizeOfflineSessionsWithMemory = async (): Promise<void> => {
   const rememberedTokenHashes = new Set(humanMemory.listRestorableProfiles().map((profile) => profile.tokenHash));
+  const forgottenActorIds: string[] = [];
   for (const [tokenHash, session] of sessions) {
     if (session.socketIds.size > 0 || rememberedTokenHashes.has(tokenHash)) continue;
     sessions.delete(tokenHash);
     store.forgetDmParticipant(session.member.id);
+    forgottenActorIds.push(session.member.id);
   }
+  await Promise.all(forgottenActorIds.map((actorId) => socialMemory.forgetActor(actorId)));
 };
 const joinAttempts = new Map<string, number[]>();
 const socketBuckets = new Map<
@@ -615,6 +632,7 @@ const director = new SocialDirector(
     footballCompetitionProvider,
     marketPulseCoordinator,
     ambientEpisodeLedger,
+    socialMemory,
   },
 );
 
@@ -646,6 +664,7 @@ const voiceDirector = new VoiceDirector({
   speech: voiceSpeech,
   actorChannels,
   humanMemory,
+  socialMemory,
   behaviorTuningProvider,
   establishedChannelLanguage: (channelId) => director.trustedLanguageForChannel(channelId),
   recentChannelMessages: (channelId) => store.getRecent(channelId, 6)
@@ -792,6 +811,23 @@ const adminHumans = (): AdminHumanMember[] => [...sessions.values()]
   }))
   .sort((a, b) => a.name.localeCompare(b.name));
 
+const socialMemoryAdmin = new SocialMemoryAdmin({
+  store: socialMemoryStore,
+  getActors: () => {
+    const actors = new Map<string, { id: string; name: string; kind: "resident" | "human" }>();
+    for (const persona of PERSONAS) {
+      actors.set(persona.id, { id: persona.id, name: persona.name, kind: "resident" });
+    }
+    for (const profile of humanMemory.listRestorableProfiles()) {
+      actors.set(profile.member.id, { id: profile.member.id, name: profile.member.name, kind: "human" });
+    }
+    for (const session of sessions.values()) {
+      actors.set(session.member.id, { id: session.member.id, name: session.member.name, kind: "human" });
+    }
+    return [...actors.values()];
+  },
+});
+
 const disconnectModeratedHuman = (
   memberId: string,
   reason: string | undefined,
@@ -899,6 +935,7 @@ app.use("/api/admin", createAdminRouter({
     voiceDirector.onCatalogChanged(voiceRooms.listRooms().map((room) => room.id));
     io.to("public").emit("health:update", getHealth());
   },
+  socialMemory: socialMemoryAdmin,
 }));
 
 app.get("/api/voice/capabilities", (_request, response) => {
@@ -1220,6 +1257,7 @@ app.delete("/api/session/memory", async (request, response) => {
   }
   authenticated.session.lastSeenAt = Date.now();
   humanMemory.resetRememberedDetails(authenticated.session.member.id, authenticated.session.lastSeenAt);
+  await socialMemory.forgetActor(authenticated.session.member.id);
   await humanMemory.flush();
   setSessionCookie(request, response, authenticated.token);
   response.json({ ok: true, memory: humanMemory.clientSummary(authenticated.session.member.id) });
@@ -1277,7 +1315,7 @@ app.post("/api/session", async (request, response) => {
   });
   sessions.set(tokenHash, session);
   humanMemory.upsertSession({ tokenHash, member: session.member, seenAt: session.lastSeenAt });
-  synchronizeOfflineSessionsWithMemory();
+  await synchronizeOfflineSessionsWithMemory();
   try {
     await humanMemory.flush();
   } catch (error) {
@@ -1753,6 +1791,7 @@ director.start();
 
 const healthInterval = setInterval(async () => {
   const now = Date.now();
+  const expiredSocialMemoryActors: string[] = [];
   for (const [tokenHash, session] of sessions) {
     if (session.socketIds.size > 0) {
       if (now - session.lastSeenAt >= SESSION_HEARTBEAT_MS) {
@@ -1765,12 +1804,14 @@ const healthInterval = setInterval(async () => {
       sessions.delete(tokenHash);
       humanMemory.forgetProfile(session.member.id);
       store.forgetDmParticipant(session.member.id);
+      expiredSocialMemoryActors.push(session.member.id);
     }
   }
+  await Promise.all(expiredSocialMemoryActors.map((actorId) => socialMemory.forgetActor(actorId)));
   humanMemory.prune(now);
   adminAuth.prune(now);
   adminModeration.prune(now);
-  synchronizeOfflineSessionsWithMemory();
+  await synchronizeOfflineSessionsWithMemory();
   for (const [ip, timestamps] of joinAttempts) {
     const recent = timestamps.filter((timestamp) => now - timestamp < 10 * 60_000);
     if (recent.length > 0) joinAttempts.set(ip, recent);
@@ -1795,6 +1836,7 @@ const shutdown = async (signal: string) => {
   clearInterval(healthInterval);
   director.stop();
   io.close();
+  await socialMemory.close();
   await Promise.all([
     store.flush(),
     humanMemory.flush(),
@@ -1802,6 +1844,7 @@ const shutdown = async (signal: string) => {
     adminState.flush(),
     modelProviders.close(),
   ]);
+  socialMemoryStore.close();
   httpServer.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5_000).unref();
 };

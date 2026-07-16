@@ -8,12 +8,14 @@ import type {
 } from "./lmStudio.js";
 import type { ModelProviderId } from "./modelBackend.js";
 import type { MemoryAnalysis, MemoryAnalysisInput, TurnAnalysis, TurnAnalysisInput } from "./semanticRouter.js";
+import type { SocialMemoryAnalysis, SocialMemoryAnalysisInput } from "./socialMemoryAnalysis.js";
 
 export interface SocialModelClient {
   probe(): Promise<ServerHealth["model"]>;
   health(overrideLabel?: string): ServerHealth["model"];
   analyzeTurn(input: TurnAnalysisInput, execution?: TurnAnalysisExecutionOptions): Promise<TurnAnalysis>;
   analyzeMemoryTurn(input: MemoryAnalysisInput): Promise<MemoryAnalysis>;
+  analyzeSocialEpisode(input: SocialMemoryAnalysisInput): Promise<SocialMemoryAnalysis>;
   generateScene(
     request: SceneRequest,
     priority?: number,
@@ -82,6 +84,10 @@ export class SwitchableSocialModel implements SocialModelClient {
 
   async analyzeMemoryTurn(input: MemoryAnalysisInput): Promise<MemoryAnalysis> {
     return await this.guarded((client) => client.analyzeMemoryTurn(input));
+  }
+
+  async analyzeSocialEpisode(input: SocialMemoryAnalysisInput): Promise<SocialMemoryAnalysis> {
+    return await this.guarded((client) => client.analyzeSocialEpisode(input));
   }
 
   async generateScene(

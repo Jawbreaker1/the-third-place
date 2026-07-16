@@ -769,6 +769,119 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionBody.messages[1].content).toContain('"currentBurstMessages"');
   });
 
+  it("runs source-bound social memory in the same preemptible background lane", async () => {
+    let completionCalls = 0;
+    let completionBody: any;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      completionBody = JSON.parse(String(init?.body));
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ events: [{
+        slot: "event_1",
+        kind: "personal_disclosure",
+        sourceMessageIds: ["message-social-1"],
+        summary: "Johan said he is moving to Gothenburg next week.",
+        visibility: "public_context",
+        salience: 0.82,
+        confidence: 0.96,
+        fact: {
+          subjectParticipantId: "human-johan",
+          provenance: "human_self_report",
+          sourceMessageId: "message-social-1",
+          verbatimExcerpt: "Jag flyttar till Göteborg nästa vecka",
+        },
+        resolution: "none",
+        openLoop: null,
+        views: [{
+          ownerResidentId: "ai-mira",
+          perspective: "Johan is moving soon, which may matter when he returns.",
+          appraisal: {
+            targetParticipantId: "human-johan",
+            outcome: "neutral",
+            effects: ["familiarity_up"],
+            confidence: 0.9,
+          },
+        }],
+      }] }) } }] });
+    }));
+
+    const lm = new LmStudioClient();
+    const request = {
+      episodeId: "episode-public-1",
+      scope: "public_channel" as const,
+      channel: { id: "lobby", name: "lobby" },
+      participants: [
+        { id: "human-johan", kind: "human" as const, displayName: "Johan" },
+        { id: "ai-mira", kind: "resident" as const, displayName: "Mira" },
+      ],
+      messages: [{
+        id: "message-social-1",
+        authorId: "human-johan",
+        authorKind: "human" as const,
+        content: "Jag flyttar till Göteborg nästa vecka",
+        createdAt: "2026-07-16T14:00:00.000Z",
+      }],
+      eligibleResidentOwners: [{
+        residentId: "ai-mira",
+        witnessedMessageIds: ["message-social-1"],
+        appraisalNote: "Mira is warm but not presumptuous.",
+      }],
+    };
+    const first = lm.analyzeSocialEpisode(request);
+    expect(lm.analyzeSocialEpisode(request)).toBe(first);
+    await expect(first).resolves.toMatchObject({
+      source: "lm",
+      events: [{ kind: "personal_disclosure", views: [{ ownerResidentId: "ai-mira" }] }],
+    });
+    expect(completionCalls).toBe(1);
+    expect(completionBody.response_format.json_schema.name).toBe("multilingual_social_memory_episode_v1");
+    expect(completionBody.messages[0].content).toContain("strict multilingual episodic social-memory analyst");
+  });
+
+  it("deduplicates in-flight social analysis but evicts transient failures so a later retry can succeed", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return completionCalls === 1
+        ? jsonResponse({ choices: [{ message: { content: "not valid json" } }] })
+        : jsonResponse({ choices: [{ message: { content: JSON.stringify({ events: [] }) } }] });
+    }));
+
+    const lm = new LmStudioClient();
+    const request = {
+      episodeId: "episode-social-retry",
+      scope: "public_channel" as const,
+      channel: { id: "lobby", name: "lobby" },
+      participants: [
+        { id: "human-johan", kind: "human" as const, displayName: "Johan" },
+        { id: "ai-mira", kind: "resident" as const, displayName: "Mira" },
+      ],
+      messages: [{
+        id: "message-social-retry",
+        authorId: "human-johan",
+        authorKind: "human" as const,
+        content: "En vanlig levererad rad.",
+        createdAt: "2026-07-16T14:00:00.000Z",
+      }],
+      eligibleResidentOwners: [{
+        residentId: "ai-mira",
+        witnessedMessageIds: ["message-social-retry"],
+        appraisalNote: "Mira notices the room without inventing details.",
+      }],
+    };
+
+    const failed = lm.analyzeSocialEpisode(request);
+    expect(lm.analyzeSocialEpisode(request)).toBe(failed);
+    await expect(failed).resolves.toMatchObject({ source: "fallback", failureReason: "invalid_output" });
+
+    const retry = lm.analyzeSocialEpisode(request);
+    expect(retry).not.toBe(failed);
+    await expect(retry).resolves.toMatchObject({ source: "lm", failureReason: null, events: [] });
+    expect(lm.analyzeSocialEpisode(request)).toBe(retry);
+    expect(completionCalls).toBe(2);
+  });
+
   it("preempts an active low-priority memory pass for the next live turn router", async () => {
     let memoryStarted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => { memoryStarted = resolve; });

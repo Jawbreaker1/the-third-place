@@ -132,3 +132,101 @@ export type AdminChannelWrite = AdminChannelConfig;
 export interface AdminSessionState {
   authenticated: boolean;
 }
+
+/** Read-only actor projection used by the private social-memory inspector. */
+export interface AdminMemoryActorSummary {
+  id: string;
+  name: string;
+  kind: "resident" | "human";
+  memoryCount: number;
+  outgoingRelationshipCount: number;
+  incomingRelationshipCount: number;
+  openLoopCount: number;
+  lastActivityAt?: string;
+}
+
+export interface AdminMemoryStats {
+  actors: number;
+  memories: number;
+  relationships: number;
+  openLoops: number;
+  auditEntries: number;
+}
+
+export interface AdminMemoryOverview {
+  stats: AdminMemoryStats;
+  actors: AdminMemoryActorSummary[];
+}
+
+/**
+ * One resident-owned, subjective memory. Source IDs point back to immutable
+ * observed events/messages; the summary itself is never treated as provenance.
+ */
+export interface AdminMemoryItem {
+  id: string;
+  ownerId: string;
+  kind: string;
+  scope: string;
+  perspective: string;
+  summary: string;
+  confidence: number;
+  salience: number;
+  pinned: boolean;
+  sourceEventIds: string[];
+  sourceMessageIds: string[];
+  createdAt: string;
+  updatedAt: string;
+  expiresAt?: string;
+}
+
+/** A directed relationship: the owner is the actor holding this view. */
+export interface AdminMemoryRelationship {
+  ownerId: string;
+  subjectId: string;
+  ownerName: string;
+  subjectName: string;
+  familiarity: number;
+  warmth: number;
+  trust: number;
+  respect: number;
+  friction: number;
+  updatedAt: string;
+}
+
+export interface AdminMemoryOpenLoop {
+  id: string;
+  ownerId: string;
+  kind: string;
+  summary: string;
+  status: string;
+  subjectIds: string[];
+  sourceEventIds: string[];
+  sourceMessageIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AdminMemoryAuditEntry {
+  id: string;
+  actorId?: string;
+  action: string;
+  entityType: string;
+  entityId: string;
+  summary: string;
+  sourceEventIds: string[];
+  sourceMessageIds: string[];
+  createdAt: string;
+}
+
+export interface AdminMemoryActorDetail {
+  actor: AdminMemoryActorSummary;
+  ownedMemories: AdminMemoryItem[];
+  outgoingRelationships: AdminMemoryRelationship[];
+  incomingRelationships: AdminMemoryRelationship[];
+  openLoops: AdminMemoryOpenLoop[];
+  audit: AdminMemoryAuditEntry[];
+}
+
+export interface AdminMemoryItemPatch {
+  pinned: boolean;
+}

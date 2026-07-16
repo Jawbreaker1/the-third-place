@@ -93,6 +93,17 @@ import {
   type TurnAnalysisInput,
   type TurnCapability,
 } from "./semanticRouter.js";
+import {
+  buildSocialMemoryAnalysisResponseFormat,
+  buildSocialMemoryAnalysisSystemPrompt,
+  buildSocialMemoryAnalysisUserData,
+  createFailClosedSocialMemoryAnalysis,
+  parseSocialMemoryAnalysisContent,
+  socialMemoryAnalysisInputSchema,
+  type NormalizedSocialMemoryAnalysisInput,
+  type SocialMemoryAnalysis,
+  type SocialMemoryAnalysisInput,
+} from "./socialMemoryAnalysis.js";
 
 const mergeVerifiedEvidencePlan = (
   primary: TurnAnalysis,
@@ -544,7 +555,24 @@ interface MemoryAnalysisQueueItem {
   reject: (reason: unknown) => void;
 }
 
-type QueueItem = SceneQueueItem | VisionQueueItem | TurnAnalysisQueueItem | MemoryAnalysisQueueItem;
+interface SocialMemoryAnalysisQueueItem {
+  type: "social-memory-analysis";
+  id: number;
+  priority: number;
+  input: NormalizedSocialMemoryAnalysisInput;
+  deadlineAt: number;
+  timeout?: ReturnType<typeof setTimeout>;
+  settled: boolean;
+  resolve: (value: SocialMemoryAnalysis) => void;
+  reject: (reason: unknown) => void;
+}
+
+type QueueItem =
+  | SceneQueueItem
+  | VisionQueueItem
+  | TurnAnalysisQueueItem
+  | MemoryAnalysisQueueItem
+  | SocialMemoryAnalysisQueueItem;
 
 /**
  * Opaque scheduler identity for work that belongs to one live surface. Voice
@@ -1196,8 +1224,11 @@ export class LmStudioClient {
   private activeTurnAnalysisAbort?: AbortController;
   private activeMemoryAnalysis?: MemoryAnalysisQueueItem;
   private activeMemoryAnalysisAbort?: AbortController;
+  private activeSocialMemoryAnalysis?: SocialMemoryAnalysisQueueItem;
+  private activeSocialMemoryAnalysisAbort?: AbortController;
   private readonly turnAnalysisById = new Map<string, Promise<TurnAnalysis>>();
   private readonly memoryAnalysisById = new Map<string, Promise<MemoryAnalysis>>();
+  private readonly socialMemoryAnalysisById = new Map<string, Promise<SocialMemoryAnalysis>>();
   /**
    * One-use bridge between the sole-resident voice router and its scene. The
    * router may co-produce a draft, but the draft has no publication authority:
@@ -1320,6 +1351,89 @@ export class LmStudioClient {
     return analysis;
   }
 
+  /**
+   * Extracts sparse, source-bound social episodes after a conversation was
+   * actually published. Like profile memory, this is optional background work
+   * and can never delay a live turn or manufacture a relationship update.
+   */
+  analyzeSocialEpisode(input: SocialMemoryAnalysisInput): Promise<SocialMemoryAnalysis> {
+    const validated = socialMemoryAnalysisInputSchema.safeParse(input);
+    if (!validated.success) return Promise.resolve(createFailClosedSocialMemoryAnalysis("invalid_output"));
+    const cached = this.socialMemoryAnalysisById.get(validated.data.episodeId);
+    if (cached) return cached;
+    if (this.socialMemoryAnalysisById.size >= 512) {
+      const oldest = this.socialMemoryAnalysisById.keys().next().value as string | undefined;
+      if (oldest !== undefined) this.socialMemoryAnalysisById.delete(oldest);
+    }
+    const episodeId = validated.data.episodeId;
+    const pending = this.enqueueSocialMemoryAnalysis(validated.data);
+    let cacheEntry!: Promise<SocialMemoryAnalysis>;
+    cacheEntry = pending.then(
+      (result) => {
+        // Keep in-flight deduplication and durable valid decisions (including
+        // a legitimate empty event set), but never turn a transient provider,
+        // timeout, queue or validation failure into a process-lifetime verdict.
+        if (result.source !== "lm" || result.failureReason !== null) {
+          if (this.socialMemoryAnalysisById.get(episodeId) === cacheEntry) {
+            this.socialMemoryAnalysisById.delete(episodeId);
+          }
+        }
+        return result;
+      },
+      (error) => {
+        if (this.socialMemoryAnalysisById.get(episodeId) === cacheEntry) {
+          this.socialMemoryAnalysisById.delete(episodeId);
+        }
+        throw error;
+      },
+    );
+    this.socialMemoryAnalysisById.set(episodeId, cacheEntry);
+    return cacheEntry;
+  }
+
+  private enqueueSocialMemoryAnalysis(
+    input: NormalizedSocialMemoryAnalysisInput,
+  ): Promise<SocialMemoryAnalysis> {
+    if (!this.enabled) return Promise.resolve(createFailClosedSocialMemoryAnalysis("provider_error"));
+    if (this.queue.length >= 8) return Promise.resolve(createFailClosedSocialMemoryAnalysis("provider_error"));
+
+    return new Promise((resolve) => {
+      const startedAt = performance.now();
+      const item = {} as SocialMemoryAnalysisQueueItem;
+      const settle = (value: SocialMemoryAnalysis) => {
+        if (item.settled) return;
+        item.settled = true;
+        if (item.timeout) clearTimeout(item.timeout);
+        resolve(value);
+      };
+      Object.assign(item, {
+        type: "social-memory-analysis" as const,
+        id: this.nextQueueId++,
+        priority: 4,
+        input,
+        deadlineAt: startedAt + TURN_ANALYSIS_TIMEOUT_MS,
+        settled: false,
+        resolve: settle,
+        reject: (_reason: unknown) => settle(createFailClosedSocialMemoryAnalysis("provider_error")),
+      });
+      item.timeout = setTimeout(() => {
+        const queuedIndex = this.queue.findIndex(
+          (candidate) => candidate.type === "social-memory-analysis" && candidate.id === item.id,
+        );
+        if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
+        if (this.activeSocialMemoryAnalysis?.id === item.id) {
+          this.activeSocialMemoryAnalysisAbort?.abort(
+            new DOMException("Social memory analysis deadline exceeded", "TimeoutError"),
+          );
+        }
+        settle(createFailClosedSocialMemoryAnalysis("timeout"));
+      }, TURN_ANALYSIS_TIMEOUT_MS);
+      this.queue.push(item);
+      this.queue.sort(compareQueueItems);
+      void this.pump();
+    });
+  }
+
   private enqueueMemoryAnalysis(input: NormalizedMemoryAnalysisInput): Promise<MemoryAnalysis> {
     if (!this.enabled) return Promise.resolve(createFailClosedMemoryAnalysis("disabled"));
     if (this.queue.length >= 8) return Promise.resolve(createFailClosedMemoryAnalysis("queue_full"));
@@ -1358,14 +1472,16 @@ export class LmStudioClient {
   }
 
   private abortActiveMemoryAnalysis(reason: string): void {
-    if (!this.activeMemoryAnalysis) return;
     this.activeMemoryAnalysisAbort?.abort(new Error(reason));
+    this.activeSocialMemoryAnalysisAbort?.abort(new Error(reason));
   }
 
   private dropQueuedBackgroundWork(reason: string): boolean {
     // Persistent memory is optional and invisible, so it yields before an
     // ambient scene. Both remain lower priority than live human work.
-    let index = this.queue.findIndex((item) => item.type === "memory-analysis");
+    let index = this.queue.findIndex(
+      (item) => item.type === "memory-analysis" || item.type === "social-memory-analysis",
+    );
     if (index < 0) {
       index = this.queue.findIndex((item) => item.type === "scene" && item.request.kind === "ambient");
     }
@@ -1635,9 +1751,11 @@ export class LmStudioClient {
     this.activeSceneAbort?.abort(error);
     this.activeTurnAnalysisAbort?.abort(error);
     this.activeMemoryAnalysisAbort?.abort(error);
+    this.activeSocialMemoryAnalysisAbort?.abort(error);
     this.activeVision?.reject(error);
     this.turnAnalysisById.clear();
     this.memoryAnalysisById.clear();
+    this.socialMemoryAnalysisById.clear();
     this.voiceDraftByMessageId.clear();
     this.voiceContinuationHandoff = undefined;
   }
@@ -1709,11 +1827,16 @@ export class LmStudioClient {
           } else {
             await Promise.resolve();
           }
-        } else {
+        } else if (item.type === "memory-analysis") {
           const abort = new AbortController();
           this.activeMemoryAnalysis = item;
           this.activeMemoryAnalysisAbort = abort;
           item.resolve(await this.performMemoryAnalysis(item.input, abort.signal, item.deadlineAt));
+        } else {
+          const abort = new AbortController();
+          this.activeSocialMemoryAnalysis = item;
+          this.activeSocialMemoryAnalysisAbort = abort;
+          item.resolve(await this.performSocialMemoryAnalysis(item.input, abort.signal, item.deadlineAt));
         }
       } catch (error) {
         const typedPreemption = item.type === "scene" &&
@@ -1738,6 +1861,10 @@ export class LmStudioClient {
         if (this.activeMemoryAnalysis?.id === item.id) {
           this.activeMemoryAnalysis = undefined;
           this.activeMemoryAnalysisAbort = undefined;
+        }
+        if (this.activeSocialMemoryAnalysis?.id === item.id) {
+          this.activeSocialMemoryAnalysis = undefined;
+          this.activeSocialMemoryAnalysisAbort = undefined;
         }
       }
     }
@@ -1988,6 +2115,34 @@ export class LmStudioClient {
     }
   }
 
+  private async performSocialMemoryAnalysis(
+    input: NormalizedSocialMemoryAnalysisInput,
+    signal: AbortSignal,
+    deadlineAt: number,
+  ): Promise<SocialMemoryAnalysis> {
+    try {
+      if (signal.aborted || performance.now() >= deadlineAt) {
+        return createFailClosedSocialMemoryAnalysis("timeout");
+      }
+      const model = await this.resolveModelForTurnAnalysis(signal);
+      if (!model) return createFailClosedSocialMemoryAnalysis("provider_error");
+      const raw = await this.callSocialMemoryAnalysis(input, model, signal);
+      if (signal.aborted || performance.now() >= deadlineAt) {
+        return createFailClosedSocialMemoryAnalysis("timeout");
+      }
+      const completion = completionSchema.safeParse(raw);
+      const content = completion.success ? completion.data.choices[0]?.message.content : undefined;
+      if (!content) return createFailClosedSocialMemoryAnalysis("invalid_output");
+      return parseSocialMemoryAnalysisContent(content, input) ??
+        createFailClosedSocialMemoryAnalysis("invalid_output");
+    } catch {
+      if (signal.aborted || performance.now() >= deadlineAt) {
+        return createFailClosedSocialMemoryAnalysis("timeout");
+      }
+      return createFailClosedSocialMemoryAnalysis("provider_error");
+    }
+  }
+
   private async resolveModelForTurnAnalysis(signal: AbortSignal): Promise<string | undefined> {
     const known = this.resolvedModel ?? this.backend.configuredModel;
     if (known) return known;
@@ -2075,6 +2230,26 @@ export class LmStudioClient {
         stream: false,
         response_format: buildMemoryAnalysisResponseFormat(),
       }, signal);
+  }
+
+  private async callSocialMemoryAnalysis(
+    input: NormalizedSocialMemoryAnalysisInput,
+    model: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    return await this.complete({
+      model,
+      messages: [
+        { role: "system", content: buildSocialMemoryAnalysisSystemPrompt() },
+        { role: "user", content: JSON.stringify(buildSocialMemoryAnalysisUserData(input)) },
+      ],
+      temperature: 0,
+      top_p: 1,
+      reasoning_effort: "none",
+      max_tokens: 1_200,
+      stream: false,
+      response_format: buildSocialMemoryAnalysisResponseFormat(input),
+    }, signal);
   }
 
   private async performVision(image: Buffer, caption: string): Promise<VisualObservation> {

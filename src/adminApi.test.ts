@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deleteAdminCodexSession,
+  deleteAdminMemoryItem,
+  deleteAdminMemoryRelationship,
   deleteAdminSession,
   getAdminLlmState,
+  getAdminMemory,
+  getAdminMemoryActor,
   patchAdminBehavior,
   patchAdminLlmProvider,
+  patchAdminMemoryItem,
   patchAdminPersona,
   startAdminCodexLogin,
 } from "./adminApi";
@@ -167,5 +172,78 @@ describe("admin LLM provider API", () => {
       "/api/admin/llm/codex/session",
       expect.objectContaining({ method: "DELETE", credentials: "same-origin" }),
     ]);
+  });
+});
+
+describe("admin social-memory API", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reads the overview and an encoded actor detail through separate contracts", async () => {
+    const overview = {
+      stats: { actors: 1, memories: 2, relationships: 3, openLoops: 1, auditEntries: 4 },
+      actors: [{
+        id: "ai/mira",
+        name: "Mira",
+        kind: "resident",
+        memoryCount: 2,
+        outgoingRelationshipCount: 2,
+        incomingRelationshipCount: 1,
+        openLoopCount: 1,
+      }],
+    };
+    const detail = {
+      actor: overview.actors[0],
+      ownedMemories: [],
+      outgoingRelationships: [],
+      incomingRelationships: [],
+      openLoops: [],
+      audit: [],
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(overview), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(detail), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getAdminMemory()).resolves.toEqual(overview);
+    await expect(getAdminMemoryActor("ai/mira")).resolves.toEqual(detail);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/admin/memory");
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/admin/memory/actors/ai%2Fmira");
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ credentials: "same-origin" }));
+  });
+
+  it("pins and forgets only the addressed memory item", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await patchAdminMemoryItem("memory/one", { pinned: false });
+    await deleteAdminMemoryItem("memory/one");
+
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/admin/memory/items/memory%2Fone",
+      expect.objectContaining({
+        method: "PATCH",
+        credentials: "same-origin",
+        body: JSON.stringify({ pinned: false }),
+      }),
+    ]);
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "/api/admin/memory/items/memory%2Fone",
+      expect.objectContaining({ method: "DELETE", credentials: "same-origin" }),
+    ]);
+  });
+
+  it("resets one directed edge without conflating its reverse", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await deleteAdminMemoryRelationship("ai/mira", "human johan");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/memory/relationships/ai%2Fmira/human%20johan",
+      expect.objectContaining({ method: "DELETE", credentials: "same-origin" }),
+    );
   });
 });

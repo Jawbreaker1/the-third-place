@@ -85,6 +85,27 @@ describe("admin HTTP API", () => {
     const human = { id: "human-1", name: "Alex", status: "online" as const };
     const kicked: Array<{ memberId: string; reason?: string }> = [];
     const banned: Array<{ memberId: string; reason?: string }> = [];
+    const memoryMutations: string[] = [];
+    const memoryOverview = {
+      stats: { actors: 1, memories: 1, relationships: 1, openLoops: 0, auditEntries: 0 },
+      actors: [{
+        id: "ai-mira",
+        name: "Mira",
+        kind: "resident" as const,
+        memoryCount: 1,
+        outgoingRelationshipCount: 1,
+        incomingRelationshipCount: 0,
+        openLoopCount: 0,
+      }],
+    };
+    const memoryDetail = {
+      actor: memoryOverview.actors[0]!,
+      ownedMemories: [],
+      outgoingRelationships: [],
+      incomingRelationships: [],
+      openLoops: [],
+      audit: [],
+    };
     const app = express();
     app.use("/api/admin", createAdminRouter({
       auth,
@@ -114,6 +135,22 @@ describe("admin HTTP API", () => {
         if (memberId !== human.id) return undefined;
         banned.push({ memberId, ...(reason ? { reason } : {}) });
         return human;
+      },
+      socialMemory: {
+        getOverview: () => memoryOverview,
+        getActorDetail: (id) => id === "ai-mira" ? memoryDetail : undefined,
+        setMemoryPinned: (id, pinned) => {
+          memoryMutations.push(`pin:${id}:${pinned}`);
+          return id === "memory-1";
+        },
+        deleteMemory: (id) => {
+          memoryMutations.push(`delete:${id}`);
+          return id === "memory-1";
+        },
+        resetRelationship: (ownerId, subjectId) => {
+          memoryMutations.push(`reset:${ownerId}:${subjectId}`);
+          return ownerId === "ai-mira" && subjectId === "human-1";
+        },
       },
       now: () => Date.UTC(2026, 6, 14, 12),
     }));
@@ -164,6 +201,51 @@ describe("admin HTTP API", () => {
         },
       },
     });
+
+    const memory = await dispatch(app, { method: "GET", path: "/api/admin/memory", cookie });
+    expect(memory.status).toBe(200);
+    expect(memory.body).toEqual(memoryOverview);
+    expect((await dispatch(app, {
+      method: "GET",
+      path: "/api/admin/memory/actors/ai-mira",
+      cookie,
+    })).body).toEqual(memoryDetail);
+    expect((await dispatch(app, {
+      method: "GET",
+      path: "/api/admin/memory/actors/missing",
+      cookie,
+    })).status).toBe(404);
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/memory/items/memory-1",
+      cookie,
+      origin: "https://evil.example",
+      body: { pinned: true },
+    })).status).toBe(403);
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/memory/items/memory-1",
+      cookie,
+      origin: "https://admin.example",
+      body: { pinned: true },
+    })).status).toBe(204);
+    expect((await dispatch(app, {
+      method: "DELETE",
+      path: "/api/admin/memory/items/memory-1",
+      cookie,
+      origin: "https://admin.example",
+    })).status).toBe(204);
+    expect((await dispatch(app, {
+      method: "DELETE",
+      path: "/api/admin/memory/relationships/ai-mira/human-1",
+      cookie,
+      origin: "https://admin.example",
+    })).status).toBe(204);
+    expect(memoryMutations).toEqual([
+      "pin:memory-1:true",
+      "delete:memory-1",
+      "reset:ai-mira:human-1",
+    ]);
 
     const crossOrigin = await dispatch(app, {
       method: "PATCH",

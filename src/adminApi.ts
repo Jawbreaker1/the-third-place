@@ -1,6 +1,9 @@
 import type {
   AdminBehaviorPatch,
   AdminChannelWrite,
+  AdminMemoryActorDetail,
+  AdminMemoryItemPatch,
+  AdminMemoryOverview,
   AdminPersonaWrite,
   AdminSessionState,
   AdminStateSnapshot,
@@ -142,4 +145,30 @@ export async function moderateAdminHuman(id: string, action: "kick" | "ban"): Pr
 
 export async function deleteAdminBan(memberId: string): Promise<void> {
   await request(`/api/admin/bans/${encodeURIComponent(memberId)}`, { method: "DELETE" });
+}
+
+export async function getAdminMemory(): Promise<AdminMemoryOverview> {
+  return await request("/api/admin/memory") as AdminMemoryOverview;
+}
+
+export async function getAdminMemoryActor(id: string): Promise<AdminMemoryActorDetail> {
+  return await request(`/api/admin/memory/actors/${encodeURIComponent(id)}`) as AdminMemoryActorDetail;
+}
+
+export async function patchAdminMemoryItem(id: string, patch: AdminMemoryItemPatch): Promise<void> {
+  await request(`/api/admin/memory/items/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: jsonBody(patch),
+  });
+}
+
+export async function deleteAdminMemoryItem(id: string): Promise<void> {
+  await request(`/api/admin/memory/items/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function deleteAdminMemoryRelationship(ownerId: string, subjectId: string): Promise<void> {
+  await request(
+    `/api/admin/memory/relationships/${encodeURIComponent(ownerId)}/${encodeURIComponent(subjectId)}`,
+    { method: "DELETE" },
+  );
 }

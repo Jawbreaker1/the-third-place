@@ -87,6 +87,10 @@ interface LanguageTurnOptions {
   reply?: string;
   reviewedOutputLanguage?: { tag: string; confidence: number };
   onAnalyze?: () => void;
+  socialMemory?: {
+    promptNote: ReturnType<typeof vi.fn>;
+    enqueueDeliveredEpisode: ReturnType<typeof vi.fn>;
+  };
 }
 
 const runLanguageTurn = async (options: LanguageTurnOptions) => {
@@ -116,6 +120,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
   let analysisInput: TurnAnalysisInput | undefined;
   let sceneLanguage: string | undefined;
   let scenePremise: string | undefined;
+  let sceneRelationshipNote: string | undefined;
   const syntheses: Array<Record<string, unknown>> = [];
   const payloads: Array<Record<string, unknown>> = [];
   const director = new VoiceDirector({
@@ -130,6 +135,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
       generateScene: async (request) => {
         sceneLanguage = request.semanticContext?.languageTag;
         scenePremise = request.premise;
+        sceneRelationshipNote = request.relationshipNotes?.["ai-sana"];
         return [{
           personaId: "ai-sana",
           content: options.reply ?? "Ett kort och naturligt svar.",
@@ -167,6 +173,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
       },
     },
     actorChannels: new ActorChannelRuntime(),
+    ...(options.socialMemory ? { socialMemory: options.socialMemory as never } : {}),
     ...(options.establishedChannelLanguage
       ? { establishedChannelLanguage: () => options.establishedChannelLanguage }
       : {}),
@@ -191,6 +198,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
     runtime,
     sceneLanguage,
     scenePremise,
+    sceneRelationshipNote,
     syntheses,
   };
 };
@@ -205,6 +213,55 @@ const installCustomPersona = (id: string, name: string): (() => void) => {
 };
 
 describe("VoiceDirector", () => {
+  it("persists only the voice exchange that reached transcript and reuses scoped resident memory", async () => {
+    const promptNote = vi.fn(() => "remembered that Alex likes odd film trivia");
+    const enqueueDeliveredEpisode = vi.fn(async () => ({
+      status: "no_events" as const,
+      episodeId: "voice-test",
+      eventIds: [],
+      createdEventIds: [],
+    }));
+    const result = await runLanguageTurn({
+      analysis: routedAnalysis("sv-SE", { addressedIds: ["ai-sana"] }),
+      utterance: "Kommer du ihåg vad vi pratade om?",
+      socialMemory: { promptNote, enqueueDeliveredEpisode },
+    });
+
+    expect(result.sceneRelationshipNote).toContain("odd film trivia");
+    expect(promptNote).toHaveBeenCalledWith(
+      "ai-sana",
+      "human-language-anchor",
+      expect.objectContaining({
+        kind: "voice",
+        roomId: result.roomId,
+        participantIds: ["ai-sana", "human-language-anchor"],
+      }),
+    );
+    expect(enqueueDeliveredEpisode).toHaveBeenCalledOnce();
+    expect(enqueueDeliveredEpisode).toHaveBeenCalledWith(expect.objectContaining({
+      origin: "human",
+      scope: expect.objectContaining({ kind: "voice", roomId: result.roomId }),
+      messages: [
+        expect.objectContaining({ authorId: "human-language-anchor", authorKind: "human" }),
+        expect.objectContaining({ authorId: "ai-sana", authorKind: "resident" }),
+      ],
+      eligibleResidentOwners: [{
+        residentId: "ai-sana",
+        witnessedMessageIds: expect.arrayContaining([
+          expect.any(String),
+        ]),
+        appraisalNote: expect.any(String),
+      }],
+    }));
+    const episode = enqueueDeliveredEpisode.mock.calls[0]?.[0] as {
+      messages: Array<{ id: string }>;
+      eligibleResidentOwners: Array<{ witnessedMessageIds: string[] }>;
+    };
+    expect(episode.eligibleResidentOwners[0]?.witnessedMessageIds).toEqual(
+      episode.messages.map((message) => message.id),
+    );
+  });
+
   it.each([
     {
       name: "keeps an anchor when only raw STT points elsewhere",
