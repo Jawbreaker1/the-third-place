@@ -369,6 +369,8 @@ export default function App() {
   const [voiceVadPaused, setVoiceVadPaused] = useState(false);
   const [voiceTranscripts, setVoiceTranscripts] = useState<Record<string, VoiceTranscriptEntry[]>>({});
   const [voiceTypedTurn, setVoiceTypedTurn] = useState("");
+  const [voiceInvitingBotId, setVoiceInvitingBotId] = useState<string | null>(null);
+  const [voiceInviteExpanded, setVoiceInviteExpanded] = useState(false);
   const [, setRemoteStreamRevision] = useState(0);
   const socketRef = useRef<Socket | null>(null);
   const meRef = useRef<Member | null>(null);
@@ -429,6 +431,7 @@ export default function App() {
   const voiceActivityEventRef = useRef<(event: VoiceActivityEvent) => void>(() => undefined);
   const voiceVadFrameRef = useRef<number | undefined>(undefined);
   const voiceVadSpeakingRef = useRef(false);
+  const voiceInvitingBotIdRef = useRef<string | null>(null);
   const voiceAudioBlocked = voiceAiAudioBlocked || voiceRemoteAudioBlocked;
   voiceHasAiListenerRef.current = voiceRooms.some(
     (room) => room.id === joinedVoiceRoomId && room.participants.some((participant) => participant.kind === "ai"),
@@ -619,6 +622,8 @@ export default function App() {
     voiceMutedRef.current = true;
     voiceRecordingRef.current = false;
     voicePlaybackActiveRef.current = false;
+    voiceInvitingBotIdRef.current = null;
+    setVoiceInvitingBotId(null);
     setVoiceRecording("idle");
   }, [stopVoiceVad]);
 
@@ -956,6 +961,8 @@ export default function App() {
     socket.on("disconnect", (reason) => {
       typingExpiryRef.current?.clear();
       setTyping({});
+      voiceInvitingBotIdRef.current = null;
+      setVoiceInvitingBotId(null);
       if (reason !== "io client disconnect") setConnection("reconnecting");
       if (reason !== "io client disconnect" && joinedVoiceRoomRef.current) setVoiceJoinState("reconnecting");
     });
@@ -1062,8 +1069,23 @@ export default function App() {
   const voiceRoomInView = voiceRooms.find((room) => room.id === voiceViewRoomId);
   const joinedVoiceRoom = voiceRooms.find((room) => room.id === joinedVoiceRoomId);
   const voiceRoomTranscripts = voiceRoomInView ? voiceTranscripts[voiceRoomInView.id] ?? [] : [];
-  const availableVoiceBots = members.filter((member) => member.kind === "ai" && !voiceRoomInView?.participants.some((participant) => participant.memberId === member.id));
+  const voiceBotIdsInOtherRooms = new Set(
+    voiceRooms
+      .filter((room) => room.id !== voiceRoomInView?.id)
+      .flatMap((room) => room.participants.filter((participant) => participant.kind === "ai").map((participant) => participant.memberId)),
+  );
+  const availableVoiceBots = members.filter((member) =>
+    member.kind === "ai" &&
+    !voiceRoomInView?.participants.some((participant) => participant.memberId === member.id) &&
+    !voiceBotIdsInOtherRooms.has(member.id),
+  );
+  const voiceBotLimit = voiceCapabilities?.maxBots ?? 2;
+  const voiceBotCount = voiceRoomInView?.participants.filter((participant) => participant.kind === "ai").length ?? 0;
+  const voiceBotSlotsRemaining = Math.max(0, voiceBotLimit - voiceBotCount);
+  const displayedVoiceBots = voiceInviteExpanded ? availableVoiceBots : availableVoiceBots.slice(0, 8);
   const voicePanelMembers = voiceRoomInView?.participants.map((participant) => memberMap.get(participant.memberId)).filter((member): member is Member => Boolean(member)) ?? [];
+
+  useEffect(() => setVoiceInviteExpanded(false), [voiceViewRoomId]);
 
   const updateImageDraft = useCallback((channelId: string, draft: ImageDraft | undefined) => {
     setImageDrafts((current) => {
@@ -1817,8 +1839,13 @@ export default function App() {
   };
 
   const inviteVoiceBot = (memberId: string) => {
-    if (!voiceRoomInView || !socketRef.current) return;
+    if (!voiceRoomInView || !socketRef.current || voiceInvitingBotIdRef.current || voiceBotSlotsRemaining <= 0) return;
+    voiceInvitingBotIdRef.current = memberId;
+    setVoiceInvitingBotId(memberId);
+    setVoiceError(null);
     socketRef.current.emit("voice:bot:invite", { roomId: voiceRoomInView.id, personaId: memberId }, (result: VoiceInviteBotResult) => {
+      if (voiceInvitingBotIdRef.current === memberId) voiceInvitingBotIdRef.current = null;
+      setVoiceInvitingBotId((current) => current === memberId ? null : current);
       if (result.ok) upsertVoiceRoom(result.room);
       else setVoiceError(result.error);
     });
@@ -2174,11 +2201,67 @@ export default function App() {
                     </div>
                   )}
 
-                  {joinedVoiceRoomId === voiceRoomInView.id && voiceRoomInView.hostMemberId === me?.id && availableVoiceBots.length > 0 && (
-                    <div className="voice-invite-panel">
-                      <div><strong>Invite an AI friend</strong><span>Up to {voiceCapabilities?.maxBots ?? 2} AI residents can join. They remain visibly labelled.</span></div>
-                      <div>{availableVoiceBots.slice(0, 8).map((bot) => <button type="button" key={bot.id} onClick={() => inviteVoiceBot(bot.id)}><Avatar member={bot} size="sm" /><span dir="auto">{bot.name}</span><AiBadge /></button>)}</div>
-                    </div>
+                  {joinedVoiceRoomId === voiceRoomInView.id && voiceRoomInView.hostMemberId === me?.id && (
+                    <section className="voice-invite-panel" aria-labelledby="voice-invite-title" aria-describedby="voice-invite-description">
+                      <header className="voice-invite-head">
+                        <span className="voice-invite-icon"><Icon name="users" size={19} /></span>
+                        <div className="voice-invite-copy">
+                          <strong id="voice-invite-title">Invite an AI friend</strong>
+                          <span id="voice-invite-description">Choose a resident below. One tap invites them straight into this call.</span>
+                        </div>
+                        <span className={`voice-invite-capacity ${voiceBotSlotsRemaining === 0 ? "full" : ""}`} aria-live="polite">
+                          <strong>{voiceBotCount}</strong><span> / {voiceBotLimit} AI seats</span>
+                        </span>
+                      </header>
+
+                      {voiceBotSlotsRemaining > 0 && availableVoiceBots.length > 0 ? (
+                        <>
+                          <div className="voice-invite-grid">
+                            {displayedVoiceBots.map((bot) => {
+                              const pending = voiceInvitingBotId === bot.id;
+                              return (
+                                <button
+                                  aria-busy={pending}
+                                  aria-disabled={voiceInvitingBotId !== null}
+                                  aria-label={`Invite ${bot.name} to this voice room`}
+                                  className={`voice-invite-card ${pending ? "pending" : ""}`}
+                                  data-voice-invite-id={bot.id}
+                                  disabled={voiceInvitingBotId !== null && !pending}
+                                  key={bot.id}
+                                  onClick={() => inviteVoiceBot(bot.id)}
+                                  type="button"
+                                >
+                                  <Avatar member={bot} size="sm" />
+                                  <span className="voice-invite-person">
+                                    <strong dir="auto">{bot.name}</strong>
+                                    <span><AiBadge /><small>{pending ? "Joining…" : "Available"}</small></span>
+                                  </span>
+                                  <span className="voice-invite-action"><Icon name={pending ? "pulse" : "plus"} size={15} /><span>{pending ? "Inviting" : "Invite"}</span></span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                          {availableVoiceBots.length > 8 && (
+                            <button
+                              aria-expanded={voiceInviteExpanded}
+                              className="voice-invite-more"
+                              onClick={() => setVoiceInviteExpanded((expanded) => !expanded)}
+                              type="button"
+                            >
+                              <Icon name="chevron" size={14} />
+                              {voiceInviteExpanded ? "Show fewer residents" : `Show ${availableVoiceBots.length - 8} more residents`}
+                            </button>
+                          )}
+                        </>
+                      ) : (
+                        <div className="voice-invite-full" role="status">
+                          <Icon name={voiceBotSlotsRemaining === 0 ? "users" : "info"} size={17} />
+                          <span>{voiceBotSlotsRemaining === 0
+                            ? "All AI seats are filled. Remove a resident from their voice tile to invite someone else."
+                            : "The other AI residents are already in voice calls."}</span>
+                        </div>
+                      )}
+                    </section>
                   )}
 
                   {joinedVoiceRoomId === voiceRoomInView.id && (
