@@ -19,6 +19,7 @@ import {
   conductResponderIds,
   ensureEvidenceResponder,
   autonomousResearchFailureBackoffMs,
+  autonomousResearchSeedFailureBackoffMs,
   autonomousResearchResultIsFresh,
   canonicalAutonomousResearchUrl,
   linkPreviewFromResearch,
@@ -31,6 +32,7 @@ import {
   selectAmbientSeed,
   selectAutonomousResearchSeed,
   selectConsideredConversation,
+  sampleAmbientTurnWordLimit,
   selectResponders,
   socialSignalsFromTurnAnalysis,
   SocialDirector,
@@ -55,7 +57,7 @@ import {
 } from "./behaviorTuning.js";
 import { CapabilityRegistry } from "./capabilities/registry.js";
 import type { MarketObservation, MarketSnapshot } from "./marketData/types.js";
-import type { MarketPulseMovementCandidate } from "./marketPulse.js";
+import type { MarketPulseFeedCandidate, MarketPulseMovementCandidate } from "./marketPulse.js";
 
 const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => {
   const evidence = overrides.evidence ?? {
@@ -324,6 +326,7 @@ describe("social director", () => {
     const snapshotProvider = { snapshot: vi.fn(async () => snapshot) };
     const evaluateMarketObservations = vi.fn(async () => [exceptional]);
     const pollOfficialFeeds = vi.fn(async () => []);
+    const acknowledgeFeedPublication = vi.fn(async () => undefined);
     const ordinaryLookup = vi.fn();
     const director = new SocialDirector(
       { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
@@ -341,7 +344,11 @@ describe("social director", () => {
         autonomousResearchChance: 1,
         autonomousResearchHumanQuietMs: 15_000,
         marketSnapshotProvider: snapshotProvider,
-        marketPulseCoordinator: { evaluateMarketObservations, pollOfficialFeeds },
+        marketPulseCoordinator: {
+          evaluateMarketObservations,
+          pollOfficialFeeds,
+          acknowledgeFeedPublication,
+        },
       },
     );
     const runExceptional = vi.fn(async (..._args: unknown[]) => true);
@@ -405,6 +412,7 @@ describe("social director", () => {
         marketPulseCoordinator: {
           evaluateMarketObservations: disabledEvaluate,
           pollOfficialFeeds: disabledPoll,
+          acknowledgeFeedPublication: vi.fn(async () => undefined),
         },
         behaviorTuningProvider: () => ({
           activity: 50,
@@ -2893,6 +2901,40 @@ describe("social director", () => {
     expect(bounded.slice(1).every((message) => message.authorId.startsWith("ai-"))).toBe(true);
   });
 
+  it("restores a persisted room language and keeps it after a long autonomous tail", () => {
+    const now = Date.parse("2026-07-16T12:00:00.000Z");
+    const store = new RoomStore(`/tmp/director-language-continuity-${process.pid}-${Math.random()}.json`);
+    store.setTrustedChannelLanguage("3d-visualisation", "sv-SE", "human", new Date(now - 60_000).toISOString());
+    for (let index = 0; index < 320; index += 1) {
+      store.addPublicMessage(createMessage(
+        "3d-visualisation",
+        index % 2 === 0 ? "ai-bea" : "ai-pixel",
+        `autonomous row ${index}`,
+        { createdAt: new Date(now - (320 - index) * 1_000).toISOString() },
+      ));
+    }
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      { health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      { now: () => now, autonomousResearchEnabled: false },
+    );
+    director.start();
+    const thread = (director as unknown as {
+      getOrStartAmbientThread: (channelId: string, at: number) => AmbientThreadState | undefined;
+    }).getOrStartAmbientThread("3d-visualisation", now);
+
+    expect(director.trustedLanguageForChannel("3d-visualisation")).toBe("sv-SE");
+    expect(thread?.languageTag).toBe("sv-SE");
+    expect(thread?.languageHint).toBe("sv-SE");
+    director.stop();
+  });
+
   it("chooses a room-relevant lead over the loudest generic resident", () => {
     const candidates = PERSONAS.filter((persona) => ["ai-bosse", "ai-sana"].includes(persona.id));
     const lead = selectAmbientLead(candidates, (id) => (id === "ai-sana" ? 1 : 0), () => 0);
@@ -2969,6 +3011,33 @@ describe("social director", () => {
     expect(limits[lead.id]!.minimum).toBe(lead.style.typicalWords[0]);
   });
 
+  it("samples visibly different language-neutral message shapes inside the ordinary persona envelope", () => {
+    const actor = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const sample = (roll: number) => sampleAmbientTurnWordLimit(actor, {
+      mode: "discussion",
+      continuation: true,
+      action: "specific_example",
+      rng: () => roll,
+    });
+    const fragment = sample(0);
+    const short = sample(0.2);
+    const ordinary = sample(0.5);
+    const expanded = sample(0.95);
+
+    expect(fragment.shape).toBe("fragment");
+    expect(short.shape).toBe("short");
+    expect(ordinary.shape).toBe("ordinary");
+    expect(expanded.shape).toBe("expanded");
+    expect(fragment.minimum).toBe(1);
+    expect(fragment.maximum).toBeLessThan(short.maximum);
+    expect(short.maximum).toBeLessThan(ordinary.maximum);
+    expect(expanded.minimum).toBeGreaterThan(short.maximum);
+    for (const limits of [fragment, short, ordinary, expanded]) {
+      expect(limits.minimum).toBeLessThanOrEqual(limits.maximum);
+      expect(limits.maximum).toBeLessThanOrEqual(actor.style.hardMaxWords);
+    }
+  });
+
   it("keeps autonomous rooms silent when the model is offline or returns no valid lines", async () => {
     const runCase = async (
       connected: boolean,
@@ -2979,6 +3048,9 @@ describe("social director", () => {
       const io = { to: vi.fn(() => ({ emit })) };
       const store = {
         getRecent: vi.fn(() => recentMessages),
+        getAllMessages: vi.fn(() => CHANNELS.flatMap((channel) =>
+          recentMessages.map((message) => ({ ...message, channelId: channel.id })),
+        )),
         addPublicMessage: vi.fn(),
       };
       const lm = {
@@ -3711,7 +3783,7 @@ describe("social director", () => {
     expect(combined).not.toContain("45–75-word");
   });
 
-  it("keeps every register inside the actor's own hard maximum", () => {
+  it("lets only a rare capable lead stretch beyond the ordinary ceiling while replies stay bounded", () => {
     const plan = {
       lead: PERSONAS.find((persona) => persona.id === "ai-ibrahim")!,
       responder: PERSONAS.find((persona) => persona.id === "ai-farah")!,
@@ -3723,13 +3795,15 @@ describe("social director", () => {
     const studio = consideredConversationWordLimits(plan, "studio");
 
     for (const limits of [everyday, technical, fandom, studio]) {
-      expect(limits.lead.maximum).toBeLessThanOrEqual(plan.lead.style.hardMaxWords);
       expect(limits.response.maximum).toBeLessThanOrEqual(plan.responder.style.hardMaxWords);
       expect(limits.lead.minimum).toBeLessThanOrEqual(limits.lead.maximum);
     }
+    expect(everyday.lead.maximum).toBeGreaterThan(plan.lead.style.hardMaxWords);
+    expect(technical.lead.maximum).toBeGreaterThan(everyday.lead.maximum);
+    expect(technical.lead.maximum).toBeLessThanOrEqual(76);
     expect(everyday.lead.maximum).toBeLessThan(technical.lead.maximum);
     expect(everyday.lead.maximum).toBeLessThan(fandom.lead.maximum);
-    expect(studio.lead.maximum).toBe(plan.lead.style.hardMaxWords);
+    expect(studio.lead.maximum).toBeGreaterThan(plan.lead.style.hardMaxWords);
   });
 
   it("does not recruit a relevant resident who is still cooling down", () => {
@@ -3859,7 +3933,7 @@ describe("social director", () => {
   });
 
   it("rejects an overlong generated message atomically instead of cutting a URL", () => {
-    const longUrl = `https://example.com/${"a".repeat(520)}`;
+    const longUrl = `https://example.com/${"a".repeat(800)}`;
     expect(normalizeGeneratedMessageContent(`läs ${longUrl}`)).toBeUndefined();
   });
 
@@ -4065,6 +4139,10 @@ describe("social director", () => {
     expect(autonomousResearchFailureBackoffMs(3)).toBe(4 * 60_000);
     expect(autonomousResearchFailureBackoffMs(4)).toBe(4 * 60_000);
     expect(autonomousResearchFailureBackoffMs(20)).toBe(4 * 60_000);
+    expect(autonomousResearchSeedFailureBackoffMs(1)).toBe(30 * 60_000);
+    expect(autonomousResearchSeedFailureBackoffMs(2)).toBe(60 * 60_000);
+    expect(autonomousResearchSeedFailureBackoffMs(3)).toBe(2 * 60 * 60_000);
+    expect(autonomousResearchSeedFailureBackoffMs(20)).toBe(6 * 60 * 60_000);
   });
 
   it("enforces configured autonomous-source freshness without language heuristics", () => {
@@ -4090,6 +4168,7 @@ describe("social director", () => {
     const staleUrl = "https://example.com/old-item";
     const freshUrl = "https://example.com/fresh-item";
     const laterStaleUrl = "https://example.com/undated-old-item";
+    const undatedDistractors = [1, 2, 3].map((index) => `https://example.com/undated-${index}`);
     const research = vi.fn()
       .mockResolvedValueOnce({
         kind: "search",
@@ -4103,7 +4182,19 @@ describe("social director", () => {
             snippet: "Old",
             publishedAt: "2025-01-01T00:00:00.000Z",
           },
-          { id: "S2", title: "Undated search hit", url: freshUrl, snippet: "Candidate" },
+          ...undatedDistractors.map((url, index) => ({
+            id: `S${index + 2}`,
+            title: `Undated search hit ${index + 1}`,
+            url,
+            snippet: "Candidate without provider date",
+          })),
+          {
+            id: "S5",
+            title: "Provider-dated fresh search hit",
+            url: freshUrl,
+            snippet: "Fresh candidate",
+            publishedAt: "2026-07-13T09:00:00.000Z",
+          },
         ],
       })
       .mockResolvedValueOnce({
@@ -4112,8 +4203,8 @@ describe("social director", () => {
         retrievedAt: new Date(now).toISOString(),
         results: [{ id: "S1", title: "Another undated hit", url: laterStaleUrl, snippet: "Candidate" }],
       });
-    const read = vi.fn()
-      .mockResolvedValueOnce({
+    const read = vi.fn(async (request: { url: URL }) => {
+      if (request.url.toString() === freshUrl) return {
         kind: "page",
         query: "fresh",
         retrievedAt: new Date(now).toISOString(),
@@ -4124,8 +4215,8 @@ describe("social director", () => {
           snippet: "Fresh bounded detail",
           publishedAt: "2026-07-13T09:00:00.000Z",
         }],
-      })
-      .mockResolvedValueOnce({
+      };
+      if (request.url.toString() === laterStaleUrl) return {
         kind: "page",
         query: "old",
         retrievedAt: new Date(now).toISOString(),
@@ -4136,7 +4227,9 @@ describe("social director", () => {
           snippet: "Old bounded detail",
           publishedAt: "2025-01-01T00:00:00.000Z",
         }],
-      });
+      };
+      return undefined;
+    });
     const director = new SocialDirector(
       { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
       new RoomStore("/tmp/director-autonomous-page-date-unused.json"),
@@ -4162,8 +4255,9 @@ describe("social director", () => {
     });
 
     const fresh = await safelyRead("recent bounded item");
-    expect(read).toHaveBeenCalledTimes(1);
-    expect(read).toHaveBeenLastCalledWith(
+    expect(read).toHaveBeenCalledTimes(4);
+    expect(read).toHaveBeenNthCalledWith(
+      1,
       expect.objectContaining({ url: new URL(freshUrl) }),
       "ambient-research:lobby",
     );
@@ -4172,8 +4266,8 @@ describe("social director", () => {
     ]);
 
     const staleAfterRead = await safelyRead("another bounded item");
-    expect(read).toHaveBeenCalledTimes(2);
-    expect(staleAfterRead).toEqual({ failureReason: "no_safe_fresh_result" });
+    expect(read).toHaveBeenCalledTimes(5);
+    expect(staleAfterRead).toEqual({ failureReason: "freshness_rejected_after_read" });
   });
 
   it("canonicalizes autonomous source URLs for cross-room repeat protection", () => {
@@ -4380,6 +4474,19 @@ describe("social director", () => {
         mode: "web",
         discussionAngle: "Discuss why displaced background work should preserve provider health.",
       };
+      const feedCandidate: MarketPulseFeedCandidate = {
+        origin: "official_feed",
+        priority: "routine",
+        id: "ecb-press:retry-contract",
+        providerId: "ecb-press",
+        providerLabel: "European Central Bank",
+        title: "Background retry contract",
+        url: "https://example.com/background-retry",
+        publishedAt: new Date(now - 60_000).toISOString(),
+        detectedAt: new Date(now).toISOString(),
+        regions: ["europe"],
+      };
+      const acknowledgeFeedPublication = vi.fn(async () => undefined);
       let generationAttempt = 0;
       const generateScene = vi.fn(async (request: {
         selected: Array<(typeof PERSONAS)[number]>;
@@ -4413,6 +4520,11 @@ describe("social director", () => {
           now: () => now,
           rng: () => 0,
           autonomousResearchEnabled: true,
+          marketPulseCoordinator: {
+            pollOfficialFeeds: vi.fn(async () => []),
+            evaluateMarketObservations: vi.fn(async () => []),
+            acknowledgeFeedPublication,
+          },
         },
       );
       const newThread = (): AmbientThreadState => ({
@@ -4432,6 +4544,7 @@ describe("social director", () => {
           state: AmbientThreadState,
           researchSeed: AutonomousResearchSeed,
           prepared: { research: typeof research },
+          feed?: MarketPulseFeedCandidate,
         ) => Promise<boolean>;
         recordAutonomousResearchFailure: (
           channelId: string,
@@ -4462,6 +4575,7 @@ describe("social director", () => {
         firstThread,
         seed,
         { research },
+        feedCandidate,
       )).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
 
       expect(store.getRecent(channel.id, 10)).toEqual([]);
@@ -4472,6 +4586,7 @@ describe("social director", () => {
       expect(internals.autonomousResearchFailureStateByChannel.get(channel.id)).toEqual(channelFailureBefore);
       expect(internals.autonomousResearchGlobalRetryAfterAt).toBe(globalRetryBefore);
       expect(internals.autonomousResearchGlobalConsecutiveFailures).toBe(globalFailuresBefore);
+      expect(acknowledgeFeedPublication).not.toHaveBeenCalled();
 
       const retryThread = newThread();
       internals.ambientThreads.set(channel.id, retryThread);
@@ -4482,8 +4597,11 @@ describe("social director", () => {
         retryThread,
         seed,
         { research },
+        feedCandidate,
       )).resolves.toBe(true);
       expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(acknowledgeFeedPublication).toHaveBeenCalledOnce();
+      expect(acknowledgeFeedPublication).toHaveBeenCalledWith(feedCandidate);
       expect(store.getRecent(channel.id, 10)).toEqual([
         expect.objectContaining({
           content: "Det är rimligt: en avbruten bakgrundskörning säger inget om källans kvalitet.",
@@ -4534,6 +4652,50 @@ describe("social director", () => {
     expect(recordFailure.autonomousResearchGlobalRetryAfterAt).toBe(now + 2 * 60_000);
     expect(director.getAutonomousResearchDiagnostics().lastFailure?.retryAfterAt)
       .toBe(now + 2 * 60_000);
+    director.stop();
+  });
+
+  it("isolates stale or unreadable source pools to their seed instead of pausing every room", () => {
+    const now = Date.parse("2026-07-16T12:00:00.000Z");
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-autonomous-seed-local-backoff-unused.json"),
+      {} as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      { now: () => now, autonomousResearchEnabled: true },
+    );
+    const seed: AutonomousResearchSeed = {
+      id: "undated-source-pool",
+      query: "one current subject",
+      mode: "news",
+      maxAgeDays: 30,
+      discussionAngle: "Discuss one supported current detail.",
+    };
+    const internals = director as unknown as {
+      recordAutonomousResearchFailure: (
+        channelId: string,
+        researchSeed: AutonomousResearchSeed,
+        reason: "freshness_unverifiable_after_read",
+      ) => false;
+      autonomousResearchFailureStateBySeed: Map<string, { retryAfterAt: number }>;
+      autonomousResearchGlobalRetryAfterAt?: number;
+      autonomousResearchGlobalConsecutiveFailures: number;
+    };
+
+    internals.recordAutonomousResearchFailure("lobby", seed, "freshness_unverifiable_after_read");
+
+    expect(internals.autonomousResearchFailureStateBySeed.get(`lobby:${seed.id}`)?.retryAfterAt)
+      .toBe(now + 30 * 60_000);
+    expect(internals.autonomousResearchGlobalRetryAfterAt).toBeUndefined();
+    expect(internals.autonomousResearchGlobalConsecutiveFailures).toBe(0);
+    expect(director.getAutonomousResearchDiagnostics().lastFailure).toMatchObject({
+      reason: "freshness_unverifiable_after_read",
+      retryAfterAt: now + 30 * 60_000,
+    });
     director.stop();
   });
 

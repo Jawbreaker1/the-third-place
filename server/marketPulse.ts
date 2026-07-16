@@ -16,6 +16,7 @@ const MARKET_OBSERVATION_MAX_AGE_MS = 30 * MINUTE_MS;
 const FUTURE_SKEW_MS = 5 * MINUTE_MS;
 const MAX_FEED_ITEMS = 64;
 const MAX_FEED_CANDIDATES_PER_POLL = 4;
+const MAX_PENDING_FEED_CANDIDATES = 64;
 const MAX_SEEN_KEYS = 4_000;
 const MAX_MOVEMENT_HIGH_WATER = 1_000;
 const MAX_STATE_BYTES = 512 * 1024;
@@ -181,8 +182,10 @@ interface MovementHighWaterState {
 }
 
 export interface MarketPulsePersistedState {
-  version: 1;
+  version: 2;
   feeds: Record<string, FeedPollState>;
+  /** Durable delivery outbox. Discovery alone must never populate `seen`. */
+  pendingFeedCandidates: MarketPulseFeedCandidate[];
   seen: SeenKeyState[];
   movementHighWater: MovementHighWaterState[];
 }
@@ -601,8 +604,9 @@ export const parseOfficialMarketPulseFeed = (
 };
 
 const emptyState = (): MarketPulsePersistedState => ({
-  version: 1,
+  version: 2,
   feeds: {},
+  pendingFeedCandidates: [],
   seen: [],
   movementHighWater: [],
 });
@@ -620,9 +624,59 @@ const safeConditionalHeader = (value: unknown, limit = 512): string | undefined 
     ? value
     : undefined;
 
+const feedCandidateKeys = (
+  candidate: Pick<MarketPulseFeedCandidate, "id" | "url">,
+): { candidateKey: string; urlKey: string } => ({
+  candidateKey: `candidate:${hashKey(candidate.id)}`,
+  urlKey: `url:${hashKey(candidate.url)}`,
+});
+
+/** Revalidates every persisted outbox record instead of trusting JSON shape. */
+const normalizePendingFeedCandidate = (
+  raw: unknown,
+  now: number,
+): MarketPulseFeedCandidate | undefined => {
+  const source = recordValue(raw);
+  if (source?.origin !== "official_feed" || source.priority !== "routine") return undefined;
+  const feed = MARKET_PULSE_FEEDS.find((candidate) => candidate.id === source.providerId);
+  if (!feed || typeof source.id !== "string") return undefined;
+  const idPrefix = `${feed.id}:`;
+  const idHash = source.id.startsWith(idPrefix) ? source.id.slice(idPrefix.length) : "";
+  if (!/^[a-f0-9]{32}$/u.test(idHash)) return undefined;
+  const title = typeof source.title === "string" ? boundedCleanText(source.title, 180) : "";
+  const summary = typeof source.summary === "string" ? boundedCleanText(source.summary, 600) : "";
+  const url = typeof source.url === "string" ? canonicalMarketPulseUrl(source.url) : undefined;
+  const publishedAtMs = typeof source.publishedAt === "string" ? Date.parse(source.publishedAt) : Number.NaN;
+  const detectedAtMs = typeof source.detectedAt === "string" ? Date.parse(source.detectedAt) : Number.NaN;
+  if (
+    !title ||
+    !url ||
+    !allowedHost(new URL(url), feed.allowedHosts) ||
+    !Number.isFinite(publishedAtMs) ||
+    !Number.isFinite(detectedAtMs) ||
+    publishedAtMs > now + FUTURE_SKEW_MS ||
+    detectedAtMs > now + FUTURE_SKEW_MS ||
+    detectedAtMs + FUTURE_SKEW_MS < publishedAtMs ||
+    now - publishedAtMs > feed.maxItemAgeMs
+  ) return undefined;
+  return {
+    origin: "official_feed",
+    priority: "routine",
+    id: source.id,
+    providerId: feed.id,
+    providerLabel: feed.label,
+    title,
+    url,
+    ...(summary ? { summary } : {}),
+    publishedAt: new Date(publishedAtMs).toISOString(),
+    detectedAt: new Date(detectedAtMs).toISOString(),
+    regions: [...feed.regions],
+  };
+};
+
 const normalizePersistedState = (raw: unknown, now: number): MarketPulsePersistedState => {
   const source = recordValue(raw);
-  if (!source || source.version !== 1) return emptyState();
+  if (!source || (source.version !== 1 && source.version !== 2)) return emptyState();
   const allowedFeedIds = new Set<string>(MARKET_PULSE_FEEDS.map((feed) => feed.id));
   const feedDefinitions = new Map<string, MarketPulseFeedDefinition>(
     MARKET_PULSE_FEEDS.map((feed) => [feed.id, feed]),
@@ -661,6 +715,12 @@ const normalizePersistedState = (raw: unknown, now: number): MarketPulsePersiste
         : [];
     }).slice(0, MAX_SEEN_KEYS)
     : [];
+  const pendingFeedCandidates = source.version === 2 && Array.isArray(source.pendingFeedCandidates)
+    ? source.pendingFeedCandidates.flatMap((rawCandidate): MarketPulseFeedCandidate[] => {
+      const candidate = normalizePendingFeedCandidate(rawCandidate, now);
+      return candidate ? [candidate] : [];
+    }).slice(0, MAX_PENDING_FEED_CANDIDATES)
+    : [];
   const movementHighWater = Array.isArray(source.movementHighWater)
     ? source.movementHighWater.flatMap((rawEntry): MovementHighWaterState[] => {
       const entry = recordValue(rawEntry);
@@ -674,7 +734,7 @@ const normalizePersistedState = (raw: unknown, now: number): MarketPulsePersiste
         : [];
     }).slice(0, MAX_MOVEMENT_HIGH_WATER)
     : [];
-  return { version: 1, feeds, seen, movementHighWater };
+  return { version: 2, feeds, pendingFeedCandidates, seen, movementHighWater };
 };
 
 const pruneState = (state: MarketPulsePersistedState, now: number): void => {
@@ -682,6 +742,24 @@ const pruneState = (state: MarketPulsePersistedState, now: number): void => {
     .filter((entry) => entry.expiresAt > now)
     .sort((left, right) => right.expiresAt - left.expiresAt)
     .slice(0, MAX_SEEN_KEYS);
+  const seenKeys = new Set(state.seen.map((entry) => entry.key));
+  const pendingKeys = new Set<string>();
+  state.pendingFeedCandidates = state.pendingFeedCandidates
+    .filter((candidate) => normalizePendingFeedCandidate(candidate, now) !== undefined)
+    .sort((left, right) => Date.parse(right.publishedAt) - Date.parse(left.publishedAt))
+    .filter((candidate) => {
+      const { candidateKey, urlKey } = feedCandidateKeys(candidate);
+      if (
+        seenKeys.has(candidateKey) ||
+        seenKeys.has(urlKey) ||
+        pendingKeys.has(candidateKey) ||
+        pendingKeys.has(urlKey)
+      ) return false;
+      pendingKeys.add(candidateKey);
+      pendingKeys.add(urlKey);
+      return true;
+    })
+    .slice(0, MAX_PENDING_FEED_CANDIDATES);
   state.movementHighWater = state.movementHighWater
     .filter((entry) => entry.expiresAt > now)
     .sort((left, right) => right.expiresAt - left.expiresAt)
@@ -829,7 +907,11 @@ export class MarketPulseCoordinator {
       if (feedDefinitions.length === 0) return [];
 
       const seenKeys = new Set(state.seen.map((entry) => entry.key));
-      const candidates: MarketPulseFeedCandidate[] = [];
+      const pendingKeys = new Set(state.pendingFeedCandidates.flatMap((candidate) => {
+        const { candidateKey, urlKey } = feedCandidateKeys(candidate);
+        return [candidateKey, urlKey];
+      }));
+      const dueFeedIds = new Set<MarketPulseFeedId>(feedDefinitions.map((feed) => feed.id));
       for (const feed of feedDefinitions) {
         const previous = state.feeds[feed.id];
         const headers: Record<string, string> = {
@@ -896,15 +978,19 @@ export class MarketPulseCoordinator {
         for (const item of parsed) {
           const identityKey = `id:${hashKey(`${feed.id}:${item.itemId ?? item.url}`)}`;
           const urlKey = `url:${hashKey(item.url)}`;
-          if (seenKeys.has(identityKey) || seenKeys.has(urlKey)) continue;
-          const expiresAt = now + SEEN_RETENTION_MS;
-          state.seen.push({ key: identityKey, expiresAt }, { key: urlKey, expiresAt });
-          seenKeys.add(identityKey);
-          seenKeys.add(urlKey);
-          candidates.push({
+          const candidateId = `${feed.id}:${hashKey(item.itemId ?? item.url)}`;
+          const candidateKey = `candidate:${hashKey(candidateId)}`;
+          if (
+            seenKeys.has(identityKey) ||
+            seenKeys.has(candidateKey) ||
+            seenKeys.has(urlKey) ||
+            pendingKeys.has(candidateKey) ||
+            pendingKeys.has(urlKey)
+          ) continue;
+          const candidate: MarketPulseFeedCandidate = {
             origin: "official_feed",
             priority: "routine",
-            id: `${feed.id}:${hashKey(item.itemId ?? item.url)}`,
+            id: candidateId,
             providerId: feed.id,
             providerLabel: feed.label,
             title: item.title,
@@ -913,14 +999,57 @@ export class MarketPulseCoordinator {
             publishedAt: item.publishedAt,
             detectedAt: new Date(now).toISOString(),
             regions: [...feed.regions],
-          });
+          };
+          // Discovery is not delivery. Persist a bounded outbox record, but do
+          // not mutate durable seen-state until the source card is committed.
+          state.pendingFeedCandidates.push(candidate);
+          pendingKeys.add(candidateKey);
+          pendingKeys.add(urlKey);
         }
       }
       pruneState(state, now);
       await this.store.save(structuredClone(state));
-      return candidates
+      return state.pendingFeedCandidates
+        .filter((candidate) => dueFeedIds.has(candidate.providerId))
         .sort((left, right) => Date.parse(right.publishedAt) - Date.parse(left.publishedAt))
         .slice(0, this.maxFeedCandidatesPerPoll);
+    });
+  }
+
+  /** Durable two-phase acknowledgement: only a committed source card is seen. */
+  async acknowledgeFeedPublication(candidate: MarketPulseFeedCandidate): Promise<void> {
+    await this.exclusive(async () => {
+      const now = this.now();
+      const normalized = normalizePendingFeedCandidate(candidate, now);
+      if (!normalized) throw new TypeError("MarketPulse publication acknowledgement is invalid.");
+      const currentState = await this.loadedState(now);
+      const { candidateKey, urlKey } = feedCandidateKeys(normalized);
+      const matchingPending = currentState.pendingFeedCandidates.some((pending) =>
+        pending.providerId === normalized.providerId &&
+        pending.id === normalized.id &&
+        pending.url === normalized.url,
+      );
+      const seenKeys = new Set(currentState.seen.map((entry) => entry.key));
+      if (!matchingPending) {
+        // A repeated acknowledgement is harmless, but a record which was
+        // never offered must not be able to poison durable dedupe state.
+        if (seenKeys.has(candidateKey) && seenKeys.has(urlKey)) return;
+        throw new TypeError("MarketPulse publication acknowledgement was not pending.");
+      }
+      // Mutate a snapshot and publish it in memory only after the atomic store
+      // write succeeds. A failed acknowledgement therefore remains retryable.
+      const nextState = structuredClone(currentState);
+      const expiresAt = now + SEEN_RETENTION_MS;
+      for (const key of [candidateKey, urlKey]) {
+        if (!seenKeys.has(key)) nextState.seen.push({ key, expiresAt });
+      }
+      nextState.pendingFeedCandidates = nextState.pendingFeedCandidates.filter((pending) => {
+        const keys = feedCandidateKeys(pending);
+        return keys.candidateKey !== candidateKey && keys.urlKey !== urlKey;
+      });
+      pruneState(nextState, now);
+      await this.store.save(structuredClone(nextState));
+      this.state = nextState;
     });
   }
 

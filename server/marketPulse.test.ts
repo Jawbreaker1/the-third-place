@@ -10,6 +10,8 @@ import {
   canonicalMarketPulseUrl,
   parseOfficialMarketPulseFeed,
   type MarketPulseFeedFetchResponse,
+  type MarketPulsePersistedState,
+  type MarketPulseStateStore,
   type ValidatedMarketObservation,
 } from "./marketPulse.js";
 
@@ -147,11 +149,13 @@ describe("MarketPulseCoordinator feed polling", () => {
       enabledFeedIds: [FED_FEED],
     });
 
-    expect(await coordinator.pollOfficialFeeds()).toEqual([expect.objectContaining({
+    const [candidate] = await coordinator.pollOfficialFeeds();
+    expect(candidate).toEqual(expect.objectContaining({
       origin: "official_feed",
       priority: "routine",
       providerId: FED_FEED,
-    })]);
+    }));
+    await coordinator.acknowledgeFeedPublication(candidate!);
     expect(await coordinator.pollOfficialFeeds()).toEqual([]);
     expect(fetcher).toHaveBeenCalledTimes(1);
 
@@ -169,6 +173,90 @@ describe("MarketPulseCoordinator feed polling", () => {
     });
   });
 
+  it("retries an unacknowledged discovery across restart even when the next feed response is 304", async () => {
+    let now = NOW;
+    const store = new MemoryMarketPulseStateStore();
+    const first = new MarketPulseCoordinator(
+      vi.fn(async () => feedResponse(rss(), { ETag: '"outbox-version"' })),
+      store,
+      { now: () => now, enabledFeedIds: [FED_FEED] },
+    );
+    const [discovered] = await first.pollOfficialFeeds();
+    expect(discovered).toBeDefined();
+    expect(await store.load()).toMatchObject({
+      version: 2,
+      pendingFeedCandidates: [expect.objectContaining({ id: discovered!.id })],
+      seen: [],
+    });
+
+    now += 10 * 60_000;
+    const afterRestartFetcher = vi.fn(async () => ({
+      status: 304,
+      finalUrl: new URL("https://www.federalreserve.gov/feeds/press_monetary.xml"),
+      mediaType: "application/rss+xml",
+    } satisfies MarketPulseFeedFetchResponse));
+    const afterRestart = new MarketPulseCoordinator(afterRestartFetcher, store, {
+      now: () => now,
+      enabledFeedIds: [FED_FEED],
+    });
+    expect(await afterRestart.pollOfficialFeeds()).toEqual([discovered]);
+    expect(afterRestartFetcher.mock.calls[0]?.[0].headers).toMatchObject({
+      "If-None-Match": '"outbox-version"',
+    });
+
+    await afterRestart.acknowledgeFeedPublication(discovered!);
+    await expect(afterRestart.acknowledgeFeedPublication(discovered!)).resolves.toBeUndefined();
+    expect(await store.load()).toMatchObject({
+      pendingFeedCandidates: [],
+      seen: [expect.any(Object), expect.any(Object)],
+    });
+
+    now += 10 * 60_000;
+    const finalRestart = new MarketPulseCoordinator(afterRestartFetcher, store, {
+      now: () => now,
+      enabledFeedIds: [FED_FEED],
+    });
+    expect(await finalRestart.pollOfficialFeeds()).toEqual([]);
+  });
+
+  it("keeps the outbox retryable in memory and on disk when acknowledgement persistence fails", async () => {
+    let now = NOW;
+    let rejectAcknowledgement = false;
+    const durableStore = new MemoryMarketPulseStateStore();
+    const store: MarketPulseStateStore = {
+      load: () => durableStore.load(),
+      save: async (state: MarketPulsePersistedState) => {
+        if (rejectAcknowledgement && state.pendingFeedCandidates.length === 0) {
+          rejectAcknowledgement = false;
+          throw new Error("simulated acknowledgement write failure");
+        }
+        await durableStore.save(state);
+      },
+    };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(feedResponse(rss(), { ETag: '"retry-version"' }))
+      .mockResolvedValueOnce({
+        status: 304,
+        finalUrl: new URL("https://www.federalreserve.gov/feeds/press_monetary.xml"),
+        mediaType: "application/rss+xml",
+      } satisfies MarketPulseFeedFetchResponse);
+    const coordinator = new MarketPulseCoordinator(fetcher, store, {
+      now: () => now,
+      enabledFeedIds: [FED_FEED],
+    });
+    const [candidate] = await coordinator.pollOfficialFeeds();
+    rejectAcknowledgement = true;
+    await expect(coordinator.acknowledgeFeedPublication(candidate!))
+      .rejects.toThrow("simulated acknowledgement write failure");
+    expect(await durableStore.load()).toMatchObject({
+      pendingFeedCandidates: [expect.objectContaining({ id: candidate!.id })],
+      seen: [],
+    });
+
+    now += 10 * 60_000;
+    expect(await coordinator.pollOfficialFeeds()).toEqual([candidate]);
+  });
+
   it("deduplicates both provider IDs and canonical URLs across coordinator restarts for 30 days", async () => {
     let now = NOW;
     const store = new MemoryMarketPulseStateStore();
@@ -180,7 +268,9 @@ describe("MarketPulseCoordinator feed polling", () => {
       now: () => now,
       enabledFeedIds: [FED_FEED],
     });
-    expect(await first.pollOfficialFeeds()).toHaveLength(1);
+    const [published] = await first.pollOfficialFeeds();
+    expect(published).toBeDefined();
+    await first.acknowledgeFeedPublication(published!);
 
     now += 10 * 60_000;
     const secondFetcher = vi.fn(async () => feedResponse(rss({
@@ -297,14 +387,51 @@ describe("MarketPulseCoordinator feed polling", () => {
         store,
         { now: () => NOW, enabledFeedIds: [FED_FEED] },
       );
-      expect(await coordinator.pollOfficialFeeds()).toHaveLength(1);
-      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ version: 1 });
+      const [published] = await coordinator.pollOfficialFeeds();
+      expect(published).toBeDefined();
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+        version: 2,
+        pendingFeedCandidates: [expect.objectContaining({ id: published!.id })],
+        seen: [],
+      });
+      await coordinator.acknowledgeFeedPublication(published!);
       const restarted = new MarketPulseCoordinator(
         vi.fn(async () => feedResponse(rss())),
         new JsonFileMarketPulseStateStore(path),
         { now: () => NOW + 10 * 60_000, enabledFeedIds: [FED_FEED] },
       );
       expect(await restarted.pollOfficialFeeds()).toEqual([]);
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+        version: 2,
+        pendingFeedCandidates: [],
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates version-1 state without treating a newly discovered item as published", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "market-pulse-v1-"));
+    const path = join(directory, "state.json");
+    try {
+      await writeFile(path, JSON.stringify({
+        version: 1,
+        feeds: {},
+        seen: [],
+        movementHighWater: [],
+      }), "utf8");
+      const coordinator = new MarketPulseCoordinator(
+        vi.fn(async () => feedResponse(rss())),
+        new JsonFileMarketPulseStateStore(path),
+        { now: () => NOW, enabledFeedIds: [FED_FEED] },
+      );
+      const [candidate] = await coordinator.pollOfficialFeeds();
+      expect(candidate).toBeDefined();
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+        version: 2,
+        pendingFeedCandidates: [expect.objectContaining({ id: candidate!.id })],
+        seen: [],
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -321,7 +448,7 @@ describe("MarketPulseCoordinator feed polling", () => {
         { now: () => NOW, enabledFeedIds: [FED_FEED] },
       );
       expect(await coordinator.pollOfficialFeeds()).toHaveLength(1);
-      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ version: 1 });
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ version: 2 });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

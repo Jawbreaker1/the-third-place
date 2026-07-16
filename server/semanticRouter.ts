@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
 import { containsVisibleUrlText, findUrlTextCandidates } from "../shared/unicodeBoundaries.js";
 import { unicodeCaselessKey } from "../shared/unicodeSafety.js";
 import {
@@ -2362,15 +2363,11 @@ export const VOICE_CANDIDATE_REVIEW_ISSUES = [
   "output_language_mismatch",
 ] as const satisfies readonly CandidateReviewIssue[];
 
-const NON_VOICE_CANDIDATE_REVIEW_ISSUES = CANDIDATE_REVIEW_ISSUES.filter(
-  (issue) => issue !== "output_language_mismatch",
-) satisfies readonly CandidateReviewIssue[];
-
 const candidateReviewIssueInventory = (
   input: Pick<NormalizedCandidateReviewInput, "sceneKind">,
 ): readonly CandidateReviewIssue[] => input.sceneKind === "voice"
   ? VOICE_CANDIDATE_REVIEW_ISSUES
-  : NON_VOICE_CANDIDATE_REVIEW_ISSUES;
+  : CANDIDATE_REVIEW_ISSUES;
 
 const samePrimaryLanguage = (left: string, right: string): boolean =>
   left.split("-", 1)[0]!.toLocaleLowerCase("en-US") ===
@@ -2542,7 +2539,7 @@ export const candidateReviewInputSchema = z.object({
   candidates: z.array(z.object({
     personaId: safeId,
     actorName: boundedText(80),
-    content: boundedText(500),
+    content: boundedText(MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS),
     sourceIds: z.array(safeId).max(8),
     /** Fallible orientation belonging only to this candidate; quoted data, never an instruction. */
     privateRelationshipNote: boundedText(2_600).nullable().default(null),
@@ -2555,8 +2552,8 @@ export const candidateReviewInputSchema = z.object({
       stanceIntensity: z.enum(PERSONA_STANCE_INTENSITIES).default("ordinary"),
       explicitnessTarget: z.enum(PERSONA_EXPLICITNESS_TARGETS).default("persona"),
     }).strict(),
-    recentOwnTexts: z.array(boundedText(500)).max(8),
-    peerTexts: z.array(boundedText(500)).max(8),
+    recentOwnTexts: z.array(boundedText(MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS)).max(8),
+    peerTexts: z.array(boundedText(MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS)).max(8),
   }).strict().superRefine((candidate, context) => {
     if (candidate.mustFulfillRequest && !candidate.mustReply) {
       context.addIssue({
@@ -2735,8 +2732,8 @@ export interface CandidateLineReview {
   severity: CandidateReviewSeverity;
   issues: CandidateReviewIssue[];
   rewriteInstruction: string | null;
-  /** Required for voice review; omitted by the unchanged non-voice contract. */
-  outputLanguage?: { tag: string; confidence: number };
+  /** Mandatory semantic classification of this exact candidate's written language. */
+  outputLanguage: { tag: string; confidence: number };
 }
 
 export interface CandidateReviewBatch {
@@ -2755,9 +2752,7 @@ export const createCandidateReviewOutputSchema = (input: NormalizedCandidateRevi
       severity: candidateReviewSeveritySchema,
       issues: z.array(candidateReviewIssueSchema).max(issueInventory.length),
       rewriteInstruction: z.string().min(1).max(240).nullable(),
-      outputLanguage: input.sceneKind === "voice"
-        ? candidateOutputLanguageSchema
-        : z.never().optional(),
+      outputLanguage: candidateOutputLanguageSchema,
     }).strict()).length(personaIds.size),
   }).strict().superRefine((value, context) => {
     const returnedIds = value.reviews.map((review) => review.personaId);
@@ -2778,9 +2773,7 @@ export const createCandidateReviewOutputSchema = (input: NormalizedCandidateRevi
         review.outputLanguage.confidence >= CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE
         ? review.outputLanguage.tag
         : undefined;
-      const requiredOutputLanguage = input.sceneKind === "voice"
-        ? input.semanticContext.languageTag ?? undefined
-        : undefined;
+      const requiredOutputLanguage = input.semanticContext.languageTag ?? undefined;
       const actualOutputLanguageMismatch = Boolean(
         requiredOutputLanguage &&
         trustedOutputLanguage &&
@@ -2829,7 +2822,7 @@ export const createCandidateReviewOutputSchema = (input: NormalizedCandidateRevi
         context.addIssue({
           code: z.ZodIssueCode.custom,
           path: ["reviews", index, "issues"],
-          message: "A voice output-language mismatch must exactly match trusted required and actual primary languages",
+          message: "An output-language mismatch must exactly match trusted required and actual primary languages",
         });
       }
       if (hasOutputLanguageMismatch && review.severity !== "high") {
@@ -2942,26 +2935,22 @@ export const buildCandidateReviewResponseFormat = (input: NormalizedCandidateRev
                   items: { type: "string", enum: allowedIssues },
                 },
                 rewriteInstruction: nullableJsonSchema({ type: "string", minLength: 1, maxLength: 240 }),
-                ...(input.sceneKind === "voice"
-                  ? {
-                      outputLanguage: {
-                        type: "object",
-                        additionalProperties: false,
-                        properties: {
-                          tag: { type: "string", minLength: 2, maxLength: 35 },
-                          confidence: { type: "number", minimum: 0, maximum: 1 },
-                        },
-                        required: ["tag", "confidence"],
-                      },
-                    }
-                  : {}),
+                outputLanguage: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    tag: { type: "string", minLength: 2, maxLength: 35 },
+                    confidence: { type: "number", minimum: 0, maximum: 1 },
+                  },
+                  required: ["tag", "confidence"],
+                },
               },
               required: [
                 "personaId",
                 "severity",
                 "issues",
                 "rewriteInstruction",
-                ...(input.sceneKind === "voice" ? ["outputLanguage"] : []),
+                "outputLanguage",
               ],
             },
           },
@@ -3012,6 +3001,8 @@ surfaceStylePlan is trusted per-candidate policy. visibleAffect true permits one
 
 Judge the candidate's actual asserted meaning, not isolated words. A quoted, negated, hypothetical, sarcastic or corrected claim is not the same as the candidate asserting it. In particular, do not flag a line merely because it quotes somebody else's false limitation, academic phrasing, intoxication reference or acoustic claim while clearly rejecting or discussing it.
 
+For every candidate, identify the language actually used in that candidate's output—not the trigger's requested or assumed language—as outputLanguage. Return a canonical registered BCP-47 tag and calibrated confidence. Prefer the least-specific justified tag (normally the primary language); never invent a region or script. A borrowed fragment alone does not decide the language. If code, names, emoji, very short ambiguity or a genuinely even language mix makes the output indeterminate, use und with low confidence. This classification is semantic and script-aware: never use word lists, regex or language-pair special cases.
+
 Use only these publication issues:
 - irrelevant_to_turn: it fails to answer or react to the actual latest turn.
 - unfulfilled_explicit_request: use only when semanticContext.intentTrusted is true, semanticContext.replyExpected is expected, this candidate's mustFulfillRequest is true and mustReportCapabilityFailure is false. mustReply alone may instead represent moderation, typed evidence, dissent or another social role and never creates request ownership. A planned typed capability deliberately sets mustFulfillRequest false: judge that scene with evidence, temporal, relevance and capability rules instead. When readable supplied sources genuinely omit the requested datum, one concrete statement of exactly what is absent is a grounded outcome, not an unfulfilled self-contained request; if the evidence actually contains the answer and the candidate evades it, use evidence_ungrounded or irrelevant_to_turn as appropriate. Judge the complete pragmatic meaning in context, in any language or language mix, never words, phrase templates, punctuation or translated keywords. If the trigger makes a feasible, self-contained request whose requested outcome can be supplied in this message, the designated owner must actually supply that outcome. Flag an offer or promise to do it later, narration about trying/thinking/working on it, a progress or status update, a request for permission to substitute an adjacent activity, or the adjacent substitute itself when it evades the requested outcome. Do not flag a candidate that actually performs or answers the request: a requested riddle, joke, example, explanation, choice, rewrite or other artifact is fulfilment even when brief, playful, imperfect or surprising. When mustReportCapabilityFailure is true, trusted server state says the selected attempt really failed and the unavailable requested fact cannot be supplied: one concise, temporary, in-character report of that concrete constraint is the required response, not an unfulfilled request. Use irrelevant_to_turn if such a candidate instead evades both the failed attempt and the actual turn. Do not apply this issue when the request genuinely depends on unavailable evidence, a future event, external action or missing information; when the human explicitly requested planning, permission or a status update; or when the trusted gating fields above are absent. Relatedness alone is not fulfilment.
@@ -3038,10 +3029,11 @@ Use only these publication issues:
 - ambient_action_mismatch: use only when ambientAction is present. The candidate clearly fails its one assigned move: it restarts the seed instead of continuing the committed target, jumps to another topic, merely paraphrases or broadly agrees with the latest line, substitutes generic room chatter, or closes an open hook without adding the required example, countertake, consequence, question or source follow-up. Judge semantic movement in any language, never keywords or length. A terse fragment, joke, dry disagreement or pointed question is clean when it actually advances the live episode. Do not demand an essay, a second actor, a forced resolution or explicit mention of the internal action label.
 - self_repetition: semantic repetition or near-paraphrase of that actor's recent lines, including that actor's own recalled historical lines supplied in recentOwnTexts.
 - peer_echo: it merely repeats another candidate or peer instead of adding its own stance.
+- output_language_mismatch: semanticContext.languageTag is the trusted required response language, while outputLanguage is the language actually written. Emit this issue exactly when both tags are determined with output confidence at least ${CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE} and their primary languages differ. Locale variants of the same primary language are compatible. An und or low-confidence output language is not a mismatch. This is always high severity; regenerate in the required language without unnecessarily translating names or genuinely quoted fragments.
 
 Profanity is not itself a publication defect. Judge its pragmatic use in full multilingual context without word lists. A safe proportionate reply such as an in-character swear, blunt dismissal or sarcastic comeback can be completely clean. Conversely, euphemistic wording can still be an unsafe threat or dogpile.
 
-Severity high means the line must not be published unchanged. Medium/low are advisory and must not be inflated merely for stylistic preference. diegetic_identity_break, unsafe_retaliation, conflict_pile_on, unsupported_room_recall, unsupported_external_evidence_claim and ambient_action_mismatch are publication blockers and always high severity when emitted. unfulfilled_explicit_request is also always high severity when emitted; publication must retry the required actor with the complete triggering turn rather than ask a context-poor copy editor to invent the missing artifact. conflict_register_mismatch, behavior_intensity_under_target and behavior_intensity_violation are repairable when the intended safe reaction can be preserved. Standalone behavior intensity issues must use medium severity. For every non-clean review, give one concise language-appropriate rewrite instruction that preserves supported facts and the actor's intent. For a clean line return severity none, issues [] and rewriteInstruction null. Evidence, diegetic identity, relevance, request fulfilment, temporal grounding, room-recall grounding and acoustic-grounding problems are factual publication blockers, not style preferences.`;
+Severity high means the line must not be published unchanged. Medium/low are advisory and must not be inflated merely for stylistic preference. diegetic_identity_break, unsafe_retaliation, conflict_pile_on, unsupported_room_recall, unsupported_external_evidence_claim, ambient_action_mismatch and output_language_mismatch are publication blockers and always high severity when emitted. unfulfilled_explicit_request is also always high severity when emitted; publication must retry the required actor with the complete triggering turn rather than ask a context-poor copy editor to invent the missing artifact. conflict_register_mismatch, behavior_intensity_under_target and behavior_intensity_violation are repairable when the intended safe reaction can be preserved. Standalone behavior intensity issues must use medium severity. For every non-clean review, give one concise language-appropriate rewrite instruction that preserves supported facts and the actor's intent. For a clean line return severity none, issues [] and rewriteInstruction null. Evidence, diegetic identity, relevance, request fulfilment, response-language, temporal grounding, room-recall grounding and acoustic-grounding problems are factual publication blockers, not style preferences.`;
 
 /**
  * Voice review is on the live-call critical path. It cannot use ambient,

@@ -1,4 +1,5 @@
 import type { Channel } from "../shared/types.js";
+import type { PersonaStyleFingerprint } from "./personaStyle.js";
 
 export type ExpertiseLevel = "basic" | "casual" | "competent" | "advanced" | "specialist";
 
@@ -61,34 +62,45 @@ export interface ConversationRegisterProfile {
 export const CONVERSATION_REGISTERS: Record<ConversationRegister, ConversationRegisterProfile> = {
   everyday: {
     guidance: "Ordinary group-chat language: plain verbs, familiar words and one thought at a time. A serious point should still sound typed off the cuff, usually through one recognizable example rather than abstract framing, symmetrical debate prose or institutional vocabulary. Fragments, small asides and imperfect rhythm are welcome; intelligence does not require formality.",
-    consideredLeadWords: [18, 42],
+    consideredLeadWords: [26, 62],
     consideredResponseWords: [5, 22],
   },
   banter: {
     guidance: "Loose table-talk language: direct reactions, fragments, specific references, playful overstatement and occasional self-correction. Prefer a memorable detail or punchline over a polished explanation. Never make everyone use the same slang, joke rhythm or level of enthusiasm.",
-    consideredLeadWords: [16, 40],
+    consideredLeadWords: [22, 56],
     consideredResponseWords: [4, 20],
   },
   technical: {
     guidance: "Informed colleague chat. Exact technical terms, code names and causal reasoning are natural, but write like people debugging together rather than a paper, documentation page or conference panel. Lead with the concrete failure, mechanism or trade-off; do not inflate a simple point with academic framing.",
-    consideredLeadWords: [24, 52],
+    consideredLeadWords: [36, 76],
     consideredResponseWords: [7, 28],
   },
   analytical: {
     guidance: "Informed analytical chat. Domain terms and careful distinctions are welcome, but each message should make one legible claim in a human voice, not read like an op-ed, memo or textbook paragraph. Prefer one concrete business, incentive or consequence over a chain of abstractions.",
-    consideredLeadWords: [24, 52],
+    consideredLeadWords: [34, 72],
     consideredResponseWords: [7, 28],
   },
   fandom: {
     guidance: "Fan and guild-chat language. Use concrete classes, encounters, places, mechanics or lore when known; jargon may be casual and unexplained. Sound like people comparing opinions in chat, not critics writing a general game-design essay.",
-    consideredLeadWords: [18, 44],
+    consideredLeadWords: [28, 64],
     consideredResponseWords: [5, 23],
   },
   studio: {
     guidance: "Practical studio-floor language. Talk through a visible cue, material, light, camera choice or pipeline snag as artists and technical peers would at a monitor. Technical precision is welcome; portfolio-review prose and abstract design manifestos are not.",
-    consideredLeadWords: [20, 46],
+    consideredLeadWords: [32, 70],
     consideredResponseWords: [6, 24],
   },
+};
+
+/** A rare deeper opener may exceed only the persona's ordinary-chat ceiling. */
+export const consideredLeadWordRange = (
+  register: ConversationRegister,
+  style: Pick<PersonaStyleFingerprint, "hardMaxWords" | "complexityAppetite">,
+): readonly [minimum: number, maximum: number] => {
+  const roomRange = CONVERSATION_REGISTERS[register].consideredLeadWords;
+  const personaMaximum = style.hardMaxWords + Math.round(10 + style.complexityAppetite * 24);
+  const maximum = Math.min(roomRange[1], personaMaximum);
+  return [Math.min(roomRange[0], maximum), maximum];
 };
 
 export interface ChannelProfile {

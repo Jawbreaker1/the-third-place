@@ -289,7 +289,16 @@ const candidateReviewCompletion = (reviews: Array<{
   rewriteInstruction: string | null;
   outputLanguage?: { tag: string; confidence: number };
 }>) => jsonResponse({
-  choices: [{ message: { content: JSON.stringify({ reviews }) } }],
+  choices: [{
+    message: {
+      content: JSON.stringify({
+        reviews: reviews.map((review) => ({
+          outputLanguage: { tag: "und", confidence: 0 },
+          ...review,
+        })),
+      }),
+    },
+  }],
 });
 
 const voiceCandidateReviewCompletion = (
@@ -2962,6 +2971,151 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(reviewPayload.semanticContext.languageTag).toBeNull();
   });
 
+  it.each(["welcome", "public", "dm", "ambient"] as const)(
+    "preserves trusted reviewed output language for a clean %s scene",
+    async (kind) => {
+      process.env.CANDIDATE_REVIEW_ENABLED = "true";
+      const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+      const bodies: any[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        const body = JSON.parse(String(init?.body));
+        bodies.push(body);
+        return bodies.length === 1
+          ? completionResponse([{ personaId: sana.id, content: "うん、その順番なら自然だと思う。" }])
+          : candidateReviewCompletion([{
+              personaId: sana.id,
+              severity: "none",
+              issues: [],
+              rewriteInstruction: null,
+              outputLanguage: { tag: "ja-JP", confidence: 0.99 },
+            }]);
+      }));
+
+      const lines = await new LmStudioClient().generateScene({
+        kind,
+        channelId: "lobby",
+        channelName: "lobby",
+        selected: [sana],
+        history: [],
+        semanticContext: {
+          languageTag: "ja",
+          asksForList: false,
+          asksAboutAiIdentity: false,
+          asksAboutAcoustics: false,
+        },
+      });
+
+      expect(lines).toEqual([expect.objectContaining({
+        personaId: sana.id,
+        reviewedOutputLanguage: { tag: "ja-JP", confidence: 0.99 },
+      })]);
+      const responseItem = bodies[1].response_format.json_schema.schema.properties.reviews.items;
+      expect(responseItem.required).toContain("outputLanguage");
+    },
+  );
+
+  it("recovers one ambient text candidate that fails the trusted response-language contract", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const recovered = "Den konkreta nackdelen är att kön blir svårare att felsöka.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: sana.id, content: "The concrete downside is a harder queue to debug." }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: sana.id,
+          severity: "high",
+          issues: ["output_language_mismatch"],
+          rewriteInstruction: "Svara på svenska utan att byta hela replikens språk.",
+          outputLanguage: { tag: "en", confidence: 0.99 },
+        }]);
+      }
+      if (bodies.length === 3) return completionResponse([{ personaId: sana.id, content: recovered }]);
+      return candidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+        outputLanguage: { tag: "sv-SE", confidence: 0.99 },
+      }]);
+    }));
+
+    const recoveryBudget = { retriesRemaining: 1 };
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [sana],
+      history: [],
+      premise: "Continue the assigned queue trade-off without changing topic.",
+      mustReplyIds: [sana.id],
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      responseRecoveryBudget: recoveryBudget,
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      content: recovered,
+      reviewedOutputLanguage: { tag: "sv-SE", confidence: 0.99 },
+    })]);
+    expect(bodies).toHaveLength(4);
+    expect(recoveryBudget.retriesRemaining).toBe(0);
+    const retryScene = JSON.parse(bodies[2].messages[1].content);
+    expect(retryScene.premise).toContain("one bounded full-scene recovery");
+    expect(retryScene.premise).toContain("trusted required response language");
+  });
+
+  it("stops after one reviewed text-language recovery when the retry still mismatches", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1 || bodies.length === 3) {
+        return completionResponse([{ personaId: sana.id, content: "This remains in the wrong language." }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "high",
+        issues: ["output_language_mismatch"],
+        rewriteInstruction: "Svara i det betrodda svarsspråket.",
+        outputLanguage: { tag: "en", confidence: 0.99 },
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+      mustReplyIds: [sana.id],
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines).toEqual([]);
+    expect(bodies).toHaveLength(4);
+  });
+
   it("reviews every generated line in one strict temperature-zero batch", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
@@ -5009,8 +5163,7 @@ describe("LM Studio room prompt", () => {
     });
     expect(prompt).toContain("writes 16–32 words");
     expect(prompt).toContain("Loose table-talk language");
-    expect(prompt).toContain("Preserve the actor's ordinary voice and hard maximum");
-    expect(prompt).not.toContain("may override the ordinary style maximum");
+    expect(prompt).toContain("Preserve the actor's ordinary voice; this rare role may stretch beyond only their ordinary-chat length ceiling");
   });
 
   it("leaves intoxicant meaning to semantic review but still drops invented pub URLs mechanically", async () => {
@@ -5269,10 +5422,9 @@ describe("LM Studio room prompt", () => {
       selected: [lead, responder],
       history: [],
     });
-    expect(prompt).toContain(`${lead.name} writes 24–46 words`);
+    expect(prompt).toContain(`${lead.name} writes 36–76 words`);
     expect(prompt).toContain("Informed colleague chat");
-    expect(prompt).toContain("Preserve each actor's ordinary voice and hard maximum");
-    expect(prompt).not.toContain("may override the ordinary style maximum");
+    expect(prompt).toContain("Only the lead's rare role may stretch beyond their ordinary-chat length ceiling");
     expect(prompt).toContain("Never paraphrase the lead");
     expect(prompt).toContain("counterexample, pointed question, practical consequence or respectful challenge");
     expect(prompt).not.toContain("normally 4–35 words");
@@ -5522,11 +5674,11 @@ describe("LM Studio one-pass humanizer", () => {
       completionCalls += 1;
       return completionCalls === 1
         ? completionResponse([
-            { personaId: ibrahim.id, content: words("lead", 47) },
+            { personaId: ibrahim.id, content: words("l", 77) },
             { personaId: tess.id, content: words("svar", 29) },
           ])
         : completionResponse([
-            { personaId: ibrahim.id, content: words("nylead", 40) },
+            { personaId: ibrahim.id, content: words("n", 50) },
             { personaId: tess.id, content: words("nyttsvar", 18) },
           ]);
     }));
@@ -5542,7 +5694,7 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(completionCalls).toBe(2);
-    expect(lines.map((line) => line.content.split(/\s+/u).length)).toEqual([40, 18]);
+    expect(lines.map((line) => line.content.split(/\s+/u).length)).toEqual([50, 18]);
   });
 
   it("repairs a thin quick ambient contribution against its explicit scene-role minimum", async () => {

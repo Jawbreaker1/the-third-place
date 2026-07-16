@@ -17,6 +17,7 @@ import { ActorChannelRuntime } from "./actorChannels.js";
 import {
   CHANNELS,
   CONVERSATION_REGISTERS,
+  consideredLeadWordRange,
   getChannelProfile,
   type AmbientMode,
   type AutonomousResearchSeed,
@@ -43,6 +44,7 @@ import {
 import { assessCandidate, protectTechnicalFragments, restoreTechnicalFragments } from "./humanizer.js";
 import type { HumanMemory } from "./humanMemory.js";
 import {
+  CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE,
   createFailClosedTurnAnalysis,
   projectTrustedTurnAnalysis,
   TURN_TRUST_THRESHOLDS,
@@ -63,6 +65,7 @@ import {
   type BehaviorTuningProvider,
 } from "./behaviorTuning.js";
 import type { AdminBehaviorTuning } from "../shared/adminTypes.js";
+import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
 import { recallChannelHistory } from "./channelRecall.js";
 import {
   DmTurnCoordinator,
@@ -133,6 +136,8 @@ const AUTO_SHARED_LINK_GLOBAL_LIMIT = 4;
 const AUTO_SHARED_LINK_STATE_LIMIT = 1_000;
 const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_BASE_MS = 60_000;
 const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS = 4 * 60_000;
+const AUTONOMOUS_RESEARCH_SEED_BACKOFF_BASE_MS = 30 * 60_000;
+const AUTONOMOUS_RESEARCH_SEED_BACKOFF_MAX_MS = 6 * 60 * 60_000;
 const AMBIENT_BUSY_RETRY_MIN_MS = 4_000;
 const AMBIENT_BUSY_RETRY_MAX_MS = 8_000;
 const HUMAN_REACTION_STATE_LIMIT = 1_000;
@@ -158,7 +163,10 @@ const boundedUntrustedText = (value: string, maxLength: number): string =>
     .slice(0, maxLength);
 
 /** Preserves code, URLs and intentional line breaks; overlong content is rejected atomically. */
-export const normalizeGeneratedMessageContent = (value: string, maxLength = 500): string | undefined => {
+export const normalizeGeneratedMessageContent = (
+  value: string,
+  maxLength = MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS,
+): string | undefined => {
   const protectedText = protectTechnicalFragments(value);
   const normalized = protectedText.text
     .replace(/\s*\[S\d+\](?=\p{P})/giu, "")
@@ -390,6 +398,8 @@ const AMBIENT_ALTERNATE_WAIT_MS = 30_000;
 // mechanically complete mini-scene at a time.
 const AMBIENT_THREAD_CONTINUITY_BONUS = 4.5;
 
+export type AmbientTurnLength = "fragment" | "short" | "ordinary" | "expanded";
+
 export interface AmbientThreadState {
   seed: string;
   /** Stable server-authored keys; no transcript text is treated as taxonomy. */
@@ -604,6 +614,71 @@ export function ambientSceneWordLimits(
   return limits;
 }
 
+/**
+ * Samples visible message shape without inspecting transcript words or a
+ * particular language. The persona range remains an envelope, while short
+ * fragments and roomier turns stop the local model from converging on the
+ * same safe midpoint for every message in a room.
+ */
+export function sampleAmbientTurnWordLimit(
+  persona: Persona,
+  options: {
+    mode: AmbientMode;
+    continuation: boolean;
+    action?: AmbientActionKind;
+    rng: () => number;
+  },
+): { shape: AmbientTurnLength; minimum: number; maximum: number } {
+  const envelope = ambientSceneWordLimits(
+    persona,
+    undefined,
+    options.continuation,
+    options.mode,
+  )[persona.id]!;
+  const roll = clamp(options.rng(), 0, 0.999_999);
+  const fragmentChance = options.continuation
+    ? options.mode === "banter" ? 0.22 : options.mode === "casual" ? 0.18 : 0.11
+    : options.mode === "banter" ? 0.1 : 0.06;
+  const shortChance = options.mode === "banter" ? 0.28 : options.mode === "casual" ? 0.25 : 0.2;
+  const expandedChance = options.action === "open_topic"
+    ? options.mode === "discussion" ? 0.2 : 0.14
+    : options.mode === "discussion" ? 0.12 : 0.08;
+  const shape: AmbientTurnLength = roll < fragmentChance
+    ? "fragment"
+    : roll < fragmentChance + shortChance
+      ? "short"
+      : roll >= 1 - expandedChance
+        ? "expanded"
+        : "ordinary";
+  const [typicalMinimum, typicalMaximum] = persona.style.typicalWords;
+  if (shape === "fragment") {
+    return {
+      shape,
+      minimum: 1,
+      maximum: Math.max(2, Math.min(envelope.maximum, Math.round(typicalMinimum * 0.65) + 2)),
+    };
+  }
+  if (shape === "short") {
+    const maximum = Math.max(
+      5,
+      Math.min(envelope.maximum, Math.round(typicalMinimum + (typicalMaximum - typicalMinimum) * 0.34)),
+    );
+    return { shape, minimum: Math.min(2, maximum), maximum };
+  }
+  if (shape === "expanded") {
+    const minimum = Math.max(
+      6,
+      Math.min(envelope.maximum, Math.round(typicalMaximum * 0.72)),
+    );
+    return { shape, minimum, maximum: envelope.maximum };
+  }
+  return {
+    shape,
+    minimum: Math.min(Math.max(2, typicalMinimum - 2), envelope.maximum),
+    maximum: Math.min(envelope.maximum, Math.max(typicalMinimum, typicalMaximum)),
+  };
+}
+
 export function ambientConversationPremise(
   seed: string,
   lead: Persona,
@@ -612,8 +687,9 @@ export function ambientConversationPremise(
   debateBeat = false,
   mode: AmbientMode = "discussion",
   action?: AmbientActionKind,
+  suppliedWordLimits?: Record<string, { minimum: number; maximum: number }>,
 ): string {
-  const wordLimits = ambientSceneWordLimits(lead, responder, continuation, mode);
+  const wordLimits = suppliedWordLimits ?? ambientSceneWordLimits(lead, responder, continuation, mode);
   const leadLimit = wordLimits[lead.id]!;
   const responseLimit = responder ? wordLimits[responder.id]! : undefined;
   if (mode === "banter") {
@@ -677,14 +753,14 @@ export function consideredConversationWordLimits(
   register: ConversationRegister,
 ): { lead: ConversationWordLimit; response: ConversationWordLimit } {
   const profile = CONVERSATION_REGISTERS[register];
-  const leadMaximum = Math.min(profile.consideredLeadWords[1], plan.lead.style.hardMaxWords);
+  const [leadMinimum, leadMaximum] = consideredLeadWordRange(register, plan.lead.style);
   const responseRoomMaximum = plan.responseRole === "question"
     ? Math.min(profile.consideredResponseWords[1], 24)
     : profile.consideredResponseWords[1];
   const responseMaximum = Math.min(responseRoomMaximum, plan.responder.style.hardMaxWords);
   return {
     lead: {
-      minimum: Math.min(profile.consideredLeadWords[0], plan.lead.style.typicalWords[1], leadMaximum),
+      minimum: leadMinimum,
       maximum: leadMaximum,
     },
     response: {
@@ -742,7 +818,7 @@ export interface SocialDirectorOptions {
   /** Fixed-source market event coordinator. `null` disables autonomous market events. */
   marketPulseCoordinator?: Pick<
     MarketPulseCoordinator,
-    "pollOfficialFeeds" | "evaluateMarketObservations"
+    "pollOfficialFeeds" | "evaluateMarketObservations" | "acknowledgeFeedPublication"
   > | null;
   /** Live server-owned behavior settings; storage and authorization stay outside the director. */
   behaviorTuningProvider?: BehaviorTuningProvider;
@@ -955,11 +1031,23 @@ export function autonomousResearchFailureBackoffMs(consecutiveFailures: number):
   );
 }
 
+/** Content-local failures rotate the seed instead of making every room wait. */
+export function autonomousResearchSeedFailureBackoffMs(consecutiveFailures: number): number {
+  const exponent = Math.max(0, Math.min(4, Math.floor(consecutiveFailures) - 1));
+  return Math.min(
+    AUTONOMOUS_RESEARCH_SEED_BACKOFF_MAX_MS,
+    AUTONOMOUS_RESEARCH_SEED_BACKOFF_BASE_MS * 2 ** exponent,
+  );
+}
+
 export type AutonomousResearchFailureReason =
   | "no_researcher"
   | "no_responder"
   | "lookup_failed"
   | "no_safe_fresh_result"
+  | "no_candidate_after_filter"
+  | "freshness_unverifiable_after_read"
+  | "freshness_rejected_after_read"
   | "source_read_failed"
   | "generation_failed"
   | "invalid_generated_lines"
@@ -994,7 +1082,12 @@ type AutonomousResearchReadOutcome =
     research?: never;
     failureReason: Extract<
       AutonomousResearchFailureReason,
-      "lookup_failed" | "no_safe_fresh_result" | "source_read_failed"
+      | "lookup_failed"
+      | "no_safe_fresh_result"
+      | "no_candidate_after_filter"
+      | "freshness_unverifiable_after_read"
+      | "freshness_rejected_after_read"
+      | "source_read_failed"
     >;
   };
 
@@ -1251,16 +1344,17 @@ export function selectConsideredConversation(
     .map((persona) => ({
       persona,
       score:
-        affinity(persona.id) * 0.62 +
-        persona.curiosity * 0.16 +
-        persona.conscientiousness * 0.1 +
-        rng() * 0.12,
+        affinity(persona.id) * 0.48 +
+        persona.style.complexityAppetite * 0.24 +
+        persona.curiosity * 0.14 +
+        persona.conscientiousness * 0.08 +
+        rng() * 0.06,
     }))
     .sort((a, b) => b.score - a.score);
-  const lead = available[0]?.persona;
+  const lead = available.find(({ persona }) => persona.style.complexityAppetite >= 0.55)?.persona;
   if (!lead) return undefined;
 
-  const rest = available.slice(1);
+  const rest = available.filter(({ persona }) => persona.id !== lead.id);
   if (rest.length === 0) return undefined;
   const rolePredicates: Record<ConsideredResponseRole, (persona: Persona) => boolean> = {
     challenge: (persona) =>
@@ -1618,6 +1712,10 @@ export class SocialDirector {
     consecutiveFailures: number;
     retryAfterAt: number;
   }>();
+  private readonly autonomousResearchFailureStateBySeed = new Map<string, {
+    consecutiveFailures: number;
+    retryAfterAt: number;
+  }>();
   private readonly autonomousResearchDiagnostics: AutonomousResearchDiagnostics = {
     attempts: 0,
     published: 0,
@@ -1669,7 +1767,7 @@ export class SocialDirector {
   private readonly marketSnapshotProvider?: Pick<MarketSnapshotService, "snapshot">;
   private readonly marketPulseCoordinator?: Pick<
     MarketPulseCoordinator,
-    "pollOfficialFeeds" | "evaluateMarketObservations"
+    "pollOfficialFeeds" | "evaluateMarketObservations" | "acknowledgeFeedPublication"
   >;
   private readonly dmTurns: DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>;
   private readonly typingLeases: TypingLeaseCounter<string>;
@@ -1798,6 +1896,9 @@ export class SocialDirector {
     this.historyAccountingRestored = true;
     const now = this.now();
     const knownMemberKinds = new Map(this.getMembers().map((member) => [member.id, member.kind]));
+    for (const observation of this.store.getTrustedChannelLanguages()) {
+      this.lastTrustedLanguageByChannel.set(observation.channelId, observation.languageTag);
+    }
     for (const message of this.store.getAllMessages()) {
       const timestamp = Date.parse(message.createdAt);
       if (!Number.isFinite(timestamp) || timestamp > now) continue;
@@ -1898,6 +1999,45 @@ export class SocialDirector {
     return this.lastTrustedLanguageByChannel.get(channelId);
   }
 
+  private rememberTrustedChannelLanguage(
+    channelId: string,
+    languageTag: string,
+    authority: "human" | "resident",
+    observedAt: string,
+  ): void {
+    this.store.setTrustedChannelLanguage(channelId, languageTag, authority, observedAt);
+    const trusted = this.store.getTrustedChannelLanguage(channelId);
+    if (trusted) this.lastTrustedLanguageByChannel.set(channelId, trusted.languageTag);
+  }
+
+  private lockAmbientThreadLanguage(
+    channelId: string,
+    thread: AmbientThreadState,
+    line: GeneratedLine,
+    observedAt: string,
+  ): void {
+    if (thread.languageTag) return;
+    const reviewed = line.reviewedOutputLanguage;
+    if (
+      !reviewed ||
+      reviewed.confidence < CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE ||
+      reviewed.tag === "und"
+    ) return;
+    thread.languageTag = reviewed.tag;
+    thread.languageHint = reviewed.tag;
+    const hasHumanHistory = this.store.getAllMessages().some(
+      (message) =>
+        message.channelId === channelId &&
+        !message.system &&
+        !message.authorId.startsWith("ai-"),
+    );
+    // A resident can establish a genuinely empty room, but never overwrite or
+    // infer the language of an older human-authored room history.
+    if (!hasHumanHistory) {
+      this.rememberTrustedChannelLanguage(channelId, reviewed.tag, "resident", observedAt);
+    }
+  }
+
   noteHumanVoiceActivity(channelId: string): void {
     const now = this.now();
     this.lastHumanMessageAtByChannel.set(channelId, now);
@@ -1934,13 +2074,18 @@ export class SocialDirector {
     const typingLease = this.acquireTyping("lobby", persona.id);
     let line: GeneratedLine | undefined;
     try {
+      const trustedRoomLanguage = this.lastTrustedLanguageByChannel.get("lobby");
+      const lobbyHistory = this.store.getAllMessages().filter((message) => message.channelId === "lobby");
+      const hasHumanLanguageAnchor = lobbyHistory.some(
+        (message) => !message.system && !message.authorId.startsWith("ai-") && message.content.trim(),
+      );
       const generated = await this.lm.generateScene(
         {
           kind: "welcome",
           channelId: "lobby",
           channelName: "lobby",
           selected: [persona],
-          history: this.transcript("lobby", 18),
+          history: this.transcriptMessages(ambientHistoryWithAnchor(lobbyHistory, 18)),
           trigger: {
             author: "room",
             content: returning
@@ -1952,7 +2097,19 @@ export class SocialDirector {
             ? `Give ${human.name} one light, character-specific welcome back. Recognition may be subtle. Use at most one remembered detail only if it fits naturally; never recite memory or make them the center of a parade.`
             : `Give ${human.name} one warm, character-specific welcome. Do not make them the center of a parade.`,
           mustReplyIds: [persona.id],
-          languageHint: options.languageHint ?? ambientLanguageHint(this.store.getRecent("lobby", 18)),
+          languageHint: trustedRoomLanguage
+            ?? (hasHumanLanguageAnchor ? ambientLanguageHint(lobbyHistory) : options.languageHint)
+            ?? "the room's established language",
+          ...(trustedRoomLanguage
+            ? {
+                semanticContext: {
+                  languageTag: trustedRoomLanguage,
+                  asksForList: false,
+                  asksAboutAiIdentity: false,
+                  asksAboutAcoustics: false,
+                },
+              }
+            : {}),
           relationshipNotes: this.relationshipNotes([persona], human, { kind: "public", channelId: "lobby" }),
           actorChannelNotes: this.actorChannels.promptNotes([persona], "lobby"),
           actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], "lobby"),
@@ -2801,7 +2958,14 @@ export class SocialDirector {
       return;
     }
     const trustedLanguage = classifiedLanguage(analysis);
-    if (trustedLanguage) this.lastTrustedLanguageByChannel.set(trigger.channelId, trustedLanguage);
+    if (trustedLanguage) {
+      this.rememberTrustedChannelLanguage(
+        trigger.channelId,
+        trustedLanguage,
+        "human",
+        trigger.createdAt,
+      );
+    }
     const mechanicalSignals = analyzeSocialSignals(combined);
     const deterministicAddressedIds = addressedPersonaIds(mechanicalSignals.mentionedIds, replyTarget);
     if (
@@ -3649,14 +3813,23 @@ export class SocialDirector {
       const recentSeeds = this.recentAutonomousResearchSeedsByChannel.get(candidate.channel.id) ?? [];
       let seed: AutonomousResearchSeed | undefined;
       let preparedOutcome: AutonomousResearchReadOutcome | undefined;
+      let preparedFeedCandidate: MarketPulseFeedCandidate | undefined;
       if (getChannelProfile(candidate.channel.id)?.marketPulseSourceSet === "global_markets") {
         const pulse = await this.prepareMarketPulseConversation(candidate.channel.id);
         seed = pulse?.seed;
         preparedOutcome = pulse?.outcome;
+        preparedFeedCandidate = pulse?.feedCandidate;
       }
       const persistedResearchEpisode = this.ambientEpisodeLedger?.current(candidate.channel.id);
       const eligibleResearchSeeds = candidate.seeds.filter((researchSeed) => {
         const semanticKey = `research:${researchSeed.id}`;
+        const failedSeedKey = `${candidate.channel.id}:${researchSeed.id}`;
+        const failedSeed = this.autonomousResearchFailureStateBySeed.get(failedSeedKey);
+        if (failedSeed && now >= failedSeed.retryAfterAt) {
+          this.autonomousResearchFailureStateBySeed.delete(failedSeedKey);
+        } else if (failedSeed) {
+          return false;
+        }
         const matchesCurrent = Boolean(
           persistedResearchEpisode && (
             unicodeCaselessKey(persistedResearchEpisode.semanticKey) === unicodeCaselessKey(semanticKey) ||
@@ -3682,6 +3855,7 @@ export class SocialDirector {
         thread,
         seed,
         preparedOutcome,
+        preparedFeedCandidate,
       );
       if (!published && thread.messageCount === 0) {
         this.abandonAmbientThread(candidate.channel.id, thread);
@@ -3695,7 +3869,11 @@ export class SocialDirector {
 
   private async prepareMarketPulseConversation(
     channelId: string,
-  ): Promise<{ seed: AutonomousResearchSeed; outcome: AutonomousResearchReadOutcome } | undefined> {
+  ): Promise<{
+    seed: AutonomousResearchSeed;
+    outcome: AutonomousResearchReadOutcome;
+    feedCandidate: MarketPulseFeedCandidate;
+  } | undefined> {
     if (!this.marketPulseCoordinator) return undefined;
     try {
       const feed = (await this.marketPulseCoordinator.pollOfficialFeeds())[0];
@@ -3704,6 +3882,7 @@ export class SocialDirector {
       return {
         seed,
         outcome: await this.safelyReadMarketPulseFeedCandidate(channelId, seed, feed),
+        feedCandidate: feed,
       };
     } catch (error) {
       console.warn("Official market pulse unavailable safely:", error instanceof Error ? error.message : error);
@@ -3756,7 +3935,8 @@ export class SocialDirector {
 
     // This survives process restarts: a recent synthetic tail must cool down
     // before the director starts a fresh, explicitly anchored conversation.
-    const recent = this.store.getRecent(channelId, 80);
+    const channelHistory = this.store.getAllMessages().filter((message) => message.channelId === channelId);
+    const recent = ambientHistoryWithAnchor(channelHistory, 80);
     if (trailingAiMessageCount(recent) === 0) return true;
     const latestNonSystem = [...recent].reverse().find((message) => !message.system);
     const latestAt = latestNonSystem ? Date.parse(latestNonSystem.createdAt) : Number.NaN;
@@ -3804,7 +3984,8 @@ export class SocialDirector {
     if (!seed) return undefined;
     const selectedSeed = eligibleSeeds.find((candidate) => candidate.premise === seed)!;
     const episodeId = randomUUID();
-    const recent = this.store.getRecent(channelId, 80);
+    const channelHistory = this.store.getAllMessages().filter((message) => message.channelId === channelId);
+    const recent = ambientHistoryWithAnchor(channelHistory, 80);
     const languageTag = this.lastTrustedLanguageByChannel.get(channelId);
     const baseDebateChance = profile.ambientMode === "banter" ? 0.08 : profile.ambientMode === "casual" ? 0.14 : 0.28;
     const debateChance = ambientDebateChance(
@@ -4138,21 +4319,42 @@ export class SocialDirector {
       consecutiveFailures,
       retryAfterAt: channelRetryAfterAt,
     });
-    // A bounded global backoff protects a failing provider from being hit by
-    // every room in turn; the per-room backoff independently protects a bad
-    // query or repeatedly unreadable source family.
-    this.autonomousResearchGlobalConsecutiveFailures += 1;
-    const globalRetryAfterAt = failedAt + autonomousResearchFailureBackoffMs(
-      this.autonomousResearchGlobalConsecutiveFailures,
-    );
-    this.autonomousResearchGlobalRetryAfterAt = globalRetryAfterAt;
+    const seedLocalFailure = [
+      "no_safe_fresh_result",
+      "no_candidate_after_filter",
+      "freshness_unverifiable_after_read",
+      "freshness_rejected_after_read",
+      "source_read_failed",
+    ].includes(reason);
+    let seedRetryAfterAt: number | undefined;
+    if (seedLocalFailure) {
+      const seedKey = `${channelId}:${seed.id}`;
+      const previousSeed = this.autonomousResearchFailureStateBySeed.get(seedKey);
+      const seedFailures = (previousSeed?.consecutiveFailures ?? 0) + 1;
+      seedRetryAfterAt = failedAt + autonomousResearchSeedFailureBackoffMs(seedFailures);
+      this.autonomousResearchFailureStateBySeed.set(seedKey, {
+        consecutiveFailures: seedFailures,
+        retryAfterAt: seedRetryAfterAt,
+      });
+    }
+    // Only a lookup transport/provider failure is allowed to pause other
+    // rooms. A stale/undated result pool, unreadable origin or model rejection
+    // is local to this room/seed and must not make the whole community quiet.
+    let globalRetryAfterAt: number | undefined;
+    if (reason === "lookup_failed") {
+      this.autonomousResearchGlobalConsecutiveFailures += 1;
+      globalRetryAfterAt = failedAt + autonomousResearchFailureBackoffMs(
+        this.autonomousResearchGlobalConsecutiveFailures,
+      );
+      this.autonomousResearchGlobalRetryAfterAt = globalRetryAfterAt;
+    }
     this.autonomousResearchDiagnostics.failed += 1;
     this.autonomousResearchDiagnostics.lastFailure = {
       channelId,
       seedId: seed.id,
       reason,
       failedAt,
-      retryAfterAt: Math.max(channelRetryAfterAt, globalRetryAfterAt),
+      retryAfterAt: Math.max(channelRetryAfterAt, globalRetryAfterAt ?? 0, seedRetryAfterAt ?? 0),
       consecutiveFailures,
     };
     return false;
@@ -4168,6 +4370,7 @@ export class SocialDirector {
     this.autonomousResearchGlobalConsecutiveFailures = 0;
     this.autonomousResearchDiagnostics.published += 1;
     if (seedId) {
+      this.autonomousResearchFailureStateBySeed.delete(`${channelId}:${seedId}`);
       const recent = this.recentAutonomousResearchSeedsByChannel.get(channelId) ?? [];
       this.recentAutonomousResearchSeedsByChannel.set(channelId, [...recent, seedId].slice(-2));
     }
@@ -4192,19 +4395,29 @@ export class SocialDirector {
     let retrievedAt: string | undefined;
     let pageReadSucceeded = false;
     let postReadFreshnessRejected = false;
+    let postReadFreshnessUnverifiable = false;
     const eligibleResults = search.results
-      .filter((candidate) => {
+      .flatMap((candidate, providerIndex) => {
         const urlKey = canonicalAutonomousResearchUrl(candidate.url);
-        return Boolean(
-          urlKey &&
-          !recentUrls.has(urlKey) &&
-          (candidate.publishedAt === undefined ||
-            autonomousResearchResultIsFresh(seed, candidate.publishedAt, this.now())),
-        );
+        if (!urlKey || recentUrls.has(urlKey)) return [];
+        if (
+          candidate.publishedAt !== undefined &&
+          !autonomousResearchResultIsFresh(seed, candidate.publishedAt, this.now())
+        ) return [];
+        return [{
+          candidate,
+          providerIndex,
+          // A provider-verified fresh date gets the bounded read budget before
+          // an undated hit. Provider order remains stable inside each class.
+          freshnessRank: candidate.publishedAt === undefined ? 1 : 0,
+        }];
       })
+      .sort((left, right) =>
+        left.freshnessRank - right.freshnessRank || left.providerIndex - right.providerIndex,
+      )
       .slice(0, 4);
-    if (eligibleResults.length === 0) return { failureReason: "no_safe_fresh_result" };
-    for (const result of eligibleResults) {
+    if (eligibleResults.length === 0) return { failureReason: "no_candidate_after_filter" };
+    for (const { candidate: result } of eligibleResults) {
       let url: URL;
       try {
         url = new URL(result.url);
@@ -4226,6 +4439,10 @@ export class SocialDirector {
       if (!page || !pageResult || pageResult.url !== url.toString()) continue;
       pageReadSucceeded = true;
       const candidatePublishedAt = result.publishedAt ?? pageResult.publishedAt;
+      if (seed.maxAgeDays !== undefined && candidatePublishedAt === undefined) {
+        postReadFreshnessUnverifiable = true;
+        continue;
+      }
       if (!autonomousResearchResultIsFresh(seed, candidatePublishedAt, this.now())) {
         postReadFreshnessRejected = true;
         continue;
@@ -4246,8 +4463,10 @@ export class SocialDirector {
       ? { research: { kind: "page", query: seed.query, retrievedAt, results: safelyReadResults } }
       : {
         failureReason: pageReadSucceeded && postReadFreshnessRejected
-          ? "no_safe_fresh_result"
-          : "source_read_failed",
+          ? "freshness_rejected_after_read"
+          : pageReadSucceeded && postReadFreshnessUnverifiable
+            ? "freshness_unverifiable_after_read"
+            : "source_read_failed",
       };
   }
 
@@ -4302,6 +4521,7 @@ export class SocialDirector {
     thread: AmbientThreadState,
     seed: AutonomousResearchSeed,
     preparedOutcome?: AutonomousResearchReadOutcome,
+    marketPulseFeedCandidate?: MarketPulseFeedCandidate,
   ): Promise<boolean> {
     this.beginAutonomousResearchAttempt();
     const researchers = available.filter((persona) => persona.canResearch);
@@ -4471,6 +4691,18 @@ export class SocialDirector {
       leadPublicationTypingLease.release();
     }
     if (!leadMessage) return this.recordAutonomousResearchFailure(channel.id, seed, "publication_failed");
+    this.lockAmbientThreadLanguage(channel.id, thread, leadLine, leadMessage.createdAt);
+    if (marketPulseFeedCandidate && this.marketPulseCoordinator) {
+      await this.marketPulseCoordinator.acknowledgeFeedPublication(marketPulseFeedCandidate).catch((error) => {
+        // The source-backed room message is already committed. A failed
+        // acknowledgement must leave the feed item retryable, not rewrite a
+        // successful publication as a failed conversation.
+        console.warn(
+          "Market pulse publication acknowledgement failed safely:",
+          error instanceof Error ? error.message : error,
+        );
+      });
+    }
     // Success accounting begins only once a source-backed message is actually
     // in room history. Everything before this point uses short retry backoff.
     this.recordAutonomousResearchSuccess(channel.id, seed.id);
@@ -4707,6 +4939,22 @@ export class SocialDirector {
         : pendingConsideredPlan
           ? consideredConversationWordLimits(pendingConsideredPlan, register)
           : undefined;
+      const sampledOrdinaryLimit = consideredLimits
+        ? undefined
+        : sampleAmbientTurnWordLimit(first, {
+            mode: ambientMode,
+            continuation: thread.messageCount > 0,
+            action: action.kind,
+            rng: this.rng,
+          });
+      const wordLimits = consideredLimits
+        ? { [first.id]: consideredPlan ? consideredLimits.lead : consideredLimits.response }
+        : {
+            [first.id]: {
+              minimum: sampledOrdinaryLimit!.minimum,
+              maximum: sampledOrdinaryLimit!.maximum,
+            },
+          };
       const premise = consideredPlan
         ? consideredConversationLeadPremise(
             consideredPlan,
@@ -4728,10 +4976,8 @@ export class SocialDirector {
               thread.debateBeat,
               ambientMode,
               action.kind,
+              wordLimits,
             );
-      const wordLimits = consideredLimits
-        ? { [first.id]: consideredPlan ? consideredLimits.lead : consideredLimits.response }
-        : ambientSceneWordLimits(first, undefined, thread.messageCount > 0, ambientMode);
       const ambientAction: AmbientActionContract = {
         episodeId: thread.episodeId,
         causalRootId: thread.causalRootId,
@@ -4839,6 +5085,7 @@ export class SocialDirector {
           else this.closeAmbientThread(thread, "model_rejected");
           return;
         }
+        this.lockAmbientThreadLanguage(channel.id, thread, leadLine, posted.createdAt);
         this.recordAmbientPost(thread, posted, action);
         if (pendingBeat && thread.pendingBeat === pendingBeat) thread.pendingBeat = undefined;
         if (consideredPlan) {
@@ -5264,7 +5511,8 @@ export class SocialDirector {
   }
 
   private ambientTranscript(channelId: string, limit: number): TranscriptLine[] {
-    return this.transcriptMessages(ambientHistoryWithAnchor(this.store.getRecent(channelId, 80), limit));
+    const channelHistory = this.store.getAllMessages().filter((message) => message.channelId === channelId);
+    return this.transcriptMessages(ambientHistoryWithAnchor(channelHistory, limit));
   }
 
   private transcriptMessages(messages: readonly ChatMessage[]): TranscriptLine[] {

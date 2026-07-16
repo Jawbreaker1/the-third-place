@@ -2200,6 +2200,10 @@ describe("dedicated multilingual persistent-memory contract", () => {
   });
 });
 
+const undeterminedOutputLanguage = {
+  outputLanguage: { tag: "und", confidence: 0 },
+} as const;
+
 const reviewInput = (): NormalizedCandidateReviewInput => candidateReviewInputSchema.parse({
   sceneKind: "public",
   room: { id: "lobby", name: "lobby", register: "everyday" },
@@ -2378,7 +2382,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(buildCandidateReviewUserData(reviewInput())).toEqual(reviewInput());
   });
 
-  it("uses one compact voice issue inventory for both prompt and response schema", () => {
+  it("uses one compact voice issue inventory while requiring output language for every scene", () => {
     const base = explicitRequestReviewInput({ candidate: "コーヒー。ちゃんと目が覚めるから。" });
     const voice = candidateReviewInputSchema.parse({
       ...base,
@@ -2409,13 +2413,19 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviewItem.properties.outputLanguage.required).toEqual(["tag", "confidence"]);
     const nonVoiceItem = (buildCandidateReviewResponseFormat(reviewInput()) as any)
       .json_schema.schema.properties.reviews.items;
-    expect(nonVoiceItem.required).not.toContain("outputLanguage");
-    expect(nonVoiceItem.properties).not.toHaveProperty("outputLanguage");
+    expect(nonVoiceItem.required).toContain("outputLanguage");
+    expect(nonVoiceItem.properties.outputLanguage.required).toEqual(["tag", "confidence"]);
     expect(prompt).toContain("language actually used in that candidate's output");
+    expect(buildCandidateReviewSystemPrompt()).toContain("language actually used in that candidate's output");
+    expect(buildCandidateReviewSystemPrompt()).toContain("output_language_mismatch");
   });
 
-  it("canonically validates actual-output language only for mandatory voice review", () => {
+  it("canonically validates mandatory actual-output language for text and voice review", () => {
     const base = explicitRequestReviewInput({ candidate: "Sim, café. Sem pensar duas vezes." });
+    const text = candidateReviewInputSchema.parse({
+      ...base,
+      semanticContext: { ...base.semanticContext, languageTag: null },
+    });
     const voice = candidateReviewInputSchema.parse({
       ...base,
       sceneKind: "voice",
@@ -2435,77 +2445,97 @@ describe("multilingual batch candidate-review contract", () => {
       }],
     });
 
-    expect(parseCandidateReviewContent(JSON.stringify(clean({ tag: "pt-br", confidence: 0.97 })), voice))
-      .toEqual(clean({ tag: "pt-BR", confidence: 0.97 }));
-    expect(parseCandidateReviewContent(JSON.stringify(clean({ tag: "pt-BR", confidence: 0.4 })), voice))
-      .toEqual(clean({ tag: "pt-BR", confidence: 0.4 }));
-    expect(parseCandidateReviewContent(JSON.stringify(clean({ tag: "zz-ZZ", confidence: 0.99 })), voice))
-      .toBeUndefined();
-    expect(parseCandidateReviewContent(JSON.stringify(clean({ tag: "pt-BR" })), voice))
-      .toBeUndefined();
-    const missing = clean({ tag: "pt-BR", confidence: 0.99 });
-    delete (missing.reviews[0] as { outputLanguage?: unknown }).outputLanguage;
-    expect(parseCandidateReviewContent(JSON.stringify(missing), voice)).toBeUndefined();
-
-    const legacyNonVoice = {
-      reviews: [{
-        personaId: "ai-mira",
-        severity: "none",
-        issues: [],
-        rewriteInstruction: null,
-      }],
-    };
-    expect(parseCandidateReviewContent(JSON.stringify(legacyNonVoice), base)).toEqual(legacyNonVoice);
-    expect(parseCandidateReviewContent(JSON.stringify({
-      reviews: [{ ...legacyNonVoice.reviews[0], outputLanguage: { tag: "fr", confidence: 0.99 } }],
-    }), base)).toBeUndefined();
+    for (const input of [text, voice]) {
+      expect(parseCandidateReviewContent(JSON.stringify(clean({ tag: "pt-br", confidence: 0.97 })), input))
+        .toEqual(clean({ tag: "pt-BR", confidence: 0.97 }));
+      expect(parseCandidateReviewContent(JSON.stringify(clean({ tag: "pt-BR", confidence: 0.4 })), input))
+        .toEqual(clean({ tag: "pt-BR", confidence: 0.4 }));
+      expect(parseCandidateReviewContent(JSON.stringify(clean({ tag: "zz-ZZ", confidence: 0.99 })), input))
+        .toBeUndefined();
+      expect(parseCandidateReviewContent(JSON.stringify(clean({ tag: "pt-BR" })), input))
+        .toBeUndefined();
+      const missing = clean({ tag: "pt-BR", confidence: 0.99 });
+      delete (missing.reviews[0] as { outputLanguage?: unknown }).outputLanguage;
+      expect(parseCandidateReviewContent(JSON.stringify(missing), input)).toBeUndefined();
+    }
   });
 
-  it("fails closed on voice-only issue drift and enforces trusted output-language mismatches", () => {
+  it.each(["welcome", "public", "dm", "ambient", "voice"] as const)(
+    "enforces trusted output-language mismatches for %s scenes without locale or uncertainty false positives",
+    (sceneKind) => {
+      const base = explicitRequestReviewInput({ candidate: "Sim, café. Sem pensar duas vezes." });
+      const input = candidateReviewInputSchema.parse({
+        ...base,
+        sceneKind,
+        semanticContext: { ...base.semanticContext, languageTag: "sv-SE" },
+        voiceFacts: sceneKind === "voice"
+          ? { acousticEvidenceAvailable: false, latestUtteranceOrigin: "microphone-stt" }
+          : null,
+      });
+      const mismatchedClean = {
+        reviews: [{
+          personaId: "ai-mira",
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+          outputLanguage: { tag: "pt-BR", confidence: 0.99 },
+        }],
+      };
+      expect(parseCandidateReviewContent(JSON.stringify(mismatchedClean), input)).toBeUndefined();
+
+      const blocked = {
+        reviews: [{
+          ...mismatchedClean.reviews[0],
+          severity: "high",
+          issues: ["output_language_mismatch"],
+          rewriteInstruction: "Svara på svenska utan att byta hela svarets språk.",
+        }],
+      };
+      expect(parseCandidateReviewContent(JSON.stringify(blocked), input)).toEqual(blocked);
+
+      const samePrimary = {
+        reviews: [{
+          ...mismatchedClean.reviews[0],
+          outputLanguage: { tag: "sv-FI", confidence: 0.99 },
+        }],
+      };
+      expect(parseCandidateReviewContent(JSON.stringify(samePrimary), input)).toEqual(samePrimary);
+
+      const indeterminate = {
+        reviews: [{
+          ...mismatchedClean.reviews[0],
+          outputLanguage: { tag: "und", confidence: 0 },
+        }],
+      };
+      expect(parseCandidateReviewContent(JSON.stringify(indeterminate), input)).toEqual(indeterminate);
+
+      const lowConfidence = {
+        reviews: [{
+          ...mismatchedClean.reviews[0],
+          outputLanguage: { tag: "pt", confidence: 0.4 },
+        }],
+      };
+      expect(parseCandidateReviewContent(JSON.stringify(lowConfidence), input)).toEqual(lowConfidence);
+    },
+  );
+
+  it("fails closed on voice-only issue drift", () => {
     const base = explicitRequestReviewInput({ candidate: "Sim, café. Sem pensar duas vezes." });
     const voice = candidateReviewInputSchema.parse({
       ...base,
       sceneKind: "voice",
       semanticContext: { ...base.semanticContext, languageTag: "sv-SE" },
-      voiceFacts: {
-        acousticEvidenceAvailable: false,
-        latestUtteranceOrigin: "microphone-stt",
-      },
+      voiceFacts: { acousticEvidenceAvailable: false, latestUtteranceOrigin: "microphone-stt" },
     });
-    const mismatchedClean = {
-      reviews: [{
-        personaId: "ai-mira",
-        severity: "none",
-        issues: [],
-        rewriteInstruction: null,
-        outputLanguage: { tag: "pt-BR", confidence: 0.99 },
-      }],
-    };
-    expect(parseCandidateReviewContent(JSON.stringify(mismatchedClean), voice)).toBeUndefined();
-
-    const blocked = {
-      reviews: [{
-        ...mismatchedClean.reviews[0],
-        severity: "high",
-        issues: ["output_language_mismatch"],
-        rewriteInstruction: "Svara på svenska utan att byta hela svarets språk.",
-      }],
-    };
-    expect(parseCandidateReviewContent(JSON.stringify(blocked), voice)).toEqual(blocked);
     expect(parseCandidateReviewContent(JSON.stringify({
       reviews: [{
-        ...blocked.reviews[0],
+        personaId: "ai-mira",
+        severity: "high",
         issues: ["unsupported_room_recall"],
+        rewriteInstruction: "Do not overclaim memory.",
+        outputLanguage: { tag: "sv", confidence: 0.99 },
       }],
     }), voice)).toBeUndefined();
-
-    const samePrimary = {
-      reviews: [{
-        ...mismatchedClean.reviews[0],
-        outputLanguage: { tag: "sv-FI", confidence: 0.99 },
-      }],
-    };
-    expect(parseCandidateReviewContent(JSON.stringify(samePrimary), voice)).toEqual(samePrimary);
   });
 
   it("accepts only structurally valid one-action ambient contracts", () => {
@@ -2757,8 +2787,8 @@ describe("multilingual batch candidate-review contract", () => {
   it("accepts quoted multilingual discussion as clean and rejects missing or duplicate persona reviews", () => {
     const clean = {
       reviews: [
-        { personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null },
-        { personaId: "ai-sana", severity: "none", issues: [], rewriteInstruction: null },
+        { personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null, ...undeterminedOutputLanguage },
+        { personaId: "ai-sana", severity: "none", issues: [], rewriteInstruction: null, ...undeterminedOutputLanguage },
       ],
     };
     expect(parseCandidateReviewContent(JSON.stringify(clean), reviewInput())).toEqual(clean);
@@ -2775,8 +2805,9 @@ describe("multilingual batch candidate-review contract", () => {
           severity: "high",
           issues: ["false_evidence_denial"],
           rewriteInstruction: "Réponds à partir de la page déjà fournie.",
+          ...undeterminedOutputLanguage,
         },
-        { personaId: "ai-sana", severity: "none", issues: [], rewriteInstruction: null },
+        { personaId: "ai-sana", severity: "none", issues: [], rewriteInstruction: null, ...undeterminedOutputLanguage },
       ],
     };
     expect(parseCandidateReviewContent(JSON.stringify(valid), reviewInput())).toEqual(valid);
@@ -2813,8 +2844,9 @@ describe("multilingual batch candidate-review contract", () => {
           severity: "high",
           issues: ["unsupported_room_recall"],
           rewriteInstruction: "Säg att du såg det i den sparade rumshistoriken i stället för att påstå personlig närvaro.",
+          ...undeterminedOutputLanguage,
         },
-        { personaId: "ai-sana", severity: "none", issues: [], rewriteInstruction: null },
+        { personaId: "ai-sana", severity: "none", issues: [], rewriteInstruction: null, ...undeterminedOutputLanguage },
       ],
     };
 
@@ -2875,6 +2907,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "high",
         issues: ["unsupported_external_evidence_claim"],
         rewriteInstruction: rewrite,
+        ...undeterminedOutputLanguage,
       }],
     };
 
@@ -2895,6 +2928,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "high",
         issues: ["unfulfilled_explicit_request"],
         rewriteInstruction: "Da ahora la adivinanza solicitada en vez de prometerla o sustituirla.",
+        ...undeterminedOutputLanguage,
       }],
     };
 
@@ -2912,6 +2946,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "high",
         issues: ["false_evidence_denial"],
         rewriteInstruction: "Behaupte nicht, dass die erfolgreiche Quelle fehlte.",
+        ...undeterminedOutputLanguage,
       }],
     };
     const unfulfilled = {
@@ -2920,6 +2955,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "high",
         issues: ["unfulfilled_explicit_request"],
         rewriteInstruction: "Liefere den nicht verfügbaren Seiteninhalt trotzdem.",
+        ...undeterminedOutputLanguage,
       }],
     };
     const permanentStillBlocks = {
@@ -2928,14 +2964,15 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "high",
         issues: ["false_evidence_denial", "permanent_web_denial"],
         rewriteInstruction: "Beschränke die Aussage auf diesen fehlgeschlagenen Versuch.",
+        ...undeterminedOutputLanguage,
       }],
     };
 
     expect(parseCandidateReviewContent(JSON.stringify(falseDenial), failed)).toEqual({
-      reviews: [{ personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null }],
+      reviews: [{ personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null, ...undeterminedOutputLanguage }],
     });
     expect(parseCandidateReviewContent(JSON.stringify(unfulfilled), failed)).toEqual({
-      reviews: [{ personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null }],
+      reviews: [{ personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null, ...undeterminedOutputLanguage }],
     });
     expect(parseCandidateReviewContent(JSON.stringify(permanentStillBlocks), failed)).toEqual({
       reviews: [{
@@ -2943,6 +2980,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "high",
         issues: ["permanent_web_denial"],
         rewriteInstruction: "Beschränke die Aussage auf diesen fehlgeschlagenen Versuch.",
+        ...undeterminedOutputLanguage,
       }],
     });
   });
@@ -2974,6 +3012,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "high",
         issues: ["unfulfilled_explicit_request"],
         rewriteInstruction: "Perform the requested outcome now.",
+        ...undeterminedOutputLanguage,
       }],
     };
 
@@ -2998,6 +3037,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "high",
         issues: ["unfulfilled_explicit_request"],
         rewriteInstruction: "Perform the requested outcome now.",
+        ...undeterminedOutputLanguage,
       }],
     };
     const requiredButNotOwner = explicitRequestReviewInput({
@@ -3017,7 +3057,7 @@ describe("multilingual batch candidate-review contract", () => {
       candidate: "パンはパンでも食べられないパンは？ フライパン。",
     });
     const clean = {
-      reviews: [{ personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null }],
+      reviews: [{ personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null, ...undeterminedOutputLanguage }],
     };
 
     expect(parseCandidateReviewContent(JSON.stringify(clean), fulfilled)).toEqual(clean);
@@ -3079,6 +3119,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "medium",
         issues: ["behavior_intensity_under_target"],
         rewriteInstruction: "Behåll poängen men gör den tilldelade skärpan tydlig utan personangrepp.",
+        ...undeterminedOutputLanguage,
       }],
     }), base);
 
@@ -3105,6 +3146,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "medium",
         issues: ["behavior_intensity_under_target"],
         rewriteInstruction: "Invent more intensity.",
+        ...undeterminedOutputLanguage,
       }],
     }), ordinary)).toBeUndefined();
 
@@ -3126,6 +3168,7 @@ describe("multilingual batch candidate-review contract", () => {
         severity: "medium",
         issues: ["behavior_intensity_violation"],
         rewriteInstruction: "Ta bort det förbjudna personangreppet och behåll sakpoängen lugn.",
+        ...undeterminedOutputLanguage,
       }],
     }), restrainedClean)?.reviews[0].issues).toEqual(["behavior_intensity_violation"]);
   });

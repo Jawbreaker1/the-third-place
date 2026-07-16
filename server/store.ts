@@ -13,14 +13,27 @@ import type {
   Reaction,
   ReplyPreview,
 } from "../shared/types.js";
+import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
+import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 
 interface PersistedState {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   messages: ChatMessage[];
   /** Private conversations stay server-only and are never included in room snapshots. */
   privateThreads?: PrivateThread[];
   /** Server-only autonomous accounting; never serialized in public messages. */
   autonomousPublications?: AutonomousPublicationRecord[];
+  /** Server-owned room language observations; version 3 requires this collection. */
+  trustedChannelLanguages?: TrustedChannelLanguage[];
+}
+
+export type TrustedChannelLanguageAuthority = "human" | "resident";
+
+export interface TrustedChannelLanguage {
+  channelId: string;
+  languageTag: string;
+  observedAt: string;
+  authority: TrustedChannelLanguageAuthority;
 }
 
 export interface AutonomousPublicationRecord {
@@ -82,9 +95,11 @@ const MAX_PERSISTED_PRIVATE_THREADS = 10_000;
 const MAX_PERSISTED_PRIVATE_MESSAGES_PER_THREAD = 20_000;
 const MAX_PERSISTED_PRIVATE_MESSAGES_TOTAL = 200_000;
 const MAX_PERSISTED_AUTONOMOUS_PUBLICATIONS = 100_000;
+const MAX_PERSISTED_TRUSTED_CHANNEL_LANGUAGES = 10_000;
 const MAX_ID_LENGTH = 100;
 const MAX_CHANNEL_ID_LENGTH = 256;
-const MAX_MESSAGE_CONTENT_LENGTH = 500;
+const MAX_LANGUAGE_TAG_LENGTH = 35;
+const MAX_MESSAGE_CONTENT_LENGTH = MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS;
 const MAX_REACTIONS_PER_MESSAGE = 32;
 const MAX_REACTION_MEMBERS = 256;
 const MAX_SOURCES_PER_MESSAGE = 8;
@@ -110,6 +125,15 @@ const isBoundedChannelId = (value: unknown): value is string =>
 
 const isTimestamp = (value: unknown): value is string =>
   isBoundedString(value, 64, 1) && Number.isFinite(Date.parse(value));
+
+const isCanonicalIsoTimestamp = (value: unknown): value is string => {
+  if (!isTimestamp(value)) return false;
+  try {
+    return new Date(value).toISOString() === value;
+  } catch {
+    return false;
+  }
+};
 
 const isFiniteInteger = (value: unknown, minimum: number, maximum: number): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum;
@@ -172,6 +196,22 @@ const OBSERVATION_KEYS = new Set([
   "uncertainties",
   "analyzedAt",
 ]);
+const TRUSTED_CHANNEL_LANGUAGE_KEYS = new Set([
+  "channelId",
+  "languageTag",
+  "observedAt",
+  "authority",
+]);
+const LEGACY_PERSISTED_STATE_KEYS = new Set([
+  "version",
+  "messages",
+  "privateThreads",
+  "autonomousPublications",
+]);
+const PERSISTED_STATE_V3_KEYS = new Set([
+  ...LEGACY_PERSISTED_STATE_KEYS,
+  "trustedChannelLanguages",
+]);
 
 const isReaction = (value: unknown): value is Reaction => {
   if (!isRecord(value) || !hasOnlyKeys(value, REACTION_KEYS)) return false;
@@ -184,7 +224,7 @@ const isReplyPreview = (value: unknown): value is ReplyPreview =>
   isRecord(value) && hasOnlyKeys(value, REPLY_PREVIEW_KEYS) &&
   isBoundedIdentifier(value.authorId) &&
   isBoundedString(value.authorName, 100, 1) && value.authorName.trim().length > 0 &&
-  isBoundedString(value.content, 500);
+  isBoundedString(value.content, MAX_MESSAGE_CONTENT_LENGTH);
 
 const isFrozenMember = (value: unknown, authorId: string): value is Member => {
   if (!isRecord(value) || !hasOnlyKeys(value, MEMBER_KEYS) || value.id !== authorId ||
@@ -273,6 +313,16 @@ const isAutonomousPublicationRecord = (value: unknown): value is AutonomousPubli
     (record.attendance === "attended" || record.attendance === "unattended");
 };
 
+const isTrustedChannelLanguage = (value: unknown): value is TrustedChannelLanguage => {
+  if (!isRecord(value) || !hasOnlyKeys(value, TRUSTED_CHANNEL_LANGUAGE_KEYS)) return false;
+  const record = value as Partial<TrustedChannelLanguage>;
+  if (!isBoundedChannelId(record.channelId) || record.channelId.trim() !== record.channelId ||
+      !isBoundedString(record.languageTag, MAX_LANGUAGE_TAG_LENGTH, 1) ||
+      !isCanonicalIsoTimestamp(record.observedAt) ||
+      (record.authority !== "human" && record.authority !== "resident")) return false;
+  return canonicalRegisteredLanguageTag(record.languageTag) === record.languageTag;
+};
+
 const boundedLimit = (value: number | undefined, fallback: number, minimum: number, maximum: number): number =>
   Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, Math.floor(value!))) : fallback;
 
@@ -331,11 +381,15 @@ const restorePrivateThread = (value: unknown, hardLimit: number): PrivateThread 
 };
 
 const parsePersistedState = (value: unknown): PersistedState => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecord(value)) {
     throw new TypeError("Room state root must be an object.");
   }
   const state = value as Partial<PersistedState>;
-  if (state.version !== 1 && state.version !== 2) throw new TypeError("Room state version is unsupported.");
+  if (state.version !== 1 && state.version !== 2 && state.version !== 3) {
+    throw new TypeError("Room state version is unsupported.");
+  }
+  const allowedKeys = state.version === 3 ? PERSISTED_STATE_V3_KEYS : LEGACY_PERSISTED_STATE_KEYS;
+  if (!hasOnlyKeys(value, allowedKeys)) throw new TypeError("Room state contains unsupported fields.");
   if (!Array.isArray(state.messages) || state.messages.length > MAX_PERSISTED_PUBLIC_MESSAGES ||
       !state.messages.every(isPersistedMessage)) {
     throw new TypeError("Room state contains an invalid public history.");
@@ -355,8 +409,8 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state private history exceeds its retention envelope.");
   }
-  if (state.version === 2 && !Array.isArray(state.privateThreads)) {
-    throw new TypeError("Version 2 room state is missing its private-thread collection.");
+  if ((state.version === 2 || state.version === 3) && !Array.isArray(state.privateThreads)) {
+    throw new TypeError(`Version ${state.version} room state is missing its private-thread collection.`);
   }
   if (state.autonomousPublications !== undefined && (
     !Array.isArray(state.autonomousPublications) ||
@@ -364,6 +418,21 @@ const parsePersistedState = (value: unknown): PersistedState => {
     !state.autonomousPublications.every(isAutonomousPublicationRecord)
   )) {
     throw new TypeError("Room state contains invalid autonomous-publication accounting.");
+  }
+  if (state.version === 3 && !Array.isArray(state.trustedChannelLanguages)) {
+    throw new TypeError("Version 3 room state is missing its trusted channel-language collection.");
+  }
+  if (state.trustedChannelLanguages !== undefined && (
+    !Array.isArray(state.trustedChannelLanguages) ||
+    state.trustedChannelLanguages.length > MAX_PERSISTED_TRUSTED_CHANNEL_LANGUAGES ||
+    !state.trustedChannelLanguages.every(isTrustedChannelLanguage)
+  )) {
+    throw new TypeError("Room state contains invalid trusted channel-language observations.");
+  }
+  if (state.trustedChannelLanguages &&
+      new Set(state.trustedChannelLanguages.map((record) => record.channelId)).size !==
+        state.trustedChannelLanguages.length) {
+    throw new TypeError("Room state contains duplicate trusted channel-language observations.");
   }
   return state as PersistedState;
 };
@@ -648,6 +717,7 @@ export class RoomStore {
   private messages: ChatMessage[] = [];
   private autonomousPublications: AutonomousPublicationRecord[] = [];
   private readonly privateThreads = new Map<string, PrivateThread>();
+  private readonly trustedChannelLanguages = new Map<string, TrustedChannelLanguage>();
   private persistTimer?: NodeJS.Timeout;
   private writeQueue: Promise<void> = Promise.resolve();
   private removalHandler?: (messages: ChatMessage[]) => void;
@@ -696,6 +766,10 @@ export class RoomStore {
       this.autonomousPublications = Array.isArray(parsed.autonomousPublications)
         ? parsed.autonomousPublications.filter(isAutonomousPublicationRecord)
         : [];
+      this.trustedChannelLanguages.clear();
+      for (const record of parsed.trustedChannelLanguages ?? []) {
+        this.trustedChannelLanguages.set(record.channelId, { ...record });
+      }
       this.privateThreads.clear();
       for (const candidate of parsed.privateThreads ?? []) {
         const restored = restorePrivateThread(candidate, this.dmHistoryHardLimit);
@@ -712,23 +786,25 @@ export class RoomStore {
       const missingChannelSeeds = builtInScene.filter((message) => !populatedChannels.has(message.channelId));
       if (missingChannelSeeds.length > 0) this.messages.push(...missingChannelSeeds);
       this.trimAllChannels(this.publicHistoryHardLimit);
-      // Version 2 also contains private DM history. Tighten permissions on a
+      // Version 2+ also contains private DM history. Tighten permissions on a
       // legacy state file immediately, even when this startup needs no write.
       await chmod(this.filePath, 0o600).catch((error) => {
         console.warn("Could not restrict room-state file permissions.", error);
       });
-      if (missingChannelSeeds.length > 0) await this.flush();
+      if (missingChannelSeeds.length > 0 || parsed.version !== 3) await this.flush();
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") {
         this.messages = [];
         this.autonomousPublications = [];
         this.privateThreads.clear();
+        this.trustedChannelLanguages.clear();
         throw new RoomStateLoadError(error);
       }
       this.messages = seedMessages();
       this.autonomousPublications = [];
       this.privateThreads.clear();
+      this.trustedChannelLanguages.clear();
       await this.flush();
     }
   }
@@ -739,6 +815,57 @@ export class RoomStore {
 
   getAutonomousPublicationHistory(): AutonomousPublicationRecord[] {
     return this.autonomousPublications.map((record) => ({ ...record }));
+  }
+
+  getTrustedChannelLanguage(channelId: string): TrustedChannelLanguage | undefined {
+    const record = this.trustedChannelLanguages.get(channelId);
+    return record ? { ...record } : undefined;
+  }
+
+  getTrustedChannelLanguages(): TrustedChannelLanguage[] {
+    return [...this.trustedChannelLanguages.values()]
+      .map((record) => ({ ...record }))
+      .sort((left, right) => left.channelId.localeCompare(right.channelId));
+  }
+
+  /**
+   * Persist a trusted room-language observation without allowing autonomous
+   * residents to steer an established room. A resident may only seed an empty
+   * room; a human observation always supersedes a resident seed, while an
+   * established human observation only moves forward in time.
+   */
+  setTrustedChannelLanguage(
+    channelId: string,
+    languageTag: string,
+    authority: TrustedChannelLanguageAuthority,
+    observedAt = new Date().toISOString(),
+  ): boolean {
+    if (!isBoundedChannelId(channelId) || channelId.trim() !== channelId) {
+      throw new TypeError("Trusted channel language requires a bounded channel ID.");
+    }
+    const canonicalLanguageTag = canonicalRegisteredLanguageTag(languageTag);
+    if (!canonicalLanguageTag) {
+      throw new TypeError("Trusted channel language requires a registered BCP-47 tag.");
+    }
+    if (authority !== "human" && authority !== "resident") {
+      throw new TypeError("Trusted channel language authority is invalid.");
+    }
+    if (!isCanonicalIsoTimestamp(observedAt)) {
+      throw new TypeError("Trusted channel language requires a canonical ISO timestamp.");
+    }
+
+    const current = this.trustedChannelLanguages.get(channelId);
+    if (authority === "resident" && current) return false;
+    if (authority === "human" && current?.authority === "human" && observedAt <= current.observedAt) return false;
+
+    this.trustedChannelLanguages.set(channelId, {
+      channelId,
+      languageTag: canonicalLanguageTag,
+      observedAt,
+      authority,
+    });
+    this.schedulePersist();
+    return true;
   }
 
   private pruneAutonomousPublications(referenceAt = Date.now()): void {
@@ -974,10 +1101,11 @@ export class RoomStore {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
       const payload: PersistedState = {
-        version: 2,
+        version: 3,
         messages: this.messages,
         privateThreads: [...this.privateThreads.values()],
         autonomousPublications: this.autonomousPublications,
+        trustedChannelLanguages: this.getTrustedChannelLanguages(),
       };
       const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
       try {

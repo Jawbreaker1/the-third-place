@@ -77,6 +77,20 @@ describe("room history", () => {
     await store.flush();
   });
 
+  it("round-trips a bounded longer considered resident turn", async () => {
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath);
+    await store.load();
+    const content = "å".repeat(650);
+    const message = createMessage("ai-programming", "ai-sana", content, undefined, "lm");
+    store.addPublicMessage(message);
+    await store.flush();
+
+    const restored = new RoomStore(filePath);
+    await restored.load();
+    expect(restored.getMessage(message.id)?.content).toBe(content);
+  });
+
   it("persists private conversations across a restart without exposing them as public history", async () => {
     const filePath = tempStorePath();
     const first = new RoomStore(filePath);
@@ -95,7 +109,177 @@ describe("room history", () => {
       "Japp, den här tråden ligger kvar.",
     ]);
     expect(restored.getAllMessages().some((message) => message.channelId === thread.id)).toBe(false);
-    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ version: 2 });
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
+      version: 3,
+      trustedChannelLanguages: [],
+    });
+  });
+
+  it("migrates version 2 and persists canonical trusted channel languages across restart", async () => {
+    const filePath = tempStorePath();
+    const existing = createMessage("lobby", "human-returning", "preserve this v2 history");
+    await writeFile(filePath, JSON.stringify({
+      version: 2,
+      messages: [existing],
+      privateThreads: [],
+      autonomousPublications: [],
+    }), "utf8");
+
+    const migrated = new RoomStore(filePath);
+    await migrated.load();
+    expect(migrated.setTrustedChannelLanguage(
+      "lobby",
+      "swe",
+      "resident",
+      "2026-07-16T09:00:00.000Z",
+    )).toBe(true);
+    await migrated.flush();
+
+    const persisted = JSON.parse(await readFile(filePath, "utf8")) as {
+      version: number;
+      trustedChannelLanguages: unknown[];
+    };
+    expect(persisted).toMatchObject({
+      version: 3,
+      trustedChannelLanguages: [{
+        channelId: "lobby",
+        languageTag: "sv",
+        observedAt: "2026-07-16T09:00:00.000Z",
+        authority: "resident",
+      }],
+    });
+
+    const restored = new RoomStore(filePath);
+    await restored.load();
+    expect(restored.getTrustedChannelLanguage("lobby")).toEqual({
+      channelId: "lobby",
+      languageTag: "sv",
+      observedAt: "2026-07-16T09:00:00.000Z",
+      authority: "resident",
+    });
+  });
+
+  it("lets residents seed only empty rooms while later human observations remain authoritative", async () => {
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath);
+
+    expect(store.setTrustedChannelLanguage(
+      "stock-market",
+      "en",
+      "resident",
+      "2026-07-16T09:00:00.000Z",
+    )).toBe(true);
+    expect(store.setTrustedChannelLanguage(
+      "stock-market",
+      "sv",
+      "resident",
+      "2026-07-16T10:00:00.000Z",
+    )).toBe(false);
+    expect(store.getTrustedChannelLanguage("stock-market")?.languageTag).toBe("en");
+
+    expect(store.setTrustedChannelLanguage(
+      "stock-market",
+      "sv-SE",
+      "human",
+      "2026-07-16T10:30:00.000Z",
+    )).toBe(true);
+    expect(store.setTrustedChannelLanguage(
+      "stock-market",
+      "en-GB",
+      "resident",
+      "2026-07-16T11:00:00.000Z",
+    )).toBe(false);
+    expect(store.setTrustedChannelLanguage(
+      "stock-market",
+      "en-GB",
+      "human",
+      "2026-07-16T10:00:00.000Z",
+    )).toBe(false);
+    expect(store.setTrustedChannelLanguage(
+      "stock-market",
+      "en-GB",
+      "human",
+      "2026-07-16T11:30:00.000Z",
+    )).toBe(true);
+    expect(store.getTrustedChannelLanguage("stock-market")).toEqual({
+      channelId: "stock-market",
+      languageTag: "en-GB",
+      observedAt: "2026-07-16T11:30:00.000Z",
+      authority: "human",
+    });
+    await store.flush();
+  });
+
+  it("fails closed on malformed version 3 trusted channel-language state", async () => {
+    const validRow = {
+      channelId: "lobby",
+      languageTag: "sv",
+      observedAt: "2026-07-16T09:00:00.000Z",
+      authority: "human",
+    };
+    const malformedStates: unknown[] = [
+      {
+        version: 3,
+        messages: [],
+        privateThreads: [],
+        autonomousPublications: [],
+      },
+      {
+        version: 3,
+        messages: [],
+        privateThreads: [],
+        autonomousPublications: [],
+        trustedChannelLanguages: [{ ...validRow, unexpected: true }],
+      },
+      {
+        version: 3,
+        messages: [],
+        privateThreads: [],
+        autonomousPublications: [],
+        trustedChannelLanguages: [validRow, { ...validRow, languageTag: "en" }],
+      },
+      {
+        version: 3,
+        messages: [],
+        privateThreads: [],
+        autonomousPublications: [],
+        trustedChannelLanguages: [{ ...validRow, languageTag: "swe" }],
+      },
+      {
+        version: 3,
+        messages: [],
+        privateThreads: [],
+        autonomousPublications: [],
+        trustedChannelLanguages: [{ ...validRow, observedAt: "2026-07-16" }],
+      },
+      {
+        version: 3,
+        messages: [],
+        privateThreads: [],
+        autonomousPublications: [],
+        trustedChannelLanguages: [{ ...validRow, authority: "system" }],
+      },
+      {
+        version: 3,
+        messages: [],
+        privateThreads: [],
+        autonomousPublications: [],
+        trustedChannelLanguages: [validRow],
+        unexpected: true,
+      },
+    ];
+
+    for (const [index, malformed] of malformedStates.entries()) {
+      const filePath = `${tempStorePath()}-${index}`;
+      const originalBytes = JSON.stringify(malformed);
+      await writeFile(filePath, originalBytes, "utf8");
+
+      const store = new RoomStore(filePath);
+      await expect(store.load()).rejects.toBeInstanceOf(RoomStateLoadError);
+      expect(await readFile(filePath, "utf8")).toBe(originalBytes);
+      expect(store.getAllMessages()).toEqual([]);
+      expect(store.getTrustedChannelLanguages()).toEqual([]);
+    }
   });
 
   it("inventories durable public humans only from matching frozen server snapshots", async () => {
@@ -317,7 +501,7 @@ describe("room history", () => {
       version: number;
       messages: Array<{ id: string }>;
     };
-    expect(persisted.version).toBe(2);
+    expect(persisted.version).toBe(3);
     expect(persisted.messages.map((message) => message.id)).toEqual(expectedIds);
 
     const temporaryPrefix = `${basename(filePath)}.`;

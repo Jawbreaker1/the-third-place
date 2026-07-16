@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import sharp from "sharp";
 import type { MemberKind, ServerHealth, VisualObservation, VoiceUtteranceOrigin } from "../shared/types.js";
+import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
 import { containsVisibleUrlText } from "../shared/unicodeBoundaries.js";
 import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
-import { CONVERSATION_REGISTERS, getChannelProfile } from "./channels.js";
+import { CONVERSATION_REGISTERS, consideredLeadWordRange, getChannelProfile } from "./channels.js";
 import {
   behaviorTuningPrompt,
   DEFAULT_RUNTIME_BEHAVIOR_TUNING,
@@ -729,6 +730,7 @@ const EVIDENCE_PLAN_VERIFIER_TIMEOUT_MS = 8_000;
 const TURN_ANALYSIS_SETTLE_MARGIN_MS = 750;
 const VOICE_DRAFT_TTL_MS = 60_000;
 const MAX_VOICE_DRAFTS = 64;
+const CONSIDERED_MAX_CONTENT_LENGTH = MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS;
 
 interface CachedVoiceDraft {
   personaId: string;
@@ -1133,18 +1135,12 @@ export const buildSceneSystemPrompt = (request: SceneRequest): string => {
     : "Silence is valid; do not make every candidate speak.";
   const consideredLead = request.selected[0];
   const effectiveRegisterProfile = registerProfile ?? CONVERSATION_REGISTERS.everyday;
+  const effectiveRegister = profile?.conversationRegister ?? "everyday";
   const defaultLeadLimit = consideredLead
-    ? {
-        minimum: Math.min(
-          effectiveRegisterProfile.consideredLeadWords[0],
-          consideredLead.style.typicalWords[1],
-          consideredLead.style.hardMaxWords,
-        ),
-        maximum: Math.min(
-          effectiveRegisterProfile.consideredLeadWords[1],
-          consideredLead.style.hardMaxWords,
-        ),
-      }
+    ? (() => {
+        const [minimum, maximum] = consideredLeadWordRange(effectiveRegister, consideredLead.style);
+        return { minimum, maximum };
+      })()
     : { minimum: 12, maximum: 35 };
   const consideredLeadLimit = consideredLead && request.wordLimits?.[consideredLead.id]
     ? request.wordLimits[consideredLead.id]!
@@ -1173,7 +1169,7 @@ export const buildSceneSystemPrompt = (request: SceneRequest): string => {
     ? request.consideredRole === "lead"
       ? `
 - This is the lead phase of a rare deeper chat beat. The one selected actor writes ${consideredLeadLimit.minimum}–${consideredLeadLimit.maximum} words with ${informalConsidered ? "one recognizable example, concrete detail, recommendation, gripe or unresolved disagreement" : "one concrete observation, mechanism, example or trade-off"} that gives the next person something real to answer.
-- Only the selected lead speaks. Preserve the actor's ordinary voice and hard maximum. Keep it chat-shaped rather than essay-shaped: no thesis framing, balanced mini-debate, conclusion paragraph, headings, numbered structure or generic invitation for everyone to share their thoughts.`
+- Only the selected lead speaks. Preserve the actor's ordinary voice; this rare role may stretch beyond only their ordinary-chat length ceiling, never the bounded considered range. Keep it chat-shaped rather than essay-shaped: no thesis framing, balanced mini-debate, conclusion paragraph, headings, numbered structure or generic invitation for everyone to share their thoughts.`
       : request.consideredRole === "response"
         ? `
 - This is the response phase of a rare deeper chat beat. The selected actor writes ${consideredResponseLimit.minimum}–${consideredResponseLimit.maximum} words and responds directly to the latest resident transcript line with the assigned ${request.consideredResponseRole ?? "response"} move. Never paraphrase the lead or open a different topic.
@@ -1181,7 +1177,7 @@ export const buildSceneSystemPrompt = (request: SceneRequest): string => {
         : `
 - This is a rare deeper chat beat, not a normal quick reply. ${request.selected[0]?.name ?? "The first selected actor"} writes ${consideredLeadLimit.minimum}–${consideredLeadLimit.maximum} words with one concrete observation, example or unresolved point that gives the room something real to discuss.
 - Any other selected actor stays at ${consideredResponseLimit.minimum}–${consideredResponseLimit.maximum} words and must add a genuinely different move: a counterexample, pointed question, practical consequence or respectful challenge. Never paraphrase the lead.
-- Preserve each actor's ordinary voice and hard maximum. Keep it conversational rather than essay-like: no thesis framing, balanced mini-debate, conclusion paragraph, headings, numbered structure or generic invitation for everyone to share their thoughts.`
+- Preserve each actor's ordinary voice. Only the lead's rare role may stretch beyond their ordinary-chat length ceiling; responders retain their normal ceiling. Keep it conversational rather than essay-like: no thesis framing, balanced mini-debate, conclusion paragraph, headings, numbered structure or generic invitation for everyone to share their thoughts.`
     : "";
   const ambientActionRules = request.kind === "ambient" && request.ambientAction
     ? `
@@ -2695,7 +2691,21 @@ export class LmStudioClient {
           .filter((persona) => request.mustReplyIds?.includes(persona.id))
           .map((persona) => persona.id)
       : [];
-    const missingRequiredIds = [...new Set([...explicitOwnerIds, ...responseRecoveryIds, ...soleRequiredDmIds])]
+    // A text candidate that used a confidently different primary language is a
+    // reviewed publication failure, not natural silence. Give that exact actor
+    // the same one bounded, full-context recovery used by other delivery
+    // guarantees. Voice already enters this path through responseRecoveryIds.
+    const textLanguageMismatchIds = request.kind === "voice"
+      ? []
+      : request.selected
+          .filter((persona) => semanticReviews?.get(persona.id)?.issues.includes("output_language_mismatch"))
+          .map((persona) => persona.id);
+    const missingRequiredIds = [...new Set([
+      ...explicitOwnerIds,
+      ...responseRecoveryIds,
+      ...soleRequiredDmIds,
+      ...textLanguageMismatchIds,
+    ])]
       .filter((personaId) => !deliveredIds.has(personaId));
     let result = humanizedLines;
     const recoveryBudget = request.responseRecoveryBudget ?? { retriesRemaining: 1 };
@@ -2703,10 +2713,13 @@ export class LmStudioClient {
       recoveryBudget.retriesRemaining -= 1;
       const missingActors = request.selected.filter((persona) => missingRequiredIds.includes(persona.id));
       const retryOwnerIds = missingRequiredIds.filter((personaId) => explicitOwnerIds.includes(personaId));
+      const recoversTextLanguage = missingRequiredIds.some((personaId) => textLanguageMismatchIds.includes(personaId));
       const actorNames = missingActors.map((persona) => persona.name).join(", ");
       const reviewCorrection = reviewedRecoveryPolicy(missingRequiredIds, semanticReviews);
       const completionPremise = retryOwnerIds.length > 0
         ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: complete the actual triggering request in this message now. An offer, promise, progress report, permission request or adjacent substitute is not completion. Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
+        : recoversTextLanguage
+          ? `${actorNames || "The selected resident"}'s first candidate did not survive required output-language review. This is the one bounded full-scene recovery: perform the same assigned scene in the trusted required response language, preserving the supplied premise, transcript, evidence and conversational move. Do not translate names or genuinely quoted fragments unnecessarily.${reviewCorrection}`
         : `${actorNames || "The selected resident"} owes this human-triggered scene one direct response and the first candidate did not survive review. This is the one bounded full-scene recovery: respond directly and relevantly to the newest complete turn now, preserving the supplied transcript and evidence. Do not change subject merely to produce a line and do not invent an explicit request that the human did not make.${reviewCorrection}`;
       try {
         const retryLines = await this.perform(
@@ -2809,7 +2822,7 @@ export class LmStudioClient {
     const allowedSources = new Set(request.research?.results.map((result) => result.id) ?? []);
     const seen = new Set<string>();
     const lines: GeneratedLine[] = [];
-    const maxLength = request.conversationMode === "considered" ? 500 : 360;
+    const maxLength = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
 
     for (const candidate of parsed.messages ?? []) {
       if (!candidate.personaId || !allowed.has(candidate.personaId) || seen.has(candidate.personaId)) continue;
@@ -2888,7 +2901,7 @@ export class LmStudioClient {
       return [{
         personaId: line.personaId,
         actorName: persona.name,
-        content: line.content.slice(0, 500),
+        content: line.content.slice(0, MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS),
         sourceIds: line.sourceIds,
         privateRelationshipNote: request.relationshipNotes?.[line.personaId]?.slice(0, 2_600) ?? null,
         mustReply: request.mustReplyIds?.includes(line.personaId) ?? false,
@@ -2914,13 +2927,13 @@ export class LmStudioClient {
           ...(request.roomRecall?.transcript ?? [])
             .filter((historyLine) => historyLine.kind === "ai" && sameActor(historyLine.author))
             .map((historyLine) => historyLine.content),
-        ].slice(-8).map((text) => text.slice(0, 500)),
+        ].slice(-8).map((text) => text.slice(0, MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS)),
         peerTexts: [
           ...request.history
             .filter((historyLine) => historyLine.kind === "ai" && !sameActor(historyLine.author))
             .map((historyLine) => historyLine.content),
           ...lines.filter((candidate) => candidate.personaId !== line.personaId).map((candidate) => candidate.content),
-        ].slice(-8).map((text) => text.slice(0, 500)),
+        ].slice(-8).map((text) => text.slice(0, MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS)),
       }];
     });
     const reviewProfile = getChannelProfile(request.channelId ?? "");
@@ -3148,7 +3161,7 @@ export class LmStudioClient {
     let prose = protectedText.text;
     for (const fragment of protectedText.fragments) prose = prose.split(fragment.placeholder).join(" ");
     const wordCount = segmentWords(prose, request.semanticContext?.languageTag ?? request.languageHint).length;
-    const maximumCharacters = request.conversationMode === "considered" ? 500 : 360;
+    const maximumCharacters = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
     if (line.content.length > maximumCharacters) {
       return `Shorten the complete line to at most ${maximumCharacters} characters without cutting or changing any technical token; the rejected draft had ${line.content.length}.`;
     }
@@ -3160,12 +3173,15 @@ export class LmStudioClient {
         : undefined;
     }
     if (request.conversationMode === "considered") {
-      const registerProfile = CONVERSATION_REGISTERS[this.humanizerRegister(request) ?? "everyday"];
-      const roomRange = consideredRoleFor(request, selectedIndex) === "lead"
-        ? registerProfile.consideredLeadWords
-        : registerProfile.consideredResponseWords;
-      const minimum = Math.min(roomRange[0], persona.style.typicalWords[1], persona.style.hardMaxWords);
-      const maximum = Math.min(roomRange[1], persona.style.hardMaxWords);
+      const register = this.humanizerRegister(request) ?? "everyday";
+      const registerProfile = CONVERSATION_REGISTERS[register];
+      const isLead = consideredRoleFor(request, selectedIndex) === "lead";
+      const [minimum, maximum] = isLead
+        ? consideredLeadWordRange(register, persona.style)
+        : [
+            Math.min(registerProfile.consideredResponseWords[0], persona.style.typicalWords[1], persona.style.hardMaxWords),
+            Math.min(registerProfile.consideredResponseWords[1], persona.style.hardMaxWords),
+          ];
       return wordCount < minimum || wordCount > maximum
         ? `Keep this scene role between ${minimum} and ${maximum} words; the rejected draft had ${wordCount}.`
         : undefined;
@@ -3330,8 +3346,7 @@ export class LmStudioClient {
       // Never preserve language metadata from generation or an earlier draft:
       // only this exact candidate's mandatory semantic review may establish it.
       const { reviewedOutputLanguage: _unreviewedLanguage, ...unreviewedLine } = line;
-      const reviewedOutputLanguage = request.kind === "voice" &&
-        semanticReview?.outputLanguage &&
+      const reviewedOutputLanguage = semanticReview?.outputLanguage &&
         semanticReview.outputLanguage.tag !== "und" &&
         semanticReview.outputLanguage.confidence >= CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE
         ? semanticReview.outputLanguage
@@ -3520,7 +3535,7 @@ export class LmStudioClient {
   ): Promise<GeneratedLine[]> {
     const prepared = rejected.map((entry) => this.prepareRepair(entry));
     const personaIds = prepared.map((entry) => entry.reviewed.line.personaId);
-    const maxContentLength = request.conversationMode === "considered" ? 500 : 360;
+    const maxContentLength = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
     const roomRegister = this.humanizerRegister(request);
     const roomRegisterGuidance = roomRegister
       ? CONVERSATION_REGISTERS[roomRegister].guidance
@@ -3687,7 +3702,7 @@ export class LmStudioClient {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     const personaIds = request.selected.map((persona) => persona.id);
     const maxMessages = Math.max(1, Math.min(request.selected.length, request.kind === "ambient" ? 2 : 3));
-    const maxContentLength = request.conversationMode === "considered" ? 500 : 360;
+    const maxContentLength = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
     const researchSourceIds = request.research?.results.map((result) => result.id) ?? [];
     // Gemma 4 exposes its internal reasoning separately and counts it against
     // max_tokens. A chat-sized line can therefore require 300–700 completion
