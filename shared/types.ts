@@ -63,7 +63,8 @@ export interface VisualObservation {
 export type ImageAnalysis =
   | { status: "pending" }
   | { status: "ready"; observation: VisualObservation }
-  | { status: "unavailable" };
+  | { status: "unavailable" }
+  | { status: "not_requested" };
 
 export interface ImageAttachment {
   id: string;

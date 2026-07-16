@@ -263,7 +263,7 @@ const isObservationList = (value: unknown, maximumItems: number, maximumLength: 
 
 const isImageAnalysis = (value: unknown): value is ImageAnalysis => {
   if (!isRecord(value) || !hasOnlyKeys(value, ANALYSIS_KEYS)) return false;
-  if (value.status === "pending" || value.status === "unavailable") {
+  if (value.status === "pending" || value.status === "unavailable" || value.status === "not_requested") {
     return value.observation === undefined;
   }
   if (value.status !== "ready" || !isRecord(value.observation) ||
@@ -936,12 +936,50 @@ export class RoomStore {
     attachmentId: string,
     analysis: ImageAnalysis,
   ): ImageAttachment | undefined {
-    const message = this.messages.find((candidate) => candidate.channelId === channelId && candidate.id === messageId);
+    const message = this.privateThreads.get(channelId)?.messages.find((candidate) => candidate.id === messageId)
+      ?? this.messages.find((candidate) => candidate.channelId === channelId && candidate.id === messageId);
     const attachment = message?.attachments?.find((candidate) => candidate.id === attachmentId);
     if (!attachment) return undefined;
     attachment.analysis = analysis;
     this.schedulePersist();
     return attachment;
+  }
+
+  /**
+   * Server-only attachment inventory used by image recovery and garbage
+   * collection. Private rows are deliberately never exposed in snapshots.
+   */
+  getAllImageMessages(): ChatMessage[] {
+    return [
+      ...this.messages,
+      ...[...this.privateThreads.values()].flatMap((thread) => thread.messages),
+    ].filter((message) => (message.attachments?.length ?? 0) > 0);
+  }
+
+  /**
+   * Public images remain visible to every joined member. A private image is
+   * visible only to the exact durable participant set of its DM thread.
+   * An absent result for unknown or unauthorized IDs keeps the HTTP boundary
+   * opaque, while the scope lets the transport disable browser caching for DM.
+   */
+  imageAttachmentVisibilityFor(
+    attachmentId: string,
+    viewerId: string,
+  ): "public" | "private" | undefined {
+    if (this.messages.some((message) =>
+      message.attachments?.some((attachment) => attachment.id === attachmentId),
+    )) return "public";
+    for (const thread of this.privateThreads.values()) {
+      if (!thread.participantIds.includes(viewerId)) continue;
+      if (thread.messages.some((message) =>
+        message.attachments?.some((attachment) => attachment.id === attachmentId),
+      )) return "private";
+    }
+    return undefined;
+  }
+
+  canViewImageAttachment(attachmentId: string, viewerId: string): boolean {
+    return this.imageAttachmentVisibilityFor(attachmentId, viewerId) !== undefined;
   }
 
   setLinkPreview(channelId: string, messageId: string, linkPreview: LinkPreview): ChatMessage | undefined {
@@ -1012,6 +1050,8 @@ export class RoomStore {
     generation?: "lm" | "fallback",
     sources?: MessageSource[],
     linkPreview?: LinkPreview,
+    attachments?: ImageAttachment[],
+    authorSnapshot?: Member,
   ): ChatMessage | undefined {
     const thread = this.privateThreads.get(threadId);
     if (!thread || !thread.participantIds.includes(authorId)) return undefined;
@@ -1020,10 +1060,14 @@ export class RoomStore {
       generation,
       sources,
       linkPreview,
+      attachments,
+      authorSnapshot,
     });
     thread.messages.push(message);
     if (thread.messages.length > this.dmHistoryHardLimit) {
+      const removed = thread.messages.slice(0, -this.dmHistoryTrimTo);
       thread.messages = thread.messages.slice(-this.dmHistoryTrimTo);
+      if (removed.length > 0) this.removalHandler?.(removed);
     }
     this.schedulePersist();
     return message;
@@ -1086,7 +1130,11 @@ export class RoomStore {
   forgetDmParticipant(memberId: string): void {
     let changed = false;
     for (const [threadId, thread] of this.privateThreads) {
-      if (thread.participantIds.includes(memberId)) changed = this.privateThreads.delete(threadId) || changed;
+      if (!thread.participantIds.includes(memberId)) continue;
+      if (this.privateThreads.delete(threadId)) {
+        changed = true;
+        if (thread.messages.length > 0) this.removalHandler?.(thread.messages);
+      }
     }
     if (changed) this.schedulePersist();
   }

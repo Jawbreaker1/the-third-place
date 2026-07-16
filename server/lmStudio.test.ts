@@ -3,6 +3,7 @@ import { ActorChannelRuntime } from "./actorChannels.js";
 import {
   BackgroundWorkPreemptedError,
   buildSceneSystemPrompt,
+  MAX_VISUAL_EVIDENCE_ENTRIES,
   deriveSceneBehaviorStylePlan,
   LmStudioClient,
   sanitizeObservationText,
@@ -3868,6 +3869,265 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(JSON.parse(bodies[1].messages[1].content).capabilityContext)
       .toEqual(JSON.parse(bodies[0].messages[1].content).trustedCapabilityContext);
     expect(bodies.some((body) => body.messages[0].content.includes("one-pass copy editor"))).toBe(false);
+  });
+
+  it("recovers a multilingual false voice-chat denial from structured community capability truth", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: mira.id, content: "Aquí solo tenemos texto; no existe chat de voz." }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["community_capability_contradiction"],
+          rewriteInstruction: "Responde usando los datos comunitarios de voz suministrados.",
+          outputLanguage: { tag: "es", confidence: 0.99 },
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Sí. Inicia una sala de voz aquí y luego puedes invitarme.",
+        }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+        outputLanguage: { tag: "es", confidence: 0.99 },
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Lucía", content: "¿También se puede hablar por voz aquí?" },
+      mustReplyIds: [mira.id],
+      semanticContext: {
+        languageTag: "es",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      content: "Sí. Inicia una sala de voz aquí y luego puedes invitarme.",
+    })]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[0].messages[0].content).toContain("trustedCommunityCapabilities is server-owned product truth");
+    expect(JSON.parse(bodies[0].messages[1].content).trustedCommunityCapabilities).toEqual({
+      voiceChat: {
+        available: true,
+        humansCanStartFromPublicRooms: true,
+        humansCanJoin: true,
+        residentsCanBeInvited: true,
+        residentsCanStartAutonomously: false,
+      },
+    });
+    expect(JSON.parse(bodies[1].messages[1].content).communityCapabilities)
+      .toEqual(JSON.parse(bodies[0].messages[1].content).trustedCommunityCapabilities);
+    expect(bodies[2].messages[1].content).toContain("contradicted trusted community capability facts");
+  });
+
+  it("publishes a translated image detail with generation/review parity over the same bounded chronological evidence", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const visualObservation = {
+      summary: "An orange cat is sitting beside a blue mug.",
+      details: ["The cat faces away from the camera."],
+      visibleText: ["MONDAY"],
+      topics: ["cat", "mug"],
+      uncertainties: ["The small logo on the mug is unclear."],
+      analyzedAt: "2026-07-14T12:00:00.000Z",
+    };
+    const visualEvidence = Array.from({ length: MAX_VISUAL_EVIDENCE_ENTRIES + 1 }, (_, index) => ({
+      messageId: `message-image-${index + 1}`,
+      attachmentId: `attachment-image-${index + 1}`,
+      observation: {
+        ...visualObservation,
+        analyzedAt: `2026-07-14T12:0${index}:00.000Z`,
+      },
+    }));
+    const expectedVisualEvidence = visualEvidence.slice(-MAX_VISUAL_EVIDENCE_ENTRIES);
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: "Un gato naranja está sentado junto a una taza azul." }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            outputLanguage: { tag: "es", confidence: 0.99 },
+          }]);
+    }));
+
+    await expect(new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Lucía",
+        content: "¿Qué ves en la imagen?",
+        messageId: visualEvidence.at(-1)!.messageId,
+        imageAttachmentIds: [visualEvidence.at(-1)!.attachmentId],
+      },
+      visualEvidence,
+      semanticContext: {
+        languageTag: "es",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    })).resolves.toEqual([expect.objectContaining({
+      content: "Un gato naranja está sentado junto a una taza azul.",
+    })]);
+
+    const generationData = JSON.parse(bodies[0].messages[1].content);
+    const reviewData = JSON.parse(bodies[1].messages[1].content);
+    expect(generationData.visualEvidence).toEqual(expectedVisualEvidence);
+    expect(reviewData.visualEvidence).toEqual(expectedVisualEvidence);
+    expect(reviewData.visualEvidence).toEqual(generationData.visualEvidence);
+    expect(reviewData.visualEvidence.map((entry: { messageId: string }) => entry.messageId)).toEqual([
+      "message-image-2",
+      "message-image-3",
+      "message-image-4",
+    ]);
+    expect(reviewData.trigger.messageId).toBe("message-image-4");
+    expect(generationData.triggeringEvent.imageAttachmentIds).toEqual(["attachment-image-4"]);
+    expect(reviewData.trigger.imageAttachmentIds).toEqual(generationData.triggeringEvent.imageAttachmentIds);
+    expect(bodies[1].response_format.json_schema.schema.properties.reviews.items.properties.issues.items.enum)
+      .toContain("unsupported_visual_claim");
+  });
+
+  it("blocks a multilingual image hallucination absent from trusted visual grounding", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: mira.id, content: "En la imagen corre un perro negro bajo la lluvia." }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "high",
+            issues: ["unsupported_visual_claim"],
+            rewriteInstruction: "Limítate a los detalles respaldados por la observación visual.",
+            outputLanguage: { tag: "es", confidence: 0.99 },
+          }]);
+    }));
+
+    await expect(new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Lucía",
+        content: "¿Qué ves en la imagen?",
+        messageId: "message-current-image",
+        imageAttachmentIds: ["attachment-current-image"],
+      },
+      visualEvidence: [{
+        messageId: "message-current-image",
+        attachmentId: "attachment-current-image",
+        observation: {
+          summary: "An orange cat is sitting beside a blue mug.",
+          details: [],
+          visibleText: [],
+          topics: ["cat", "mug"],
+          uncertainties: [],
+          analyzedAt: "2026-07-14T12:00:00.000Z",
+        },
+      }],
+      semanticContext: {
+        languageTag: "es",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    })).resolves.toEqual([]);
+    expect(call).toBe(2);
+  });
+
+  it("does not let an older image observation masquerade as the unavailable current trigger image", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: "La imagen actual muestra un gato naranja junto a una taza azul." }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "high",
+            issues: ["unsupported_visual_claim"],
+            rewriteInstruction: "No atribuyas la observación anterior a la imagen actual sin analizar.",
+            outputLanguage: { tag: "es", confidence: 0.99 },
+          }]);
+    }));
+
+    await expect(new LmStudioClient().generateScene({
+      kind: "dm",
+      channelId: "dm-thread",
+      channelName: "Mira",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Lucía",
+        content: "¿Qué ves en esta imagen?",
+        messageId: "message-current-unanalysed",
+        imageAttachmentIds: ["attachment-current-unanalysed"],
+      },
+      visualEvidence: [{
+        messageId: "message-older-image",
+        attachmentId: "attachment-older-image",
+        observation: {
+          summary: "An orange cat is sitting beside a blue mug.",
+          details: [],
+          visibleText: [],
+          topics: ["cat", "mug"],
+          uncertainties: [],
+          analyzedAt: "2026-07-14T12:00:00.000Z",
+        },
+      }],
+      semanticContext: {
+        languageTag: "es",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    })).resolves.toEqual([]);
+
+    expect(bodies).toHaveLength(2);
+    const generationData = JSON.parse(bodies[0].messages[1].content);
+    const reviewData = JSON.parse(bodies[1].messages[1].content);
+    expect(generationData.triggeringEvent.messageId).toBe("message-current-unanalysed");
+    expect(reviewData.trigger.messageId).toBe("message-current-unanalysed");
+    expect(generationData.triggeringEvent.imageAttachmentIds).toEqual(["attachment-current-unanalysed"]);
+    expect(reviewData.trigger.imageAttachmentIds).toEqual(generationData.triggeringEvent.imageAttachmentIds);
+    expect(reviewData.visualEvidence).toEqual(generationData.visualEvidence);
+    expect(reviewData.visualEvidence[0].messageId).toBe("message-older-image");
   });
 
   it("drops a Norwegian written-medium illusion as grounding, not style", async () => {

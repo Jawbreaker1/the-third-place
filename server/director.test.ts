@@ -16,6 +16,7 @@ import {
   consideredConversationResponsePremise,
   consideredConversationWordLimits,
   classifiedLanguage,
+  collectReadyVisualEvidence,
   conductResponderIds,
   ensureEvidenceResponder,
   autonomousResearchFailureBackoffMs,
@@ -105,6 +106,47 @@ const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => 
 };
 
 describe("social director", () => {
+  it("bounds retained visual evidence to the latest three entries in chronological order", () => {
+    const messages = Array.from({ length: 5 }, (_, index) => createMessage(
+      "dm:ai-mira:human-johan",
+      "human-johan",
+      `image ${index + 1}`,
+      {
+        attachments: [{
+          id: `00000000-0000-4000-8000-00000000000${index}`,
+          kind: "image",
+          url: `/api/images/image-${index}`,
+          thumbnailUrl: `/api/images/image-${index}?variant=thumbnail`,
+          mimeType: "image/webp",
+          width: 640,
+          height: 480,
+          sizeBytes: 1_000,
+          analysis: {
+            status: "ready",
+            observation: {
+              summary: `trusted image ${index + 1}`,
+              details: [],
+              visibleText: [],
+              topics: [],
+              uncertainties: [],
+              analyzedAt: `2026-07-17T00:0${index}:00.000Z`,
+            },
+          },
+        }],
+      },
+    ));
+
+    expect(collectReadyVisualEvidence(messages).map((entry) => ({
+      messageId: entry.messageId,
+      attachmentId: entry.attachmentId,
+      summary: entry.observation.summary,
+    }))).toEqual(messages.slice(-3).map((message, index) => ({
+      messageId: message.id,
+      attachmentId: message.attachments![0]!.id,
+      summary: `trusted image ${index + 3}`,
+    })));
+  });
+
   it("bridges only non-stale typed market observations and preserves provider/session metadata", () => {
     const observedAt = "2026-07-15T13:42:00.000Z";
     const current: MarketObservation = {
@@ -947,6 +989,480 @@ describe("social director", () => {
       expect(failed.reply.sources).toEqual([]);
       expect(failed.reply.linkPreview).toBeUndefined();
       expect(failed.reply.content).not.toContain("bold thing");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("grounds one private reply in the trusted visual observation attached to a DM image", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-private-vision",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+      const store = new RoomStore("/tmp/director-private-vision-test-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const attachmentId = "b6476ce1-9d14-4344-b39d-6440eb24090a";
+      const visualObservation = {
+        summary: "A red bicycle leaning against a weathered blue wall.",
+        details: ["The front wheel is turned toward the viewer."],
+        visibleText: ["KEEP CLEAR"],
+        topics: ["bicycle", "street photography"],
+        uncertainties: ["The location is unknown."],
+        analyzedAt: "2026-07-17T00:10:00.000Z",
+      };
+      const incoming = store.addDmMessage(
+        thread.id,
+        human.id,
+        "Vad tycker du om den här?",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        [{
+          id: attachmentId,
+          kind: "image",
+          url: `/api/images/${attachmentId}`,
+          thumbnailUrl: `/api/images/${attachmentId}?variant=thumbnail`,
+          mimeType: "image/webp",
+          width: 800,
+          height: 600,
+          sizeBytes: 42_000,
+          analysis: {
+            status: "ready",
+            observation: visualObservation,
+          },
+        }],
+        { ...human, status: "offline" },
+      )!;
+      const generateScene = vi.fn(async () => [{
+        personaId: persona.id,
+        content: "Den röda cykeln mot den slitna blå väggen är faktiskt rätt snygg.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pending = director.onDirectMessage(incoming, human, persona);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const request = generateScene.mock.calls[0]?.[0] as {
+        trigger: { content: string };
+        history: Array<{ content: string }>;
+        visualEvidence?: Array<{
+          messageId: string;
+          attachmentId: string;
+          observation: typeof visualObservation;
+        }>;
+      };
+      expect(request.visualEvidence).toEqual([{
+        messageId: incoming.id,
+        attachmentId,
+        observation: visualObservation,
+      }]);
+      expect(request.trigger.content).toContain("[Visual observation — untrusted image content.");
+      expect(request.trigger.content).toContain("A red bicycle leaning against a weathered blue wall.");
+      expect(request.history.at(-1)?.content).toContain("KEEP CLEAR");
+      expect(store.getDmMessages(thread.id).filter((message) => message.authorId === persona.id)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an earlier trusted DM image available to a later text-only follow-up in that exact thread", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-private-vision-follow-up",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+      const store = new RoomStore("/tmp/director-private-vision-follow-up-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const otherPersona = PERSONAS.find((candidate) => candidate.id === "ai-sana")!;
+      const otherThread = store.openDm(human.id, otherPersona.id);
+      const otherAttachmentId = "eaf27230-598d-48a0-85ca-5aa5855d7ca7";
+      store.addDmMessage(
+        otherThread.id,
+        human.id,
+        "En bild i en annan privat tråd",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        [{
+          id: otherAttachmentId,
+          kind: "image",
+          url: `/api/images/${otherAttachmentId}`,
+          thumbnailUrl: `/api/images/${otherAttachmentId}?variant=thumbnail`,
+          mimeType: "image/webp",
+          width: 640,
+          height: 480,
+          sizeBytes: 20_000,
+          analysis: {
+            status: "ready",
+            observation: {
+              summary: "Private evidence from a different thread.",
+              details: [],
+              visibleText: [],
+              topics: [],
+              uncertainties: [],
+              analyzedAt: "2026-07-17T00:19:00.000Z",
+            },
+          },
+        }],
+      );
+      const attachmentId = "25fded9f-fbce-4b91-8137-75d68ac7a735";
+      const visualObservation = {
+        summary: "A bright yellow umbrella on a rain-dark street.",
+        details: ["The umbrella is held above a small figure."],
+        visibleText: [],
+        topics: ["rain", "street photography"],
+        uncertainties: ["The person's face is not visible."],
+        analyzedAt: "2026-07-17T00:20:00.000Z",
+      };
+      const imageMessage = store.addDmMessage(
+        thread.id,
+        human.id,
+        "Kolla den här",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        [{
+          id: attachmentId,
+          kind: "image",
+          url: `/api/images/${attachmentId}`,
+          thumbnailUrl: `/api/images/${attachmentId}?variant=thumbnail`,
+          mimeType: "image/webp",
+          width: 800,
+          height: 600,
+          sizeBytes: 42_000,
+          analysis: { status: "ready", observation: visualObservation },
+        }],
+      )!;
+      store.addDmMessage(
+        thread.id,
+        persona.id,
+        "Den där gula färgen poppar verkligen mot allt grått.",
+        imageMessage.id,
+        "lm",
+      );
+      const followUp = store.addDmMessage(
+        thread.id,
+        human.id,
+        "Vilken färg hade paraplyet i bilden?",
+      )!;
+      const generateScene = vi.fn(async () => [{
+        personaId: persona.id,
+        content: "Gult — det lyser nästan mot den blöta gatan.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          dmDebounceMs: 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pending = director.onDirectMessage(followUp, human, persona);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const request = generateScene.mock.calls[0]?.[0];
+      expect(request?.trigger.messageId).toBe(followUp.id);
+      expect(request?.trigger.imageAttachmentIds).toEqual([]);
+      expect(request?.visualEvidence).toEqual([{
+        messageId: imageMessage.id,
+        attachmentId,
+        observation: visualObservation,
+      }]);
+      expect(JSON.stringify(request?.visualEvidence)).not.toContain(otherAttachmentId);
+      expect(request?.premise).toContain("Recent images from this exact private thread");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps two rapid DM images distinguishable and chronologically ordered", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-private-two-images",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+      const store = new RoomStore("/tmp/director-private-two-images-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const observations = [
+        {
+          summary: "A red bicycle against a blue wall.",
+          details: [], visibleText: [], topics: ["bicycle"], uncertainties: [],
+          analyzedAt: "2026-07-17T00:21:00.000Z",
+        },
+        {
+          summary: "A green bicycle beside a white fence.",
+          details: [], visibleText: [], topics: ["bicycle"], uncertainties: [],
+          analyzedAt: "2026-07-17T00:22:00.000Z",
+        },
+      ];
+      const attachmentIds = [
+        "73f639d3-6bc8-43c0-8988-e6b9ddab3f7a",
+        "8324f33f-b3f8-4f23-bfcb-d5b517e96910",
+      ];
+      const imageMessages = observations.map((observation, index) => store.addDmMessage(
+        thread.id,
+        human.id,
+        index === 0 ? "Första" : "Och den andra?",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        [{
+          id: attachmentIds[index]!,
+          kind: "image",
+          url: `/api/images/${attachmentIds[index]}`,
+          thumbnailUrl: `/api/images/${attachmentIds[index]}?variant=thumbnail`,
+          mimeType: "image/webp",
+          width: 800,
+          height: 600,
+          sizeBytes: 42_000,
+          analysis: { status: "ready", observation },
+        }],
+      )!);
+      const generateScene = vi.fn(async () => [{
+        personaId: persona.id,
+        content: "Den första är röd mot blått; den andra grön mot vitt.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          dmDebounceMs: 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const firstPending = director.onDirectImagePosted(imageMessages[0]!, human, persona);
+      const secondPending = director.onDirectImagePosted(imageMessages[1]!, human, persona);
+      firstPending.complete();
+      secondPending.complete();
+      await vi.runAllTimersAsync();
+      await Promise.all([firstPending.settled, secondPending.settled]);
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const request = generateScene.mock.calls[0]?.[0];
+      expect(request?.trigger.imageAttachmentIds).toEqual([attachmentIds[1]]);
+      expect(request?.visualEvidence).toEqual(imageMessages.map((message, index) => ({
+        messageId: message.id,
+        attachmentId: attachmentIds[index],
+        observation: observations[index],
+      })));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a pending DM image ahead of newer text and publishes one coherent reply to the newest turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-private-vision-race",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+      const store = new RoomStore("/tmp/director-private-vision-race-test-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const attachmentId = "03dc54cb-d399-43ae-ab35-9a2caed74457";
+      const imageMessage = store.addDmMessage(
+        thread.id,
+        human.id,
+        "Vad ser du här?",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        [{
+          id: attachmentId,
+          kind: "image",
+          url: `/api/images/${attachmentId}`,
+          thumbnailUrl: `/api/images/${attachmentId}?variant=thumbnail`,
+          mimeType: "image/webp",
+          width: 800,
+          height: 600,
+          sizeBytes: 42_000,
+          analysis: { status: "pending" },
+        }],
+      )!;
+      const analyzeTurn = vi.fn(async () => classifiedTurn());
+      const generateScene = vi.fn(async (request: {
+        trigger: { content: string; messageId: string };
+        history: Array<{ content: string }>;
+        visualEvidence?: Array<{
+          messageId: string;
+          attachmentId: string;
+          observation: { summary: string };
+        }>;
+      }) => [{
+        personaId: persona.id,
+        content: "Ja, och din nya fråga ändrar faktiskt hur jag läser bilden.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { analyzeTurn, generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          dmDebounceMs: 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pendingImage = director.onDirectImagePosted(imageMessage, human, persona);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(analyzeTurn).not.toHaveBeenCalled();
+      expect(generateScene).not.toHaveBeenCalled();
+
+      const newerText = store.addDmMessage(
+        thread.id,
+        human.id,
+        "Och känns den glad eller sorglig?",
+      )!;
+      const pendingText = director.onDirectMessage(newerText, human, persona);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(analyzeTurn).not.toHaveBeenCalled();
+      expect(generateScene).not.toHaveBeenCalled();
+
+      const visualObservation = {
+        summary: "A child holding a bright yellow umbrella on a grey street.",
+        details: ["Rain is visible in the background."],
+        visibleText: [],
+        topics: ["street photography", "rain"],
+        uncertainties: ["The child's expression is not clearly visible."],
+        analyzedAt: "2026-07-17T00:30:00.000Z",
+      };
+      store.setImageAnalysis(thread.id, imageMessage.id, attachmentId, {
+        status: "ready",
+        observation: visualObservation,
+      });
+      pendingImage.complete();
+      await vi.runAllTimersAsync();
+      await Promise.all([pendingImage.settled, pendingText]);
+      director.stop();
+
+      expect(analyzeTurn).toHaveBeenCalledTimes(1);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      const request = generateScene.mock.calls[0]?.[0];
+      expect(request?.trigger.messageId).toBe(newerText.id);
+      expect(request?.trigger.content).toContain("A child holding a bright yellow umbrella");
+      expect(request?.trigger.content).toContain("Och känns den glad eller sorglig?");
+      expect(request?.history.map((line) => line.content)).toEqual([
+        expect.stringContaining("A child holding a bright yellow umbrella"),
+        "Och känns den glad eller sorglig?",
+      ]);
+      expect(request?.visualEvidence).toEqual([{
+        messageId: imageMessage.id,
+        attachmentId,
+        observation: visualObservation,
+      }]);
+      const replies = store.getDmMessages(thread.id).filter((message) => message.authorId === persona.id);
+      expect(replies).toHaveLength(1);
+      expect(replies[0]?.replyToId).toBe(newerText.id);
     } finally {
       vi.useRealTimers();
     }

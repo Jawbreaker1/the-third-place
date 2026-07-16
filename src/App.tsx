@@ -791,6 +791,25 @@ export default function App() {
             : message,
         ),
       );
+      setDmThreads((current) => {
+        const next = current.map((thread) => thread.id !== payload.channelId
+          ? thread
+          : {
+              ...thread,
+              messages: thread.messages.map((message) => message.id !== payload.messageId
+                ? message
+                : {
+                    ...message,
+                    attachments: message.attachments?.map((attachment) =>
+                      attachment.id === payload.attachmentId
+                        ? { ...attachment, analysis: payload.analysis }
+                        : attachment,
+                    ),
+                  }),
+            });
+        dmThreadsRef.current = next;
+        return next;
+      });
       setLightbox((current) => current?.attachment.id === payload.attachmentId
         ? { ...current, attachment: { ...current.attachment, analysis: payload.analysis } }
         : current);
@@ -1069,7 +1088,7 @@ export default function App() {
   const typingMembers = (typing[activeChannelId] ?? []).map((id) => memberMap.get(id)).filter((member): member is Member => Boolean(member));
   const activeHistory = historyPageInfo[activeChannelId] ?? { hasMore: false };
   const pendingImage = imageDrafts[activeChannelId];
-  const canAttachImage = Boolean(me && activeChannel);
+  const canAttachImage = Boolean(me && (activeChannel || activeThread));
   const voiceRoomInView = voiceRooms.find((room) => room.id === voiceViewRoomId);
   const joinedVoiceRoom = voiceRooms.find((room) => room.id === joinedVoiceRoomId);
   const voiceRoomTranscripts = voiceRoomInView ? voiceTranscripts[voiceRoomInView.id] ?? [] : [];
@@ -1107,8 +1126,10 @@ export default function App() {
   }, [revokeDraftPreview]);
 
   const queueImageFile = useCallback((file: File, channelId = activeChannelRef.current) => {
-    if (!me || !channels.some((channel) => channel.id === channelId)) {
-      pushToast({ tone: "warning", title: "Public rooms only", message: "Image sharing in private messages is coming later." });
+    const conversationExists = channels.some((channel) => channel.id === channelId)
+      || dmThreadsRef.current.some((thread) => thread.id === channelId);
+    if (!me || !conversationExists) {
+      pushToast({ tone: "warning", title: "Conversation unavailable", message: "Open a room or private conversation before attaching an image." });
       return;
     }
     if (!new Set(["image/jpeg", "image/png", "image/webp"]).has(file.type)) {
@@ -1126,8 +1147,10 @@ export default function App() {
   }, [channels, me, pushToast, updateImageDraft]);
 
   const queueImageUrl = useCallback((raw: string, channelId = activeChannelRef.current): boolean => {
-    if (!me || !channels.some((channel) => channel.id === channelId)) {
-      pushToast({ tone: "warning", title: "Public rooms only", message: "Image sharing in private messages is coming later." });
+    const conversationExists = channels.some((channel) => channel.id === channelId)
+      || dmThreadsRef.current.some((thread) => thread.id === channelId);
+    if (!me || !conversationExists) {
+      pushToast({ tone: "warning", title: "Conversation unavailable", message: "Open a room or private conversation before attaching an image." });
       return false;
     }
     try {
@@ -1870,8 +1893,9 @@ export default function App() {
     const image = imageDrafts[activeChannelId];
     if ((!content && !image) || !socketRef.current || !me) return;
     if (image) {
-      if (!activeChannel || image.status === "preparing" || image.status === "sending") return;
+      if ((!activeChannel && !activeThread) || image.status === "preparing" || image.status === "sending") return;
       const channelId = activeChannelId;
+      const privateThreadId = activeThread?.id;
       const rawComposer = composer;
       const previousReply = replyTo;
       updateImageDraft(channelId, { ...image, status: "sending", error: undefined });
@@ -1881,16 +1905,30 @@ export default function App() {
       if (image.source === "file" && image.file) form.set("image", image.file, image.file.name || "shared-image");
       if (image.source === "url" && image.imageUrl) form.set("imageUrl", image.imageUrl);
       try {
-        const response = await fetch(`/api/channels/${encodeURIComponent(channelId)}/image-messages`, {
+        const endpoint = privateThreadId
+          ? `/api/dms/${encodeURIComponent(privateThreadId)}/image-messages`
+          : `/api/channels/${encodeURIComponent(channelId)}/image-messages`;
+        const response = await fetch(endpoint, {
           method: "POST",
           body: form,
           credentials: "same-origin",
         });
         const result = (await response.json()) as ImageMessageResult;
         if (!response.ok || !result.ok) throw new Error(result.ok ? "Image could not be shared." : result.error);
-        setMessages((current) => current.some((message) => message.id === result.message.id)
-          ? current
-          : boundPublicMessages([...current, result.message]));
+        if (privateThreadId) {
+          setDmThreads((current) => {
+            const next = current.map((thread) => thread.id !== privateThreadId
+              || thread.messages.some((message) => message.id === result.message.id)
+              ? thread
+              : { ...thread, messages: [...thread.messages, result.message] });
+            dmThreadsRef.current = next;
+            return next;
+          });
+        } else {
+          setMessages((current) => current.some((message) => message.id === result.message.id)
+            ? current
+            : boundPublicMessages([...current, result.message]));
+        }
         revokeDraftPreview(image);
         setImageDrafts((current) => current[channelId]?.id === image.id ? { ...current, [channelId]: undefined } : current);
         if (activeChannelRef.current === channelId) {
@@ -2451,9 +2489,10 @@ export default function App() {
                           <span className="image-expand"><Icon name="image" size={14} /> View</span>
                         </button>
                         <figcaption className={`image-analysis image-analysis-${attachment.analysis.status}`}>
-                          {attachment.analysis.status === "pending" ? <><span className="analysis-pulse" /><span>AI residents are looking at this…</span></> : null}
-                          {attachment.analysis.status === "ready" ? <><Icon name="spark" size={11} /><span>Seen by the room</span></> : null}
+                          {attachment.analysis.status === "pending" ? <><span className="analysis-pulse" /><span>{activeThread ? "Image is being viewed…" : "AI residents are looking at this…"}</span></> : null}
+                          {attachment.analysis.status === "ready" ? <><Icon name="spark" size={11} /><span>{activeThread ? "Seen in this private chat" : "Seen by the room"}</span></> : null}
                           {attachment.analysis.status === "unavailable" ? <><Icon name="info" size={11} /><span>Visual description unavailable</span></> : null}
+                          {attachment.analysis.status === "not_requested" ? <><Icon name="lock" size={11} /><span>Shared privately</span></> : null}
                         </figcaption>
                       </figure>
                     );
@@ -2606,7 +2645,7 @@ export default function App() {
             }}
           />
           <form id="message-composer" className={`composer ${!me ? "disabled" : ""} ${pendingImage ? "has-image" : ""}`} onSubmit={sendMessage}>
-            <button type="button" className="attach-button" disabled={!canAttachImage || pendingImage?.status === "sending"} onClick={() => imageInputRef.current?.click()} aria-label="Attach an image" title={activeThread ? "Images are currently available in public rooms" : "Attach image"}><Icon name="image" size={17} /></button>
+            <button type="button" className="attach-button" disabled={!canAttachImage || pendingImage?.status === "sending"} onClick={() => imageInputRef.current?.click()} aria-label="Attach an image" title="Attach image"><Icon name="image" size={17} /></button>
             <button type="button" className={`attach-button ${imageUrlOpen ? "active" : ""}`} disabled={!canAttachImage || pendingImage?.status === "sending"} onClick={() => setImageUrlOpen((value) => !value)} aria-label="Attach a direct image URL" title="Attach direct HTTPS image URL"><Icon name="link" size={16} /></button>
             <textarea
               ref={composerInputRef}
@@ -2640,7 +2679,11 @@ export default function App() {
             ><Icon name="smile" /></button>
             <button type="submit" className="send-button" disabled={!me || (!composer.trim() && !pendingImage) || pendingImage?.status === "preparing" || pendingImage?.status === "sending"}>{pendingImage?.status === "sending" ? <span className="button-spinner" /> : <Icon name="send" size={17} />}</button>
           </form>
-          <div className="composer-note"><Icon name="spark" size={11} /> AI residents may read public messages and view shared images. Public HTTPS links may unfurl; an explicit read/check request lets the server fetch bounded page text. DMs stay out of public context.</div>
+          <div className="composer-note"><Icon name="spark" size={11} /> {activeThread
+            ? activePeer?.kind === "ai"
+              ? "Images and captions stay inside this private conversation. This AI resident can view the sanitized image."
+              : "Images and captions stay inside this private conversation."
+            : "AI residents may read public messages and view shared images. Public HTTPS links may unfurl; an explicit read/check request lets the server fetch bounded page text. DMs stay out of public context."}</div>
         </div>
 
         <nav className="mobile-nav mobile-only">
@@ -2751,7 +2794,8 @@ export default function App() {
             <figcaption>
               <strong dir="auto">{lightbox.authorName}</strong>
               {lightbox.attachment.analysis.status === "ready" && <span dir="auto">{lightbox.attachment.analysis.observation.summary}</span>}
-              {lightbox.attachment.analysis.status === "pending" && <span>AI residents are still looking at this image…</span>}
+              {lightbox.attachment.analysis.status === "pending" && <span>{activeThread ? "This AI resident is still looking at the image…" : "AI residents are still looking at this image…"}</span>}
+              {lightbox.attachment.analysis.status === "not_requested" && <span>Shared privately without AI image analysis.</span>}
             </figcaption>
           </figure>
         </div>

@@ -1,11 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { chmod, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
+import type { ImageAttachment, Member } from "../shared/types.js";
 import { createMessage, RoomStateLoadError, RoomStore } from "./store.js";
 import { CHANNELS } from "./channels.js";
 
 const tempStorePath = () => `/tmp/third-place-store-${Date.now()}-${Math.random()}.json`;
 const tempStore = () => new RoomStore(tempStorePath());
+const imageAttachment = (id = "7fa0a7d6-3915-4b2c-9db0-928f416a8301"): ImageAttachment => ({
+  id,
+  kind: "image",
+  url: `/api/images/${id}`,
+  thumbnailUrl: `/api/images/${id}?variant=thumbnail`,
+  mimeType: "image/webp",
+  width: 640,
+  height: 480,
+  sizeBytes: 12_345,
+  analysis: { status: "pending" },
+});
 
 describe("room history", () => {
   it("seeds every configured channel so newly added rooms do not open empty", async () => {
@@ -113,6 +125,150 @@ describe("room history", () => {
       version: 3,
       trustedChannelLanguages: [],
     });
+  });
+
+  it("persists private image rows and authorizes only their exact DM participants", async () => {
+    const filePath = tempStorePath();
+    const first = new RoomStore(filePath);
+    await first.load();
+    const human: Member = {
+      id: "human-private-image",
+      name: "Private uploader",
+      kind: "human",
+      status: "offline",
+      avatar: { color: "#123456", accent: "#abcdef", glyph: "P" },
+    };
+    const thread = first.openDm(human.id, "ai-mira");
+    const attachment = imageAttachment();
+    const message = first.addDmMessage(
+      thread.id,
+      human.id,
+      "bara för Mira",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [attachment],
+      human,
+    );
+
+    expect(message?.attachments).toEqual([attachment]);
+    expect(first.canViewImageAttachment(attachment.id, human.id)).toBe(true);
+    expect(first.canViewImageAttachment(attachment.id, "ai-mira")).toBe(true);
+    expect(first.canViewImageAttachment(attachment.id, "human-outsider")).toBe(false);
+    expect(first.imageAttachmentVisibilityFor(attachment.id, human.id)).toBe("private");
+    expect(first.imageAttachmentVisibilityFor(attachment.id, "human-outsider")).toBeUndefined();
+    expect(first.getAllMessages()).not.toContainEqual(message);
+    expect(first.getAllImageMessages()).toContainEqual(message);
+
+    const ready = first.setImageAnalysis(thread.id, message!.id, attachment.id, {
+      status: "ready",
+      observation: {
+        summary: "A red bicycle beside a wall.",
+        details: ["The front wheel is turned left."],
+        visibleText: [],
+        topics: ["bicycle"],
+        uncertainties: [],
+        analyzedAt: "2026-07-17T00:00:00.000Z",
+      },
+    });
+    expect(ready?.analysis.status).toBe("ready");
+    await first.flush();
+
+    const restored = new RoomStore(filePath);
+    await restored.load();
+    expect(restored.getAllImageMessages()).toHaveLength(1);
+    expect(restored.openDm(human.id, "ai-mira").messages[0]?.attachments?.[0]?.analysis.status).toBe("ready");
+    expect(restored.canViewImageAttachment(attachment.id, human.id)).toBe(true);
+    expect(restored.canViewImageAttachment(attachment.id, "human-outsider")).toBe(false);
+  });
+
+  it("round-trips the terminal no-vision state for a private human DM image", async () => {
+    const filePath = tempStorePath();
+    const first = new RoomStore(filePath);
+    await first.load();
+    const thread = first.openDm("human-one", "human-two");
+    const attachment = imageAttachment("3cf0054d-9d96-4815-8497-d78582e25bcc");
+    attachment.analysis = { status: "not_requested" };
+    first.addDmMessage(
+      thread.id,
+      "human-one",
+      "bara mellan oss",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [attachment],
+    );
+    await first.flush();
+
+    const restored = new RoomStore(filePath);
+    await restored.load();
+    expect(restored.getDmMessages(thread.id)[0]?.attachments?.[0]?.analysis).toEqual({
+      status: "not_requested",
+    });
+  });
+
+  it("keeps public images join-visible while removing forgotten private image ownership", async () => {
+    const store = tempStore();
+    await store.load();
+    const publicAttachment = imageAttachment("e880c73e-09db-4f57-8c35-b50050b727b2");
+    store.addPublicMessage(createMessage("lobby", "human-public", "public", {
+      attachments: [publicAttachment],
+    }));
+    expect(store.canViewImageAttachment(publicAttachment.id, "human-any-joined-member")).toBe(true);
+    expect(store.imageAttachmentVisibilityFor(publicAttachment.id, "human-any-joined-member")).toBe("public");
+
+    const privateAttachment = imageAttachment("e1035c41-4f18-45d8-89ca-7a955a1f5632");
+    const thread = store.openDm("human-forgotten", "ai-mira");
+    store.addDmMessage(
+      thread.id,
+      "human-forgotten",
+      "private",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [privateAttachment],
+    );
+    const removedIds: string[] = [];
+    store.onMessagesRemoved((messages) => {
+      removedIds.push(...messages.flatMap((message) => message.attachments?.map((attachment) => attachment.id) ?? []));
+    });
+    store.forgetDmParticipant("human-forgotten");
+    expect(removedIds).toContain(privateAttachment.id);
+    expect(store.canViewImageAttachment(privateAttachment.id, "ai-mira")).toBe(false);
+  });
+
+  it("hands private image files to retention cleanup when bounded DM history trims them", () => {
+    const store = new RoomStore(tempStorePath(), {
+      dmHistoryHardLimit: 160,
+      dmHistoryTrimTo: 120,
+    });
+    const thread = store.openDm("human-dm-retention", "ai-mira");
+    const oldAttachment = imageAttachment("35c5c4ac-b6b3-498e-b0f1-f71ccbadd8bb");
+    store.addDmMessage(
+      thread.id,
+      "human-dm-retention",
+      "old private image",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [oldAttachment],
+    );
+    const removedIds: string[] = [];
+    store.onMessagesRemoved((messages) => {
+      removedIds.push(...messages.flatMap((message) => message.attachments?.map((attachment) => attachment.id) ?? []));
+    });
+
+    for (let index = 0; index < 160; index += 1) {
+      store.addDmMessage(thread.id, "ai-mira", `newer private message ${index}`);
+    }
+
+    expect(store.getDmMessages(thread.id)).toHaveLength(120);
+    expect(removedIds).toContain(oldAttachment.id);
+    expect(store.canViewImageAttachment(oldAttachment.id, "human-dm-retention")).toBe(false);
   });
 
   it("migrates version 2 and persists canonical trusted channel languages across restart", async () => {

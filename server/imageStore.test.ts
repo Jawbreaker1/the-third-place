@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { fetchRemoteImage, ImageStore, ImageStoreError, sanitizeImageBuffer } from "./imageStore.js";
+import { createMessage } from "./store.js";
 
 const png = async (width: number, height: number): Promise<Buffer> =>
   await sharp({
@@ -115,6 +116,27 @@ describe("image store safety", () => {
       await restoredStore.remove(attachment.id);
       expect(await restoredStore.read(attachment.id)).toBeUndefined();
       expect((await readdir(directory)).some((name) => name.startsWith(attachment.id))).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("retains sanitized files referenced by a private message during restart recovery", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-private-images-"));
+    try {
+      const firstStore = new ImageStore(directory);
+      const attachment = await firstStore.create(await png(16, 12), "image/png");
+      const privateMessage = createMessage(
+        "dm:ai-mira:human-johan",
+        "human-johan",
+        "private image",
+        { attachments: [attachment] },
+      );
+
+      const restartedStore = new ImageStore(directory);
+      await restartedStore.initialize([privateMessage]);
+      expect((await restartedStore.read(attachment.id))?.byteLength).toBeGreaterThan(0);
+      expect((await restartedStore.read(attachment.id, true))?.byteLength).toBeGreaterThan(0);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

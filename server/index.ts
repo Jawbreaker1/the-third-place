@@ -42,6 +42,7 @@ import { SocialDirector } from "./director.js";
 import { AmbientEpisodeLedger } from "./ambientEpisodeLedger.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
 import { fetchRemoteImage, ImageStore, ImageStoreError } from "./imageStore.js";
+import { planDmImageVision, startPlannedDmImageVision } from "./dmImagePolicy.js";
 import {
   assertHumanMemoryContinuity,
   HUMAN_MEMORY_DEFAULTS,
@@ -724,12 +725,25 @@ const voiceDirector = new VoiceDirector({
   },
 });
 
-const analyzeImageMessage = (message: ChatMessage, human: Member): void => {
+type ImageAnalysisAudience =
+  | { kind: "public" }
+  | {
+    kind: "dm";
+    participants: [string, string];
+    completeDirectImage?: () => void;
+  };
+
+const analyzeImageMessage = (
+  message: ChatMessage,
+  human: Member,
+  audience: ImageAnalysisAudience = { kind: "public" },
+): void => {
   const attachment = message.attachments?.[0];
   if (!attachment) return;
-  void imageStore.read(attachment.id).then(async (image) => {
+  void (async () => {
     let analysis: ImageAnalysis = { status: "unavailable" };
     try {
+      const image = await imageStore.read(attachment.id);
       if (!image) throw new Error("Sanitized image was unavailable");
       const observation = await lm.analyzeImage(image, message.content, 1);
       analysis = { status: "ready", observation };
@@ -737,7 +751,10 @@ const analyzeImageMessage = (message: ChatMessage, human: Member): void => {
       console.warn("Image analysis unavailable:", error instanceof Error ? error.message : error);
     }
     const updated = store.setImageAnalysis(message.channelId, message.id, attachment.id, analysis);
-    if (!updated) return;
+    if (!updated) {
+      if (audience.kind === "dm") audience.completeDirectImage?.();
+      return;
+    }
     imageStore.update(updated);
     const payload: ImageAnalysisPayload = {
       channelId: message.channelId,
@@ -745,8 +762,18 @@ const analyzeImageMessage = (message: ChatMessage, human: Member): void => {
       attachmentId: attachment.id,
       analysis,
     };
-    io.to("public").emit("image-analysis:update", payload);
-    director.onHumanImageReady(message, human, analysis.status === "ready" ? analysis.observation : undefined);
+    if (audience.kind === "public") {
+      io.to("public").emit("image-analysis:update", payload);
+      director.onHumanImageReady(message, human, analysis.status === "ready" ? analysis.observation : undefined);
+      return;
+    }
+    for (const participantId of audience.participants) {
+      io.to(`user:${participantId}`).emit("image-analysis:update", payload);
+    }
+    audience.completeDirectImage?.();
+  })().catch((error) => {
+    console.warn("Image analysis finalization failed safely:", error instanceof Error ? error.message : error);
+    if (audience.kind === "dm") audience.completeDirectImage?.();
   });
 };
 
@@ -1121,46 +1148,28 @@ app.post("/api/voice/:roomId/turns", async (request, response) => {
   }
 });
 
-app.get("/api/images/:imageId", async (request, response) => {
-  if (!sessionFromRequest(request)) {
-    response.status(401).json({ ok: false, error: "Join the room to view shared images." });
-    return;
-  }
-  const image = await imageStore.read(request.params.imageId, request.query.variant === "thumbnail");
-  if (!image) {
-    response.status(404).json({ ok: false, error: "That image is no longer available." });
-    return;
-  }
-  response.setHeader("Content-Type", "image/webp");
-  response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
-  response.setHeader("X-Content-Type-Options", "nosniff");
-  response.setHeader("Content-Disposition", "inline");
-  response.send(image);
-});
+type ImageMessageDestination =
+  | { kind: "public"; channelId: string }
+  | { kind: "dm"; threadId: string; participants: [string, string] };
 
-app.post("/api/channels/:channelId/image-messages", async (request, response) => {
-  const session = sessionFromRequest(request);
-  if (!session) {
-    response.status(401).json({ ok: false, error: "Join the room before sharing an image." } satisfies ImageMessageResult);
-    return;
-  }
+const handleImageMessageUpload = async (
+  request: Request,
+  response: Response,
+  session: HumanSession,
+  destination: ImageMessageDestination,
+): Promise<void> => {
   if (!hasAllowedOrigin(request)) {
     response.status(403).json({ ok: false, error: "That upload origin is not allowed." } satisfies ImageMessageResult);
     return;
   }
   if (!session.imageBucket.take()) {
-    response.status(429).json({ ok: false, error: "Image cooldown — give the room a moment." } satisfies ImageMessageResult);
+    response.status(429).json({ ok: false, error: "Image cooldown — give the conversation a moment." } satisfies ImageMessageResult);
     return;
   }
   if (activeImageIngests >= MAX_CONCURRENT_IMAGE_INGESTS) {
     response
       .status(503)
       .json({ ok: false, error: "The image desk is busy — try again in a moment." } satisfies ImageMessageResult);
-    return;
-  }
-  const channelId = request.params.channelId;
-  if (!CHANNELS.some((channel) => channel.id === channelId)) {
-    response.status(404).json({ ok: false, error: "That public channel does not exist." } satisfies ImageMessageResult);
     return;
   }
 
@@ -1175,26 +1184,67 @@ app.post("/api/channels/:channelId/image-messages", async (request, response) =>
     if (Boolean(form.file) === Boolean(form.imageUrl)) {
       throw new ImageStoreError("Attach exactly one uploaded image or direct HTTPS image URL.");
     }
-    const replied = form.replyToId ? store.getMessage(form.replyToId) : undefined;
-    if (form.replyToId && (!replied || replied.channelId !== channelId)) {
-      throw new ImageStoreError("That reply target is no longer available in this channel.");
+    const conversationId = destination.kind === "public" ? destination.channelId : destination.threadId;
+    const replied = form.replyToId
+      ? destination.kind === "public"
+        ? store.getMessage(form.replyToId)
+        : store.getDmMessages(destination.threadId).find((message) => message.id === form.replyToId)
+      : undefined;
+    if (form.replyToId && (!replied || replied.channelId !== conversationId)) {
+      throw new ImageStoreError("That reply target is no longer available in this conversation.");
     }
 
     const input = form.file ?? (form.imageUrl ? await fetchRemoteImage(form.imageUrl) : undefined);
     if (!input) throw new ImageStoreError("Choose an image to share.");
     const attachment = await imageStore.create(input.body, "mimeType" in input ? input.mimeType : input.contentType);
     attachmentId = attachment.id;
-    const message = createMessage(channelId, session.member.id, content, {
-      replyToId: form.replyToId,
-      ...(replied ? { replyPreview: replyPreviewFor(replied) } : {}),
-      authorSnapshot: { ...session.member, status: "offline" },
-      attachments: [attachment],
+    if (destination.kind === "public") {
+      const message = createMessage(destination.channelId, session.member.id, content, {
+        replyToId: form.replyToId,
+        ...(replied ? { replyPreview: replyPreviewFor(replied) } : {}),
+        authorSnapshot: { ...session.member, status: "offline" },
+        attachments: [attachment],
+      });
+      store.addPublicMessage(message);
+      attachmentId = undefined;
+      io.to("public").emit("message:new", message);
+      if (message.content) humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
+      director.onHumanImagePosted(message);
+      analyzeImageMessage(message, session.member);
+      response.status(201).json({ ok: true, message } satisfies ImageMessageResult);
+      return;
+    }
+
+    const visionPlan = planDmImageVision(
+      destination.participants,
+      session.member.id,
+      new Set(PERSONAS.map((persona) => persona.id)),
+    );
+    attachment.analysis = visionPlan.initialAnalysis;
+    const message = store.addDmMessage(
+      destination.threadId,
+      session.member.id,
+      content,
+      form.replyToId,
+      undefined,
+      undefined,
+      undefined,
+      [attachment],
+      { ...session.member, status: "offline" },
+    );
+    if (!message) throw new ImageStoreError("That private conversation is no longer available.", 404);
+    attachmentId = undefined;
+    emitDmUpdate(destination.participants, message);
+    startPlannedDmImageVision(visionPlan, (residentId) => {
+      const persona = PERSONAS.find((candidate) => candidate.id === residentId);
+      if (!persona) return;
+      const pendingDirectImage = director.onDirectImagePosted(message, session.member, persona);
+      analyzeImageMessage(message, session.member, {
+        kind: "dm",
+        participants: destination.participants,
+        completeDirectImage: pendingDirectImage.complete,
+      });
     });
-    store.addPublicMessage(message);
-    io.to("public").emit("message:new", message);
-    if (message.content) humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
-    director.onHumanImagePosted(message);
-    analyzeImageMessage(message, session.member);
     response.status(201).json({ ok: true, message } satisfies ImageMessageResult);
   } catch (error) {
     if (attachmentId) await imageStore.remove(attachmentId);
@@ -1204,6 +1254,66 @@ app.post("/api/channels/:channelId/image-messages", async (request, response) =>
   } finally {
     activeImageIngests -= 1;
   }
+};
+
+app.get("/api/images/:imageId", async (request, response) => {
+  const session = sessionFromRequest(request);
+  if (!session) {
+    response.status(401).json({ ok: false, error: "Join the room to view shared images." });
+    return;
+  }
+  const visibility = store.imageAttachmentVisibilityFor(request.params.imageId, session.member.id);
+  if (!visibility) {
+    response.status(404).json({ ok: false, error: "That image is no longer available." });
+    return;
+  }
+  const image = await imageStore.read(request.params.imageId, request.query.variant === "thumbnail");
+  if (!image) {
+    response.status(404).json({ ok: false, error: "That image is no longer available." });
+    return;
+  }
+  response.setHeader("Content-Type", "image/webp");
+  response.setHeader(
+    "Cache-Control",
+    visibility === "private" ? "private, no-store" : "private, max-age=31536000, immutable",
+  );
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("Content-Disposition", "inline");
+  response.send(image);
+});
+
+app.post("/api/channels/:channelId/image-messages", async (request, response) => {
+  const session = sessionFromRequest(request);
+  if (!session) {
+    response.status(401).json({ ok: false, error: "Join the room before sharing an image." } satisfies ImageMessageResult);
+    return;
+  }
+  const channelId = request.params.channelId;
+  if (!CHANNELS.some((channel) => channel.id === channelId)) {
+    response.status(404).json({ ok: false, error: "That public channel does not exist." } satisfies ImageMessageResult);
+    return;
+  }
+  await handleImageMessageUpload(request, response, session, { kind: "public", channelId });
+});
+
+app.post("/api/dms/:threadId/image-messages", async (request, response) => {
+  const session = sessionFromRequest(request);
+  if (!session) {
+    response.status(401).json({ ok: false, error: "Join before sharing an image." } satisfies ImageMessageResult);
+    return;
+  }
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, error: "That upload origin is not allowed." } satisfies ImageMessageResult);
+    return;
+  }
+  const threadId = request.params.threadId;
+  const participants = store.getDmParticipants(threadId);
+  if (!participants?.includes(session.member.id)) {
+    // Do not reveal whether an inaccessible private thread exists.
+    response.status(404).json({ ok: false, error: "That private conversation is not available." } satisfies ImageMessageResult);
+    return;
+  }
+  await handleImageMessageUpload(request, response, session, { kind: "dm", threadId, participants });
 });
 
 app.get("/api/preview", (_request, response) => {
@@ -1828,13 +1938,13 @@ if (!humanMemoryLoad.continuityVerified) {
 for (const profile of humanMemory.listRestorableProfiles()) {
   sessions.set(profile.tokenHash, createHumanSession(profile.tokenHash, profile.member, profile.lastSeenAt));
 }
-await imageStore.initialize(store.getAllMessages());
+await imageStore.initialize(store.getAllImageMessages());
 store.onMessagesRemoved((removed) => {
   for (const message of removed) {
     for (const attachment of message.attachments ?? []) void imageStore.remove(attachment.id);
   }
 });
-for (const message of store.getAllMessages()) {
+for (const message of store.getAllImageMessages()) {
   for (const attachment of message.attachments ?? []) {
     if (attachment.analysis.status !== "pending") continue;
     const unavailable: ImageAnalysis = { status: "unavailable" };
