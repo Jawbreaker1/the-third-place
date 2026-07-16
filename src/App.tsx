@@ -563,9 +563,10 @@ export default function App() {
     context.createMediaStreamSource(stream).connect(highPass).connect(analyser);
     voiceAudioContextRef.current = context;
     context.onstatechange = () => setVoiceVadPaused(context.state !== "running" && context.state !== "closed");
-    // Preserve brief conversational acknowledgements. The high-pass activity
-    // signal and server-side acoustic gate handle stationary noise separately.
-    voiceActivityRef.current = new VoiceActivityDetector({ startFrames: 2, minSpeechMs: 140 });
+    // Keep the detector's conservative defaults. Neural speech validation on
+    // the server remains authoritative, while this browser gate only decides
+    // when to cut a recording segment.
+    voiceActivityRef.current = new VoiceActivityDetector();
     const samples = new Float32Array(analyser.fftSize);
     const sample = () => {
       analyser.getFloatTimeDomainData(samples);
@@ -665,7 +666,10 @@ export default function App() {
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        // Automatic gain can turn quiet fans and keyboard clicks into apparent
+        // foreground speech. Echo/noise suppression remain enabled, while the
+        // server performs the language-neutral speech decision.
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
         video: false,
       });
     } catch (error) {
@@ -1759,9 +1763,10 @@ export default function App() {
     const roomId = joinedVoiceRoomRef.current;
     if (event.type === "speechStarted") {
       voiceVadSpeakingRef.current = true;
-      voicePlaybackRef.current?.bargeIn();
-      setVoiceAiAudioBlocked(false);
-      setVoiceBrowserSpeech(false);
+      // This is only a fast acoustic hint. Keyboard clicks can cross a browser
+      // RMS threshold, so never cancel AI audio or generation until the server
+      // has accepted a real transcript. The accepted human-final turn will
+      // supersede stale AI work; a little overlap is preferable to false stops.
       if (roomId) socketRef.current?.emit("voice:self-state", {
         roomId,
         muted: voiceMutedRef.current,

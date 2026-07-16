@@ -659,11 +659,10 @@ const voiceDirector = new VoiceDirector({
       content: message.content,
       createdAt: message.createdAt,
     })),
-  // Browser VAD has already observed a quiet boundary. Keep only a small
-  // coalescing window; renewed human speech still cancels in-flight AI work.
-  floorSilenceMs: 150,
-  floorRecheckMs: 100,
-  hasPendingHumanIngest: (roomId) => (pendingVoiceIngestsByRoom.get(roomId) ?? 0) > 0,
+  // The browser has already observed a quiet boundary and the server has
+  // accepted real speech. Start immediately; a later accepted human turn may
+  // supersede this one, but an untrusted RMS hint never can.
+  floorSilenceMs: 0,
   events: {
     roomChanged: publishVoiceRoom,
     transcriptFinal: (entry) => io.to(voiceSocketRoom(entry.roomId)).emit("voice:transcript:final", entry),
@@ -1449,18 +1448,12 @@ io.on("connection", (socket) => {
       acknowledge?.({ ok: false, code: "NOT_AUTHORIZED", error: "That voice state is invalid." });
       return;
     }
-    const wasSpeaking = voiceRooms.getRoom(parsed.data.roomId)?.participants
-      .find((participant) => participant.memberId === session.member.id)?.speaking ?? false;
     const result = voiceRooms.setHumanState(parsed.data.roomId, socket.id, parsed.data);
     if (result.ok) {
       publishVoiceRoom(result.room);
-      const isSpeakingNow = result.room.participants.find(
-        (participant) => participant.memberId === session.member.id,
-      )?.speaking ?? false;
-      if (parsed.data.speaking === true && !wasSpeaking && isSpeakingNow) {
-        voiceDirector.onHumanSpeechStarted(parsed.data.roomId);
-        director.noteHumanVoiceActivity(result.room.channelId);
-      }
+      // `speaking` is an untrusted, low-latency UI hint from the browser RMS
+      // detector. Do not let keyboard clicks or room noise cancel generation.
+      // Accepted STT turns notify both directors in the voice upload endpoint.
     }
     acknowledge?.(result);
   });

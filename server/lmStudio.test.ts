@@ -9,7 +9,12 @@ import {
   type SceneRequest,
 } from "./lmStudio.js";
 import { PERSONAS } from "./personas.js";
-import { turnAnalysisInputSchema, type NormalizedTurnAnalysisInput } from "./semanticRouter.js";
+import {
+  buildTurnAnalysisSystemPrompt,
+  buildVoiceTurnAnalysisSystemPrompt,
+  turnAnalysisInputSchema,
+  type NormalizedTurnAnalysisInput,
+} from "./semanticRouter.js";
 import { resolveLocalDateTime } from "./timeResolver.js";
 
 const jsonResponse = (payload: unknown) =>
@@ -53,6 +58,69 @@ const dmTurnInput = (
   medium: "dm",
   channel: { id: channelId, name: "private chat with Mira" },
   mechanicalAddressedPersonaIds: ["ai-mira"],
+});
+
+const voiceTurnInput = (turnId = "voice-analysis-1"): NormalizedTurnAnalysisInput =>
+  turnAnalysisInputSchema.parse({
+    turnId,
+    medium: "voice",
+    channel: { id: "lobby", name: "lobby" },
+    latestMessage: {
+      id: `${turnId}-message`,
+      authorId: "human-jaw-b",
+      authorName: "Jaw_B",
+      content: "Det där var faktiskt rätt kul.",
+    },
+    recentMessages: [{
+      id: `${turnId}-recent`,
+      authorId: "ai-mira",
+      authorName: "Mira",
+      content: "Jag trodde aldrig att den skulle fungera.",
+    }],
+    personaCandidates: [
+      { id: "ai-mira", name: "Mira", interests: ["film"] },
+      { id: "ai-sana", name: "Sana", interests: ["programming"] },
+    ],
+    mechanicalAddressedPersonaIds: [],
+    urlCandidates: [],
+    availableCapabilities: ["local_datetime"],
+    historyRecallAvailable: false,
+    transportLanguageHint: "sv",
+  });
+
+const voiceTurnAnalysisCompletion = () => jsonResponse({
+  choices: [{
+    message: {
+      content: JSON.stringify({
+        l: "sv",
+        lx: 0.99,
+        rl: "sv",
+        rlx: 0.99,
+        i: { k: "statement", q: false, r: "optional", x: 0.97 },
+        p: { a: [], r: [], v: ["ai-mira"], x: 0, y: 0.9 },
+        s: { w: 0.5, h: 0, p: 0.4, a: 0, u: 0, e: 0.4, o: 0, c: 0.1, x: 0.96 },
+        b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 0.97 },
+        m: { r: "none", a: "none", c: [], x: 0.99 },
+        e: {
+          a: "none",
+          x: 0.99,
+          g: null,
+          q: null,
+          u: null,
+          m: null,
+          z: null,
+          k: null,
+          l: null,
+          c: null,
+          w: null,
+          f: null,
+        },
+        c: { d: [], r: "none", a: false, i: false, l: false, x: 0.99 },
+        h: { n: "none", q: null, x: 1 },
+        y: [],
+      }),
+    },
+  }],
 });
 
 const turnAnalysisCompletion = (overrides: Record<string, unknown> = {}) => jsonResponse({
@@ -202,6 +270,49 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionBody.messages[1].content).toContain('"ref":"latest:0"');
     expect(completionBody.messages[1].content).toContain('"communityClock":{"timeZone":"Europe/Stockholm","locationLabel":"The Third Place"}');
     expect(completionBody.messages[1].content).not.toContain('"url":');
+    expect(completionBody.messages[0].content).toBe(buildTurnAnalysisSystemPrompt());
+  });
+
+  it("uses the compact voice prompt with the same strict schema and complete router payload", async () => {
+    let completionCalls = 0;
+    let completionBody: any;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      completionBody = JSON.parse(String(init?.body));
+      return voiceTurnAnalysisCompletion();
+    }));
+
+    await expect(new LmStudioClient({
+      communityTimeZone: "Europe/Stockholm",
+      communityLocationLabel: "The Third Place",
+    }).analyzeTurn(voiceTurnInput())).resolves.toMatchObject({
+      source: "lm",
+      responseLanguage: { tag: "sv" },
+      evidence: { action: "none" },
+      personas: { relevantIds: ["ai-mira"] },
+    });
+
+    expect(completionCalls).toBe(1);
+    expect(completionBody.messages[0].content).toBe(buildVoiceTurnAnalysisSystemPrompt());
+    expect(completionBody.messages[0].content).not.toBe(buildTurnAnalysisSystemPrompt());
+    expect(completionBody).toMatchObject({
+      temperature: 0,
+      reasoning_effort: "none",
+      max_tokens: 600,
+      response_format: { type: "json_schema", json_schema: { strict: true } },
+    });
+    expect(completionBody.response_format.json_schema.schema.properties.e.properties.a.enum)
+      .toEqual(["none", "local_datetime"]);
+    const userData = JSON.parse(completionBody.messages[1].content);
+    expect(userData).toMatchObject({
+      medium: "voice",
+      transportLanguageHint: "sv",
+      availableCapabilities: ["local_datetime"],
+      historyRecallAvailable: false,
+      communityClock: { timeZone: "Europe/Stockholm", locationLabel: "The Third Place" },
+    });
+    expect(userData.recentMessages).toHaveLength(1);
   });
 
   it("runs persistent memory as a separate strict multilingual pass and deduplicates it", async () => {
@@ -1440,6 +1551,98 @@ describe("LM Studio multilingual batch candidate review", () => {
     ]);
   });
 
+  it("gives a voice delivery guarantee one reviewed recovery without manufacturing request ownership", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: sana.id, content: "Jag funderar mest på om det blir regn i helgen." }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: sana.id,
+          severity: "high",
+          issues: ["irrelevant_to_turn"],
+          rewriteInstruction: "Besvara den senaste talade frågan direkt.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{ personaId: sana.id, content: "Jag väljer te, mest för att kaffe gör mig alldeles för rastlös." }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "voice",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [{
+        author: "Alex",
+        kind: "human",
+        content: "Sana, kaffe eller te?",
+        createdAt: "2026-07-16T12:00:00.000Z",
+        utteranceOrigin: "microphone-stt",
+      }],
+      trigger: {
+        author: "Alex",
+        content: "Sana, kaffe eller te?",
+        messageId: "voice-recovery-1",
+        createdAt: "2026-07-16T12:00:00.000Z",
+      },
+      mustReplyIds: [sana.id],
+      responseRecoveryIds: [sana.id],
+      requestOwnerIds: [],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: false,
+        replyExpected: "optional",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      voiceContext: {
+        latestSpeakerId: "human-alex",
+        latestUtteranceOrigin: "microphone-stt",
+        acousticEvidenceAvailable: false,
+        participants: [
+          { memberId: "human-alex", name: "Alex", kind: "human" },
+          { memberId: sana.id, name: sana.name, kind: "ai" },
+        ],
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([
+      "Jag väljer te, mest för att kaffe gör mig alldeles för rastlös.",
+    ]);
+    expect(bodies).toHaveLength(4);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    const recoveryScene = JSON.parse(bodies[2].messages[1].content);
+    const recoveryReview = JSON.parse(bodies[3].messages[1].content);
+    expect(firstReview.candidates).toEqual([
+      expect.objectContaining({ personaId: sana.id, mustReply: true, mustFulfillRequest: false }),
+    ]);
+    expect(recoveryScene).toMatchObject({
+      requiredActorIds: [sana.id],
+      explicitRequestOwnerIds: [],
+    });
+    expect(recoveryScene.premise).toContain('"irrelevant_to_turn"');
+    expect(recoveryScene.premise).toContain("Answer the newest complete turn itself");
+    expect(recoveryReview.candidates).toEqual([
+      expect.objectContaining({ personaId: sana.id, mustReply: true, mustFulfillRequest: false }),
+    ]);
+  });
+
   it("keeps explicit sole-DM ownership true throughout its one reviewed retry", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
@@ -1502,6 +1705,8 @@ describe("LM Studio multilingual batch candidate review", () => {
     ]);
     expect(retryScene.explicitRequestOwnerIds).toEqual([mira.id]);
     expect(retryScene.premise).toContain("one bounded full-scene retry");
+    expect(retryScene.premise).toContain('"unfulfilled_explicit_request"');
+    expect(retryScene.premise).toContain("Deliver the requested answer or self-contained artifact now");
     expect(retryReview.candidates).toEqual([
       expect.objectContaining({ personaId: mira.id, mustReply: true, mustFulfillRequest: true }),
     ]);

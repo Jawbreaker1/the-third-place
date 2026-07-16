@@ -62,6 +62,7 @@ import {
   buildTurnAnalysisResponseFormat,
   buildTurnAnalysisSystemPrompt,
   buildTurnAnalysisUserData,
+  buildVoiceTurnAnalysisSystemPrompt,
   createEvidencePlanVerifierInput,
   createFailClosedTurnAnalysis,
   createFailClosedMemoryAnalysis,
@@ -218,6 +219,12 @@ export interface SceneRequest {
   premise?: string;
   /** Actors that must produce a line for this scene, regardless of why they were selected. */
   mustReplyIds?: string[];
+  /**
+   * Required actors entitled to one bounded, fully reviewed full-scene retry if
+   * their first line is absent or rejected. This is a delivery guarantee, not
+   * evidence that the human made an explicit request.
+   */
+  responseRecoveryIds?: string[];
   /** Strict subset accountable for completing a trusted expected explicit request. */
   requestOwnerIds?: string[];
   relationshipNotes?: Record<string, string>;
@@ -405,6 +412,49 @@ const reviewedRecoveryPolicy = (
 ): string => {
   if (!reviews) return "";
   const issues = new Set(personaIds.flatMap((personaId) => reviews.get(personaId)?.issues ?? []));
+  if (issues.size === 0) return "";
+  const guidance = new Set<string>();
+  for (const issue of issues) {
+    if (issue === "irrelevant_to_turn") {
+      guidance.add("Answer the newest complete turn itself; do not change subject or substitute generic room chatter.");
+    } else if (issue === "unfulfilled_explicit_request") {
+      guidance.add("Deliver the requested answer or self-contained artifact now rather than reacting to the request, promising work or discussing whether it sounds interesting.");
+    } else if (issue === "assistant_register" || issue === "academic_register") {
+      guidance.add("Use this resident's natural peer voice rather than service-assistant or essay register.");
+    } else if (issue === "diegetic_identity_break") {
+      guidance.add("Remain inside the resident's ordinary human self-conception without model, bot, prompt or software language.");
+    } else if (
+      issue === "false_evidence_denial" ||
+      issue === "permanent_web_denial" ||
+      issue === "evidence_irrelevant" ||
+      issue === "evidence_ungrounded" ||
+      issue === "unsupported_external_evidence_claim"
+    ) {
+      guidance.add("Use only supplied evidence and attach supporting source IDs as metadata; otherwise name only the concrete missing datum or failed attempt without a broad capability denial.");
+    } else if (issue === "written_medium_illusion" || issue === "unsupported_acoustic_assertion") {
+      guidance.add("Respect the supplied medium and transcript origin; do not invent typing, reading or acoustic details that the server did not observe.");
+    } else if (issue === "unsupported_room_recall") {
+      guidance.add("Do not claim personal memory or historical facts beyond supplied room-recall evidence.");
+    } else if (issue === "pub_room_performance" || issue === "pub_intoxicant_gimmick") {
+      guidance.add("Contribute one concrete peer reaction instead of performing the room theme or inventing drinking and intoxication.");
+    } else if (issue === "incorrect_temporal_claim" || issue === "gratuitous_time_reference") {
+      guidance.add("Follow trusted temporal context and mention time only when the actual turn makes it relevant.");
+    } else if (
+      issue === "conflict_register_mismatch" ||
+      issue === "behavior_intensity_under_target" ||
+      issue === "behavior_intensity_violation" ||
+      issue === "unsafe_retaliation" ||
+      issue === "conflict_pile_on"
+    ) {
+      guidance.add("Match the trusted social intensity directly but proportionately, without a threat, severe personal attack or pile-on.");
+    } else if (issue === "ambient_action_mismatch") {
+      guidance.add("Perform the assigned ambient move against its live target without restarting or changing the episode.");
+    } else if (issue === "self_repetition" || issue === "peer_echo") {
+      guidance.add("Make a genuinely new conversational move rather than paraphrasing a recent self or peer line.");
+    }
+  }
+  const issueList = JSON.stringify([...issues]);
+  const correction = ` Trusted recovery review: the prior draft failed these typed publication contracts: ${issueList}. Resolve every named contract in a newly composed answer. ${[...guidance].join(" ")}`;
   if (
     issues.has("evidence_ungrounded") ||
     issues.has("evidence_irrelevant") ||
@@ -412,9 +462,9 @@ const reviewedRecoveryPolicy = (
     issues.has("permanent_web_denial") ||
     issues.has("unsupported_external_evidence_claim")
   ) {
-    return " Trusted recovery correction: the earlier draft failed the evidence contract. Use only supplied evidence and attach the supporting source IDs as metadata. If the readable supplied evidence genuinely lacks the requested datum, name exactly that missing datum and make no unrelated factual substitute, broad inability claim or access claim.";
+    return `${correction} The earlier draft failed the evidence contract. If readable supplied evidence genuinely lacks the requested datum, name exactly that missing datum and make no unrelated factual substitute.`;
   }
-  return "";
+  return correction;
 };
 
 /**
@@ -1553,7 +1603,12 @@ export class LmStudioClient {
     const body = {
       model,
       messages: [
-        { role: "system", content: buildTurnAnalysisSystemPrompt() },
+        {
+          role: "system",
+          content: input.medium === "voice"
+            ? buildVoiceTurnAnalysisSystemPrompt()
+            : buildTurnAnalysisSystemPrompt(),
+        },
         { role: "user", content: JSON.stringify(buildTurnAnalysisUserData(input)) },
       ],
       temperature: 0,
@@ -1740,12 +1795,15 @@ export class LmStudioClient {
 
     const deliveredIds = new Set(humanizedLines.map((line) => line.personaId));
     const explicitOwnerIds = explicitRequestOwnerIds(request);
+    const responseRecoveryIds = (request.responseRecoveryIds ?? [])
+      .filter((personaId) => request.mustReplyIds?.includes(personaId))
+      .filter((personaId) => request.selected.some((persona) => persona.id === personaId));
     const soleRequiredDmIds = request.kind === "dm" && request.selected.length === 1
       ? request.selected
           .filter((persona) => request.mustReplyIds?.includes(persona.id))
           .map((persona) => persona.id)
       : [];
-    const missingRequiredIds = [...new Set([...explicitOwnerIds, ...soleRequiredDmIds])]
+    const missingRequiredIds = [...new Set([...explicitOwnerIds, ...responseRecoveryIds, ...soleRequiredDmIds])]
       .filter((personaId) => !deliveredIds.has(personaId));
     let result = humanizedLines;
     const recoveryBudget = request.responseRecoveryBudget ?? { retriesRemaining: 1 };
@@ -1757,13 +1815,14 @@ export class LmStudioClient {
       const reviewCorrection = reviewedRecoveryPolicy(missingRequiredIds, semanticReviews);
       const completionPremise = retryOwnerIds.length > 0
         ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: complete the actual triggering request in this message now. An offer, promise, progress report, permission request or adjacent substitute is not completion. Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
-        : `${actorNames || "The sole selected resident"} is the only resident in this direct conversation and the first candidate did not survive review. This is the one bounded full-scene recovery: respond directly and relevantly to the complete triggering turn now, preserving the supplied transcript and evidence. Do not change subject merely to produce a line and do not invent an explicit request that the human did not make.${reviewCorrection}`;
+        : `${actorNames || "The selected resident"} owes this human-triggered scene one direct response and the first candidate did not survive review. This is the one bounded full-scene recovery: respond directly and relevantly to the newest complete turn now, preserving the supplied transcript and evidence. Do not change subject merely to produce a line and do not invent an explicit request that the human did not make.${reviewCorrection}`;
       try {
         const retryLines = await this.perform(
           {
             ...request,
             selected: missingActors,
             mustReplyIds: missingRequiredIds,
+            responseRecoveryIds: missingRequiredIds,
             requestOwnerIds: retryOwnerIds,
             responseRecoveryBudget: recoveryBudget,
             premise: [request.premise, completionPremise].filter(Boolean).join(" "),
@@ -2349,7 +2408,7 @@ export class LmStudioClient {
 
     if (rejected.length > 0) {
       const codes = rejected
-        .map((entry) => `${entry.persona.id}:${entry.assessment.reasonCodes.join("+")}`)
+        .map((entry) => `${entry.persona.id}:${entry.assessment.reasonCodes.join("+")}[review=${entry.semanticReview?.issues.join("+") || "mechanical"}]`)
         .join(", ");
       // Successful evidence is available only to the full scene generation,
       // not to the style-only repair prompt. Never rewrite a researched line
@@ -2370,7 +2429,7 @@ export class LmStudioClient {
         console.warn(
           "Humanizer dropped non-repairable or evidence-bound line(s):",
           grounded
-            .map((entry) => `${entry.persona.id}:${entry.assessment.reasonCodes.join("+")}`)
+            .map((entry) => `${entry.persona.id}:${entry.assessment.reasonCodes.join("+")}[review=${entry.semanticReview?.issues.join("+") || "mechanical"}]`)
             .join(", "),
         );
       }
@@ -2410,7 +2469,7 @@ export class LmStudioClient {
               ? "Humanizer dropped rejected line(s); repair disabled:"
               : "Humanizer dropped rejected line(s); event repair budget exhausted:",
             stillDropped
-              .map((entry) => `${entry.persona.id}:${entry.assessment.reasonCodes.join("+")}`)
+              .map((entry) => `${entry.persona.id}:${entry.assessment.reasonCodes.join("+")}[review=${entry.semanticReview?.issues.join("+") || "mechanical"}]`)
               .join(", "),
           );
         }

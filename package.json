@@ -14,6 +14,8 @@
     "lm:check": "node scripts/lm-check.mjs",
     "smoke:e2e": "node scripts/e2e-smoke.mjs",
     "smoke:voice": "node scripts/voice-smoke.mjs",
+    "setup:stt-vad": "node scripts/setup-stt-vad.mjs",
+    "test:stt-vad-setup": "node --test scripts/stt-vad-setup.node-test.mjs",
     "setup:tts": "node scripts/setup-piper-tts.mjs",
     "prestart:tts": "npm run setup:tts",
     "start:tts": "node scripts/start-piper-tts.mjs",

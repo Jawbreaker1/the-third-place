@@ -262,19 +262,6 @@ export class VoiceDirector {
     this.scheduleFloorResponse(entry, epoch, floorSilenceMs, channelContext);
   }
 
-  /** Human speech owns the floor immediately, before STT has finished. */
-  onHumanSpeechStarted(roomId: string): void {
-    const hasActiveAiWork = this.pendingResponseTimerByRoom.has(roomId) ||
-      this.generationAbortByRoom.has(roomId) ||
-      this.speechAbortByRoom.has(roomId) ||
-      (this.options.runtime.getRoom(roomId)?.participants.some(
-        (participant) => participant.kind === "ai" && (participant.botState === "thinking" || participant.botState === "speaking"),
-      ) ?? false);
-    if (!hasActiveAiWork) return;
-    this.invalidateRoom(roomId);
-    this.resetBotsToListening(roomId);
-  }
-
   invalidateRoom(roomId: string): number {
     const pending = this.pendingResponseTimerByRoom.get(roomId);
     if (pending) clearTimeout(pending);
@@ -544,6 +531,10 @@ export class VoiceDirector {
           history: transcriptFor(this.options.runtime.getTranscript(room.id), persona.id),
           trigger: { author: entry.speakerName, content: entry.text, messageId: entry.id, createdAt: entry.endedAt },
           mustReplyIds: [persona.id],
+          // Every accepted human voice turn that reaches a selected resident is
+          // entitled to one reviewed recovery even when semantic intent routing
+          // is uncertain. This does not manufacture explicit request ownership.
+          responseRecoveryIds: [persona.id],
           requestOwnerIds: (trusted.intentTrusted && trusted.replyExpected === "expected") || invocation
             ? [persona.id]
             : [],
@@ -596,6 +587,9 @@ export class VoiceDirector {
           requestedClock: capabilityScene?.requestedClock,
           temporalPolicy: capabilityScene?.temporalPolicy ?? "reactive_only",
           temporalSurfaceActorId: capabilityScene?.temporalPolicy ? persona.id : undefined,
+          // Spoken turns should not pay for an optional stylistic rewrite and
+          // second review. The mandatory first semantic review remains intact.
+          humanizerBudget: { repairsRemaining: 0 },
           premise: `${persona.name} has joined an active multi-participant voice call. Answer the newest complete human utterance once, conversationally. The reply will be spoken aloud; do not narrate actions or produce another speaker. ${semanticPremise}`,
         },
         0,

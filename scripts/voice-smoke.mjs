@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { io } from "socket.io-client";
 
 const baseUrl = process.env.APP_BASE_URL ?? "http://127.0.0.1:4000";
@@ -55,6 +57,7 @@ const connect = async (cookie) => {
 
 const sockets = [];
 let roomId;
+let noiseIgnored = false;
 try {
   const [cookieA, cookieB] = await Promise.all([
     createSession(`Voice-A-${marker}`),
@@ -100,7 +103,25 @@ try {
   const invited = await emitAck(a.socket, "voice:bot:invite", { roomId, personaId: "ai-sana" });
   assert.ok(invited.room.participants.some((participant) => participant.memberId === "ai-sana" && participant.kind === "ai"));
 
-  const typedTurn = `Sana, ge oss ett mycket kort voice-svar om banandrivna servrar. ${marker}`;
+  if (process.env.VOICE_NOISE_FIXTURE) {
+    const form = new FormData();
+    form.append("audio", new Blob([await readFile(process.env.VOICE_NOISE_FIXTURE)], { type: "audio/wav" }), "noise.wav");
+    form.append("utteranceId", randomUUID());
+    const noiseResponse = await fetch(`${baseUrl}/api/voice/${encodeURIComponent(roomId)}/turns`, {
+      method: "POST",
+      headers: { Cookie: cookieA },
+      body: form,
+    });
+    const noiseResult = await noiseResponse.json();
+    assert.equal(noiseResponse.status, 200);
+    assert.deepEqual(noiseResult, { ok: true, ignored: true });
+    noiseIgnored = true;
+  }
+
+  // The room ID and exact human transcript already correlate this isolated
+  // run. Do not inject a machine marker into the conversational meaning: this
+  // live-model smoke should exercise an ordinary, self-contained spoken turn.
+  const typedTurn = "Sana, välj kaffe eller te och motivera valet med en kort mening.";
   const humanTranscriptPromise = waitForEvent(
     b.socket,
     "voice:transcript:final",
@@ -120,12 +141,26 @@ try {
     120_000,
   );
 
+  const turnStartedAt = performance.now();
+  let thinkingAt;
+  let speakingAt;
+  const trackBotState = (rooms) => {
+    const state = rooms
+      ?.find((room) => room.id === roomId)
+      ?.participants.find((participant) => participant.memberId === "ai-sana")
+      ?.botState;
+    if (state === "thinking" && thinkingAt === undefined) thinkingAt = performance.now();
+    if (state === "speaking" && speakingAt === undefined) speakingAt = performance.now();
+  };
+  b.socket.on("voice:rooms:update", trackBotState);
   await emitAck(a.socket, "voice:text-turn", { roomId, text: typedTurn });
   const [humanTranscript, aiTranscript, aiSpeech] = await Promise.all([
     humanTranscriptPromise,
     aiTranscriptPromise,
     aiSpeechPromise,
   ]);
+  const turnToAiSpeechMs = Math.round(performance.now() - turnStartedAt);
+  b.socket.off("voice:rooms:update", trackBotState);
   assert.equal(humanTranscript.trigger.eligible, true);
   assert.equal(humanTranscript.utteranceOrigin, "typed-voice-fallback");
   assert.ok(humanTranscript.heardByPersonaIds.includes("ai-sana"));
@@ -173,12 +208,16 @@ try {
     humans: [a.snapshot.me.name, b.snapshot.me.name],
     strictSignalForward: true,
     invitedBot: "ai-sana",
+    noiseIgnored,
     humanTranscript: humanTranscript.text,
     aiTranscript: aiTranscript.text,
     aiSpeech: {
       text: aiSpeech.text,
       serverAudio: Boolean(aiSpeech.audioUrl),
       mimeType: aiSpeech.mimeType,
+      turnToAiSpeechMs,
+      turnToThinkingMs: thinkingAt === undefined ? null : Math.round(thinkingAt - turnStartedAt),
+      thinkingToSpeechMs: thinkingAt === undefined ? null : Math.round((speakingAt ?? performance.now()) - thinkingAt),
     },
     modelConnected: Boolean(health.model?.connected),
     roomClosed: true,

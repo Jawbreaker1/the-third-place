@@ -12,6 +12,7 @@ import {
   buildCapabilityRoutingGuidance,
   capabilitiesForMedium,
   capabilityCatalogEntry,
+  hasBroadDiscoveryFallbackCapability,
   hasExternalEvidenceCapability,
   isExternalEvidenceCapability,
   validateCapabilityArgumentShape,
@@ -59,6 +60,12 @@ describe("declarative capability catalog", () => {
     expect(CAPABILITY_CATALOG.football_data.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.local_datetime.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.weather_forecast.routingClass).toBe("narrow_structured");
+    expect(CAPABILITY_CATALOG.web_search.broadDiscoveryFallback).toBe(true);
+    expect(CAPABILITY_CATALOG_ENTRIES
+      .filter((entry) => entry.broadDiscoveryFallback)
+      .map((entry) => entry.id)).toEqual(["web_search"]);
+    expect(hasBroadDiscoveryFallbackCapability(["local_datetime"])).toBe(false);
+    expect(hasBroadDiscoveryFallbackCapability(["local_datetime", "web_search"])).toBe(true);
     expect(isExternalEvidenceCapability("local_datetime")).toBe(false);
     expect(isExternalEvidenceCapability("read_url")).toBe(true);
     expect(hasExternalEvidenceCapability(["local_datetime"])).toBe(false);

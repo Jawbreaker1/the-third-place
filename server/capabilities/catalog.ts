@@ -50,6 +50,12 @@ export interface CapabilityRoutingGuidance {
 
 interface CapabilityCatalogDefinition {
   routingClass: CapabilityRoutingClass;
+  /**
+   * Allows the bounded semantic verifier to recover an omitted action from a
+   * generic answer-expected question/request. Narrow providers must stay false:
+   * they should be selected by the primary router, not probed on every turn.
+   */
+  broadDiscoveryFallback: boolean;
   /** Media allowed to advertise this action; provider availability still applies. */
   media: readonly CapabilityMedium[];
   /** External means the capability obtains information beyond the server's own clock. */
@@ -76,6 +82,7 @@ const footballTargetRoutingMap = FOOTBALL_COMPETITION_IDS
 const capabilityDefinitions = {
   read_url: {
     routingClass: "exact_source",
+    broadDiscoveryFallback: false,
     media: ["public", "dm"],
     external: true,
     arguments: {
@@ -91,6 +98,7 @@ const capabilityDefinitions = {
   },
   web_search: {
     routingClass: "generic_external_default",
+    broadDiscoveryFallback: true,
     media: ["public", "dm"],
     external: true,
     arguments: {
@@ -106,6 +114,7 @@ const capabilityDefinitions = {
   },
   market_snapshot: {
     routingClass: "narrow_structured",
+    broadDiscoveryFallback: false,
     media: ["public", "dm"],
     external: true,
     arguments: {
@@ -121,6 +130,7 @@ const capabilityDefinitions = {
   },
   football_data: {
     routingClass: "narrow_structured",
+    broadDiscoveryFallback: false,
     media: ["public", "dm"],
     external: true,
     arguments: {
@@ -139,6 +149,7 @@ const capabilityDefinitions = {
   },
   local_datetime: {
     routingClass: "narrow_structured",
+    broadDiscoveryFallback: false,
     media: ["public", "dm", "voice"],
     external: false,
     arguments: {
@@ -153,6 +164,7 @@ const capabilityDefinitions = {
   },
   weather_forecast: {
     routingClass: "narrow_structured",
+    broadDiscoveryFallback: false,
     media: ["public", "dm"],
     external: true,
     arguments: {
@@ -194,6 +206,9 @@ export const isExternalEvidenceCapability = (id: TurnCapability): boolean =>
 
 export const hasExternalEvidenceCapability = (ids: readonly TurnCapability[]): boolean =>
   ids.some(isExternalEvidenceCapability);
+
+export const hasBroadDiscoveryFallbackCapability = (ids: readonly TurnCapability[]): boolean =>
+  ids.some((id) => CAPABILITY_CATALOG[id].broadDiscoveryFallback);
 
 export const capabilitiesForMedium = (medium: CapabilityMedium): TurnCapability[] =>
   TURN_CAPABILITIES.filter((id) =>

@@ -95,7 +95,7 @@ export const DEFAULT_VOICE_ACTIVITY_OPTIONS: Readonly<VoiceActivityOptions> = {
   // A short conversational pause should end the microphone turn promptly.
   // The server independently verifies that the normalized clip contains
   // likely speech, so latency does not have to double as our noise filter.
-  silenceHangoverMs: 450,
+  silenceHangoverMs: 280,
   maxSegmentMs: 26_000,
   maxFrameGapMs: 100,
   initialNoiseFloor: 0.006,

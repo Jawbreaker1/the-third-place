@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   analyzePcmSpeechPresence,
@@ -79,6 +82,40 @@ const harmonicPcmWav = (frameAmplitudes: readonly number[], fundamental = 120): 
       body.writeInt16LE(Math.round(Math.max(-1, Math.min(1, amplitude * harmonicShape)) * 32_767), 44 + sampleIndex * 2);
       sampleIndex += 1;
     }
+  }
+  return body;
+};
+
+const transientClusterPcmWav = (clickFrames: readonly number[], frameCount = 60): Buffer => {
+  const samplesPerFrame = 320;
+  const sampleCount = frameCount * samplesPerFrame;
+  const body = Buffer.alloc(44 + sampleCount * 2);
+  body.write("RIFF", 0, "ascii");
+  body.writeUInt32LE(36 + sampleCount * 2, 4);
+  body.write("WAVE", 8, "ascii");
+  body.write("fmt ", 12, "ascii");
+  body.writeUInt32LE(16, 16);
+  body.writeUInt16LE(1, 20);
+  body.writeUInt16LE(1, 22);
+  body.writeUInt32LE(16_000, 24);
+  body.writeUInt32LE(32_000, 28);
+  body.writeUInt16LE(2, 32);
+  body.writeUInt16LE(16, 34);
+  body.write("data", 36, "ascii");
+  body.writeUInt32LE(sampleCount * 2, 40);
+  const clicks = new Set(clickFrames);
+  let randomState = 0x1234_5678;
+  for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
+    randomState ^= randomState << 13;
+    randomState ^= randomState >>> 17;
+    randomState ^= randomState << 5;
+    const background = ((randomState >>> 0) / 0xffff_ffff - 0.5) * 0.0005;
+    const frameIndex = Math.floor(sampleIndex / samplesPerFrame);
+    const withinFrame = sampleIndex % samplesPerFrame;
+    const impact = clicks.has(frameIndex) && withinFrame < 64
+      ? (((randomState >>> 8) & 1) === 0 ? -1 : 1) * 0.24 * Math.exp(-withinFrame / 10)
+      : 0;
+    body.writeInt16LE(Math.round(Math.max(-1, Math.min(1, background + impact)) * 32_767), 44 + sampleIndex * 2);
   }
   return body;
 };
@@ -213,11 +250,19 @@ describe("normalized PCM speech presence", () => {
       0.006,
       ...Array.from({ length: 24 }, () => 0.0005),
     ]);
+    const fragmentedQuietEnvelope = pcmWav(Array.from(
+      { length: 60 },
+      (_value, frame) => [5, 10, 15, 20, 25, 30, 35, 40].includes(frame) ? 0.006 : 0.0005,
+    ));
 
     expect(analyzePcmSpeechPresence(quietVoiced).classification).toBe("uncertain");
     expect(analyzePcmSpeechPresence(uninterruptedSteady).classification).toBe("uncertain");
     expect(analyzePcmSpeechPresence(sustainedHarmonicVoice).classification).toBe("uncertain");
     expect(analyzePcmSpeechPresence(tinyShortSignal).classification).toBe("uncertain");
+    expect(analyzePcmSpeechPresence(fragmentedQuietEnvelope)).toMatchObject({
+      classification: "uncertain",
+      activeRunCount: 8,
+    });
   });
 
   it("rejects uninterrupted 50/60 Hz mains hum and first harmonics using spectral evidence", () => {
@@ -227,6 +272,309 @@ describe("normalized PCM speech presence", () => {
 
       expect(evidence.classification, `${frequency} Hz`).toBe("noise");
       expect(evidence.stationaryToneRatio, `${frequency} Hz`).toBeGreaterThan(0.9);
+    }
+  });
+
+  it("leaves sparse high-crest keyboard-like clusters uncertain for neural VAD", () => {
+    const typing = transientClusterPcmWav([5, 10, 15, 20, 25, 30, 35, 40]);
+    const evidence = analyzePcmSpeechPresence(typing);
+
+    expect(evidence.classification).toBe("uncertain");
+    expect(evidence.activeRunCount).toBeGreaterThanOrEqual(3);
+    expect(evidence.longestActiveRunMs).toBeLessThanOrEqual(80);
+    expect(evidence.activeOccupancy).toBeLessThan(0.45);
+    expect(evidence.activeMedianCrestRatio).toBeGreaterThan(2.8);
+  });
+});
+
+describe("optional Silero STT preflight", () => {
+  const configuredEnv = {
+    STT_BASE_URL: "https://speech.test/v1",
+    STT_MODEL: "whisper-test",
+    STT_VAD_MODEL_PATH: "/models/ggml-silero-v6.2.0.bin",
+  };
+  const uncertainPresence = {
+    classification: "uncertain" as const,
+    activeMs: 0,
+    noiseFloorRms: 0.001,
+    highEnergyRms: 0.001,
+    peakRms: 0.001,
+    stationaryToneRatio: 0,
+    activeRunCount: 0,
+    longestActiveRunMs: 0,
+    activeOccupancy: 0,
+    activeMedianCrestRatio: 0,
+    dynamicRangeDb: 0,
+    activeVariationDb: 0,
+  };
+
+  it("rejects only an explicit zero-segment result and removes its private WAV", async () => {
+    const root = await mkdtemp(join(tmpdir(), "third-place-vad-test-"));
+    const normalizedBody = pcmWav(Array.from({ length: 12 }, () => 0));
+    let providerCalls = 0;
+    try {
+      const runner: AudioProcessRunner = async (command, args, input, options) => {
+        expect(command).toBe("whisper-vad-speech-segments");
+        expect(input).toHaveLength(0);
+        expect(options).toMatchObject({ timeoutMs: 5_000, maxOutputBytes: 64 * 1024 });
+        expect(args).toContain("--no-prints");
+        expect(args.slice(args.indexOf("--vad-threshold"), args.indexOf("--vad-threshold") + 2))
+          .toEqual(["--vad-threshold", "0.5"]);
+        expect(args.slice(args.indexOf("--vad-min-speech-duration-ms"), args.indexOf("--vad-min-speech-duration-ms") + 2))
+          .toEqual(["--vad-min-speech-duration-ms", "100"]);
+        const audioPath = args[args.indexOf("--file") + 1]!;
+        expect(await readFile(audioPath)).toEqual(normalizedBody);
+        return Buffer.from("Detected 0 speech segments:\n");
+      };
+      const service = new VoiceSpeechService({
+        env: configuredEnv,
+        sttVadRunner: runner,
+        sttVadTempRoot: root,
+        normalizer: {
+          available: async () => true,
+          normalize: async () => ({
+            body: normalizedBody,
+            mimeType: "audio/wav" as const,
+            durationMs: 240,
+            sampleRate: 16_000 as const,
+            channels: 1 as const,
+            speechPresence: uncertainPresence,
+          }),
+        },
+        fetchImpl: (async () => {
+          providerCalls += 1;
+          return new Response(JSON.stringify({ text: "Thanks" }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }) as typeof fetch,
+      });
+
+      await expectVoiceError(
+        service.transcribe({ audio: Buffer.from("noise"), mimeType: "audio/webm" }),
+        "NO_SPEECH",
+      );
+      expect(providerCalls).toBe(0);
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps confirmed local PCM noise ahead of the optional process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "third-place-vad-test-"));
+    let vadCalls = 0;
+    let providerCalls = 0;
+    try {
+      const service = new VoiceSpeechService({
+        env: configuredEnv,
+        sttVadTempRoot: root,
+        sttVadRunner: async () => {
+          vadCalls += 1;
+          return Buffer.from("Detected 1 speech segment:\n");
+        },
+        normalizer: {
+          available: async () => true,
+          normalize: async () => ({
+            body: wav(),
+            mimeType: "audio/wav" as const,
+            durationMs: 400,
+            sampleRate: 16_000 as const,
+            channels: 1 as const,
+            speechPresence: { ...uncertainPresence, classification: "noise" as const },
+          }),
+        },
+        fetchImpl: (async () => {
+          providerCalls += 1;
+          return new Response(JSON.stringify({ text: "not reached" }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }) as typeof fetch,
+      });
+
+      await expectVoiceError(
+        service.transcribe({ audio: Buffer.from("confirmed-noise"), mimeType: "audio/webm" }),
+        "NO_SPEECH",
+      );
+      expect(vadCalls).toBe(0);
+      expect(providerCalls).toBe(0);
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes a positive segment result to STT even when PCM evidence was conservative", async () => {
+    const root = await mkdtemp(join(tmpdir(), "third-place-vad-test-"));
+    let providerCalls = 0;
+    try {
+      const service = new VoiceSpeechService({
+        env: configuredEnv,
+        sttVadTempRoot: root,
+        sttVadRunner: async () => Buffer.from("Detected 1 speech segment:\n0: 0.00 --> 0.22\n"),
+        normalizer: {
+          available: async () => true,
+          normalize: async () => ({
+            body: wav(),
+            mimeType: "audio/wav" as const,
+            durationMs: 220,
+            sampleRate: 16_000 as const,
+            channels: 1 as const,
+            speechPresence: uncertainPresence,
+          }),
+        },
+        fetchImpl: (async () => {
+          providerCalls += 1;
+          return new Response(JSON.stringify({ text: "Ja", language: "sv" }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }) as typeof fetch,
+      });
+
+      await expect(service.transcribe({ audio: Buffer.from("short-word"), mimeType: "audio/webm" }))
+        .resolves.toMatchObject({ text: "Ja", language: "sv" });
+      expect(providerCalls).toBe(1);
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails open on CLI failure and malformed output without transcript phrase rules", async () => {
+    const root = await mkdtemp(join(tmpdir(), "third-place-vad-test-"));
+    let vadCalls = 0;
+    let providerCalls = 0;
+    try {
+      const service = new VoiceSpeechService({
+        env: configuredEnv,
+        sttVadTempRoot: root,
+        sttVadRunner: async () => {
+          vadCalls += 1;
+          if (vadCalls === 1) throw new Error("binary/model unavailable");
+          return Buffer.from("unstructured output mentioning 0 but no CLI summary");
+        },
+        normalizer: {
+          available: async () => true,
+          normalize: async () => ({
+            body: wav(),
+            mimeType: "audio/wav" as const,
+            durationMs: 400,
+            sampleRate: 16_000 as const,
+            channels: 1 as const,
+            speechPresence: uncertainPresence,
+          }),
+        },
+        fetchImpl: (async () => {
+          providerCalls += 1;
+          return new Response(JSON.stringify({ text: "Okej" }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }) as typeof fetch,
+      });
+
+      await expect(service.transcribe({ audio: Buffer.from("first"), mimeType: "audio/webm" }))
+        .resolves.toMatchObject({ text: "Okej" });
+      await expect(service.transcribe({ audio: Buffer.from("second"), mimeType: "audio/webm" }))
+        .resolves.toMatchObject({ text: "Okej" });
+      expect(providerCalls).toBe(2);
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates caller abort and still cleans the per-turn directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "third-place-vad-test-"));
+    const controller = new AbortController();
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let providerCalls = 0;
+    try {
+      const runner: AudioProcessRunner = async (_command, _args, _input, options) =>
+        await new Promise<Buffer>((_resolve, reject) => {
+          const abort = () => reject(new Error("aborted"));
+          if (options.signal?.aborted) abort();
+          else options.signal?.addEventListener("abort", abort, { once: true });
+          markStarted();
+        });
+      const service = new VoiceSpeechService({
+        env: configuredEnv,
+        sttVadRunner: runner,
+        sttVadTempRoot: root,
+        normalizer: fakeNormalizer,
+        fetchImpl: (async () => {
+          providerCalls += 1;
+          return new Response(JSON.stringify({ text: "not reached" }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }) as typeof fetch,
+      });
+
+      const transcription = service.transcribe({
+        audio: Buffer.from("audio"),
+        mimeType: "audio/webm",
+        signal: controller.signal,
+      });
+      await started;
+      controller.abort();
+      await expectVoiceError(transcription, "REQUEST_CANCELLED");
+      expect(providerCalls).toBe(0);
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("isolates concurrent WAV files and cleans both directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "third-place-vad-test-"));
+    const firstWav = pcmWav(Array.from({ length: 8 }, () => 0.08), 220);
+    const secondWav = pcmWav(Array.from({ length: 9 }, () => 0.1), 330);
+    const paths: string[] = [];
+    const bodies: Buffer[] = [];
+    let releaseBoth!: () => void;
+    const bothStarted = new Promise<void>((resolve) => { releaseBoth = resolve; });
+    let providerCalls = 0;
+    try {
+      const runner: AudioProcessRunner = async (_command, args) => {
+        const audioPath = args[args.indexOf("--file") + 1]!;
+        paths.push(audioPath);
+        bodies.push(await readFile(audioPath));
+        if (paths.length === 2) releaseBoth();
+        await bothStarted;
+        return Buffer.from("Detected 1 speech segment:\n");
+      };
+      const service = new VoiceSpeechService({
+        env: configuredEnv,
+        sttVadRunner: runner,
+        sttVadTempRoot: root,
+        normalizer: {
+          available: async () => true,
+          normalize: async (body: Buffer) => ({
+            body,
+            mimeType: "audio/wav" as const,
+            durationMs: 180,
+            sampleRate: 16_000 as const,
+            channels: 1 as const,
+          }),
+        },
+        fetchImpl: (async () => {
+          providerCalls += 1;
+          return new Response(JSON.stringify({ text: "speech" }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }) as typeof fetch,
+      });
+
+      await Promise.all([
+        service.transcribe({ audio: firstWav, mimeType: "audio/wav" }),
+        service.transcribe({ audio: secondWav, mimeType: "audio/wav" }),
+      ]);
+      expect(providerCalls).toBe(2);
+      expect(new Set(paths).size).toBe(2);
+      expect(bodies.some((body) => body.equals(firstWav))).toBe(true);
+      expect(bodies.some((body) => body.equals(secondWav))).toBe(true);
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });
@@ -315,6 +663,10 @@ describe("OpenAI-compatible speech providers", () => {
             highEnergyRms: 0.001,
             peakRms: 0.001,
             stationaryToneRatio: 0,
+            activeRunCount: 0,
+            longestActiveRunMs: 0,
+            activeOccupancy: 0,
+            activeMedianCrestRatio: 0,
             dynamicRangeDb: 0,
             activeVariationDb: 0,
           },
@@ -400,6 +752,23 @@ describe("OpenAI-compatible speech providers", () => {
       "NO_SPEECH",
     );
   });
+
+  it.each(["Thanks", "Abrigada", "Obrigada", "ありがとう"])(
+    "keeps confidently decoded speech regardless of transcript text: %s",
+    async (text) => {
+      const service = new VoiceSpeechService({
+        env: { STT_BASE_URL: "https://speech.test/v1", STT_MODEL: "whisper-test" },
+        fetchImpl: (async () => new Response(JSON.stringify({
+          text,
+          segments: [{ start: 0, end: 0.4, text, no_speech_prob: 0.02, avg_logprob: -0.05 }],
+        }), { headers: { "Content-Type": "application/json" } })) as typeof fetch,
+        normalizer: fakeNormalizer,
+      });
+
+      await expect(service.transcribe({ audio: Buffer.from("real-speech"), mimeType: "audio/webm" }))
+        .resolves.toMatchObject({ text });
+    },
+  );
 
   it("removes only provider segments confidently marked as no-speech", async () => {
     const service = new VoiceSpeechService({

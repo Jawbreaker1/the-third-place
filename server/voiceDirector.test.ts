@@ -837,6 +837,7 @@ describe("VoiceDirector", () => {
 
     let languageHint: string | undefined;
     let semanticLanguage: string | undefined;
+    let responseRecoveryIds: string[] | undefined;
     let analysisInput: TurnAnalysisInput | undefined;
     const speeches: string[] = [];
     const director = new VoiceDirector({
@@ -850,6 +851,7 @@ describe("VoiceDirector", () => {
         generateScene: async (request) => {
           languageHint = request.languageHint;
           semanticLanguage = request.semanticContext?.languageTag;
+          responseRecoveryIds = request.responseRecoveryIds;
           return [];
         },
       },
@@ -876,6 +878,7 @@ describe("VoiceDirector", () => {
 
     expect(languageHint).toBe("infer and mirror the language of the latest human utterance directly");
     expect(semanticLanguage).toBeUndefined();
+    expect(responseRecoveryIds).toEqual(["ai-sana"]);
     expect(analysisInput?.transportLanguageHint).toBeUndefined();
     expect(speeches).toEqual([]);
     expect(runtime.getTranscript(created.room.id)).toHaveLength(1);

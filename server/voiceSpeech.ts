@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 
@@ -68,6 +71,11 @@ export interface VoiceSpeechPresence {
   peakRms: number;
   /** Fraction of a stable active window explained by a 50/60 Hz mains tone or its first harmonic. */
   stationaryToneRatio: number;
+  activeRunCount: number;
+  longestActiveRunMs: number;
+  activeOccupancy: number;
+  /** Median sample-peak / RMS crest factor across active 20 ms frames. */
+  activeMedianCrestRatio: number;
   dynamicRangeDb: number;
   activeVariationDb: number;
 }
@@ -152,6 +160,10 @@ export interface VoiceSpeechServiceOptions {
   normalizer?: AudioNormalizerLike;
   audioStore?: TtsAudioStore;
   now?: () => number;
+  /** Test/embedding seam for the optional local Silero preflight process. */
+  sttVadRunner?: AudioProcessRunner;
+  /** Existing directory under which private per-turn VAD directories are created. */
+  sttVadTempRoot?: string;
   /** Provider voice IDs that callers can supply on each synthesis request. */
   ttsVoices?: readonly string[];
 }
@@ -164,6 +176,14 @@ interface ProviderConfig {
 }
 
 interface SttProviderConfig extends ProviderConfig {}
+
+interface SttVadConfig {
+  command: string;
+  modelPath: string;
+  threshold: number;
+  minSpeechMs: number;
+  timeoutMs: number;
+}
 
 interface TtsProviderConfig extends ProviderConfig {
   defaultVoice?: string;
@@ -218,9 +238,18 @@ const PCM_MAX_STATIONARY_VARIATION_DB = 1.25;
 const PCM_MIN_STATIONARY_TONE_RATIO = 0.65;
 const PCM_STATIONARY_WINDOW_FRAMES = PCM_MIN_STATIONARY_MS / 20;
 const PCM_MAINS_TONE_FREQUENCIES = [50, 60, 100, 120] as const;
+const PCM_TRANSIENT_MIN_RUNS = 3;
+const PCM_TRANSIENT_MAX_RUN_MS = 80;
+const PCM_TRANSIENT_MAX_OCCUPANCY = 0.45;
+const PCM_TRANSIENT_MIN_MEDIAN_CREST = 2.8;
 
 const clampInteger = (raw: string | undefined, fallback: number, min: number, max: number): number => {
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
+};
+
+const clampNumber = (raw: string | undefined, fallback: number, min: number, max: number): number => {
+  const parsed = raw ? Number(raw) : Number.NaN;
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
 };
 
@@ -343,20 +372,28 @@ export const analyzePcmSpeechPresence = (
       highEnergyRms: 0,
       peakRms: 0,
       stationaryToneRatio: 0,
+      activeRunCount: 0,
+      longestActiveRunMs: 0,
+      activeOccupancy: 0,
+      activeMedianCrestRatio: 0,
       dynamicRangeDb: 0,
       activeVariationDb: 0,
     };
   }
 
   const frameRms: number[] = [];
+  const framePeaks: number[] = [];
   const dataEnd = chunk.offset + chunk.bytes;
   for (let frameOffset = chunk.offset; frameOffset + PCM_FRAME_SAMPLES * 2 <= dataEnd; frameOffset += PCM_FRAME_SAMPLES * 2) {
     let squared = 0;
+    let peak = 0;
     for (let sampleOffset = frameOffset; sampleOffset < frameOffset + PCM_FRAME_SAMPLES * 2; sampleOffset += 2) {
       const normalized = wav.readInt16LE(sampleOffset) / 32_768;
       squared += normalized * normalized;
+      peak = Math.max(peak, Math.abs(normalized));
     }
     frameRms.push(Math.sqrt(squared / PCM_FRAME_SAMPLES));
+    framePeaks.push(peak);
   }
 
   if (frameRms.length === 0) {
@@ -367,6 +404,10 @@ export const analyzePcmSpeechPresence = (
       highEnergyRms: 0,
       peakRms: 0,
       stationaryToneRatio: 0,
+      activeRunCount: 0,
+      longestActiveRunMs: 0,
+      activeOccupancy: 0,
+      activeMedianCrestRatio: 0,
       dynamicRangeDb: 0,
       activeVariationDb: 0,
     };
@@ -382,6 +423,25 @@ export const analyzePcmSpeechPresence = (
     .filter((index) => index >= 0);
   const active = activeFrameIndexes.map((index) => frameRms[index] ?? 0).sort((a, b) => a - b);
   const activeMs = active.length * 20;
+  let activeRunCount = 0;
+  let longestActiveRunFrames = 0;
+  let currentActiveRunFrames = 0;
+  let previousActiveFrame = -2;
+  for (const frameIndex of activeFrameIndexes) {
+    if (frameIndex === previousActiveFrame + 1) currentActiveRunFrames += 1;
+    else {
+      activeRunCount += 1;
+      currentActiveRunFrames = 1;
+    }
+    longestActiveRunFrames = Math.max(longestActiveRunFrames, currentActiveRunFrames);
+    previousActiveFrame = frameIndex;
+  }
+  const longestActiveRunMs = longestActiveRunFrames * 20;
+  const activeOccupancy = activeFrameIndexes.length / frameRms.length;
+  const activeCrestRatios = activeFrameIndexes
+    .map((index) => (framePeaks[index] ?? 0) / Math.max(frameRms[index] ?? 0, 1e-7))
+    .sort((a, b) => a - b);
+  const activeMedianCrestRatio = percentile(activeCrestRatios, 0.5);
   const dynamicRangeDb = ratioDb(highEnergyRms, noiseFloorRms);
   const activeVariationDb = active.length > 1
     ? ratioDb(percentile(active, 0.9), percentile(active, 0.1))
@@ -410,10 +470,22 @@ export const analyzePcmSpeechPresence = (
   const confidentStationaryNoise = stationaryFrameIndexes.length * 20 >= PCM_MIN_STATIONARY_MS &&
     stationaryVariationDb <= PCM_MAX_STATIONARY_VARIATION_DB &&
     stationaryToneRatio >= PCM_MIN_STATIONARY_TONE_RATIO;
-  const classification: VoiceSpeechPresence["classification"] = positiveSpeechEvidence
-    ? "speech"
-    : confidentSilence || confidentClick || confidentStationaryNoise
-      ? "noise"
+  // Repeated keyboard/key-tap impulses often form sparse, high-crest bursts,
+  // but plosives and short paused speech can share that envelope. Keep this as
+  // diagnostic/uncertain evidence for the provider's neural VAD, never as a
+  // local hard rejection.
+  const keyboardLikeTransientCluster = activeMs >= PCM_MIN_ACTIVE_MS &&
+    activeRunCount >= PCM_TRANSIENT_MIN_RUNS &&
+    longestActiveRunMs <= PCM_TRANSIENT_MAX_RUN_MS &&
+    activeOccupancy <= PCM_TRANSIENT_MAX_OCCUPANCY &&
+    activeMedianCrestRatio >= PCM_TRANSIENT_MIN_MEDIAN_CREST;
+  const confidentNoise = confidentSilence || confidentClick || confidentStationaryNoise;
+  const classification: VoiceSpeechPresence["classification"] = confidentNoise
+    ? "noise"
+    : keyboardLikeTransientCluster
+      ? "uncertain"
+      : positiveSpeechEvidence
+      ? "speech"
       : "uncertain";
 
   return {
@@ -423,6 +495,10 @@ export const analyzePcmSpeechPresence = (
     highEnergyRms,
     peakRms,
     stationaryToneRatio,
+    activeRunCount,
+    longestActiveRunMs,
+    activeOccupancy,
+    activeMedianCrestRatio,
     dynamicRangeDb,
     activeVariationDb,
   };
@@ -660,6 +736,22 @@ const providerConfig = (
   };
 };
 
+const sttVadConfig = (env: NodeJS.ProcessEnv): SttVadConfig | undefined => {
+  const modelPath = env.STT_VAD_MODEL_PATH?.trim();
+  if (!modelPath || modelPath.length > 4_096 || /[\u0000-\u001f\u007f]/.test(modelPath)) return undefined;
+  const configuredCommand = env.STT_VAD_COMMAND?.trim();
+  const command = configuredCommand || "whisper-vad-speech-segments";
+  if (command.length > 1_024 || /[\u0000-\u001f\u007f]/.test(command)) return undefined;
+  return {
+    command,
+    modelPath,
+    threshold: clampNumber(env.STT_VAD_THRESHOLD, 0.5, 0, 1),
+    // Keep very short acknowledgements while still rejecting incidental noise.
+    minSpeechMs: clampInteger(env.STT_VAD_MIN_SPEECH_MS, 100, 100, 120),
+    timeoutMs: clampInteger(env.STT_VAD_TIMEOUT_MS, 5_000, 250, 30_000),
+  };
+};
+
 const responseContentType = (response: Response): string =>
   normalizeMimeType(response.headers.get("content-type") ?? "");
 
@@ -840,6 +932,101 @@ const runProcess: AudioProcessRunner = async (command, args, input, options) =>
     child.stdin.on("error", () => undefined);
     child.stdin.end(input);
   });
+
+type SttVadDecision = "speech" | "no-speech" | "unknown";
+
+const parseSttVadDecision = (output: Buffer): SttVadDecision => {
+  const prefix = "Detected ";
+  const pluralSuffix = " speech segments:";
+  const singularSuffix = " speech segment:";
+  const summaries: number[] = [];
+  for (const rawLine of output.toString("utf8").split("\n")) {
+    const line = rawLine.trim();
+    if (!line.startsWith(prefix)) continue;
+    const suffix = line.endsWith(pluralSuffix)
+      ? pluralSuffix
+      : line.endsWith(singularSuffix)
+        ? singularSuffix
+        : undefined;
+    if (!suffix) continue;
+    const digits = line.slice(prefix.length, line.length - suffix.length);
+    if (!digits || (digits.length > 1 && digits[0] === "0")) continue;
+    let allDigits = true;
+    for (let index = 0; index < digits.length; index += 1) {
+      const code = digits.charCodeAt(index);
+      if (code < 48 || code > 57) {
+        allDigits = false;
+        break;
+      }
+    }
+    if (!allDigits) continue;
+    const count = Number(digits);
+    if (Number.isSafeInteger(count)) summaries.push(count);
+  }
+  if (summaries.length !== 1) return "unknown";
+  return summaries[0] === 0 ? "no-speech" : "speech";
+};
+
+class SttVadPreflight {
+  constructor(
+    private readonly config: SttVadConfig,
+    private readonly runner: AudioProcessRunner,
+    private readonly tempRoot: string,
+  ) {}
+
+  async classify(audio: NormalizedVoiceAudio, signal?: AbortSignal): Promise<SttVadDecision> {
+    let directory: string | undefined;
+    let audioPath: string | undefined;
+    try {
+      this.throwIfCancelled(signal);
+      directory = await mkdtemp(join(this.tempRoot, "third-place-stt-vad-"));
+      audioPath = join(directory, "utterance.wav");
+      this.throwIfCancelled(signal);
+      await writeFile(audioPath, audio.body, { flag: "wx", mode: 0o600 });
+      this.throwIfCancelled(signal);
+      const output = await this.runner(
+        this.config.command,
+        [
+          "--no-prints",
+          "--vad-model",
+          this.config.modelPath,
+          "--vad-threshold",
+          String(this.config.threshold),
+          "--vad-min-speech-duration-ms",
+          String(this.config.minSpeechMs),
+          "--vad-min-silence-duration-ms",
+          "100",
+          "--file",
+          audioPath,
+        ],
+        Buffer.alloc(0),
+        {
+          timeoutMs: this.config.timeoutMs,
+          maxOutputBytes: 64 * 1024,
+          ...(signal ? { signal } : {}),
+        },
+      );
+      this.throwIfCancelled(signal);
+      return parseSttVadDecision(output);
+    } catch (error) {
+      if (error instanceof VoiceSpeechError && error.code === "REQUEST_CANCELLED") throw error;
+      this.throwIfCancelled(signal);
+      // This preflight is an optional guard, never a dependency of STT. Missing
+      // binaries/models, bad output, timeouts, and filesystem failures all pass
+      // the already-normalized WAV through to the transcription provider.
+      return "unknown";
+    } finally {
+      if (audioPath) await unlink(audioPath).catch(() => undefined);
+      if (directory) await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  private throwIfCancelled(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw new VoiceSpeechError("Audio processing was cancelled.", 499, "REQUEST_CANCELLED");
+    }
+  }
+}
 
 export class AudioNormalizer implements AudioNormalizerLike {
   readonly maxInputBytes = MAX_AUDIO_INPUT_BYTES;
@@ -1252,6 +1439,7 @@ export class VoiceSpeechService {
   private readonly sttConfig?: SttProviderConfig;
   private readonly ttsConfig?: TtsProviderConfig;
   private readonly stt?: OpenAiCompatibleSttProvider;
+  private readonly sttVad?: SttVadPreflight;
   private readonly tts?: OpenAiCompatibleTtsProvider;
   private readonly browserFallbackAllowed: boolean;
 
@@ -1287,7 +1475,17 @@ export class VoiceSpeechService {
     const ttlMs = clampInteger(env.TTS_AUDIO_TTL_MS, DEFAULT_TTS_TTL_MS, 5_000, 300_000);
     this.audioStore = options.audioStore ?? new TtsAudioStore(ttlMs, options.now ?? Date.now);
     this.browserFallbackAllowed = env.VOICE_BROWSER_FALLBACK?.toLocaleLowerCase() !== "false";
-    if (this.sttConfig) this.stt = new OpenAiCompatibleSttProvider(this.sttConfig, fetchImpl);
+    if (this.sttConfig) {
+      this.stt = new OpenAiCompatibleSttProvider(this.sttConfig, fetchImpl);
+      const vadConfig = sttVadConfig(env);
+      if (vadConfig) {
+        this.sttVad = new SttVadPreflight(
+          vadConfig,
+          options.sttVadRunner ?? runProcess,
+          options.sttVadTempRoot ?? tmpdir(),
+        );
+      }
+    }
     if (this.ttsConfig) this.tts = new OpenAiCompatibleTtsProvider(this.ttsConfig, fetchImpl);
   }
 
@@ -1325,6 +1523,10 @@ export class VoiceSpeechService {
     if (normalized.speechPresence?.classification === "noise") {
       throw new VoiceSpeechError("No speech was detected.", 422, "NO_SPEECH");
     }
+    const vadDecision = this.sttVad
+      ? await this.sttVad.classify(normalized, input.signal)
+      : undefined;
+    if (vadDecision === "no-speech") throw new VoiceSpeechError("No speech was detected.", 422, "NO_SPEECH");
     return await this.stt.transcribe(normalized, input);
   }
 
