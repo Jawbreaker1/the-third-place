@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import sharp from "sharp";
 import type { MemberKind, ServerHealth, VisualObservation, VoiceUtteranceOrigin } from "../shared/types.js";
@@ -104,6 +105,17 @@ import {
   type SocialMemoryAnalysis,
   type SocialMemoryAnalysisInput,
 } from "./socialMemoryAnalysis.js";
+import {
+  buildSocialMemoryConsolidationResponseFormat,
+  buildSocialMemoryConsolidationSystemPrompt,
+  buildSocialMemoryConsolidationUserData,
+  createFailClosedSocialMemoryConsolidation,
+  parseSocialMemoryConsolidationContent,
+  socialMemoryConsolidationInputSchema,
+  type NormalizedSocialMemoryConsolidationInput,
+  type SocialMemoryConsolidation,
+  type SocialMemoryConsolidationInput,
+} from "./socialMemoryConsolidation.js";
 
 const mergeVerifiedEvidencePlan = (
   primary: TurnAnalysis,
@@ -567,12 +579,25 @@ interface SocialMemoryAnalysisQueueItem {
   reject: (reason: unknown) => void;
 }
 
+interface SocialMemoryConsolidationQueueItem {
+  type: "social-memory-consolidation";
+  id: number;
+  priority: number;
+  input: NormalizedSocialMemoryConsolidationInput;
+  deadlineAt: number;
+  timeout?: ReturnType<typeof setTimeout>;
+  settled: boolean;
+  resolve: (value: SocialMemoryConsolidation) => void;
+  reject: (reason: unknown) => void;
+}
+
 type QueueItem =
   | SceneQueueItem
   | VisionQueueItem
   | TurnAnalysisQueueItem
   | MemoryAnalysisQueueItem
-  | SocialMemoryAnalysisQueueItem;
+  | SocialMemoryAnalysisQueueItem
+  | SocialMemoryConsolidationQueueItem;
 
 /**
  * Opaque scheduler identity for work that belongs to one live surface. Voice
@@ -911,6 +936,91 @@ const consideredRoleFor = (request: SceneRequest, selectedIndex: number): "lead"
   return request.consideredRole ?? (selectedIndex === 0 ? "lead" : "response");
 };
 
+const actorSubsetRecord = <Value>(
+  values: Readonly<Record<string, Value>> | undefined,
+  personaIds: readonly string[],
+): Record<string, Value> | undefined => {
+  if (!values) return undefined;
+  const entries = personaIds.flatMap((personaId) => {
+    if (!Object.prototype.hasOwnProperty.call(values, personaId)) return [];
+    const value = values[personaId];
+    return value === undefined ? [] : [[personaId, value] as const];
+  });
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+};
+
+const actorSubsetIds = (values: readonly string[] | undefined, personaIds: ReadonlySet<string>): string[] | undefined =>
+  values === undefined ? undefined : values.filter((personaId) => personaIds.has(personaId));
+
+/**
+ * A single model request is one shared attention space: keying private notes by
+ * resident ID does not stop another generated resident from reading them. Any
+ * multi-actor scene carrying a real private relationship note is therefore
+ * decomposed into independent, fully reviewed requests. Shared transcript and
+ * evidence remain shared because every selected participant legitimately sees
+ * them. Actor-channel state is also reduced to the current actor on this path;
+ * ordinary no-memory batch scenes stay one model call for local-model latency.
+ */
+const carriesActorScopedContext = (request: SceneRequest): boolean =>
+  Object.values(request.relationshipNotes ?? {}).some((note) => note.trim().length > 0);
+
+const actorSubsetTemporalPolicy = (
+  request: SceneRequest,
+  personaIds: ReadonlySet<string>,
+): Pick<SceneRequest, "requestedClock" | "temporalPolicy" | "temporalSurfaceActorId" | "temporalContext"> => {
+  if (!request.temporalSurfaceActorId || personaIds.has(request.temporalSurfaceActorId)) {
+    return {
+      requestedClock: request.requestedClock,
+      temporalPolicy: request.temporalPolicy,
+      temporalSurfaceActorId: request.temporalSurfaceActorId,
+      temporalContext: undefined,
+    };
+  }
+  return {
+    requestedClock: undefined,
+    temporalPolicy: request.kind === "ambient" ? "ambient_silent" : "reactive_only",
+    temporalSurfaceActorId: undefined,
+    temporalContext: undefined,
+  };
+};
+
+const actorSubsetConsideredRole = (
+  request: SceneRequest,
+  personas: readonly Persona[],
+): SceneRequest["consideredRole"] => {
+  if (request.conversationMode !== "considered") return request.consideredRole;
+  if (request.consideredRole) return request.consideredRole;
+  const originalIndices = personas.map((persona) =>
+    request.selected.findIndex((candidate) => candidate.id === persona.id)
+  );
+  if (originalIndices.every((index) => index > 0)) return "response";
+  return personas.length === 1 && originalIndices[0] === 0 ? "lead" : undefined;
+};
+
+const actorSubsetSceneRequest = (
+  request: SceneRequest,
+  personas: readonly Persona[],
+  includePrivateRelationshipNote: boolean,
+): SceneRequest => {
+  const personaIds = personas.map((persona) => persona.id);
+  const personaIdSet = new Set(personaIds);
+  return {
+    ...request,
+    selected: [...personas],
+    consideredRole: actorSubsetConsideredRole(request, personas),
+    wordLimits: actorSubsetRecord(request.wordLimits, personaIds),
+    mustReplyIds: actorSubsetIds(request.mustReplyIds, personaIdSet),
+    responseRecoveryIds: actorSubsetIds(request.responseRecoveryIds, personaIdSet),
+    requestOwnerIds: actorSubsetIds(request.requestOwnerIds, personaIdSet),
+    relationshipNotes: includePrivateRelationshipNote
+      ? actorSubsetRecord(request.relationshipNotes, personaIds)
+      : undefined,
+    actorChannelNotes: actorSubsetRecord(request.actorChannelNotes, personaIds),
+    actorExpertiseNotes: actorSubsetRecord(request.actorExpertiseNotes, personaIds),
+    ...actorSubsetTemporalPolicy(request, personaIdSet),
+  };
+};
+
 const compactVoiceBehaviorTuning = (request: SceneRequest): string => request.behaviorTuning
   ? `\nTrusted live behavior tuning: Competence ${request.behaviorTuning.competence}/100; Aggression ${request.behaviorTuning.aggression}/100; Explicitness ${request.behaviorTuning.explicitness}/100. Competence controls supported detail, aggression controls claim-level directness, and explicitness permits only bounded non-targeted adult wording. These never override truth, safety, personality, room policy or the 25-word limit.`
   : "";
@@ -1226,9 +1336,12 @@ export class LmStudioClient {
   private activeMemoryAnalysisAbort?: AbortController;
   private activeSocialMemoryAnalysis?: SocialMemoryAnalysisQueueItem;
   private activeSocialMemoryAnalysisAbort?: AbortController;
+  private activeSocialMemoryConsolidation?: SocialMemoryConsolidationQueueItem;
+  private activeSocialMemoryConsolidationAbort?: AbortController;
   private readonly turnAnalysisById = new Map<string, Promise<TurnAnalysis>>();
   private readonly memoryAnalysisById = new Map<string, Promise<MemoryAnalysis>>();
   private readonly socialMemoryAnalysisById = new Map<string, Promise<SocialMemoryAnalysis>>();
+  private readonly socialMemoryConsolidationByFingerprint = new Map<string, Promise<SocialMemoryConsolidation>>();
   /**
    * One-use bridge between the sole-resident voice router and its scene. The
    * router may co-produce a draft, but the draft has no publication authority:
@@ -1391,6 +1504,97 @@ export class LmStudioClient {
     return cacheEntry;
   }
 
+  /**
+   * Plans bounded, source-ID-only memory deduplication as optional background
+   * work. The cache identity includes every normalized candidate field, so a
+   * reused batch label can never return a verdict for changed memory content.
+   */
+  consolidateSocialMemories(
+    input: SocialMemoryConsolidationInput,
+  ): Promise<SocialMemoryConsolidation> {
+    const validated = socialMemoryConsolidationInputSchema.safeParse(input);
+    if (!validated.success) {
+      return Promise.resolve(createFailClosedSocialMemoryConsolidation("invalid_output"));
+    }
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify(validated.data))
+      .digest("hex");
+    const cacheKey = `${validated.data.batchId}\u0000${fingerprint}`;
+    const cached = this.socialMemoryConsolidationByFingerprint.get(cacheKey);
+    if (cached) return cached;
+    if (this.socialMemoryConsolidationByFingerprint.size >= 256) {
+      const oldest = this.socialMemoryConsolidationByFingerprint.keys().next().value as string | undefined;
+      if (oldest !== undefined) this.socialMemoryConsolidationByFingerprint.delete(oldest);
+    }
+
+    const pending = this.enqueueSocialMemoryConsolidation(validated.data);
+    let cacheEntry!: Promise<SocialMemoryConsolidation>;
+    cacheEntry = pending.then(
+      (result) => {
+        // A valid empty plan is durable process-local work. Transient queue,
+        // provider, timeout and schema failures remain retryable.
+        if (result.source !== "lm" || result.failureReason !== null) {
+          if (this.socialMemoryConsolidationByFingerprint.get(cacheKey) === cacheEntry) {
+            this.socialMemoryConsolidationByFingerprint.delete(cacheKey);
+          }
+        }
+        return result;
+      },
+      (error) => {
+        if (this.socialMemoryConsolidationByFingerprint.get(cacheKey) === cacheEntry) {
+          this.socialMemoryConsolidationByFingerprint.delete(cacheKey);
+        }
+        throw error;
+      },
+    );
+    this.socialMemoryConsolidationByFingerprint.set(cacheKey, cacheEntry);
+    return cacheEntry;
+  }
+
+  private enqueueSocialMemoryConsolidation(
+    input: NormalizedSocialMemoryConsolidationInput,
+  ): Promise<SocialMemoryConsolidation> {
+    if (!this.enabled || this.queue.length >= 8) {
+      return Promise.resolve(createFailClosedSocialMemoryConsolidation("provider_error"));
+    }
+
+    return new Promise((resolve) => {
+      const startedAt = performance.now();
+      const item = {} as SocialMemoryConsolidationQueueItem;
+      const settle = (value: SocialMemoryConsolidation) => {
+        if (item.settled) return;
+        item.settled = true;
+        if (item.timeout) clearTimeout(item.timeout);
+        resolve(value);
+      };
+      Object.assign(item, {
+        type: "social-memory-consolidation" as const,
+        id: this.nextQueueId++,
+        priority: 4,
+        input,
+        deadlineAt: startedAt + TURN_ANALYSIS_TIMEOUT_MS,
+        settled: false,
+        resolve: settle,
+        reject: (_reason: unknown) => settle(createFailClosedSocialMemoryConsolidation("provider_error")),
+      });
+      item.timeout = setTimeout(() => {
+        const queuedIndex = this.queue.findIndex(
+          (candidate) => candidate.type === "social-memory-consolidation" && candidate.id === item.id,
+        );
+        if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
+        if (this.activeSocialMemoryConsolidation?.id === item.id) {
+          this.activeSocialMemoryConsolidationAbort?.abort(
+            new DOMException("Social memory consolidation deadline exceeded", "TimeoutError"),
+          );
+        }
+        settle(createFailClosedSocialMemoryConsolidation("timeout"));
+      }, TURN_ANALYSIS_TIMEOUT_MS);
+      this.queue.push(item);
+      this.queue.sort(compareQueueItems);
+      void this.pump();
+    });
+  }
+
   private enqueueSocialMemoryAnalysis(
     input: NormalizedSocialMemoryAnalysisInput,
   ): Promise<SocialMemoryAnalysis> {
@@ -1474,13 +1678,16 @@ export class LmStudioClient {
   private abortActiveMemoryAnalysis(reason: string): void {
     this.activeMemoryAnalysisAbort?.abort(new Error(reason));
     this.activeSocialMemoryAnalysisAbort?.abort(new Error(reason));
+    this.activeSocialMemoryConsolidationAbort?.abort(new Error(reason));
   }
 
   private dropQueuedBackgroundWork(reason: string): boolean {
     // Persistent memory is optional and invisible, so it yields before an
     // ambient scene. Both remain lower priority than live human work.
     let index = this.queue.findIndex(
-      (item) => item.type === "memory-analysis" || item.type === "social-memory-analysis",
+      (item) => item.type === "memory-analysis" ||
+        item.type === "social-memory-analysis" ||
+        item.type === "social-memory-consolidation",
     );
     if (index < 0) {
       index = this.queue.findIndex((item) => item.type === "scene" && item.request.kind === "ambient");
@@ -1752,10 +1959,12 @@ export class LmStudioClient {
     this.activeTurnAnalysisAbort?.abort(error);
     this.activeMemoryAnalysisAbort?.abort(error);
     this.activeSocialMemoryAnalysisAbort?.abort(error);
+    this.activeSocialMemoryConsolidationAbort?.abort(error);
     this.activeVision?.reject(error);
     this.turnAnalysisById.clear();
     this.memoryAnalysisById.clear();
     this.socialMemoryAnalysisById.clear();
+    this.socialMemoryConsolidationByFingerprint.clear();
     this.voiceDraftByMessageId.clear();
     this.voiceContinuationHandoff = undefined;
   }
@@ -1832,11 +2041,16 @@ export class LmStudioClient {
           this.activeMemoryAnalysis = item;
           this.activeMemoryAnalysisAbort = abort;
           item.resolve(await this.performMemoryAnalysis(item.input, abort.signal, item.deadlineAt));
-        } else {
+        } else if (item.type === "social-memory-analysis") {
           const abort = new AbortController();
           this.activeSocialMemoryAnalysis = item;
           this.activeSocialMemoryAnalysisAbort = abort;
           item.resolve(await this.performSocialMemoryAnalysis(item.input, abort.signal, item.deadlineAt));
+        } else {
+          const abort = new AbortController();
+          this.activeSocialMemoryConsolidation = item;
+          this.activeSocialMemoryConsolidationAbort = abort;
+          item.resolve(await this.performSocialMemoryConsolidation(item.input, abort.signal, item.deadlineAt));
         }
       } catch (error) {
         const typedPreemption = item.type === "scene" &&
@@ -1865,6 +2079,10 @@ export class LmStudioClient {
         if (this.activeSocialMemoryAnalysis?.id === item.id) {
           this.activeSocialMemoryAnalysis = undefined;
           this.activeSocialMemoryAnalysisAbort = undefined;
+        }
+        if (this.activeSocialMemoryConsolidation?.id === item.id) {
+          this.activeSocialMemoryConsolidation = undefined;
+          this.activeSocialMemoryConsolidationAbort = undefined;
         }
       }
     }
@@ -2143,6 +2361,34 @@ export class LmStudioClient {
     }
   }
 
+  private async performSocialMemoryConsolidation(
+    input: NormalizedSocialMemoryConsolidationInput,
+    signal: AbortSignal,
+    deadlineAt: number,
+  ): Promise<SocialMemoryConsolidation> {
+    try {
+      if (signal.aborted || performance.now() >= deadlineAt) {
+        return createFailClosedSocialMemoryConsolidation("timeout");
+      }
+      const model = await this.resolveModelForTurnAnalysis(signal);
+      if (!model) return createFailClosedSocialMemoryConsolidation("provider_error");
+      const raw = await this.callSocialMemoryConsolidation(input, model, signal);
+      if (signal.aborted || performance.now() >= deadlineAt) {
+        return createFailClosedSocialMemoryConsolidation("timeout");
+      }
+      const completion = completionSchema.safeParse(raw);
+      const content = completion.success ? completion.data.choices[0]?.message.content : undefined;
+      if (!content) return createFailClosedSocialMemoryConsolidation("invalid_output");
+      return parseSocialMemoryConsolidationContent(content, input) ??
+        createFailClosedSocialMemoryConsolidation("invalid_output");
+    } catch {
+      if (signal.aborted || performance.now() >= deadlineAt) {
+        return createFailClosedSocialMemoryConsolidation("timeout");
+      }
+      return createFailClosedSocialMemoryConsolidation("provider_error");
+    }
+  }
+
   private async resolveModelForTurnAnalysis(signal: AbortSignal): Promise<string | undefined> {
     const known = this.resolvedModel ?? this.backend.configuredModel;
     if (known) return known;
@@ -2252,6 +2498,26 @@ export class LmStudioClient {
     }, signal);
   }
 
+  private async callSocialMemoryConsolidation(
+    input: NormalizedSocialMemoryConsolidationInput,
+    model: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    return await this.complete({
+      model,
+      messages: [
+        { role: "system", content: buildSocialMemoryConsolidationSystemPrompt() },
+        { role: "user", content: JSON.stringify(buildSocialMemoryConsolidationUserData(input)) },
+      ],
+      temperature: 0,
+      top_p: 1,
+      reasoning_effort: "none",
+      max_tokens: 720,
+      stream: false,
+      response_format: buildSocialMemoryConsolidationResponseFormat(input),
+    }, signal);
+  }
+
   private async performVision(image: Buffer, caption: string): Promise<VisualObservation> {
     if (!this.resolvedModel) await this.probe();
     const model = this.resolvedModel ?? this.backend.configuredModel;
@@ -2300,6 +2566,7 @@ export class LmStudioClient {
     baseRequest: SceneRequest,
     signal?: AbortSignal,
     allowRequestOwnerRetry = true,
+    actorContextIsolated = false,
   ): Promise<GeneratedLine[]> {
     const temporalActorSelected = baseRequest.temporalSurfaceActorId
       ? baseRequest.selected.some((persona) => persona.id === baseRequest.temporalSurfaceActorId)
@@ -2310,6 +2577,13 @@ export class LmStudioClient {
       }
     } else if (baseRequest.requestedClock) {
       throw new TypeError("A requested clock requires direct_answer temporal policy");
+    }
+    if (
+      !actorContextIsolated &&
+      baseRequest.selected.length > 1 &&
+      carriesActorScopedContext(baseRequest)
+    ) {
+      return await this.performActorIsolatedScene(baseRequest, signal, allowRequestOwnerRetry);
     }
     const sceneNow = new Date(this.now());
     const requestedClock = baseRequest.requestedClock
@@ -2469,6 +2743,66 @@ export class LmStudioClient {
     return result.slice(0, request.selected.length);
   }
 
+  private async performActorIsolatedScene(
+    request: SceneRequest,
+    signal: AbortSignal | undefined,
+    allowRequestOwnerRetry: boolean,
+  ): Promise<GeneratedLine[]> {
+    // Production's director supplies at most one private viewpoint, which
+    // means one isolated call plus one redacted batch. Keep this lower boundary
+    // lossless for other callers: every actor that actually arrives with a note
+    // gets an isolated request, while all note-free actors stay one batch.
+    const privateActors = request.selected.filter((persona) =>
+      (request.relationshipNotes?.[persona.id]?.trim().length ?? 0) > 0
+    );
+    if (privateActors.length === 0) {
+      return await this.perform(
+        { ...request, relationshipNotes: undefined },
+        signal,
+        allowRequestOwnerRetry,
+        true,
+      );
+    }
+    const privateActorIds = new Set(privateActors.map((persona) => persona.id));
+    const publicBatch = request.selected.filter((persona) => !privateActorIds.has(persona.id));
+    const batches: Array<{ personas: Persona[]; includePrivateRelationshipNote: boolean }> = [
+      ...privateActors.map((persona) => ({
+        personas: [persona],
+        includePrivateRelationshipNote: true,
+      })),
+      ...(publicBatch.length > 0
+        ? [{ personas: publicBatch, includePrivateRelationshipNote: false }]
+        : []),
+    ];
+    const linesByPersona = new Map<string, GeneratedLine>();
+    for (const batch of batches) {
+      if (signal?.aborted) throw signal.reason ?? new Error("Generation aborted");
+      const actorRequest = actorSubsetSceneRequest(
+        request,
+        batch.personas,
+        batch.includePrivateRelationshipNote,
+      );
+      try {
+        const actorLines = await this.perform(actorRequest, signal, allowRequestOwnerRetry, true);
+        for (const line of actorLines) linesByPersona.set(line.personaId, line);
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason ?? error;
+        // Each accepted batch has already passed its complete review pipeline.
+        // Preserve it when a later independent batch fails; the director can
+        // still run its one bounded focused recovery for a missing required
+        // actor. Cancellation/preemption remains atomic via the abort above.
+        console.warn(
+          "Actor-isolated scene batch failed; preserving earlier reviewed lines:",
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+    return request.selected.flatMap((persona) => {
+      const line = linesByPersona.get(persona.id);
+      return line ? [line] : [];
+    });
+  }
+
   private parseSceneLines(content: string, request: SceneRequest): GeneratedLine[] {
     const parsed = sceneOutputSchema.parse(JSON.parse(cleanJson(content)));
     const allowed = new Set(request.selected.map((persona) => persona.id));
@@ -2556,6 +2890,7 @@ export class LmStudioClient {
         actorName: persona.name,
         content: line.content.slice(0, 500),
         sourceIds: line.sourceIds,
+        privateRelationshipNote: request.relationshipNotes?.[line.personaId]?.slice(0, 2_600) ?? null,
         mustReply: request.mustReplyIds?.includes(line.personaId) ?? false,
         // Self-contained artifacts use the explicit-request contract. A typed
         // capability scene instead uses its evidence/temporal grounding
@@ -3529,7 +3864,11 @@ export class LmStudioClient {
       requiredActorIds: request.mustReplyIds ?? [],
       explicitRequestOwnerIds: explicitRequestOwnerIds(request),
       relationshipNotes: request.relationshipNotes ?? {},
-      actorChannelNotes: request.actorChannelNotes ?? {},
+      // Per-resident unread/focus state is not shared social context. A normal
+      // no-memory batch keeps one generation call but omits this private-ish
+      // runtime projection; memory-bearing scenes are actor-isolated earlier
+      // and therefore retain the speaking resident's own channel note here.
+      actorChannelNotes: request.selected.length === 1 ? request.actorChannelNotes ?? {} : {},
       requiredLanguage: request.semanticContext?.languageTag ?? request.languageHint ?? "mirror latest trigger",
       semanticContext: request.semanticContext ?? null,
       trustedTemporalContext: request.temporalContext

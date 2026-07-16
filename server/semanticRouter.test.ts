@@ -207,13 +207,21 @@ describe("multilingual semantic router contract", () => {
   });
 
   it("builds strict dynamic persona, URL-reference and capability enums", () => {
-    const format = buildTurnAnalysisResponseFormat(input()) as {
+    const routedInput = input({
+      humanCandidates: [
+        { id: "human-kat", displayLabel: "Κατερίνα" },
+        { id: "human-noor", displayLabel: "نور" },
+      ],
+    });
+    const format = buildTurnAnalysisResponseFormat(routedInput) as {
       json_schema: { strict: boolean; schema: { additionalProperties: boolean; properties: Record<string, any> } };
     };
     const properties = format.json_schema.schema.properties;
     expect(format.json_schema.strict).toBe(true);
     expect(format.json_schema.schema.additionalProperties).toBe(false);
     expect(properties.p.properties.a.items.enum).toEqual(["ai-mira", "ai-sana"]);
+    expect(properties.p.properties.h.items.enum).toEqual(["human-kat", "human-noor"]);
+    expect(properties.p.required).toEqual(expect.arrayContaining(["h", "z"]));
     expect(properties.e.properties.u.anyOf[0].enum).toEqual(["latest:0", "reply:0"]);
     expect(properties.e.properties.a.enum).toEqual(["none", "read_url", "web_search", "local_datetime", "weather_forecast"]);
     expect(properties.e.properties.q.anyOf[0].description).toContain("optional weather_forecast place-only fallback alias");
@@ -230,6 +238,70 @@ describe("multilingual semantic router contract", () => {
     const restricted = buildTurnAnalysisResponseFormat(noNetworkTools) as any;
     expect(restricted.json_schema.schema.properties.e.properties.a.enum).toEqual(["none", "local_datetime"]);
     expect(properties.y.maxItems).toBe(0);
+  });
+
+  it("resolves supplied offline humans semantically across languages and projects only trusted known IDs", () => {
+    const routedInput = input({
+      latestMessage: {
+        id: "message-offline-reference",
+        authorId: "human-1",
+        authorName: "Hana",
+        content: "ミラ、昨日来たカテリナのこと覚えてる？",
+      },
+      humanCandidates: [
+        { id: "human-kat", displayLabel: "Κατερίνα" },
+        { id: "human-noor", displayLabel: "نور" },
+      ],
+      historyRecallAvailable: true,
+    });
+    const descriptive = {
+      ...modelOutput(),
+      referencedHumanIds: ["human-kat"],
+      referencedHumanConfidence: 0.97,
+      historyRecall: { need: "required", query: "カテリナ", confidence: 0.96 },
+    };
+    const parsedDescriptive = parseTurnAnalysisContent(JSON.stringify(descriptive), routedInput);
+    expect(projectTrustedTurnAnalysis(parsedDescriptive, ["human-kat", "human-noor"]).referencedHumanIds)
+      .toEqual(["human-kat"]);
+    expect(projectTrustedTurnAnalysis(parsedDescriptive, ["human-noor"]).referencedHumanIds).toEqual([]);
+
+    const compact = compactWeatherOutput({
+      p: { a: [], r: [], v: ["ai-mira"], x: 0, y: 0.9, h: ["human-noor"], z: 0.95 },
+    });
+    const parsedCompact = parseTurnAnalysisContent(JSON.stringify(compact), routedInput);
+    expect(parsedCompact).toMatchObject({
+      referencedHumanIds: ["human-noor"],
+      referencedHumanConfidence: 0.95,
+    });
+    expect(projectTrustedTurnAnalysis(parsedCompact, ["human-kat", "human-noor"]).referencedHumanIds)
+      .toEqual(["human-noor"]);
+
+    const lowConfidence = { ...descriptive, referencedHumanConfidence: 0.89 };
+    expect(projectTrustedTurnAnalysis(
+      parseTurnAnalysisContent(JSON.stringify(lowConfidence), routedInput),
+      ["human-kat", "human-noor"],
+    ).referencedHumanIds).toEqual([]);
+    expect(parseTurnAnalysisContent(
+      JSON.stringify({ ...descriptive, referencedHumanIds: ["human-unknown"] }),
+      routedInput,
+    )).toBeUndefined();
+    expect(buildTurnAnalysisUserData(routedInput)).toMatchObject({
+      humanCandidates: [
+        { id: "human-kat", displayLabel: "Κατερίνα" },
+        { id: "human-noor", displayLabel: "نور" },
+      ],
+    });
+    expect(buildTurnAnalysisSystemPrompt()).toContain("clearly refers in the third person");
+  });
+
+  it("rejects caseless-colliding human catalogs before they reach the model", () => {
+    expect(turnAnalysisInputSchema.safeParse({
+      ...input(),
+      humanCandidates: [
+        { id: "human-one", displayLabel: "Alex" },
+        { id: "human-two", displayLabel: "ＡＬＥＸ" },
+      ],
+    }).success).toBe(false);
   });
 
   it("accepts semantic output in an arbitrary language with a mechanically valid IANA timezone", () => {
@@ -1053,6 +1125,7 @@ describe("multilingual semantic router contract", () => {
       replyExpected: "none",
       inferredAddressedIds: [],
       relevantIds: [],
+      referencedHumanIds: [],
       socialTrusted: false,
       social: { warmth: 0, hostility: 0, playfulness: 0, absurdity: 0, urgency: 0, energy: 0, pileOnRisk: 0, claimStrength: 0 },
       moderationTrusted: false,

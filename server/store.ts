@@ -37,6 +37,16 @@ interface PrivateThread {
   messages: ChatMessage[];
 }
 
+export class RoomStateLoadError extends Error {
+  readonly code = "ROOM_STATE_LOAD_FAILED";
+
+  constructor(cause: unknown) {
+    super("Room history could not be read safely. Startup was aborted and the original state was left untouched.");
+    this.name = "RoomStateLoadError";
+    this.cause = cause;
+  }
+}
+
 const minuteAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 const boundedRetention = (raw: string | undefined, fallback: number, minimum: number, maximum: number): number => {
   const parsed = Number.parseInt(raw ?? "", 10);
@@ -67,6 +77,177 @@ const DEFAULT_DM_HISTORY_TRIM_TO = boundedRetention(
   DEFAULT_DM_HISTORY_HARD_LIMIT - 1,
 );
 const AUTONOMOUS_ACCOUNTING_RETENTION_MS = 48 * 60 * 60_000;
+const MAX_PERSISTED_PUBLIC_MESSAGES = 100_000;
+const MAX_PERSISTED_PRIVATE_THREADS = 10_000;
+const MAX_PERSISTED_PRIVATE_MESSAGES_PER_THREAD = 20_000;
+const MAX_PERSISTED_PRIVATE_MESSAGES_TOTAL = 200_000;
+const MAX_PERSISTED_AUTONOMOUS_PUBLICATIONS = 100_000;
+const MAX_ID_LENGTH = 100;
+const MAX_CHANNEL_ID_LENGTH = 256;
+const MAX_MESSAGE_CONTENT_LENGTH = 500;
+const MAX_REACTIONS_PER_MESSAGE = 32;
+const MAX_REACTION_MEMBERS = 256;
+const MAX_SOURCES_PER_MESSAGE = 8;
+const MAX_ATTACHMENTS_PER_MESSAGE = 4;
+const MAX_PERSISTED_IMAGE_BYTES = 32 * 1024 * 1024;
+const MAX_URL_LENGTH = 2_048;
+const SYSTEM_AUTHOR_ID = "system";
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+const hasOnlyKeys = (value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean =>
+  Object.keys(value).every((key) => allowed.has(key));
+
+const isBoundedString = (value: unknown, maximum: number, minimum = 0): value is string =>
+  typeof value === "string" && value.length >= minimum && value.length <= maximum;
+
+const isBoundedIdentifier = (value: unknown): value is string =>
+  isBoundedString(value, MAX_ID_LENGTH, 1) && value.trim().length > 0;
+
+const isBoundedChannelId = (value: unknown): value is string =>
+  isBoundedString(value, MAX_CHANNEL_ID_LENGTH, 1) && value.trim().length > 0;
+
+const isTimestamp = (value: unknown): value is string =>
+  isBoundedString(value, 64, 1) && Number.isFinite(Date.parse(value));
+
+const isFiniteInteger = (value: unknown, minimum: number, maximum: number): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum;
+
+const isPublicHttpsUrl = (value: unknown): value is string => {
+  if (!isBoundedString(value, MAX_URL_LENGTH, 1) || /[\u0000-\u001f\u007f]/u.test(value)) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && !parsed.username && !parsed.password;
+  } catch {
+    return false;
+  }
+};
+
+const isSafeAvatarUrl = (value: unknown): value is string => {
+  if (!isBoundedString(value, MAX_URL_LENGTH, 1) || /[\u0000-\u001f\u007f\\]/u.test(value)) return false;
+  if (value.startsWith("/") && !value.startsWith("//")) return true;
+  return isPublicHttpsUrl(value);
+};
+
+const MESSAGE_KEYS = new Set([
+  "id",
+  "channelId",
+  "authorId",
+  "content",
+  "createdAt",
+  "reactions",
+  "replyToId",
+  "replyPreview",
+  "system",
+  "authorSnapshot",
+  "generation",
+  "sources",
+  "linkPreview",
+  "attachments",
+]);
+const REACTION_KEYS = new Set(["emoji", "memberIds"]);
+const REPLY_PREVIEW_KEYS = new Set(["authorId", "authorName", "content"]);
+const MEMBER_KEYS = new Set(["id", "name", "kind", "status", "avatar", "role", "bio", "activity"]);
+const AVATAR_KEYS = new Set(["color", "accent", "glyph", "imageUrl"]);
+const SOURCE_KEYS = new Set(["title", "url", "publishedAt"]);
+const LINK_PREVIEW_KEYS = new Set(["url", "displayHost", "title", "description", "siteName", "fetchedAt"]);
+const ATTACHMENT_KEYS = new Set([
+  "id",
+  "kind",
+  "url",
+  "thumbnailUrl",
+  "mimeType",
+  "width",
+  "height",
+  "sizeBytes",
+  "analysis",
+]);
+const ANALYSIS_KEYS = new Set(["status", "observation"]);
+const OBSERVATION_KEYS = new Set([
+  "summary",
+  "details",
+  "visibleText",
+  "topics",
+  "uncertainties",
+  "analyzedAt",
+]);
+
+const isReaction = (value: unknown): value is Reaction => {
+  if (!isRecord(value) || !hasOnlyKeys(value, REACTION_KEYS)) return false;
+  if (!isBoundedString(value.emoji, 32, 1) || !Array.isArray(value.memberIds) ||
+      value.memberIds.length > MAX_REACTION_MEMBERS || !value.memberIds.every(isBoundedIdentifier)) return false;
+  return new Set(value.memberIds).size === value.memberIds.length;
+};
+
+const isReplyPreview = (value: unknown): value is ReplyPreview =>
+  isRecord(value) && hasOnlyKeys(value, REPLY_PREVIEW_KEYS) &&
+  isBoundedIdentifier(value.authorId) &&
+  isBoundedString(value.authorName, 100, 1) && value.authorName.trim().length > 0 &&
+  isBoundedString(value.content, 500);
+
+const isFrozenMember = (value: unknown, authorId: string): value is Member => {
+  if (!isRecord(value) || !hasOnlyKeys(value, MEMBER_KEYS) || value.id !== authorId ||
+      !isBoundedIdentifier(value.id) || !isBoundedString(value.name, 100, 1) || value.name.trim().length < 1 ||
+      (value.kind !== "human" && value.kind !== "ai") ||
+      !["online", "idle", "dnd", "offline"].includes(String(value.status)) ||
+      !isRecord(value.avatar) || !hasOnlyKeys(value.avatar, AVATAR_KEYS)) return false;
+  const avatar = value.avatar;
+  if (!isBoundedString(avatar.color, 32, 1) || !/^#[0-9a-f]{3,8}$/iu.test(avatar.color) ||
+      !isBoundedString(avatar.accent, 32, 1) || !/^#[0-9a-f]{3,8}$/iu.test(avatar.accent) ||
+      !isBoundedString(avatar.glyph, 8, 1) ||
+      (avatar.imageUrl !== undefined && !isSafeAvatarUrl(avatar.imageUrl))) return false;
+  return (value.role === undefined || isBoundedString(value.role, 80, 1)) &&
+    (value.bio === undefined || isBoundedString(value.bio, 240, 1)) &&
+    (value.activity === undefined || isBoundedString(value.activity, 160, 1));
+};
+
+const isMessageSource = (value: unknown): value is MessageSource =>
+  isRecord(value) && hasOnlyKeys(value, SOURCE_KEYS) &&
+  isBoundedString(value.title, 500, 1) && value.title.trim().length > 0 &&
+  isPublicHttpsUrl(value.url) &&
+  (value.publishedAt === undefined || isTimestamp(value.publishedAt));
+
+const isLinkPreview = (value: unknown): value is LinkPreview =>
+  isRecord(value) && hasOnlyKeys(value, LINK_PREVIEW_KEYS) &&
+  isPublicHttpsUrl(value.url) &&
+  isBoundedString(value.displayHost, 255, 1) &&
+  isBoundedString(value.title, 500, 1) &&
+  (value.description === undefined || isBoundedString(value.description, 2_000, 1)) &&
+  isBoundedString(value.siteName, 255, 1) &&
+  isTimestamp(value.fetchedAt);
+
+const isObservationList = (value: unknown, maximumItems: number, maximumLength: number): value is string[] =>
+  Array.isArray(value) && value.length <= maximumItems &&
+  value.every((item) => isBoundedString(item, maximumLength, 1));
+
+const isImageAnalysis = (value: unknown): value is ImageAnalysis => {
+  if (!isRecord(value) || !hasOnlyKeys(value, ANALYSIS_KEYS)) return false;
+  if (value.status === "pending" || value.status === "unavailable") {
+    return value.observation === undefined;
+  }
+  if (value.status !== "ready" || !isRecord(value.observation) ||
+      !hasOnlyKeys(value.observation, OBSERVATION_KEYS)) return false;
+  const observation = value.observation;
+  return isBoundedString(observation.summary, 500, 1) &&
+    isObservationList(observation.details, 8, 160) &&
+    isObservationList(observation.visibleText, 6, 160) &&
+    isObservationList(observation.topics, 8, 60) &&
+    isObservationList(observation.uncertainties, 4, 160) &&
+    isTimestamp(observation.analyzedAt);
+};
+
+const IMAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const isImageAttachment = (value: unknown): value is ImageAttachment => {
+  if (!isRecord(value) || !hasOnlyKeys(value, ATTACHMENT_KEYS) ||
+      !isBoundedIdentifier(value.id) || !IMAGE_ID.test(value.id) || value.kind !== "image" ||
+      value.url !== `/api/images/${value.id}` ||
+      value.thumbnailUrl !== `/api/images/${value.id}?variant=thumbnail` ||
+      value.mimeType !== "image/webp" ||
+      !isFiniteInteger(value.width, 1, 2_048) || !isFiniteInteger(value.height, 1, 2_048) ||
+      !isFiniteInteger(value.sizeBytes, 1, MAX_PERSISTED_IMAGE_BYTES)) return false;
+  return isImageAnalysis(value.analysis);
+};
 
 export interface RoomStoreOptions {
   publicHistoryHardLimit?: number;
@@ -83,11 +264,11 @@ const compareMessages = (a: Pick<ChatMessage, "createdAt" | "id">, b: Pick<ChatM
   a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
 
 const isAutonomousPublicationRecord = (value: unknown): value is AutonomousPublicationRecord => {
-  if (!value || typeof value !== "object") return false;
+  if (!isRecord(value)) return false;
   const record = value as Partial<AutonomousPublicationRecord>;
-  return typeof record.messageId === "string" && record.messageId.length > 0 &&
-    typeof record.channelId === "string" && record.channelId.length > 0 &&
-    typeof record.createdAt === "string" && Number.isFinite(Date.parse(record.createdAt)) &&
+  return isBoundedIdentifier(record.messageId) &&
+    isBoundedChannelId(record.channelId) &&
+    isTimestamp(record.createdAt) &&
     (record.kind === "ambient" || record.kind === "research") &&
     (record.attendance === "attended" || record.attendance === "unattended");
 };
@@ -95,29 +276,96 @@ const isAutonomousPublicationRecord = (value: unknown): value is AutonomousPubli
 const boundedLimit = (value: number | undefined, fallback: number, minimum: number, maximum: number): number =>
   Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, Math.floor(value!))) : fallback;
 
+const isPersistedMessage = (value: unknown): value is ChatMessage => {
+  if (!isRecord(value) || !hasOnlyKeys(value, MESSAGE_KEYS) ||
+      !isBoundedIdentifier(value.id) || !isBoundedChannelId(value.channelId) ||
+      !isBoundedIdentifier(value.authorId) ||
+      !isBoundedString(value.content, MAX_MESSAGE_CONTENT_LENGTH) || !isTimestamp(value.createdAt) ||
+      !Array.isArray(value.reactions) || value.reactions.length > MAX_REACTIONS_PER_MESSAGE ||
+      !value.reactions.every(isReaction)) return false;
+  if (new Set(value.reactions.map((reaction) => reaction.emoji)).size !== value.reactions.length) return false;
+  if (value.replyToId !== undefined && !isBoundedIdentifier(value.replyToId)) return false;
+  if (value.replyPreview !== undefined && !isReplyPreview(value.replyPreview)) return false;
+  if (value.system !== undefined && typeof value.system !== "boolean") return false;
+  if ((value.system === true) !== (value.authorId === SYSTEM_AUTHOR_ID)) return false;
+  if (value.authorSnapshot !== undefined && !isFrozenMember(value.authorSnapshot, value.authorId)) return false;
+  if (value.generation !== undefined && value.generation !== "lm" && value.generation !== "fallback") return false;
+  if (value.sources !== undefined) {
+    if (!Array.isArray(value.sources) || value.sources.length > MAX_SOURCES_PER_MESSAGE ||
+        !value.sources.every(isMessageSource)) return false;
+    if (new Set(value.sources.map((source) => source.url)).size !== value.sources.length) return false;
+  }
+  if (value.linkPreview !== undefined && !isLinkPreview(value.linkPreview)) return false;
+  if (value.attachments !== undefined) {
+    if (!Array.isArray(value.attachments) || value.attachments.length > MAX_ATTACHMENTS_PER_MESSAGE ||
+        !value.attachments.every(isImageAttachment)) return false;
+    if (new Set(value.attachments.map((attachment) => attachment.id)).size !== value.attachments.length) return false;
+  }
+  return true;
+};
+
 const restorePrivateThread = (value: unknown, hardLimit: number): PrivateThread | undefined => {
-  if (!value || typeof value !== "object") return undefined;
+  if (!isRecord(value)) return undefined;
   const record = value as Partial<PrivateThread>;
   if (!Array.isArray(record.participantIds) || record.participantIds.length !== 2) return undefined;
-  const participantIds = record.participantIds.filter(
-    (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0 && candidate.length <= 100,
-  );
+  const participantIds = record.participantIds.filter(isBoundedIdentifier);
   if (participantIds.length !== 2 || participantIds[0] === participantIds[1]) return undefined;
   participantIds.sort();
   const canonicalId = `dm:${participantIds.join(":")}`;
-  if (record.id !== canonicalId || !Array.isArray(record.messages)) return undefined;
+  if (record.id !== canonicalId || !Array.isArray(record.messages) ||
+      record.messages.length > MAX_PERSISTED_PRIVATE_MESSAGES_PER_THREAD) return undefined;
   const participants = new Set(participantIds);
-  const messages = record.messages.filter((message): message is ChatMessage => {
-    if (!message || typeof message !== "object") return false;
-    const candidate = message as Partial<ChatMessage>;
-    return typeof candidate.id === "string" && candidate.id.length > 0 && candidate.id.length <= 100 &&
-      candidate.channelId === canonicalId &&
-      typeof candidate.authorId === "string" && participants.has(candidate.authorId) &&
-      typeof candidate.content === "string" && candidate.content.length <= 500 &&
-      typeof candidate.createdAt === "string" && Number.isFinite(Date.parse(candidate.createdAt)) &&
-      Array.isArray(candidate.reactions);
-  }).slice(-hardLimit);
-  return { id: canonicalId, participantIds: participantIds as [string, string], messages };
+  const messages = record.messages.filter((message): message is ChatMessage =>
+    isPersistedMessage(message) && message.channelId === canonicalId && participants.has(message.authorId) &&
+    (message.replyPreview === undefined || participants.has(message.replyPreview.authorId)) &&
+    message.reactions.every((reaction) => reaction.memberIds.every((memberId) => participants.has(memberId))),
+  );
+  // Never silently repair a partially corrupt private thread: dropping even
+  // one invalid row would make startup's DM actor inventory incomplete.
+  if (messages.length !== record.messages.length) return undefined;
+  return {
+    id: canonicalId,
+    participantIds: participantIds as [string, string],
+    messages: messages.slice(-hardLimit),
+  };
+};
+
+const parsePersistedState = (value: unknown): PersistedState => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("Room state root must be an object.");
+  }
+  const state = value as Partial<PersistedState>;
+  if (state.version !== 1 && state.version !== 2) throw new TypeError("Room state version is unsupported.");
+  if (!Array.isArray(state.messages) || state.messages.length > MAX_PERSISTED_PUBLIC_MESSAGES ||
+      !state.messages.every(isPersistedMessage)) {
+    throw new TypeError("Room state contains an invalid public history.");
+  }
+  if (new Set(state.messages.map((message) => message.id)).size !== state.messages.length) {
+    throw new TypeError("Room state contains duplicate public message IDs.");
+  }
+  if (state.privateThreads !== undefined && !Array.isArray(state.privateThreads)) {
+    throw new TypeError("Room state contains an invalid private-thread collection.");
+  }
+  if (state.privateThreads && (
+    state.privateThreads.length > MAX_PERSISTED_PRIVATE_THREADS ||
+    state.privateThreads.reduce((total, thread) => {
+      if (!isRecord(thread) || !Array.isArray(thread.messages)) return MAX_PERSISTED_PRIVATE_MESSAGES_TOTAL + 1;
+      return total + thread.messages.length;
+    }, 0) > MAX_PERSISTED_PRIVATE_MESSAGES_TOTAL
+  )) {
+    throw new TypeError("Room state private history exceeds its retention envelope.");
+  }
+  if (state.version === 2 && !Array.isArray(state.privateThreads)) {
+    throw new TypeError("Version 2 room state is missing its private-thread collection.");
+  }
+  if (state.autonomousPublications !== undefined && (
+    !Array.isArray(state.autonomousPublications) ||
+    state.autonomousPublications.length > MAX_PERSISTED_AUTONOMOUS_PUBLICATIONS ||
+    !state.autonomousPublications.every(isAutonomousPublicationRecord)
+  )) {
+    throw new TypeError("Room state contains invalid autonomous-publication accounting.");
+  }
+  return state as PersistedState;
 };
 
 const seedMessages = (): ChatMessage[] => [
@@ -442,16 +690,22 @@ export class RoomStore {
   async load(): Promise<void> {
     try {
       const raw = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as PersistedState;
+      const parsed = parsePersistedState(JSON.parse(raw) as unknown);
       const builtInScene = seedMessages();
       this.messages = Array.isArray(parsed.messages) && parsed.messages.length > 0 ? parsed.messages : builtInScene;
       this.autonomousPublications = Array.isArray(parsed.autonomousPublications)
         ? parsed.autonomousPublications.filter(isAutonomousPublicationRecord)
         : [];
       this.privateThreads.clear();
-      for (const candidate of Array.isArray(parsed.privateThreads) ? parsed.privateThreads : []) {
+      for (const candidate of parsed.privateThreads ?? []) {
         const restored = restorePrivateThread(candidate, this.dmHistoryHardLimit);
-        if (restored) this.privateThreads.set(restored.id, restored);
+        if (!restored || this.privateThreads.has(restored.id)) {
+          throw new TypeError("Room state contains an invalid or duplicate private thread.");
+        }
+        this.privateThreads.set(restored.id, {
+          ...restored,
+          messages: restored.messages.slice(-this.dmHistoryHardLimit),
+        });
       }
       this.pruneAutonomousPublications();
       const populatedChannels = new Set(this.messages.map((message) => message.channelId));
@@ -466,7 +720,12 @@ export class RoomStore {
       if (missingChannelSeeds.length > 0) await this.flush();
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") console.warn("Could not read room state; starting from the built-in scene.", error);
+      if (code !== "ENOENT") {
+        this.messages = [];
+        this.autonomousPublications = [];
+        this.privateThreads.clear();
+        throw new RoomStateLoadError(error);
+      }
       this.messages = seedMessages();
       this.autonomousPublications = [];
       this.privateThreads.clear();
@@ -645,6 +904,52 @@ export class RoomStore {
 
   getDmParticipants(threadId: string): [string, string] | undefined {
     return this.privateThreads.get(threadId)?.participantIds;
+  }
+
+  /**
+   * Complete trusted human-author inventory from durable public rows. A frozen
+   * server-authored snapshot, matching the row author ID, is required; actor
+   * type is never guessed from an ID prefix or display-name convention.
+   */
+  getAllPublicHumanAuthorIds(): string[] {
+    return [...new Set(this.messages.flatMap((message) =>
+      message.authorSnapshot?.kind === "human" && message.authorSnapshot.id === message.authorId
+        ? [message.authorId]
+        : [],
+    ))].sort();
+  }
+
+  /**
+   * Complete actor inventory for the missing-companion continuity barrier.
+   * Legacy public rows may predate frozen author snapshots, and the original
+   * message behind a reply preview may already have aged out. Startup must
+   * therefore account for every non-system author, reactor and quoted author
+   * instead of trusting a type marker that might simply be absent. Current
+   * resident IDs are reconciled by the caller; any other surviving ID requires
+   * a human profile or tombstone.
+   */
+  getAllPublicParticipantActorIds(): string[] {
+    const actorIds = new Set<string>();
+    const addActor = (actorId: string): void => {
+      // `system` is the exact reserved transport author, not an actor-type
+      // guess based on a caller-controlled prefix or display name.
+      if (actorId !== SYSTEM_AUTHOR_ID) actorIds.add(actorId);
+    };
+    for (const message of this.messages) {
+      if (!message.system) addActor(message.authorId);
+      if (message.replyPreview) addActor(message.replyPreview.authorId);
+      for (const reaction of message.reactions) {
+        for (const memberId of reaction.memberIds) addActor(memberId);
+      }
+    }
+    return [...actorIds].sort();
+  }
+
+  /** Complete stable-id inventory used by the fail-closed startup barrier. */
+  getAllDmParticipantIds(): string[] {
+    return [...new Set(
+      [...this.privateThreads.values()].flatMap((thread) => thread.participantIds),
+    )].sort();
   }
 
   getDmMessages(threadId: string): ChatMessage[] {

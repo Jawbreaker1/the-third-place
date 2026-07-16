@@ -882,6 +882,169 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionCalls).toBe(2);
   });
 
+  it("runs bounded social-memory consolidation in the preemptible lane and caches by candidate content", async () => {
+    let completionCalls = 0;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      bodies.push(JSON.parse(String(init?.body)));
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({ actions: [{
+        slot: "merge_1",
+        kind: "subsumed",
+        sourceMemoryIds: ["memory-c1", "memory-c2"],
+        canonicalMemoryId: "memory-c1",
+        perspective: "Johan kanske flyttar; Mira är inte säker ännu.",
+        salience: 0.94,
+        confidence: 0.62,
+      }] }) } }] });
+    }));
+
+    const request = {
+      batchId: "consolidation-batch-1",
+      candidates: [{
+        id: "memory-c1",
+        ownerId: "ai-mira",
+        subjectIds: ["human-johan"],
+        scope: { kind: "public" as const, channelId: "lobby" },
+        sourceEventIds: ["event-c1"],
+        perspective: "Johan kanske flyttar; Mira är inte säker ännu.",
+        salience: 0.7,
+        confidence: 0.62,
+        tier: "episodic" as const,
+        occurredAt: 1_789_000_000_000,
+        pinned: false,
+      }, {
+        id: "memory-c2",
+        ownerId: "ai-mira",
+        subjectIds: ["human-johan"],
+        scope: { kind: "public" as const, channelId: "lobby" },
+        sourceEventIds: ["event-c2"],
+        perspective: "Mira minns att Johan möjligen ska flytta.",
+        salience: 0.94,
+        confidence: 0.88,
+        tier: "episodic" as const,
+        occurredAt: 1_789_000_100_000,
+        pinned: false,
+      }],
+    };
+    const lm = new LmStudioClient();
+    const first = lm.consolidateSocialMemories(request);
+    expect(lm.consolidateSocialMemories(request)).toBe(first);
+    await expect(first).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      actions: [{
+        sourceMemoryIds: ["memory-c1", "memory-c2"],
+        perspective: "Johan kanske flyttar; Mira är inte säker ännu.",
+        confidence: 0.62,
+      }],
+    });
+    expect(lm.consolidateSocialMemories(request)).toBe(first);
+    expect(completionCalls).toBe(1);
+    expect(bodies[0]).toMatchObject({
+      temperature: 0,
+      reasoning_effort: "none",
+      max_tokens: 720,
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "multilingual_social_memory_consolidation_v1", strict: true },
+      },
+    });
+    expect(bodies[0].messages[0].content).toContain("strict multilingual social-memory deduplication planner");
+
+    const changed = {
+      ...request,
+      candidates: request.candidates.map((candidate, index) => index === 1
+        ? { ...candidate, perspective: "Mira recalls the possible move, still uncertain." }
+        : candidate),
+    };
+    const changedResult = lm.consolidateSocialMemories(changed);
+    expect(changedResult).not.toBe(first);
+    await expect(changedResult).resolves.toMatchObject({ source: "lm" });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("retries transient or invalid consolidation output but caches a valid no-op", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return completionCalls === 1
+        ? jsonResponse({ choices: [{ message: { content: "not valid json" } }] })
+        : jsonResponse({ choices: [{ message: { content: JSON.stringify({ actions: [] }) } }] });
+    }));
+
+    const request = {
+      batchId: "consolidation-retry",
+      candidates: ["one", "two"].map((suffix, index) => ({
+        id: `memory-${suffix}`,
+        ownerId: "ai-mira",
+        subjectIds: ["human-johan"],
+        scope: { kind: "public" as const, channelId: "lobby" },
+        sourceEventIds: [`event-${suffix}`],
+        perspective: index === 0 ? "Mira minns mötet." : "Mira kommer ihåg mötet.",
+        salience: 0.7,
+        confidence: 0.8,
+        tier: "episodic" as const,
+        occurredAt: 1_789_000_000_000 + index,
+        pinned: false,
+      })),
+    };
+    const lm = new LmStudioClient();
+    const failed = lm.consolidateSocialMemories(request);
+    expect(lm.consolidateSocialMemories(request)).toBe(failed);
+    await expect(failed).resolves.toMatchObject({ source: "fallback", failureReason: "invalid_output" });
+
+    const retried = lm.consolidateSocialMemories(request);
+    expect(retried).not.toBe(failed);
+    await expect(retried).resolves.toEqual({ source: "lm", failureReason: null, actions: [] });
+    expect(lm.consolidateSocialMemories(request)).toBe(retried);
+    expect(completionCalls).toBe(2);
+  });
+
+  it("preempts active consolidation when a live semantic turn needs the shared model", async () => {
+    let consolidationStarted!: () => void;
+    const started = new Promise<void>((resolve) => { consolidationStarted = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        consolidationStarted();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+    const lm = new LmStudioClient();
+    const consolidation = lm.consolidateSocialMemories({
+      batchId: "background-consolidation",
+      candidates: ["one", "two"].map((suffix) => ({
+        id: `memory-${suffix}`,
+        ownerId: "ai-mira",
+        subjectIds: ["human-johan"],
+        scope: { kind: "public" as const, channelId: "lobby" },
+        sourceEventIds: [`event-${suffix}`],
+        perspective: "Mira remembers the same bounded event.",
+        salience: 0.7,
+        confidence: 0.8,
+        tier: "episodic" as const,
+        occurredAt: 1_789_000_000_000,
+        pinned: false,
+      })),
+    });
+    await started;
+    const live = lm.analyzeTurn(turnInput("live-preempts-consolidation"));
+
+    await expect(consolidation).resolves.toMatchObject({ source: "fallback", actions: [] });
+    await expect(live).resolves.toMatchObject({ source: "lm", evidence: { action: "read_url" } });
+    expect(completionCalls).toBe(2);
+  });
+
   it("preempts an active low-priority memory pass for the next live turn router", async () => {
     let memoryStarted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => { memoryStarted = resolve; });
@@ -4459,6 +4622,169 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain("At most one remembered detail");
     expect(prompt).toContain("never recite a stored profile");
     expect(prompt).toContain("mention internal labels");
+  });
+
+  it("keeps an ordinary multi-resident scene to one generation call when no private relationship note exists", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const completionBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      completionBodies.push(body);
+      return completionResponse([
+        { personaId: mira.id, content: "den första idén är faktiskt rätt kul" },
+        { personaId: sana.id, content: "jag hade testat den i mindre skala först" },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira, sana],
+      history: [],
+      actorChannelNotes: {
+        [mira.id]: "Mira has one unread room.",
+        [sana.id]: "Sana has another unread room.",
+      },
+      actorExpertiseNotes: {
+        [mira.id]: "Mira has basic room knowledge.",
+        [sana.id]: "Sana has advanced room knowledge.",
+      },
+    });
+
+    expect(lines.map((line) => line.personaId)).toEqual([mira.id, sana.id]);
+    expect(completionBodies).toHaveLength(1);
+    const sceneData = JSON.parse(completionBodies[0]!.messages[1]!.content) as {
+      actorChannelNotes: Record<string, string>;
+    };
+    expect(sceneData.actorChannelNotes).toEqual({});
+  });
+
+  it("isolates resident-private context through generation and review in a multi-actor scene", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const miraOnlyDetail = "MIRA_ONLY_BLUE_ORCHID_7319";
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      const system = body.messages[0]?.content ?? "";
+      const userText = body.messages[1]?.content ?? "{}";
+      if (system.includes("publication reviewer")) {
+        const reviewInput = JSON.parse(userText) as { candidates: Array<{ personaId: string }> };
+        return candidateReviewCompletion(reviewInput.candidates.map((candidate) => ({
+          personaId: candidate.personaId,
+          severity: "none" as const,
+          issues: [],
+          rewriteInstruction: null,
+        })));
+      }
+      const scene = JSON.parse(userText) as {
+        relationshipNotes?: Record<string, string>;
+      };
+      const personaId = Object.keys(scene.relationshipNotes ?? {})[0];
+      return personaId === mira.id
+        ? completionResponse([{ personaId: mira.id, content: `jag minns ${miraOnlyDetail}` }])
+        : completionResponse([{ personaId: sana.id, content: "jag minns bara det som faktiskt är mitt" }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira, sana],
+      history: [],
+      trigger: { author: "Guest", content: "Vad minns ni?" },
+      mustReplyIds: [mira.id, sana.id],
+      relationshipNotes: {
+        [mira.id]: `Private memory: ${miraOnlyDetail}`,
+      },
+      actorChannelNotes: {
+        [mira.id]: `Mira channel state also contains ${miraOnlyDetail}`,
+        [sana.id]: "Sana has no unread rooms.",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([
+      expect.objectContaining({ personaId: mira.id, content: expect.stringContaining(miraOnlyDetail) }),
+      expect.objectContaining({ personaId: sana.id, content: "jag minns bara det som faktiskt är mitt" }),
+    ]);
+    const sanaBodies = bodies.filter((body) => body.messages.some((message) =>
+      message.content.includes(sana.id),
+    ));
+    expect(sanaBodies).toHaveLength(2);
+    for (const body of sanaBodies) {
+      expect(JSON.stringify(body)).not.toContain(miraOnlyDetail);
+    }
+    expect(bodies.filter((body) =>
+      !body.messages[0]?.content.includes("publication reviewer")
+    )).toHaveLength(2);
+    const reviewPayloads = bodies
+      .filter((body) => body.messages[0]?.content.includes("publication reviewer"))
+      .map((body) => JSON.parse(body.messages[1]!.content) as {
+        candidates: Array<{ personaId: string; privateRelationshipNote: string | null }>;
+      });
+    expect(reviewPayloads).toEqual([
+      expect.objectContaining({
+        candidates: [expect.objectContaining({
+          personaId: mira.id,
+          privateRelationshipNote: expect.stringContaining(miraOnlyDetail),
+        })],
+      }),
+      expect.objectContaining({
+        candidates: [expect.objectContaining({
+          personaId: sana.id,
+          privateRelationshipNote: null,
+        })],
+      }),
+    ]);
+  });
+
+  it("preserves an earlier reviewed isolated line when a later redacted batch fails", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    let completionCalls = 0;
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        return completionResponse([{ personaId: mira.id, content: "den detaljen minns jag faktiskt" }]);
+      }
+      throw new Error("redacted batch transport failed");
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira, sana],
+      history: [],
+      mustReplyIds: [mira.id, sana.id],
+      relationshipNotes: {
+        [mira.id]: "Private memory: a bounded detail Mira may subtly recall.",
+      },
+    });
+
+    expect(completionCalls).toBe(2);
+    expect(lines).toEqual([
+      expect.objectContaining({ personaId: mira.id, content: "den detaljen minns jag faktiskt" }),
+    ]);
+    expect(console.warn).toHaveBeenCalledWith(
+      "Actor-isolated scene batch failed; preserving earlier reviewed lines:",
+      "redacted batch transport failed",
+    );
   });
 
   it("keeps hostile linked-page text in untrusted user data, never the system prompt", async () => {

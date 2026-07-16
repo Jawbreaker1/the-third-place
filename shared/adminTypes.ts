@@ -139,6 +139,16 @@ export interface AdminMemoryActorSummary {
   name: string;
   kind: "resident" | "human";
   memoryCount: number;
+  /** True when the inspector reached its row bound; additional rows may exist. */
+  memoryRowsTruncated: boolean;
+  /** Active, source-event memories that have not yet been consolidated away. */
+  activeEpisodicMemoryCount: number;
+  /** Durable summaries produced by source-bound multilingual consolidation. */
+  consolidatedMemoryCount: number;
+  /** Older items retained only as lifecycle provenance. */
+  supersededMemoryCount: number;
+  /** Items whose retention deadline has elapsed and are awaiting/reported by lifecycle cleanup. */
+  expiredMemoryCount: number;
   outgoingRelationshipCount: number;
   incomingRelationshipCount: number;
   openLoopCount: number;
@@ -148,6 +158,10 @@ export interface AdminMemoryActorSummary {
 export interface AdminMemoryStats {
   actors: number;
   memories: number;
+  activeEpisodicMemories: number;
+  consolidatedMemories: number;
+  supersededMemories: number;
+  expiredMemories: number;
   relationships: number;
   openLoops: number;
   auditEntries: number;
@@ -172,11 +186,17 @@ export interface AdminMemoryItem {
   confidence: number;
   salience: number;
   pinned: boolean;
+  tier: "episodic" | "consolidated";
   sourceEventIds: string[];
+  sourceEventCount: number;
   sourceMessageIds: string[];
+  recallCount: number;
   createdAt: string;
   updatedAt: string;
+  lastRecalledAt?: string;
+  reinforcedAt?: string;
   expiresAt?: string;
+  supersededBy?: string;
 }
 
 /** A directed relationship: the owner is the actor holding this view. */

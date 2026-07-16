@@ -20,6 +20,8 @@ const ADMIN_ACTOR_ID = "local-admin";
 const MAX_CATALOG_ACTORS = 200;
 const MAX_ROWS_PER_ACTOR = 50;
 const MAX_AUDIT_ROWS = 50;
+const MAX_MEMORY_PROVENANCE_EVENTS = 50;
+const MAX_MEMORY_PROVENANCE_MESSAGES = 100;
 const SAFE_ID = /^[\p{L}\p{N}_.:@/+\-=]{1,120}$/u;
 const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/u;
 
@@ -32,11 +34,15 @@ export interface SocialMemoryAdminActor {
 export interface SocialMemoryAdminOptions {
   store: SocialMemoryStore;
   getActors: () => readonly SocialMemoryAdminActor[];
+  /** Invalidates process-local prompt projections after a durable mutation. */
+  onStateChanged?: () => void;
 }
 
 interface ActorProjection {
   actor: SocialMemoryAdminActor;
   memories: SocialMemoryView[];
+  activeMemoryIds: ReadonlySet<string>;
+  memoryRowsTruncated: boolean;
   outgoing: RelationshipEdge[];
   incoming: RelationshipEdge[];
   loops: OpenLoop[];
@@ -67,6 +73,87 @@ const maximum = (values: number[]): number | undefined => {
   return finite.length ? Math.max(...finite) : undefined;
 };
 
+interface LifecycleMemoryFields {
+  tier?: unknown;
+  sourceEventIds?: unknown;
+  recallCount?: unknown;
+  lastRecalledAt?: unknown;
+  reinforcedAt?: unknown;
+  expiresAt?: unknown;
+  supersededBy?: unknown;
+}
+
+interface MemoryLifecycleProjection {
+  tier: "episodic" | "consolidated";
+  sourceEventIds: string[];
+  sourceEventCount: number;
+  recallCount: number;
+  lastRecalledAt?: number;
+  reinforcedAt?: number;
+  expiresAt?: number;
+  supersededBy?: string;
+}
+
+const optionalTimestamp = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+
+const optionalCount = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+
+const lifecycleProjection = (memory: SocialMemoryView): MemoryLifecycleProjection => {
+  const fields = memory as SocialMemoryView & LifecycleMemoryFields;
+  const tier = fields.tier === "consolidated" ? "consolidated" : "episodic";
+  const allSourceEventIds = Array.isArray(fields.sourceEventIds)
+    ? fields.sourceEventIds
+      .map(boundedId)
+      .filter((id): id is string => id !== undefined)
+    : [];
+  const canonicalSourceEventIds = [...new Set(
+    allSourceEventIds.length ? allSourceEventIds : [memory.eventId],
+  )];
+  const supersededBy = boundedId(fields.supersededBy);
+  return {
+    tier,
+    sourceEventIds: canonicalSourceEventIds.slice(0, MAX_MEMORY_PROVENANCE_EVENTS),
+    sourceEventCount: canonicalSourceEventIds.length,
+    recallCount: optionalCount(fields.recallCount) ?? 0,
+    ...(optionalTimestamp(fields.lastRecalledAt) === undefined
+      ? {}
+      : { lastRecalledAt: optionalTimestamp(fields.lastRecalledAt) }),
+    ...(optionalTimestamp(fields.reinforcedAt) === undefined
+      ? {}
+      : { reinforcedAt: optionalTimestamp(fields.reinforcedAt) }),
+    ...(optionalTimestamp(fields.expiresAt) === undefined
+      ? {}
+      : { expiresAt: optionalTimestamp(fields.expiresAt) }),
+    ...(supersededBy ? { supersededBy } : {}),
+  };
+};
+
+const lifecycleCounts = (
+  memories: readonly SocialMemoryView[],
+  activeMemoryIds: ReadonlySet<string>,
+) => {
+  const projected = memories.map(lifecycleProjection);
+  return {
+    activeEpisodic: memories.filter((memory, index) =>
+      activeMemoryIds.has(memory.id) && projected[index]?.tier === "episodic"
+    ).length,
+    consolidated: memories.filter((memory, index) =>
+      activeMemoryIds.has(memory.id) && projected[index]?.tier === "consolidated"
+    ).length,
+    superseded: projected.filter((memory) => Boolean(memory.supersededBy)).length,
+    expired: memories.filter((memory, index) =>
+      !activeMemoryIds.has(memory.id) && !projected[index]?.supersededBy
+    ).length,
+  };
+};
+
+const overviewLifecycleCount = (
+  stats: object,
+  key: "activeEpisodicMemories" | "consolidatedMemories" | "supersededMemories" | "expiredMemories",
+): number | undefined => optionalCount((stats as Record<string, unknown>)[key]);
+
 /**
  * Read-only DTO projection plus narrowly scoped admin mutations for social memory.
  * It deliberately exposes neither SQLite rows nor model-analysis payloads.
@@ -74,10 +161,12 @@ const maximum = (values: number[]): number | undefined => {
 export class SocialMemoryAdmin {
   readonly #store: SocialMemoryStore;
   readonly #getActors: () => readonly SocialMemoryAdminActor[];
+  readonly #onStateChanged?: () => void;
 
   constructor(options: SocialMemoryAdminOptions) {
     this.#store = options.store;
     this.#getActors = options.getActors;
+    this.#onStateChanged = options.onStateChanged;
   }
 
   getOverview(): AdminMemoryOverview {
@@ -85,10 +174,21 @@ export class SocialMemoryAdmin {
     const eventCache = new Map<string, ReturnType<SocialMemoryStore["getEvent"]>>();
     const projections = actors.map((actor) => this.#projectActor(actor));
     const storeOverview = this.#store.overview();
+    const visibleMemories = projections.flatMap((projection) => projection.memories);
+    const visibleActiveIds = new Set(projections.flatMap((projection) => [...projection.activeMemoryIds]));
+    const visibleLifecycle = lifecycleCounts(visibleMemories, visibleActiveIds);
     return {
       stats: {
         actors: actors.length,
         memories: storeOverview.stats.memories,
+        activeEpisodicMemories:
+          overviewLifecycleCount(storeOverview.stats, "activeEpisodicMemories") ?? visibleLifecycle.activeEpisodic,
+        consolidatedMemories:
+          overviewLifecycleCount(storeOverview.stats, "consolidatedMemories") ?? visibleLifecycle.consolidated,
+        supersededMemories:
+          overviewLifecycleCount(storeOverview.stats, "supersededMemories") ?? visibleLifecycle.superseded,
+        expiredMemories:
+          overviewLifecycleCount(storeOverview.stats, "expiredMemories") ?? visibleLifecycle.expired,
         relationships: storeOverview.stats.relationships,
         openLoops: storeOverview.stats.openLoops,
         auditEntries: storeOverview.stats.auditEntries,
@@ -110,24 +210,28 @@ export class SocialMemoryAdmin {
     const eventCache = new Map<string, ReturnType<SocialMemoryStore["getEvent"]>>();
     const projection = this.#projectActor(actor);
     const memorySources = new Map(
-      projection.memories.map((memory) => [
-        memory.id,
-        { eventId: memory.eventId, messageIds: [...memory.event.sourceMessageIds] },
-      ]),
+      projection.memories.map((memory) => {
+        const eventIds = lifecycleProjection(memory).sourceEventIds;
+        const messageIds = [...new Set([
+          ...memory.event.sourceMessageIds,
+          ...eventIds.flatMap((eventId) => this.#event(eventId, eventCache)?.sourceMessageIds ?? []),
+        ])].slice(0, MAX_MEMORY_PROVENANCE_MESSAGES);
+        return [memory.id, { eventIds, messageIds }] as const;
+      }),
     );
     const loopSources = new Map(
       projection.loops.map((loop) => {
         const event = this.#event(loop.eventId, eventCache);
         return [
           loop.id,
-          { eventId: loop.eventId, messageIds: event ? [...event.sourceMessageIds] : [] },
+          { eventIds: [loop.eventId], messageIds: event ? [...event.sourceMessageIds] : [] },
         ];
       }),
     );
 
     return {
       actor: this.#actorSummary(projection, eventCache),
-      ownedMemories: projection.memories.map((memory) => this.#memoryItem(memory)),
+      ownedMemories: projection.memories.map((memory) => this.#memoryItem(memory, eventCache)),
       outgoingRelationships: projection.outgoing.map((relationship) =>
         this.#relationshipItem(relationship, names),
       ),
@@ -144,19 +248,29 @@ export class SocialMemoryAdmin {
 
   setMemoryPinned(memoryId: string, pinned: boolean): boolean {
     if (!boundedId(memoryId) || typeof pinned !== "boolean") return false;
-    return this.#store.setMemoryPinned(memoryId, pinned, ADMIN_ACTOR_ID);
+    return this.#mutated(this.#store.setMemoryPinned(memoryId, pinned, ADMIN_ACTOR_ID));
   }
 
   deleteMemory(memoryId: string): boolean {
     if (!boundedId(memoryId)) return false;
-    return this.#store.deleteMemory(memoryId, ADMIN_ACTOR_ID);
+    return this.#mutated(this.#store.deleteMemory(memoryId, ADMIN_ACTOR_ID));
   }
 
   resetRelationship(ownerId: string, subjectId: string): boolean {
     const owner = boundedId(ownerId);
     const subject = boundedId(subjectId);
     if (!owner || !subject) return false;
-    return this.#store.resetRelationship(owner, subject, ADMIN_ACTOR_ID);
+    return this.#mutated(this.#store.resetRelationship(owner, subject, ADMIN_ACTOR_ID));
+  }
+
+  #mutated(changed: boolean): boolean {
+    if (!changed) return false;
+    try {
+      this.#onStateChanged?.();
+    } catch {
+      // Durable admin changes remain authoritative even if a cache hook fails.
+    }
+    return true;
   }
 
   #catalog(): SocialMemoryAdminActor[] {
@@ -187,9 +301,21 @@ export class SocialMemoryAdmin {
   }
 
   #projectActor(actor: SocialMemoryAdminActor): ActorProjection {
+    const memoryRows = this.#store.listMemories({
+      ownerId: actor.id,
+      limit: MAX_ROWS_PER_ACTOR + 1,
+      includeInactive: true,
+    });
+    const memories = memoryRows.slice(0, MAX_ROWS_PER_ACTOR);
+    const activeMemoryIds = new Set(
+      this.#store.listMemories({ ownerId: actor.id, limit: MAX_ROWS_PER_ACTOR })
+        .map((memory) => memory.id),
+    );
     return {
       actor,
-      memories: this.#store.listMemories({ ownerId: actor.id, limit: MAX_ROWS_PER_ACTOR }),
+      memories,
+      activeMemoryIds,
+      memoryRowsTruncated: memoryRows.length > MAX_ROWS_PER_ACTOR,
       outgoing: this.#store.listRelationships({ ownerId: actor.id, limit: MAX_ROWS_PER_ACTOR }),
       incoming: this.#store.listRelationships({ subjectId: actor.id, limit: MAX_ROWS_PER_ACTOR }),
       loops: this.#store.listOpenLoops({ ownerId: actor.id, limit: MAX_ROWS_PER_ACTOR }),
@@ -208,9 +334,15 @@ export class SocialMemoryAdmin {
       this.#event(loop.eventId, eventCache)?.occurredAt ?? loop.createdAt,
     );
     const lastActivityAt = maximum([...memoryActivity, ...relationshipActivity, ...loopActivity]);
+    const lifecycle = lifecycleCounts(projection.memories, projection.activeMemoryIds);
     return {
       ...projection.actor,
       memoryCount: projection.memories.length,
+      memoryRowsTruncated: projection.memoryRowsTruncated,
+      activeEpisodicMemoryCount: lifecycle.activeEpisodic,
+      consolidatedMemoryCount: lifecycle.consolidated,
+      supersededMemoryCount: lifecycle.superseded,
+      expiredMemoryCount: lifecycle.expired,
       outgoingRelationshipCount: projection.outgoing.length,
       incomingRelationshipCount: projection.incoming.length,
       openLoopCount: projection.loops.filter((loop) => loop.state === "open").length,
@@ -218,7 +350,17 @@ export class SocialMemoryAdmin {
     };
   }
 
-  #memoryItem(memory: SocialMemoryView): AdminMemoryItem {
+  #memoryItem(
+    memory: SocialMemoryView,
+    eventCache: Map<string, ReturnType<SocialMemoryStore["getEvent"]>>,
+  ): AdminMemoryItem {
+    const lifecycle = lifecycleProjection(memory);
+    const sourceMessageIds = [...new Set([
+      ...memory.event.sourceMessageIds,
+      ...lifecycle.sourceEventIds.flatMap((eventId) =>
+        this.#event(eventId, eventCache)?.sourceMessageIds ?? []
+      ),
+    ])].slice(0, MAX_MEMORY_PROVENANCE_MESSAGES);
     return {
       id: memory.id,
       ownerId: memory.ownerId,
@@ -229,10 +371,17 @@ export class SocialMemoryAdmin {
       confidence: memory.confidence,
       salience: memory.salience,
       pinned: memory.pinned,
-      sourceEventIds: [memory.eventId],
-      sourceMessageIds: [...memory.event.sourceMessageIds],
+      tier: lifecycle.tier,
+      sourceEventIds: lifecycle.sourceEventIds,
+      sourceEventCount: lifecycle.sourceEventCount,
+      sourceMessageIds,
+      recallCount: lifecycle.recallCount,
       createdAt: asIso(memory.createdAt),
       updatedAt: asIso(memory.updatedAt),
+      ...(lifecycle.lastRecalledAt === undefined ? {} : { lastRecalledAt: asIso(lifecycle.lastRecalledAt) }),
+      ...(lifecycle.reinforcedAt === undefined ? {} : { reinforcedAt: asIso(lifecycle.reinforcedAt) }),
+      ...(lifecycle.expiresAt === undefined ? {} : { expiresAt: asIso(lifecycle.expiresAt) }),
+      ...(lifecycle.supersededBy ? { supersededBy: lifecycle.supersededBy } : {}),
     };
   }
 
@@ -276,8 +425,8 @@ export class SocialMemoryAdmin {
   #auditItem(
     entry: AuditEntry,
     actorId: string,
-    memorySources: ReadonlyMap<string, { eventId: string; messageIds: string[] }>,
-    loopSources: ReadonlyMap<string, { eventId: string; messageIds: string[] }>,
+    memorySources: ReadonlyMap<string, { eventIds: string[]; messageIds: string[] }>,
+    loopSources: ReadonlyMap<string, { eventIds: string[]; messageIds: string[] }>,
     eventCache: Map<string, ReturnType<SocialMemoryStore["getEvent"]>>,
   ): AdminMemoryAuditEntry {
     const indexedSource = entry.targetType === "memory"
@@ -290,7 +439,7 @@ export class SocialMemoryAdmin {
       ? this.#event(metadataEventId, eventCache)
       : undefined;
     const source = indexedSource ?? (metadataEventId
-      ? { eventId: metadataEventId, messageIds: metadataEvent?.sourceMessageIds ?? [] }
+      ? { eventIds: [metadataEventId], messageIds: metadataEvent?.sourceMessageIds ?? [] }
       : undefined);
     return {
       id: String(entry.id),
@@ -299,7 +448,7 @@ export class SocialMemoryAdmin {
       entityType: entry.targetType,
       entityId: entry.targetId,
       summary: entry.reason ?? entry.action.replaceAll(".", " "),
-      sourceEventIds: source ? [source.eventId] : [],
+      sourceEventIds: source ? [...source.eventIds] : [],
       sourceMessageIds: source ? [...source.messageIds] : [],
       createdAt: asIso(entry.createdAt),
     };
@@ -308,8 +457,8 @@ export class SocialMemoryAdmin {
   #auditBelongsToActor(
     entry: AuditEntry,
     actorId: string,
-    memorySources: ReadonlyMap<string, { eventId: string; messageIds: string[] }>,
-    loopSources: ReadonlyMap<string, { eventId: string; messageIds: string[] }>,
+    memorySources: ReadonlyMap<string, { eventIds: string[]; messageIds: string[] }>,
+    loopSources: ReadonlyMap<string, { eventIds: string[]; messageIds: string[] }>,
   ): boolean {
     if (entry.targetType === "memory") {
       return memorySources.has(entry.targetId) || entry.metadata.ownerId === actorId;

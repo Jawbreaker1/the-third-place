@@ -5,11 +5,15 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { Member } from "../shared/types.js";
 import {
+  assertHumanMemoryContinuity,
+  HumanMemoryLoadError,
   HumanMemoryStore,
+  reconcilePendingActorForgets,
   type HumanMemoryFactKind,
   type HumanMemoryStoreOptions,
   type MemoryCandidate,
 } from "./humanMemory.js";
+import { RoomStore } from "./store.js";
 
 const hour = 60 * 60_000;
 const day = 24 * hour;
@@ -385,6 +389,7 @@ describe("persistent human memory", () => {
     expect(result).toEqual({ profilesRemoved: 1, factsRemoved: 1 });
     expect(store.findByHumanId("human-stale")).toBeUndefined();
     expect(store.findByHumanId("human-fresh")?.facts).toEqual([]);
+    expect(store.listPendingActorForgets()).toEqual(["human-stale"]);
   });
 
   it("defensively migrates an unversioned legacy shape and drops invalid records", async () => {
@@ -414,16 +419,194 @@ describe("persistent human memory", () => {
     }), "utf8");
 
     const store = new HumanMemoryStore({ filePath, now: () => 3_000, persistDelayMs: 60_000 });
-    await store.load();
+    const loadResult = await store.load();
     const profile = store.findByHumanId("human-legacy")!;
     expect(profile).toMatchObject({ visitCount: 3, facts: [expect.objectContaining({ value: "Rust" })] });
     expect(profile.facts).toHaveLength(1);
     expect(profile.channelScores[0]).toMatchObject({ channelId: "lobby", messageCount: 7 });
     expect(profile.relations["ai-mira"]).toMatchObject({ familiarity: 1, affinity: -1, irritation: 1 });
     expect(store.listRestorableProfiles()).toHaveLength(1);
-    const migrated = JSON.parse(await readFile(filePath, "utf8")) as { version: number; profiles: Array<{ facts: unknown[] }> };
+    expect(loadResult.pendingActorForgetIds).toEqual(["human-bad"]);
+    const migrated = JSON.parse(await readFile(filePath, "utf8")) as {
+      version: number;
+      pendingActorForgetIds: string[];
+      profiles: Array<{ facts: unknown[] }>;
+    };
     expect(migrated).toMatchObject({ version: 1 });
+    expect(migrated.pendingActorForgetIds).toEqual(["human-bad"]);
     expect(migrated.profiles[0]?.facts).toHaveLength(1);
+  });
+
+  it("durably hands expired and overflow profile IDs to downstream memory erasure", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-forget-handoff-"));
+    const filePath = join(directory, "human-memory.json");
+    const source = new HumanMemoryStore({
+      filePath,
+      now: () => 100 * day,
+      retentionMs: 1_000 * day,
+      maxProfiles: 3,
+      persistDelayMs: 60_000,
+    });
+    await source.load();
+    source.upsertSession({ tokenHash: hash("actor-a"), member: member("human-a", "A"), seenAt: 1 * day });
+    source.upsertSession({ tokenHash: hash("actor-b"), member: member("human-b", "B"), seenAt: 20 * day });
+    source.upsertSession({ tokenHash: hash("actor-c"), member: member("human-c", "C"), seenAt: 99 * day });
+    await source.flush();
+
+    const pruned = new HumanMemoryStore({
+      filePath,
+      now: () => 100 * day,
+      retentionMs: 90 * day,
+      maxProfiles: 1,
+      persistDelayMs: 60_000,
+    });
+    const firstLoad = await pruned.load();
+    expect(firstLoad.pendingActorForgetIds).toEqual(["human-a", "human-b"]);
+    expect(pruned.listRestorableProfiles().map((profile) => profile.member.id)).toEqual(["human-c"]);
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
+      pendingActorForgetIds: ["human-a", "human-b"],
+    });
+
+    const failedForget = vi.fn(async (actorId: string) => {
+      if (actorId === "human-b") throw new Error("downstream store unavailable");
+    });
+    await expect(reconcilePendingActorForgets(
+      pruned,
+      firstLoad.pendingActorForgetIds,
+      { forgetActor: failedForget, flushDownstream: vi.fn(async () => undefined) },
+    )).rejects.toThrow(/downstream store unavailable/iu);
+    expect(failedForget.mock.calls.map(([actorId]) => actorId)).toEqual(["human-a", "human-b"]);
+
+    // No acknowledgement was persisted after the partial failure. Replaying an
+    // already-successful forget is intentional and safe because downstream
+    // actor erasure is idempotent.
+    const retry = new HumanMemoryStore({ filePath, now: () => 100 * day, persistDelayMs: 60_000 });
+    const retryLoad = await retry.load();
+    expect(retryLoad.pendingActorForgetIds).toEqual(["human-a", "human-b"]);
+    const successfulForget = vi.fn(async (_actorId: string) => undefined);
+    await expect(reconcilePendingActorForgets(
+      retry,
+      retryLoad.pendingActorForgetIds,
+      { forgetActor: successfulForget, flushDownstream: vi.fn(async () => undefined) },
+    )).resolves.toBe(2);
+    expect(successfulForget.mock.calls.map(([actorId]) => actorId)).toEqual(["human-a", "human-b"]);
+
+    const acknowledged = new HumanMemoryStore({ filePath, now: () => 100 * day, persistDelayMs: 60_000 });
+    await expect(acknowledged.load()).resolves.toMatchObject({ pendingActorForgetIds: [] });
+  });
+
+  it("persists live-removal tombstones before erasing social memory and durable DMs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-live-forget-"));
+    const humanPath = join(directory, "human-memory.json");
+    const roomPath = join(directory, "rooms.json");
+    const human = new HumanMemoryStore({ filePath: humanPath, persistDelayMs: 60_000 });
+    await human.load();
+    human.confirmContinuityBaseline();
+    human.upsertSession({ tokenHash: hash("live-forget"), member: member("human-live", "Live") });
+    await human.flush();
+
+    const rooms = new RoomStore(roomPath);
+    await rooms.load();
+    const dm = rooms.openDm("human-live", "ai-mira");
+    rooms.addDmMessage(dm.id, "human-live", "This private line must be erased.");
+    await rooms.flush();
+
+    expect(human.forgetProfile("human-live")).toBe(true);
+    const downstreamOrder: string[] = [];
+    await expect(reconcilePendingActorForgets(
+      human,
+      human.listPendingActorForgets(),
+      {
+        forgetActor: async (actorId) => {
+          const durableIntent = JSON.parse(await readFile(humanPath, "utf8")) as {
+            pendingActorForgetIds: string[];
+          };
+          expect(durableIntent.pendingActorForgetIds).toContain(actorId);
+          downstreamOrder.push(`social:${actorId}`);
+          rooms.forgetDmParticipant(actorId);
+        },
+        flushDownstream: async () => {
+          downstreamOrder.push("room:flush");
+          await rooms.flush();
+        },
+      },
+    )).resolves.toBe(1);
+    expect(downstreamOrder).toEqual(["social:human-live", "room:flush"]);
+
+    const restartedRooms = new RoomStore(roomPath);
+    await restartedRooms.load();
+    expect(restartedRooms.getDmParticipants(dm.id)).toBeUndefined();
+    const restartedHuman = new HumanMemoryStore({ filePath: humanPath, persistDelayMs: 60_000 });
+    expect((await restartedHuman.load()).pendingActorForgetIds).toEqual([]);
+  });
+
+  it("replays a live-removal tombstone when the downstream durability barrier fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-live-forget-crash-"));
+    const filePath = join(directory, "human-memory.json");
+    const store = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+    await store.load();
+    store.confirmContinuityBaseline();
+    store.upsertSession({ tokenHash: hash("crash"), member: member("human-crash", "Crash") });
+    await store.flush();
+    store.forgetProfile("human-crash");
+
+    await expect(reconcilePendingActorForgets(
+      store,
+      store.listPendingActorForgets(),
+      {
+        forgetActor: vi.fn(async () => undefined),
+        flushDownstream: vi.fn(async () => {
+          throw new Error("room store flush failed");
+        }),
+      },
+    )).rejects.toThrow(/room store flush failed/iu);
+
+    const afterCrash = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+    expect((await afterCrash.load()).pendingActorForgetIds).toEqual(["human-crash"]);
+  });
+
+  it("refuses to resurrect an actor while durable downstream erasure is pending", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-pending-reconnect-"));
+    const filePath = join(directory, "human-memory.json");
+    const tokenHash = hash("pending-reconnect");
+    const store = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+    await store.load();
+    store.confirmContinuityBaseline();
+    store.upsertSession({
+      tokenHash,
+      member: member("human-pending", "Pending"),
+      seenAt: 1_000,
+    });
+    await store.flush();
+    expect(store.forgetProfile("human-pending")).toBe(true);
+    await store.flush();
+
+    await expect(reconcilePendingActorForgets(
+      store,
+      store.listPendingActorForgets(),
+      {
+        forgetActor: vi.fn(async () => {
+          throw new Error("social store temporarily unavailable");
+        }),
+        flushDownstream: vi.fn(async () => undefined),
+      },
+    )).rejects.toThrow(/temporarily unavailable/iu);
+
+    expect(() => store.upsertSession({
+      tokenHash,
+      member: member("human-pending", "Pending again"),
+      seenAt: 2_000,
+    })).toThrow(/pending durable memory erasure/iu);
+    expect(store.findByHumanId("human-pending")).toBeUndefined();
+    expect(store.listPendingActorForgets()).toEqual(["human-pending"]);
+    await store.flush();
+
+    const restarted = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+    await expect(restarted.load()).resolves.toMatchObject({
+      continuityVerified: true,
+      pendingActorForgetIds: ["human-pending"],
+    });
+    expect(restarted.findByHumanId("human-pending")).toBeUndefined();
   });
 
   it("recovers the serialized write queue after a transient failed flush", async () => {
@@ -441,19 +624,205 @@ describe("persistent human memory", () => {
     expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ version: 1 });
   });
 
-  it("replaces malformed JSON with an empty current schema", async () => {
+  it("fails closed on corrupt JSON without destroying or permitting replacement of the companion", async () => {
     const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-invalid-"));
     const filePath = join(directory, "human-memory.json");
-    await writeFile(filePath, "{ definitely not json", "utf8");
+    const corruptBytes = "{ definitely not json";
+    await writeFile(filePath, corruptBytes, "utf8");
     const store = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    try {
-      await store.load();
-      expect(warning).toHaveBeenCalledOnce();
-    } finally {
-      warning.mockRestore();
-    }
+    await expect(store.load()).rejects.toMatchObject({
+      name: "HumanMemoryLoadError",
+      code: "HUMAN_MEMORY_LOAD_FAILED",
+    });
     expect(store.listRestorableProfiles()).toEqual([]);
-    expect(JSON.parse(await readFile(filePath, "utf8"))).toEqual({ version: 1, profiles: [] });
+    expect(await readFile(filePath, "utf8")).toBe(corruptBytes);
+
+    const restarted = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+    await expect(restarted.load()).rejects.toBeInstanceOf(HumanMemoryLoadError);
+    expect(await readFile(filePath, "utf8")).toBe(corruptBytes);
+  });
+
+  it("fails closed on invalid root, schema, and tombstone metadata without rewriting bytes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-schema-"));
+    const cases = [
+      ["root", []],
+      ["version", { version: 2, continuityVerified: true, pendingActorForgetIds: [], profiles: [] }],
+      ["profile", { version: 1, continuityVerified: true, pendingActorForgetIds: [], profiles: [{}] }],
+      ["tombstones", { version: 1, continuityVerified: true, pendingActorForgetIds: [" unsafe "], profiles: [] }],
+    ] as const;
+
+    for (const [label, payload] of cases) {
+      const filePath = join(directory, `${label}.json`);
+      const originalBytes = JSON.stringify(payload);
+      await writeFile(filePath, originalBytes, "utf8");
+      const store = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+      await expect(store.load()).rejects.toBeInstanceOf(HumanMemoryLoadError);
+      expect(await readFile(filePath, "utf8")).toBe(originalBytes);
+    }
+  });
+
+  it("fails closed when a current-schema profile has corrupted stable identity fields", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-current-identity-"));
+    const validProfile = {
+      tokenHash: hash("current-profile"),
+      member: member("human-current", "Current"),
+      createdAt: 1_000,
+      lastSeenAt: 2_000,
+      visitCount: 1,
+      facts: [],
+      channelScores: [],
+      relations: [],
+    };
+    const corruptProfiles = [
+      {
+        label: "token",
+        profile: {
+          ...validProfile,
+          tokenHash: "corrupted-token-hash",
+        },
+      },
+      {
+        label: "member",
+        profile: {
+          ...validProfile,
+          member: { ...validProfile.member, name: "" },
+        },
+      },
+      {
+        label: "actor-type",
+        profile: {
+          ...validProfile,
+          member: { ...validProfile.member, kind: "ai" },
+        },
+      },
+    ];
+
+    for (const { label, profile } of corruptProfiles) {
+      const filePath = join(directory, `${label}.json`);
+      const payload = {
+        version: 1,
+        continuityVerified: true,
+        pendingActorForgetIds: [],
+        profiles: [profile],
+      };
+      const originalBytes = JSON.stringify(payload);
+      await writeFile(filePath, originalBytes, "utf8");
+
+      const store = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+      await expect(store.load()).rejects.toBeInstanceOf(HumanMemoryLoadError);
+      expect(await readFile(filePath, "utf8")).toBe(originalBytes);
+      expect(store.listRestorableProfiles()).toEqual([]);
+      expect(store.listPendingActorForgets()).toEqual([]);
+    }
+  });
+
+  it("fails closed on current-schema token and actor identity collisions", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-current-collision-"));
+    const profile = (humanId: string, name: string, tokenHash: string) => ({
+      tokenHash,
+      member: member(humanId, name),
+      createdAt: 1_000,
+      lastSeenAt: 2_000,
+      visitCount: 1,
+      facts: [],
+      channelScores: [],
+      relations: [],
+    });
+    const collisions = [
+      {
+        label: "shared-token",
+        profiles: [
+          profile("human-one", "One", hash("shared-token")),
+          profile("human-two", "Two", hash("shared-token")),
+        ],
+      },
+      {
+        label: "conflicting-actor-rows",
+        profiles: [
+          profile("human-same", "Same", hash("first-token")),
+          profile("human-same", "Same", hash("second-token")),
+        ],
+      },
+    ];
+
+    for (const collision of collisions) {
+      const filePath = join(directory, `${collision.label}.json`);
+      const originalBytes = JSON.stringify({
+        version: 1,
+        continuityVerified: true,
+        pendingActorForgetIds: [],
+        profiles: collision.profiles,
+      });
+      await writeFile(filePath, originalBytes, "utf8");
+      const store = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+      await expect(store.load()).rejects.toBeInstanceOf(HumanMemoryLoadError);
+      expect(await readFile(filePath, "utf8")).toBe(originalBytes);
+      expect(store.listRestorableProfiles()).toEqual([]);
+      expect(store.listPendingActorForgets()).toEqual([]);
+    }
+  });
+
+  it("fails closed on an unreadable human-memory path instead of creating a replacement", async () => {
+    const parentBlocker = join(
+      await mkdtemp(join(tmpdir(), "third-place-human-memory-unreadable-")),
+      "not-a-directory",
+    );
+    await writeFile(parentBlocker, "original companion boundary", "utf8");
+    const impossiblePath = join(parentBlocker, "human-memory.json");
+
+    const store = new HumanMemoryStore({ filePath: impossiblePath, persistDelayMs: 60_000 });
+    await expect(store.load()).rejects.toBeInstanceOf(HumanMemoryLoadError);
+    expect(await readFile(parentBlocker, "utf8")).toBe("original companion boundary");
+    expect(store.listRestorableProfiles()).toEqual([]);
+  });
+
+  it("keeps a missing companion unverified across restarts until the exact actor inventory is reconciled", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-missing-"));
+    const filePath = join(directory, "human-memory.json");
+    const missing = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+    expect(await missing.load()).toEqual({ continuityVerified: false, pendingActorForgetIds: [] });
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ continuityVerified: false });
+
+    const restarted = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+    const loadResult = await restarted.load();
+    expect(loadResult.continuityVerified).toBe(false);
+    expect(() => assertHumanMemoryContinuity({
+      ...loadResult,
+      socialActorIds: ["ai-mira"],
+      socialActorCount: 2,
+      retainedHumanActorIds: [],
+      residentActorIds: ["ai-mira"],
+    })).toThrow(/continuity/iu);
+    expect(() => assertHumanMemoryContinuity({
+      ...loadResult,
+      socialActorIds: ["ai-mira"],
+      socialActorCount: 1,
+      retainedHumanActorIds: [],
+      residentActorIds: ["ai-mira"],
+      additionalActorInventories: [{ actorIds: ["ai-mira", "human-dm-survivor"], actorCount: 2 }],
+    })).toThrow(/continuity/iu);
+    expect(() => assertHumanMemoryContinuity({
+      ...loadResult,
+      socialActorIds: ["ai-mira"],
+      socialActorCount: 1,
+      retainedHumanActorIds: [],
+      residentActorIds: ["ai-mira"],
+    })).not.toThrow();
+    restarted.confirmContinuityBaseline();
+    await restarted.flush();
+
+    const verified = new HumanMemoryStore({ filePath, persistDelayMs: 60_000 });
+    expect((await verified.load()).continuityVerified).toBe(true);
+  });
+
+  it("never accepts a current resident id as a human erasure tombstone", () => {
+    expect(() => assertHumanMemoryContinuity({
+      continuityVerified: true,
+      socialActorIds: [],
+      socialActorCount: 0,
+      retainedHumanActorIds: [],
+      residentActorIds: ["ai-mira"],
+      pendingActorForgetIds: ["ai-mira"],
+    })).toThrow(/will not erase any actor/iu);
   });
 });

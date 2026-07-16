@@ -190,12 +190,21 @@ function EmptyState({ title, children }: { title: string; children: ReactNode })
 }
 
 const memoryLabel = (value: string): string => value.replaceAll("_", " ").replaceAll("-", " ");
+const ADMIN_MEMORY_ACTOR_RENDER_LIMIT = 200;
 
 const formatMemoryScore = (value: number): string => {
   if (!Number.isFinite(value)) return "—";
   const normalized = Math.abs(value) <= 1 ? value * 100 : value;
   return `${Math.round(normalized)}%`;
 };
+
+const memoryHasExpired = (expiresAt?: string): boolean => {
+  if (!expiresAt) return false;
+  const timestamp = Date.parse(expiresAt);
+  return Number.isFinite(timestamp) && timestamp <= Date.now();
+};
+
+const boundedMemoryCount = (count: number, truncated: boolean): string => `${count}${truncated ? "+" : ""}`;
 
 function MemorySourceIds({ eventIds, messageIds }: { eventIds: string[]; messageIds: string[] }) {
   const sources = [
@@ -1416,10 +1425,25 @@ export default function AdminApp() {
           {memoryOverviewError && <div className="admin-provider-warning" role="alert">{memoryOverviewError}</div>}
           <section className="admin-memory-stat-grid" aria-label="Persistent social memory totals">
             <div className="admin-stat"><span>Actors</span><strong>{memoryOverview.stats.actors}</strong><small>Residents and known humans</small></div>
-            <div className="admin-stat"><span>Memories</span><strong>{memoryOverview.stats.memories}</strong><small>Subjective retained items</small></div>
+            <div className="admin-stat"><span>Active episodes</span><strong>{memoryOverview.stats.activeEpisodicMemories}</strong><small>Current source-backed moments</small></div>
+            <div className="admin-stat"><span>Consolidated</span><strong>{memoryOverview.stats.consolidatedMemories}</strong><small>Durable summaries</small></div>
+            <div className="admin-stat"><span>Expired</span><strong>{memoryOverview.stats.expiredMemories}</strong><small>Past their retention deadline</small></div>
+            <div className="admin-stat"><span>Superseded</span><strong>{memoryOverview.stats.supersededMemories}</strong><small>Replaced, retained as provenance</small></div>
             <div className="admin-stat"><span>Relations</span><strong>{memoryOverview.stats.relationships}</strong><small>Directed social views</small></div>
             <div className="admin-stat"><span>Open loops</span><strong>{memoryOverview.stats.openLoops}</strong><small>Promises and unresolved threads</small></div>
-            <div className="admin-stat"><span>Audit</span><strong>{memoryOverview.stats.auditEntries}</strong><small>Provenance changes</small></div>
+          </section>
+          <section className="admin-card admin-memory-lifecycle-note" aria-label="How memory lifecycle works">
+            <div><p className="admin-kicker">Bounded continuity</p><h2>Relevant, rotating recall</h2></div>
+            <p>
+              Fixed per-perspective caps keep memory from growing forever. Recall rotates relevant items with a
+              cooldown instead of repeating the same favourite memory. Lower-value episodes can expire or be
+              consolidated into multilingual, source-bound summaries; pinned items stay protected.
+            </p>
+            <div className="admin-memory-lifecycle-facts">
+              <span><strong>{memoryOverview.stats.memories}</strong> retained memory rows</span>
+              <span><strong>{memoryOverview.stats.auditEntries}</strong> lifecycle audit entries</span>
+              <span>Every consolidation keeps source-event provenance</span>
+            </div>
           </section>
           {!memoryOverview.actors.length ? (
             <section className="admin-card">
@@ -1433,7 +1457,7 @@ export default function AdminApp() {
                   <span className="admin-count-badge">{memoryOverview.actors.length}</span>
                 </div>
                 <div className="admin-entity-list">
-                  {memoryOverview.actors.map((actor) => (
+                  {memoryOverview.actors.slice(0, ADMIN_MEMORY_ACTOR_RENDER_LIMIT).map((actor) => (
                     <button
                       aria-current={selectedMemoryActorId === actor.id ? "true" : undefined}
                       className={selectedMemoryActorId === actor.id ? "active" : ""}
@@ -1448,7 +1472,7 @@ export default function AdminApp() {
                       <span className={`admin-avatar-chip ${actor.kind}`}>{actor.name.slice(0, 1).toLocaleUpperCase() || "?"}</span>
                       <span>
                         <strong>{actor.name}</strong>
-                        <small>{actor.memoryCount} memories · {actor.openLoopCount} open</small>
+                        <small>{boundedMemoryCount(actor.activeEpisodicMemoryCount, actor.memoryRowsTruncated)} episodes · {boundedMemoryCount(actor.consolidatedMemoryCount, actor.memoryRowsTruncated)} consolidated · {actor.openLoopCount} open</small>
                       </span>
                       <i>{actor.kind === "resident" ? "AI" : "H"}</i>
                     </button>
@@ -1494,7 +1518,10 @@ export default function AdminApp() {
                         <code>{memoryDetail.actor.id}</code>
                       </div>
                       <div className="admin-memory-actor-counts">
-                        <span><strong>{memoryDetail.ownedMemories.length}</strong> owned memories</span>
+                        <span><strong>{boundedMemoryCount(memoryDetail.actor.activeEpisodicMemoryCount, memoryDetail.actor.memoryRowsTruncated)}</strong> active episodes</span>
+                        <span><strong>{boundedMemoryCount(memoryDetail.actor.consolidatedMemoryCount, memoryDetail.actor.memoryRowsTruncated)}</strong> consolidated</span>
+                        <span><strong>{boundedMemoryCount(memoryDetail.actor.expiredMemoryCount, memoryDetail.actor.memoryRowsTruncated)}</strong> expired</span>
+                        <span><strong>{boundedMemoryCount(memoryDetail.actor.supersededMemoryCount, memoryDetail.actor.memoryRowsTruncated)}</strong> superseded</span>
                         <span><strong>{memoryDetail.outgoingRelationships.length}</strong> outward views</span>
                         <span><strong>{memoryDetail.incomingRelationships.length}</strong> incoming views</span>
                       </div>
@@ -1505,11 +1532,18 @@ export default function AdminApp() {
                       {memoryDetail.ownedMemories.length ? (
                         <div className="admin-memory-items">
                           {memoryDetail.ownedMemories.map((item) => (
-                            <article className={`admin-memory-item ${item.pinned ? "pinned" : ""}`} key={item.id}>
+                            <article className={`admin-memory-item ${item.pinned ? "pinned" : ""} ${item.supersededBy ? "superseded" : ""}`} key={item.id}>
                               <header>
                                 <div className="admin-memory-tags">
+                                  <span className={`tier-${item.tier}`}>{memoryLabel(item.tier)}</span>
                                   <span>{memoryLabel(item.kind)}</span>
                                   {item.pinned && <span className="pinned">Pinned</span>}
+                                  {item.supersededBy && <span className="superseded">Superseded</span>}
+                                  {!item.pinned && !item.supersededBy && item.expiresAt && (
+                                    <span className={memoryHasExpired(item.expiresAt) ? "expired" : "expiring"}>
+                                      {memoryHasExpired(item.expiresAt) ? "Expired" : "Expiring"}
+                                    </span>
+                                  )}
                                 </div>
                                 <div className="admin-row-actions">
                                   <button
@@ -1545,12 +1579,19 @@ export default function AdminApp() {
                                 <div><dt>Perspective</dt><dd>{memoryLabel(item.perspective)}</dd></div>
                                 <div><dt>Confidence</dt><dd>{formatMemoryScore(item.confidence)}</dd></div>
                                 <div><dt>Salience</dt><dd>{formatMemoryScore(item.salience)}</dd></div>
+                                <div><dt>Recall count</dt><dd>{item.recallCount}</dd></div>
+                                <div><dt>Source events</dt><dd>{item.sourceEventCount}</dd></div>
                               </dl>
                               <MemorySourceIds eventIds={item.sourceEventIds ?? []} messageIds={item.sourceMessageIds ?? []} />
                               <footer>
                                 <span>Created {formatDateTime(item.createdAt)}</span>
                                 <span>Updated {formatDateTime(item.updatedAt)}</span>
+                                {item.reinforcedAt && <span>Reinforced {formatDateTime(item.reinforcedAt)}</span>}
+                                {item.lastRecalledAt
+                                  ? <span>Last recalled {formatDateTime(item.lastRecalledAt)}</span>
+                                  : <span>Not recalled yet</span>}
                                 {item.expiresAt && <span>Expires {formatDateTime(item.expiresAt)}</span>}
+                                {item.supersededBy && <span>Superseded by <code>{item.supersededBy}</code></span>}
                               </footer>
                             </article>
                           ))}

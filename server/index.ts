@@ -42,7 +42,12 @@ import { SocialDirector } from "./director.js";
 import { AmbientEpisodeLedger } from "./ambientEpisodeLedger.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
 import { fetchRemoteImage, ImageStore, ImageStoreError } from "./imageStore.js";
-import { HUMAN_MEMORY_DEFAULTS, HumanMemoryStore } from "./humanMemory.js";
+import {
+  assertHumanMemoryContinuity,
+  HUMAN_MEMORY_DEFAULTS,
+  HumanMemoryStore,
+  reconcilePendingActorForgets,
+} from "./humanMemory.js";
 import { LmStudioClient } from "./lmStudio.js";
 import { LmStudioBackend } from "./lmStudioBackend.js";
 import { CodexBackend } from "./codexBackend.js";
@@ -81,6 +86,7 @@ import { preferredRequestLanguage } from "./requestLanguage.js";
 import { SocialMemoryStore } from "./socialMemory.js";
 import { SocialMemoryAdmin } from "./socialMemoryAdmin.js";
 import { SocialMemoryCoordinator } from "./socialMemoryCoordinator.js";
+import { SocialMemoryLifecycleManager } from "./socialMemoryLifecycle.js";
 import { VoiceIngestGate, VoiceIngestGateError, type VoiceIngestRelease } from "./voiceIngestGate.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
 import { VoiceSpeechError, VoiceSpeechService } from "./voiceSpeech.js";
@@ -442,13 +448,24 @@ const codexClient = new LmStudioClient({
   timeoutMs: Number.parseInt(process.env.CODEX_TIMEOUT_MS ?? "120000", 10),
 });
 const lm = new SwitchableSocialModel({ lmstudio: lmStudioClient, codex: codexClient });
-const socialMemory = new SocialMemoryCoordinator(lm, socialMemoryStore, {
+let socialMemory!: SocialMemoryCoordinator;
+const socialMemoryLifecycle = new SocialMemoryLifecycleManager(lm, socialMemoryStore, {
+  onError: (error) => {
+    console.warn(
+      "Social memory lifecycle failed safely:",
+      error instanceof Error ? error.message : error,
+    );
+  },
+  onStateChanged: () => socialMemory?.invalidatePromptNotes(),
+});
+socialMemory = new SocialMemoryCoordinator(lm, socialMemoryStore, {
   onError: (error, episodeId) => {
     console.warn(
       `Social memory episode ${episodeId} failed safely:`,
       error instanceof Error ? error.message : error,
     );
   },
+  lifecycle: socialMemoryLifecycle,
 });
 const modelProviders = new ModelProviderManager(lm, codexBackend);
 await modelProviders.load();
@@ -495,16 +512,32 @@ const voiceRooms = new VoiceRoomRuntime(
   },
 );
 const sessions = new Map<string, HumanSession>();
+let actorForgetReconciliationTail: Promise<unknown> = Promise.resolve();
+const reconcilePendingHumanActorForgets = (): Promise<number> => {
+  const operation = actorForgetReconciliationTail.then(() => reconcilePendingActorForgets(
+    humanMemory,
+    humanMemory.listPendingActorForgets(),
+    {
+      forgetActor: async (actorId) => {
+        await socialMemory.forgetActor(actorId);
+        store.forgetDmParticipant(actorId);
+      },
+      flushDownstream: () => store.flush(),
+    },
+  ));
+  // Serialize callers without letting one transient failure poison every later
+  // health-cycle retry. Tombstones remain durable until a full attempt succeeds.
+  actorForgetReconciliationTail = operation.then(() => undefined, () => undefined);
+  return operation;
+};
 const synchronizeOfflineSessionsWithMemory = async (): Promise<void> => {
   const rememberedTokenHashes = new Set(humanMemory.listRestorableProfiles().map((profile) => profile.tokenHash));
-  const forgottenActorIds: string[] = [];
   for (const [tokenHash, session] of sessions) {
     if (session.socketIds.size > 0 || rememberedTokenHashes.has(tokenHash)) continue;
     sessions.delete(tokenHash);
-    store.forgetDmParticipant(session.member.id);
-    forgottenActorIds.push(session.member.id);
+    humanMemory.queuePendingActorForget(session.member.id);
   }
-  await Promise.all(forgottenActorIds.map((actorId) => socialMemory.forgetActor(actorId)));
+  await reconcilePendingHumanActorForgets();
 };
 const joinAttempts = new Map<string, number[]>();
 const socketBuckets = new Map<
@@ -813,6 +846,10 @@ const adminHumans = (): AdminHumanMember[] => [...sessions.values()]
 
 const socialMemoryAdmin = new SocialMemoryAdmin({
   store: socialMemoryStore,
+  onStateChanged: () => {
+    socialMemory.invalidatePromptNotes();
+    socialMemoryLifecycle.notifyMemoryChanged();
+  },
   getActors: () => {
     const actors = new Map<string, { id: string; name: string; kind: "resident" | "human" }>();
     for (const persona of PERSONAS) {
@@ -1765,12 +1802,32 @@ app.use((error: unknown, request: Request, response: Response, _next: unknown) =
   });
 });
 
-await humanMemory.load();
+const humanMemoryLoad = await humanMemory.load();
+adminState.validateActiveCatalog();
+await store.load();
+const socialActorInventory = socialMemoryStore.overview();
+const dmActorIds = store.getAllDmParticipantIds();
+const publicParticipantActorIds = store.getAllPublicParticipantActorIds();
+assertHumanMemoryContinuity({
+  continuityVerified: humanMemoryLoad.continuityVerified,
+  socialActorIds: socialActorInventory.actorIds,
+  socialActorCount: socialActorInventory.stats.actors,
+  retainedHumanActorIds: humanMemory.listRestorableProfiles().map((profile) => profile.member.id),
+  residentActorIds: PERSONAS.map((persona) => persona.id),
+  pendingActorForgetIds: humanMemoryLoad.pendingActorForgetIds,
+  additionalActorInventories: [
+    { actorIds: dmActorIds, actorCount: dmActorIds.length },
+    { actorIds: publicParticipantActorIds, actorCount: publicParticipantActorIds.length },
+  ],
+});
+await reconcilePendingHumanActorForgets();
+if (!humanMemoryLoad.continuityVerified) {
+  humanMemory.confirmContinuityBaseline();
+  await humanMemory.flush();
+}
 for (const profile of humanMemory.listRestorableProfiles()) {
   sessions.set(profile.tokenHash, createHumanSession(profile.tokenHash, profile.member, profile.lastSeenAt));
 }
-adminState.validateActiveCatalog();
-await store.load();
 await imageStore.initialize(store.getAllMessages());
 store.onMessagesRemoved((removed) => {
   for (const message of removed) {
@@ -1787,11 +1844,11 @@ for (const message of store.getAllMessages()) {
 }
 actorChannels.restore(store.getAllMessages());
 await lm.probe();
+socialMemoryLifecycle.start();
 director.start();
 
 const healthInterval = setInterval(async () => {
   const now = Date.now();
-  const expiredSocialMemoryActors: string[] = [];
   for (const [tokenHash, session] of sessions) {
     if (session.socketIds.size > 0) {
       if (now - session.lastSeenAt >= SESSION_HEARTBEAT_MS) {
@@ -1803,15 +1860,19 @@ const healthInterval = setInterval(async () => {
     if (session.socketIds.size === 0 && now - session.lastSeenAt > SESSION_RETENTION_MS) {
       sessions.delete(tokenHash);
       humanMemory.forgetProfile(session.member.id);
-      store.forgetDmParticipant(session.member.id);
-      expiredSocialMemoryActors.push(session.member.id);
     }
   }
-  await Promise.all(expiredSocialMemoryActors.map((actorId) => socialMemory.forgetActor(actorId)));
   humanMemory.prune(now);
   adminAuth.prune(now);
   adminModeration.prune(now);
-  await synchronizeOfflineSessionsWithMemory();
+  try {
+    await synchronizeOfflineSessionsWithMemory();
+  } catch (error) {
+    console.warn(
+      "Deferred actor-memory erasure will be retried from its durable tombstone.",
+      error instanceof Error ? error.message : error,
+    );
+  }
   for (const [ip, timestamps] of joinAttempts) {
     const recent = timestamps.filter((timestamp) => now - timestamp < 10 * 60_000);
     if (recent.length > 0) joinAttempts.set(ip, recent);
@@ -1837,6 +1898,7 @@ const shutdown = async (signal: string) => {
   director.stop();
   io.close();
   await socialMemory.close();
+  await socialMemoryLifecycle.close();
   await Promise.all([
     store.flush(),
     humanMemory.flush(),

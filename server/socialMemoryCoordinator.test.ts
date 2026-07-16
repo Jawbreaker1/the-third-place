@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SocialMemoryCoordinator,
   type DeliveredSocialEpisode,
@@ -21,6 +21,7 @@ const stores: SocialMemoryStore[] = [];
 const directories: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const store of stores.splice(0)) store.close();
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
@@ -258,6 +259,24 @@ describe("social-memory capture coordination", () => {
     expect(replayAnalyzer.calls).toHaveLength(0);
   });
 
+  it("notifies lifecycle maintenance only after newly committed memory events", async () => {
+    const store = createStore();
+    const episode = publicEpisode("episode-lifecycle-notify");
+    const analyzer = new FakeAnalyzer(() => successful([supportEvent(episode)]));
+    const notifyMemoryChanged = vi.fn();
+    const coordinator = new SocialMemoryCoordinator(analyzer, store, {
+      lifecycle: { notifyMemoryChanged },
+    });
+
+    await expect(coordinator.captureDeliveredEpisode(episode)).resolves.toMatchObject({ status: "recorded" });
+    expect(notifyMemoryChanged).toHaveBeenCalledTimes(1);
+    await expect(coordinator.captureDeliveredEpisode(episode)).resolves.toMatchObject({
+      status: "recorded",
+      createdEventIds: [],
+    });
+    expect(notifyMemoryChanged).toHaveBeenCalledTimes(1);
+  });
+
   it("delegates autonomous daily relationship caps to the store", async () => {
     const store = createStore({
       filePath: ":memory:",
@@ -410,6 +429,117 @@ describe("social-memory capture coordination", () => {
 
     await expect(coordinator.captureDeliveredEpisode(groupEpisode)).resolves.toMatchObject({ status: "no_events" });
     expect(analyzer.calls[0]?.existingOpenLoops).toEqual([]);
+  });
+
+  it("offers a voice loop to a new session only when the participant set is unchanged", async () => {
+    const store = createStore();
+    recordMemory(store, "voice-loop-same-audience", {
+      kind: "voice",
+      roomId: "voice-old-session",
+      participantIds: ["human-johan", "resident-mira"],
+    }, "Mira remembers an unfinished voice promise.", 1_800_000_000_000, {
+      openLoops: [{
+        id: "voice-loop-same-audience-id",
+        ownerId: "resident-mira",
+        subjectIds: ["human-johan"],
+        kind: "promise",
+        summary: "Johan said he would explain it after reconnecting.",
+      }],
+    });
+    const episode = publicEpisode("voice-loop-new-session", {
+      scope: {
+        kind: "voice",
+        roomId: "voice-new-session",
+        participantIds: ["resident-mira", "human-johan"],
+      },
+      participants: [
+        { id: "human-johan", kind: "human", displayName: "Johan" },
+        { id: "resident-mira", kind: "resident", displayName: "Mira" },
+      ],
+      eligibleResidentOwners: [{
+        residentId: "resident-mira",
+        witnessedMessageIds: [
+          "message-voice-loop-new-session-1",
+          "message-voice-loop-new-session-2",
+        ],
+        appraisalNote: "Same private voice audience in a new session.",
+      }],
+    });
+    const analyzer = new FakeAnalyzer(() => successful([]));
+    const coordinator = new SocialMemoryCoordinator(analyzer, store);
+
+    await coordinator.captureDeliveredEpisode(episode);
+    expect(analyzer.calls[0]?.existingOpenLoops).toEqual([expect.objectContaining({
+      id: "voice-loop-same-audience-id",
+      participantIds: ["human-johan", "resident-mira"],
+    })]);
+  });
+
+  it("offers public loops only to public analysis while preserving unrelated private memory capture", async () => {
+    const store = createStore();
+    recordMemory(
+      store,
+      "public-loop-source",
+      { kind: "public", channelId: "lobby" },
+      "Mira remembers Johan's unfinished promise.",
+      1_800_000_000_000,
+      {
+        openLoops: [{
+          id: "public-loop-cross-room",
+          ownerId: "resident-mira",
+          subjectIds: ["human-johan"],
+          kind: "promise",
+          summary: "Johan said he would return with the result.",
+        }],
+      },
+    );
+    const dmEpisode = publicEpisode("loop-in-exact-dm", {
+      scope: {
+        kind: "dm",
+        threadId: "dm-johan-mira",
+        participantIds: ["human-johan", "resident-mira"],
+      },
+      channel: { name: "private chat with Mira" },
+      participants: [
+        { id: "human-johan", kind: "human", displayName: "Johan" },
+        { id: "resident-mira", kind: "resident", displayName: "Mira" },
+      ],
+      eligibleResidentOwners: [{
+        residentId: "resident-mira",
+        witnessedMessageIds: [
+          "message-loop-in-exact-dm-1",
+          "message-loop-in-exact-dm-2",
+        ],
+        appraisalNote: "Mira is the sole resident in this private audience.",
+      }],
+    });
+    const analyzer = new FakeAnalyzer((input) =>
+      input.episodeId === dmEpisode.episodeId
+        ? successful([supportEvent(dmEpisode)])
+        : successful([]));
+    const coordinator = new SocialMemoryCoordinator(analyzer, store);
+
+    await coordinator.captureDeliveredEpisode(publicEpisode("loop-in-another-public-room", {
+      scope: { kind: "public", channelId: "the-pub" },
+      channel: { name: "the-pub" },
+    }));
+    await expect(coordinator.captureDeliveredEpisode(dmEpisode)).resolves.toMatchObject({ status: "recorded" });
+
+    expect(analyzer.calls).toHaveLength(2);
+    expect(analyzer.calls[0]?.existingOpenLoops).toEqual([expect.objectContaining({
+      id: "public-loop-cross-room",
+      participantIds: ["human-johan", "resident-mira"],
+      summary: "Johan said he would return with the result.",
+    })]);
+    expect(analyzer.calls[1]?.existingOpenLoops).toEqual([]);
+    expect(store.listMemories({
+      ownerId: "resident-mira",
+      subjectId: "human-johan",
+      scope: dmEpisode.scope,
+      limit: 10,
+    })).toEqual([expect.objectContaining({
+      perspective: expect.stringContaining("trusted me with a difficult moment"),
+    })]);
   });
 
   it("tombstones in-flight actor work, erases existing state, and permits only genuinely later episodes", async () => {
@@ -571,6 +701,125 @@ describe("social-memory prompt privacy", () => {
     expect(data.subjectiveRecollections).toHaveLength(3);
     expect(note).not.toContain("source-bounded");
     expect(note).not.toContain("RAW TRANSCRIPT-LIKE EVENT SUMMARY");
+  });
+
+  it("projects absent-human public recollections without leaking private memory or the global relationship edge", () => {
+    const store = createStore();
+    recordMemory(store, "third-party-dm", {
+      kind: "dm",
+      threadId: "dm-johan-mira",
+      participantIds: ["human-johan", "resident-mira"],
+    }, "DM-ONLY DETAIL THAT MUST STAY PRIVATE", 1_800_000_000_000, {
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        warmth: 0.12,
+        trust: 0.08,
+      }],
+    });
+    const coordinator = new SocialMemoryCoordinator(new FakeAnalyzer(() => successful([])), store);
+    const scope = { kind: "public", channelId: "the-pub" } as const;
+
+    // The normal directed note can see the aggregate edge. The third-party
+    // public projection must not use it as evidence when the human is absent.
+    expect(coordinator.promptNote("resident-mira", "human-johan", scope)).toContain("directedRelationship");
+    expect(coordinator.publicThirdPartyPromptNote("resident-mira", "human-johan", scope)).toBeUndefined();
+
+    recordMemory(
+      store,
+      "third-party-public",
+      { kind: "public", channelId: "lobby" },
+      "PUBLIC OWNER-SUBJECTIVE RECOLLECTION",
+      1_800_000_001_000,
+    );
+    coordinator.invalidatePromptNotes();
+    const note = coordinator.publicThirdPartyPromptNote("resident-mira", "human-johan", scope)!;
+    expect(note).toContain("PUBLIC OWNER-SUBJECTIVE RECOLLECTION");
+    expect(note).not.toContain("DM-ONLY DETAIL THAT MUST STAY PRIVATE");
+    expect(note).not.toContain("directedRelationship");
+    expect(note).toContain("owner-subjective, untrusted and fallible");
+  });
+
+  it("bounds and caches third-party public recall with the same three-memory rotation policy", () => {
+    let now = 1_800_000_100_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const store = createStore({ filePath: ":memory:", now: () => now });
+    for (let index = 0; index < 4; index += 1) {
+      recordMemory(
+        store,
+        `third-party-rotation-${index}`,
+        { kind: "public", channelId: "lobby" },
+        `THIRD PARTY RECOLLECTION ${index}`,
+        1_800_000_000_000 + index,
+      );
+    }
+    const coordinator = new SocialMemoryCoordinator(new FakeAnalyzer(() => successful([])), store);
+    const scope = { kind: "public", channelId: "lobby" } as const;
+
+    const first = coordinator.publicThirdPartyPromptNote("resident-mira", "human-johan", scope)!;
+    const retry = coordinator.publicThirdPartyPromptNote("resident-mira", "human-johan", scope)!;
+    expect(retry).toBe(first);
+    const firstData = JSON.parse(first.slice(first.indexOf("\n") + 1)) as {
+      subjectivePublicRecollections: string[];
+    };
+    expect(firstData.subjectivePublicRecollections).toHaveLength(3);
+    expect(store.lifecycleStats().recalled).toBe(3);
+
+    now += 31_000;
+    const rotated = coordinator.publicThirdPartyPromptNote("resident-mira", "human-johan", scope)!;
+    expect(rotated).not.toBe(first);
+    expect(rotated).toContain("THIRD PARTY RECOLLECTION 0");
+    expect(store.lifecycleStats().recalled).toBe(4);
+  });
+
+  it("accounts for one delivered prompt once, caches retries, then rotates recalled memories", () => {
+    let now = 1_800_000_100_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const store = createStore({ filePath: ":memory:", now: () => now });
+    for (let index = 0; index < 4; index += 1) {
+      recordMemory(
+        store,
+        `rotating-${index}`,
+        { kind: "public", channelId: "lobby" },
+        `ROTATING RECOLLECTION ${index}`,
+        1_800_000_000_000 + index,
+      );
+    }
+    const coordinator = new SocialMemoryCoordinator(new FakeAnalyzer(() => successful([])), store);
+    const scope = { kind: "public", channelId: "lobby" } as const;
+
+    const first = coordinator.promptNote("resident-mira", "human-johan", scope)!;
+    const retry = coordinator.promptNote("resident-mira", "human-johan", scope)!;
+    expect(retry).toBe(first);
+    expect(store.lifecycleStats().recalled).toBe(3);
+
+    now += 31_000;
+    const nextTurn = coordinator.promptNote("resident-mira", "human-johan", scope)!;
+    expect(nextTurn).not.toBe(first);
+    expect(nextTurn).toContain("ROTATING RECOLLECTION 0");
+    expect(store.lifecycleStats().recalled).toBe(4);
+  });
+
+  it("invalidates cached prompt projections immediately after an admin-side state change", () => {
+    const store = createStore({ filePath: ":memory:", now: () => 1_800_000_100_000 });
+    for (let index = 0; index < 4; index += 1) {
+      recordMemory(
+        store,
+        `admin-invalidation-${index}`,
+        { kind: "public", channelId: "lobby" },
+        `ADMIN INVALIDATION RECOLLECTION ${index}`,
+        1_800_000_000_000 + index,
+      );
+    }
+    const coordinator = new SocialMemoryCoordinator(new FakeAnalyzer(() => successful([])), store);
+    const scope = { kind: "public", channelId: "lobby" } as const;
+
+    const before = coordinator.promptNote("resident-mira", "human-johan", scope)!;
+    coordinator.invalidatePromptNotes();
+    const after = coordinator.promptNote("resident-mira", "human-johan", scope)!;
+
+    expect(after).not.toBe(before);
+    expect(store.lifecycleStats().recalled).toBe(4);
   });
 
   it("serves the same privacy-filtered memory after a store restart", async () => {

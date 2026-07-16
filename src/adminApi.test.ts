@@ -182,12 +182,27 @@ describe("admin social-memory API", () => {
 
   it("reads the overview and an encoded actor detail through separate contracts", async () => {
     const overview = {
-      stats: { actors: 1, memories: 2, relationships: 3, openLoops: 1, auditEntries: 4 },
+      stats: {
+        actors: 1,
+        memories: 2,
+        activeEpisodicMemories: 1,
+        consolidatedMemories: 1,
+        supersededMemories: 0,
+        expiredMemories: 1,
+        relationships: 3,
+        openLoops: 1,
+        auditEntries: 4,
+      },
       actors: [{
         id: "ai/mira",
         name: "Mira",
         kind: "resident",
         memoryCount: 2,
+        memoryRowsTruncated: false,
+        activeEpisodicMemoryCount: 1,
+        consolidatedMemoryCount: 1,
+        supersededMemoryCount: 0,
+        expiredMemoryCount: 1,
         outgoingRelationshipCount: 2,
         incomingRelationshipCount: 1,
         openLoopCount: 1,

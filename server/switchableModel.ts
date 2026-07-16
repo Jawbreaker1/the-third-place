@@ -9,6 +9,10 @@ import type {
 import type { ModelProviderId } from "./modelBackend.js";
 import type { MemoryAnalysis, MemoryAnalysisInput, TurnAnalysis, TurnAnalysisInput } from "./semanticRouter.js";
 import type { SocialMemoryAnalysis, SocialMemoryAnalysisInput } from "./socialMemoryAnalysis.js";
+import type {
+  SocialMemoryConsolidation,
+  SocialMemoryConsolidationInput,
+} from "./socialMemoryConsolidation.js";
 
 export interface SocialModelClient {
   probe(): Promise<ServerHealth["model"]>;
@@ -16,6 +20,7 @@ export interface SocialModelClient {
   analyzeTurn(input: TurnAnalysisInput, execution?: TurnAnalysisExecutionOptions): Promise<TurnAnalysis>;
   analyzeMemoryTurn(input: MemoryAnalysisInput): Promise<MemoryAnalysis>;
   analyzeSocialEpisode(input: SocialMemoryAnalysisInput): Promise<SocialMemoryAnalysis>;
+  consolidateSocialMemories(input: SocialMemoryConsolidationInput): Promise<SocialMemoryConsolidation>;
   generateScene(
     request: SceneRequest,
     priority?: number,
@@ -88,6 +93,12 @@ export class SwitchableSocialModel implements SocialModelClient {
 
   async analyzeSocialEpisode(input: SocialMemoryAnalysisInput): Promise<SocialMemoryAnalysis> {
     return await this.guarded((client) => client.analyzeSocialEpisode(input));
+  }
+
+  async consolidateSocialMemories(
+    input: SocialMemoryConsolidationInput,
+  ): Promise<SocialMemoryConsolidation> {
+    return await this.guarded((client) => client.consolidateSocialMemories(input));
   }
 
   async generateScene(

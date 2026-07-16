@@ -18,6 +18,7 @@ const fakeClient = (name: string) => ({
   analyzeTurn: vi.fn(async () => ({ provider: name })),
   analyzeMemoryTurn: vi.fn(async () => ({ provider: name })),
   analyzeSocialEpisode: vi.fn(async () => ({ provider: name })),
+  consolidateSocialMemories: vi.fn(async () => ({ provider: name })),
   generateScene: vi.fn(async () => [{ personaId: name, content: "hello", sourceIds: [] }]),
   analyzeImage: vi.fn(async () => ({ summary: name, details: [], safety: "safe" })),
   rememberDeliveredLine: vi.fn(),
@@ -36,12 +37,14 @@ describe("SwitchableSocialModel", () => {
     await model.analyzeTurn({ turnId: "turn" } as never);
     await model.analyzeMemoryTurn({ turnId: "memory" } as never);
     await model.analyzeSocialEpisode({ episodeId: "social-memory" } as never);
+    await model.consolidateSocialMemories({ batchId: "consolidation" } as never);
     await model.generateScene({ kind: "ambient" } as never, 7);
     await model.analyzeImage(Buffer.from("image"), "caption", 3);
 
     expect(lmstudio.analyzeTurn).toHaveBeenCalledOnce();
     expect(lmstudio.analyzeMemoryTurn).toHaveBeenCalledOnce();
     expect(lmstudio.analyzeSocialEpisode).toHaveBeenCalledOnce();
+    expect(lmstudio.consolidateSocialMemories).toHaveBeenCalledOnce();
     expect(lmstudio.generateScene).toHaveBeenCalledWith({ kind: "ambient" }, 7, undefined, undefined);
     expect(lmstudio.analyzeImage).toHaveBeenCalledWith(Buffer.from("image"), "caption", 3);
     expect(codex.analyzeTurn).not.toHaveBeenCalled();

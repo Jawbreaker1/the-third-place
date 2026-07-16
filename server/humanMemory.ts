@@ -118,6 +118,51 @@ export interface HumanMemoryPruneResult {
   factsRemoved: number;
 }
 
+export class HumanMemoryLoadError extends Error {
+  readonly code = "HUMAN_MEMORY_LOAD_FAILED";
+
+  constructor(cause: unknown) {
+    super("Human memory could not be read safely. Startup was aborted and the original companion was left untouched.");
+    this.name = "HumanMemoryLoadError";
+    this.cause = cause;
+  }
+}
+
+/**
+ * Actor IDs removed while loading, retention-pruning, or explicitly forgetting
+ * a durable profile. They remain as tombstones until every downstream memory
+ * store confirms erasure.
+ */
+export interface HumanMemoryLoadResult {
+  pendingActorForgetIds: string[];
+  /**
+   * False when the durable companion was missing. The
+   * caller must prove that surviving cross-store actors are accounted for
+   * before serving requests or marking the new baseline as trusted.
+   */
+  continuityVerified: boolean;
+}
+
+export interface HumanMemoryContinuityInventory {
+  continuityVerified: boolean;
+  socialActorIds: readonly string[];
+  socialActorCount: number;
+  retainedHumanActorIds: readonly string[];
+  residentActorIds: readonly string[];
+  pendingActorForgetIds: readonly string[];
+  /** Other durable private actor stores, such as RoomStore DM participants. */
+  additionalActorInventories?: readonly {
+    actorIds: readonly string[];
+    actorCount: number;
+  }[];
+}
+
+export interface PendingActorForgetReconciliation {
+  forgetActor(actorId: string): Promise<unknown>;
+  /** Persists every downstream deletion before tombstones may be acknowledged. */
+  flushDownstream(): Promise<unknown>;
+}
+
 export interface UpsertHumanSessionInput {
   tokenHash: string;
   member: Member;
@@ -126,8 +171,12 @@ export interface UpsertHumanSessionInput {
 
 /** Small integration surface used by the HTTP/session layer and social director. */
 export interface HumanMemory {
-  load(): Promise<void>;
+  load(): Promise<HumanMemoryLoadResult>;
   flush(): Promise<void>;
+  listPendingActorForgets(): string[];
+  queuePendingActorForget(actorId: string): boolean;
+  acknowledgePendingActorForgets(actorIds: readonly string[]): number;
+  confirmContinuityBaseline(): boolean;
   upsertSession(input: UpsertHumanSessionInput): HumanMemoryProfile;
   listRestorableProfiles(): RestorableHumanProfile[];
   findByHumanId(humanId: string): HumanMemoryProfile | undefined;
@@ -180,6 +229,8 @@ interface InternalProfile extends Omit<HumanMemoryProfile, "relations"> {
 
 interface PersistedHumanMemory {
   version: 1;
+  continuityVerified: boolean;
+  pendingActorForgetIds: string[];
   profiles: Array<{
     tokenHash: string;
     member: Member & { kind: "human" };
@@ -197,6 +248,61 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+
+const persistedActorId = (raw: unknown): string | undefined => {
+  const value = asRecord(raw);
+  const member = asRecord(value?.member);
+  const candidate = member?.id ?? value?.humanId;
+  if (typeof candidate !== "string") return undefined;
+  const normalized = candidate.normalize("NFKC").trim();
+  // Never turn a malformed identifier into another actor's valid identifier.
+  if (normalized !== candidate || !SAFE_ID.test(normalized)) return undefined;
+  return normalized;
+};
+
+interface ValidatedPersistedRoot {
+  root: Record<string, unknown>;
+  rawProfiles: unknown[];
+  pendingActorForgetIds: string[];
+}
+
+const validatePersistedRoot = (value: unknown): ValidatedPersistedRoot => {
+  const root = asRecord(value);
+  if (!root) throw new TypeError("Human-memory root must be an object.");
+  if (root.version !== undefined && root.version !== 1) {
+    throw new TypeError("Human-memory version is unsupported.");
+  }
+  if (!Array.isArray(root.profiles)) {
+    throw new TypeError("Human-memory profile collection is invalid.");
+  }
+  if (root.continuityVerified !== undefined && typeof root.continuityVerified !== "boolean") {
+    throw new TypeError("Human-memory continuity metadata is invalid.");
+  }
+  if (root.pendingActorForgetIds !== undefined && !Array.isArray(root.pendingActorForgetIds)) {
+    throw new TypeError("Human-memory erasure tombstones are invalid.");
+  }
+
+  // An unidentifiable profile cannot be safely repaired: its actor may still
+  // exist in another durable store, but there is no trustworthy ID with which
+  // to reconcile it. Recognizable legacy rows may still be sanitized below.
+  for (const rawProfile of root.profiles) {
+    if (!persistedActorId(rawProfile)) {
+      throw new TypeError("Human-memory profile schema contains an unidentifiable actor.");
+    }
+  }
+
+  const pendingActorForgetIds: string[] = [];
+  const uniqueTombstones = new Set<string>();
+  for (const rawActorId of root.pendingActorForgetIds ?? []) {
+    const actorId = persistedActorId({ humanId: rawActorId });
+    if (!actorId || uniqueTombstones.has(actorId)) {
+      throw new TypeError("Human-memory erasure tombstone metadata is invalid.");
+    }
+    uniqueTombstones.add(actorId);
+    pendingActorForgetIds.push(actorId);
+  }
+  return { root, rawProfiles: root.profiles, pendingActorForgetIds };
+};
 
 const finiteNumber = (value: unknown, fallback: number): number => {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -404,6 +510,8 @@ export class HumanMemoryStore implements HumanMemory {
   private readonly persistDelayMs: number;
   private readonly profilesByHumanId = new Map<string, InternalProfile>();
   private readonly humanIdByTokenHash = new Map<string, string>();
+  private readonly pendingActorForgetIds = new Set<string>();
+  private continuityVerified = false;
   private persistTimer?: NodeJS.Timeout;
   private writeQueue: Promise<void> = Promise.resolve();
 
@@ -453,23 +561,50 @@ export class HumanMemoryStore implements HumanMemory {
     );
   }
 
-  async load(): Promise<void> {
+  async load(): Promise<HumanMemoryLoadResult> {
     this.profilesByHumanId.clear();
     this.humanIdByTokenHash.clear();
+    this.pendingActorForgetIds.clear();
+    this.continuityVerified = false;
     let shouldRewrite = false;
     try {
       const parsed = JSON.parse(await readFile(this.filePath, "utf8")) as unknown;
-      const root = asRecord(parsed);
-      const rawProfiles = Array.isArray(root?.profiles) ? root.profiles : [];
-      shouldRewrite = root?.version !== 1 || !Array.isArray(root?.profiles);
+      const { root, rawProfiles, pendingActorForgetIds } = validatePersistedRoot(parsed);
+      const currentSchema = root.version === 1;
+      // Additive marker: a structurally valid legacy file predating the marker
+      // is trusted because it is itself the durable companion being migrated.
+      this.continuityVerified = root.continuityVerified === undefined
+        ? true
+        : root.continuityVerified === true;
+      shouldRewrite = root.version !== 1 ||
+        root.continuityVerified === undefined ||
+        root.pendingActorForgetIds === undefined;
+      for (const actorId of pendingActorForgetIds) this.pendingActorForgetIds.add(actorId);
       const now = this.now();
+      const persistedProfileIds = new Set<string>();
       for (const rawProfile of rawProfiles) {
+        const rawProfileRecord = asRecord(rawProfile);
+        const persistedMember = asRecord(rawProfileRecord?.member);
+        if (currentSchema && persistedMember?.kind !== "human") {
+          throw new TypeError("Current human-memory schema contains an invalid actor type.");
+        }
+        const rawActorId = persistedActorId(rawProfile);
+        if (rawActorId) persistedProfileIds.add(rawActorId);
         const profile = this.sanitizeProfile(rawProfile, now);
         if (!profile) {
+          if (currentSchema) {
+            throw new TypeError("Current human-memory schema contains an invalid stable profile identity.");
+          }
           shouldRewrite = true;
           continue;
         }
-        const rawProfileRecord = asRecord(rawProfile);
+        if (this.pendingActorForgetIds.has(profile.member.id)) {
+          if (currentSchema) {
+            throw new TypeError("Current human-memory schema contains a profile/tombstone identity collision.");
+          }
+          shouldRewrite = true;
+          continue;
+        }
         const rawFactCount = Array.isArray(rawProfileRecord?.facts)
           ? rawProfileRecord.facts.length
           : 0;
@@ -477,24 +612,44 @@ export class HumanMemoryStore implements HumanMemory {
         const existingHumanId = this.humanIdByTokenHash.get(profile.tokenHash);
         const existing = this.profilesByHumanId.get(profile.member.id);
         if (existingHumanId || existing) {
+          if (currentSchema) {
+            throw new TypeError("Current human-memory schema contains duplicate stable identities.");
+          }
           shouldRewrite = true;
           const incumbent = existing ?? (existingHumanId ? this.profilesByHumanId.get(existingHumanId) : undefined);
           if (incumbent && incumbent.lastSeenAt >= profile.lastSeenAt) continue;
-          if (incumbent) this.removeInternal(incumbent.member.id);
+          if (incumbent) {
+            // Replacing duplicate rows for the same stable actor is a file
+            // repair, not an actor erasure. A conflicting token that belonged
+            // to another actor still requires downstream cleanup.
+            this.removeInternal(incumbent.member.id, incumbent.member.id !== profile.member.id);
+          }
         }
         this.profilesByHumanId.set(profile.member.id, profile);
         this.humanIdByTokenHash.set(profile.tokenHash, profile.member.id);
       }
       const pruned = this.pruneInternal(now);
+      for (const actorId of persistedProfileIds) {
+        if (!this.profilesByHumanId.has(actorId)) this.pendingActorForgetIds.add(actorId);
+      }
       shouldRewrite ||= pruned.profilesRemoved > 0 || pruned.factsRemoved > 0 || rawProfiles.length !== this.profilesByHumanId.size;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") {
-        console.warn("Could not read human memory; starting with an empty privacy-safe store.", error);
+        this.profilesByHumanId.clear();
+        this.humanIdByTokenHash.clear();
+        this.pendingActorForgetIds.clear();
+        this.continuityVerified = false;
+        // A present-but-unreadable companion is not equivalent to a missing
+        // companion. Inventory cannot prove what its original bytes contained.
+        throw new HumanMemoryLoadError(error);
       }
+      // Persist an explicit unverified marker. A restart may not silently turn
+      // one missing-companion startup into a trusted empty baseline.
       shouldRewrite = true;
     }
     if (shouldRewrite) await this.flush();
+    return this.loadResult();
   }
 
   async flush(): Promise<void> {
@@ -511,11 +666,52 @@ export class HumanMemoryStore implements HumanMemory {
     return this.writeQueue;
   }
 
+  acknowledgePendingActorForgets(actorIds: readonly string[]): number {
+    if (!Array.isArray(actorIds)) throw new TypeError("actorIds must be an array");
+    let acknowledged = 0;
+    for (const rawActorId of new Set(actorIds)) {
+      const actorId = persistedActorId({ humanId: rawActorId });
+      if (!actorId) throw new TypeError("actorIds must contain only safe persisted actor identifiers");
+      if (this.pendingActorForgetIds.delete(actorId)) acknowledged += 1;
+    }
+    if (acknowledged > 0) this.schedulePersist();
+    return acknowledged;
+  }
+
+  listPendingActorForgets(): string[] {
+    return [...this.pendingActorForgetIds].sort();
+  }
+
+  queuePendingActorForget(rawActorId: string): boolean {
+    const actorId = persistedActorId({ humanId: rawActorId });
+    if (!actorId) throw new TypeError("actorId must be a safe persisted actor identifier");
+    // A retained profile is authoritative evidence that this actor is live and
+    // must not be erased merely because another in-memory index was stale.
+    if (this.profilesByHumanId.has(actorId) || this.pendingActorForgetIds.has(actorId)) return false;
+    this.pendingActorForgetIds.add(actorId);
+    this.schedulePersist();
+    return true;
+  }
+
+  confirmContinuityBaseline(): boolean {
+    if (this.continuityVerified) return false;
+    this.continuityVerified = true;
+    this.schedulePersist();
+    return true;
+  }
+
   upsertSession(input: UpsertHumanSessionInput): HumanMemoryProfile {
     const tokenHash = input.tokenHash.toLowerCase();
     if (!TOKEN_HASH.test(tokenHash)) throw new TypeError("Human memory accepts only a SHA-256 tokenHash, never a raw session token.");
     const member = sanitizeMember(input.member);
     if (!member || input.member.kind !== "human") throw new TypeError("A valid server-issued human Member is required.");
+    if (this.pendingActorForgetIds.has(member.id)) {
+      // A durable erasure tombstone owns this stable actor ID until every
+      // downstream store has acknowledged the delete. Recreating the profile
+      // early would both let the retry erase fresh DM/social state and persist
+      // an invalid profile+tombstone collision for the next restart.
+      throw new Error(`Human actor ${member.id} is still pending durable memory erasure.`);
+    }
     const at = Math.max(0, finiteNumber(input.seenAt, this.now()));
     const byTokenId = this.humanIdByTokenHash.get(tokenHash);
     const byToken = byTokenId ? this.profilesByHumanId.get(byTokenId) : undefined;
@@ -921,17 +1117,27 @@ export class HumanMemoryStore implements HumanMemory {
     return { profilesRemoved, factsRemoved };
   }
 
-  private removeInternal(humanId: string): boolean {
+  private removeInternal(humanId: string, queueForget = true): boolean {
     const profile = this.profilesByHumanId.get(humanId);
     if (!profile) return false;
     this.profilesByHumanId.delete(humanId);
     this.humanIdByTokenHash.delete(profile.tokenHash);
+    if (queueForget) this.pendingActorForgetIds.add(humanId);
     return true;
+  }
+
+  private loadResult(): HumanMemoryLoadResult {
+    return {
+      pendingActorForgetIds: this.listPendingActorForgets(),
+      continuityVerified: this.continuityVerified,
+    };
   }
 
   private serialize(): PersistedHumanMemory {
     return {
       version: 1,
+      continuityVerified: this.continuityVerified,
+      pendingActorForgetIds: [...this.pendingActorForgetIds].sort(),
       profiles: [...this.profilesByHumanId.values()]
         .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
         .map((profile) => ({
@@ -959,3 +1165,66 @@ export class HumanMemoryStore implements HumanMemory {
     this.persistTimer.unref?.();
   }
 }
+
+/**
+ * Replays durable startup or live-retention erasures one at a time. Tombstones are acknowledged
+ * only after the complete bounded sequence succeeds, so a crash or transient
+ * store failure safely retries the same idempotent forgets on next startup.
+ */
+export const reconcilePendingActorForgets = async (
+  memory: Pick<HumanMemory, "acknowledgePendingActorForgets" | "flush">,
+  pendingActorForgetIds: readonly string[],
+  downstream: PendingActorForgetReconciliation,
+): Promise<number> => {
+  const actorIds = [...new Set(pendingActorForgetIds)].sort();
+  if (actorIds.length === 0) return 0;
+  // First make the intent durable. If the process dies after either downstream
+  // store changes, the same idempotent erasure will be replayed after restart.
+  await memory.flush();
+  for (const actorId of actorIds) await downstream.forgetActor(actorId);
+  // RoomStore uses delayed JSON persistence, so its explicit flush is part of
+  // the transaction boundary rather than an optional cleanup step.
+  await downstream.flushDownstream();
+  const acknowledged = memory.acknowledgePendingActorForgets(actorIds);
+  if (acknowledged > 0) await memory.flush();
+  return acknowledged;
+};
+
+/**
+ * Fail-closed guard for a missing human-memory companion. Corrupt or unreadable
+ * companions abort in load() before this inventory path is reachable. It never
+ * guesses actor type from a prefix and never deletes an unknown actor. The
+ * caller may trust a new baseline only when every complete private actor-store
+ * inventory is accounted for by retained humans, the current resident catalog,
+ * or durable pending-erasure tombstones.
+ */
+export const assertHumanMemoryContinuity = (inventory: HumanMemoryContinuityInventory): void => {
+  const residentActorIds = new Set(inventory.residentActorIds);
+  const actorTypeCollision = inventory.retainedHumanActorIds.some((actorId) => residentActorIds.has(actorId)) ||
+    inventory.pendingActorForgetIds.some((actorId) => residentActorIds.has(actorId));
+  if (actorTypeCollision) {
+    throw new Error(
+      "Human-memory continuity contains an ambiguous resident identity. The server will not erase any actor.",
+    );
+  }
+  if (inventory.continuityVerified) return;
+  const accountedFor = new Set([
+    ...inventory.retainedHumanActorIds,
+    ...residentActorIds,
+    ...inventory.pendingActorForgetIds,
+  ]);
+  const durableInventories = [
+    { actorIds: inventory.socialActorIds, actorCount: inventory.socialActorCount },
+    ...(inventory.additionalActorInventories ?? []),
+  ];
+  const inventoriesVerified = durableInventories.every(({ actorIds, actorCount }) => {
+    const uniqueActorIds = new Set(actorIds);
+    const complete = Number.isSafeInteger(actorCount) && actorCount >= 0 && actorCount === uniqueActorIds.size;
+    return complete && [...uniqueActorIds].every((actorId) => accountedFor.has(actorId));
+  });
+  if (!inventoriesVerified) {
+    throw new Error(
+      "Human-memory continuity could not be verified. The server will not serve requests or erase unknown actors.",
+    );
+  }
+};
