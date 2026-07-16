@@ -2935,6 +2935,61 @@ describe("social director", () => {
     director.stop();
   });
 
+  it("keeps the first reviewed language stable in memory for a migrated human room", () => {
+    const now = Date.parse("2026-07-16T12:00:00.000Z");
+    const store = new RoomStore(`/tmp/director-language-migration-${process.pid}-${Math.random()}.json`);
+    store.addPublicMessage(createMessage(
+      "3d-visualisation",
+      "human-johan",
+      "legacy room language anchor",
+      { createdAt: new Date(now - 60_000).toISOString() },
+    ));
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      {} as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      { now: () => now, autonomousResearchEnabled: false },
+    );
+    const thread: AmbientThreadState = {
+      seed: "migration",
+      messageCount: 0,
+      participantIds: [],
+      debateBeat: false,
+      openedAt: now,
+      updatedAt: now,
+    };
+    (director as unknown as {
+      lockAmbientThreadLanguage: (
+        channelId: string,
+        state: AmbientThreadState,
+        line: {
+          personaId: string;
+          content: string;
+          source: "lm";
+          sourceIds: string[];
+          reviewedOutputLanguage: { tag: string; confidence: number };
+        },
+        observedAt: string,
+      ) => void;
+    }).lockAmbientThreadLanguage("3d-visualisation", thread, {
+      personaId: "ai-bea",
+      content: "reviewed migration turn",
+      source: "lm",
+      sourceIds: [],
+      reviewedOutputLanguage: { tag: "sv-SE", confidence: 0.99 },
+    }, new Date(now).toISOString());
+
+    expect(director.trustedLanguageForChannel("3d-visualisation")).toBe("sv-SE");
+    expect(thread.languageTag).toBe("sv-SE");
+    expect(store.getTrustedChannelLanguage("3d-visualisation")).toBeUndefined();
+    director.stop();
+  });
+
   it("chooses a room-relevant lead over the loudest generic resident", () => {
     const candidates = PERSONAS.filter((persona) => ["ai-bosse", "ai-sana"].includes(persona.id));
     const lead = selectAmbientLead(candidates, (id) => (id === "ai-sana" ? 1 : 0), () => 0);

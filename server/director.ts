@@ -2025,6 +2025,12 @@ export class SocialDirector {
     ) return;
     thread.languageTag = reviewed.tag;
     thread.languageHint = reviewed.tag;
+    // Even a legacy room without a persisted human classification must stay
+    // stable for the rest of this process once its first reviewed turn picks
+    // up the room's transcript language. The lower-authority observation is
+    // persisted only for genuinely empty rooms; a later classified human turn
+    // remains the sole durable authority for established history.
+    this.lastTrustedLanguageByChannel.set(channelId, reviewed.tag);
     const hasHumanHistory = this.store.getAllMessages().some(
       (message) =>
         message.channelId === channelId &&
