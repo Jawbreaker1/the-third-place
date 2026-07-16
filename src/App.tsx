@@ -551,9 +551,17 @@ export default function App() {
     const analyser = context.createAnalyser();
     analyser.fftSize = 512;
     analyser.smoothingTimeConstant = 0.62;
-    context.createMediaStreamSource(stream).connect(analyser);
+    // Remove mains and desk rumble from activity detection only. Peers and STT
+    // continue receiving the unfiltered microphone track.
+    const highPass = context.createBiquadFilter();
+    highPass.type = "highpass";
+    highPass.frequency.value = 80;
+    highPass.Q.value = Math.SQRT1_2;
+    context.createMediaStreamSource(stream).connect(highPass).connect(analyser);
     voiceAudioContextRef.current = context;
     context.onstatechange = () => setVoiceVadPaused(context.state !== "running" && context.state !== "closed");
+    // Preserve brief conversational acknowledgements. The high-pass activity
+    // signal and server-side acoustic gate handle stationary noise separately.
     voiceActivityRef.current = new VoiceActivityDetector({ startFrames: 2, minSpeechMs: 140 });
     const samples = new Float32Array(analyser.fftSize);
     const sample = () => {

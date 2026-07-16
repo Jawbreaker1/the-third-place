@@ -55,6 +55,21 @@ export interface NormalizedVoiceAudio {
   durationMs?: number;
   sampleRate: 16_000;
   channels: 1;
+  /** Language-independent evidence measured from normalized PCM before STT. */
+  speechPresence?: VoiceSpeechPresence;
+}
+
+export interface VoiceSpeechPresence {
+  /** Only `noise` is safe to discard before the transcription provider. */
+  classification: "speech" | "noise" | "uncertain";
+  activeMs: number;
+  noiseFloorRms: number;
+  highEnergyRms: number;
+  peakRms: number;
+  /** Fraction of a stable active window explained by a 50/60 Hz mains tone or its first harmonic. */
+  stationaryToneRatio: number;
+  dynamicRangeDb: number;
+  activeVariationDb: number;
 }
 
 export interface StoredTtsAudioMetadata {
@@ -186,6 +201,23 @@ const MAX_TTS_STORE_BYTES = 32 * 1024 * 1024;
 const MAX_TTS_STORE_ENTRIES = 128;
 const TRANSCRIPT_MAX_CHARS = 4_000;
 const TTS_TEXT_MAX_CHARS = 600;
+const PCM_FRAME_SAMPLES = 320; // 20 ms at 16 kHz
+const PCM_MIN_ACTIVE_MS = 100;
+const PCM_CONFIDENT_SILENCE_RMS = 0.001;
+const PCM_CONFIDENT_SILENCE_PEAK_RMS = 0.0035;
+const PCM_MAX_CLICK_MS = 40;
+const PCM_MIN_CLICK_PEAK_RMS = 0.05;
+const PCM_MIN_CLICK_CREST_RATIO = 4;
+const PCM_MIN_HIGH_ENERGY_RMS = 0.005;
+const PCM_MIN_STATIONARY_MS = 300;
+const PCM_MIN_DYNAMIC_RANGE_DB = 5;
+const PCM_MIN_ACTIVE_VARIATION_DB = 2;
+// A 60 Hz tone spans 1.2 cycles per 20 ms frame, so its frame RMS naturally
+// ripples by about 1 dB even with a perfectly constant amplitude.
+const PCM_MAX_STATIONARY_VARIATION_DB = 1.25;
+const PCM_MIN_STATIONARY_TONE_RATIO = 0.65;
+const PCM_STATIONARY_WINDOW_FRAMES = PCM_MIN_STATIONARY_MS / 20;
+const PCM_MAINS_TONE_FREQUENCIES = [50, 60, 100, 120] as const;
 
 const clampInteger = (raw: string | undefined, fallback: number, min: number, max: number): number => {
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
@@ -209,6 +241,192 @@ const sanitizeIdentifier = (value: string, label: string, maxLength = 160): stri
 };
 
 const sanitizeLanguage = canonicalRegisteredLanguageTag;
+
+interface WavDataChunk {
+  offset: number;
+  bytes: number;
+}
+
+const findWavDataChunk = (wav: Buffer): WavDataChunk | undefined => {
+  let offset = 12;
+  while (offset + 8 <= wav.length) {
+    const id = wav.subarray(offset, offset + 4).toString("ascii");
+    const declaredSize = wav.readUInt32LE(offset + 4);
+    const dataOffset = offset + 8;
+    const available = wav.length - dataOffset;
+    // WAV written to a non-seekable ffmpeg pipe may retain an unknown/maximum
+    // data size in its header. The bounded process output is the authority.
+    if (id === "data") return { offset: dataOffset, bytes: Math.min(declaredSize, available) || available };
+    if (declaredSize > available) return undefined;
+    offset = dataOffset + declaredSize + (declaredSize % 2);
+  }
+  return undefined;
+};
+
+const percentile = (sorted: readonly number[], fraction: number): number => {
+  if (sorted.length === 0) return 0;
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * fraction)));
+  return sorted[index] ?? 0;
+};
+
+const ratioDb = (high: number, low: number): number =>
+  20 * Math.log10(Math.max(high, 1e-7) / Math.max(low, 1e-7));
+
+const stationaryMainsToneRatio = (
+  wav: Buffer,
+  chunk: WavDataChunk,
+  activeFrameIndexes: readonly number[],
+): number => {
+  let runStart = -1;
+  let runLength = 0;
+  let previous = -2;
+  for (const frameIndex of activeFrameIndexes) {
+    if (frameIndex === previous + 1) runLength += 1;
+    else {
+      runStart = frameIndex;
+      runLength = 1;
+    }
+    previous = frameIndex;
+    if (runLength >= PCM_STATIONARY_WINDOW_FRAMES) break;
+  }
+  if (runStart < 0 || runLength < PCM_STATIONARY_WINDOW_FRAMES) return 0;
+
+  const sampleCount = PCM_STATIONARY_WINDOW_FRAMES * PCM_FRAME_SAMPLES;
+  const sampleOffset = chunk.offset + runStart * PCM_FRAME_SAMPLES * 2;
+  const samples = new Float64Array(sampleCount);
+  let mean = 0;
+  for (let index = 0; index < sampleCount; index += 1) {
+    const sample = wav.readInt16LE(sampleOffset + index * 2) / 32_768;
+    samples[index] = sample;
+    mean += sample;
+  }
+  mean /= sampleCount;
+  let totalEnergy = 0;
+  for (let index = 0; index < sampleCount; index += 1) {
+    samples[index] = (samples[index] ?? 0) - mean;
+    totalEnergy += (samples[index] ?? 0) ** 2;
+  }
+  if (totalEnergy <= 1e-12) return 0;
+
+  let strongestRatio = 0;
+  for (const frequency of PCM_MAINS_TONE_FREQUENCIES) {
+    const angularStep = (2 * Math.PI * frequency) / 16_000;
+    let real = 0;
+    let imaginary = 0;
+    for (let index = 0; index < sampleCount; index += 1) {
+      const sample = samples[index] ?? 0;
+      const phase = angularStep * index;
+      real += sample * Math.cos(phase);
+      imaginary -= sample * Math.sin(phase);
+    }
+    const fittedToneEnergy = (2 * (real * real + imaginary * imaginary)) / sampleCount;
+    strongestRatio = Math.max(strongestRatio, Math.min(1, fittedToneEnergy / totalEnergy));
+  }
+  return strongestRatio;
+};
+
+/**
+ * Conservative speech-presence evidence for normalized mono PCM. This is not
+ * language recognition and never examines transcript words. Only near-silence,
+ * an isolated high-crest click, or a stable narrow-band mains tone is labelled
+ * noise; every acoustically ambiguous clip reaches the transcription provider.
+ */
+export const analyzePcmSpeechPresence = (
+  wav: Buffer,
+  chunk = findWavDataChunk(wav),
+): VoiceSpeechPresence => {
+  if (!chunk || chunk.bytes < PCM_FRAME_SAMPLES * 2) {
+    return {
+      classification: "noise",
+      activeMs: 0,
+      noiseFloorRms: 0,
+      highEnergyRms: 0,
+      peakRms: 0,
+      stationaryToneRatio: 0,
+      dynamicRangeDb: 0,
+      activeVariationDb: 0,
+    };
+  }
+
+  const frameRms: number[] = [];
+  const dataEnd = chunk.offset + chunk.bytes;
+  for (let frameOffset = chunk.offset; frameOffset + PCM_FRAME_SAMPLES * 2 <= dataEnd; frameOffset += PCM_FRAME_SAMPLES * 2) {
+    let squared = 0;
+    for (let sampleOffset = frameOffset; sampleOffset < frameOffset + PCM_FRAME_SAMPLES * 2; sampleOffset += 2) {
+      const normalized = wav.readInt16LE(sampleOffset) / 32_768;
+      squared += normalized * normalized;
+    }
+    frameRms.push(Math.sqrt(squared / PCM_FRAME_SAMPLES));
+  }
+
+  if (frameRms.length === 0) {
+    return {
+      classification: "noise",
+      activeMs: 0,
+      noiseFloorRms: 0,
+      highEnergyRms: 0,
+      peakRms: 0,
+      stationaryToneRatio: 0,
+      dynamicRangeDb: 0,
+      activeVariationDb: 0,
+    };
+  }
+
+  const sorted = [...frameRms].sort((a, b) => a - b);
+  const noiseFloorRms = percentile(sorted, 0.2);
+  const highEnergyRms = percentile(sorted, 0.9);
+  const peakRms = sorted.at(-1) ?? 0;
+  const activeThreshold = Math.max(0.0035, noiseFloorRms * 1.8);
+  const activeFrameIndexes = frameRms
+    .map((rms, index) => rms >= activeThreshold ? index : -1)
+    .filter((index) => index >= 0);
+  const active = activeFrameIndexes.map((index) => frameRms[index] ?? 0).sort((a, b) => a - b);
+  const activeMs = active.length * 20;
+  const dynamicRangeDb = ratioDb(highEnergyRms, noiseFloorRms);
+  const activeVariationDb = active.length > 1
+    ? ratioDb(percentile(active, 0.9), percentile(active, 0.1))
+    : 0;
+  const positiveSpeechEvidence = activeMs >= PCM_MIN_ACTIVE_MS &&
+    highEnergyRms >= PCM_MIN_HIGH_ENERGY_RMS &&
+    dynamicRangeDb >= PCM_MIN_DYNAMIC_RANGE_DB &&
+    activeVariationDb >= PCM_MIN_ACTIVE_VARIATION_DB;
+  const allFrameIndexes = frameRms.map((_rms, index) => index);
+  const stationaryFrameIndexes = activeFrameIndexes.length >= PCM_STATIONARY_WINDOW_FRAMES
+    ? activeFrameIndexes
+    : dynamicRangeDb <= PCM_MAX_STATIONARY_VARIATION_DB
+      ? allFrameIndexes
+      : [];
+  const stationaryToneRatio = stationaryMainsToneRatio(wav, chunk, stationaryFrameIndexes);
+  const confidentSilence = highEnergyRms <= PCM_CONFIDENT_SILENCE_RMS &&
+    peakRms <= PCM_CONFIDENT_SILENCE_PEAK_RMS;
+  const confidentClick = activeMs > 0 && activeMs <= PCM_MAX_CLICK_MS &&
+    peakRms >= PCM_MIN_CLICK_PEAK_RMS &&
+    peakRms / Math.max(highEnergyRms, 1e-7) >= PCM_MIN_CLICK_CREST_RATIO;
+  // Stable RMS alone is ambiguous with sustained voicing. Hard rejection also
+  // requires a narrow-band 50/60 Hz mains signature (or first harmonic).
+  const stationaryVariationDb = activeFrameIndexes.length >= PCM_STATIONARY_WINDOW_FRAMES
+    ? activeVariationDb
+    : dynamicRangeDb;
+  const confidentStationaryNoise = stationaryFrameIndexes.length * 20 >= PCM_MIN_STATIONARY_MS &&
+    stationaryVariationDb <= PCM_MAX_STATIONARY_VARIATION_DB &&
+    stationaryToneRatio >= PCM_MIN_STATIONARY_TONE_RATIO;
+  const classification: VoiceSpeechPresence["classification"] = positiveSpeechEvidence
+    ? "speech"
+    : confidentSilence || confidentClick || confidentStationaryNoise
+      ? "noise"
+      : "uncertain";
+
+  return {
+    classification,
+    activeMs,
+    noiseFloorRms,
+    highEnergyRms,
+    peakRms,
+    stationaryToneRatio,
+    dynamicRangeDb,
+    activeVariationDb,
+  };
+};
 
 /**
  * OpenAI Whisper's verbose JSON reports the detected language as one of the
@@ -722,11 +940,11 @@ export class AudioNormalizer implements AudioNormalizerLike {
     if (output.length < 44 || output.subarray(0, 4).toString("ascii") !== "RIFF" || output.subarray(8, 12).toString("ascii") !== "WAVE") {
       throw new VoiceSpeechError("The normalized audio was malformed.", 415, "MALFORMED_NORMALIZED_AUDIO");
     }
-    const dataBytes = this.wavDataBytes(output);
-    if (dataBytes === undefined) {
+    const dataChunk = findWavDataChunk(output);
+    if (!dataChunk) {
       throw new VoiceSpeechError("The normalized audio was malformed.", 415, "MALFORMED_NORMALIZED_AUDIO");
     }
-    const decodedDurationMs = Math.round((dataBytes / (16_000 * 2)) * 1_000);
+    const decodedDurationMs = Math.round((dataChunk.bytes / (16_000 * 2)) * 1_000);
     if (decodedDurationMs > this.maxDurationMs + 100) {
       throw new VoiceSpeechError(`Voice clips can be at most ${Math.round(this.maxDurationMs / 1_000)} seconds.`, 413, "AUDIO_TOO_LONG");
     }
@@ -738,20 +956,8 @@ export class AudioNormalizer implements AudioNormalizerLike {
         : decodedDurationMs,
       sampleRate: 16_000,
       channels: 1,
+      speechPresence: analyzePcmSpeechPresence(output, dataChunk),
     };
-  }
-
-  private wavDataBytes(output: Buffer): number | undefined {
-    let offset = 12;
-    while (offset + 8 <= output.length) {
-      const id = output.subarray(offset, offset + 4).toString("ascii");
-      const declaredSize = output.readUInt32LE(offset + 4);
-      const dataOffset = offset + 8;
-      if (id === "data") return Math.max(0, output.length - dataOffset);
-      if (declaredSize > output.length - dataOffset) return undefined;
-      offset = dataOffset + declaredSize + (declaredSize % 2);
-    }
-    return undefined;
   }
 
   private processingError(error: unknown, phase: "inspect" | "decode"): VoiceSpeechError {
@@ -827,23 +1033,66 @@ class OpenAiCompatibleSttProvider {
     if (!payload || typeof payload !== "object" || typeof (payload as { text?: unknown }).text !== "string") {
       throw new VoiceSpeechError("Speech transcription provider omitted the transcript.", 502, "INVALID_PROVIDER_JSON");
     }
-    const text = sanitizeText((payload as { text: string }).text, TRANSCRIPT_MAX_CHARS);
+    let text = sanitizeText((payload as { text: string }).text, TRANSCRIPT_MAX_CHARS);
     if (!text) throw new VoiceSpeechError("No speech was detected.", 422, "NO_SPEECH");
     const returnedLanguage = normalizeSttProviderLanguage((payload as { language?: unknown }).language);
     const rawSegments = Array.isArray((payload as { segments?: unknown }).segments)
       ? (payload as { segments: unknown[] }).segments
       : [];
-    const segments = rawSegments
+    const providerSegments = rawSegments
       .slice(0, 100)
-      .map((segment): VoiceTranscriptSegment | undefined => {
+      .map((segment) => {
         if (!segment || typeof segment !== "object") return undefined;
-        const raw = segment as { start?: unknown; end?: unknown; text?: unknown };
+        const raw = segment as {
+          start?: unknown;
+          end?: unknown;
+          text?: unknown;
+          no_speech_prob?: unknown;
+          avg_logprob?: unknown;
+        };
         const start = typeof raw.start === "number" ? raw.start : Number.NaN;
         const end = typeof raw.end === "number" ? raw.end : Number.NaN;
         const segmentText = typeof raw.text === "string" ? sanitizeText(raw.text, 500) : "";
-        if (!Number.isFinite(start) || !Number.isFinite(end) || end < start || !segmentText) return undefined;
-        return { startMs: Math.max(0, Math.round(start * 1_000)), endMs: Math.max(0, Math.round(end * 1_000)), text: segmentText };
+        const noSpeechProbability = typeof raw.no_speech_prob === "number" &&
+          Number.isFinite(raw.no_speech_prob) && raw.no_speech_prob >= 0 && raw.no_speech_prob <= 1
+          ? raw.no_speech_prob
+          : undefined;
+        const averageLogProbability = typeof raw.avg_logprob === "number" && Number.isFinite(raw.avg_logprob)
+          ? raw.avg_logprob
+          : undefined;
+        // Whisper's no-speech probability is not sufficient by itself: short
+        // real speech after leading silence can have a high no-speech token
+        // probability while the decoded words remain strongly supported.
+        const likelyNoSpeech = noSpeechProbability !== undefined &&
+          noSpeechProbability >= 0.6 &&
+          (averageLogProbability === undefined || averageLogProbability < -1);
+        return {
+          text: segmentText,
+          likelyNoSpeech,
+          timed: Number.isFinite(start) && Number.isFinite(end) && end >= start && segmentText
+            ? {
+                startMs: Math.max(0, Math.round(start * 1_000)),
+                endMs: Math.max(0, Math.round(end * 1_000)),
+                text: segmentText,
+              } satisfies VoiceTranscriptSegment
+            : undefined,
+        };
       })
+      .filter((segment): segment is NonNullable<typeof segment> => Boolean(segment));
+    const rejectedSegments = providerSegments.filter((segment) => segment.likelyNoSpeech);
+    const acceptedSegments = providerSegments.filter((segment) => !segment.likelyNoSpeech && segment.text);
+    if (providerSegments.length > 0 && rejectedSegments.length === providerSegments.length) {
+      throw new VoiceSpeechError("No speech was detected.", 422, "NO_SPEECH");
+    }
+    // If only part of a verbose Whisper result is confidently marked as
+    // no-speech, omit that provider segment instead of preserving its common
+    // silence hallucination in the top-level aggregate text.
+    if (rejectedSegments.length > 0 && acceptedSegments.length > 0) {
+      text = sanitizeText(acceptedSegments.map((segment) => segment.text).join(" "), TRANSCRIPT_MAX_CHARS);
+    }
+    if (!text) throw new VoiceSpeechError("No speech was detected.", 422, "NO_SPEECH");
+    const segments = acceptedSegments
+      .map((segment) => segment.timed)
       .filter((segment): segment is VoiceTranscriptSegment => Boolean(segment));
     return {
       text,
@@ -1073,6 +1322,9 @@ export class VoiceSpeechService {
   async transcribe(input: VoiceTranscriptionInput): Promise<VoiceTranscriptionResult> {
     if (!this.stt) throw new VoiceSpeechError("Server speech recognition is not configured.", 503, "STT_DISABLED");
     const normalized = await this.normalizer.normalize(input.audio, input.mimeType, input.signal);
+    if (normalized.speechPresence?.classification === "noise") {
+      throw new VoiceSpeechError("No speech was detected.", 422, "NO_SPEECH");
+    }
     return await this.stt.transcribe(normalized, input);
   }
 

@@ -659,7 +659,10 @@ const voiceDirector = new VoiceDirector({
       content: message.content,
       createdAt: message.createdAt,
     })),
-  floorSilenceMs: 650,
+  // Browser VAD has already observed a quiet boundary. Keep only a small
+  // coalescing window; renewed human speech still cancels in-flight AI work.
+  floorSilenceMs: 150,
+  floorRecheckMs: 100,
   hasPendingHumanIngest: (roomId) => (pendingVoiceIngestsByRoom.get(roomId) ?? 0) > 0,
   events: {
     roomChanged: publishVoiceRoom,
@@ -1022,6 +1025,13 @@ app.post("/api/voice/:roomId/turns", async (request, response) => {
           error.code,
         )
       : error;
+    // Silence and background noise are expected in hands-free mode. Treat a
+    // rejected acoustic segment as a successful no-op: no transcript, no bot
+    // trigger and no alarming error banner in the browser.
+    if (normalized instanceof VoiceSpeechError && normalized.code === "NO_SPEECH") {
+      response.status(200).json({ ok: true, ignored: true });
+      return;
+    }
     if (!request.readableEnded && !request.destroyed) request.resume();
     const status = normalized instanceof VoiceSpeechError ? normalized.status : 400;
     response.status(status).json({ ok: false, error: normalized instanceof Error ? normalized.message : "That voice turn could not be transcribed." });

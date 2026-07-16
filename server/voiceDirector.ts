@@ -63,6 +63,8 @@ export interface VoiceDirectorOptions {
   now?: () => number;
   /** Quiet floor after the latest completed human turn; production uses this to coalesce overlapping speakers. */
   floorSilenceMs?: number;
+  /** Poll interval while another human still owns the floor or has audio awaiting STT. */
+  floorRecheckMs?: number;
   /** True while a human clip in this room is queued, uploading or being transcribed. */
   hasPendingHumanIngest?: (roomId: string) => boolean;
   /** Last trusted response language in the public channel, used only to seed a new voice session. */
@@ -416,7 +418,12 @@ export class VoiceDirector {
         (participant) => participant.kind === "human" && participant.speaking,
       ) ?? false;
       if (humanStillSpeaking || this.options.hasPendingHumanIngest?.(entry.roomId)) {
-        this.scheduleFloorResponse(entry, epoch, 250, channelContext);
+        this.scheduleFloorResponse(
+          entry,
+          epoch,
+          Math.max(25, this.options.floorRecheckMs ?? 250),
+          channelContext,
+        );
         return;
       }
       this.pendingResponseTimerByRoom.delete(entry.roomId);

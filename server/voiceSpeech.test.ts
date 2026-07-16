@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  analyzePcmSpeechPresence,
   AudioNormalizer,
   type AudioProcessRunner,
   TtsAudioStore,
@@ -22,6 +23,63 @@ const wav = (): Buffer => {
   body.writeUInt16LE(16, 34);
   body.write("data", 36, "ascii");
   body.writeUInt32LE(0, 40);
+  return body;
+};
+
+const pcmWav = (frameAmplitudes: readonly number[], frequency = 220): Buffer => {
+  const samplesPerFrame = 320;
+  const sampleCount = frameAmplitudes.length * samplesPerFrame;
+  const body = Buffer.alloc(44 + sampleCount * 2);
+  body.write("RIFF", 0, "ascii");
+  body.writeUInt32LE(36 + sampleCount * 2, 4);
+  body.write("WAVE", 8, "ascii");
+  body.write("fmt ", 12, "ascii");
+  body.writeUInt32LE(16, 16);
+  body.writeUInt16LE(1, 20);
+  body.writeUInt16LE(1, 22);
+  body.writeUInt32LE(16_000, 24);
+  body.writeUInt32LE(32_000, 28);
+  body.writeUInt16LE(2, 32);
+  body.writeUInt16LE(16, 34);
+  body.write("data", 36, "ascii");
+  body.writeUInt32LE(sampleCount * 2, 40);
+  let sampleIndex = 0;
+  for (const amplitude of frameAmplitudes) {
+    for (let frameSample = 0; frameSample < samplesPerFrame; frameSample += 1) {
+      const value = amplitude * Math.sin((2 * Math.PI * frequency * sampleIndex) / 16_000);
+      body.writeInt16LE(Math.round(Math.max(-1, Math.min(1, value)) * 32_767), 44 + sampleIndex * 2);
+      sampleIndex += 1;
+    }
+  }
+  return body;
+};
+
+const harmonicPcmWav = (frameAmplitudes: readonly number[], fundamental = 120): Buffer => {
+  const samplesPerFrame = 320;
+  const sampleCount = frameAmplitudes.length * samplesPerFrame;
+  const body = Buffer.alloc(44 + sampleCount * 2);
+  body.write("RIFF", 0, "ascii");
+  body.writeUInt32LE(36 + sampleCount * 2, 4);
+  body.write("WAVE", 8, "ascii");
+  body.write("fmt ", 12, "ascii");
+  body.writeUInt32LE(16, 16);
+  body.writeUInt16LE(1, 20);
+  body.writeUInt16LE(1, 22);
+  body.writeUInt32LE(16_000, 24);
+  body.writeUInt32LE(32_000, 28);
+  body.writeUInt16LE(2, 32);
+  body.writeUInt16LE(16, 34);
+  body.write("data", 36, "ascii");
+  body.writeUInt32LE(sampleCount * 2, 40);
+  let sampleIndex = 0;
+  for (const amplitude of frameAmplitudes) {
+    for (let frameSample = 0; frameSample < samplesPerFrame; frameSample += 1) {
+      const phase = (2 * Math.PI * fundamental * sampleIndex) / 16_000;
+      const harmonicShape = (Math.sin(phase) + 0.7 * Math.sin(phase * 2) + 0.4 * Math.sin(phase * 3)) / 2.1;
+      body.writeInt16LE(Math.round(Math.max(-1, Math.min(1, amplitude * harmonicShape)) * 32_767), 44 + sampleIndex * 2);
+      sampleIndex += 1;
+    }
+  }
   return body;
 };
 
@@ -100,6 +158,79 @@ describe("portable audio normalizer", () => {
   });
 });
 
+describe("normalized PCM speech presence", () => {
+  it("rejects a low steady hum even when it is followed by room silence", () => {
+    const humThenSilence = pcmWav([
+      ...Array.from({ length: 35 }, () => 0.03),
+      ...Array.from({ length: 25 }, () => 0.0005),
+    ], 120);
+
+    const evidence = analyzePcmSpeechPresence(humThenSilence);
+
+    expect(evidence.classification).toBe("noise");
+    expect(evidence.activeMs).toBeGreaterThan(100);
+    expect(evidence.activeVariationDb).toBeLessThan(1);
+    expect(evidence.stationaryToneRatio).toBeGreaterThan(0.9);
+  });
+
+  it("accepts a quiet amplitude-modulated utterance over a low noise floor", () => {
+    const speechLike = pcmWav([
+      0.006, 0.012, 0.024, 0.038, 0.02, 0.009,
+      0.007, 0.018, 0.034, 0.026, 0.012, 0.006,
+      0.008, 0.022, 0.04, 0.025, 0.01, 0.006,
+      ...Array.from({ length: 24 }, () => 0.0008),
+    ]);
+
+    const evidence = analyzePcmSpeechPresence(speechLike);
+
+    expect(evidence.classification).toBe("speech");
+    expect(evidence.activeMs).toBeGreaterThanOrEqual(100);
+    expect(evidence.dynamicRangeDb).toBeGreaterThan(5);
+  });
+
+  it("rejects a click without treating its peak as an utterance", () => {
+    const click = pcmWav([
+      ...Array.from({ length: 10 }, () => 0.0005),
+      0.3,
+      ...Array.from({ length: 25 }, () => 0.0005),
+    ]);
+
+    expect(analyzePcmSpeechPresence(click)).toMatchObject({ classification: "noise", activeMs: 20 });
+  });
+
+  it("passes ambiguous quiet and uniformly voiced clips to STT instead of hard-rejecting them", () => {
+    const quietVoiced = pcmWav([
+      ...Array.from({ length: 18 }, () => 0.003),
+      ...Array.from({ length: 24 }, () => 0.0008),
+    ]);
+    const uninterruptedSteady = pcmWav(Array.from({ length: 60 }, () => 0.02), 140);
+    const sustainedHarmonicVoice = harmonicPcmWav([
+      ...Array.from({ length: 20 }, () => 0.03),
+      ...Array.from({ length: 25 }, () => 0.0005),
+    ]);
+    const tinyShortSignal = pcmWav([
+      ...Array.from({ length: 8 }, () => 0.0005),
+      0.006,
+      ...Array.from({ length: 24 }, () => 0.0005),
+    ]);
+
+    expect(analyzePcmSpeechPresence(quietVoiced).classification).toBe("uncertain");
+    expect(analyzePcmSpeechPresence(uninterruptedSteady).classification).toBe("uncertain");
+    expect(analyzePcmSpeechPresence(sustainedHarmonicVoice).classification).toBe("uncertain");
+    expect(analyzePcmSpeechPresence(tinyShortSignal).classification).toBe("uncertain");
+  });
+
+  it("rejects uninterrupted 50/60 Hz mains hum and first harmonics using spectral evidence", () => {
+    for (const frequency of [50, 60, 100, 120]) {
+      const uninterruptedHum = pcmWav(Array.from({ length: 40 }, () => 0.03), frequency);
+      const evidence = analyzePcmSpeechPresence(uninterruptedHum);
+
+      expect(evidence.classification, `${frequency} Hz`).toBe("noise");
+      expect(evidence.stationaryToneRatio, `${frequency} Hz`).toBeGreaterThan(0.9);
+    }
+  });
+});
+
 describe("OpenAI-compatible speech providers", () => {
   it("disables providers cleanly when their independent configuration is absent", async () => {
     const service = new VoiceSpeechService({ env: {}, normalizer: { ...fakeNormalizer, available: async () => false } });
@@ -157,6 +288,139 @@ describe("OpenAI-compatible speech providers", () => {
     expect(seenMultipart).toContain("verbose_json");
     expect(seenMultipart).toContain('name="language"');
     expect(seenMultipart).toContain("zh-Hant-TW");
+  });
+
+  it("drops acoustically empty PCM before calling the transcription provider", async () => {
+    let providerCalls = 0;
+    const service = new VoiceSpeechService({
+      env: { STT_BASE_URL: "https://speech.test/v1", STT_MODEL: "whisper-test" },
+      fetchImpl: (async () => {
+        providerCalls += 1;
+        return new Response(JSON.stringify({ text: "Thanks" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as typeof fetch,
+      normalizer: {
+        available: async () => true,
+        normalize: async () => ({
+          body: wav(),
+          mimeType: "audio/wav" as const,
+          durationMs: 800,
+          sampleRate: 16_000 as const,
+          channels: 1 as const,
+          speechPresence: {
+            classification: "noise",
+            activeMs: 0,
+            noiseFloorRms: 0.001,
+            highEnergyRms: 0.001,
+            peakRms: 0.001,
+            stationaryToneRatio: 0,
+            dynamicRangeDb: 0,
+            activeVariationDb: 0,
+          },
+        }),
+      },
+    });
+
+    await expectVoiceError(
+      service.transcribe({ audio: Buffer.from("hum"), mimeType: "audio/webm" }),
+      "NO_SPEECH",
+    );
+    expect(providerCalls).toBe(0);
+  });
+
+  it("passes a quiet sustained ambiguous signal through to the transcription provider", async () => {
+    const quietSustained = pcmWav([
+      ...Array.from({ length: 18 }, () => 0.003),
+      ...Array.from({ length: 24 }, () => 0.0008),
+    ], 220);
+    const speechPresence = analyzePcmSpeechPresence(quietSustained);
+    let providerCalls = 0;
+    const service = new VoiceSpeechService({
+      env: { STT_BASE_URL: "https://speech.test/v1", STT_MODEL: "whisper-test" },
+      fetchImpl: (async () => {
+        providerCalls += 1;
+        return new Response(JSON.stringify({ text: "Ja", language: "sv" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as typeof fetch,
+      normalizer: {
+        available: async () => true,
+        normalize: async () => ({
+          body: quietSustained,
+          mimeType: "audio/wav" as const,
+          durationMs: 840,
+          sampleRate: 16_000 as const,
+          channels: 1 as const,
+          speechPresence,
+        }),
+      },
+    });
+
+    expect(speechPresence.classification).toBe("uncertain");
+    await expect(service.transcribe({ audio: Buffer.from("quiet"), mimeType: "audio/webm" }))
+      .resolves.toMatchObject({ text: "Ja", language: "sv" });
+    expect(providerCalls).toBe(1);
+  });
+
+  it("requires poor or missing decode confidence before trusting Whisper no-speech probability", async () => {
+    let responsePayload: unknown = {
+      text: "Thanks",
+      language: "en",
+      segments: [{ start: 0, end: 0.4, text: "Thanks", no_speech_prob: 0.96, avg_logprob: -1.2 }],
+    };
+    const service = new VoiceSpeechService({
+      env: { STT_BASE_URL: "https://speech.test/v1", STT_MODEL: "whisper-test" },
+      fetchImpl: (async () => new Response(JSON.stringify(responsePayload), {
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch,
+      normalizer: fakeNormalizer,
+    });
+
+    await expectVoiceError(
+      service.transcribe({ audio: Buffer.from("noise"), mimeType: "audio/webm" }),
+      "NO_SPEECH",
+    );
+
+    responsePayload = {
+      text: "Ja",
+      language: "sv",
+      segments: [{ start: 0, end: 0.2, text: "Ja", no_speech_prob: 0.96, avg_logprob: -0.1 }],
+    };
+    await expect(service.transcribe({ audio: Buffer.from("short-speech"), mimeType: "audio/webm" }))
+      .resolves.toMatchObject({ text: "Ja", language: "sv" });
+
+    responsePayload = {
+      text: "Okej",
+      language: "sv",
+      segments: [{ start: 0, end: 0.35, text: "Okej", no_speech_prob: 0.85 }],
+    };
+    await expectVoiceError(
+      service.transcribe({ audio: Buffer.from("uncertain-noise"), mimeType: "audio/webm" }),
+      "NO_SPEECH",
+    );
+  });
+
+  it("removes only provider segments confidently marked as no-speech", async () => {
+    const service = new VoiceSpeechService({
+      env: { STT_BASE_URL: "https://speech.test/v1", STT_MODEL: "whisper-test" },
+      fetchImpl: (async () => new Response(JSON.stringify({
+        text: "Hej Thanks",
+        language: "sv",
+        segments: [
+          { start: 0, end: 0.5, text: "Hej", no_speech_prob: 0.02, avg_logprob: -0.05 },
+          { start: 0.5, end: 1, text: "Thanks", no_speech_prob: 0.92, avg_logprob: -1.2 },
+        ],
+      }), { headers: { "Content-Type": "application/json" } })) as typeof fetch,
+      normalizer: fakeNormalizer,
+    });
+
+    await expect(service.transcribe({ audio: Buffer.from("speech"), mimeType: "audio/webm" }))
+      .resolves.toEqual({
+        text: "Hej",
+        language: "sv",
+        segments: [{ startMs: 0, endMs: 500, text: "Hej" }],
+      });
   });
 
   it("normalizes exact Whisper language names without weakening BCP-47 validation", async () => {

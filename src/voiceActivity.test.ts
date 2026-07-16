@@ -58,24 +58,26 @@ describe("VoiceActivityDetector", () => {
     const detector = new VoiceActivityDetector();
     beginSpeech(detector);
     detector.push({ nowMs: 100, rms: 0.08 });
+    const boundary = 100 + detector.options.silenceHangoverMs;
 
-    expect(detector.push({ nowMs: 900, rms: 0.001 })).toEqual([]);
-    const ended = detector.push({ nowMs: 951, rms: 0.001 });
+    expect(detector.push({ nowMs: boundary - 1, rms: 0.001 })).toEqual([]);
+    const ended = detector.push({ nowMs: boundary, rms: 0.001 });
 
     expect(eventTypes(ended)).toEqual(["speechEnded", "segmentDiscarded"]);
     expect(ended[1]).toMatchObject({ reason: "too-short" });
     expect(detector.snapshot().speechActive).toBe(false);
   });
 
-  it("keeps a real utterance after about 850ms of silence", () => {
+  it("keeps a real utterance after the conversational silence boundary", () => {
     const detector = new VoiceActivityDetector();
     beginSpeech(detector);
     for (let nowMs = 80; nowMs <= 440; nowMs += 40) {
       detector.push({ nowMs, rms: 0.06 });
     }
+    const boundary = 440 + detector.options.silenceHangoverMs;
 
-    expect(detector.push({ nowMs: 1_280, rms: 0.002 })).toEqual([]);
-    const ended = detector.push({ nowMs: 1_300, rms: 0.002 });
+    expect(detector.push({ nowMs: boundary - 1, rms: 0.002 })).toEqual([]);
+    const ended = detector.push({ nowMs: boundary, rms: 0.002 });
 
     expect(eventTypes(ended)).toEqual(["speechEnded", "segmentStopped"]);
     expect(ended[1]).toMatchObject({ reason: "silence" });
