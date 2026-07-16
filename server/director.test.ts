@@ -4088,6 +4088,14 @@ describe("social director", () => {
     expect(otherRoomActive.run.mock.calls[0]?.[0]).toMatchObject({ id: "stock-market" });
     otherRoomActive.director.stop();
 
+    const failedInOtherRoom = makeDirector("other-room-failed");
+    failedInOtherRoom.director.noteHumanVoiceActivity("lobby");
+    failedInOtherRoom.run.mockResolvedValueOnce(false);
+    expect(await invoke(failedInOtherRoom.director)).toBe(false);
+    expect(failedInOtherRoom.run).toHaveBeenCalledTimes(1);
+    expect(failedInOtherRoom.run.mock.calls[0]?.[0]).toMatchObject({ id: "stock-market" });
+    failedInOtherRoom.director.stop();
+
     const sameRoomActive = makeDirector("same-room-active");
     sameRoomActive.director.noteHumanVoiceActivity("stock-market");
     expect(await invoke(sameRoomActive.director)).toBe(false);

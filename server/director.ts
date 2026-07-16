@@ -3781,7 +3781,9 @@ export class SocialDirector {
         { research },
       );
       if (!published && thread.messageCount === 0) this.abandonAmbientThread(candidate.channel.id, thread);
-      return true;
+      // A failed source attempt owns the network budget for this tick, but it
+      // must not also consume the ordinary ambient publication opportunity.
+      return published;
     }
 
     const candidates = eligibleCandidates.filter((candidate) =>
@@ -3860,9 +3862,10 @@ export class SocialDirector {
       if (!published && thread.messageCount === 0) {
         this.abandonAmbientThread(candidate.channel.id, thread);
       }
-      // One bounded network/generation attempt per ambient tick, successful or
-      // not. Failures own their own short backoff and must not cascade rooms.
-      return true;
+      // One bounded network/generation attempt per ambient tick. A failure
+      // does not cascade into another lookup, but returning false lets the
+      // caller continue with one ordinary ambient turn instead of going quiet.
+      return published;
     }
     return false;
   }
