@@ -19,6 +19,7 @@ import {
   collectReadyVisualEvidence,
   conductResponderIds,
   ensureEvidenceResponder,
+  autonomousResearchActivityPolicy,
   autonomousResearchFailureBackoffMs,
   autonomousResearchSeedFailureBackoffMs,
   autonomousResearchResultIsFresh,
@@ -43,6 +44,7 @@ import {
   shouldSurfaceTemporalCue,
   shouldStartConsideredConversation,
   trailingAiMessageCount,
+  weightAutonomousResearchSelection,
   type ConsideredConversationGate,
   type AmbientThreadState,
 } from "./director.js";
@@ -4777,6 +4779,39 @@ describe("social director", () => {
     expect(disabled.chance).toBe(0);
   });
 
+  it("reserves background link capacity and modestly favors a recently active human room", () => {
+    const maximum = autonomousLinkPolicy(100);
+    const background = autonomousResearchActivityPolicy(maximum, false);
+    expect(background).toMatchObject({
+      enabled: true,
+      chance: 0.65,
+      globalCooldownMs: 5 * 60_000,
+      channelCooldownMs: 20 * 60_000,
+      humanQuietMs: 45_000,
+      dailyCap: 27,
+      selectionWeight: 1,
+    });
+
+    const recent = autonomousResearchActivityPolicy(maximum, true);
+    expect(recent.chance).toBeCloseTo(1 - 0.35 ** 1.35);
+    expect(recent).toMatchObject({
+      enabled: true,
+      globalCooldownMs: 4 * 60_000,
+      channelCooldownMs: 20 * 60_000,
+      humanQuietMs: 45_000,
+      dailyCap: 36,
+      selectionWeight: 1.4,
+    });
+    expect(weightAutonomousResearchSelection(0.5, recent.selectionWeight)).toBeGreaterThan(0.5);
+
+    expect(autonomousResearchActivityPolicy(autonomousLinkPolicy(0), true)).toMatchObject({
+      enabled: false,
+      chance: 0,
+      dailyCap: 0,
+      selectionWeight: 1,
+    });
+  });
+
   it("keeps autonomous research room-local while another room is active, but pauses the active room", async () => {
     const now = Date.parse("2026-07-15T12:00:00.000Z");
     const tuning = {
@@ -4843,6 +4878,118 @@ describe("social director", () => {
     expect(await invoke(sameRoomActive.director)).toBe(false);
     expect(sameRoomActive.run).not.toHaveBeenCalled();
     sameRoomActive.director.stop();
+  });
+
+  it("recognizes only online, recent target-room human participation for the research overlay", () => {
+    let now = Date.parse("2026-07-17T08:00:00.000Z");
+    let onlineHumans = 1;
+    const store = new RoomStore(`/tmp/director-recent-research-human-${process.pid}.json`);
+    const human = {
+      id: "guest-recent-research",
+      name: "Guest",
+      kind: "human" as const,
+      status: "online" as const,
+      avatar: { color: "#123", accent: "#456", glyph: "G" },
+    };
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      { health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => [...PERSONAS, human],
+      () => onlineHumans,
+      { now: () => now, autonomousResearchEnabled: true },
+    );
+    const recent = (channelId: string) => (director as unknown as {
+      hasRecentHumanResearchActivity: (id: string, at?: number) => boolean;
+    }).hasRecentHumanResearchActivity(channelId, now);
+
+    const humanMessage = createMessage("lobby", human.id, "one ordinary room message");
+    store.addPublicMessage(humanMessage);
+    director.onHumanMessage(humanMessage, human);
+    expect(recent("lobby")).toBe(true);
+    expect(recent("the-pub")).toBe(false);
+    onlineHumans = 0;
+    expect(recent("lobby")).toBe(false);
+
+    onlineHumans = 1;
+    now += 10 * 60_000 + 1;
+    expect(recent("lobby")).toBe(false);
+    director.noteHumanVoiceActivity("stock-market");
+    expect(recent("stock-market")).toBe(true);
+
+    now += 10 * 60_000 + 1;
+    const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
+    const target = createMessage("lobby", persona.id, "react to this");
+    store.addPublicMessage(target);
+    store.togglePublicReaction("lobby", target.id, "👀", human.id);
+    director.onHumanReaction({ channelId: "lobby", messageId: target.id, emoji: "👀" }, human);
+    expect(recent("lobby")).toBe(true);
+    director.stop();
+  });
+
+  it("uses the effective link-frequency quiet time for a recently active target room", async () => {
+    let now = Date.parse("2026-07-17T09:00:00.000Z");
+    const actorChannels = new ActorChannelRuntime();
+    const lobbyActors = actorChannels.autonomousCandidatesFor("lobby");
+    vi.spyOn(actorChannels, "autonomousCandidatesFor").mockImplementation((channelId) =>
+      channelId === "lobby" ? lobbyActors : []);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-effective-research-quiet-${process.pid}.json`),
+      { health: vi.fn(() => ({ connected: true, queueDepth: 0 })) } as never,
+      actorChannels,
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        autonomousResearchEnabled: true,
+        behaviorTuningProvider: () => ({
+          activity: 50,
+          autonomousLinkFrequency: 100,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+    const run = vi.fn(async () => true);
+    const internals = director as unknown as {
+      maybeRunAutonomousResearch: (
+        at: number,
+        tuning: { activity: number; autonomousLinkFrequency: number; competence: number; aggression: number; explicitness: number },
+        queueDepth: number,
+      ) => Promise<boolean>;
+      runAutonomousResearchConversation: typeof run;
+    };
+    internals.runAutonomousResearchConversation = run;
+    director.noteHumanVoiceActivity("lobby");
+
+    now += 44_999;
+    expect(await internals.maybeRunAutonomousResearch(now, {
+      activity: 50,
+      autonomousLinkFrequency: 100,
+      competence: 50,
+      aggression: 25,
+      explicitness: 50,
+    }, 0)).toBe(false);
+    expect(run).not.toHaveBeenCalled();
+
+    now += 2;
+    expect(await internals.maybeRunAutonomousResearch(now, {
+      activity: 50,
+      autonomousLinkFrequency: 100,
+      competence: 50,
+      aggression: 25,
+      explicitness: 50,
+    }, 0)).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+    director.stop();
   });
 
   it("maps autonomous-link frequency onto a bounded cadence with the former cadence at 50", () => {
@@ -5808,6 +5955,7 @@ describe("social director", () => {
       expect(lm.generateScene).toHaveBeenCalledWith(
         expect.objectContaining({
           urlPublicationPolicy: "server_card",
+          responseRecoveryIds: [expect.any(String)],
           research: expect.objectContaining({
             query: "recent practical agent testing",
             results: [
@@ -6909,6 +7057,7 @@ describe("social director", () => {
       lastHumanMessageAtByChannel: Map<string, number>;
       lastSpoke: Map<string, number>;
       autonomousAiTimestamps: number[];
+      autonomousResearchSuccessTimestamps: number[];
     };
     const safe = () => internals.autonomousResearchIsStillSafe("lobby", 0, [actor], 1);
     expect(internals.autonomousResearchPolicy("lobby")).toMatchObject({
@@ -6935,6 +7084,9 @@ describe("social director", () => {
     internals.lastHumanMessageAtByChannel.set("lobby", now);
     expect(safe()).toBe(false);
     internals.lastHumanMessageAtByChannel.delete("lobby");
+    internals.autonomousResearchSuccessTimestamps.push(now, now, now, now, now, now);
+    expect(safe()).toBe(false);
+    internals.autonomousResearchSuccessTimestamps.length = 0;
     internals.autonomousAiTimestamps.push(now, now, now);
     expect(safe()).toBe(false);
     internals.autonomousAiTimestamps.length = 0;

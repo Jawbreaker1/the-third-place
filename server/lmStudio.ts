@@ -2755,10 +2755,18 @@ export class LmStudioClient {
       const recoversTextLanguage = missingRequiredIds.some((personaId) => textLanguageMismatchIds.includes(personaId));
       const recoversCommunityCapability = missingRequiredIds.some((personaId) =>
         communityCapabilityContradictionIds.includes(personaId));
+      const recoversAutonomousResearchOpening = Boolean(
+        request.kind === "ambient" &&
+        request.ambientAction?.kind === "open_topic" &&
+        request.autonomousResearchContext &&
+        request.urlPublicationPolicy === "server_card"
+      );
       const actorNames = missingActors.map((persona) => persona.name).join(", ");
       const reviewCorrection = reviewedRecoveryPolicy(missingRequiredIds, semanticReviews);
       const completionPremise = retryOwnerIds.length > 0
         ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: complete the actual triggering request in this message now. An offer, promise, progress report, permission request or adjacent substitute is not completion. Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
+        : recoversAutonomousResearchOpening
+          ? `${actorNames || "The selected research lead"}'s first autonomous source-backed opening did not survive its typed source and review contract. This is the one bounded full-scene recovery: write one room-relevant opening for the same trusted autonomous research angle, grounded in exactly one supplied evidence result, and attach exactly that result's allowed source ID. Preserve the ambient action and leave one concrete hook for another resident. Do not imply that a human asked, mention searching or tooling, write a URL, or change subject.${reviewCorrection}`
         : recoversCommunityCapability
           ? `${actorNames || "The selected resident"}'s first candidate contradicted trusted community capability facts. This is the one bounded full-scene recovery: answer the actual turn from trustedCommunityCapabilities, preserving the character voice and language. Voice chat exists; humans can start and join it from public rooms, residents can be invited, and residents do not start rooms autonomously.${reviewCorrection}`
         : recoversTextLanguage
@@ -3018,6 +3026,7 @@ export class LmStudioClient {
             previousActions: request.ambientAction.previousActions,
           }
         : null,
+      urlPublicationPolicy: request.urlPublicationPolicy ?? null,
       semanticContext: {
         // `languageHint` is a human-readable generation direction, not
         // machine metadata (ambient scenes intentionally use full phrases).
@@ -3337,6 +3346,16 @@ export class LmStudioClient {
     const inventedUrl = writtenUrls.find((url) => !suppliedUrls.has(url));
     const suppliedMarkers = humanSuppliedInternalMarkers(request);
     const leakedMarker = internalMarkerLiterals(line.content).find((marker) => !suppliedMarkers.has(marker));
+    const requiresSingleAutonomousOpeningSource = Boolean(
+      request.kind === "ambient" &&
+      request.ambientAction?.kind === "open_topic" &&
+      request.autonomousResearchContext &&
+      request.urlPublicationPolicy === "server_card"
+    );
+    const invalidAutonomousOpeningSource = requiresSingleAutonomousOpeningSource && (
+      line.sourceIds.length !== 1 ||
+      !request.research?.results.some((result) => result.id === line.sourceIds[0])
+    );
     const violations = [
       ...(inventedUrl ? [{
         message: "The candidate contains a URL that was not present in the allowed input.",
@@ -3349,6 +3368,10 @@ export class LmStudioClient {
       ...(leakedMarker ? [{
         message: "The candidate contains internal marker-shaped text that no human supplied.",
         hint: "Remove internal marker-shaped text. Preserve it only when it is an exact literal supplied by a human in this conversation.",
+      }] : []),
+      ...(invalidAutonomousOpeningSource ? [{
+        message: "The autonomous server-card opening does not select exactly one allowed source ID.",
+        hint: "Ground the opening in exactly one supplied evidence result and attach only that result's source ID.",
       }] : []),
     ];
     if (violations.length === 0) return assessment;
@@ -3752,6 +3775,15 @@ export class LmStudioClient {
     const maxMessages = Math.max(1, Math.min(request.selected.length, request.kind === "ambient" ? 2 : 3));
     const maxContentLength = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
     const researchSourceIds = request.research?.results.map((result) => result.id) ?? [];
+    const requiresSingleAutonomousOpeningSource = Boolean(
+      request.kind === "ambient" &&
+      request.ambientAction?.kind === "open_topic" &&
+      request.autonomousResearchContext &&
+      request.urlPublicationPolicy === "server_card"
+    );
+    if (requiresSingleAutonomousOpeningSource && researchSourceIds.length === 0) {
+      throw new TypeError("An autonomous server-card opening requires at least one allowed research source");
+    }
     // Gemma 4 exposes its internal reasoning separately and counts it against
     // max_tokens. A chat-sized line can therefore require 300–700 completion
     // tokens before any JSON appears. Keep enough headroom without allowing an
@@ -3789,8 +3821,10 @@ export class LmStudioClient {
                     researchSourceIds.length > 0
                       ? {
                           type: "array",
-                          minItems: 0,
-                          maxItems: Math.min(3, researchSourceIds.length),
+                          minItems: requiresSingleAutonomousOpeningSource ? 1 : 0,
+                          maxItems: requiresSingleAutonomousOpeningSource
+                            ? 1
+                            : Math.min(3, researchSourceIds.length),
                           items: { type: "string", enum: researchSourceIds },
                         }
                       : { type: "array", maxItems: 0 },

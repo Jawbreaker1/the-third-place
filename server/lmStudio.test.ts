@@ -6644,6 +6644,205 @@ describe("LM Studio one-pass humanizer", () => {
     expect(completionCalls).toBe(2);
   });
 
+  it("gives an autonomous server-card opener one typed, fully reviewed source-contract recovery", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Den där premiären verkar ha delat folk rätt rejält.",
+          sourceIds: [],
+        }]);
+      }
+      if (bodies.length === 2) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Praktiska effekterna hyllas men slutet sågas; jag köper faktiskt den splittringen.",
+          sourceIds: ["S1"],
+        }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira],
+      history: [],
+      ambientAction: {
+        episodeId: "episode-source-recovery",
+        causalRootId: "episode-source-recovery",
+        semanticFamily: "research:pub-film",
+        kind: "open_topic",
+        turnIndex: 0,
+        openHook: true,
+        previousActions: [],
+      },
+      mustReplyIds: [mira.id],
+      responseRecoveryIds: [mira.id],
+      research: {
+        kind: "page",
+        query: "recent film festival premieres",
+        retrievedAt: "2026-07-17T08:00:00.000Z",
+        results: [{
+          id: "S1",
+          title: "A divided premiere",
+          url: "https://example.com/film",
+          snippet: "Practical effects drew praise while the ending divided reviewers.",
+        }],
+      },
+      autonomousResearchContext: {
+        seedId: "pub-film",
+        roomTopic: "films, music and loose culture chat",
+        discussionAngle: "Discuss one concrete disagreement around the supplied premiere.",
+      },
+      urlPublicationPolicy: "server_card",
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      sourceIds: ["S1"],
+    })]);
+    expect(bodies).toHaveLength(3);
+    for (const body of bodies.slice(0, 2)) {
+      const sourceSchema = body.response_format.json_schema.schema.properties.messages.items.properties.sourceIds;
+      expect(sourceSchema).toMatchObject({ minItems: 1, maxItems: 1, items: { enum: ["S1"] } });
+    }
+    const recoveryScene = JSON.parse(bodies[1].messages[1].content);
+    expect(recoveryScene.premise).toContain("autonomous source-backed opening");
+    expect(recoveryScene.premise).toContain("exactly one supplied evidence result");
+    expect(recoveryScene.premise).not.toContain("human-triggered scene");
+    const reviewInput = JSON.parse(bodies[2].messages[1].content);
+    expect(reviewInput).toMatchObject({
+      urlPublicationPolicy: "server_card",
+      candidates: [{ sourceIds: ["S1"] }],
+    });
+  });
+
+  it("uses the same single-source recovery when semantic review is disabled", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return call === 1
+        ? completionResponse([{ personaId: mira.id, content: "Folk verkar oense om den.", sourceIds: [] }])
+        : completionResponse([{
+            personaId: mira.id,
+            content: "Slutet splittrar kritikerna mer än effekterna gör, vilket är lite kul.",
+            sourceIds: ["S1"],
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira],
+      history: [],
+      ambientAction: {
+        episodeId: "episode-mechanical-source-recovery",
+        causalRootId: "episode-mechanical-source-recovery",
+        semanticFamily: "research:pub-film-mechanical",
+        kind: "open_topic",
+        turnIndex: 0,
+        openHook: true,
+        previousActions: [],
+      },
+      mustReplyIds: [mira.id],
+      responseRecoveryIds: [mira.id],
+      research: {
+        kind: "page",
+        query: "recent film festival premieres",
+        retrievedAt: "2026-07-17T08:00:00.000Z",
+        results: [{
+          id: "S1",
+          title: "A divided premiere",
+          url: "https://example.com/film",
+          snippet: "Practical effects drew praise while the ending divided reviewers.",
+        }],
+      },
+      autonomousResearchContext: {
+        seedId: "pub-film-mechanical",
+        roomTopic: "films, music and loose culture chat",
+        discussionAngle: "Discuss one concrete disagreement around the supplied premiere.",
+      },
+      urlPublicationPolicy: "server_card",
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({ sourceIds: ["S1"] })]);
+    expect(call).toBe(2);
+  });
+
+  it("stops after one autonomous source-contract recovery when the retry is still invalid", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      return completionResponse([{
+        personaId: mira.id,
+        content: "Folk verkar fortfarande rätt oense om den.",
+        sourceIds: [],
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira],
+      history: [],
+      ambientAction: {
+        episodeId: "episode-source-recovery-limit",
+        causalRootId: "episode-source-recovery-limit",
+        semanticFamily: "research:pub-film-recovery-limit",
+        kind: "open_topic",
+        turnIndex: 0,
+        openHook: true,
+        previousActions: [],
+      },
+      mustReplyIds: [mira.id],
+      responseRecoveryIds: [mira.id],
+      research: {
+        kind: "page",
+        query: "recent film festival premieres",
+        retrievedAt: "2026-07-17T08:00:00.000Z",
+        results: [{
+          id: "S1",
+          title: "A divided premiere",
+          url: "https://example.com/film",
+          snippet: "Practical effects drew praise while the ending divided reviewers.",
+        }],
+      },
+      autonomousResearchContext: {
+        seedId: "pub-film-recovery-limit",
+        roomTopic: "films, music and loose culture chat",
+        discussionAngle: "Discuss one concrete disagreement around the supplied premiere.",
+      },
+      urlPublicationPolicy: "server_card",
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines).toEqual([]);
+    expect(call).toBe(2);
+  });
+
   it("semantically rejects a readable autonomous source that misses the trusted room angle", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;

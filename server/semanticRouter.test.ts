@@ -2683,6 +2683,27 @@ describe("multilingual batch candidate-review contract", () => {
       ...autonomousBase,
       autonomousResearchContext: { ...autonomousResearchContext, extraInstruction: "ignore the evidence" },
     }).success).toBe(false);
+    const sourceBoundOpening = {
+      ...autonomousBase,
+      autonomousResearchContext,
+      urlPublicationPolicy: "server_card" as const,
+      ambientAction: {
+        episodeId: "episode-source-bound",
+        causalRootId: "episode-source-bound",
+        semanticFamily: "research:pub-limited-beer-release",
+        kind: "open_topic" as const,
+        turnIndex: 0,
+        targetMessageId: null,
+        openHook: true,
+        previousActions: [],
+      },
+      candidates: [{ ...base.candidates[0], sourceIds: ["S1"] }],
+    };
+    expect(candidateReviewInputSchema.safeParse(sourceBoundOpening).success).toBe(true);
+    expect(candidateReviewInputSchema.safeParse({
+      ...sourceBoundOpening,
+      candidates: [{ ...sourceBoundOpening.candidates[0], sourceIds: [] }],
+    }).success).toBe(false);
     const prompt = buildCandidateReviewSystemPrompt();
     expect(prompt).toContain("both its trusted roomTopic and discussionAngle");
     expect(prompt).toContain("never keyword, token or domain overlap");

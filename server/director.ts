@@ -64,6 +64,7 @@ import {
   resolveBehaviorTuning,
   scaleAmbientDelay,
   unattendedAmbientPolicy,
+  type AutonomousLinkPolicy,
   type BehaviorTuningProvider,
 } from "./behaviorTuning.js";
 import type { AdminBehaviorTuning } from "../shared/adminTypes.js";
@@ -140,6 +141,11 @@ const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_BASE_MS = 60_000;
 const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS = 4 * 60_000;
 const AUTONOMOUS_RESEARCH_SEED_BACKOFF_BASE_MS = 30 * 60_000;
 const AUTONOMOUS_RESEARCH_SEED_BACKOFF_MAX_MS = 6 * 60 * 60_000;
+const AUTONOMOUS_RESEARCH_RECENT_HUMAN_WINDOW_MS = 10 * 60_000;
+const AUTONOMOUS_RESEARCH_RECENT_CHANCE_WEIGHT = 1.35;
+const AUTONOMOUS_RESEARCH_RECENT_SELECTION_WEIGHT = 1.4;
+const AUTONOMOUS_RESEARCH_RECENT_GLOBAL_COOLDOWN_FACTOR = 0.8;
+const AUTONOMOUS_RESEARCH_BACKGROUND_DAILY_CAP_FACTOR = 0.75;
 const AMBIENT_BUSY_RETRY_MIN_MS = 4_000;
 const AMBIENT_BUSY_RETRY_MAX_MS = 8_000;
 const HUMAN_REACTION_STATE_LIMIT = 1_000;
@@ -992,6 +998,50 @@ export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boo
   return gate.rng() < clamp(gate.chance, 0, 1);
 }
 
+export interface AutonomousResearchActivityPolicy extends AutonomousLinkPolicy {
+  /** Affects only weighted room ordering; it never changes room cooldowns. */
+  selectionWeight: number;
+}
+
+/**
+ * A content- and language-blind attendance overlay. A recently participating
+ * human gives only that room a modest opportunity/ordering lift. Background
+ * rooms retain the ordinary cadence but stop at three quarters of the same
+ * global rolling cap, leaving capacity for a later attended session.
+ */
+export function autonomousResearchActivityPolicy(
+  policy: AutonomousLinkPolicy,
+  recentHumanActivity: boolean,
+): AutonomousResearchActivityPolicy {
+  if (!policy.enabled) return { ...policy, chance: 0, dailyCap: 0, selectionWeight: 1 };
+  if (!recentHumanActivity) {
+    return {
+      ...policy,
+      dailyCap: Math.max(1, Math.floor(policy.dailyCap * AUTONOMOUS_RESEARCH_BACKGROUND_DAILY_CAP_FACTOR)),
+      selectionWeight: 1,
+    };
+  }
+  return {
+    ...policy,
+    chance: 1 - (1 - clamp(policy.chance, 0, 1)) ** AUTONOMOUS_RESEARCH_RECENT_CHANCE_WEIGHT,
+    globalCooldownMs: Math.max(
+      60_000,
+      Math.round(policy.globalCooldownMs * AUTONOMOUS_RESEARCH_RECENT_GLOBAL_COOLDOWN_FACTOR),
+    ),
+    selectionWeight: AUTONOMOUS_RESEARCH_RECENT_SELECTION_WEIGHT,
+  };
+}
+
+/** Applies the attendance preference to ordering without altering cooldowns. */
+export function weightAutonomousResearchSelection(
+  selectionKey: number,
+  selectionWeight: number,
+): number {
+  const key = clamp(selectionKey, Number.EPSILON, 1);
+  const weight = clamp(selectionWeight, 1, AUTONOMOUS_RESEARCH_RECENT_SELECTION_WEIGHT);
+  return key ** (1 / weight);
+}
+
 export interface PrioritizedAutonomousResearchPolicy {
   chance: number;
   channelCooldownMs: number;
@@ -1784,6 +1834,8 @@ export class SocialDirector {
   private readonly channelEpoch = new Map<string, number>();
   private catalogEpoch = 0;
   private readonly lastHumanMessageAtByChannel = new Map<string, number>();
+  /** Human message, reaction or accepted voice transcript; joins alone do not qualify. */
+  private readonly lastHumanResearchActivityAtByChannel = new Map<string, number>();
   private readonly lastTrustedLanguageByChannel = new Map<string, string>();
   private lastAmbientChannelId?: string;
   private started = false;
@@ -1963,6 +2015,10 @@ export class SocialDirector {
         this.lastHumanMessageAtByChannel.set(
           message.channelId,
           Math.max(this.lastHumanMessageAtByChannel.get(message.channelId) ?? 0, timestamp),
+        );
+        this.lastHumanResearchActivityAtByChannel.set(
+          message.channelId,
+          Math.max(this.lastHumanResearchActivityAtByChannel.get(message.channelId) ?? 0, timestamp),
         );
       }
       if (PERSONAS.some((persona) => persona.id === message.authorId)) {
@@ -2169,6 +2225,7 @@ export class SocialDirector {
   noteHumanVoiceActivity(channelId: string): void {
     const now = this.now();
     this.lastHumanMessageAtByChannel.set(channelId, now);
+    this.lastHumanResearchActivityAtByChannel.set(channelId, now);
     this.invalidateAmbientChannel(channelId, "human_preempted");
   }
 
@@ -2315,6 +2372,7 @@ export class SocialDirector {
 
     const now = this.now();
     this.lastHumanMessageAtByChannel.set(event.channelId, now);
+    this.lastHumanResearchActivityAtByChannel.set(event.channelId, now);
     this.invalidateAmbientChannel(event.channelId, "human_preempted");
 
     const pendingKey = `${event.channelId}:${event.messageId}:${human.id}`;
@@ -2520,6 +2578,7 @@ export class SocialDirector {
   private noteHumanChannelEvent(message: ChatMessage): void {
     const now = this.now();
     this.lastHumanMessageAtByChannel.set(message.channelId, now);
+    this.lastHumanResearchActivityAtByChannel.set(message.channelId, now);
     const epoch = this.invalidateAmbientChannel(message.channelId, "human_preempted");
     this.actorChannels.noteChannelEvent(message);
     this.humanMessageEpochById.set(message.id, epoch);
@@ -3925,6 +3984,14 @@ export class SocialDirector {
     };
   }
 
+  private hasRecentHumanResearchActivity(channelId: string, now = this.now()): boolean {
+    if (this.getOnlineHumanCount() < 1) return false;
+    const lastActivityAt = this.lastHumanResearchActivityAtByChannel.get(channelId);
+    return lastActivityAt !== undefined &&
+      lastActivityAt <= now &&
+      now - lastActivityAt <= AUTONOMOUS_RESEARCH_RECENT_HUMAN_WINDOW_MS;
+  }
+
   /**
    * Research is selected across all eligible rooms before ordinary ambient
    * room scoring. This prevents a source-oriented room from losing every
@@ -3954,10 +4021,15 @@ export class SocialDirector {
       const profile = getChannelProfile(channel.id);
       const seeds = profile?.autonomousResearchSeeds ?? [];
       const channelTuning = this.channelBehaviorTuning(channel.id, globalTuning);
+      const recentHumanActivity = this.hasRecentHumanResearchActivity(channel.id, now);
+      const activityPolicy = autonomousResearchActivityPolicy(
+        this.autonomousResearchPolicy(channel.id),
+        recentHumanActivity,
+      );
       if (
         seeds.length === 0 ||
         channelTuning.activity === 0 ||
-        now - (this.lastHumanMessageAtByChannel.get(channel.id) ?? 0) <= this.ambientHumanQuietMs ||
+        now - (this.lastHumanMessageAtByChannel.get(channel.id) ?? 0) <= activityPolicy.humanQuietMs ||
         !this.ambientChannelIsAvailable(channel.id, now) ||
         this.ambientThreads.has(channel.id)
       ) return [];
@@ -3981,14 +4053,28 @@ export class SocialDirector {
         );
       if (available.length < 2 || !available.some((persona) => persona.canResearch)) return [];
 
-      const basePolicy = this.autonomousResearchPolicy(channel.id);
-      const prioritized = prioritizeAutonomousResearch(
-        basePolicy.chance,
-        basePolicy.channelCooldownMs,
+      const basePriority = prioritizeAutonomousResearch(
+        activityPolicy.chance,
+        activityPolicy.channelCooldownMs,
         profile?.autonomousResearchPriority,
         this.rng(),
       );
-      return [{ channel, profile, seeds, available, failureState, basePolicy, prioritized }];
+      const prioritized = {
+        ...basePriority,
+        selectionKey: weightAutonomousResearchSelection(
+          basePriority.selectionKey,
+          activityPolicy.selectionWeight,
+        ),
+      };
+      return [{
+        channel,
+        profile,
+        seeds,
+        available,
+        failureState,
+        basePolicy: activityPolicy,
+        prioritized,
+      }];
     });
 
     // A validated exceptional move gets deterministic attention once the
@@ -4512,7 +4598,10 @@ export class SocialDirector {
     const now = this.now();
     const globalTuning = this.globalBehaviorTuning();
     const channelTuning = this.channelBehaviorTuning(channelId, globalTuning);
-    const researchPolicy = this.autonomousResearchPolicy(channelId);
+    const researchPolicy = autonomousResearchActivityPolicy(
+      this.autonomousResearchPolicy(channelId),
+      this.hasRecentHumanResearchActivity(channelId, now),
+    );
     const lastChannelHumanActivityAt = this.lastHumanMessageAtByChannel.get(channelId);
     if (
       this.stopped ||
@@ -4522,6 +4611,7 @@ export class SocialDirector {
       epoch !== (this.channelEpoch.get(channelId) ?? 0) ||
       this.lm.health().queueDepth !== 0 ||
       this.availableAutonomousMessageSlots(now, globalTuning.activity) < requiredSlots ||
+      this.autonomousResearchSuccessTimestamps.length >= researchPolicy.dailyCap ||
       (lastChannelHumanActivityAt !== undefined &&
         now - lastChannelHumanActivityAt < researchPolicy.humanQuietMs)
     ) return false;
@@ -4865,6 +4955,7 @@ export class SocialDirector {
           ambientActionInstruction("open_topic", mode),
         ].join(" "),
         mustReplyIds: [lead.id],
+        responseRecoveryIds: [lead.id],
         wordLimits: limits,
         languageHint: thread.languageHint,
         semanticContext: thread.languageTag ? {
