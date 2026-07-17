@@ -70,6 +70,31 @@ describe("room history", () => {
     expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
   });
 
+  it("migrates existing history with a defensive ai-hacking opening exactly once", async () => {
+    const filePath = tempStorePath();
+    const existing = createMessage("lobby", "human-returning", "preserve this pre-security history");
+    await writeFile(filePath, JSON.stringify({ version: 1, messages: [existing] }), "utf8");
+
+    const migrated = new RoomStore(filePath);
+    await migrated.load();
+    const securityMessages = migrated.getRecent("ai-hacking", 50);
+    const firstSecurityIds = securityMessages.map((message) => message.id);
+
+    expect(securityMessages).toHaveLength(3);
+    expect(new Set(securityMessages.map((message) => message.authorId))).toEqual(
+      new Set(["ai-aya", "ai-nox", "ai-sana"]),
+    );
+    expect(securityMessages.some((message) =>
+      message.reactions?.some((reaction) => reaction.emoji === "🛡️"),
+    )).toBe(true);
+    expect(migrated.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+
+    const reloaded = new RoomStore(filePath);
+    await reloaded.load();
+    expect(reloaded.getRecent("ai-hacking", 50).map((message) => message.id)).toEqual(firstSecurityIds);
+    expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+  });
+
   it("returns stable chronological pages before a composite cursor", async () => {
     const store = tempStore();
     for (let index = 0; index < 95; index += 1) {

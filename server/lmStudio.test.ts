@@ -5039,6 +5039,105 @@ describe("LM Studio room prompt", () => {
     expect(prompt).not.toContain("Never claim to be human");
   });
 
+  it("places the ai-hacking defensive contract, freshness boundary and specialist expertise in the trusted prompt", () => {
+    const runtime = new ActorChannelRuntime();
+    const aya = PERSONAS.find((persona) => persona.id === "ai-aya")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "ai-hacking",
+      channelName: "ai-hacking",
+      selected: [aya],
+      history: [],
+      actorExpertiseNotes: runtime.expertiseNotes([aya], "ai-hacking"),
+    });
+
+    expect(prompt).toContain("working security channel for defenders and authorized testing");
+    expect(prompt).toContain("actual mechanism, affected boundary and next validation step");
+    expect(prompt).toContain("not a boilerplate refusal merely because security vocabulary appears");
+    expect(prompt).toContain("semantically across languages, never by keyword lists");
+    expect(prompt).toContain("lab-safe reproduction, detection, mitigation or architecture analysis");
+    expect(prompt).toContain("Current CVE status, affected and fixed versions");
+    expect(prompt).toContain("require supplied fresh evidence");
+    expect(prompt).toContain("private competence level here is specialist");
+    expect(prompt).toContain("AI-agent threat modelling");
+    expect(prompt).toContain("Room register changes formality, not personality");
+  });
+
+  it("recovers one generic security refusal into a concrete reviewed lab answer", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const aya = PERSONAS.find((persona) => persona.id === "ai-aya")!;
+    const refusal = "Jag kan inte hjälpa till med hacking eller säkerhetstester.";
+    const concrete = "Mata agenten ett märkt dokument och ge verktyget en ofarlig canary-operation; loggen ska visa om dokumenttexten korsade behörighetsgränsen.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: aya.id, content: refusal }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: aya.id,
+          severity: "high",
+          issues: ["assistant_register", "unfulfilled_explicit_request"],
+          rewriteInstruction: "Answer the authorized isolated-lab validation question directly with one safe mechanism and observable signal.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{ personaId: aya.id, content: concrete }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: aya.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "ai-hacking",
+      channelName: "ai-hacking",
+      selected: [aya],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "I en isolerad labbmiljö, hur validerar du indirekt prompt injection mot en agent med ett enda testverktyg?",
+        messageId: "security-lab-request",
+      },
+      mustReplyIds: [aya.id],
+      requestOwnerIds: [aya.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      actorExpertiseNotes: new ActorChannelRuntime().expertiseNotes([aya], "ai-hacking"),
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([concrete]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[0].messages[0].content).toContain("defenders and authorized testing");
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    expect(firstReview.room).toMatchObject({
+      id: "ai-hacking",
+      freshnessRule: expect.stringContaining("Current CVE status"),
+      conversationGuidance: expect.stringContaining("not a boilerplate refusal"),
+    });
+    expect(firstReview.candidates).toEqual([
+      expect.objectContaining({ personaId: aya.id, mustFulfillRequest: true }),
+    ]);
+    const retry = JSON.parse(bodies[2].messages[1].content);
+    expect(retry.premise).toContain("one bounded full-scene retry");
+    expect(retry.triggeringEvent.content).toContain("isolerad labbmiljö");
+    expect(bodies[2].messages[0].content).toContain("defenders and authorized testing");
+  });
+
   it("carries the stock-room contract into review, keeps a concrete thesis and drops an invented live move", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const farah = PERSONAS.find((persona) => persona.id === "ai-farah")!;

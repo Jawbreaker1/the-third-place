@@ -79,7 +79,14 @@ describe("persistent admin overlay state", () => {
     expect(initial.behavior.channels).toEqual({});
     expect(initial.automation.autonomousLinkChannelIds).toContain("the-pub");
     expect(initial.automation.autonomousLinkChannelIds).toContain("football-talk");
+    expect(initial.automation.autonomousLinkChannelIds).toContain("ai-hacking");
     expect(initial.channels.some((channel) => channel.id === "lobby")).toBe(true);
+    expect(initial.channels.find((channel) => channel.id === "ai-hacking")).toMatchObject({
+      name: "ai-hacking",
+      register: "technical",
+      mode: "discussion",
+      seeds: expect.arrayContaining([expect.stringContaining("Metasploit module")]),
+    });
     expect(initial.channels.find((channel) => channel.id === "football-talk")).toMatchObject({
       name: "football-talk",
       register: "banter",

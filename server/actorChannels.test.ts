@@ -68,6 +68,7 @@ describe("actor channel runtime", () => {
     const specialistChannels = [
       "ai-lab",
       "ai-programming",
+      "ai-hacking",
       "stock-market",
       "football-talk",
       "world-of-warcraft",
@@ -170,6 +171,38 @@ describe("actor channel runtime", () => {
     });
     expect(runtime.expertise("ai-vale", "football-talk").level).toBe("advanced");
     expect(runtime.expertise("ai-ibrahim", "football-talk").level).toBe("advanced");
+  });
+
+  it("builds a selective ai-hacking roster with defensive experts and varied chat energy", () => {
+    const runtime = new ActorChannelRuntime();
+    const candidates = runtime.candidatesFor("ai-hacking");
+    const ids = candidates.map((persona) => persona.id);
+
+    expect(ids).toEqual(expect.arrayContaining([
+      "ai-runa",
+      "ai-mira",
+      "ai-aya",
+      "ai-nox",
+      "ai-zed",
+      "ai-sana",
+      "ai-linnea",
+      "ai-ibrahim",
+    ]));
+    expect(candidates.length).toBeGreaterThanOrEqual(8);
+    expect(candidates.length).toBeLessThan(PERSONAS.length);
+    expect(candidates.filter((persona) => persona.canResearch).map((persona) => persona.id)).toEqual(
+      expect.arrayContaining(["ai-aya", "ai-zed", "ai-sana", "ai-linnea", "ai-ibrahim"]),
+    );
+    expect(candidates.some((persona) => persona.talkativeness >= 0.8)).toBe(true);
+    expect(candidates.some((persona) => persona.talkativeness <= 0.2)).toBe(true);
+    expect(candidates.some((persona) => persona.disagreement >= 0.9)).toBe(true);
+
+    expect(runtime.expertise("ai-aya", "ai-hacking")).toMatchObject({
+      level: "specialist",
+      specialties: expect.arrayContaining(["AI-agent threat modelling", "prompt-injection boundaries"]),
+    });
+    expect(runtime.expertise("ai-nox", "ai-hacking").level).toBe("advanced");
+    expect(runtime.expertise("ai-zed", "ai-hacking").level).toBe("advanced");
   });
 
   it("restores an actor's last channel focus from persisted history", () => {

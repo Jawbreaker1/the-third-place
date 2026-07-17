@@ -3190,7 +3190,8 @@ export class LmStudioClient {
 
   private humanizerMode(request: SceneRequest): HumanizerMode {
     if (request.kind === "voice") return "voice";
-    return request.channelId === "ai-programming" || request.channelId === "3d-visualisation"
+    const register = getChannelProfile(request.channelId ?? "")?.conversationRegister;
+    return register === "technical" || register === "studio"
       ? "technical"
       : "chat";
   }
