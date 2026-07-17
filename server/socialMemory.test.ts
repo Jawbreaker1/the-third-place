@@ -300,6 +300,10 @@ describe("persistent social memory store", () => {
       relationshipDeltas: [{ ownerId: "resident-sana", subjectId: "human-alex", warmth: 0.05 }],
       openLoops: [],
     }));
+    expect(store.setMemoryPinned("memory-forget-human", true, "local-admin")).toBe(true);
+    expect(store.setOpenLoopPinned("loop-forget-human", true, "local-admin")).toBe(true);
+    expect(store.setMemoryPinned("memory-keep-other", true, "local-admin")).toBe(true);
+    expect(store.listAudit()).toHaveLength(3);
 
     expect(store.forgetActor("human-johan")).toEqual({
       events: 1,
@@ -312,6 +316,9 @@ describe("persistent social memory store", () => {
     expect(store.getRelationship("resident-mira", "human-johan")).toBeUndefined();
     expect(store.listOpenLoops({ ownerId: "resident-mira", subjectId: "human-johan" })).toEqual([]);
     expect(store.getEvent("keep-other")).toBeDefined();
+    expect(store.listAudit()).toEqual([
+      expect.objectContaining({ targetId: "memory-keep-other" }),
+    ]);
   });
 
   it("forgets private episodes where the actor participated silently, including receipt provenance", async () => {

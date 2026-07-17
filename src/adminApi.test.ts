@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deleteAdminCodexSession,
+  deleteAdminMemoryActor,
   deleteAdminMemoryItem,
   deleteAdminMemoryRelationship,
   deleteAdminSession,
@@ -248,6 +249,18 @@ describe("admin social-memory API", () => {
       "/api/admin/memory/items/memory%2Fone",
       expect.objectContaining({ method: "DELETE", credentials: "same-origin" }),
     ]);
+  });
+
+  it("requests full actor erasure only through the encoded human actor route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await deleteAdminMemoryActor("human/test visitor");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/memory/actors/human%2Ftest%20visitor",
+      expect.objectContaining({ method: "DELETE", credentials: "same-origin" }),
+    );
   });
 
   it("resets one directed edge without conflating its reverse", async () => {

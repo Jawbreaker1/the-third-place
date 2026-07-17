@@ -133,6 +133,77 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     }
   });
 
+  it("invalidates one actor's late public reply and memory without disturbing another actor's burst", async () => {
+    vi.useFakeTimers();
+    try {
+      const otherHuman = {
+        ...human,
+        id: "guest-social-memory-survivor",
+        name: "Survivor",
+      };
+      type Line = { personaId: string; content: string; source: "lm"; sourceIds: string[] };
+      const pendingScenes = new Map<string, { selectedId: string; resolve: (lines: Line[]) => void }>();
+      const { director, store, enqueueDeliveredEpisode } = setup({
+        model: {
+          analyzeTurn: vi.fn(async () => analyzedTurn()),
+          generateScene: vi.fn((request: {
+            trigger: { author: string };
+            selected: Array<(typeof PERSONAS)[number]>;
+          }) => new Promise<Line[]>((resolve) => {
+            pendingScenes.set(request.trigger.author, {
+              selectedId: request.selected[0]!.id,
+              resolve,
+            });
+          })),
+        },
+      });
+      const forgottenMessage = createMessage("lobby", human.id, "det här kontot ska tas bort nu");
+      const survivingMessage = createMessage("lobby", otherHuman.id, "min samtidiga fråga ska fortfarande få svar");
+      store.addPublicMessage(forgottenMessage);
+      store.addPublicMessage(survivingMessage);
+      const handle = (message: typeof forgottenMessage, member: typeof human) => (director as unknown as {
+        handleHumanBurst: (messages: typeof forgottenMessage[], actor: typeof human) => Promise<void>;
+      }).handleHumanBurst([message], member);
+      const forgottenPending = handle(forgottenMessage, human);
+      const survivingPending = handle(survivingMessage, otherHuman);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect([...pendingScenes.keys()]).toEqual(expect.arrayContaining([human.name, otherHuman.name]));
+      director.invalidatePublicWorkForHumanActor(human.id);
+      const forgottenScene = pendingScenes.get(human.name)!;
+      const survivingScene = pendingScenes.get(otherHuman.name)!;
+      forgottenScene.resolve([{
+        personaId: forgottenScene.selectedId,
+        content: "ett för sent svar som aldrig får levereras",
+        source: "lm",
+        sourceIds: [],
+      }]);
+      survivingScene.resolve([{
+        personaId: survivingScene.selectedId,
+        content: "det här samtidiga svaret ska levereras",
+        source: "lm",
+        sourceIds: [],
+      }]);
+      await vi.runAllTimersAsync();
+      await Promise.all([forgottenPending, survivingPending]);
+
+      const aiMessages = store.getRecent("lobby", 20).filter((message) => message.authorId.startsWith("ai-"));
+      expect(aiMessages).toEqual([
+        expect.objectContaining({ content: "det här samtidiga svaret ska levereras", replyToId: survivingMessage.id }),
+      ]);
+      expect(enqueueDeliveredEpisode).toHaveBeenCalledTimes(1);
+      const episode = enqueueDeliveredEpisode.mock.calls[0]![0] as DeliveredSocialEpisode;
+      expect(episode.participants.map((participant) => participant.id)).toContain(otherHuman.id);
+      expect(episode.participants.map((participant) => participant.id)).not.toContain(human.id);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("captures selected silent readers and never includes a rejected response candidate", () => {
     const { director, store, enqueueDeliveredEpisode } = setup();
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;

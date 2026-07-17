@@ -24,6 +24,7 @@ import {
   deleteAdminBan,
   deleteAdminChannel,
   deleteAdminCodexSession,
+  deleteAdminMemoryActor,
   deleteAdminMemoryItem,
   deleteAdminMemoryRelationship,
   deleteAdminPersona,
@@ -501,6 +502,8 @@ export default function AdminApp() {
         setMemoryDetail(undefined);
       } else if (nextActorId === actorId) {
         setMemoryDetail(nextDetail);
+      } else {
+        setMemoryDetail(undefined);
       }
     } catch (error) {
       if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
@@ -521,12 +524,13 @@ export default function AdminApp() {
     key: string,
     successMessage: string,
     operation: () => Promise<void>,
+    refreshActorId = selectedMemoryActorId,
   ): Promise<boolean> => {
     setBusy(key);
     setNotice(undefined);
     try {
       await operation();
-      await refreshMemoryInspector();
+      await refreshMemoryInspector(refreshActorId);
       setNotice({ tone: "success", message: successMessage });
       return true;
     } catch (error) {
@@ -1474,7 +1478,7 @@ export default function AdminApp() {
                         <strong>{actor.name}</strong>
                         <small>{boundedMemoryCount(actor.activeEpisodicMemoryCount, actor.memoryRowsTruncated)} episodes · {boundedMemoryCount(actor.consolidatedMemoryCount, actor.memoryRowsTruncated)} consolidated · {actor.openLoopCount} open</small>
                       </span>
-                      <i>{actor.kind === "resident" ? "AI" : "H"}</i>
+                      <i>{actor.kind === "resident" ? "AI" : actor.kind === "human" ? "H" : "?"}</i>
                     </button>
                   ))}
                 </div>
@@ -1524,6 +1528,24 @@ export default function AdminApp() {
                         <span><strong>{boundedMemoryCount(memoryDetail.actor.supersededMemoryCount, memoryDetail.actor.memoryRowsTruncated)}</strong> superseded</span>
                         <span><strong>{memoryDetail.outgoingRelationships.length}</strong> outward views</span>
                         <span><strong>{memoryDetail.incomingRelationships.length}</strong> incoming views</span>
+                        {memoryDetail.actor.kind === "human" && (
+                          <button
+                            className="admin-button danger-quiet compact"
+                            disabled={Boolean(busy)}
+                            onClick={() => setConfirm({
+                              title: `Delete ${memoryDetail.actor.name}'s saved identity?`,
+                              message: "This permanently removes the saved login profile, all private DMs and images, and every derived memory, relationship and open loop involving this human. Public channel messages remain as historical chat under their frozen display name. This does not create a ban.",
+                              confirmLabel: "Delete human",
+                              action: () => runMemoryMutation(
+                                `delete-memory-actor-${memoryDetail.actor.id}`,
+                                `${memoryDetail.actor.name}'s saved identity and private memory were removed.`,
+                                () => deleteAdminMemoryActor(memoryDetail.actor.id),
+                                "",
+                              ),
+                            })}
+                            type="button"
+                          >Delete human</button>
+                        )}
                       </div>
                     </div>
 

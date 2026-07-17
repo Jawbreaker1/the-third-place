@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { io } from "socket.io-client";
+import { retireSmokeSession } from "./smoke-session.mjs";
 
 const baseUrl = process.env.APP_BASE_URL ?? "http://127.0.0.1:4000";
 const fixturePath = process.env.IMAGE_FIXTURE ?? "docs/assets/third-place-chat.jpg";
@@ -109,4 +110,5 @@ try {
   );
 } finally {
   socket.disconnect();
+  await retireSmokeSession(baseUrl, cookie);
 }

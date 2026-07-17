@@ -50,6 +50,12 @@ interface PrivateThread {
   messages: ChatMessage[];
 }
 
+export interface RemovedPrivateThread {
+  id: string;
+  participantIds: [string, string];
+  messages: ChatMessage[];
+}
+
 export class RoomStateLoadError extends Error {
   readonly code = "ROOM_STATE_LOAD_FAILED";
 
@@ -1078,6 +1084,28 @@ export class RoomStore {
   }
 
   /**
+   * Backfills trusted display metadata before a human profile is retired.
+   * Older public rows predate frozen author snapshots; without this step their
+   * retained text would become invisible once the live member catalog forgets
+   * the author. Existing trusted snapshots are never rewritten.
+   */
+  freezePublicAuthorSnapshot(member: Member): number {
+    if (member.kind !== "human" || !member.id) throw new TypeError("only a trusted human member can be frozen");
+    let changed = 0;
+    for (const message of this.messages) {
+      if (message.system || message.authorId !== member.id || message.authorSnapshot) continue;
+      message.authorSnapshot = {
+        ...member,
+        status: "offline",
+        avatar: { ...member.avatar },
+      };
+      changed += 1;
+    }
+    if (changed > 0) this.schedulePersist();
+    return changed;
+  }
+
+  /**
    * Complete trusted human-author inventory from durable public rows. A frozen
    * server-authored snapshot, matching the row author ID, is required; actor
    * type is never guessed from an ID prefix or display-name convention.
@@ -1127,16 +1155,31 @@ export class RoomStore {
     return [...(this.privateThreads.get(threadId)?.messages ?? [])];
   }
 
-  forgetDmParticipant(memberId: string): void {
+  /**
+   * Removes every private thread involving one participant and returns the
+   * removed rows to the caller. The return value lets an erasure coordinator
+   * include attachment-file deletion in its durability barrier instead of
+   * relying only on the best-effort retention callback.
+   */
+  forgetDmParticipant(memberId: string): RemovedPrivateThread[] {
     let changed = false;
+    const removedThreads: RemovedPrivateThread[] = [];
     for (const [threadId, thread] of this.privateThreads) {
       if (!thread.participantIds.includes(memberId)) continue;
       if (this.privateThreads.delete(threadId)) {
         changed = true;
-        if (thread.messages.length > 0) this.removalHandler?.(thread.messages);
+        removedThreads.push({
+          id: thread.id,
+          participantIds: [...thread.participantIds] as [string, string],
+          messages: [...thread.messages],
+        });
+        if (thread.messages.length > 0) {
+          this.removalHandler?.(thread.messages);
+        }
       }
     }
     if (changed) this.schedulePersist();
+    return removedThreads;
   }
 
   async flush(): Promise<void> {

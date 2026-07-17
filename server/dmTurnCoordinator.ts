@@ -106,6 +106,12 @@ export interface DmTurnCoordinatorOptions<TMessage, TResult> {
   publish(result: TResult, turn: DmTurn<TMessage>): void;
   onTypingChange?: (threadId: DmThreadId, active: boolean) => void;
   onError?: (error: unknown, turn: DmTurn<TMessage>) => void;
+  /** Releases caller-owned completion state for messages discarded by cancel/dispose. */
+  onCancelled?: (
+    messages: readonly TMessage[],
+    threadId: DmThreadId,
+    kind: Exclude<DmTurnCancellationKind, "superseded">,
+  ) => void;
 }
 
 export interface DmEnqueueReceipt {
@@ -400,6 +406,11 @@ export class DmTurnCoordinator<TMessage, TResult> {
       state.active || state.debounceTimer || state.pending.length > 0 || state.unanswered.length > 0,
     );
     if (!hadWork) return false;
+    const discarded = [
+      ...(state.active && !state.active.publicationCommitted ? state.active.messages : []),
+      ...state.pending,
+      ...state.unanswered,
+    ];
     state.epoch += 1;
     this.clearTimer(state);
     state.pending = [];
@@ -407,6 +418,13 @@ export class DmTurnCoordinator<TMessage, TResult> {
     this.invalidateActive(state, kind, false);
     state.typingLease?.release();
     state.typingLease = undefined;
+    if (kind !== "superseded" && discarded.length > 0) {
+      try {
+        this.options.onCancelled?.(discarded, threadId, kind);
+      } catch {
+        // Cancellation cleanup cannot reopen publication or leave typing live.
+      }
+    }
     return true;
   }
 }

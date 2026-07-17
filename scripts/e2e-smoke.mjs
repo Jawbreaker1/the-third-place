@@ -1,4 +1,5 @@
 import { io } from "socket.io-client";
+import { retireSmokeSessions } from "./smoke-session.mjs";
 
 const baseUrl = process.env.APP_BASE_URL ?? "http://127.0.0.1:4000";
 const marker = Date.now().toString(36).slice(-5);
@@ -63,13 +64,16 @@ const connect = async (cookie) => {
 };
 
 const sockets = [];
+const cookies = [];
 try {
-  const [cookieA, cookieB] = await Promise.all([
-    createSession(`Ada-${marker}`),
-    createSession(`Bo-${marker}`),
-  ]);
-  const [a, b] = await Promise.all([connect(cookieA), connect(cookieB)]);
-  sockets.push(a.socket, b.socket);
+  const cookieA = await createSession(`Ada-${marker}`);
+  cookies.push(cookieA);
+  const cookieB = await createSession(`Bo-${marker}`);
+  cookies.push(cookieB);
+  const a = await connect(cookieA);
+  sockets.push(a.socket);
+  const b = await connect(cookieB);
+  sockets.push(b.socket);
 
   const text = `@Nox tänk om bananen driver hela servern?! [${marker}]`;
   const humanSeen = waitForEvent(
@@ -134,4 +138,5 @@ try {
   );
 } finally {
   for (const socket of sockets) socket.disconnect();
+  await retireSmokeSessions(baseUrl, cookies);
 }

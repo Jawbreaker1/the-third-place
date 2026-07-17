@@ -409,6 +409,8 @@ export interface AmbientThreadState {
   semanticFamily?: string;
   episodeId?: string;
   causalRootId?: string;
+  /** Trusted owner for a continuation rooted in one human-authored turn. */
+  humanActorId?: string;
   messageCount: number;
   lastMessageId?: string;
   lastAuthorId?: string;
@@ -1742,6 +1744,8 @@ export class SocialDirector {
   private readonly lastSpoke = new Map<string, number>();
   private readonly pendingBursts = new Map<string, PendingBurst>();
   private readonly pendingHumanReactions = new Map<string, PendingHumanReaction>();
+  private readonly pendingCrowdReactionTimersByHuman = new Map<string, Set<NodeJS.Timeout>>();
+  private readonly invalidatedHumanActorIds = new Set<string>();
   private readonly humanReactionResponsesInFlight = new Set<string>();
   private readonly lastHumanReactionTurnAtByHumanChannel = new Map<string, number>();
   private readonly lastHumanReactionTurnAtByMessage = new Map<string, number>();
@@ -1882,6 +1886,9 @@ export class SocialDirector {
         for (const input of turn.messages) input.settle();
         console.warn("DM turn failed:", error instanceof Error ? error.message : error);
       },
+      onCancelled: (messages) => {
+        for (const input of messages) input.settle();
+      },
     });
     this.ambientHumanQuietMs = Math.max(30_000, options.ambientHumanQuietMs ?? 90_000);
     const envChance = Number.parseFloat(process.env.AI_CONSIDERED_CHANCE ?? "0.2");
@@ -1988,6 +1995,10 @@ export class SocialDirector {
     this.pendingBursts.clear();
     for (const reaction of this.pendingHumanReactions.values()) clearTimeout(reaction.timer);
     this.pendingHumanReactions.clear();
+    for (const timers of this.pendingCrowdReactionTimersByHuman.values()) {
+      for (const timer of timers) clearTimeout(timer);
+    }
+    this.pendingCrowdReactionTimersByHuman.clear();
     this.humanReactionResponsesInFlight.clear();
     this.dmTurns.dispose();
     this.typingLeases.clearAll();
@@ -2008,6 +2019,68 @@ export class SocialDirector {
         ? { lastFailure: { ...this.autonomousResearchDiagnostics.lastFailure } }
         : {}),
     };
+  }
+
+  /**
+   * Invalidates every queued or active private generation involving one actor.
+   * The DM coordinator's epoch gate suppresses late model results even when a
+   * backend ignores AbortSignal; RoomStore deletion remains the second publish
+   * barrier. This deliberately does not disturb unrelated private threads.
+   */
+  cancelDirectTurnsForActor(actorId: string): number {
+    let cancelled = 0;
+    for (const thread of this.store.getDmThreads(actorId)) {
+      if (this.dmTurns.cancel(thread.id)) cancelled += 1;
+    }
+    return cancelled;
+  }
+
+  /**
+   * Permanently closes public work rooted in one retired human identity.
+   * Publication checks use the same actor-local gate, so a backend that
+   * ignores cancellation can settle without posting or recreating memory.
+   * No unrelated DM, channel epoch or ambient thread is invalidated.
+   */
+  invalidatePublicWorkForHumanActor(actorId: string): void {
+    if (!actorId) return;
+    this.invalidatedHumanActorIds.add(actorId);
+
+    for (const [key, burst] of this.pendingBursts) {
+      if (burst.human.id !== actorId) continue;
+      clearTimeout(burst.timer);
+      this.pendingBursts.delete(key);
+    }
+    for (const [key, reaction] of this.pendingHumanReactions) {
+      if (reaction.human.id !== actorId) continue;
+      clearTimeout(reaction.timer);
+      this.pendingHumanReactions.delete(key);
+    }
+    const crowdTimers = this.pendingCrowdReactionTimersByHuman.get(actorId);
+    if (crowdTimers) {
+      for (const timer of crowdTimers) clearTimeout(timer);
+      this.pendingCrowdReactionTimersByHuman.delete(actorId);
+    }
+    for (const channel of CHANNELS) {
+      this.lastHumanReactionTurnAtByHumanChannel.delete(`${channel.id}:${actorId}`);
+    }
+
+    for (const [channelId, thread] of this.ambientThreads) {
+      if (ambientThreadOrigin(thread) !== "human_topic") continue;
+      const rootAuthorId = thread.causalRootId
+        ? this.store.getMessage(thread.causalRootId)?.authorId
+        : undefined;
+      if (thread.humanActorId !== actorId && rootAuthorId !== actorId) continue;
+      this.closeAmbientThread(thread, "human_preempted");
+      this.ambientThreads.delete(channelId);
+    }
+  }
+
+  private humanActorWorkIsCurrent(actorId: string): boolean {
+    return !this.stopped && !this.invalidatedHumanActorIds.has(actorId);
+  }
+
+  private ambientThreadIsCurrent(channelId: string, thread: AmbientThreadState): boolean {
+    return !this.stopped && thread.closedAt === undefined && this.ambientThreads.get(channelId) === thread;
   }
 
   /** Invalidates every in-flight scene after a live channel/persona catalog edit. */
@@ -2100,6 +2173,7 @@ export class SocialDirector {
   }
 
   async welcome(human: Member, options: { returning?: boolean; languageHint?: string } = {}): Promise<void> {
+    if (!this.humanActorWorkIsCurrent(human.id)) return;
     const catalogEpoch = this.catalogEpoch;
     const returning = options.returning === true;
     const arrivalAt = this.now();
@@ -2125,7 +2199,11 @@ export class SocialDirector {
     });
 
     await delay(900 + Math.random() * 1_400);
-    if (catalogEpoch !== this.catalogEpoch || !this.canSpeak()) return;
+    if (
+      catalogEpoch !== this.catalogEpoch ||
+      !this.humanActorWorkIsCurrent(human.id) ||
+      !this.canSpeak()
+    ) return;
     const typingLease = this.acquireTyping("lobby", persona.id);
     let line: GeneratedLine | undefined;
     try {
@@ -2179,7 +2257,11 @@ export class SocialDirector {
     }
     try {
       await delay(450);
-      if (catalogEpoch !== this.catalogEpoch || !this.canSpeak()) return;
+      if (
+        catalogEpoch !== this.catalogEpoch ||
+        !this.humanActorWorkIsCurrent(human.id) ||
+        !this.canSpeak()
+      ) return;
       if (!line) return;
       const posted = this.postPublic(
         "lobby",
@@ -2195,6 +2277,7 @@ export class SocialDirector {
   }
 
   onHumanMessage(message: ChatMessage, human: Member): void {
+    if (!this.humanActorWorkIsCurrent(human.id)) return;
     this.noteHumanChannelEvent(message);
     const burstKey = `${message.channelId}:${human.id}`;
     const existing = this.pendingBursts.get(burstKey);
@@ -2217,7 +2300,7 @@ export class SocialDirector {
     event: { channelId: string; messageId: string; emoji: string },
     human: Member,
   ): void {
-    if (this.stopped) return;
+    if (!this.humanActorWorkIsCurrent(human.id)) return;
     if (!isPublicReactionEmoji(event.emoji)) return;
     const target = this.store.getMessage(event.messageId);
     const persona = target && target.channelId === event.channelId
@@ -2263,7 +2346,7 @@ export class SocialDirector {
   }
 
   private async handleHumanReaction(pending: PendingHumanReaction): Promise<void> {
-    if (this.stopped) return;
+    if (!this.humanActorWorkIsCurrent(pending.human.id)) return;
     const target = this.store.getMessage(pending.messageId);
     if (!target || target.channelId !== pending.channelId || target.authorId !== pending.persona.id) return;
     const activeEmojis = [...pending.emojis].filter((emoji) =>
@@ -2341,6 +2424,7 @@ export class SocialDirector {
       const reactionStillPresent = currentTarget?.reactions.some((reaction) =>
         activeEmojis.includes(reaction.emoji) && reaction.memberIds.includes(pending.human.id),
       );
+      if (!this.humanActorWorkIsCurrent(pending.human.id)) return;
       if (
         !line ||
         !reactionStillPresent ||
@@ -2371,6 +2455,7 @@ export class SocialDirector {
         );
         if (
           latestReactionStillPresent &&
+          this.humanActorWorkIsCurrent(pending.human.id) &&
           catalogEpoch === this.catalogEpoch &&
           channelEpoch === (this.channelEpoch.get(pending.channelId) ?? 0) &&
           this.canSpeak()
@@ -2380,6 +2465,7 @@ export class SocialDirector {
       } finally {
         publicationTypingLease.release();
       }
+      if (!this.humanActorWorkIsCurrent(pending.human.id)) return;
       this.publishDirectorEvent({
         trigger: "reaction",
         summary: posted
@@ -2411,10 +2497,12 @@ export class SocialDirector {
   }
 
   onHumanImagePosted(message: ChatMessage): void {
+    if (!this.humanActorWorkIsCurrent(message.authorId)) return;
     this.noteHumanChannelEvent(message);
   }
 
   onHumanImageReady(message: ChatMessage, human: Member, observation?: VisualObservation): void {
+    if (!this.humanActorWorkIsCurrent(human.id)) return;
     // Analysis completion can be retried by transport/recovery code. Claim the
     // message before starting generation so one image can create only one
     // social scene even if completion is delivered more than once.
@@ -2710,6 +2798,7 @@ export class SocialDirector {
   }
 
   private schedulePersistentMemory(messages: readonly ChatMessage[], human: Member): void {
+    if (!this.humanActorWorkIsCurrent(human.id)) return;
     // The source-bound coordinator supersedes the old, human-fact-only model
     // pass. Keeping both would spend inference twice and could persist two
     // incompatible interpretations of the same delivered turn.
@@ -2722,6 +2811,7 @@ export class SocialDirector {
     // Defer the optional low-priority pass until the live reply generation has
     // entered the inference queue. Memory can never delay or decide the reply.
     setTimeout(() => {
+      if (!this.humanActorWorkIsCurrent(human.id)) return;
       const recent = this.store.getRecent(latest.channelId, 40);
       const currentIds = new Set(currentBurst.map((message) => message.id));
       const firstCurrentIndex = recent.findIndex((candidate) => currentIds.has(candidate.id));
@@ -2751,6 +2841,7 @@ export class SocialDirector {
       });
       if (!request) return;
       void request.then((analysis) => {
+        if (!this.humanActorWorkIsCurrent(human.id)) return;
         if (analysis.source !== "lm") return;
         this.applyClassifiedMemoryChanges(analysis.items, human.id, latest.channelId);
       }).catch((error) => {
@@ -3045,7 +3136,8 @@ export class SocialDirector {
     const burstEpoch = this.humanMessageEpochById.get(trigger.id)
       ?? (this.channelEpoch.get(trigger.channelId) ?? 0);
     const burstIsCurrent = (): boolean =>
-      !this.stopped && burstEpoch === (this.channelEpoch.get(trigger.channelId) ?? 0);
+      this.humanActorWorkIsCurrent(human.id) &&
+      burstEpoch === (this.channelEpoch.get(trigger.channelId) ?? 0);
     if (!burstIsCurrent()) {
       this.schedulePersistentMemory(messages, human);
       return;
@@ -3708,7 +3800,9 @@ export class SocialDirector {
     }
     this.schedulePersistentMemory(messages, human);
     } finally {
-      if (selectedReadersMarked) {
+      // Catalog edits advance the channel epoch; actor erasure closes only the
+      // matching actor gate. Either invalidation must suppress a late episode.
+      if (selectedReadersMarked && burstIsCurrent()) {
         this.capturePublicHumanSocialEpisode(messages, publishedResponses, human, selected);
       }
       if (autoSharedLinkAttempt) this.autoSharedLinkDiscussionInFlight = false;
@@ -3716,6 +3810,7 @@ export class SocialDirector {
   }
 
   private scheduleCrowdReactions(message: ChatMessage, signals: SocialSignals, responders: Persona[]): number {
+    if (!this.humanActorWorkIsCurrent(message.authorId)) return 0;
     if (this.rng() < 0.17 && signals.absurdity < 0.25 && signals.energy < 0.5) return 0;
     const isHostile = signals.playfulness < 0.4 && [
       "directed_insult",
@@ -3735,6 +3830,7 @@ export class SocialDirector {
       .filter((persona) => !responders.includes(persona) || this.rng() < 0.28)
       .sort(() => this.rng() - 0.5)
       .slice(0, desired);
+    if (candidates.length === 0) return 0;
     const emojis: readonly PublicReactionEmoji[] = isHostile
       ? CROWD_REACTION_PALETTES.hostile
       : isDebate
@@ -3749,9 +3845,17 @@ export class SocialDirector {
             ? CROWD_REACTION_PALETTES.question
             : CROWD_REACTION_PALETTES.ordinary;
 
+    const pendingTimers = this.pendingCrowdReactionTimersByHuman.get(message.authorId)
+      ?? new Set<NodeJS.Timeout>();
+    this.pendingCrowdReactionTimersByHuman.set(message.authorId, pendingTimers);
     candidates.forEach((persona, index) => {
-      setTimeout(() => {
-        if (!PERSONAS.some((candidate) => candidate.id === persona.id)) return;
+      const timer = setTimeout(() => {
+        pendingTimers.delete(timer);
+        if (pendingTimers.size === 0) this.pendingCrowdReactionTimersByHuman.delete(message.authorId);
+        if (
+          !this.humanActorWorkIsCurrent(message.authorId) ||
+          !PERSONAS.some((candidate) => candidate.id === persona.id)
+        ) return;
         this.actorChannels.markRead(persona.id, message.channelId, message.id);
         const reaction = this.store.togglePublicReaction(
           message.channelId,
@@ -3764,6 +3868,7 @@ export class SocialDirector {
         const payload: ReactionPayload = { messageId: message.id, channelId: message.channelId, reaction };
         this.io.to("public").emit("reaction:update", payload);
       }, 380 + index * (280 + this.rng() * 380));
+      pendingTimers.add(timer);
     });
     return candidates.length;
   }
@@ -4389,6 +4494,7 @@ export class SocialDirector {
       ...(languageTag ? { languageTag } : {}),
       ...(retainedResearch ? { research: retainedResearch } : {}),
       origin: "human_topic",
+      humanActorId: input.trigger.authorId,
       openedAt: now,
       updatedAt: now,
     };
@@ -5203,7 +5309,10 @@ export class SocialDirector {
       } finally {
         generationTypingLease.release();
       }
-      if (epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
+      if (
+        epoch !== (this.channelEpoch.get(channel.id) ?? 0) ||
+        !this.ambientThreadIsCurrent(channel.id, thread)
+      ) return;
       if (backgroundPreempted) return;
       const leadLine = lines.find((line) => line.personaId === first.id);
       if (!leadLine) {
@@ -5218,11 +5327,19 @@ export class SocialDirector {
         else if (!pendingBeat) this.closeAmbientThread(thread, "model_rejected");
         return;
       }
-      if (!this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
+      if (
+        !this.canSpeakAutonomously(channel.id) ||
+        epoch !== (this.channelEpoch.get(channel.id) ?? 0) ||
+        !this.ambientThreadIsCurrent(channel.id, thread)
+      ) return;
       const publicationTypingLease = this.acquireTyping(channel.id, first.id);
       let posted: ChatMessage | undefined;
       try {
-        if (!this.canSpeakAutonomously(channel.id) || epoch !== (this.channelEpoch.get(channel.id) ?? 0)) return;
+        if (
+          !this.canSpeakAutonomously(channel.id) ||
+          epoch !== (this.channelEpoch.get(channel.id) ?? 0) ||
+          !this.ambientThreadIsCurrent(channel.id, thread)
+        ) return;
         posted = this.postPublic(
           channel.id,
           first,
@@ -5266,6 +5383,7 @@ export class SocialDirector {
           if (
             this.stopped ||
             reactionEpoch !== (this.channelEpoch.get(channel.id) ?? 0) ||
+            (thread.humanActorId !== undefined && !this.humanActorWorkIsCurrent(thread.humanActorId)) ||
             this.activeVoicePersonaIds.has(reactor.id) ||
             !this.store.getMessage(postedId)
           ) return;

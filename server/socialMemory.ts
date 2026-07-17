@@ -1540,6 +1540,30 @@ export class SocialMemoryStore {
       ).get(actor, actor) as Record<string, unknown>;
       const relationships = rowNumber(relationshipRow, "count");
 
+      // Administrative audit rows are intentionally retained for ordinary
+      // item mutations, but an actor erasure must not leave the same stable ID
+      // behind in structured audit metadata. Remove rows tied to one of the
+      // actor's erased source events/memories, or carrying the actor ID as an
+      // exact structured value. Free-form text is never searched heuristically.
+      const auditRows = this.#database.prepare(
+        "SELECT id, target_type, target_id, metadata_json FROM audit_entries",
+      ).all() as Record<string, unknown>[];
+      const deleteAudit = this.#database.prepare("DELETE FROM audit_entries WHERE id = ?");
+      for (const row of auditRows) {
+        const targetType = rowString(row, "target_type");
+        const targetId = rowString(row, "target_id");
+        const metadata = JSON.parse(rowString(row, "metadata_json")) as Record<string, unknown>;
+        const structuredValues = Object.values(metadata);
+        const sourceEventId = typeof metadata.eventId === "string" ? metadata.eventId : undefined;
+        if (
+          structuredValues.includes(actor) ||
+          (sourceEventId !== undefined && eventIds.has(sourceEventId)) ||
+          (targetType === "memory" && derivedMemoryIds.has(targetId))
+        ) {
+          deleteAudit.run(rowNumber(row, "id"));
+        }
+      }
+
       const deleteEvent = this.#database.prepare("DELETE FROM social_events WHERE id = ?");
       for (const eventId of eventIds) deleteEvent.run(eventId);
       this.#database.prepare(

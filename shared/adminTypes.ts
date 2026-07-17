@@ -137,7 +137,8 @@ export interface AdminSessionState {
 export interface AdminMemoryActorSummary {
   id: string;
   name: string;
-  kind: "resident" | "human";
+  /** Unknown is historical storage provenance whose actor type is no longer trusted. */
+  kind: "resident" | "human" | "unknown";
   memoryCount: number;
   /** True when the inspector reached its row bound; additional rows may exist. */
   memoryRowsTruncated: boolean;

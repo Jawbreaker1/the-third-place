@@ -38,6 +38,7 @@ import { AdminModerationGuard } from "./adminModeration.js";
 import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
+import { ActorPublicationGate } from "./actorPublicationGate.js";
 import { SocialDirector } from "./director.js";
 import { AmbientEpisodeLedger } from "./ambientEpisodeLedger.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
@@ -513,19 +514,47 @@ const voiceRooms = new VoiceRoomRuntime(
   },
 );
 const sessions = new Map<string, HumanSession>();
+const actorPublicationGate = new ActorPublicationGate();
+const isActiveHumanSession = (session: HumanSession): boolean =>
+  sessions.get(session.tokenHash) === session &&
+  !adminState.isBanned(session.member.id, session.member.name) &&
+  !adminModeration.isKicked(session.member.id, session.member.name);
 let actorForgetReconciliationTail: Promise<unknown> = Promise.resolve();
 const reconcilePendingHumanActorForgets = (): Promise<number> => {
-  const operation = actorForgetReconciliationTail.then(() => reconcilePendingActorForgets(
-    humanMemory,
-    humanMemory.listPendingActorForgets(),
-    {
-      forgetActor: async (actorId) => {
-        await socialMemory.forgetActor(actorId);
-        store.forgetDmParticipant(actorId);
+  const operation = actorForgetReconciliationTail.then(async () => {
+    const removedPrivateThreads: Array<{
+      id: string;
+      participantIds: [string, string];
+      forgottenActorId: string;
+    }> = [];
+    return await reconcilePendingActorForgets(
+      humanMemory,
+      humanMemory.listPendingActorForgets(),
+      {
+        forgetActor: async (actorId) => {
+          await socialMemory.forgetActor(actorId);
+          const removed = store.forgetDmParticipant(actorId);
+          removedPrivateThreads.push(...removed.map((thread) => ({
+            id: thread.id,
+            participantIds: thread.participantIds,
+            forgottenActorId: actorId,
+          })));
+          await Promise.all(removed.flatMap((thread) => thread.messages).flatMap((message) =>
+            (message.attachments ?? []).map((attachment) => imageStore.remove(attachment.id)),
+          ));
+        },
+        flushDownstream: async () => {
+          if (removedPrivateThreads.length > 0) await store.flush();
+          for (const thread of removedPrivateThreads) {
+            for (const participantId of thread.participantIds) {
+              if (participantId === thread.forgottenActorId) continue;
+              io.to(`user:${participantId}`).emit("dm:removed", { threadId: thread.id });
+            }
+          }
+        },
       },
-      flushDownstream: () => store.flush(),
-    },
-  ));
+    );
+  });
   // Serialize callers without letting one transient failure poison every later
   // health-cycle retry. Tombstones remain durable until a full attempt succeeds.
   actorForgetReconciliationTail = operation.then(() => undefined, () => undefined);
@@ -726,7 +755,7 @@ const voiceDirector = new VoiceDirector({
 });
 
 type ImageAnalysisAudience =
-  | { kind: "public" }
+  | { kind: "public"; isAuthorCurrent?: () => boolean }
   | {
     kind: "dm";
     participants: [string, string];
@@ -764,6 +793,7 @@ const analyzeImageMessage = (
     };
     if (audience.kind === "public") {
       io.to("public").emit("image-analysis:update", payload);
+      if (audience.isAuthorCurrent && !audience.isAuthorCurrent()) return;
       director.onHumanImageReady(message, human, analysis.status === "ready" ? analysis.observation : undefined);
       return;
     }
@@ -780,10 +810,7 @@ const analyzeImageMessage = (
 const sessionFromRequest = (request: Request): HumanSession | undefined => {
   const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
   const session = token ? sessions.get(hashToken(token)) : undefined;
-  if (!session || adminState.isBanned(session.member.id, session.member.name) || adminModeration.isKicked(session.member.id, session.member.name)) {
-    return undefined;
-  }
-  return session;
+  return session && isActiveHumanSession(session) ? session : undefined;
 };
 
 const authenticatedSessionFromRequest = (
@@ -792,9 +819,7 @@ const authenticatedSessionFromRequest = (
   const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
   if (!token) return undefined;
   const session = sessions.get(hashToken(token));
-  if (!session || adminState.isBanned(session.member.id, session.member.name) || adminModeration.isKicked(session.member.id, session.member.name)) {
-    return undefined;
-  }
+  if (!session || !isActiveHumanSession(session)) return undefined;
   return { session, token };
 };
 
@@ -862,6 +887,14 @@ const setSessionCookie = (request: Request, response: Response, token: string): 
   );
 };
 
+const clearSessionCookie = (request: Request, response: Response): void => {
+  const secure = request.secure || publicOrigin?.startsWith("https://");
+  response.setHeader(
+    "Set-Cookie",
+    `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure ? "; Secure" : ""}`,
+  );
+};
+
 const adminHumans = (): AdminHumanMember[] => [...sessions.values()]
   .map((session) => ({
     id: session.member.id,
@@ -892,19 +925,21 @@ const socialMemoryAdmin = new SocialMemoryAdmin({
   },
 });
 
-const disconnectModeratedHuman = (
+const disconnectHumanSockets = (
   memberId: string,
-  reason: string | undefined,
-  reconnectCooldown: boolean,
+  notice: { action: "kick" | "ban" | "forget"; message: string },
 ): AdminHumanMember | undefined => {
+  // Revoke every already-admitted async HTTP publication before touching
+  // sockets or durable state. A slow upload retains its old lease and fails at
+  // the commit boundary even if its fetch/decoder ignores cancellation.
+  actorPublicationGate.invalidate(memberId);
   const session = [...sessions.values()].find((candidate) => candidate.member.id === memberId);
   if (!session) return undefined;
-  if (reconnectCooldown) adminModeration.kick(session.member.id, session.member.name);
   for (const socketId of [...session.socketIds]) {
     const socket = io.sockets.sockets.get(socketId);
     socket?.emit("session:moderated", {
-      action: reconnectCooldown ? "kick" : "ban",
-      message: reason || (reconnectCooldown ? "You were removed from the room for a short cooldown." : "You were banned from this room."),
+      action: notice.action,
+      message: notice.message,
     });
     const voiceRoom = voiceRooms.getRoomForSocket(socketId);
     const voiceResult = voiceRooms.leaveRoom(socketId);
@@ -916,6 +951,10 @@ const disconnectModeratedHuman = (
         io.to(voiceSocketRoom(voiceResult.roomId)).emit("voice:room:closed", { roomId: voiceResult.roomId });
         publishVoiceRooms();
       } else {
+        // Leaving changes the trusted participant set. Abort any reply or
+        // social-memory capture built against the previous audience before
+        // publishing the surviving room state.
+        voiceDirector.invalidateRoom(voiceResult.room.id);
         publishVoiceRoom(voiceResult.room);
       }
     }
@@ -929,6 +968,63 @@ const disconnectModeratedHuman = (
     status: session.member.status,
     joinedAt: new Date(session.createdAt).toISOString(),
   };
+};
+
+const disconnectModeratedHuman = (
+  memberId: string,
+  reason: string | undefined,
+  reconnectCooldown: boolean,
+): AdminHumanMember | undefined => {
+  const session = [...sessions.values()].find((candidate) => candidate.member.id === memberId);
+  if (!session) return undefined;
+  if (reconnectCooldown) adminModeration.kick(session.member.id, session.member.name);
+  return disconnectHumanSockets(memberId, {
+    action: reconnectCooldown ? "kick" : "ban",
+    message: reason || (reconnectCooldown
+      ? "You were removed from the room for a short cooldown."
+      : "You were banned from this room."),
+  });
+};
+
+const forgetHumanActor = async (actorId: string): Promise<boolean> => {
+  if (PERSONAS.some((persona) => persona.id === actorId)) return false;
+  const profile = humanMemory.findByHumanId(actorId);
+  const runtimeSessions = [...sessions.entries()].filter(([, session]) => session.member.id === actorId);
+  // Human erasure is authorized only by the trusted durable profile/session
+  // catalog. Historical SQLite IDs never become humans through naming rules.
+  if (!profile && runtimeSessions.length === 0) return false;
+  const trustedMember = profile?.member ?? runtimeSessions[0]?.[1].member;
+  if (!trustedMember) return false;
+
+  // No await before all runtime publication paths are closed: the event loop
+  // cannot accept another turn between cancellation, disconnect and token
+  // eviction. Durable work begins only after the actor can no longer publish.
+  director.cancelDirectTurnsForActor(actorId);
+  // Public generations, reactions and human-rooted ambient work use an
+  // actor-local gate. Self-retirement must never cancel somebody else's DM,
+  // room reply or autonomous discussion.
+  director.invalidatePublicWorkForHumanActor(actorId);
+  disconnectHumanSockets(actorId, {
+    action: "forget",
+    message: "Your saved profile and private history were removed by an administrator. You may join again with a new identity.",
+  });
+  for (const [tokenHash] of runtimeSessions) sessions.delete(tokenHash);
+
+  // Public history intentionally survives account retirement. Legacy rows may
+  // predate author snapshots, so freeze the still-trusted profile and make
+  // those snapshots durable *before* removing the profile or persisting its
+  // tombstone. A crash in this window can safely restore the old profile; it
+  // can never strand an unrenderable historical row without its last trusted
+  // display metadata. Runtime publication was already revoked above.
+  const frozenLegacyRows = store.freezePublicAuthorSnapshot(trustedMember);
+  if (frozenLegacyRows > 0) await store.flush();
+
+  if (profile) humanMemory.forgetProfile(actorId);
+  else humanMemory.queuePendingActorForget(actorId);
+
+  await reconcilePendingHumanActorForgets();
+  io.to("public").emit("presence:update", { members: getMembers() });
+  return true;
 };
 
 adminState.setHooks({
@@ -1000,6 +1096,7 @@ app.use("/api/admin", createAdminRouter({
     io.to("public").emit("health:update", getHealth());
   },
   socialMemory: socialMemoryAdmin,
+  forgetHumanActor,
 }));
 
 app.get("/api/voice/capabilities", (_request, response) => {
@@ -1158,6 +1255,7 @@ const handleImageMessageUpload = async (
   session: HumanSession,
   destination: ImageMessageDestination,
 ): Promise<void> => {
+  const publicationLease = actorPublicationGate.capture(session.member.id);
   if (!hasAllowedOrigin(request)) {
     response.status(403).json({ ok: false, error: "That upload origin is not allowed." } satisfies ImageMessageResult);
     return;
@@ -1198,6 +1296,9 @@ const handleImageMessageUpload = async (
     if (!input) throw new ImageStoreError("Choose an image to share.");
     const attachment = await imageStore.create(input.body, "mimeType" in input ? input.mimeType : input.contentType);
     attachmentId = attachment.id;
+    if (!isActiveHumanSession(session) || !actorPublicationGate.isCurrent(publicationLease)) {
+      throw new ImageStoreError("Your session ended before the image could be shared.", 401);
+    }
     if (destination.kind === "public") {
       const message = createMessage(destination.channelId, session.member.id, content, {
         replyToId: form.replyToId,
@@ -1210,7 +1311,11 @@ const handleImageMessageUpload = async (
       io.to("public").emit("message:new", message);
       if (message.content) humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
       director.onHumanImagePosted(message);
-      analyzeImageMessage(message, session.member);
+      analyzeImageMessage(message, session.member, {
+        kind: "public",
+        isAuthorCurrent: () =>
+          isActiveHumanSession(session) && actorPublicationGate.isCurrent(publicationLease),
+      });
       response.status(201).json({ ok: true, message } satisfies ImageMessageResult);
       return;
     }
@@ -1376,6 +1481,31 @@ app.get("/api/session", (request, response) => {
   humanMemory.noteSeen(authenticated.session.member.id, authenticated.session.lastSeenAt);
   setSessionCookie(request, response, authenticated.token);
   response.json({ ok: true, me: authenticated.session.member });
+});
+
+// A complete identity retirement endpoint, used by ephemeral smoke clients and
+// available to a human who wants the server-side identity removed. This is not
+// the lighter "clear remembered details" operation below: it uses the same
+// durable erasure coordinator as the admin memory inspector.
+app.delete("/api/session", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, error: "This identity request did not come from the room." });
+    return;
+  }
+  const authenticated = authenticatedSessionFromRequest(request);
+  if (!authenticated) {
+    clearSessionCookie(request, response);
+    response.status(401).json({ ok: false, error: "That saved identity is no longer active." });
+    return;
+  }
+  if (!await forgetHumanActor(authenticated.session.member.id)) {
+    clearSessionCookie(request, response);
+    response.status(404).json({ ok: false, error: "That saved identity is no longer retained." });
+    return;
+  }
+  clearSessionCookie(request, response);
+  response.status(204).end();
 });
 
 app.get("/api/session/memory", (request, response) => {

@@ -35,6 +35,8 @@ export interface AdminRouterDependencies {
     SocialMemoryAdmin,
     "getOverview" | "getActorDetail" | "setMemoryPinned" | "deleteMemory" | "resetRelationship"
   >;
+  /** Durable cross-store erasure for a trusted human identity. */
+  forgetHumanActor?: (actorId: string) => Promise<boolean>;
 }
 
 const sendError = (response: Response, error: unknown): void => {
@@ -330,6 +332,36 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
       return;
     }
     response.json(detail);
+  });
+
+  router.delete("/memory/actors/:id", async (request, response, next) => {
+    if (!dependencies.socialMemory || !dependencies.forgetHumanActor) {
+      response.status(503).json({ ok: false, error: "Human memory erasure is unavailable." });
+      return;
+    }
+    try {
+      const actorId = idParam.parse(request.params.id);
+      const detail = dependencies.socialMemory.getActorDetail(actorId);
+      if (!detail) {
+        response.status(404).json({ ok: false, error: "That memory actor was not found." });
+        return;
+      }
+      if (detail.actor.kind !== "human") {
+        response.status(409).json({
+          ok: false,
+          code: "ACTOR_NOT_HUMAN",
+          error: "Only human identities can be erased from the memory inspector.",
+        });
+        return;
+      }
+      if (!await dependencies.forgetHumanActor(actorId)) {
+        response.status(404).json({ ok: false, error: "That human identity is no longer retained." });
+        return;
+      }
+      response.status(204).end();
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
   });
 
   router.patch("/memory/items/:id", (request, response, next) => {

@@ -331,7 +331,7 @@ describe("social-memory admin projection", () => {
     expect(admin.getActorDetail("\u0000unsafe")).toBeUndefined();
   });
 
-  it("keeps historical relationship actors visible after they leave the live catalog", () => {
+  it("keeps historical relationship actors visible without guessing their actor type", () => {
     const store = createStore();
     store.recordEvent(firstEvent());
     const admin = new SocialMemoryAdmin({
@@ -342,7 +342,7 @@ describe("social-memory admin projection", () => {
     const overview = admin.getOverview();
     expect(overview.actors).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: "human-johan", name: "human-johan", kind: "human" }),
+        expect.objectContaining({ id: "human-johan", name: "human-johan", kind: "unknown" }),
       ]),
     );
     expect(admin.getActorDetail("human-johan")?.incomingRelationships[0]).toMatchObject({

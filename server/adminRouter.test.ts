@@ -85,6 +85,7 @@ describe("admin HTTP API", () => {
     const human = { id: "human-1", name: "Alex", status: "online" as const };
     const kicked: Array<{ memberId: string; reason?: string }> = [];
     const banned: Array<{ memberId: string; reason?: string }> = [];
+    const forgotten: string[] = [];
     const memoryMutations: string[] = [];
     const memoryOverview = {
       stats: { actors: 1, memories: 1, relationships: 1, openLoops: 0, auditEntries: 0 },
@@ -105,6 +106,10 @@ describe("admin HTTP API", () => {
       incomingRelationships: [],
       openLoops: [],
       audit: [],
+    };
+    const humanMemoryDetail = {
+      ...memoryDetail,
+      actor: { ...memoryDetail.actor, id: human.id, name: human.name, kind: "human" as const },
     };
     const app = express();
     app.use("/api/admin", createAdminRouter({
@@ -138,7 +143,11 @@ describe("admin HTTP API", () => {
       },
       socialMemory: {
         getOverview: () => memoryOverview,
-        getActorDetail: (id) => id === "ai-mira" ? memoryDetail : undefined,
+        getActorDetail: (id) => id === "ai-mira"
+          ? memoryDetail
+          : id === human.id
+            ? humanMemoryDetail
+            : undefined,
         setMemoryPinned: (id, pinned) => {
           memoryMutations.push(`pin:${id}:${pinned}`);
           return id === "memory-1";
@@ -151,6 +160,11 @@ describe("admin HTTP API", () => {
           memoryMutations.push(`reset:${ownerId}:${subjectId}`);
           return ownerId === "ai-mira" && subjectId === "human-1";
         },
+      },
+      forgetHumanActor: async (actorId) => {
+        if (actorId !== human.id) return false;
+        forgotten.push(actorId);
+        return true;
       },
       now: () => Date.UTC(2026, 6, 14, 12),
     }));
@@ -215,6 +229,25 @@ describe("admin HTTP API", () => {
       path: "/api/admin/memory/actors/missing",
       cookie,
     })).status).toBe(404);
+    expect((await dispatch(app, {
+      method: "DELETE",
+      path: "/api/admin/memory/actors/ai-mira",
+      cookie,
+      origin: "https://admin.example",
+    })).status).toBe(409);
+    expect((await dispatch(app, {
+      method: "DELETE",
+      path: `/api/admin/memory/actors/${human.id}`,
+      cookie,
+      origin: "https://evil.example",
+    })).status).toBe(403);
+    expect((await dispatch(app, {
+      method: "DELETE",
+      path: `/api/admin/memory/actors/${human.id}`,
+      cookie,
+      origin: "https://admin.example",
+    })).status).toBe(204);
+    expect(forgotten).toEqual([human.id]);
     expect((await dispatch(app, {
       method: "PATCH",
       path: "/api/admin/memory/items/memory-1",

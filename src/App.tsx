@@ -963,14 +963,119 @@ export default function App() {
           : { ...current, [payload.thread.id]: payload.message!.id });
       }
     });
+    socket.on("dm:removed", (payload: { threadId: string }) => {
+      const threadId = payload.threadId;
+      if (!threadId) return;
+
+      const removedThread = dmThreadsRef.current.find((thread) => thread.id === threadId);
+      const removedMessageIds = new Set(removedThread?.messages.map((message) => message.id) ?? []);
+      const removedAttachmentIds = new Set(
+        removedThread?.messages.flatMap((message) => message.attachments?.map((attachment) => attachment.id) ?? []) ?? [],
+      );
+      const wasActive = activeChannelRef.current === threadId;
+
+      // Remove the conversation synchronously from the ref as well as React
+      // state so a following socket event cannot still treat it as available.
+      dmThreadsRef.current = dmThreadsRef.current.filter((thread) => thread.id !== threadId);
+      setDmThreads((current) => current.filter((thread) => thread.id !== threadId));
+      setTyping((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setUnreadDividers((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setChannelNotices((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setImageDrafts((current) => {
+        const draft = current[threadId];
+        if (!draft) return current;
+        revokeDraftPreview(draft);
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setReplyTo((current) => wasActive || current?.channelId === threadId ? null : current);
+      setEmojiPickerTarget((current) => wasActive
+        || (current?.kind === "reaction" && removedMessageIds.has(current.messageId))
+        ? null
+        : current);
+      setLightbox((current) => current && removedAttachmentIds.has(current.attachment.id) ? null : current);
+      setProfile((current) => current?.id === removedThread?.peerId ? null : current);
+
+      viewportByConversation.current.delete(threadId);
+      if (pendingConversationEntry.current?.channelId === threadId) pendingConversationEntry.current = undefined;
+      historyRequestGeneration.current[threadId] = (historyRequestGeneration.current[threadId] ?? 0) + 1;
+      historyLoadingChannels.current.delete(threadId);
+      prependingHistoryChannels.current.delete(threadId);
+      for (const messageId of removedMessageIds) historicalMessageIds.current.delete(messageId);
+      setHistoryPageInfo((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setHistoryLoading((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+      setHistoryError((current) => {
+        if (!(threadId in current)) return current;
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      });
+
+      if (!wasActive) return;
+
+      if (typingTimer.current) window.clearTimeout(typingTimer.current);
+      typingTimer.current = undefined;
+      setComposer("");
+      setSearch("");
+      setImageUrlOpen(false);
+      setImageUrlValue("");
+      dragDepth.current = 0;
+      setDragActive(false);
+      setMobilePanel(null);
+
+      const fallback = channelsRef.current.find((channel) => channel.id === "lobby")
+        ?? channelsRef.current[0];
+      if (!fallback) return;
+      queueConversationEntry(fallback.id);
+      activeChannelRef.current = fallback.id;
+      setActiveChannelId(fallback.id);
+      setChannelNotices((current) => clearChannelNotice(current, fallback.id));
+      pushToast({
+        tone: "info",
+        title: "Private conversation removed",
+        message: `A participant's saved identity was deleted. You were moved to #${fallback.name}.`,
+      });
+    });
     socket.on("toast", pushToast);
-    socket.on("session:moderated", (payload: { action: "kick" | "ban"; message?: string }) => {
+    socket.on("session:moderated", (payload: { action: "kick" | "ban" | "forget"; message?: string }) => {
       pushToast({
         tone: "warning",
-        title: payload.action === "ban" ? "Access removed" : "Disconnected by an administrator",
-        message: payload.message ?? (payload.action === "ban"
-          ? "You have been banned from this room."
-          : "You can reconnect after a short cooldown."),
+        title: payload.action === "forget"
+          ? "Saved identity removed"
+          : payload.action === "ban"
+            ? "Access removed"
+            : "Disconnected by an administrator",
+        message: payload.message ?? (payload.action === "forget"
+          ? "Your saved profile and private history were removed."
+          : payload.action === "ban"
+            ? "You have been banned from this room."
+            : "You can reconnect after a short cooldown."),
       });
       clearVoiceMedia();
       joinedVoiceRoomRef.current = null;
@@ -1030,7 +1135,7 @@ export default function App() {
         setConnection("offline");
       }
     });
-  }, [applySnapshot, clearVoiceMedia, createVoiceMesh, playVoiceAiSpeech, pushToast, upsertVoiceRoom]);
+  }, [applySnapshot, clearVoiceMedia, createVoiceMesh, playVoiceAiSpeech, pushToast, queueConversationEntry, revokeDraftPreview, upsertVoiceRoom]);
 
   useEffect(() => {
     let alive = true;

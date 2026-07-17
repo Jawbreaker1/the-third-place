@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { io } from "socket.io-client";
+import { retireSmokeSessions } from "./smoke-session.mjs";
 
 const baseUrl = process.env.APP_BASE_URL ?? "http://127.0.0.1:4000";
 const marker = Date.now().toString(36).slice(-6);
@@ -72,15 +73,18 @@ const waitForModelIdle = async (timeoutMs = 120_000) => {
 };
 
 const sockets = [];
+const cookies = [];
 let roomId;
 let noiseIgnored = false;
 try {
-  const [cookieA, cookieB] = await Promise.all([
-    createSession(`Voice-A-${marker}`),
-    createSession(`Voice-B-${marker}`),
-  ]);
-  const [a, b] = await Promise.all([connect(cookieA), connect(cookieB)]);
-  sockets.push(a.socket, b.socket);
+  const cookieA = await createSession(`Voice-A-${marker}`);
+  cookies.push(cookieA);
+  const cookieB = await createSession(`Voice-B-${marker}`);
+  cookies.push(cookieB);
+  const a = await connect(cookieA);
+  sockets.push(a.socket);
+  const b = await connect(cookieB);
+  sockets.push(b.socket);
 
   const created = await emitAck(a.socket, "voice:room:create", { channelId: "lobby" });
   roomId = created.room.id;
@@ -252,4 +256,5 @@ try {
     for (const socket of sockets) socket.emit("voice:room:leave", { roomId });
   }
   for (const socket of sockets) socket.disconnect();
+  await retireSmokeSessions(baseUrl, cookies);
 }

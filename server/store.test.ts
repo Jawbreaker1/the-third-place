@@ -221,7 +221,7 @@ describe("room history", () => {
 
     const privateAttachment = imageAttachment("e1035c41-4f18-45d8-89ca-7a955a1f5632");
     const thread = store.openDm("human-forgotten", "ai-mira");
-    store.addDmMessage(
+    const privateMessage = store.addDmMessage(
       thread.id,
       "human-forgotten",
       "private",
@@ -235,8 +235,16 @@ describe("room history", () => {
     store.onMessagesRemoved((messages) => {
       removedIds.push(...messages.flatMap((message) => message.attachments?.map((attachment) => attachment.id) ?? []));
     });
-    store.forgetDmParticipant("human-forgotten");
+    const removed = store.forgetDmParticipant("human-forgotten");
     expect(removedIds).toContain(privateAttachment.id);
+    expect(removed).toEqual([
+      expect.objectContaining({
+        id: thread.id,
+        participantIds: ["ai-mira", "human-forgotten"],
+      }),
+    ]);
+    expect(removed.flatMap((removedThread) => removedThread.messages).map((message) => message.id))
+      .toContain(privateMessage?.id);
     expect(store.canViewImageAttachment(privateAttachment.id, "ai-mira")).toBe(false);
   });
 
@@ -457,6 +465,35 @@ describe("room history", () => {
     }));
 
     expect(store.getAllPublicHumanAuthorIds()).toEqual(["human-history-only"]);
+  });
+
+  it("freezes legacy public authors before profile erasure and preserves them across restart", async () => {
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath);
+    await store.load();
+    const human: Member = {
+      id: "human-legacy-retired",
+      name: "Legacy Visitor",
+      kind: "human",
+      status: "online",
+      avatar: { color: "#123456", accent: "#abcdef", glyph: "L" },
+    };
+    const legacy = createMessage("lobby", human.id, "Keep this historical line visible.");
+    store.addPublicMessage(legacy);
+
+    expect(store.freezePublicAuthorSnapshot(human)).toBe(1);
+    expect(store.freezePublicAuthorSnapshot({ ...human, name: "Later Name" })).toBe(0);
+    await store.flush();
+
+    const restarted = new RoomStore(filePath);
+    await restarted.load();
+    const restored = restarted.getRecent("lobby", 100).find((message) => message.id === legacy.id);
+    expect(restored?.authorSnapshot).toEqual({
+      ...human,
+      status: "offline",
+      avatar: { ...human.avatar },
+    });
+    expect(restarted.getAllPublicHumanAuthorIds()).toContain(human.id);
   });
 
   it("inventories every non-system public actor for missing-companion continuity", async () => {

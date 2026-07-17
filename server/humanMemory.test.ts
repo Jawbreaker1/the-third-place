@@ -13,7 +13,7 @@ import {
   type HumanMemoryStoreOptions,
   type MemoryCandidate,
 } from "./humanMemory.js";
-import { RoomStore } from "./store.js";
+import { createMessage, RoomStore } from "./store.js";
 
 const hour = 60 * 60_000;
 const day = 24 * hour;
@@ -507,12 +507,50 @@ describe("persistent human memory", () => {
 
     const rooms = new RoomStore(roomPath);
     await rooms.load();
+    const legacyPublic = createMessage("lobby", "human-live", "This public line remains as history.");
+    rooms.addPublicMessage(legacyPublic);
     const dm = rooms.openDm("human-live", "ai-mira");
-    rooms.addDmMessage(dm.id, "human-live", "This private line must be erased.");
+    const privateAttachmentId = "31ef164d-059b-4023-b31d-ea36a989cf30";
+    rooms.addDmMessage(
+      dm.id,
+      "human-live",
+      "This private line and image must be erased.",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [{
+        id: privateAttachmentId,
+        kind: "image",
+        url: `/api/images/${privateAttachmentId}`,
+        thumbnailUrl: `/api/images/${privateAttachmentId}?variant=thumbnail`,
+        mimeType: "image/webp",
+        width: 640,
+        height: 480,
+        sizeBytes: 12_345,
+        analysis: { status: "pending" },
+      }],
+    );
     await rooms.flush();
+
+    expect(rooms.freezePublicAuthorSnapshot(member("human-live", "Live"))).toBe(1);
+    // Snapshot persistence must precede the profile tombstone. If the process
+    // dies in between, restart may restore the still-valid human identity, but
+    // it must never lose the last trusted rendering metadata for public rows.
+    await rooms.flush();
+    const crashWindowRooms = new RoomStore(roomPath);
+    await crashWindowRooms.load();
+    expect(crashWindowRooms.getRecent("lobby", 100)).toContainEqual(expect.objectContaining({
+      id: legacyPublic.id,
+      authorSnapshot: expect.objectContaining({ id: "human-live", name: "Live", kind: "human" }),
+    }));
+    const crashWindowHuman = new HumanMemoryStore({ filePath: humanPath, persistDelayMs: 60_000 });
+    await crashWindowHuman.load();
+    expect(crashWindowHuman.findByHumanId("human-live")).toBeDefined();
 
     expect(human.forgetProfile("human-live")).toBe(true);
     const downstreamOrder: string[] = [];
+    const removedAttachmentIds: string[] = [];
     await expect(reconcilePendingActorForgets(
       human,
       human.listPendingActorForgets(),
@@ -523,7 +561,9 @@ describe("persistent human memory", () => {
           };
           expect(durableIntent.pendingActorForgetIds).toContain(actorId);
           downstreamOrder.push(`social:${actorId}`);
-          rooms.forgetDmParticipant(actorId);
+          removedAttachmentIds.push(...rooms.forgetDmParticipant(actorId)
+            .flatMap((thread) => thread.messages)
+            .flatMap((message) => message.attachments?.map((attachment) => attachment.id) ?? []));
         },
         flushDownstream: async () => {
           downstreamOrder.push("room:flush");
@@ -532,10 +572,21 @@ describe("persistent human memory", () => {
       },
     )).resolves.toBe(1);
     expect(downstreamOrder).toEqual(["social:human-live", "room:flush"]);
+    expect(removedAttachmentIds).toEqual([privateAttachmentId]);
 
     const restartedRooms = new RoomStore(roomPath);
     await restartedRooms.load();
     expect(restartedRooms.getDmParticipants(dm.id)).toBeUndefined();
+    expect(restartedRooms.getRecent("lobby", 100)).toContainEqual(expect.objectContaining({
+      id: legacyPublic.id,
+      authorId: "human-live",
+      authorSnapshot: expect.objectContaining({
+        id: "human-live",
+        name: "Live",
+        kind: "human",
+        status: "offline",
+      }),
+    }));
     const restartedHuman = new HumanMemoryStore({ filePath: humanPath, persistDelayMs: 60_000 });
     expect((await restartedHuman.load()).pendingActorForgetIds).toEqual([]);
   });

@@ -1,4 +1,5 @@
 import { io } from "socket.io-client";
+import { retireSmokeSession } from "./smoke-session.mjs";
 
 const baseUrl = process.env.APP_BASE_URL ?? "http://127.0.0.1:4000";
 const marker = Date.now().toString(36).slice(-6);
@@ -96,4 +97,5 @@ try {
   }, null, 2));
 } finally {
   socket.disconnect();
+  await retireSmokeSession(baseUrl, cookie);
 }

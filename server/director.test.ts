@@ -1546,6 +1546,177 @@ describe("social director", () => {
     }
   });
 
+  it("cancels an in-flight DM for a forgotten actor and suppresses a backend's late result", async () => {
+    vi.useFakeTimers();
+    try {
+      const human = {
+        id: "guest-dm-forgotten",
+        name: "Forgotten Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "F" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-juno")!;
+      const store = new RoomStore("/tmp/director-dm-forgotten-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const incoming = store.addDmMessage(thread.id, human.id, "please answer later")!;
+      const publishAttempt = vi.spyOn(store, "addDmMessage");
+      let resolveGeneration!: (lines: Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>) => void;
+      const delayedGeneration = new Promise<Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>>((resolve) => { resolveGeneration = resolve; });
+      let generationSignal: AbortSignal | undefined;
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene: vi.fn((_request, _priority, signal) => {
+            generationSignal = signal;
+            return delayedGeneration;
+          }),
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          dmDebounceMs: 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pending = director.onDirectMessage(incoming, human, persona);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(generationSignal?.aborted).toBe(false);
+      expect(director.cancelDirectTurnsForActor(human.id)).toBe(1);
+      expect(generationSignal?.aborted).toBe(true);
+      const removed = store.forgetDmParticipant(human.id);
+      expect(removed.flatMap((removedThread) => removedThread.messages).map((message) => message.id))
+        .toContain(incoming.id);
+      await pending;
+
+      resolveGeneration([{
+        personaId: persona.id,
+        content: "this result arrived after erasure",
+        source: "lm",
+        sourceIds: [],
+      }]);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(publishAttempt).not.toHaveBeenCalled();
+      expect(store.getDmParticipants(thread.id)).toBeUndefined();
+      director.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not cancel another human's in-flight DM when public work for one actor is invalidated", async () => {
+    vi.useFakeTimers();
+    try {
+      const retiredHuman = {
+        id: "guest-public-retired-only",
+        name: "Retired Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "R" },
+      };
+      const survivingHuman = {
+        ...retiredHuman,
+        id: "guest-dm-survivor",
+        name: "Surviving Guest",
+        avatar: { ...retiredHuman.avatar, glyph: "S" },
+      };
+      const persona = PERSONAS.find((candidate) => candidate.id === "ai-juno")!;
+      const store = new RoomStore("/tmp/director-actor-public-invalidation-dm-isolation-unused.json");
+      const thread = store.openDm(survivingHuman.id, persona.id);
+      const incoming = store.addDmMessage(thread.id, survivingHuman.id, "please keep answering")!;
+      let resolveGeneration!: (lines: Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>) => void;
+      let generationSignal: AbortSignal | undefined;
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene: vi.fn((_request, _priority, signal) => {
+            generationSignal = signal;
+            return new Promise<Array<{
+              personaId: string;
+              content: string;
+              source: "lm";
+              sourceIds: string[];
+            }>>((resolve) => { resolveGeneration = resolve; });
+          }),
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [retiredHuman, survivingHuman, ...PERSONAS],
+        () => 2,
+        {
+          dmDebounceMs: 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date().toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pending = director.onDirectMessage(incoming, survivingHuman, persona);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(generationSignal?.aborted).toBe(false);
+      director.invalidatePublicWorkForHumanActor(retiredHuman.id);
+      expect(generationSignal?.aborted).toBe(false);
+      resolveGeneration([{
+        personaId: persona.id,
+        content: "this unrelated DM still arrives",
+        source: "lm",
+        sourceIds: [],
+      }]);
+      await vi.runAllTimersAsync();
+      await pending;
+
+      expect(store.getDmMessages(thread.id).at(-1)).toMatchObject({
+        authorId: persona.id,
+        content: "this unrelated DM still arrives",
+        replyToId: incoming.id,
+      });
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("supersedes a rejected DM generation without publishing a stale deterministic fallback", async () => {
     vi.useFakeTimers();
     const deterministicFallback = vi.spyOn(CapabilityRegistry.prototype, "deterministicFallback");
@@ -7235,6 +7406,126 @@ describe("social director", () => {
       vi.clearAllTimers();
       vi.useRealTimers();
     }
+  });
+
+  it("retires only the matching human-rooted ambient continuation and suppresses its late output", async () => {
+    const now = Date.parse("2026-07-17T10:00:00.000Z");
+    const retiredHuman = {
+      id: "guest-ambient-retired",
+      name: "Retired Guest",
+      kind: "human" as const,
+      status: "offline" as const,
+      avatar: { color: "#123", accent: "#456", glyph: "R" },
+    };
+    const survivingHuman = {
+      ...retiredHuman,
+      id: "guest-ambient-survivor",
+      name: "Surviving Guest",
+      avatar: { ...retiredHuman.avatar, glyph: "S" },
+    };
+    const store = new RoomStore("/tmp/director-actor-ambient-isolation-unused.json");
+    const retiredRoot = createMessage("lobby", retiredHuman.id, "continue this retired topic");
+    const survivingRoot = createMessage("the-pub", survivingHuman.id, "keep this other topic");
+    store.addPublicMessage(retiredRoot);
+    store.addPublicMessage(survivingRoot);
+    let selectedId = "";
+    let resolveScene!: (lines: Array<{
+      personaId: string;
+      content: string;
+      source: "lm";
+      sourceIds: string[];
+    }>) => void;
+    const generateScene = vi.fn((request: { selected: Array<(typeof PERSONAS)[number]> }) => {
+      selectedId = request.selected[0]!.id;
+      return new Promise<Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>>((resolve) => { resolveScene = resolve; });
+    });
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => [retiredHuman, survivingHuman, ...PERSONAS],
+      () => 0,
+      {
+        now: () => now,
+        rng: () => 0.99,
+        consideredConversationChance: 0,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "lobby" ? 50 : 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+    const baseThread = (input: {
+      root: typeof retiredRoot;
+      humanActorId: string;
+    }): AmbientThreadState => ({
+      seed: "Continue the exact human-rooted topic.",
+      seedKey: `human:${input.root.id}`,
+      semanticFamily: "human-started-topic",
+      episodeId: `episode-${input.root.id}`,
+      causalRootId: input.root.id,
+      humanActorId: input.humanActorId,
+      messageCount: 0,
+      participantIds: [],
+      actionHistory: [],
+      shape: { minimumMessages: 2, softTargetMessages: 3, hardMaximumMessages: 4 },
+      hasOpenHook: true,
+      nextEligibleAt: now,
+      debateBeat: false,
+      languageHint: "en",
+      origin: "human_topic",
+      openedAt: now,
+      updatedAt: now,
+    });
+    const retiredThread = baseThread({ root: retiredRoot, humanActorId: retiredHuman.id });
+    const survivingThread = baseThread({ root: survivingRoot, humanActorId: survivingHuman.id });
+    const internals = director as unknown as {
+      runAmbient: () => Promise<void>;
+      ambientThreads: Map<string, AmbientThreadState>;
+      channelEpoch: Map<string, number>;
+    };
+    internals.ambientThreads.set("lobby", retiredThread);
+    internals.ambientThreads.set("the-pub", survivingThread);
+
+    const pending = internals.runAmbient();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(generateScene).toHaveBeenCalledTimes(1);
+    expect(selectedId).not.toBe("");
+    const epochsBefore = new Map(internals.channelEpoch);
+    director.invalidatePublicWorkForHumanActor(retiredHuman.id);
+    expect(internals.ambientThreads.has("lobby")).toBe(false);
+    expect(internals.ambientThreads.get("the-pub")).toBe(survivingThread);
+    expect(internals.channelEpoch).toEqual(epochsBefore);
+
+    resolveScene([{
+      personaId: selectedId,
+      content: "this retired continuation must never be published",
+      source: "lm",
+      sourceIds: [],
+    }]);
+    await pending;
+
+    expect(store.getAllMessages().filter((message) => message.authorId.startsWith("ai-"))).toEqual([]);
+    expect(internals.ambientThreads.get("the-pub")).toBe(survivingThread);
+    director.stop();
   });
 
   it("executes a typed multilingual weather plan and publishes only sourced answerable forecast evidence", async () => {

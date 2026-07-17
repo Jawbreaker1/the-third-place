@@ -155,6 +155,10 @@ export async function getAdminMemoryActor(id: string): Promise<AdminMemoryActorD
   return await request(`/api/admin/memory/actors/${encodeURIComponent(id)}`) as AdminMemoryActorDetail;
 }
 
+export async function deleteAdminMemoryActor(id: string): Promise<void> {
+  await request(`/api/admin/memory/actors/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
 export async function patchAdminMemoryItem(id: string, patch: AdminMemoryItemPatch): Promise<void> {
   await request(`/api/admin/memory/items/${encodeURIComponent(id)}`, {
     method: "PATCH",

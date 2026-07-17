@@ -28,7 +28,7 @@ const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/u;
 export interface SocialMemoryAdminActor {
   id: string;
   name: string;
-  kind: "resident" | "human";
+  kind: "resident" | "human" | "unknown";
 }
 
 export interface SocialMemoryAdminOptions {
@@ -286,7 +286,8 @@ export class SocialMemoryAdmin {
     }
     // A human can leave, or a resident can be removed, while their directed
     // relationship edges remain useful historical state. Keep those actors
-    // inspectable even when the live catalog no longer knows their display name.
+    // inspectable, but never infer actor type from an ID prefix: only the
+    // durable companion/catalog can authorize human erasure.
     for (const id of this.#store.overview().actorIds) {
       if (result.length >= MAX_CATALOG_ACTORS) break;
       if (seen.has(id)) continue;
@@ -294,7 +295,7 @@ export class SocialMemoryAdmin {
       result.push({
         id,
         name: id,
-        kind: id.startsWith("ai-") || id.startsWith("resident-") ? "resident" : "human",
+        kind: "unknown",
       });
     }
     return result;

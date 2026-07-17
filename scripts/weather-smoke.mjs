@@ -1,4 +1,5 @@
 import { io } from "socket.io-client";
+import { retireSmokeSession } from "./smoke-session.mjs";
 
 const baseUrl = process.env.APP_BASE_URL ?? "http://127.0.0.1:4000";
 const marker = Date.now().toString(36).slice(-6);
@@ -97,25 +98,33 @@ const emitAck = (socket, event, payload, timeoutMs = 10_000) =>
   });
 
 const createConnection = async (caseId, index) => {
-  const response = await fetch(`${baseUrl}/api/session`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: `Weather-${marker}-${index + 1}` }),
-  });
-  const body = await response.json();
-  if (!response.ok) throw new Error(`${caseId}: session failed: ${body.error ?? response.status}`);
-  const cookie = response.headers.get("set-cookie")?.split(";")[0];
-  if (!cookie) throw new Error(`${caseId}: session endpoint did not return a cookie`);
-  const socket = io(baseUrl, {
-    forceNew: true,
-    transports: ["websocket"],
-    extraHeaders: { Cookie: cookie },
-  });
-  const snapshot = await Promise.race([
-    waitForEvent(socket, "room:snapshot", () => true, 10_000),
-    new Promise((_, reject) => socket.once("connect_error", reject)),
-  ]);
-  return { socket, snapshot };
+  let cookie;
+  let socket;
+  try {
+    const response = await fetch(`${baseUrl}/api/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: `Weather-${marker}-${index + 1}` }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(`${caseId}: session failed: ${body.error ?? response.status}`);
+    cookie = response.headers.get("set-cookie")?.split(";")[0];
+    if (!cookie) throw new Error(`${caseId}: session endpoint did not return a cookie`);
+    socket = io(baseUrl, {
+      forceNew: true,
+      transports: ["websocket"],
+      extraHeaders: { Cookie: cookie },
+    });
+    const snapshot = await Promise.race([
+      waitForEvent(socket, "room:snapshot", () => true, 10_000),
+      new Promise((_, reject) => socket.once("connect_error", reject)),
+    ]);
+    return { cookie, socket, snapshot };
+  } catch (error) {
+    socket?.disconnect();
+    if (cookie) await retireSmokeSession(baseUrl, cookie);
+    throw error;
+  }
 };
 
 const openMeteoSource = (reply) => reply?.sources?.find((candidate) => {
@@ -193,7 +202,7 @@ const runDmCase = async (testCase, socket) => {
 
 const results = [];
 for (const [index, testCase] of selectedCases.entries()) {
-  const { socket, snapshot } = await createConnection(testCase.id, index);
+  const { cookie, socket, snapshot } = await createConnection(testCase.id, index);
   try {
     const reply = testCase.medium === "public"
       ? await runPublicCase(testCase, socket, snapshot.me)
@@ -208,6 +217,7 @@ for (const [index, testCase] of selectedCases.entries()) {
     });
   } finally {
     socket.disconnect();
+    await retireSmokeSession(baseUrl, cookie);
   }
 }
 
