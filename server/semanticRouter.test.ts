@@ -235,6 +235,8 @@ describe("multilingual semantic router contract", () => {
     expect(properties.s.required).toEqual(expect.arrayContaining(["p", "u", "o"]));
     expect(properties.b.properties.r.enum).toEqual(["none", "optional", "required"]);
     expect(properties.i.properties.k.enum).toContain("identity_question");
+    expect(properties.i.properties.d.enum).toEqual(["brief", "normal", "detailed"]);
+    expect(properties.i.required).toContain("d");
     expect(properties.h.properties.n.enum).toEqual(["none", "helpful", "required"]);
     expect(format.json_schema.schema.required).toContain("h");
 
@@ -242,6 +244,52 @@ describe("multilingual semantic router contract", () => {
     const restricted = buildTurnAnalysisResponseFormat(noNetworkTools) as any;
     expect(restricted.json_schema.schema.properties.e.properties.a.enum).toEqual(["none", "local_datetime"]);
     expect(properties.y.maxItems).toBe(0);
+  });
+
+  it("projects requested answer depth semantically across scripts and fails closed", () => {
+    const cases = [
+      {
+        language: "sv",
+        content: "Aya, ge ett genomarbetat exempel och förklara mekanismen och motåtgärden.",
+      },
+      {
+        language: "ja",
+        content: "具体例を一つ作って、仕組みと防御策を段階的に説明して。",
+      },
+    ];
+
+    for (const fixture of cases) {
+      const routedInput = input({
+        latestMessage: {
+          id: `depth-${fixture.language}`,
+          authorId: "human-1",
+          authorName: "Hana",
+          content: fixture.content,
+        },
+      });
+      const compact = compactWeatherOutput({
+        l: fixture.language,
+        lx: 0.99,
+        rl: fixture.language,
+        rlx: 0.99,
+        i: { k: "request", q: false, r: "expected", d: "detailed", x: 0.97 },
+      });
+      const parsed = parseTurnAnalysisContent(JSON.stringify(compact), routedInput);
+      expect(parsed?.intent.answerDepth).toBe("detailed");
+      expect(projectTrustedTurnAnalysis(parsed).answerDepth).toBe("detailed");
+
+      const uncertain = parseTurnAnalysisContent(JSON.stringify({
+        ...compact,
+        i: { ...compact.i, x: 0.69 },
+      }), routedInput);
+      expect(projectTrustedTurnAnalysis(uncertain).answerDepth).toBe("normal");
+    }
+
+    // Old queued compact output remains readable, but cannot opt into depth.
+    const legacy = parseTurnAnalysisContent(JSON.stringify(compactWeatherOutput()), input());
+    expect(legacy?.intent.answerDepth).toBe("normal");
+    expect(buildTurnAnalysisSystemPrompt()).toContain("requested outcome in context, across languages and scripts");
+    expect(buildTurnAnalysisSystemPrompt()).toContain("A technical noun alone never makes an answer detailed");
   });
 
   it("resolves supplied offline humans semantically across languages and projects only trusted known IDs", () => {
@@ -1127,6 +1175,7 @@ describe("multilingual semantic router contract", () => {
       intentTrusted: false,
       isQuestion: false,
       replyExpected: "none",
+      answerDepth: "normal",
       inferredAddressedIds: [],
       relevantIds: [],
       referencedHumanIds: [],
@@ -1242,6 +1291,52 @@ describe("multilingual semantic router contract", () => {
       y: [],
     };
     expect(parseTurnAnalysisContent(JSON.stringify(compact), input())?.capabilities.discussed).toEqual([]);
+  });
+
+  it("revokes a contradictory compact execution claim without discarding independent answer depth", () => {
+    const compact = {
+      l: "sv",
+      lx: 1,
+      rl: "sv",
+      rlx: 1,
+      i: { k: "request", q: true, r: "expected", d: "detailed", x: 0.95 },
+      p: { a: ["ai-sana"], r: ["ai-sana"], v: ["ai-sana"], x: 1, y: 0.9, h: [], z: 0 },
+      s: { w: 0.5, h: 0, p: 0, a: 0, u: 0, e: 0.5, o: 0, c: 0, x: 0.9 },
+      b: { k: "ordinary", t: "room", r: "none", c: 0, m: 0, x: 0.9 },
+      m: { r: "low", a: "none", c: [], x: 0.9 },
+      e: {
+        a: "none", x: 1, g: null, q: null, u: null, m: null, z: null,
+        k: null, l: null, c: null, w: null, f: null,
+      },
+      c: { d: ["read_url", "web_search"], r: "execute", a: false, i: true, l: false, x: 0.9 },
+      h: { n: "none", q: null, x: 1 },
+      y: [],
+    };
+
+    const parsed = parseTurnAnalysisContent(JSON.stringify(compact), input());
+    expect(parsed).toMatchObject({
+      intent: { kind: "request", replyExpected: "expected", answerDepth: "detailed" },
+      evidence: { action: "none" },
+      capabilities: {
+        discussed: [],
+        requestKind: "none",
+        asksAboutAiIdentity: true,
+        confidence: 0,
+      },
+    });
+    expect(projectTrustedTurnAnalysis(parsed)).toMatchObject({
+      intentTrusted: true,
+      answerDepth: "detailed",
+      capabilityTrusted: false,
+      asksAboutAiIdentity: false,
+    });
+
+    const mislabeled = structuredClone(compact);
+    mislabeled.i.k = "capability_question";
+    expect(parseTurnAnalysisContent(JSON.stringify(mislabeled), input())).toMatchObject({
+      intent: { kind: "question", answerDepth: "detailed" },
+      capabilities: { discussed: [], requestKind: "none", confidence: 0 },
+    });
   });
 
   it("rejects a compact identity route that leaks into capability metadata", () => {

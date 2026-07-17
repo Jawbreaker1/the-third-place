@@ -114,18 +114,30 @@ describe("room history", () => {
     await store.flush();
   });
 
-  it("round-trips a bounded longer considered resident turn", async () => {
+  it("round-trips an exactly ceiling-sized considered or detailed resident turn", async () => {
     const filePath = tempStorePath();
     const store = new RoomStore(filePath);
     await store.load();
-    const content = "å".repeat(650);
-    const message = createMessage("ai-programming", "ai-sana", content, undefined, "lm");
+    const content = "å".repeat(1_600);
+    const message = createMessage("ai-programming", "ai-sana", content, { generation: "lm" });
     store.addPublicMessage(message);
     await store.flush();
 
     const restored = new RoomStore(filePath);
     await restored.load();
     expect(restored.getMessage(message.id)?.content).toBe(content);
+  });
+
+  it("fails closed on a persisted resident turn beyond the shared ceiling", async () => {
+    const filePath = tempStorePath();
+    const oversized = createMessage("ai-programming", "ai-sana", "å".repeat(1_601), { generation: "lm" });
+    const originalBytes = JSON.stringify({ version: 1, messages: [oversized] });
+    await writeFile(filePath, originalBytes, "utf8");
+
+    const store = new RoomStore(filePath);
+    await expect(store.load()).rejects.toBeInstanceOf(RoomStateLoadError);
+    expect(await readFile(filePath, "utf8")).toBe(originalBytes);
+    expect(store.getAllMessages()).toEqual([]);
   });
 
   it("persists private conversations across a restart without exposing them as public history", async () => {

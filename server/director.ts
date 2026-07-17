@@ -780,6 +780,31 @@ export function consideredConversationWordLimits(
   };
 }
 
+/**
+ * A trusted detailed human request may temporarily stretch one accountable
+ * resident beyond their ordinary-chat ceiling. The room register owns the
+ * envelope; the persona still scales it so terse characters do not turn into
+ * the same essay voice. This is never used for idle or voice scenes.
+ */
+export function detailedHumanResponseWordLimits(
+  personas: readonly Persona[],
+  ownerIds: readonly string[],
+  register: ConversationRegister,
+): Record<string, ConversationWordLimit> | undefined {
+  const owners = new Set(ownerIds);
+  const [roomMinimum, roomMaximum] = CONVERSATION_REGISTERS[register].detailedHumanResponseWords;
+  const limits = personas.flatMap((persona) => {
+    if (!owners.has(persona.id)) return [];
+    const maximum = Math.max(
+      roomMinimum,
+      Math.min(roomMaximum, persona.style.hardMaxWords * 4),
+    );
+    const minimum = Math.min(roomMinimum, persona.style.hardMaxWords + 12, maximum);
+    return [[persona.id, { minimum, maximum }] as const];
+  });
+  return limits.length > 0 ? Object.fromEntries(limits) : undefined;
+}
+
 export interface ConsideredConversationGate {
   now: number;
   lastStartedAt?: number;
@@ -1765,6 +1790,7 @@ const semanticSceneContext = (analysis: TurnAnalysis) => {
     languageTag: trusted.languageTag,
     intentTrusted: trusted.intentTrusted,
     replyExpected: trusted.replyExpected,
+    answerDepth: trusted.answerDepth,
     socialTrusted: trusted.socialTrusted,
     warmth: trusted.social.warmth,
     hostility: trusted.social.hostility,
@@ -3484,6 +3510,20 @@ export class SocialDirector {
           : selected[0]
       : undefined;
     const requestOwnerIds = requestOwner ? [requestOwner.id] : [];
+    const directDetailedOwnerOnly = Boolean(
+      requestOwner &&
+      trustedTurn.answerDepth === "detailed" &&
+      signals.mentionedIds.includes(requestOwner.id) &&
+      !evidenceRequested &&
+      !roomRecall &&
+      !referencedHumanMemoryOwner &&
+      signals.reactionNeed !== "required",
+    );
+    if (directDetailedOwnerOnly && requestOwner) selected = [requestOwner];
+    const register = getChannelProfile(trigger.channelId)?.conversationRegister ?? "everyday";
+    const responseWordLimits = trustedTurn.answerDepth === "detailed" && responseExpected
+      ? detailedHumanResponseWordLimits(selected, requestOwnerIds, register)
+      : undefined;
     const relationshipNotes = referencedHumanMemoryOwnerId
       ? referencedHumanNotes
       : this.relationshipNotes(selected, human, publicScope);
@@ -3608,6 +3648,7 @@ export class SocialDirector {
           },
           mustReplyIds: requiredIds,
           requestOwnerIds,
+          wordLimits: responseWordLimits,
           relationshipNotes,
           languageHint: classifiedLanguage(analysis),
           semanticContext: semanticSceneContext(analysis),
@@ -3676,6 +3717,9 @@ export class SocialDirector {
             },
             mustReplyIds: [persona.id],
             requestOwnerIds: focusedOwnsRequest ? [persona.id] : [],
+            wordLimits: focusedOwnsRequest && responseWordLimits?.[persona.id]
+              ? { [persona.id]: responseWordLimits[persona.id] }
+              : undefined,
             relationshipNotes: relationshipNotes[persona.id]
               ? { [persona.id]: relationshipNotes[persona.id] }
               : {},
@@ -3731,6 +3775,14 @@ export class SocialDirector {
     if (!burstIsCurrent()) {
       this.schedulePersistentMemory(messages, human);
       return;
+    }
+    const directlyAddressedOwnerIds = requestOwnerIds.filter((id) => signals.mentionedIds.includes(id));
+    if (
+      directlyAddressedOwnerIds.length > 0 &&
+      !lines.some((line) => directlyAddressedOwnerIds.includes(line.personaId))
+    ) {
+      const structurallyRequiredNonOwners = new Set(conductIds);
+      lines = lines.filter((line) => structurallyRequiredNonOwners.has(line.personaId));
     }
     if (this.capabilityRegistry.requiresDesignatedResponder(capabilityResolution)) {
       // Capability answers have one designated owner. This also prevents an

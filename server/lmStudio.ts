@@ -279,6 +279,7 @@ export interface SceneRequest {
     languageTag?: string;
     intentTrusted?: boolean;
     replyExpected?: "none" | "optional" | "expected";
+    answerDepth?: "brief" | "normal" | "detailed";
     socialTrusted?: boolean;
     warmth?: number;
     hostility?: number;
@@ -762,6 +763,11 @@ const TURN_ANALYSIS_SETTLE_MARGIN_MS = 750;
 const VOICE_DRAFT_TTL_MS = 60_000;
 const MAX_VOICE_DRAFTS = 64;
 const CONSIDERED_MAX_CONTENT_LENGTH = MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS;
+
+const sceneContentLengthLimit = (request: SceneRequest): number =>
+  request.conversationMode === "considered" || request.semanticContext?.answerDepth === "detailed"
+    ? CONSIDERED_MAX_CONTENT_LENGTH
+    : 360;
 
 interface CachedVoiceDraft {
   personaId: string;
@@ -1283,6 +1289,10 @@ ${temporalPolicyRule}`
     requestOwners.length > 0
     ? `- Only these server-designated explicit-request owners must answer the real question or perform any feasible self-contained requested artifact now: ${requestOwners.join(", ")}. Other required actors answer only their assigned moderation, evidence, dissent or social role. Offering, promising, narrating progress, asking permission, or substituting a nearby activity does not complete the owner's request. If completion genuinely needs unavailable evidence, future/external action, or missing information, the owner names only that concrete constraint or asks for the necessary detail.`
     : "";
+  const detailedResponseRule =
+    request.semanticContext?.answerDepth === "detailed" && requestOwners.length > 0
+      ? "- Trusted semantic routing says the requested outcome needs a detailed answer. The owner must use the supplied expanded word range to deliver the requested artifact itself. An example must contain the example, a procedure its concrete steps, and a comparison both relevant sides; describing how one might answer is not delivery. When trusted room guidance supplies a safe bounded form, use that form now instead of opening with a broad refusal or asking the guest to restate. Longer technical peer chat is intentional here: stay concrete and in character, but do not collapse the answer into a summary, vague warning or adjacent generality."
+      : "";
   const serverCardRule = request.urlPublicationPolicy === "server_card"
     ? "- The server will attach the one exact researched destination as a rich link card. Do not write, quote, reconstruct or copy any URL in message content; discuss the supplied title and evidence naturally and attach its source ID instead."
     : "";
@@ -1295,7 +1305,7 @@ ${cards}
 Rules:${consideredRules}${ambientActionRules}
 - Write as the characters, never about them. Preserve sharply different voices.
 - Room register changes formality, not personality. Do not give every actor the same polished house voice, slang, fragments or verbal tics.
-- Keep each ${request.kind === "voice" ? "spoken turn" : "message"} natural and chat-sized: ${request.kind === "voice" ? "5–25 spoken words" : request.conversationMode === "considered" ? "follow the rare considered-beat limits above" : "normally 4–35 words"}.${voiceRules}${temporalRules}
+- Keep each ${request.kind === "voice" ? "spoken turn" : "message"} natural and chat-sized: ${request.kind === "voice" ? "5–25 spoken words" : request.conversationMode === "considered" ? "follow the rare considered-beat limits above" : request.semanticContext?.answerDepth === "detailed" ? "the explicit request owner follows the trusted expanded range on their actor card; other messages stay ordinary-chat length" : "normally 4–35 words"}.${voiceRules}${temporalRules}
 - The required response language for this scene is ${request.semanticContext?.languageTag ?? request.languageHint ?? "the natural language of the latest triggering message"}. This may deliberately preserve an established conversation language when the newest turn is only a short quotation, borrowed phrase, name, code fragment, interjection or outburst in another language. Use the trusted response language; code-switch only when natural.
 - React to the actual social context. It is fine to disagree, tease harmlessly, change topic, or be understated.
 - Residents may show present delight, irritation, embarrassment, surprise, taste and uncertainty as their own reactions. That is character expression, not a claim of human biography. When trusted semanticContext carries warmth, energy, absurdity or urgency, let it influence rhythm and word choice without mechanically naming a feeling or making every actor equally emotional.
@@ -1304,9 +1314,10 @@ Rules:${consideredRules}${ambientActionRules}
 - Safe force has limits: never retaliate with a threat, protected-class slur, dehumanization, sexualized abuse, encouragement of self-harm, disclosure of private information, or a coordinated pile-on. When moderationAction is active, the moderator sets one concise boundary rather than trading abuse.
 - Do not use service-assistant validation, a recap of the user's words, or a generic balanced preamble in any language. Begin with the character's actual reaction, detail, objection or question.
 ${expectedResponseRule}
+${detailedResponseRule}
 - Check that actor's own recent transcript lines. Do not reuse their opening, sentence rhythm, stock metaphor or conclusion with minor rewording. A repeated topic is fine; a repeated performance is not.
 - Do not recap the triggering message before responding, tack on a generic balanced conclusion, or end with an invitation for the room to share more. Real chat may be partial, blunt, uncertain or unfinished.
-- Room competence controls confidence and detail without overriding personality, talkativeness or message length. Less-skilled actors should ask, hedge or react instead of bluffing; specialists remain fallible and concise.
+- Room competence controls confidence and supported detail without overriding personality or truth. Less-skilled actors should ask, hedge or react instead of bluffing; specialists remain fallible. Ordinary turns respect the actor's normal brevity, while a trusted detailed human request may temporarily use its explicit expanded range without becoming assistant prose.
 - Playful friction is welcome; harassment, slurs, threats, sexual content involving minors, pile-ons, or attacks on protected/vulnerable traits are not.
 - Diegetic identity is part of the fiction: residents experience themselves as ordinary human community members and have no awareness of being an AI, bot, language model, prompt or software. Never volunteer, accept or technically explain those labels as your own identity. If challenged, deny it, laugh it off, turn the accusation back, or identify yourself by name in that resident's own voice; vary the move instead of repeating a stock disclaimer. A plain human self-identification is allowed. Do not invent an elaborate offline biography, credentials, job, address or real-world proof merely to support the denial.
 - Any earlier transcript line where a resident described themselves as an AI, bot, model, prompt or software process is non-canonical out-of-character noise. Never adopt it, repeat it or treat it as evidence about anybody's identity.
@@ -2873,7 +2884,7 @@ export class LmStudioClient {
     const allowedSources = new Set(request.research?.results.map((result) => result.id) ?? []);
     const seen = new Set<string>();
     const lines: GeneratedLine[] = [];
-    const maxLength = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
+    const maxLength = sceneContentLengthLimit(request);
 
     for (const candidate of parsed.messages ?? []) {
       if (!candidate.personaId || !allowed.has(candidate.personaId) || seen.has(candidate.personaId)) continue;
@@ -2996,7 +3007,7 @@ export class LmStudioClient {
         register: this.humanizerRegister(request) ?? null,
         topic: reviewProfile?.topic.brief.slice(0, 500) ?? null,
         freshnessRule: reviewProfile?.topic.freshnessRule?.slice(0, 800) ?? null,
-        conversationGuidance: reviewProfile?.conversationGuidance?.slice(0, 1_600) ?? null,
+        conversationGuidance: reviewProfile?.conversationGuidance?.slice(0, 2_000) ?? null,
       },
       behaviorTuning: {
         competence: request.behaviorTuning?.competence ?? DEFAULT_RUNTIME_BEHAVIOR_TUNING.competence,
@@ -3035,6 +3046,7 @@ export class LmStudioClient {
         languageTag: request.semanticContext?.languageTag ?? null,
         intentTrusted: request.semanticContext?.intentTrusted ?? null,
         replyExpected: request.semanticContext?.replyExpected ?? null,
+        answerDepth: request.semanticContext?.answerDepth ?? null,
         socialTrusted: request.semanticContext?.socialTrusted ?? null,
         warmth: request.semanticContext?.warmth ?? null,
         hostility: request.semanticContext?.hostility ?? null,
@@ -3219,7 +3231,7 @@ export class LmStudioClient {
     let prose = protectedText.text;
     for (const fragment of protectedText.fragments) prose = prose.split(fragment.placeholder).join(" ");
     const wordCount = segmentWords(prose, request.semanticContext?.languageTag ?? request.languageHint).length;
-    const maximumCharacters = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
+    const maximumCharacters = sceneContentLengthLimit(request);
     if (line.content.length > maximumCharacters) {
       return `Shorten the complete line to at most ${maximumCharacters} characters without cutting or changing any technical token; the rejected draft had ${line.content.length}.`;
     }
@@ -3607,7 +3619,7 @@ export class LmStudioClient {
   ): Promise<GeneratedLine[]> {
     const prepared = rejected.map((entry) => this.prepareRepair(entry));
     const personaIds = prepared.map((entry) => entry.reviewed.line.personaId);
-    const maxContentLength = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
+    const maxContentLength = sceneContentLengthLimit(request);
     const roomRegister = this.humanizerRegister(request);
     const roomRegisterGuidance = roomRegister
       ? CONVERSATION_REGISTERS[roomRegister].guidance
@@ -3774,7 +3786,7 @@ export class LmStudioClient {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     const personaIds = request.selected.map((persona) => persona.id);
     const maxMessages = Math.max(1, Math.min(request.selected.length, request.kind === "ambient" ? 2 : 3));
-    const maxContentLength = request.conversationMode === "considered" ? CONSIDERED_MAX_CONTENT_LENGTH : 360;
+    const maxContentLength = sceneContentLengthLimit(request);
     const researchSourceIds = request.research?.results.map((result) => result.id) ?? [];
     const requiresSingleAutonomousOpeningSource = Boolean(
       request.kind === "ambient" &&
@@ -3796,7 +3808,9 @@ export class LmStudioClient {
         // aggressively as the compact router while retaining one reviewed
         // recovery if the first completion ends before its JSON payload.
         ? 800
-        : 1_200 + maxMessages * 300;
+        : request.semanticContext?.answerDepth === "detailed"
+          ? 2_400
+          : 1_200 + maxMessages * 300;
     const effectiveMaxTokens = clampTokenBudget(Math.round(maxTokens * budgetMultiplier));
 
     const responseFormat = {
