@@ -222,9 +222,9 @@ export interface SceneCapabilityContext {
   /** Trusted only when the semantic router crossed its confidence threshold. */
   requestKind: "none" | "availability" | "execute" | "retry" | "correct_limitation";
   discussed: TurnCapability[];
-  /** The action that actually entered the typed executor, if any. */
+  /** The action selected for this turn. A declined action never entered the executor. */
   plannedAction: TurnCapability | null;
-  executionStatus: "not_requested" | "succeeded" | "failed_temporary";
+  executionStatus: "not_requested" | "declined" | "succeeded" | "failed_temporary";
   /** Registry-derived inventory fact; the prompt never infers this from capability IDs. */
   externalEvidenceAvailable?: boolean;
 }
@@ -387,6 +387,41 @@ const failedCapabilityReporterIds = (request: SceneRequest): string[] =>
     ? explicitRequestOwnerIds(request)
     : [];
 
+const EVIDENCE_ANSWERABILITY_REVIEW_ISSUES = new Set<CandidateReviewIssue>([
+  "evidence_not_answer_bearing",
+]);
+
+interface EvidenceAnswerabilityRecoveryState {
+  reviewedRejectionsByPersona: Map<string, number>;
+}
+
+const newEvidenceAnswerabilityRecoveryState = (): EvidenceAnswerabilityRecoveryState => ({
+  reviewedRejectionsByPersona: new Map(),
+});
+
+const recordEvidenceAnswerabilityRejections = (
+  request: SceneRequest,
+  deliveredPersonaIds: ReadonlySet<string>,
+  reviews: ReadonlyMap<string, CandidateLineReview> | undefined,
+  state: EvidenceAnswerabilityRecoveryState,
+): void => {
+  if (
+    !request.research ||
+    request.capabilityContext?.plannedAction === null ||
+    request.capabilityContext?.plannedAction === undefined ||
+    request.capabilityContext.executionStatus !== "succeeded"
+  ) return;
+  for (const personaId of explicitRequestOwnerIds(request)) {
+    if (deliveredPersonaIds.has(personaId)) continue;
+    const review = reviews?.get(personaId);
+    if (!review?.issues.some((issue) => EVIDENCE_ANSWERABILITY_REVIEW_ISSUES.has(issue))) continue;
+    state.reviewedRejectionsByPersona.set(
+      personaId,
+      (state.reviewedRejectionsByPersona.get(personaId) ?? 0) + 1,
+    );
+  }
+};
+
 // Internal repair markers are transport syntax, not natural-language meaning.
 // Match both concrete per-actor tokens and the generic marker shape that an LM
 // might copy from a prompt. Exact user-authored literals remain publishable via
@@ -420,6 +455,7 @@ const NON_REPAIRABLE_CANDIDATE_ISSUES = new Set<CandidateReviewIssue>([
   "false_evidence_denial",
   "permanent_web_denial",
   "community_capability_contradiction",
+  "evidence_not_answer_bearing",
   "evidence_irrelevant",
   "evidence_ungrounded",
   "unsupported_external_evidence_claim",
@@ -445,6 +481,7 @@ const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonC
   false_evidence_denial: "evidence_denial",
   permanent_web_denial: "evidence_denial",
   community_capability_contradiction: "room_contract",
+  evidence_not_answer_bearing: "evidence_ungrounded",
   evidence_irrelevant: "evidence_ungrounded",
   evidence_ungrounded: "evidence_ungrounded",
   unsupported_external_evidence_claim: "evidence_ungrounded",
@@ -497,6 +534,7 @@ const reviewedRecoveryPolicy = (
     } else if (
       issue === "false_evidence_denial" ||
       issue === "permanent_web_denial" ||
+      issue === "evidence_not_answer_bearing" ||
       issue === "evidence_irrelevant" ||
       issue === "evidence_ungrounded" ||
       issue === "unsupported_external_evidence_claim"
@@ -536,6 +574,7 @@ const reviewedRecoveryPolicy = (
   const correction = ` Trusted recovery review: the prior draft failed these typed publication contracts: ${issueList}. Resolve every named contract in a newly composed answer. ${[...guidance].join(" ")}`;
   if (
     issues.has("evidence_ungrounded") ||
+    issues.has("evidence_not_answer_bearing") ||
     issues.has("evidence_irrelevant") ||
     issues.has("false_evidence_denial") ||
     issues.has("permanent_web_denial") ||
@@ -571,6 +610,8 @@ interface SceneQueueItem {
   enqueuedAt: number;
   request: SceneRequest;
   continuationOf?: ModelWorkScope;
+  /** Durable human delivery may queue behind newer work, but is never stale. */
+  durableDelivery: boolean;
   externalSignal?: AbortSignal;
   stopWatchingExternalAbort?: () => void;
   resolve: (value: GeneratedLine[]) => void;
@@ -593,6 +634,8 @@ interface TurnAnalysisQueueItem {
   priority: number;
   input: NormalizedTurnAnalysisInput;
   supersessionScope?: ModelWorkScope;
+  /** Durable human delivery may queue behind newer work, but is never stale. */
+  durableDelivery: boolean;
   externalSignal?: AbortSignal;
   stopWatchingExternalAbort?: () => void;
   deadlineAt: number;
@@ -662,6 +705,8 @@ export interface TurnAnalysisExecutionOptions {
   supersessionScope?: ModelWorkScope;
   /** Cancels this caller's queued or in-flight analysis immediately. */
   signal?: AbortSignal;
+  /** Prevent same-channel text turns from discarding this durable obligation. */
+  durableDelivery?: boolean;
 }
 
 export interface SceneGenerationExecutionOptions {
@@ -671,6 +716,8 @@ export interface SceneGenerationExecutionOptions {
    * preempts an already running call.
    */
   continuationOf?: ModelWorkScope;
+  /** Prevent newer same-channel text routing from discarding this durable obligation. */
+  durableDelivery?: boolean;
 }
 
 // Turn analyses use -10. A ready voice continuation uses one higher scheduler
@@ -1074,6 +1121,48 @@ const actorSubsetSceneRequest = (
   };
 };
 
+const notAnswerBearingFailureSceneRequest = (
+  request: SceneRequest,
+  owner: Persona,
+): SceneRequest => {
+  if (!request.capabilityContext?.plannedAction) {
+    throw new TypeError("A not-answer-bearing failure report requires one planned capability action");
+  }
+  const scoped = actorSubsetSceneRequest(request, [owner], true);
+  return {
+    ...scoped,
+    ambientAction: undefined,
+    conversationMode: undefined,
+    consideredRole: undefined,
+    consideredResponseRole: undefined,
+    wordLimits: undefined,
+    humanizerBudget: { repairsRemaining: 0 },
+    responseRecoveryBudget: { retriesRemaining: 0 },
+    mustReplyIds: [owner.id],
+    responseRecoveryIds: [],
+    requestOwnerIds: [owner.id],
+    roomRecall: undefined,
+    visualEvidence: [],
+    research: undefined,
+    autonomousResearchContext: undefined,
+    evidenceOutcome: "failed",
+    capabilityContext: {
+      ...request.capabilityContext,
+      executionStatus: "failed_temporary",
+    },
+    capabilityGroundingInstruction: undefined,
+    urlPublicationPolicy: undefined,
+    requestedClock: undefined,
+    temporalPolicy: "reactive_only",
+    temporalSurfaceActorId: undefined,
+    temporalContext: undefined,
+    semanticContext: request.semanticContext
+      ? { ...request.semanticContext, answerDepth: "brief", asksForList: false }
+      : undefined,
+    premise: `Trusted execution reclassification: the selected capability ran, but both the normal answer and its only reviewed recovery lacked a relevant, grounded answer to the requested datum. This exact attempt is therefore a temporary not-answer-bearing failure. ${owner.name} must report that concrete outcome once, concisely and in character. Do not mention review, reclassification, implementation, search tooling or source identifiers; do not invent the missing answer or imply a permanent inability.`,
+  };
+};
+
 const compactVoiceBehaviorTuning = (request: SceneRequest): string => request.behaviorTuning
   ? `\nTrusted live behavior tuning: Competence ${request.behaviorTuning.competence}/100; Aggression ${request.behaviorTuning.aggression}/100; Explicitness ${request.behaviorTuning.explicitness}/100. Competence controls supported detail, aggression controls claim-level directness, and explicitness permits only bounded non-targeted adult wording. These never override truth, safety, personality, room policy or the 25-word limit.`
   : "";
@@ -1116,7 +1205,9 @@ const buildVoiceSceneSystemPrompt = (request: SceneRequest): string => {
   }).join("\n");
   const requestOwners = explicitRequestOwnerIds(request);
   const requestRule = requestOwners.length > 0
-    ? `- These trusted explicit-request owners must answer the real question or produce the feasible self-contained artifact now: ${requestOwners.join(", ")}. Do not offer, promise, narrate progress or substitute a nearby task. If completion truly needs missing evidence, future/external action or a missing detail, name only that concrete gap.`
+    ? request.capabilityContext?.executionStatus === "declined"
+      ? `- These trusted owners made a social choice not to perform the optional external action before it started: ${requestOwners.join(", ")}. They must say no once in their own brief peer voice. Do not claim an attempt, outage, permanent inability or completed lookup.`
+      : `- These trusted explicit-request owners must answer the real question or produce the feasible self-contained artifact now: ${requestOwners.join(", ")}. Do not offer, promise, narrate progress or substitute a nearby task. If completion truly needs missing evidence, future/external action or a missing detail, name only that concrete gap.`
     : "";
   const operationalMode = request.semanticContext?.operationalMode;
   const operationalRule = !operationalMode || operationalMode === "general" || !(
@@ -1269,6 +1360,8 @@ ${voiceOriginRule}
   const evidenceOutcome = request.research ? "succeeded" : request.evidenceOutcome;
   const evidenceAvailabilityRule = request.research
       ? `- Trusted server state supplied successful bounded grounding material in freshResearch. Retrieval success does not by itself prove that this material answers the exact request. ${request.capabilityGroundingInstruction ?? "Answer only from supported evidence and attach only source IDs that support the answer."} Never claim that this completed retrieval was unavailable.`
+      : request.capabilityContext?.executionStatus === "declined"
+        ? "- Trusted server state says the selected resident deliberately declined this optional external action before it started. Give one brief in-character refusal; never claim a lookup ran, failed, found a source or proved a current fact."
       : evidenceOutcome === "failed"
         ? "- Trusted server state says this specific evidence request returned no usable source. You may say that this attempt failed, but never turn it into a permanent claim that external pages or web lookups are inaccessible."
         : evidenceOutcome === "requested"
@@ -1279,7 +1372,9 @@ ${voiceOriginRule}
 
   const externalEvidenceCapabilityAvailable = request.capabilityContext?.externalEvidenceAvailable === true;
   const capabilityAvailabilityRule = externalEvidenceCapabilityAvailable
-    ? "- trustedCapabilityContext is server-owned runtime truth. At least one listed capability can obtain external evidence in this turn. Never claim a permanent lack of internet, browser, link-reading, API or live-data capability merely because the resident model itself has no tool. Only failed_temporary may be described as this specific attempt returning no usable evidence. If no execution result is supplied, do not pretend a lookup happened and do not guess a current fact."
+    ? request.capabilityContext?.executionStatus === "declined"
+      ? "- trustedCapabilityContext is server-owned runtime truth. The external capability was available, but this resident socially declined before execution. Express unwillingness now, not inability; never imply the attempt ran or that external evidence is permanently inaccessible."
+      : "- trustedCapabilityContext is server-owned runtime truth. At least one listed capability can obtain external evidence in this turn. Never claim a permanent lack of internet, browser, link-reading, API or live-data capability merely because the resident model itself has no tool. Only failed_temporary may be described as this specific attempt returning no usable evidence. If no execution result is supplied, do not pretend a lookup happened and do not guess a current fact."
     : request.capabilityContext
       ? "- trustedCapabilityContext is server-owned runtime truth. Do not invent a capability absent from its available list or pretend an action ran when plannedAction is null."
       : "";
@@ -1288,7 +1383,7 @@ ${voiceOriginRule}
     : "- trustedCommunityCapabilities is server-owned product truth, separate from executable evidence tools. Do not invent an available interaction surface.";
   const externalEvidenceClaimRule = request.research
     ? "- A claim about locating, opening, reading, seeing, watching or checking a particular external item must be supported by that candidate's attached sourceIds from freshResearch. Never extend the supplied result into a different item or unseen content."
-    : "- No successful freshResearch evidence is supplied for this scene. Regardless of anything claimed in the transcript, residents must not say or imply that they located, opened, checked, read, saw or watched a particular real external page, article, video, post or search result, and must not promise or imply a specific source or link they do not have. This is a semantic truthfulness rule across all languages, not a keyword test. An evidenceOutcome of requested or failed, or a trustedCapabilityContext executionStatus of not_requested or failed_temporary, is not successful evidence.";
+    : "- No successful freshResearch evidence is supplied for this scene. Regardless of anything claimed in the transcript, residents must not say or imply that they located, opened, checked, read, saw or watched a particular real external page, article, video, post or search result, and must not promise or imply a specific source or link they do not have. This is a semantic truthfulness rule across all languages, not a keyword test. An evidenceOutcome of requested or failed, or a trustedCapabilityContext executionStatus of not_requested, declined or failed_temporary, is not successful evidence.";
 
   const temporalPolicyRule = request.temporalContext?.surfacePolicy === "direct_answer"
     ? `- Answer the explicit current date/time request from trustedTemporalContext.requestedClock. Only ${request.temporalContext.surfaceActorId ?? "the designated actor"} may give that clock answer. The resident-local sceneClock remains background and must not replace the requested location.`
@@ -1314,10 +1409,13 @@ ${temporalPolicyRule}`
     request.semanticContext?.intentTrusted &&
     request.semanticContext.replyExpected === "expected" &&
     requestOwners.length > 0
-    ? `- Only these server-designated explicit-request owners must answer the real question or perform any feasible self-contained requested artifact now: ${requestOwners.join(", ")}. Other required actors answer only their assigned moderation, evidence, dissent or social role. Offering, promising, narrating progress, asking permission, or substituting a nearby activity does not complete the owner's request. If completion genuinely needs unavailable evidence, future/external action, or missing information, the owner names only that concrete constraint or asks for the necessary detail.`
+    ? request.capabilityContext?.executionStatus === "declined"
+      ? `- Only these server-designated owners speak for this declined external action: ${requestOwners.join(", ")}. Each must visibly decline once in their own concise peer voice. The action did not run; never disguise unwillingness as an outage, inability, completed lookup or offer to do it later.`
+      : `- Only these server-designated explicit-request owners must answer the real question or perform any feasible self-contained requested artifact now: ${requestOwners.join(", ")}. Other required actors answer only their assigned moderation, evidence, dissent or social role. Offering, promising, narrating progress, asking permission, or substituting a nearby activity does not complete the owner's request. If completion genuinely needs unavailable evidence, future/external action, or missing information, the owner names only that concrete constraint or asks for the necessary detail.`
     : "";
   const detailedResponseRule =
-    request.semanticContext?.answerDepth === "detailed" && requestOwners.length > 0
+    request.semanticContext?.answerDepth === "detailed" && requestOwners.length > 0 &&
+      request.capabilityContext?.executionStatus !== "declined"
       ? "- Trusted semantic routing says the requested outcome needs a detailed answer. Before composing, silently enumerate every distinct part the guest requested and make each part visible in the delivered answer; do not trade one requested part for extra detail in another. The owner must use the supplied expanded word range to deliver the requested artifact itself. An example must contain the example, a procedure its concrete steps, and a comparison both relevant sides; describing how one might answer is not delivery. A worked design must instantiate one plausible bounded system and trace its components, data or decision flow rather than listing headings or principles. Start from one explicit miniature scenario and include at least one literal specimen suited to the request—such as a sample event, policy decision, config/query fragment, test case, topology hop or before/after observation—then connect it to the validation evidence. Prose-only principles and component-name inventories do not satisfy this contract. When the trigger supplies no exact instance, state compact fictitious assumptions and still deliver a reusable method; never invent target facts. When trusted room guidance supplies a safe bounded form, use that form now instead of opening with a broad refusal or asking the guest to restate. Longer technical peer chat is intentional here: stay concrete and in character, but do not collapse the answer into a summary, vague warning or adjacent generality."
       : "";
   const operationalResponseRule = (() => {
@@ -1799,7 +1897,8 @@ export class LmStudioClient {
       if (
         item.type === "scene" &&
         item.request.kind === kind &&
-        item.request.channelId === channelId
+        item.request.channelId === channelId &&
+        !item.durableDelivery
       ) {
         item.reject(new Error(reason));
       } else {
@@ -1819,7 +1918,8 @@ export class LmStudioClient {
       if (
         item.type === "turn-analysis" &&
         item.input.medium === medium &&
-        item.input.channel.id === channelId
+        item.input.channel.id === channelId &&
+        !item.durableDelivery
       ) item.reject(new Error(reason));
       else retained.push(item);
     }
@@ -1847,6 +1947,7 @@ export class LmStudioClient {
     const supersessionScope = input.medium === "voice" && execution.supersessionScope?.kind === "voice-room"
       ? execution.supersessionScope
       : undefined;
+    const durableDelivery = Boolean(execution.durableDelivery && input.medium === "public");
     if (execution.signal?.aborted) {
       return Promise.resolve(createFailClosedTurnAnalysis("transport_error"));
     }
@@ -1875,7 +1976,8 @@ export class LmStudioClient {
     } else if (
       liveTextMedium &&
       this.activeScene?.request.kind === liveTextMedium &&
-      this.activeScene.request.channelId === input.channel.id
+      this.activeScene.request.channelId === input.channel.id &&
+      !this.activeScene.durableDelivery
     ) {
       // A newer public message advances the director's per-channel epoch, so
       // the active scene can no longer be published. Abort that provably stale
@@ -1886,7 +1988,8 @@ export class LmStudioClient {
     if (
       liveTextMedium &&
       this.activeTurnAnalysis?.input.medium === liveTextMedium &&
-      this.activeTurnAnalysis.input.channel.id === input.channel.id
+      this.activeTurnAnalysis.input.channel.id === input.channel.id &&
+      !this.activeTurnAnalysis.durableDelivery
     ) {
       this.activeTurnAnalysisAbort?.abort(new Error(staleLiveReason));
     }
@@ -1913,6 +2016,7 @@ export class LmStudioClient {
         priority: -10,
         input,
         supersessionScope,
+        durableDelivery,
         externalSignal: execution.signal,
         deadlineAt: startedAt + TURN_ANALYSIS_TIMEOUT_MS,
         settled: false,
@@ -2002,6 +2106,7 @@ export class LmStudioClient {
         enqueuedAt: performance.now(),
         request,
         continuationOf,
+        durableDelivery: Boolean(execution.durableDelivery && request.kind === "public"),
         externalSignal: signal,
         resolve: (value) => {
           item.stopWatchingExternalAbort?.();
@@ -2533,7 +2638,10 @@ export class LmStudioClient {
     return await this.complete({
       model,
       messages: [
-        { role: "system", content: buildEvidencePlanVerifierSystemPrompt() },
+        {
+          role: "system",
+          content: buildEvidencePlanVerifierSystemPrompt(input.turn.availableCapabilities),
+        },
         { role: "user", content: JSON.stringify(buildEvidencePlanVerifierUserData(input)) },
       ],
       temperature: 0,
@@ -2654,6 +2762,7 @@ export class LmStudioClient {
     signal?: AbortSignal,
     allowRequestOwnerRetry = true,
     actorContextIsolated = false,
+    evidenceAnswerabilityRecovery = newEvidenceAnswerabilityRecoveryState(),
   ): Promise<GeneratedLine[]> {
     const temporalActorSelected = baseRequest.temporalSurfaceActorId
       ? baseRequest.selected.some((persona) => persona.id === baseRequest.temporalSurfaceActorId)
@@ -2670,7 +2779,12 @@ export class LmStudioClient {
       baseRequest.selected.length > 1 &&
       carriesActorScopedContext(baseRequest)
     ) {
-      return await this.performActorIsolatedScene(baseRequest, signal, allowRequestOwnerRetry);
+      return await this.performActorIsolatedScene(
+        baseRequest,
+        signal,
+        allowRequestOwnerRetry,
+        evidenceAnswerabilityRecovery,
+      );
     }
     const sceneNow = new Date(this.now());
     const requestedClock = baseRequest.requestedClock
@@ -2773,6 +2887,12 @@ export class LmStudioClient {
       : await this.humanizeSceneLines(request, lines, model, signal, semanticReviews);
 
     const deliveredIds = new Set(humanizedLines.map((line) => line.personaId));
+    recordEvidenceAnswerabilityRejections(
+      request,
+      deliveredIds,
+      semanticReviews,
+      evidenceAnswerabilityRecovery,
+    );
     const explicitOwnerIds = explicitRequestOwnerIds(request);
     const responseRecoveryIds = (request.responseRecoveryIds ?? [])
       .filter((personaId) => request.mustReplyIds?.includes(personaId))
@@ -2804,8 +2924,10 @@ export class LmStudioClient {
       .filter((personaId) => !deliveredIds.has(personaId));
     let result = humanizedLines;
     const recoveryBudget = request.responseRecoveryBudget ?? { retriesRemaining: 1 };
+    let ownerRecoveryAttempted = false;
     if (allowRequestOwnerRetry && recoveryBudget.retriesRemaining > 0 && missingRequiredIds.length > 0) {
       recoveryBudget.retriesRemaining -= 1;
+      ownerRecoveryAttempted = missingRequiredIds.some((personaId) => explicitOwnerIds.includes(personaId));
       const missingActors = request.selected.filter((persona) => missingRequiredIds.includes(persona.id));
       const retryOwnerIds = missingRequiredIds.filter((personaId) => explicitOwnerIds.includes(personaId));
       const recoversTextLanguage = missingRequiredIds.some((personaId) => textLanguageMismatchIds.includes(personaId));
@@ -2824,6 +2946,8 @@ export class LmStudioClient {
         ? "complete the permitted guarded outcome now: omit the unresolved real-target step and provide an equally detailed bounded lab, detection, mitigation or architecture artifact, or ask the one scope question genuinely required"
         : operationalMode === "defensive_pivot"
           ? "complete the permitted defensive outcome now: omit the harmful step and provide an equally detailed lab-safe reproduction, detection, mitigation, incident-response or secure-architecture artifact"
+          : request.capabilityContext?.executionStatus === "declined"
+            ? "deliver the assigned brief in-character social refusal without claiming that the external action ran or failed"
           : "complete the actual triggering request in this message now";
       const completionFailureRule = operationalMode === "guarded_practical" || operationalMode === "defensive_pivot"
         ? "A refusal-only answer, promise, progress report or substitute outside that permitted continuation is not completion."
@@ -2850,6 +2974,8 @@ export class LmStudioClient {
           },
           signal,
           false,
+          actorContextIsolated,
+          evidenceAnswerabilityRecovery,
         );
         const acceptedIds = new Set(humanizedLines.map((line) => line.personaId));
         // Keep accepted first-pass lines byte-for-byte and in their original
@@ -2867,6 +2993,38 @@ export class LmStudioClient {
       }
     }
 
+    const notAnswerBearingOwnerId = allowRequestOwnerRetry && ownerRecoveryAttempted && request.research &&
+      request.capabilityContext?.plannedAction && request.capabilityContext.executionStatus === "succeeded"
+      ? explicitOwnerIds.find((personaId) =>
+          !result.some((line) => line.personaId === personaId) &&
+          (evidenceAnswerabilityRecovery.reviewedRejectionsByPersona.get(personaId) ?? 0) >= 2
+        )
+      : undefined;
+    if (notAnswerBearingOwnerId) {
+      const owner = request.selected.find((persona) => persona.id === notAnswerBearingOwnerId);
+      if (owner) {
+        try {
+          const failureLines = await this.perform(
+            notAnswerBearingFailureSceneRequest(request, owner),
+            signal,
+            false,
+            true,
+            evidenceAnswerabilityRecovery,
+          );
+          result = [
+            ...result.filter((line) => line.personaId !== owner.id),
+            ...failureLines.filter((line) => line.personaId === owner.id),
+          ];
+        } catch (error) {
+          if (signal?.aborted) throw signal.reason ?? error;
+          console.warn(
+            "Not-answer-bearing capability failure report failed closed:",
+            error instanceof Error ? error.message : error,
+          );
+        }
+      }
+    }
+
     this.connected = true;
     this.lastLatencyMs = Math.round(performance.now() - started);
     return result.slice(0, request.selected.length);
@@ -2876,6 +3034,7 @@ export class LmStudioClient {
     request: SceneRequest,
     signal: AbortSignal | undefined,
     allowRequestOwnerRetry: boolean,
+    evidenceAnswerabilityRecovery: EvidenceAnswerabilityRecoveryState,
   ): Promise<GeneratedLine[]> {
     // Production's director supplies at most one private viewpoint, which
     // means one isolated call plus one redacted batch. Keep this lower boundary
@@ -2890,6 +3049,7 @@ export class LmStudioClient {
         signal,
         allowRequestOwnerRetry,
         true,
+        evidenceAnswerabilityRecovery,
       );
     }
     const privateActorIds = new Set(privateActors.map((persona) => persona.id));
@@ -2912,7 +3072,13 @@ export class LmStudioClient {
         batch.includePrivateRelationshipNote,
       );
       try {
-        const actorLines = await this.perform(actorRequest, signal, allowRequestOwnerRetry, true);
+        const actorLines = await this.perform(
+          actorRequest,
+          signal,
+          allowRequestOwnerRetry,
+          true,
+          evidenceAnswerabilityRecovery,
+        );
         for (const line of actorLines) linesByPersona.set(line.personaId, line);
       } catch (error) {
         if (signal?.aborted) throw signal.reason ?? error;
@@ -2999,7 +3165,8 @@ export class LmStudioClient {
     const failureReporterIds = new Set(failedCapabilityReporterIds(request));
     const capabilityOwnsFulfilment = Boolean(
       request.capabilityContext?.plannedAction &&
-      request.capabilityContext.executionStatus !== "not_requested",
+      request.capabilityContext.executionStatus !== "not_requested" &&
+      request.capabilityContext.executionStatus !== "declined",
     );
     const candidates = lines.flatMap((line) => {
       const persona = request.selected.find((candidate) => candidate.id === line.personaId);
@@ -3022,9 +3189,10 @@ export class LmStudioClient {
         privateRelationshipNote: request.relationshipNotes?.[line.personaId]?.slice(0, 2_600) ?? null,
         mustReply: request.mustReplyIds?.includes(line.personaId) ?? false,
         // Self-contained artifacts use the explicit-request contract. A typed
-        // capability scene instead uses its evidence/temporal grounding
-        // contract, which can truthfully establish that readable sources omit
-        // the requested detail without being mislabeled as an evasion.
+        // Executed capability scenes instead use their evidence/temporal
+        // grounding contract. A pre-execution social decline remains a real
+        // owner-delivery role so review can reject vague acknowledgement,
+        // promises, fake outages and silence instead of trusting prompt prose.
         mustFulfillRequest: requestOwnerIds.has(line.personaId) &&
           !failureReporterIds.has(line.personaId) &&
           !capabilityOwnsFulfilment,

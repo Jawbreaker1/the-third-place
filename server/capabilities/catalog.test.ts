@@ -16,6 +16,7 @@ import {
   hasExternalEvidenceCapability,
   isExternalEvidenceCapability,
   validateCapabilityArgumentShape,
+  type CapabilityArgumentField,
   type CapabilityArgumentValues,
   type TurnCapability,
 } from "./catalog.js";
@@ -55,10 +56,14 @@ describe("declarative capability catalog", () => {
 
   it("classifies generic discovery, exact-source reads and narrow structured lookups declaratively", () => {
     expect(CAPABILITY_CATALOG.web_search.routingClass).toBe("generic_external_default");
+    expect(CAPABILITY_CATALOG.web_search.arguments.defaultValues).toEqual({ m: "web" });
     expect(CAPABILITY_CATALOG.read_url.routingClass).toBe("exact_source");
     expect(CAPABILITY_CATALOG.market_snapshot.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.football_data.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.local_datetime.routingClass).toBe("narrow_structured");
+    expect(CAPABILITY_CATALOG.local_datetime.arguments.defaultValues).toEqual({
+      k: "current_datetime",
+    });
     expect(CAPABILITY_CATALOG.weather_forecast.routingClass).toBe("narrow_structured");
     expect(CAPABILITY_CATALOG.web_search.broadDiscoveryFallback).toBe(true);
     expect(CAPABILITY_CATALOG_ENTRIES
@@ -82,6 +87,8 @@ describe("declarative capability catalog", () => {
         expect(known.has(field)).toBe(true);
       }
       expect(definition.arguments.required.every((field) => definition.arguments.allowed.includes(field))).toBe(true);
+      expect(Object.keys(definition.arguments.defaultValues ?? {}).every((field) =>
+        definition.arguments.allowed.includes(field as CapabilityArgumentField))).toBe(true);
     }
   });
 
@@ -235,6 +242,14 @@ describe("declarative capability catalog", () => {
     expect(market).toContain("US_DJIA: the United States Dow Jones Industrial Average");
     expect(market).toContain("GLOBAL_MAJOR: a bounded cross-region overview");
     expect(market).toContain("rest of the world or other world markets performed");
+    expect(market).toContain("individual entity remains the subject");
+    expect(market).toContain("never replace the member with its container");
+    expect(market).toContain("returning the registered index/basket's own level");
+    expect(market).toContain("cannot be answered by returning the container's level");
+
+    const search = buildCapabilityRoutingGuidance(["web_search"], "verifier");
+    expect(search).toContain("instruction to investigate, look up or verify");
+    expect(search).toContain("Interpret that communicative act semantically in any language");
     expect(market).toContain("Individual equities, market news, history, causes");
 
     const football = buildCapabilityRoutingGuidance(["football_data"], "primary");

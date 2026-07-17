@@ -196,6 +196,32 @@ const cases = [
       value.capabilities.discussed.includes("web_search"),
   },
   {
+    id: "sv-investor-lookup",
+    text: "@Mira kan du kolla upp Investor?",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    mechanicalAddressedPersonaIds: ["ai-mira"],
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.query?.toLocaleLowerCase().includes("investor") &&
+      value.capabilities.discussed.includes("web_search") &&
+      ["execute", "retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
+    id: "sv-investor-retry",
+    text: "Kolla upp då!",
+    channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },
+    mechanicalAddressedPersonaIds: ["ai-mira"],
+    recentMessages: [
+      { id: "sv-investor-1", authorId: "live-eval-human", authorName: "EvalGuest", content: "Investor på OMX30 till exempel, bra läge?" },
+      { id: "sv-investor-2", authorId: "ai-mira", authorName: "Mira", content: "Jag har ingen aktuell värdering på dem här och nu." },
+    ],
+    capabilities: ["web_search", "market_snapshot", "local_datetime"],
+    check: (value) => value.evidence.action === "web_search" &&
+      value.evidence.query?.toLocaleLowerCase().includes("investor") &&
+      value.capabilities.discussed.includes("web_search") &&
+      ["retry", "correct_limitation"].includes(value.capabilities.requestKind),
+  },
+  {
     id: "de-dax-latest-news",
     text: "Was sind die neuesten Nachrichten zum DAX und welche Unternehmen bewegen ihn heute?",
     channel: { id: "stock-market", name: "stock-market", topic: "Markets, businesses, risk and respectfully incompatible theses." },

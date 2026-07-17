@@ -35,7 +35,11 @@ import {
   type TranscriptLine,
 } from "./lmStudio.js";
 import type { SocialModelClient } from "./switchableModel.js";
-import { createMessage, RoomStore } from "./store.js";
+import {
+  createMessage,
+  RoomStore,
+  type UncommittedPublicMessageAppend,
+} from "./store.js";
 import { ResearchBroker } from "./researchBroker.js";
 import {
   PageReader,
@@ -86,6 +90,10 @@ import {
   type ResearchPacket,
   type WeatherForecastCapabilityProvider,
 } from "./capabilities/registry.js";
+import {
+  decideCapabilityParticipation,
+  type CapabilityParticipationDecision,
+} from "./capabilityParticipation.js";
 import type { MarketSnapshot } from "./marketData/types.js";
 import type { MarketSnapshotService } from "./marketData/service.js";
 import type {
@@ -153,6 +161,8 @@ const HUMAN_REACTION_STATE_LIMIT = 1_000;
 const HUMAN_REACTION_DEBOUNCE_MS = 700;
 const HUMAN_REACTION_HUMAN_COOLDOWN_MS = 24_000;
 const HUMAN_REACTION_MESSAGE_COOLDOWN_MS = 75_000;
+const PENDING_PUBLIC_TURN_RETRY_DELAY_MS = 14_000;
+const PENDING_PUBLIC_TURN_RETRY_COOLDOWN_MS = 12_000;
 const AUTONOMOUS_SOCIAL_MEMORY_WINDOW_MS = 12 * 60_000;
 const AUTONOMOUS_SOCIAL_MEMORY_COOLDOWN_MS = 10 * 60_000;
 const AUTONOMOUS_SOCIAL_MEMORY_MAX_MESSAGES = 8;
@@ -459,7 +469,15 @@ export function recruitReferencedMemoryOwner(
 interface PendingBurst {
   messages: ChatMessage[];
   human: Member;
+  claimedDeliveries: ClaimedPublicTurnTarget[];
   timer: NodeJS.Timeout;
+}
+
+interface ClaimedPublicTurnTarget {
+  messageId: string;
+  channelId: string;
+  personaId: string;
+  attempt: number;
 }
 
 const AMBIENT_THREAD_MAX_MESSAGES = 8;
@@ -1819,7 +1837,10 @@ const semanticUrlCandidates = (candidateSet: PageReadCandidateSet): TurnAnalysis
     context: pageCandidateContext(candidate),
   }));
 
-const semanticFlagsPremise = (analysis: TurnAnalysis): string => {
+const semanticFlagsPremise = (
+  analysis: TurnAnalysis,
+  capabilityParticipation: CapabilityParticipationDecision = "attempt",
+): string => {
   const trusted = projectTrustedTurnAnalysis(analysis);
   const activeModeration = trusted.moderationTrusted && MODERATOR_ACTIONS.has(trusted.moderation.action);
   const operationalPolicyActive = trusted.operationalModeTrusted || trusted.operationalMode === "guarded_practical";
@@ -1847,7 +1868,9 @@ const semanticFlagsPremise = (analysis: TurnAnalysis): string => {
             : "";
   return [
     trusted.intentTrusted && trusted.replyExpected === "expected"
-      ? "The latest turn expects a real response. The designated required resident must directly answer or perform any feasible self-contained request now; an offer, promise, progress report, permission question or adjacent substitute is not completion. If a genuine external action, missing fact or missing detail prevents completion, state that specific constraint instead of pretending to have completed it."
+      ? capabilityParticipation === "decline"
+        ? "The selected resident made a trusted social choice not to perform this optional external action before it began. They must visibly decline once in their own brief peer voice. Express unwillingness now, never a failed attempt, permanent inability, service apology or promise to do it later."
+        : "The latest turn expects a real response. The designated required resident must directly answer or perform any feasible self-contained request now; an offer, promise, progress report, permission question or adjacent substitute is not completion. If a genuine external action, missing fact or missing detail prevents completion, state that specific constraint instead of pretending to have completed it."
       : "",
     trusted.asksForList
       ? "The semantic turn analysis confirms that the human explicitly requested a list; list formatting is allowed if it is the natural answer."
@@ -1901,6 +1924,10 @@ const semanticSceneContext = (analysis: TurnAnalysis) => {
 export class SocialDirector {
   private readonly lastSpoke = new Map<string, number>();
   private readonly pendingBursts = new Map<string, PendingBurst>();
+  private pendingPublicTurnRecoveryTimer?: NodeJS.Timeout;
+  /** One durable direct-human delivery owns a room at a time across all recovery passes. */
+  private readonly pendingPublicTurnChannelsInFlight = new Set<string>();
+  private readonly deferredPublicMessageAppends = new Map<string, UncommittedPublicMessageAppend>();
   private readonly pendingHumanReactions = new Map<string, PendingHumanReaction>();
   private readonly pendingCrowdReactionTimersByHuman = new Map<string, Set<NodeJS.Timeout>>();
   private readonly invalidatedHumanActorIds = new Set<string>();
@@ -2105,6 +2132,7 @@ export class SocialDirector {
     this.started = true;
     this.stopped = false;
     this.scheduleAmbient(14_000);
+    this.schedulePendingPublicTurnRecovery();
   }
 
   private restoreAutonomousAccountingFromHistory(): void {
@@ -2155,8 +2183,17 @@ export class SocialDirector {
     this.started = false;
     if (this.ambientTimer) clearTimeout(this.ambientTimer);
     this.ambientTimer = undefined;
-    for (const burst of this.pendingBursts.values()) clearTimeout(burst.timer);
+    if (this.pendingPublicTurnRecoveryTimer) clearTimeout(this.pendingPublicTurnRecoveryTimer);
+    this.pendingPublicTurnRecoveryTimer = undefined;
+    for (const burst of this.pendingBursts.values()) {
+      clearTimeout(burst.timer);
+      for (const claim of burst.claimedDeliveries) {
+        this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
+        this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+      }
+    }
     this.pendingBursts.clear();
+    this.pendingPublicTurnChannelsInFlight.clear();
     for (const reaction of this.pendingHumanReactions.values()) clearTimeout(reaction.timer);
     this.pendingHumanReactions.clear();
     for (const timers of this.pendingCrowdReactionTimersByHuman.values()) {
@@ -2174,6 +2211,120 @@ export class SocialDirector {
 
   getEvents(): DirectorEvent[] {
     return [...this.directorEvents];
+  }
+
+  /**
+   * Claims durable, still-unanswered direct turns and re-enters their normal
+   * reviewed public pipeline. The outbox, rather than a transcript heuristic,
+   * is the authority: completion is per addressed resident, retries are
+   * bounded, and an interrupted process loses only its process-local claim.
+   */
+  recoverPendingPublicTurns(options: { ignoreAttemptCooldown?: boolean } = {}): number {
+    if (this.stopped) return 0;
+    if (this.pendingPublicTurnRecoveryTimer) {
+      clearTimeout(this.pendingPublicTurnRecoveryTimer);
+      this.pendingPublicTurnRecoveryTimer = undefined;
+    }
+    const now = this.now();
+    let profiles: ReturnType<HumanMemory["listRestorableProfiles"]>;
+    try {
+      profiles = this.humanMemory.listRestorableProfiles?.() ?? [];
+    } catch {
+      return 0;
+    }
+    const humans = new Map(profiles.map((profile) => [profile.member.id, profile.member] as const));
+    const claimedChannels = new Set<string>();
+    let recovered = 0;
+
+    for (const turn of this.store.getPendingPublicTurns()) {
+      const message = this.store.getMessage(turn.messageId);
+      const human = humans.get(turn.authorId);
+      if (!message || !human) {
+        this.store.cancelPendingPublicTurnsForActor(turn.authorId);
+        continue;
+      }
+      if (!CHANNELS.some((channel) => channel.id === turn.channelId)) {
+        for (const target of turn.targets) {
+          this.store.settlePendingPublicTurnTarget(turn.messageId, target.personaId);
+        }
+        continue;
+      }
+      // Image turns enter the social pipeline when bounded vision completes.
+      // A restart converts abandoned pending analyses to unavailable before
+      // this method runs; while the server is live, never race the vision pass.
+      if (message.attachments?.some((attachment) => attachment.analysis.status === "pending")) continue;
+      // One single-model recovery per room at a time. Otherwise several
+      // durable turns in the same room can repeatedly supersede one another
+      // before any of them gets a chance to publish.
+      if (
+        claimedChannels.has(turn.channelId) ||
+        this.pendingPublicTurnChannelsInFlight.has(turn.channelId)
+      ) continue;
+
+      const claims: ClaimedPublicTurnTarget[] = [];
+      for (const target of turn.targets) {
+        if (!PERSONAS.some((persona) => persona.id === target.personaId)) {
+          this.store.cancelPendingPublicTurnsForActor(target.personaId);
+          continue;
+        }
+        const lastAttemptAt = target.lastAttemptAt ? Date.parse(target.lastAttemptAt) : undefined;
+        if (
+          !options.ignoreAttemptCooldown &&
+          lastAttemptAt !== undefined &&
+          Number.isFinite(lastAttemptAt) &&
+          now - lastAttemptAt < this.pendingPublicTurnRetryCooldownMs(target.attempts)
+        ) continue;
+        const claim = this.store.claimPendingPublicTurnTarget(turn.messageId, target.personaId);
+        if (claim) {
+          claims.push({
+            messageId: turn.messageId,
+            channelId: turn.channelId,
+            personaId: target.personaId,
+            attempt: claim.target.attempts,
+          });
+          break;
+        }
+      }
+      if (claims.length === 0) continue;
+
+      claimedChannels.add(turn.channelId);
+      this.pendingPublicTurnChannelsInFlight.add(turn.channelId);
+      recovered += 1;
+      void this.handleHumanBurst([message], { ...human, status: "offline" }, undefined, claims)
+        .catch((error) => {
+          console.warn(
+            "Pending public turn recovery failed:",
+            error instanceof Error ? error.message : error,
+          );
+        })
+        .finally(() => {
+          // The normal publication path settles exact target replies. Every
+          // other exit releases the process lease so a later bounded retry or
+          // restart can continue from the durable attempt count.
+          for (const claim of claims) {
+            this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
+            this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+          }
+          this.schedulePendingPublicTurnRecovery(1_000);
+        });
+    }
+    if (recovered === 0) this.schedulePendingPublicTurnRecovery();
+    return recovered;
+  }
+
+  private schedulePendingPublicTurnRecovery(delayMs = PENDING_PUBLIC_TURN_RETRY_DELAY_MS): void {
+    if (this.stopped || this.pendingPublicTurnRecoveryTimer) return;
+    if (this.store.getPendingPublicTurns().length === 0) return;
+    this.pendingPublicTurnRecoveryTimer = setTimeout(() => {
+      this.pendingPublicTurnRecoveryTimer = undefined;
+      this.recoverPendingPublicTurns();
+    }, Math.max(1_000, delayMs));
+    this.pendingPublicTurnRecoveryTimer.unref?.();
+  }
+
+  private pendingPublicTurnRetryCooldownMs(completedAttempts: number): number {
+    const exponent = Math.max(0, Math.min(4, completedAttempts - 1));
+    return Math.min(120_000, PENDING_PUBLIC_TURN_RETRY_COOLDOWN_MS * (2 ** exponent));
   }
 
   getAutonomousResearchDiagnostics(): AutonomousResearchDiagnostics {
@@ -2208,10 +2359,14 @@ export class SocialDirector {
   invalidatePublicWorkForHumanActor(actorId: string): void {
     if (!actorId) return;
     this.invalidatedHumanActorIds.add(actorId);
+    this.store.cancelPendingPublicTurnsForActor(actorId);
 
     for (const [key, burst] of this.pendingBursts) {
       if (burst.human.id !== actorId) continue;
       clearTimeout(burst.timer);
+      for (const claim of burst.claimedDeliveries) {
+        this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
+      }
       this.pendingBursts.delete(key);
     }
     for (const [key, reaction] of this.pendingHumanReactions) {
@@ -2269,6 +2424,14 @@ export class SocialDirector {
     this.recentAmbientSeedsByChannel.clear();
     this.recentAutonomousResearchSeedsByChannel.clear();
     this.lastAmbientChannelId = undefined;
+    const activePersonaIds = new Set(PERSONAS.map((persona) => persona.id));
+    for (const turn of this.store.getPendingPublicTurns()) {
+      for (const target of turn.targets) {
+        if (!activePersonaIds.has(target.personaId)) {
+          this.store.cancelPendingPublicTurnsForActor(target.personaId);
+        }
+      }
+    }
   }
 
   /**
@@ -2444,15 +2607,72 @@ export class SocialDirector {
   onHumanMessage(message: ChatMessage, human: Member): void {
     if (!this.humanActorWorkIsCurrent(human.id)) return;
     this.noteHumanChannelEvent(message);
-    const burstKey = `${message.channelId}:${human.id}`;
+    const pending = this.store.getPendingPublicTurns().find((turn) => turn.messageId === message.id);
+    const claimedDeliveries = pending
+      ? this.claimOnePendingPublicTurnTarget(pending.messageId)
+      : [];
+    if (pending && claimedDeliveries.length === 0) {
+      // Another durable delivery already owns this room. The outbox, not a
+      // second coalesced scene, will resume this exact message afterwards.
+      this.schedulePendingPublicTurnRecovery(1_000);
+      return;
+    }
+    this.enqueueHumanMessage(message, human, claimedDeliveries);
+    if (pending) {
+      this.schedulePendingPublicTurnRecovery();
+    }
+  }
+
+  private claimOnePendingPublicTurnTarget(messageId: string): ClaimedPublicTurnTarget[] {
+    const turn = this.store.getPendingPublicTurns().find((candidate) => candidate.messageId === messageId);
+    if (!turn) return [];
+    if (this.pendingPublicTurnChannelsInFlight.has(turn.channelId)) return [];
+    for (const target of turn.targets) {
+      if (!PERSONAS.some((persona) => persona.id === target.personaId)) continue;
+      const claimed = this.store.claimPendingPublicTurnTarget(messageId, target.personaId);
+      if (claimed) {
+        this.pendingPublicTurnChannelsInFlight.add(turn.channelId);
+        return [{
+          messageId,
+          channelId: turn.channelId,
+          personaId: target.personaId,
+          attempt: claimed.target.attempts,
+        }];
+      }
+    }
+    return [];
+  }
+
+  private enqueueHumanMessage(
+    message: ChatMessage,
+    human: Member,
+    claimedDeliveries: readonly ClaimedPublicTurnTarget[] = [],
+  ): void {
+    const durableMessageId = claimedDeliveries[0]?.messageId;
+    const burstKey = durableMessageId
+      ? `${message.channelId}:${human.id}:durable:${durableMessageId}`
+      : `${message.channelId}:${human.id}`;
     const existing = this.pendingBursts.get(burstKey);
     if (existing) clearTimeout(existing.timer);
     const messages = [...(existing?.messages ?? []), message].slice(-3);
+    const claims = existing?.claimedDeliveries.length
+      ? existing.claimedDeliveries
+      : [...claimedDeliveries].slice(0, 1);
     const timer = setTimeout(() => {
       this.pendingBursts.delete(burstKey);
-      void this.handleHumanBurst(messages, human);
+      void this.handleHumanBurst(messages, human, undefined, claims)
+        .catch((error) => {
+          console.warn("Public human turn failed:", error instanceof Error ? error.message : error);
+        })
+        .finally(() => {
+          for (const claim of claims) {
+            this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
+            this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+          }
+          this.schedulePendingPublicTurnRecovery(1_000);
+        });
     }, 700);
-    this.pendingBursts.set(burstKey, { messages, human, timer });
+    this.pendingBursts.set(burstKey, { messages, human, claimedDeliveries: claims, timer });
   }
 
   /**
@@ -2678,9 +2898,25 @@ export class SocialDirector {
       const oldest = this.handledHumanImageIds.values().next().value as string | undefined;
       if (oldest) this.handledHumanImageIds.delete(oldest);
     }
-    void this.handleHumanBurst([message], human, observation).catch((error) => {
-      console.warn("Image scene failed:", error instanceof Error ? error.message : error);
-    });
+    const claims = this.claimOnePendingPublicTurnTarget(message.id);
+    if (
+      this.store.getPendingPublicTurns().some((turn) => turn.messageId === message.id) &&
+      claims.length === 0
+    ) {
+      this.schedulePendingPublicTurnRecovery(1_000);
+      return;
+    }
+    void this.handleHumanBurst([message], human, observation, claims)
+      .catch((error) => {
+        console.warn("Image scene failed:", error instanceof Error ? error.message : error);
+      })
+      .finally(() => {
+        for (const claim of claims) {
+          this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
+          this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+        }
+        this.schedulePendingPublicTurnRecovery(1_000);
+      });
   }
 
   private noteHumanChannelEvent(message: ChatMessage): void {
@@ -2767,6 +3003,8 @@ export class SocialDirector {
     candidateSet: PageReadCandidateSet;
     allowSearch: boolean;
     humanCandidates?: NonNullable<TurnAnalysisInput["humanCandidates"]>;
+    mechanicalAddressedPersonaIdsOverride?: readonly string[];
+    durableDelivery?: boolean;
   }): Promise<TurnAnalysis> {
     const channel = getChannelProfile(input.channelId);
     const currentIds = new Set(input.burst.map((message) => message.id));
@@ -2786,9 +3024,13 @@ export class SocialDirector {
     const latest = this.classifierMessage(input.latest);
     latest.content = boundedUntrustedText(input.latest.content, 4_000);
     const exactMentionIds = analyzeSocialSignals(input.latest.content, input.personas).mentionedIds;
-    const mechanicalAddressedPersonaIds = input.medium === "dm" && input.personas.length === 1
-      ? [input.personas[0]!.id]
-      : addressedPersonaIds(exactMentionIds, input.replyTarget, input.personas);
+    const mechanicalAddressedPersonaIds = input.mechanicalAddressedPersonaIdsOverride
+      ? [...new Set(input.mechanicalAddressedPersonaIdsOverride)].filter((personaId) =>
+          input.personas.some((persona) => persona.id === personaId)
+        )
+      : input.medium === "dm" && input.personas.length === 1
+        ? [input.personas[0]!.id]
+        : addressedPersonaIds(exactMentionIds, input.replyTarget, input.personas);
     try {
       if (typeof this.lm.analyzeTurn !== "function") return createFailClosedTurnAnalysis("disabled");
       return await this.lm.analyzeTurn({
@@ -2811,7 +3053,7 @@ export class SocialDirector {
         urlCandidates: semanticUrlCandidates(input.candidateSet),
         availableCapabilities,
         historyRecallAvailable: input.medium === "public",
-      });
+      }, { durableDelivery: input.durableDelivery });
     } catch (error) {
       console.warn("Turn analysis failed closed:", error instanceof Error ? error.message : error);
       return createFailClosedTurnAnalysis("transport_error");
@@ -2831,6 +3073,7 @@ export class SocialDirector {
     available: TurnCapability[];
     invocation?: CapabilityInvocation;
     resolution?: EvidenceResolution;
+    participation?: CapabilityParticipationDecision;
   }): SceneCapabilityContext {
     const trusted = projectTrustedTurnAnalysis(input.analysis);
     const plannedAction = input.invocation?.capability ?? null;
@@ -2842,6 +3085,8 @@ export class SocialDirector {
       plannedAction,
       executionStatus: plannedAction === null
         ? "not_requested"
+        : input.participation === "decline"
+          ? "declined"
         : input.resolution?.state === "grounding_available"
           ? "succeeded"
           : "failed_temporary",
@@ -3297,14 +3542,16 @@ export class SocialDirector {
     messages: ChatMessage[],
     human: Member,
     visualObservation?: VisualObservation,
+    preclaimedDeliveries: readonly ClaimedPublicTurnTarget[] = [],
   ): Promise<void> {
     const trigger = messages.at(-1);
     if (!trigger) return;
+    let durableDelivery = preclaimedDeliveries.length > 0;
     const burstEpoch = this.humanMessageEpochById.get(trigger.id)
       ?? (this.channelEpoch.get(trigger.channelId) ?? 0);
     const burstIsCurrent = (): boolean =>
       this.humanActorWorkIsCurrent(human.id) &&
-      burstEpoch === (this.channelEpoch.get(trigger.channelId) ?? 0);
+      (durableDelivery || burstEpoch === (this.channelEpoch.get(trigger.channelId) ?? 0));
     if (!burstIsCurrent()) {
       this.schedulePersistentMemory(messages, human);
       return;
@@ -3336,6 +3583,7 @@ export class SocialDirector {
       : undefined;
     const initialCandidates = this.actorChannels.candidatesFor(trigger.channelId);
     const humanCandidates = this.offlineHumanCandidates(human.id);
+    const preclaimedPersonaIds = [...new Set(preclaimedDeliveries.map((claim) => claim.personaId))];
     const analysis = await this.analyzeHumanTurn({
       medium: "public",
       turnId: `public:${trigger.id}`,
@@ -3348,6 +3596,10 @@ export class SocialDirector {
       candidateSet,
       allowSearch: true,
       humanCandidates,
+      durableDelivery,
+      ...(preclaimedPersonaIds.length > 0
+        ? { mechanicalAddressedPersonaIdsOverride: preclaimedPersonaIds }
+        : {}),
     });
     const availableCapabilities = this.availableTurnCapabilities(candidateSet, true, "public");
     if (!burstIsCurrent()) {
@@ -3364,7 +3616,13 @@ export class SocialDirector {
       );
     }
     const mechanicalSignals = analyzeSocialSignals(combined);
-    const deterministicAddressedIds = addressedPersonaIds(mechanicalSignals.mentionedIds, replyTarget);
+    const structurallyAddressedIds = addressedPersonaIds(mechanicalSignals.mentionedIds, replyTarget);
+    // A durable recovery claim is server-owned routing authority. It was
+    // established by the earlier successful semantic pass and must survive a
+    // later router timeout even when the replayed text has no literal @ token.
+    const deterministicAddressedIds = preclaimedPersonaIds.length > 0
+      ? preclaimedPersonaIds
+      : structurallyAddressedIds;
     if (
       analysis.source !== "lm" &&
       deterministicAddressedIds.length === 0 &&
@@ -3510,6 +3768,66 @@ export class SocialDirector {
       }
       invocation = this.capabilityRegistry.planAutomaticRead(pageReadRequest, trigger.content);
     }
+    const claimedDeliveries: ClaimedPublicTurnTarget[] = [...preclaimedDeliveries];
+    if (claimedDeliveries.length === 0 && signals.mentionedIds.length > 0) {
+      const burstMessageIds = new Set(messages.map((message) => message.id));
+      let pendingForBurst = this.store.getPendingPublicTurns().filter((turn) =>
+        burstMessageIds.has(turn.messageId)
+      );
+      const missingTargetIds = signals.mentionedIds.filter((personaId) =>
+        !pendingForBurst.some((turn) =>
+          turn.targets.some((target) => target.personaId === personaId)
+        )
+      );
+      if (missingTargetIds.length > 0) {
+        this.store.registerPendingPublicTurn(trigger.id, { targetPersonaIds: missingTargetIds });
+        // Exact @mentions/replies cross the durability barrier in transport.
+        // Only a model-inferred direct addressee is discovered here and must
+        // establish its own barrier before generation. The structural branch
+        // also keeps legacy/test callers functional without a second disk wait.
+        if (deterministicAddressedIds.length === 0) await this.store.flush();
+        pendingForBurst = this.store.getPendingPublicTurns().filter((turn) =>
+          burstMessageIds.has(turn.messageId)
+        );
+      }
+      const desiredIds = new Set(signals.mentionedIds);
+      const inferredDelivery = deterministicAddressedIds.length === 0;
+      if (pendingForBurst.length > 0 && this.pendingPublicTurnChannelsInFlight.has(trigger.channelId)) {
+        return;
+      }
+      claimLoop: for (const turn of pendingForBurst) {
+        for (const target of turn.targets) {
+          if (!desiredIds.has(target.personaId)) continue;
+          const claim = this.store.claimPendingPublicTurnTarget(turn.messageId, target.personaId);
+          if (claim) {
+            claimedDeliveries.push({
+              messageId: turn.messageId,
+              channelId: turn.channelId,
+              personaId: target.personaId,
+              attempt: claim.target.attempts,
+            });
+            if (inferredDelivery) {
+              this.pendingPublicTurnChannelsInFlight.add(turn.channelId);
+              durableDelivery = true;
+            }
+            break claimLoop;
+          }
+        }
+      }
+      // Another live/recovery episode already owns every exact direct target.
+      // Do not spend a second model call or publish a duplicate response.
+      if (pendingForBurst.length > 0 && claimedDeliveries.length === 0) return;
+    }
+    const settledDeliveryKeys = new Set<string>();
+    const deliveryKey = (claim: ClaimedPublicTurnTarget): string =>
+      `${claim.messageId}\u0000${claim.personaId}`;
+    const settleClaimedDeliveries = (personaId: string): void => {
+      for (const claim of claimedDeliveries) {
+        if (claim.personaId !== personaId) continue;
+        this.store.settlePendingPublicTurnTarget(claim.messageId, claim.personaId);
+        settledDeliveryKeys.add(deliveryKey(claim));
+      }
+    };
     const publishedResponses: ChatMessage[] = [];
     let selectedReadersMarked = false;
     try {
@@ -3530,6 +3848,17 @@ export class SocialDirector {
       evidenceResponder = evidenceSelection.responder;
       if (autoSharedLinkAttempt && evidenceResponder) selected = [evidenceResponder];
     }
+    const capabilityParticipation: CapabilityParticipationDecision = invocation && evidenceResponder
+      ? decideCapabilityParticipation({
+          persona: evidenceResponder,
+          invocation,
+          directlyAddressed: signals.mentionedIds.includes(evidenceResponder.id),
+          urgency: trustedTurn.social.urgency,
+          automatic: Boolean(autoSharedLinkAttempt),
+          recovery: claimedDeliveries.some((claim) => claim.attempt > 1),
+          rng: this.rng,
+        })
+      : "attempt";
     let recallResponder: Persona | undefined;
     if (roomRecall && !evidenceRequested) {
       const witnesses = new Set(roomRecall.witnessPersonaIds);
@@ -3594,8 +3923,11 @@ export class SocialDirector {
       ? recallResponder ?? referencedHumanMemoryOwner ?? selected[0]
       : recallResponder;
     const evidenceMustAnswer = evidenceRequested && (!autoSharedLinkAttempt || automaticReadResponseRequired);
-    const requestOwner = responseExpected || evidenceMustAnswer
-      ? evidenceRequested && evidenceResponder
+    const durableRequestOwner = durableDelivery && claimedDeliveries.length > 0
+      ? selected.find((persona) => claimedDeliveries.some((claim) => claim.personaId === persona.id))
+      : undefined;
+    const requestOwner = responseExpected || evidenceMustAnswer || Boolean(durableRequestOwner)
+      ? durableRequestOwner ?? (evidenceRequested && evidenceResponder
         ? evidenceResponder
         : referencedHumanMemoryOwner && (historyResponseRequired || trustedTurn.isQuestion)
           ? referencedHumanMemoryOwner
@@ -3605,7 +3937,7 @@ export class SocialDirector {
               (persona) => persona.id === detailedExpertPlan.preferredOwner!.id,
             )
             ? detailedExpertPlan.preferredOwner
-            : selected[0]
+            : selected[0])
       : undefined;
     const requestOwnerIds = requestOwner ? [requestOwner.id] : [];
     const directDetailedOwnerOnly = Boolean(
@@ -3674,12 +4006,23 @@ export class SocialDirector {
     let evidencePremise = "";
     try {
       if (invocation) {
-        capabilityResolution = await this.capabilityRegistry.execute(invocation, human.id);
-        capabilityScene = this.capabilityRegistry.sceneContract(invocation, capabilityResolution, {
-          actorName: evidenceResponder?.name ?? "The designated resident",
-          automatic: Boolean(autoSharedLinkAttempt),
-          failureReplyRequired: automaticReadResponseRequired,
-        });
+        if (capabilityParticipation === "decline") {
+          const actorName = evidenceResponder?.name ?? "The designated resident";
+          capabilityScene = {
+            groundingInstruction: "The optional external action did not run because the selected resident socially declined it. Express present unwillingness briefly in character; do not claim an attempt, outage, permanent inability, source result or current external fact.",
+            premise: `${actorName} chose not to perform this optional external lookup now. ${actorName} alone gives one short, natural peer refusal in the human's classified language. This is personality, not a technical failure: never mention tools, implementation, access limitations or a failed attempt.`,
+            externalEvidence: true,
+            suppressResponse: false,
+            responsePolicy: invocation.responsePolicy,
+          };
+        } else {
+          capabilityResolution = await this.capabilityRegistry.execute(invocation, human.id);
+          capabilityScene = this.capabilityRegistry.sceneContract(invocation, capabilityResolution, {
+            actorName: evidenceResponder?.name ?? "The designated resident",
+            automatic: Boolean(autoSharedLinkAttempt),
+            failureReplyRequired: automaticReadResponseRequired,
+          });
+        }
         research = capabilityScene.research;
         evidencePremise = capabilityScene.premise;
         if (capabilityScene.suppressResponse) {
@@ -3710,7 +4053,7 @@ export class SocialDirector {
         hasImage && visualEvidence.length === 0
           ? "The human shared an image, but visual analysis was unavailable. Never claim to see or know visual details; respond only to the caption, or briefly acknowledge that the image details are unavailable."
           : "",
-        semanticFlagsPremise(analysis),
+        semanticFlagsPremise(analysis, capabilityParticipation),
         evidencePremise,
         roomRecall
           ? recallResponder
@@ -3760,6 +4103,7 @@ export class SocialDirector {
             available: availableCapabilities,
             invocation,
             resolution: capabilityResolution,
+            participation: capabilityParticipation,
           }),
           capabilityGroundingInstruction: capabilityScene?.groundingInstruction,
           urlPublicationPolicy: capabilityScene?.urlPublicationPolicy,
@@ -3769,6 +4113,8 @@ export class SocialDirector {
           premise: premise || undefined,
         },
         signals.mentionedIds.length ? 0 : 2,
+        undefined,
+        { durableDelivery },
       );
     } catch (error) {
       console.warn("Public scene failed:", error instanceof Error ? error.message : error);
@@ -3833,6 +4179,7 @@ export class SocialDirector {
               available: availableCapabilities,
               invocation,
               resolution: capabilityResolution,
+              participation: capabilityParticipation,
             }),
             capabilityGroundingInstruction: capabilityScene?.groundingInstruction,
             urlPublicationPolicy: capabilityScene?.urlPublicationPolicy,
@@ -3840,10 +4187,12 @@ export class SocialDirector {
             temporalPolicy: capabilityScene?.temporalPolicy ?? "reactive_only",
             temporalSurfaceActorId: capabilityScene?.temporalPolicy ? persona.id : undefined,
             premise: [
-              semanticFlagsPremise(analysis),
+              semanticFlagsPremise(analysis, capabilityParticipation),
               evidencePremise,
               requestOwnerIds.includes(persona.id)
-                ? `${persona.name} owns the human's explicit request. Complete that request directly now; do not merely acknowledge, offer, defer, change subject or stay silent.`
+                ? capabilityParticipation === "decline"
+                  ? `${persona.name} owns this trusted pre-execution social decline. Refuse the optional action once in a brief peer voice; do not acknowledge vaguely, promise later, claim an attempt or outage, change subject or stay silent.`
+                  : `${persona.name} owns the human's explicit request. Complete that request directly now; do not merely acknowledge, offer, defer, change subject or stay silent.`
                 : signals.mentionedIds.includes(persona.id)
                 ? `${persona.name} was directly addressed and must answer in their own concise voice.`
                 : conductIds.includes(persona.id)
@@ -3862,6 +4211,8 @@ export class SocialDirector {
             ].filter(Boolean).join(" "),
           },
           0,
+          undefined,
+          { durableDelivery },
         );
         if (focused[0]) lines.push(focused[0]);
       } catch (error) {
@@ -3882,7 +4233,10 @@ export class SocialDirector {
       const structurallyRequiredNonOwners = new Set(conductIds);
       lines = lines.filter((line) => structurallyRequiredNonOwners.has(line.personaId));
     }
-    if (this.capabilityRegistry.requiresDesignatedResponder(capabilityResolution)) {
+    if (
+      capabilityParticipation === "decline" ||
+      this.capabilityRegistry.requiresDesignatedResponder(capabilityResolution)
+    ) {
       // Capability answers have one designated owner. This also prevents an
       // evidence-derived non-owner line from surviving after its citations are
       // deliberately removed by the publication policy.
@@ -3935,11 +4289,13 @@ export class SocialDirector {
       try {
         await delay(index === 0 ? 350 : 1_200 + Math.random() * 1_600);
         const ordinarySlotAvailable = this.canSpeak();
+        const directlyAddressedRequired = required.has(persona.id) &&
+          signals.mentionedIds.includes(persona.id);
         const prioritySlotAvailable = !ordinarySlotAvailable &&
           !priorityReplyPublished &&
           (!autoSharedLinkAttempt || automaticReadResponseRequired) &&
           required.has(persona.id) &&
-          this.canUsePriorityHumanReply();
+          (directlyAddressedRequired || this.canUsePriorityHumanReply());
         if (
           !burstIsCurrent() ||
           (!ordinarySlotAvailable && !prioritySlotAvailable)
@@ -3961,9 +4317,16 @@ export class SocialDirector {
           line.source,
           this.messageSources(research, publishedSourceIds),
           linkCardSourceId && research ? linkPreviewFromResearch(research, linkCardSourceId) : undefined,
+          undefined,
+          required.has(persona.id),
+          durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id),
         );
         if (posted) {
+          if (durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id)) {
+            await this.flushDurablePublicReplyBeforeBroadcast(posted);
+          }
           publishedResponses.push(posted);
+          settleClaimedDeliveries(persona.id);
           this.updateRelationship(persona.id, human.id, signals, 0.04);
           if (prioritySlotAvailable) {
             this.recordPriorityHumanReply();
@@ -3980,9 +4343,17 @@ export class SocialDirector {
               trigger.id,
               "fallback",
               this.messageSources(research, fallback.sourceIds),
+              undefined,
+              undefined,
+              true,
+              durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id),
             );
             if (fallbackMessage) {
+              if (durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id)) {
+                await this.flushDurablePublicReplyBeforeBroadcast(fallbackMessage);
+              }
               publishedResponses.push(fallbackMessage);
+              settleClaimedDeliveries(persona.id);
               this.updateRelationship(persona.id, human.id, signals, 0.04);
               if (prioritySlotAvailable) {
                 this.recordPriorityHumanReply();
@@ -4009,6 +4380,13 @@ export class SocialDirector {
     }
     this.schedulePersistentMemory(messages, human);
     } finally {
+      for (const claim of claimedDeliveries) {
+        if (!settledDeliveryKeys.has(deliveryKey(claim))) {
+          this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
+        }
+        this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+      }
+      this.schedulePendingPublicTurnRecovery();
       // Catalog edits advance the channel epoch; actor erasure closes only the
       // matching actor gate. Either invalidation must suppress a late episode.
       if (selectedReadersMarked && burstIsCurrent()) {
@@ -5677,6 +6055,8 @@ export class SocialDirector {
     sources: MessageSource[] = [],
     linkPreview?: LinkPreview,
     autonomousKind?: "ambient" | "research",
+    requiredReply = false,
+    deferBroadcast = false,
   ): ChatMessage | undefined {
     if (this.stopped) return undefined;
     if (!PERSONAS.some((candidate) => candidate.id === persona.id)) return undefined;
@@ -5694,7 +6074,8 @@ export class SocialDirector {
         content: cleaned,
         history: this.store.getAllMessages(),
       }) &&
-      !(generation === "fallback" && replyToId)
+      !(generation === "fallback" && replyToId) &&
+      !(requiredReply && replyToId)
     ) return undefined;
     const requestedReply = replyToId ? this.store.getMessage(replyToId) : undefined;
     // A resident replying to their own immediately preceding autonomous turn
@@ -5722,36 +6103,94 @@ export class SocialDirector {
       sources,
       ...(linkPreview ? { linkPreview } : {}),
     });
-    this.store.addPublicMessage(message, autonomousKind ? {
+    const autonomousPublication = autonomousKind ? {
       kind: autonomousKind,
       attendance: this.getOnlineHumanCount() > 0 ? "attended" : "unattended",
-    } : undefined);
+    } as const : undefined;
+    if (deferBroadcast) {
+      const append = this.store.addUncommittedPublicMessage(message, autonomousPublication);
+      this.deferredPublicMessageAppends.set(message.id, append);
+      return message;
+    }
+    this.store.addPublicMessage(message, autonomousPublication);
+    this.finalizePublicMessage(message, persona, now, autonomousKind);
+    return message;
+  }
+
+  private finalizePublicMessage(
+    message: ChatMessage,
+    persona: Persona,
+    publishedAt: number,
+    autonomousKind?: "ambient" | "research",
+  ): void {
     if (autonomousKind) this.lastUnattendedAmbientAttemptAt = undefined;
     this.actorChannels.noteChannelEvent(message);
-    this.actorChannels.markSpoke(persona.id, channelId, message.id);
-    this.lm.rememberDeliveredLine(persona.id, cleaned, {
+    this.actorChannels.markSpoke(persona.id, message.channelId, message.id);
+    this.lm.rememberDeliveredLine(persona.id, message.content, {
       kind: "public",
-      channelId,
-      channelName: channelId,
+      channelId: message.channelId,
+      channelName: message.channelId,
     });
-    this.io.to("public").emit("message:new", message);
-    this.io.to("public").emit("presence:update", { members: this.getMembers() });
+    this.broadcastPublicMessage(message);
     if (autonomousKind) this.bufferAutonomousSocialMessage(message);
-    this.lastSpoke.set(persona.id, now);
-    while (this.aiTimestamps[0] !== undefined && now - this.aiTimestamps[0] > 60_000) {
+    this.lastSpoke.set(persona.id, publishedAt);
+    while (this.aiTimestamps[0] !== undefined && publishedAt - this.aiTimestamps[0] > 60_000) {
       this.aiTimestamps.shift();
     }
-    this.aiTimestamps.push(now);
+    this.aiTimestamps.push(publishedAt);
     if (autonomousKind) {
       while (
         this.autonomousAiTimestamps[0] !== undefined &&
-        now - this.autonomousAiTimestamps[0] > 60_000
+        publishedAt - this.autonomousAiTimestamps[0] > 60_000
       ) {
         this.autonomousAiTimestamps.shift();
       }
-      this.autonomousAiTimestamps.push(now);
+      this.autonomousAiTimestamps.push(publishedAt);
     }
-    return message;
+  }
+
+  private broadcastPublicMessage(message: ChatMessage): void {
+    this.io.to("public").emit("message:new", message);
+    this.io.to("public").emit("presence:update", { members: this.getMembers() });
+  }
+
+  /**
+   * The browser must not observe completion before the durable trigger and
+   * exact resident reply have crossed the same room-state barrier. A bounded
+   * retry handles a transient rename/write collision. If storage remains
+   * unavailable, roll the speculative row back and leave its exact outbox
+   * target pending; never show a reply that a restart cannot remember.
+   */
+  private async flushDurablePublicReplyBeforeBroadcast(message: ChatMessage): Promise<void> {
+    const append = this.deferredPublicMessageAppends.get(message.id);
+    const persona = PERSONAS.find((candidate) => candidate.id === message.authorId);
+    if (!append || !persona) {
+      throw new TypeError("A deferred public reply is missing its publication transaction");
+    }
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await this.store.flush();
+        this.deferredPublicMessageAppends.delete(message.id);
+        this.finalizePublicMessage(message, persona, Date.parse(message.createdAt));
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    const rollback = this.store.rollbackUncommittedPublicMessage(append);
+    this.deferredPublicMessageAppends.delete(message.id);
+    if (rollback === "already_durable") {
+      this.finalizePublicMessage(message, persona, Date.parse(message.createdAt));
+      return;
+    }
+    console.error(
+      "Could not durably persist a direct resident reply before broadcast:",
+      lastError instanceof Error ? lastError.message : lastError,
+    );
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Could not durably persist a direct resident reply before broadcast");
   }
 
   private messageSources(research: ResearchPacket | undefined, sourceIds: string[]): MessageSource[] {

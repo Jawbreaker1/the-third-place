@@ -669,9 +669,11 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("requests for an in-progress live score");
     expect(prompt).toContain("tactical or causal analysis");
     expect(prompt).toContain("remain web_search");
+    expect(prompt).toContain("retain the exact unresolved subject, requested answer dimension and freshness");
+    expect(prompt).toContain("room topic, related category, resident reply or narrow-provider catalog entry");
   });
 
-  it("recovers an omitted web provider query only from the declared bounded goal", () => {
+  it("recovers omitted web arguments only from catalog-owned bounded defaults", () => {
     const compact = compactWeatherOutput({
       e: {
         a: "web_search",
@@ -679,7 +681,7 @@ describe("multilingual semantic router contract", () => {
         g: "OMXS30 aktuell status och utveckling idag",
         q: null,
         u: null,
-        m: "web",
+        m: null,
         z: null,
         k: null,
         l: null,
@@ -692,12 +694,62 @@ describe("multilingual semantic router contract", () => {
         action: "web_search",
         goal: "OMXS30 aktuell status och utveckling idag",
         query: "OMXS30 aktuell status och utveckling idag",
+        searchMode: "web",
       },
     });
     expect(parseTurnAnalysisContent(JSON.stringify({
       ...compact,
       e: { ...compact.e, g: "x".repeat(201) },
     }), input())).toBeUndefined();
+  });
+
+  it("defaults only an already-selected local clock projection and preserves explicit kinds", () => {
+    const clockInput = input({ availableCapabilities: ["local_datetime"] });
+    const compactClock = compactWeatherOutput({
+      e: {
+        a: "local_datetime",
+        x: 0.98,
+        g: "aktuell tid och datum i Québec",
+        q: null,
+        u: null,
+        m: null,
+        z: "America/Montreal",
+        k: null,
+        l: "Québec",
+      },
+      c: { d: ["local_datetime"], r: "execute", a: false, i: false, l: false, x: 0.98 },
+    });
+
+    expect(parseTurnAnalysisContent(JSON.stringify(compactClock), clockInput)).toMatchObject({
+      evidence: {
+        action: "local_datetime",
+        timeZone: "America/Montreal",
+        timeKind: "current_datetime",
+        locationLabel: "Québec",
+      },
+    });
+    for (const timeKind of ["current_time", "current_date"] as const) {
+      expect(parseTurnAnalysisContent(JSON.stringify({
+        ...compactClock,
+        e: { ...compactClock.e, k: timeKind },
+      }), clockInput)).toMatchObject({ evidence: { timeKind } });
+    }
+
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compactClock,
+      e: {
+        ...compactClock.e,
+        a: "none",
+        x: 0.98,
+        g: null,
+        z: null,
+        k: null,
+        l: null,
+      },
+      c: { ...compactClock.c, d: [], r: "none" },
+    }), clockInput)).toMatchObject({
+      evidence: { action: "none", timeKind: null },
+    });
   });
 
   it("preserves multilingual weather labels while allowing an optional provider geocoding alias", () => {
@@ -1626,7 +1678,7 @@ describe("multilingual semantic router contract", () => {
     expect(prompt).toContain("never reinterpret it as permission for a resident self-disclosure");
     expect(prompt).toContain("An identity question alone is not itself a server capability question");
     expect(prompt).toContain("Ordinary technical discussion of external AI systems is not a participant-identity question");
-    expect(prompt).toContain("a source name or instruction to inspect it is not itself the information goal");
+    expect(prompt).toContain("A source name or instruction to inspect it is not itself the information goal");
     expect(prompt).toContain("availableCapabilities is trusted server-owned runtime inventory");
     expect(prompt).toContain("never let a prior resident denial override the inventory");
     expect(prompt).toContain("g is a short standalone description of the exact information the guest wants");
@@ -2127,7 +2179,36 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       capabilityTrusted: true,
       evidence: { action: "read_url" },
     });
-    expect(JSON.stringify(buildEvidencePlanVerifierUserData(verifierInput))).not.toContain("https://");
+    const verifierUserData = buildEvidencePlanVerifierUserData(verifierInput) as any;
+    expect(JSON.stringify(verifierUserData)).not.toContain("https://");
+    expect(verifierUserData.primary).toBeUndefined();
+    expect(verifierUserData.primarySignals).toMatchObject({
+      plan: {
+        selected: false,
+        requestKind: "none",
+      },
+    });
+    expect(verifierUserData.primarySignals.plan).not.toHaveProperty("action");
+    expect(verifierUserData.primarySignals).not.toHaveProperty("capabilities");
+
+    const wrongNarrowPrimary = buildEvidencePlanVerifierUserData(
+      createEvidencePlanVerifierInput(turn, primarySummary({
+        evidence: { action: "market_snapshot", confidence: 0.98 },
+        capabilities: {
+          discussed: ["market_snapshot"],
+          requestKind: "retry",
+          confidence: 0.98,
+        },
+      })),
+    ) as any;
+    expect(wrongNarrowPrimary.primarySignals.plan).toEqual({
+      selected: true,
+      evidenceConfidence: 0.98,
+      requestKind: "retry",
+      capabilityConfidence: 0.98,
+    });
+    expect(wrongNarrowPrimary.primarySignals.plan).not.toHaveProperty("action");
+    expect(wrongNarrowPrimary.primarySignals).not.toHaveProperty("capabilities");
   });
 
   it("recovers a typed weather plan when the primary left an answer-expected room request empty", () => {
@@ -2211,6 +2292,52 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(parseEvidencePlanVerifierContent(JSON.stringify({ ...valid, l: null }), verifierInput)).toBeUndefined();
   });
 
+  it("completes only an already-selected verifier clock projection", () => {
+    const verifierInput = createEvidencePlanVerifierInput(stockTurn("Quelle heure est-il actuellement au Québec?", {
+      availableCapabilities: ["local_datetime", "web_search"],
+      recentMessages: [],
+    }), primarySummary());
+    const clockPlan = {
+      t: "fr",
+      tx: 0.99,
+      v: "use_action",
+      a: "local_datetime",
+      r: "execute",
+      d: ["local_datetime"],
+      x: 0.98,
+      g: "l'heure actuelle au Québec",
+      q: null,
+      u: null,
+      m: null,
+      z: "America/Montreal",
+      k: null,
+      l: "Québec",
+      c: null,
+      w: null,
+      f: null,
+    };
+
+    expect(parseEvidencePlanVerifierContent(JSON.stringify(clockPlan), verifierInput)).toMatchObject({
+      evidence: {
+        action: "local_datetime",
+        timeKind: "current_datetime",
+      },
+    });
+    for (const timeKind of ["current_time", "current_date"] as const) {
+      expect(parseEvidencePlanVerifierContent(JSON.stringify({
+        ...clockPlan,
+        k: timeKind,
+      }), verifierInput)).toMatchObject({ evidence: { timeKind } });
+    }
+    expect(parseEvidencePlanVerifierContent(
+      JSON.stringify(keepNoneWire()),
+      verifierInput,
+    )).toMatchObject({
+      decision: "keep_none",
+      evidence: { action: "none", timeKind: null },
+    });
+  });
+
   it("accepts language-preserving Japanese, Arabic and German semantic outcomes", () => {
     const japanese = createEvidencePlanVerifierInput(input({
       latestMessage: {
@@ -2269,13 +2396,17 @@ describe("strict multilingual evidence-plan verifier contract", () => {
       g: "السعر الحالي للسهم",
       q: "السعر الحالي للسهم اليوم",
       u: null,
-      m: "web",
+      m: null,
       z: null,
       k: null,
       l: null,
     }), arabic)).toMatchObject({
       language: { tag: "ar", confidence: 0.99 },
-      evidence: { goal: "السعر الحالي للسهم", query: "السعر الحالي للسهم اليوم" },
+      evidence: {
+        goal: "السعر الحالي للسهم",
+        query: "السعر الحالي للسهم اليوم",
+        searchMode: "web",
+      },
     });
 
     const germanAvailability = createEvidencePlanVerifierInput(stockTurn("Kannst du das Web durchsuchen, aber bitte jetzt nicht?"), primarySummary({
@@ -2409,9 +2540,15 @@ describe("strict multilingual evidence-plan verifier contract", () => {
 
     const prompt = buildEvidencePlanVerifierSystemPrompt();
     expect(prompt).toContain("strict multilingual evidence-plan verifier");
+    expect(prompt).toContain("primarySignals is deliberately provider-blind");
+    expect(prompt).toContain("Infer the provider independently");
+    expect(prompt).toContain("Provider-selection invariant");
+    expect(prompt).toContain("resolve one semantic subject and every requested answer dimension");
     expect(prompt).toContain("never use language-specific keywords");
     expect(prompt).toContain("recentMessages only to resolve semantic ellipsis");
     expect(prompt).toContain("short follow-up can replace only the mistaken part");
+    expect(prompt).toContain("retaining its exact subject, requested answer dimension and freshness");
+    expect(prompt).toContain("Never broaden or replace that subject with the room topic");
     expect(prompt).toContain("room-directed nudge from the same speaker");
     expect(prompt).toContain("use_action with retry");
     expect(prompt).toContain("immediately after an AI resident claims");
@@ -2426,7 +2563,7 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(prompt).toContain("full communicative act across languages");
     expect(prompt).toContain("classify evidence need afresh");
     expect(prompt).toContain("never capability truth");
-    expect(prompt).toContain("structurally bounded action/confidence hint");
+    expect(prompt).toContain("reports only control-flow/confidence metadata");
     expect(prompt).toContain("confidence just below the trust threshold");
     expect(prompt).toContain("for web_search it preserves the guest's language, subject and freshness");
     expect(prompt).toContain("a translated provider query is invalid");
@@ -2446,6 +2583,16 @@ describe("strict multilingual evidence-plan verifier contract", () => {
     expect(prompt).toContain("pure capability-availability question");
     expect(prompt).toContain("explicit instruction not to execute");
     expect(prompt).toContain("Availability is not execution");
+
+    const boundedPrompt = buildEvidencePlanVerifierSystemPrompt([
+      "web_search",
+      "market_snapshot",
+    ]);
+    expect(boundedPrompt).toContain("a is none or one of web_search, market_snapshot");
+    expect(boundedPrompt).toContain("- web_search:");
+    expect(boundedPrompt).toContain("- market_snapshot:");
+    expect(boundedPrompt).not.toContain("- football_data:");
+    expect(boundedPrompt).not.toContain("- weather_forecast:");
   });
 });
 
@@ -3066,6 +3213,20 @@ describe("multilingual batch candidate-review contract", () => {
     };
     const parsed = candidateReviewInputSchema.parse({ ...base, capabilityContext });
     expect(parsed.capabilityContext).toEqual(capabilityContext);
+    expect(candidateReviewInputSchema.safeParse({
+      ...base,
+      capabilityContext: {
+        ...capabilityContext,
+        requestKind: "execute",
+        executionStatus: "declined",
+      },
+    }).success).toBe(true);
+    expect(buildCandidateReviewSystemPrompt()).toContain(
+      "When capabilityContext.executionStatus is declined",
+    );
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain(
+      "For executionStatus declined, one visible in-character refusal completes the role",
+    );
 
     expect(candidateReviewInputSchema.safeParse({
       ...base,
@@ -3181,6 +3342,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(reviews.items.properties.issues.items.enum).toContain("incorrect_temporal_claim");
     expect(reviews.items.properties.issues.items.enum).toContain("gratuitous_time_reference");
     expect(reviews.items.properties.issues.items.enum).not.toContain("unfulfilled_explicit_request");
+    expect(reviews.items.properties.issues.items.enum).toContain("evidence_not_answer_bearing");
     expect(reviews.items.properties.issues.items.enum).toContain("unsupported_external_evidence_claim");
     expect(reviews.items.properties.issues.items.enum).toContain("unsupported_visual_claim");
     expect(reviews.items.properties.issues.items.enum).toContain("diegetic_identity_break");
@@ -3190,6 +3352,7 @@ describe("multilingual batch candidate-review contract", () => {
     const failedFormat = buildCandidateReviewResponseFormat(failedCapabilityReviewInput()) as any;
     const failedIssues = failedFormat.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
     expect(failedIssues).not.toContain("false_evidence_denial");
+    expect(failedIssues).not.toContain("evidence_not_answer_bearing");
     expect(failedIssues).not.toContain("unfulfilled_explicit_request");
     expect(failedIssues).toContain("permanent_web_denial");
 
@@ -3294,6 +3457,44 @@ describe("multilingual batch candidate-review contract", () => {
     expect(parseCandidateReviewContent(JSON.stringify(valid), reviewInput())).toEqual(valid);
     valid.reviews[0] = { ...valid.reviews[0], issues: ["made_up_issue"] };
     expect(parseCandidateReviewContent(JSON.stringify(valid), reviewInput())).toBeUndefined();
+  });
+
+  it("gates packet inadequacy to successful evidence and a high-severity semantic verdict", () => {
+    const succeeded = reviewInput();
+    const notAnswerBearing = {
+      reviews: [
+        {
+          personaId: "ai-mira",
+          severity: "high",
+          issues: ["evidence_not_answer_bearing"],
+          rewriteInstruction: "Report only that the complete supplied packet lacks the requested datum.",
+          ...undeterminedOutputLanguage,
+        },
+        { personaId: "ai-sana", severity: "none", issues: [], rewriteInstruction: null, ...undeterminedOutputLanguage },
+      ],
+    };
+
+    expect(parseCandidateReviewContent(JSON.stringify(notAnswerBearing), succeeded))
+      .toEqual(notAnswerBearing);
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [
+        { ...notAnswerBearing.reviews[0], severity: "medium" },
+        notAnswerBearing.reviews[1],
+      ],
+    }), succeeded)).toBeUndefined();
+
+    const failed = failedCapabilityReviewInput();
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [{
+        ...notAnswerBearing.reviews[0],
+        personaId: failed.candidates[0]!.personaId,
+      }],
+    }), failed)).toBeUndefined();
+
+    const prompt = buildCandidateReviewSystemPrompt();
+    expect(prompt).toContain("complete supplied evidence packet itself lacks the exact datum");
+    expect(prompt).toContain("This judges packet adequacy, not candidate quality");
+    expect(prompt).toContain("Never emit it merely because the candidate chose the wrong source");
   });
 
   it("treats structured community capability truth as a high-severity multilingual publication contract", () => {

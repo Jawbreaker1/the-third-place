@@ -16,15 +16,56 @@ import type {
 import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 
+export interface PendingPublicTurnTarget {
+  personaId: string;
+  attempts: number;
+  lastAttemptAt?: string;
+}
+
+export interface PendingPublicTurn {
+  messageId: string;
+  channelId: string;
+  authorId: string;
+  createdAt: string;
+  expiresAt: string;
+  targets: PendingPublicTurnTarget[];
+}
+
+export interface PendingPublicTurnRegistration {
+  targetPersonaIds: readonly string[];
+  expiresAt?: string;
+}
+
+export interface PendingPublicTurnTargetClaim {
+  turn: PendingPublicTurn;
+  target: PendingPublicTurnTarget;
+}
+
+/**
+ * Opaque handle for a public row that must not become externally visible
+ * until a room-state flush has committed it. Successful flushes commit these
+ * handles automatically; callers only need the handle when every durability
+ * attempt fails and the speculative append must be rolled back.
+ */
+export interface UncommittedPublicMessageAppend {
+  readonly transactionId: string;
+  readonly messageId: string;
+  readonly createdAt: string;
+}
+
+export type PublicMessageRollbackResult = "rolled_back" | "already_durable" | "missing";
+
 interface PersistedState {
-  version: 1 | 2 | 3;
+  version: 1 | 2 | 3 | 4;
   messages: ChatMessage[];
   /** Private conversations stay server-only and are never included in room snapshots. */
   privateThreads?: PrivateThread[];
   /** Server-only autonomous accounting; never serialized in public messages. */
   autonomousPublications?: AutonomousPublicationRecord[];
-  /** Server-owned room language observations; version 3 requires this collection. */
+  /** Server-owned room language observations; version 3+ requires this collection. */
   trustedChannelLanguages?: TrustedChannelLanguage[];
+  /** Durable per-resident delivery outbox; version 4 requires this collection. */
+  pendingPublicTurns?: PendingPublicTurn[];
 }
 
 export type TrustedChannelLanguageAuthority = "human" | "resident";
@@ -48,6 +89,21 @@ interface PrivateThread {
   id: string;
   participantIds: [string, string];
   messages: ChatMessage[];
+}
+
+interface UncommittedPublicMessageState {
+  handle: UncommittedPublicMessageAppend;
+  message: ChatMessage;
+  removedMessages: Array<{ message: ChatMessage; index: number }>;
+  removedAutonomousPublications: AutonomousPublicationRecord[];
+  addedAutonomousPublication: boolean;
+  addedPendingTurn: boolean;
+  restoredReplyTarget?: {
+    turn: Omit<PendingPublicTurn, "targets">;
+    target: PendingPublicTurnTarget;
+    targetIndex: number;
+    claimWasHeld: boolean;
+  };
 }
 
 export interface RemovedPrivateThread {
@@ -102,6 +158,11 @@ const MAX_PERSISTED_PRIVATE_MESSAGES_PER_THREAD = 20_000;
 const MAX_PERSISTED_PRIVATE_MESSAGES_TOTAL = 200_000;
 const MAX_PERSISTED_AUTONOMOUS_PUBLICATIONS = 100_000;
 const MAX_PERSISTED_TRUSTED_CHANNEL_LANGUAGES = 10_000;
+const MAX_PERSISTED_PENDING_PUBLIC_TURNS = 2_000;
+const MAX_PENDING_PUBLIC_TURN_TARGETS = 32;
+const MAX_PENDING_PUBLIC_TURN_ATTEMPTS = 1_000;
+const DEFAULT_PENDING_PUBLIC_TURN_TTL_MS = 20 * 60_000;
+const MAX_PENDING_PUBLIC_TURN_TTL_MS = 30 * 60_000;
 const MAX_ID_LENGTH = 100;
 const MAX_CHANNEL_ID_LENGTH = 256;
 const MAX_LANGUAGE_TAG_LENGTH = 35;
@@ -208,6 +269,19 @@ const TRUSTED_CHANNEL_LANGUAGE_KEYS = new Set([
   "observedAt",
   "authority",
 ]);
+const PENDING_PUBLIC_TURN_KEYS = new Set([
+  "messageId",
+  "channelId",
+  "authorId",
+  "createdAt",
+  "expiresAt",
+  "targets",
+]);
+const PENDING_PUBLIC_TURN_TARGET_KEYS = new Set([
+  "personaId",
+  "attempts",
+  "lastAttemptAt",
+]);
 const LEGACY_PERSISTED_STATE_KEYS = new Set([
   "version",
   "messages",
@@ -217,6 +291,10 @@ const LEGACY_PERSISTED_STATE_KEYS = new Set([
 const PERSISTED_STATE_V3_KEYS = new Set([
   ...LEGACY_PERSISTED_STATE_KEYS,
   "trustedChannelLanguages",
+]);
+const PERSISTED_STATE_V4_KEYS = new Set([
+  ...PERSISTED_STATE_V3_KEYS,
+  "pendingPublicTurns",
 ]);
 
 const isReaction = (value: unknown): value is Reaction => {
@@ -300,6 +378,8 @@ export interface RoomStoreOptions {
   publicHistoryTrimTo?: number;
   dmHistoryHardLimit?: number;
   dmHistoryTrimTo?: number;
+  /** Injectable wall clock for deterministic expiry and recovery tests. */
+  now?: () => number;
 }
 export interface HistoryPosition {
   createdAt: string;
@@ -327,6 +407,35 @@ const isTrustedChannelLanguage = (value: unknown): value is TrustedChannelLangua
       !isCanonicalIsoTimestamp(record.observedAt) ||
       (record.authority !== "human" && record.authority !== "resident")) return false;
   return canonicalRegisteredLanguageTag(record.languageTag) === record.languageTag;
+};
+
+const isPendingPublicTurnTarget = (value: unknown): value is PendingPublicTurnTarget => {
+  if (!isRecord(value) || !hasOnlyKeys(value, PENDING_PUBLIC_TURN_TARGET_KEYS)) return false;
+  const target = value as Partial<PendingPublicTurnTarget>;
+  return isBoundedIdentifier(target.personaId) && target.personaId !== SYSTEM_AUTHOR_ID &&
+    isFiniteInteger(target.attempts, 0, MAX_PENDING_PUBLIC_TURN_ATTEMPTS) &&
+    (target.lastAttemptAt === undefined || isCanonicalIsoTimestamp(target.lastAttemptAt)) &&
+    ((target.attempts === 0) === (target.lastAttemptAt === undefined));
+};
+
+const isPendingPublicTurn = (value: unknown): value is PendingPublicTurn => {
+  if (!isRecord(value) || !hasOnlyKeys(value, PENDING_PUBLIC_TURN_KEYS)) return false;
+  const turn = value as Partial<PendingPublicTurn>;
+  if (!isBoundedIdentifier(turn.messageId) || !isBoundedChannelId(turn.channelId) ||
+      !isBoundedIdentifier(turn.authorId) || turn.authorId === SYSTEM_AUTHOR_ID ||
+      !isCanonicalIsoTimestamp(turn.createdAt) || !isCanonicalIsoTimestamp(turn.expiresAt) ||
+      Date.parse(turn.expiresAt) <= Date.parse(turn.createdAt) ||
+      Date.parse(turn.expiresAt) - Date.parse(turn.createdAt) > MAX_PENDING_PUBLIC_TURN_TTL_MS ||
+      !Array.isArray(turn.targets) || turn.targets.length < 1 ||
+      turn.targets.length > MAX_PENDING_PUBLIC_TURN_TARGETS ||
+      !turn.targets.every(isPendingPublicTurnTarget)) return false;
+  const createdAt = turn.createdAt;
+  const expiresAt = turn.expiresAt;
+  if (new Set(turn.targets.map((target) => target.personaId)).size !== turn.targets.length) return false;
+  return turn.targets.every((target) => target.lastAttemptAt === undefined || (
+    Date.parse(target.lastAttemptAt) >= Date.parse(createdAt) &&
+    Date.parse(target.lastAttemptAt) < Date.parse(expiresAt)
+  ));
 };
 
 const boundedLimit = (value: number | undefined, fallback: number, minimum: number, maximum: number): number =>
@@ -391,10 +500,14 @@ const parsePersistedState = (value: unknown): PersistedState => {
     throw new TypeError("Room state root must be an object.");
   }
   const state = value as Partial<PersistedState>;
-  if (state.version !== 1 && state.version !== 2 && state.version !== 3) {
+  if (state.version !== 1 && state.version !== 2 && state.version !== 3 && state.version !== 4) {
     throw new TypeError("Room state version is unsupported.");
   }
-  const allowedKeys = state.version === 3 ? PERSISTED_STATE_V3_KEYS : LEGACY_PERSISTED_STATE_KEYS;
+  const allowedKeys = state.version === 4
+    ? PERSISTED_STATE_V4_KEYS
+    : state.version === 3
+      ? PERSISTED_STATE_V3_KEYS
+      : LEGACY_PERSISTED_STATE_KEYS;
   if (!hasOnlyKeys(value, allowedKeys)) throw new TypeError("Room state contains unsupported fields.");
   if (!Array.isArray(state.messages) || state.messages.length > MAX_PERSISTED_PUBLIC_MESSAGES ||
       !state.messages.every(isPersistedMessage)) {
@@ -415,7 +528,7 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state private history exceeds its retention envelope.");
   }
-  if ((state.version === 2 || state.version === 3) && !Array.isArray(state.privateThreads)) {
+  if ((state.version === 2 || state.version === 3 || state.version === 4) && !Array.isArray(state.privateThreads)) {
     throw new TypeError(`Version ${state.version} room state is missing its private-thread collection.`);
   }
   if (state.autonomousPublications !== undefined && (
@@ -425,8 +538,11 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state contains invalid autonomous-publication accounting.");
   }
-  if (state.version === 3 && !Array.isArray(state.trustedChannelLanguages)) {
-    throw new TypeError("Version 3 room state is missing its trusted channel-language collection.");
+  if (state.version === 4 && !Array.isArray(state.autonomousPublications)) {
+    throw new TypeError("Version 4 room state is missing autonomous-publication accounting.");
+  }
+  if ((state.version === 3 || state.version === 4) && !Array.isArray(state.trustedChannelLanguages)) {
+    throw new TypeError(`Version ${state.version} room state is missing its trusted channel-language collection.`);
   }
   if (state.trustedChannelLanguages !== undefined && (
     !Array.isArray(state.trustedChannelLanguages) ||
@@ -439,6 +555,20 @@ const parsePersistedState = (value: unknown): PersistedState => {
       new Set(state.trustedChannelLanguages.map((record) => record.channelId)).size !==
         state.trustedChannelLanguages.length) {
     throw new TypeError("Room state contains duplicate trusted channel-language observations.");
+  }
+  if (state.version === 4 && !Array.isArray(state.pendingPublicTurns)) {
+    throw new TypeError("Version 4 room state is missing its pending public-turn collection.");
+  }
+  if (state.pendingPublicTurns !== undefined && (
+    !Array.isArray(state.pendingPublicTurns) ||
+    state.pendingPublicTurns.length > MAX_PERSISTED_PENDING_PUBLIC_TURNS ||
+    !state.pendingPublicTurns.every(isPendingPublicTurn)
+  )) {
+    throw new TypeError("Room state contains an invalid pending public-turn collection.");
+  }
+  if (state.pendingPublicTurns &&
+      new Set(state.pendingPublicTurns.map((turn) => turn.messageId)).size !== state.pendingPublicTurns.length) {
+    throw new TypeError("Room state contains duplicate pending public turns.");
   }
   return state as PersistedState;
 };
@@ -744,10 +874,15 @@ export class RoomStore {
   private readonly publicHistoryTrimTo: number;
   private readonly dmHistoryHardLimit: number;
   private readonly dmHistoryTrimTo: number;
+  private readonly now: () => number;
   private messages: ChatMessage[] = [];
   private autonomousPublications: AutonomousPublicationRecord[] = [];
   private readonly privateThreads = new Map<string, PrivateThread>();
   private readonly trustedChannelLanguages = new Map<string, TrustedChannelLanguage>();
+  private readonly pendingPublicTurns = new Map<string, PendingPublicTurn>();
+  /** Claims are process-local leases; a restart intentionally makes work claimable again. */
+  private readonly claimedPendingPublicTurnTargets = new Set<string>();
+  private readonly uncommittedPublicMessageAppends = new Map<string, UncommittedPublicMessageState>();
   private persistTimer?: NodeJS.Timeout;
   private writeQueue: Promise<void> = Promise.resolve();
   private removalHandler?: (messages: ChatMessage[]) => void;
@@ -781,6 +916,7 @@ export class RoomStore {
       120,
       this.dmHistoryHardLimit - 1,
     );
+    this.now = options.now ?? Date.now;
   }
 
   onMessagesRemoved(handler: (messages: ChatMessage[]) => void): void {
@@ -792,13 +928,19 @@ export class RoomStore {
       const raw = await readFile(this.filePath, "utf8");
       const parsed = parsePersistedState(JSON.parse(raw) as unknown);
       const builtInScene = seedMessages();
-      this.messages = Array.isArray(parsed.messages) && parsed.messages.length > 0 ? parsed.messages : builtInScene;
+      this.messages = parsed.messages;
       this.autonomousPublications = Array.isArray(parsed.autonomousPublications)
         ? parsed.autonomousPublications.filter(isAutonomousPublicationRecord)
         : [];
       this.trustedChannelLanguages.clear();
       for (const record of parsed.trustedChannelLanguages ?? []) {
         this.trustedChannelLanguages.set(record.channelId, { ...record });
+      }
+      this.pendingPublicTurns.clear();
+      this.claimedPendingPublicTurnTargets.clear();
+      this.uncommittedPublicMessageAppends.clear();
+      for (const turn of parsed.pendingPublicTurns ?? []) {
+        this.pendingPublicTurns.set(turn.messageId, this.copyPendingPublicTurn(turn));
       }
       this.privateThreads.clear();
       for (const candidate of parsed.privateThreads ?? []) {
@@ -812,6 +954,7 @@ export class RoomStore {
         });
       }
       this.pruneAutonomousPublications();
+      const pendingPublicTurnsChanged = this.reconcilePendingPublicTurns(this.nowMs(), false);
       const populatedChannels = new Set(this.messages.map((message) => message.channelId));
       const missingChannelSeeds = builtInScene.filter((message) => !populatedChannels.has(message.channelId));
       if (missingChannelSeeds.length > 0) this.messages.push(...missingChannelSeeds);
@@ -821,7 +964,7 @@ export class RoomStore {
       await chmod(this.filePath, 0o600).catch((error) => {
         console.warn("Could not restrict room-state file permissions.", error);
       });
-      if (missingChannelSeeds.length > 0 || parsed.version !== 3) await this.flush();
+      if (missingChannelSeeds.length > 0 || pendingPublicTurnsChanged || parsed.version !== 4) await this.flush();
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") {
@@ -829,12 +972,18 @@ export class RoomStore {
         this.autonomousPublications = [];
         this.privateThreads.clear();
         this.trustedChannelLanguages.clear();
+        this.pendingPublicTurns.clear();
+        this.claimedPendingPublicTurnTargets.clear();
+        this.uncommittedPublicMessageAppends.clear();
         throw new RoomStateLoadError(error);
       }
       this.messages = seedMessages();
       this.autonomousPublications = [];
       this.privateThreads.clear();
       this.trustedChannelLanguages.clear();
+      this.pendingPublicTurns.clear();
+      this.claimedPendingPublicTurnTargets.clear();
+      this.uncommittedPublicMessageAppends.clear();
       await this.flush();
     }
   }
@@ -910,6 +1059,285 @@ export class RoomStore {
     this.autonomousPublications = [...new Map(retained.map((record) => [record.messageId, record])).values()];
   }
 
+  private nowMs(): number {
+    const value = this.now();
+    return Number.isFinite(value) ? value : Date.now();
+  }
+
+  private pendingPublicTurnClaimKey(messageId: string, personaId: string): string {
+    return JSON.stringify([messageId, personaId]);
+  }
+
+  private copyPendingPublicTurn(turn: PendingPublicTurn): PendingPublicTurn {
+    return {
+      ...turn,
+      targets: turn.targets.map((target) => ({ ...target })),
+    };
+  }
+
+  private releaseClaimsForPendingPublicTurn(messageId: string): void {
+    for (const targetKey of this.claimedPendingPublicTurnTargets) {
+      const parsed = JSON.parse(targetKey) as [string, string];
+      if (parsed[0] === messageId) this.claimedPendingPublicTurnTargets.delete(targetKey);
+    }
+  }
+
+  /**
+   * Drops expired work and treats an exact, later reply from one target as
+   * durable completion for only that target. Active work must retain its
+   * immutable trigger row; otherwise startup fails closed instead of guessing.
+   */
+  private reconcilePendingPublicTurns(referenceAt: number, schedule: boolean): boolean {
+    const at = Number.isFinite(referenceAt) ? referenceAt : this.nowMs();
+    const messagesById = new Map(this.messages.map((message) => [message.id, message]));
+    const repliesByParentId = new Map<string, ChatMessage[]>();
+    for (const message of this.messages) {
+      if (!message.replyToId) continue;
+      const replies = repliesByParentId.get(message.replyToId) ?? [];
+      replies.push(message);
+      repliesByParentId.set(message.replyToId, replies);
+    }
+
+    let changed = false;
+    for (const [messageId, turn] of this.pendingPublicTurns) {
+      if (Date.parse(turn.expiresAt) <= at) {
+        this.pendingPublicTurns.delete(messageId);
+        this.releaseClaimsForPendingPublicTurn(messageId);
+        changed = true;
+        continue;
+      }
+
+      const trigger = messagesById.get(messageId);
+      if (!trigger || trigger.system || trigger.authorId === SYSTEM_AUTHOR_ID ||
+          trigger.channelId !== turn.channelId || trigger.authorId !== turn.authorId ||
+          Date.parse(trigger.createdAt) !== Date.parse(turn.createdAt)) {
+        throw new TypeError("An active pending public turn does not match its durable trigger message.");
+      }
+
+      const replies = repliesByParentId.get(messageId) ?? [];
+      const answeredPersonaIds = new Set(replies.flatMap((reply) =>
+        reply.channelId === turn.channelId &&
+        Date.parse(reply.createdAt) >= Date.parse(turn.createdAt)
+          ? [reply.authorId]
+          : [],
+      ));
+      if (answeredPersonaIds.size === 0) continue;
+
+      const retainedTargets = turn.targets.filter((target) => !answeredPersonaIds.has(target.personaId));
+      if (retainedTargets.length === turn.targets.length) continue;
+      for (const target of turn.targets) {
+        if (answeredPersonaIds.has(target.personaId)) {
+          this.claimedPendingPublicTurnTargets.delete(
+            this.pendingPublicTurnClaimKey(messageId, target.personaId),
+          );
+        }
+      }
+      if (retainedTargets.length === 0) {
+        this.pendingPublicTurns.delete(messageId);
+      } else {
+        turn.targets = retainedTargets;
+      }
+      changed = true;
+    }
+    if (changed && schedule) this.schedulePersist();
+    return changed;
+  }
+
+  private createPendingPublicTurn(
+    message: ChatMessage,
+    registration: PendingPublicTurnRegistration,
+    referenceAt: number,
+  ): PendingPublicTurn {
+    if (!isBoundedIdentifier(message.id) || !isBoundedChannelId(message.channelId) ||
+        !isBoundedIdentifier(message.authorId) || message.authorId === SYSTEM_AUTHOR_ID || message.system ||
+        !isTimestamp(message.createdAt)) {
+      throw new TypeError("A pending public turn requires a valid non-system trigger message.");
+    }
+    if (!Array.isArray(registration.targetPersonaIds) || registration.targetPersonaIds.length < 1 ||
+        registration.targetPersonaIds.length > MAX_PENDING_PUBLIC_TURN_TARGETS ||
+        !registration.targetPersonaIds.every((personaId) =>
+          isBoundedIdentifier(personaId) && personaId !== SYSTEM_AUTHOR_ID
+        ) || new Set(registration.targetPersonaIds).size !== registration.targetPersonaIds.length) {
+      throw new TypeError("A pending public turn requires unique bounded resident targets.");
+    }
+
+    const at = Number.isFinite(referenceAt) ? referenceAt : this.nowMs();
+    const createdAt = new Date(message.createdAt).toISOString();
+    const createdAtMs = Date.parse(createdAt);
+    const explicitExpiry = registration.expiresAt;
+    if (explicitExpiry !== undefined && !isCanonicalIsoTimestamp(explicitExpiry)) {
+      throw new TypeError("A pending public turn expiry must be a canonical ISO timestamp.");
+    }
+    const expiresAt = explicitExpiry ?? new Date(createdAtMs + DEFAULT_PENDING_PUBLIC_TURN_TTL_MS).toISOString();
+    const expiryMs = Date.parse(expiresAt);
+    if (expiryMs <= at || expiryMs <= createdAtMs || expiryMs > createdAtMs + MAX_PENDING_PUBLIC_TURN_TTL_MS) {
+      throw new TypeError("A pending public turn expiry is outside the bounded delivery window.");
+    }
+
+    return {
+      messageId: message.id,
+      channelId: message.channelId,
+      authorId: message.authorId,
+      createdAt,
+      expiresAt,
+      targets: registration.targetPersonaIds.map((personaId) => ({ personaId, attempts: 0 })),
+    };
+  }
+
+  private upsertPendingPublicTurn(
+    message: ChatMessage,
+    registration: PendingPublicTurnRegistration,
+    referenceAt: number,
+  ): { turn: PendingPublicTurn; changed: boolean } {
+    const candidate = this.createPendingPublicTurn(message, registration, referenceAt);
+    const current = this.pendingPublicTurns.get(message.id);
+    if (!current) {
+      if (this.pendingPublicTurns.size >= MAX_PERSISTED_PENDING_PUBLIC_TURNS) {
+        throw new RangeError("Pending public-turn retention is full.");
+      }
+      this.pendingPublicTurns.set(message.id, candidate);
+      return { turn: candidate, changed: true };
+    }
+    if (current.channelId !== message.channelId || current.authorId !== message.authorId ||
+        Date.parse(current.createdAt) !== Date.parse(message.createdAt)) {
+      throw new TypeError("Pending public-turn registration conflicts with its durable trigger.");
+    }
+
+    let changed = false;
+    const targetsByPersonaId = new Map(current.targets.map((target) => [target.personaId, target]));
+    for (const target of candidate.targets) {
+      if (!targetsByPersonaId.has(target.personaId)) {
+        targetsByPersonaId.set(target.personaId, target);
+        changed = true;
+      }
+    }
+    if (targetsByPersonaId.size > MAX_PENDING_PUBLIC_TURN_TARGETS) {
+      throw new RangeError("Pending public turn has too many resident targets.");
+    }
+    if (changed) current.targets = [...targetsByPersonaId.values()];
+    if (registration.expiresAt && registration.expiresAt > current.expiresAt) {
+      current.expiresAt = registration.expiresAt;
+      changed = true;
+    }
+    return { turn: current, changed };
+  }
+
+  /**
+   * Adds or extends durable delivery work for an existing public trigger.
+   * Repeating the same registration is a no-op and never resets attempts.
+   */
+  registerPendingPublicTurn(
+    messageId: string,
+    registration: PendingPublicTurnRegistration,
+  ): PendingPublicTurn | undefined {
+    const message = this.messages.find((candidate) => candidate.id === messageId);
+    if (!message) throw new TypeError("Pending public-turn trigger message does not exist.");
+    const at = this.nowMs();
+    let changed = this.reconcilePendingPublicTurns(at, false);
+    const upserted = this.upsertPendingPublicTurn(message, registration, at);
+    changed = upserted.changed || changed;
+    changed = this.reconcilePendingPublicTurns(at, false) || changed;
+    if (changed) this.schedulePersist();
+    const retained = this.pendingPublicTurns.get(messageId);
+    return retained ? this.copyPendingPublicTurn(retained) : undefined;
+  }
+
+  getPendingPublicTurns(): PendingPublicTurn[] {
+    this.reconcilePendingPublicTurns(this.nowMs(), true);
+    return [...this.pendingPublicTurns.values()]
+      .map((turn) => this.copyPendingPublicTurn(turn))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) ||
+        left.messageId.localeCompare(right.messageId));
+  }
+
+  /**
+   * Claims one target inside this process and durably records an attempt.
+   * An un-settled claim can be released for retry; process restart also drops
+   * the lease while preserving the attempt counter.
+   */
+  claimPendingPublicTurnTarget(
+    messageId: string,
+    personaId: string,
+    attemptedAt = new Date(this.nowMs()).toISOString(),
+  ): PendingPublicTurnTargetClaim | undefined {
+    if (!isBoundedIdentifier(messageId) || !isBoundedIdentifier(personaId) ||
+        !isCanonicalIsoTimestamp(attemptedAt)) {
+      throw new TypeError("Pending public-turn claim is invalid.");
+    }
+    const at = this.nowMs();
+    const changedByReconciliation = this.reconcilePendingPublicTurns(at, false);
+    const turn = this.pendingPublicTurns.get(messageId);
+    const target = turn?.targets.find((candidate) => candidate.personaId === personaId);
+    const claimKey = this.pendingPublicTurnClaimKey(messageId, personaId);
+    if (!turn || !target || this.claimedPendingPublicTurnTargets.has(claimKey)) {
+      if (changedByReconciliation) this.schedulePersist();
+      return undefined;
+    }
+    const attemptedAtMs = Date.parse(attemptedAt);
+    if (attemptedAtMs < Date.parse(turn.createdAt) || attemptedAtMs >= Date.parse(turn.expiresAt)) {
+      throw new TypeError("Pending public-turn attempt is outside its delivery window.");
+    }
+
+    this.claimedPendingPublicTurnTargets.add(claimKey);
+    target.attempts = Math.min(MAX_PENDING_PUBLIC_TURN_ATTEMPTS, target.attempts + 1);
+    target.lastAttemptAt = attemptedAt;
+    this.schedulePersist();
+    return {
+      turn: this.copyPendingPublicTurn(turn),
+      target: { ...target },
+    };
+  }
+
+  releasePendingPublicTurnTarget(messageId: string, personaId: string): boolean {
+    return this.claimedPendingPublicTurnTargets.delete(
+      this.pendingPublicTurnClaimKey(messageId, personaId),
+    );
+  }
+
+  /** Settles only one resident target; repeated settlement is a safe no-op. */
+  settlePendingPublicTurnTarget(messageId: string, personaId: string): boolean {
+    const changedByReconciliation = this.reconcilePendingPublicTurns(this.nowMs(), false);
+    const turn = this.pendingPublicTurns.get(messageId);
+    const targetIndex = turn?.targets.findIndex((target) => target.personaId === personaId) ?? -1;
+    this.claimedPendingPublicTurnTargets.delete(this.pendingPublicTurnClaimKey(messageId, personaId));
+    if (!turn || targetIndex < 0) {
+      if (changedByReconciliation) this.schedulePersist();
+      return false;
+    }
+    turn.targets.splice(targetIndex, 1);
+    if (turn.targets.length === 0) this.pendingPublicTurns.delete(messageId);
+    this.schedulePersist();
+    return true;
+  }
+
+  /**
+   * Removes pending work authored by, or targeted at, a retired actor. The
+   * return value is the number of per-target deliveries cancelled.
+   */
+  cancelPendingPublicTurnsForActor(actorId: string): number {
+    if (!isBoundedIdentifier(actorId)) throw new TypeError("Pending public-turn actor ID is invalid.");
+    let cancelledTargets = 0;
+    for (const [messageId, turn] of this.pendingPublicTurns) {
+      if (turn.authorId === actorId) {
+        cancelledTargets += turn.targets.length;
+        this.pendingPublicTurns.delete(messageId);
+        this.releaseClaimsForPendingPublicTurn(messageId);
+        continue;
+      }
+      const retainedTargets = turn.targets.filter((target) => target.personaId !== actorId);
+      cancelledTargets += turn.targets.length - retainedTargets.length;
+      if (retainedTargets.length === 0) {
+        this.pendingPublicTurns.delete(messageId);
+        this.releaseClaimsForPendingPublicTurn(messageId);
+      } else if (retainedTargets.length !== turn.targets.length) {
+        turn.targets = retainedTargets;
+        this.claimedPendingPublicTurnTargets.delete(this.pendingPublicTurnClaimKey(messageId, actorId));
+      }
+    }
+    if (cancelledTargets > 0) this.schedulePersist();
+    return cancelledTargets;
+  }
+
   getRecent(channelId: string, limit = 30): ChatMessage[] {
     return this.messages.filter((message) => message.channelId === channelId).slice(-limit);
   }
@@ -937,8 +1365,211 @@ export class RoomStore {
   addPublicMessage(
     message: ChatMessage,
     autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+    pendingTurn?: PendingPublicTurnRegistration,
   ): ChatMessage[] {
+    return this.appendPublicMessage(message, autonomousPublication, pendingTurn, false);
+  }
+
+  /**
+   * Speculatively appends one new public row. It is committed automatically by
+   * the first successful flush whose snapshot contains it. Until then, the
+   * returned handle can restore the exact row, outbox target and retention
+   * state without firing attachment cleanup for rows that remain retained.
+   */
+  addUncommittedPublicMessage(
+    message: ChatMessage,
+    autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+    pendingTurn?: PendingPublicTurnRegistration,
+  ): UncommittedPublicMessageAppend {
+    if (this.messages.some((candidate) => candidate.id === message.id) ||
+        this.uncommittedPublicMessageAppends.has(message.id)) {
+      throw new TypeError("An uncommitted public append requires a new message ID.");
+    }
+
+    const at = this.nowMs();
+    this.reconcilePendingPublicTurns(at, false);
+    const messageIndexes = new Map(this.messages.map((candidate, index) => [candidate.id, index]));
+    const autonomousBefore = this.autonomousPublications.map((record) => ({ ...record }));
+    const replyTurn = message.replyToId ? this.pendingPublicTurns.get(message.replyToId) : undefined;
+    const replyTargetIndex = replyTurn?.targets.findIndex((target) => target.personaId === message.authorId) ?? -1;
+    const replyTarget = replyTurn && replyTargetIndex >= 0 ? replyTurn.targets[replyTargetIndex] : undefined;
+    const replyClaimKey = message.replyToId
+      ? this.pendingPublicTurnClaimKey(message.replyToId, message.authorId)
+      : undefined;
+    const replyClaimWasHeld = replyClaimKey !== undefined &&
+      this.claimedPendingPublicTurnTargets.has(replyClaimKey);
+
+    const removed = this.appendPublicMessage(message, autonomousPublication, pendingTurn, true);
+    const handle: UncommittedPublicMessageAppend = Object.freeze({
+      transactionId: randomUUID(),
+      messageId: message.id,
+      createdAt: message.createdAt,
+    });
+    const currentAutonomousIds = new Set(this.autonomousPublications.map((record) => record.messageId));
+    const state: UncommittedPublicMessageState = {
+      handle,
+      message,
+      removedMessages: removed.map((candidate) => ({
+        message: candidate,
+        index: messageIndexes.get(candidate.id) ?? this.messages.length,
+      })),
+      removedAutonomousPublications: autonomousBefore.filter(
+        (record) => !currentAutonomousIds.has(record.messageId),
+      ),
+      addedAutonomousPublication: autonomousPublication !== undefined &&
+        !autonomousBefore.some((record) => record.messageId === message.id),
+      addedPendingTurn: pendingTurn !== undefined && this.pendingPublicTurns.has(message.id),
+      ...(replyTurn && replyTarget && replyClaimKey
+        ? {
+            restoredReplyTarget: {
+              turn: {
+                messageId: replyTurn.messageId,
+                channelId: replyTurn.channelId,
+                authorId: replyTurn.authorId,
+                createdAt: replyTurn.createdAt,
+                expiresAt: replyTurn.expiresAt,
+              },
+              target: { ...replyTarget },
+              targetIndex: replyTargetIndex,
+              claimWasHeld: replyClaimWasHeld,
+            },
+          }
+        : {}),
+    };
+    this.uncommittedPublicMessageAppends.set(message.id, state);
+    return handle;
+  }
+
+  /**
+   * Convenience durability boundary for HTTP/socket acceptance paths. A
+   * failed write leaves neither the visible row nor its delivery outbox in
+   * memory. If an overlapping earlier flush already committed the row, that
+   * durable success wins and this method resolves normally.
+   */
+  async addPublicMessageDurably(
+    message: ChatMessage,
+    autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+    pendingTurn?: PendingPublicTurnRegistration,
+  ): Promise<ChatMessage[]> {
+    const handle = this.addUncommittedPublicMessage(message, autonomousPublication, pendingTurn);
+    const removed = this.uncommittedPublicMessageAppends.get(message.id)?.removedMessages
+      .map((entry) => entry.message) ?? [];
+    try {
+      await this.flush();
+      return removed;
+    } catch (error) {
+      const rollback = this.rollbackUncommittedPublicMessage(handle);
+      if (rollback === "already_durable") return removed;
+      throw error;
+    }
+  }
+
+  rollbackUncommittedPublicMessage(
+    handle: UncommittedPublicMessageAppend,
+  ): PublicMessageRollbackResult {
+    const state = this.uncommittedPublicMessageAppends.get(handle.messageId);
+    if (!state || state.handle.transactionId !== handle.transactionId ||
+        state.handle.createdAt !== handle.createdAt) {
+      const durable = this.messages.find((message) =>
+        message.id === handle.messageId && message.createdAt === handle.createdAt
+      );
+      return durable ? "already_durable" : "missing";
+    }
+
+    this.uncommittedPublicMessageAppends.delete(handle.messageId);
+    this.messages = this.messages.filter((message) =>
+      message.id !== handle.messageId || message.createdAt !== handle.createdAt
+    );
+    for (const removed of [...state.removedMessages].sort((left, right) => left.index - right.index)) {
+      if (this.messages.some((message) => message.id === removed.message.id)) continue;
+      this.messages.splice(Math.min(removed.index, this.messages.length), 0, removed.message);
+    }
+
+    if (state.addedAutonomousPublication) {
+      this.autonomousPublications = this.autonomousPublications.filter(
+        (record) => record.messageId !== handle.messageId,
+      );
+    }
+    const autonomousIds = new Set(this.autonomousPublications.map((record) => record.messageId));
+    for (const record of state.removedAutonomousPublications) {
+      if (!autonomousIds.has(record.messageId)) this.autonomousPublications.push({ ...record });
+    }
+    this.autonomousPublications.sort((left, right) =>
+      left.createdAt.localeCompare(right.createdAt) || left.messageId.localeCompare(right.messageId)
+    );
+
+    if (state.addedPendingTurn) {
+      this.pendingPublicTurns.delete(handle.messageId);
+      this.releaseClaimsForPendingPublicTurn(handle.messageId);
+    }
+    const restoredReplyTarget = state.restoredReplyTarget;
+    if (restoredReplyTarget) {
+      let turn = this.pendingPublicTurns.get(restoredReplyTarget.turn.messageId);
+      if (!turn) {
+        turn = { ...restoredReplyTarget.turn, targets: [] };
+        this.pendingPublicTurns.set(turn.messageId, turn);
+      }
+      if (!turn.targets.some((target) => target.personaId === restoredReplyTarget.target.personaId)) {
+        turn.targets.splice(
+          Math.min(restoredReplyTarget.targetIndex, turn.targets.length),
+          0,
+          { ...restoredReplyTarget.target },
+        );
+      }
+      if (restoredReplyTarget.claimWasHeld) {
+        this.claimedPendingPublicTurnTargets.add(this.pendingPublicTurnClaimKey(
+          turn.messageId,
+          restoredReplyTarget.target.personaId,
+        ));
+      }
+    }
+    this.schedulePersist();
+    return "rolled_back";
+  }
+
+  private appendPublicMessage(
+    message: ChatMessage,
+    autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+    pendingTurn?: PendingPublicTurnRegistration,
+    deferRemovalHandler = false,
+  ): ChatMessage[] {
+    const existing = this.messages.find((candidate) => candidate.id === message.id);
+    if (existing) {
+      if (existing.channelId !== message.channelId || existing.authorId !== message.authorId ||
+          existing.content !== message.content || existing.createdAt !== message.createdAt ||
+          existing.replyToId !== message.replyToId || existing.system !== message.system) {
+        throw new TypeError("A public message ID cannot be reused for a different message.");
+      }
+      let changed = false;
+      if (autonomousPublication && !this.autonomousPublications.some((record) => record.messageId === message.id)) {
+        this.autonomousPublications.push({
+          messageId: message.id,
+          channelId: message.channelId,
+          createdAt: message.createdAt,
+          ...autonomousPublication,
+        });
+        this.pruneAutonomousPublications(Date.parse(message.createdAt));
+        changed = true;
+      }
+      if (pendingTurn) {
+        this.registerPendingPublicTurn(message.id, pendingTurn);
+      }
+      changed = this.reconcilePendingPublicTurns(this.nowMs(), false) || changed;
+      if (changed) this.schedulePersist();
+      return [];
+    }
+
+    const at = this.nowMs();
+    let pendingCandidate: PendingPublicTurn | undefined;
+    if (pendingTurn) {
+      this.reconcilePendingPublicTurns(at, false);
+      pendingCandidate = this.createPendingPublicTurn(message, pendingTurn, at);
+      if (this.pendingPublicTurns.size >= MAX_PERSISTED_PENDING_PUBLIC_TURNS) {
+        throw new RangeError("Pending public-turn retention is full.");
+      }
+    }
     this.messages.push(message);
+    if (pendingCandidate) this.pendingPublicTurns.set(message.id, pendingCandidate);
     if (autonomousPublication) {
       this.autonomousPublications.push({
         messageId: message.id,
@@ -948,13 +1579,19 @@ export class RoomStore {
       });
       this.pruneAutonomousPublications(Date.parse(message.createdAt));
     }
+    this.reconcilePendingPublicTurns(at, false);
     let removed: ChatMessage[] = [];
     const inChannel = this.messages.filter((candidate) => candidate.channelId === message.channelId);
     if (inChannel.length > this.publicHistoryHardLimit) {
-      const removeIds = new Set(inChannel.slice(0, inChannel.length - this.publicHistoryTrimTo).map((candidate) => candidate.id));
+      const pinnedIds = new Set(this.pendingPublicTurns.keys());
+      const removalCount = inChannel.length - this.publicHistoryTrimTo;
+      const removeIds = new Set(inChannel
+        .filter((candidate) => !pinnedIds.has(candidate.id))
+        .slice(0, removalCount)
+        .map((candidate) => candidate.id));
       removed = this.messages.filter((candidate) => removeIds.has(candidate.id));
       this.messages = this.messages.filter((candidate) => !removeIds.has(candidate.id));
-      if (removed.length > 0) this.removalHandler?.(removed);
+      if (!deferRemovalHandler && removed.length > 0) this.removalHandler?.(removed);
     }
     this.schedulePersist();
     return removed;
@@ -1215,17 +1852,40 @@ export class RoomStore {
     // snapshot winning a rename race.
     this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
+      this.reconcilePendingPublicTurns(this.nowMs(), false);
+      const includedUncommittedAppends = [...this.uncommittedPublicMessageAppends.values()].filter((state) =>
+        this.messages.some((message) =>
+          message.id === state.handle.messageId && message.createdAt === state.handle.createdAt
+        )
+      );
       const payload: PersistedState = {
-        version: 3,
+        version: 4,
         messages: this.messages,
         privateThreads: [...this.privateThreads.values()],
         autonomousPublications: this.autonomousPublications,
         trustedChannelLanguages: this.getTrustedChannelLanguages(),
+        pendingPublicTurns: [...this.pendingPublicTurns.values()]
+          .map((turn) => this.copyPendingPublicTurn(turn))
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt) ||
+            left.messageId.localeCompare(right.messageId)),
       };
       const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
       try {
         await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
         await rename(tempPath, this.filePath);
+        const committedRemovedMessages: ChatMessage[] = [];
+        for (const state of includedUncommittedAppends) {
+          if (this.uncommittedPublicMessageAppends.get(state.handle.messageId) !== state) continue;
+          this.uncommittedPublicMessageAppends.delete(state.handle.messageId);
+          committedRemovedMessages.push(...state.removedMessages.map((entry) => entry.message));
+        }
+        if (committedRemovedMessages.length > 0) {
+          try {
+            this.removalHandler?.(committedRemovedMessages);
+          } catch (cleanupError) {
+            console.warn("Could not hand committed room-history removals to retention cleanup.", cleanupError);
+          }
+        }
       } catch (error) {
         await unlink(tempPath).catch((cleanupError: NodeJS.ErrnoException) => {
           if (cleanupError.code !== "ENOENT") {
@@ -1254,9 +1914,10 @@ export class RoomStore {
       messages.push(message);
       byChannel.set(message.channelId, messages);
     }
-    const keepIds = new Set(
-      [...byChannel.values()].flatMap((messages) => messages.slice(-limit).map((message) => message.id)),
-    );
+    const keepIds = new Set(this.pendingPublicTurns.keys());
+    for (const channelMessages of byChannel.values()) {
+      for (const message of channelMessages.slice(-limit)) keepIds.add(message.id);
+    }
     this.messages = this.messages.filter((message) => keepIds.has(message.id));
   }
 }

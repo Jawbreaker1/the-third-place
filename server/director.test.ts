@@ -3349,6 +3349,943 @@ describe("social director", () => {
     }
   });
 
+  it("never drops a directly addressed required reply when both normal and shared priority pace are saturated", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-17T12:30:00.000Z");
+    try {
+      const human = {
+        id: "guest-direct-priority-reply",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-direct-priority-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const incoming = createMessage("lobby", human.id, "@Mira kan du svara?", {
+        createdAt: new Date(now).toISOString(),
+        authorSnapshot: { ...human, status: "offline" },
+      });
+      store.addPublicMessage(incoming);
+      const generateScene = vi.fn(async () => [{
+        personaId: mira.id,
+        content: "japp, jag är här",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+      const internal = director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+        aiTimestamps: number[];
+        priorityHumanReplyTimestamps: number[];
+      };
+      internal.aiTimestamps.push(now, now, now);
+      internal.priorityHumanReplyTimestamps.push(now, now, now, now);
+
+      const pending = internal.handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(store.getRecent("lobby", 1)[0]).toMatchObject({
+        authorId: mira.id,
+        content: "japp, jag är här",
+        replyToId: incoming.id,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a voluntary external-lookup decline separate from execution failure and publishes it visibly", async () => {
+    vi.useFakeTimers();
+    const previousResearchEnabled = process.env.RESEARCH_ENABLED;
+    process.env.RESEARCH_ENABLED = "true";
+    const now = Date.parse("2026-07-17T12:35:00.000Z");
+    try {
+      const human = {
+        id: "guest-social-lookup-decline",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-social-decline-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const incoming = createMessage("stock-market", human.id, "@Mira kan du kolla ett bolag åt mig?", {
+        createdAt: new Date(now).toISOString(),
+        authorSnapshot: { ...human, status: "offline" },
+      });
+      store.addPublicMessage(incoming, undefined, { targetPersonaIds: [mira.id] });
+      const research = vi.fn(async () => {
+        throw new Error("a socially declined action must never enter the executor");
+      });
+      const requests: Array<{
+        requestOwnerIds: string[];
+        evidenceOutcome?: string;
+        research?: unknown;
+        premise?: string;
+        capabilityContext?: { plannedAction: string | null; executionStatus: string };
+      }> = [];
+      const generateScene = vi.fn(async (request: (typeof requests)[number]) => {
+        requests.push(request);
+        return [{
+          personaId: request.requestOwnerIds[0]!,
+          content: "nä, jag orkar faktiskt inte gräva i det just nu",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn({
+            evidence: {
+              need: "required",
+              action: "web_search",
+              confidence: 0.99,
+              goal: "current information about the requested company",
+              query: "requested company current information",
+              urlRef: null,
+              searchMode: "general",
+              timeZone: null,
+              timeKind: null,
+              locationLabel: null,
+            },
+          })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research, researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      await pending;
+      director.stop();
+
+      expect(research).not.toHaveBeenCalled();
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({
+        requestOwnerIds: [mira.id],
+        evidenceOutcome: undefined,
+        research: undefined,
+        capabilityContext: { plannedAction: "web_search", executionStatus: "declined" },
+        premise: expect.stringContaining("personality, not a technical failure"),
+      });
+      expect(store.getRecent("stock-market", 1)[0]).toMatchObject({
+        authorId: mira.id,
+        content: "nä, jag orkar faktiskt inte gräva i det just nu",
+        replyToId: incoming.id,
+      });
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      process.env.RESEARCH_ENABLED = previousResearchEnabled;
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers one fresh unanswered direct human turn after a process restart", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-17T12:40:00.000Z");
+    try {
+      const human = {
+        id: "guest-restart-recovery",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "offline" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-restart-recovery-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const incoming = createMessage("stock-market", human.id, "@Mira kan du kolla upp Investor?", {
+        createdAt: new Date(now - 8_000).toISOString(),
+        authorSnapshot: human,
+      });
+      store.addPublicMessage(incoming, undefined, { targetPersonaIds: [mira.id] });
+      const generateScene = vi.fn(async () => [{
+        personaId: mira.id,
+        content: "den förra turen dog i omstarten, jag tar den nu",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [{ tokenHash: "saved", member: human, lastSeenAt: now }]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      expect(director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(1);
+      await vi.runAllTimersAsync();
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(store.getRecent("stock-market", 1)[0]).toMatchObject({
+        authorId: mira.id,
+        replyToId: incoming.id,
+      });
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("claims a durable direct target before slow semantic analysis so scheduled recovery cannot duplicate it", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-17T12:42:00.000Z");
+    try {
+      const human = {
+        id: "guest-slow-direct-claim",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-slow-direct-claim-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const incoming = createMessage("stock-market", human.id, "@Mira kan du kolla Investor?", {
+        createdAt: new Date(now).toISOString(),
+        authorSnapshot: { ...human, status: "offline" },
+      });
+      store.addPublicMessage(incoming, undefined, { targetPersonaIds: [mira.id] });
+      const analyzeTurn = vi.fn(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 15_500));
+        return classifiedTurn();
+      });
+      const generateScene = vi.fn(async () => [{
+        personaId: mira.id,
+        content: "japp, jag tar Investor nu",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn,
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+          health: vi.fn(() => ({ queueDepth: 0 })),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [{ tokenHash: "saved", member: human, lastSeenAt: now }]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      director.onHumanMessage(incoming, human);
+      expect(store.getPendingPublicTurns()[0]?.targets).toEqual([expect.objectContaining({
+        personaId: mira.id,
+        attempts: 1,
+      })]);
+
+      // The normal 14-second recovery deadline passes while classification is
+      // still running. The process-local claim must keep it from starting a
+      // second scene or invalidating the first one.
+      await vi.advanceTimersByTimeAsync(14_500);
+      expect(analyzeTurn).toHaveBeenCalledTimes(1);
+      expect(generateScene).not.toHaveBeenCalled();
+      expect(store.getPendingPublicTurns()[0]?.targets[0]?.attempts).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      director.stop();
+
+      expect(analyzeTurn).toHaveBeenCalledTimes(1);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(store.getAllMessages().filter((message) => message.replyToId === incoming.id)).toEqual([
+        expect.objectContaining({ authorId: mira.id, content: "japp, jag tar Investor nu" }),
+      ]);
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a durable direct reply current when an unrelated human posts later in the same channel", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const now = Date.parse("2026-07-17T12:43:00.000Z");
+    try {
+      const requester = {
+        id: "guest-durable-direct-requester",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const passerBy = {
+        id: "guest-unrelated-room-post",
+        name: "Alex",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#234", accent: "#567", glyph: "A" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-durable-newer-human-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const direct = createMessage("stock-market", requester.id, "@Mira kan du kolla Investor?", {
+        createdAt: new Date(now).toISOString(),
+        authorSnapshot: { ...requester, status: "offline" },
+      });
+      store.addPublicMessage(direct, undefined, { targetPersonaIds: [mira.id] });
+      const unrelated = createMessage("stock-market", passerBy.id, "jag hämtar kaffe", {
+        createdAt: new Date(now + 1).toISOString(),
+        authorSnapshot: { ...passerBy, status: "offline" },
+      });
+      const analyzeTurn = vi.fn(async (request: { latestMessage: { id: string } }) => {
+        if (request.latestMessage.id !== direct.id) return createFailClosedTurnAnalysis("disabled");
+        await new Promise<void>((resolve) => setTimeout(resolve, 2_500));
+        return classifiedTurn();
+      });
+      const generateScene = vi.fn(async () => [{
+        personaId: mira.id,
+        content: "Investor-svaret kommer här",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn,
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+          health: vi.fn(() => ({ queueDepth: 0 })),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [
+            { tokenHash: "requester", member: requester, lastSeenAt: now },
+            { tokenHash: "passer-by", member: passerBy, lastSeenAt: now },
+          ]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [requester, passerBy, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      director.onHumanMessage(direct, requester);
+      await vi.advanceTimersByTimeAsync(800);
+      store.addPublicMessage(unrelated);
+      director.onHumanMessage(unrelated, passerBy);
+      await vi.advanceTimersByTimeAsync(4_000);
+      director.stop();
+
+      expect(analyzeTurn).toHaveBeenCalledTimes(2);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(store.getAllMessages().filter((message) => message.replyToId === direct.id)).toEqual([
+        expect.objectContaining({ authorId: mira.id, content: "Investor-svaret kommer här" }),
+      ]);
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers multiple same-channel pending turns sequentially without charging unserved attempts", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-17T12:44:00.000Z");
+    try {
+      const human = {
+        id: "guest-sequential-room-recovery",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "offline" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-sequential-room-recovery-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const turns = Array.from({ length: 4 }, (_, index) => createMessage(
+        "stock-market",
+        human.id,
+        `@Mira direkt fråga ${index + 1}`,
+        {
+          createdAt: new Date(now - 8_000 + index * 1_000).toISOString(),
+          authorSnapshot: human,
+        },
+      ));
+      for (const turn of turns) {
+        store.addPublicMessage(turn, undefined, { targetPersonaIds: [mira.id] });
+      }
+      vi.spyOn(store, "flush").mockResolvedValue();
+      const generatedOrder: string[] = [];
+      const attemptsAtGeneration: number[] = [];
+      const generateScene = vi.fn(async (request: {
+        requestOwnerIds: string[];
+        trigger: { messageId?: string; content: string };
+      }) => {
+        const messageId = request.trigger.messageId!;
+        generatedOrder.push(messageId);
+        attemptsAtGeneration.push(
+          store.getPendingPublicTurns()
+            .find((turn) => turn.messageId === messageId)
+            ?.targets.find((target) => target.personaId === mira.id)
+            ?.attempts ?? -1,
+        );
+        return [{
+          personaId: request.requestOwnerIds[0]!,
+          content: `svar på ${request.trigger.content}`,
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [{ tokenHash: "saved", member: human, lastSeenAt: now }]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      expect(director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(1);
+      // Each completed delivery schedules the next same-room turn. Re-entering
+      // the fake-timer drain also flushes the promise continuation that installs
+      // that next timer; no manual second recovery claim is allowed here.
+      for (let index = 0; index < turns.length; index += 1) {
+        await vi.runAllTimersAsync();
+      }
+      director.stop();
+
+      expect(generatedOrder).toEqual(turns.map((turn) => turn.id));
+      expect(attemptsAtGeneration).toEqual([1, 1, 1, 1]);
+      expect(generateScene).toHaveBeenCalledTimes(4);
+      expect(store.getPendingPublicTurns()).toEqual([]);
+      for (const turn of turns) {
+        expect(store.getAllMessages().filter((message) => message.replyToId === turn.id)).toEqual([
+          expect.objectContaining({ authorId: mira.id }),
+        ]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a persisted model-inferred addressee authoritative when recovery routing fails closed", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-17T12:44:30.000Z");
+    try {
+      const human = {
+        id: "guest-inferred-direct-recovery",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "offline" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-inferred-direct-recovery-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const incoming = createMessage("stock-market", human.id, "Mira, kolla bolaget åt mig", {
+        createdAt: new Date(now - 8_000).toISOString(),
+        authorSnapshot: human,
+      });
+      // The original successful semantic pass already established Mira as the
+      // target. Recovery must trust this server-owned row even if its new
+      // classifier attempt is unavailable and the text has no literal @.
+      store.addPublicMessage(incoming, undefined, { targetPersonaIds: [mira.id] });
+      vi.spyOn(store, "flush").mockResolvedValue();
+      const generateScene = vi.fn(async (request: { requestOwnerIds: string[] }) => [{
+        personaId: request.requestOwnerIds[0]!,
+        content: "japp, jag tar den nu",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => createFailClosedTurnAnalysis("timeout")),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+          health: vi.fn(() => ({ queueDepth: 0 })),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [{ tokenHash: "saved", member: human, lastSeenAt: now }]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      expect(director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(1);
+      await vi.runAllTimersAsync();
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(store.getAllMessages().filter((message) => message.replyToId === incoming.id)).toEqual([
+        expect.objectContaining({ authorId: mira.id, content: "japp, jag tar den nu" }),
+      ]);
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("serializes two rapid durable room turns and replies to each exact parent", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-17T12:44:40.000Z");
+    try {
+      const human = {
+        id: "guest-two-rapid-direct-turns",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+      const store = new RoomStore(
+        `/tmp/director-two-rapid-direct-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const first = createMessage("stock-market", human.id, "@Mira kolla Investor", {
+        createdAt: new Date(now).toISOString(), authorSnapshot: { ...human, status: "offline" },
+      });
+      const second = createMessage("stock-market", human.id, "@Vale kolla Volvo", {
+        createdAt: new Date(now).toISOString(), authorSnapshot: { ...human, status: "offline" },
+      });
+      store.addPublicMessage(first, undefined, { targetPersonaIds: [mira.id] });
+      store.addPublicMessage(second, undefined, { targetPersonaIds: [vale.id] });
+      vi.spyOn(store, "flush").mockResolvedValue();
+      const generatedParents: string[] = [];
+      const generateScene = vi.fn(async (request: {
+        trigger: { messageId?: string };
+        requestOwnerIds: string[];
+      }) => {
+        generatedParents.push(request.trigger.messageId!);
+        return [{
+          personaId: request.requestOwnerIds[0]!,
+          content: `svar på ${request.trigger.messageId}`,
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+          health: vi.fn(() => ({ queueDepth: 0 })),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [{ tokenHash: "saved", member: human, lastSeenAt: now }]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      director.onHumanMessage(first, human);
+      director.onHumanMessage(second, human);
+      for (let index = 0; index < 4; index += 1) await vi.runAllTimersAsync();
+      director.stop();
+
+      expect(generatedParents).toEqual([first.id, second.id]);
+      expect(store.getAllMessages().filter((message) => message.replyToId === first.id)).toEqual([
+        expect.objectContaining({ authorId: mira.id }),
+      ]);
+      expect(store.getAllMessages().filter((message) => message.replyToId === second.id)).toEqual([
+        expect.objectContaining({ authorId: vale.id }),
+      ]);
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("continues recovery after three infrastructure attempts instead of abandoning the outbox", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-17T12:44:50.000Z");
+    try {
+      const human = {
+        id: "guest-recovery-beyond-three",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "offline" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-recovery-beyond-three-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const incoming = createMessage("stock-market", human.id, "@Mira kolla Investor", {
+        createdAt: new Date(now - 8_000).toISOString(), authorSnapshot: human,
+      });
+      store.addPublicMessage(incoming, undefined, { targetPersonaIds: [mira.id] });
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        expect(store.claimPendingPublicTurnTarget(incoming.id, mira.id)).toBeDefined();
+        store.releasePendingPublicTurnTarget(incoming.id, mira.id);
+      }
+      expect(store.getPendingPublicTurns()[0]?.targets[0]?.attempts).toBe(3);
+      vi.spyOn(store, "flush").mockResolvedValue();
+      const generateScene = vi.fn(async () => [{
+        personaId: mira.id,
+        content: "nu kom modellen tillbaka",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [{ tokenHash: "saved", member: human, lastSeenAt: now }]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      expect(director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(1);
+      await vi.runAllTimersAsync();
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(store.getAllMessages().filter((message) => message.replyToId === incoming.id)).toEqual([
+        expect.objectContaining({ authorId: mira.id, content: "nu kom modellen tillbaka" }),
+      ]);
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rolls back an unpublished direct reply when every durability barrier fails", async () => {
+    vi.useFakeTimers();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const now = Date.parse("2026-07-17T12:44:55.000Z");
+    try {
+      const human = {
+        id: "guest-direct-persist-failure",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(
+        `/tmp/director-direct-persist-failure-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const incoming = createMessage("stock-market", human.id, "@Mira kolla Investor", {
+        createdAt: new Date(now).toISOString(),
+        authorSnapshot: { ...human, status: "offline" },
+      });
+      store.addPublicMessage(incoming, undefined, { targetPersonaIds: [mira.id] });
+      const flush = vi.spyOn(store, "flush").mockRejectedValue(new Error("disk unavailable"));
+      const emit = vi.fn();
+      const rememberDeliveredLine = vi.fn();
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene: vi.fn(async () => [{
+            personaId: mira.id,
+            content: "ett svar som aldrig får synas",
+            source: "lm" as const,
+            sourceIds: [],
+          }]),
+          rememberDeliveredLine,
+          health: vi.fn(() => ({ queueDepth: 0 })),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [{ tokenHash: "saved", member: human, lastSeenAt: now }]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      director.onHumanMessage(incoming, human);
+      await vi.advanceTimersByTimeAsync(2_000);
+      director.stop();
+
+      expect(flush.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(store.getAllMessages().filter((message) => message.replyToId === incoming.id)).toEqual([]);
+      expect(store.getPendingPublicTurns()).toEqual([
+        expect.objectContaining({
+          messageId: incoming.id,
+          targets: [expect.objectContaining({ personaId: mira.id, attempts: 1 })],
+        }),
+      ]);
+      expect(emit.mock.calls.some(([event]) => event === "message:new")).toBe(false);
+      expect(rememberDeliveredLine).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers only the still-unanswered resident from a multi-target direct turn", async () => {
+    vi.useFakeTimers();
+    const now = Date.parse("2026-07-17T12:45:00.000Z");
+    try {
+      const human = {
+        id: "guest-partial-restart-recovery",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "offline" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+      const store = new RoomStore(
+        `/tmp/director-partial-restart-${process.pid}-${Math.random()}.json`,
+        { now: () => now },
+      );
+      const incoming = createMessage(
+        "stock-market",
+        human.id,
+        "@Mira @Vale, kan ni båda kika på Investor?",
+        { createdAt: new Date(now - 8_000).toISOString(), authorSnapshot: human },
+      );
+      store.addPublicMessage(incoming, undefined, { targetPersonaIds: [mira.id, vale.id] });
+      store.addPublicMessage(createMessage("stock-market", mira.id, "jag har svarat", {
+        replyToId: incoming.id,
+        createdAt: new Date(now - 4_000).toISOString(),
+      }));
+      const requestOwnerIds: string[][] = [];
+      const generateScene = vi.fn(async (request: { requestOwnerIds: string[] }) => {
+        requestOwnerIds.push(request.requestOwnerIds);
+        return [{
+          personaId: vale.id,
+          content: "min take kommer här",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          listRestorableProfiles: vi.fn(() => [{ tokenHash: "saved", member: human, lastSeenAt: now }]),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+
+      expect(store.getPendingPublicTurns()[0]?.targets.map((target) => target.personaId)).toEqual([vale.id]);
+      expect(director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(1);
+      await vi.runAllTimersAsync();
+      director.stop();
+
+      expect(requestOwnerIds).toEqual([[vale.id]]);
+      expect(store.getRecent("stock-market", 1)[0]).toMatchObject({
+        authorId: vale.id,
+        replyToId: incoming.id,
+      });
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ["nb", "Kan noen sjekke dagens strømpris?", "dagens strømpris Norge"],
     ["de", "Kann jemand die heutigen DAX-Kurse prüfen?", "DAX Kurse heute"],

@@ -77,6 +77,10 @@ describe("turn-capability architecture boundary", () => {
         `${entry.id} recovers an argument it does not allow`,
       ).toBe(true);
       expect(
+        Object.keys(entry.arguments.defaultValues ?? {}).every((field) => allowedFields.has(field)),
+        `${entry.id} defaults an argument it does not allow`,
+      ).toBe(true);
+      expect(
         Object.keys(entry.arguments.allowedStringValues ?? {}).every((field) => allowedFields.has(field)),
         `${entry.id} constrains an argument it does not allow`,
       ).toBe(true);

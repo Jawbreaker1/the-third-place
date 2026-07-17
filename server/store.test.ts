@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { chmod, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { describe, expect, it, vi } from "vitest";
+import { chmod, mkdir, readdir, readFile, rmdir, stat, writeFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import type { ImageAttachment, Member } from "../shared/types.js";
 import { createMessage, RoomStateLoadError, RoomStore } from "./store.js";
@@ -159,8 +159,9 @@ describe("room history", () => {
     ]);
     expect(restored.getAllMessages().some((message) => message.channelId === thread.id)).toBe(false);
     expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
-      version: 3,
+      version: 4,
       trustedChannelLanguages: [],
+      pendingPublicTurns: [],
     });
   });
 
@@ -341,7 +342,7 @@ describe("room history", () => {
       trustedChannelLanguages: unknown[];
     };
     expect(persisted).toMatchObject({
-      version: 3,
+      version: 4,
       trustedChannelLanguages: [{
         channelId: "lobby",
         languageTag: "sv",
@@ -731,7 +732,7 @@ describe("room history", () => {
       version: number;
       messages: Array<{ id: string }>;
     };
-    expect(persisted.version).toBe(3);
+    expect(persisted.version).toBe(4);
     expect(persisted.messages.map((message) => message.id)).toEqual(expectedIds);
 
     const temporaryPrefix = `${basename(filePath)}.`;
@@ -739,5 +740,398 @@ describe("room history", () => {
       (entry) => entry.startsWith(temporaryPrefix) && entry.endsWith(".tmp"),
     );
     expect(leftovers).toEqual([]);
+  });
+
+  it("atomically persists a public trigger and its bounded per-resident delivery work", async () => {
+    const now = Date.parse("2026-07-17T12:00:00.000Z");
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath, { now: () => now });
+    const trigger = createMessage("stock-market", "human-johan", "@Mira kan du kolla Investor?", {
+      createdAt: new Date(now).toISOString(),
+    });
+
+    store.addPublicMessage(trigger, undefined, {
+      targetPersonaIds: ["ai-mira", "ai-vale"],
+    });
+    await store.flush();
+
+    const persisted = JSON.parse(await readFile(filePath, "utf8")) as {
+      version: number;
+      messages: Array<{ id: string }>;
+      pendingPublicTurns: Array<{ messageId: string; targets: Array<{ personaId: string }> }>;
+    };
+    expect(persisted.version).toBe(4);
+    expect(persisted.messages.some((message) => message.id === trigger.id)).toBe(true);
+    expect(persisted.pendingPublicTurns).toEqual([expect.objectContaining({
+      messageId: trigger.id,
+      expiresAt: "2026-07-17T12:20:00.000Z",
+      targets: [
+        { personaId: "ai-mira", attempts: 0 },
+        { personaId: "ai-vale", attempts: 0 },
+      ],
+    })]);
+
+    const restored = new RoomStore(filePath, { now: () => now });
+    await restored.load();
+    expect(restored.getPendingPublicTurns()).toEqual([expect.objectContaining({
+      messageId: trigger.id,
+      targets: expect.arrayContaining([
+        expect.objectContaining({ personaId: "ai-mira", attempts: 0 }),
+        expect.objectContaining({ personaId: "ai-vale", attempts: 0 }),
+      ]),
+    })]);
+  });
+
+  it("rolls back a failed durable direct image append without a dangling row, outbox or retention cleanup", async () => {
+    vi.useFakeTimers();
+    const filePath = tempStorePath();
+    await mkdir(filePath);
+    try {
+      const store = new RoomStore(filePath, {
+        publicHistoryHardLimit: 600,
+        publicHistoryTrimTo: 500,
+      });
+      const retainedAttachment = imageAttachment("46746ded-ecf3-443d-a9c2-2ceae687d4a4");
+      const retained = createMessage("lobby", "human-old", "old image", {
+        attachments: [retainedAttachment],
+      });
+      store.addPublicMessage(retained);
+      for (let index = 0; index < 599; index += 1) {
+        store.addPublicMessage(createMessage("lobby", "human-busy", `busy ${index}`));
+      }
+      const removedAttachmentIds: string[] = [];
+      store.onMessagesRemoved((messages) => {
+        removedAttachmentIds.push(...messages.flatMap((message) =>
+          message.attachments?.map((attachment) => attachment.id) ?? []
+        ));
+      });
+      const incomingAttachment = imageAttachment("0572e81a-24ed-4ac3-b793-ceb3c8b01a43");
+      const incoming = createMessage("lobby", "human-johan", "@Mira kolla bilden", {
+        attachments: [incomingAttachment],
+      });
+
+      await expect(store.addPublicMessageDurably(incoming, undefined, {
+        targetPersonaIds: ["ai-mira"],
+      })).rejects.toBeDefined();
+
+      expect(store.getMessage(incoming.id)).toBeUndefined();
+      expect(store.getPendingPublicTurns().some((turn) => turn.messageId === incoming.id)).toBe(false);
+      expect(store.getMessage(retained.id)?.attachments?.[0]?.id).toBe(retainedAttachment.id);
+      expect(store.getAllImageMessages().some((message) => message.id === incoming.id)).toBe(false);
+      expect(removedAttachmentIds).toEqual([]);
+      expect(store.getRecent("lobby", 1_000)).toHaveLength(600);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      await rmdir(filePath);
+    }
+  });
+
+  it("restores an exact claimed delivery target when an uncommitted resident reply cannot be flushed", async () => {
+    vi.useFakeTimers();
+    const filePath = tempStorePath();
+    await mkdir(filePath);
+    try {
+      const now = Date.parse("2026-07-17T12:00:00.000Z");
+      const store = new RoomStore(filePath, { now: () => now });
+      const trigger = createMessage("stock-market", "human-johan", "@Mira kolla Investor", {
+        createdAt: new Date(now).toISOString(),
+      });
+      store.addPublicMessage(trigger, undefined, { targetPersonaIds: ["ai-mira"] });
+      expect(store.claimPendingPublicTurnTarget(trigger.id, "ai-mira")).toEqual(expect.objectContaining({
+        target: expect.objectContaining({ personaId: "ai-mira", attempts: 1 }),
+      }));
+      const reply = createMessage("stock-market", "ai-mira", "Jag hittade det här.", {
+        replyToId: trigger.id,
+        createdAt: new Date(now + 1_000).toISOString(),
+      });
+
+      await expect(store.addPublicMessageDurably(reply)).rejects.toBeDefined();
+
+      expect(store.getMessage(reply.id)).toBeUndefined();
+      expect(store.getPendingPublicTurns()).toEqual([expect.objectContaining({
+        messageId: trigger.id,
+        targets: [expect.objectContaining({ personaId: "ai-mira", attempts: 1 })],
+      })]);
+      expect(store.releasePendingPublicTurnTarget(trigger.id, "ai-mira")).toBe(true);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      await rmdir(filePath);
+    }
+  });
+
+  it("does not roll back an uncommitted handle after a successful flush made its row durable", async () => {
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath);
+    const message = createMessage("lobby", "ai-mira", "durable before broadcast");
+    const append = store.addUncommittedPublicMessage(message);
+
+    await store.flush();
+
+    expect(store.rollbackUncommittedPublicMessage(append)).toBe("already_durable");
+    expect(store.getMessage(message.id)).toEqual(message);
+    const restored = new RoomStore(filePath);
+    await restored.load();
+    expect(restored.getMessage(message.id)).toEqual(message);
+  });
+
+  it("claims, retries and settles each resident target idempotently", async () => {
+    const now = Date.parse("2026-07-17T12:00:00.000Z");
+    const store = new RoomStore(tempStorePath(), { now: () => now });
+    const trigger = createMessage("stock-market", "human-johan", "kolla Investor", {
+      createdAt: new Date(now).toISOString(),
+    });
+    store.addPublicMessage(trigger, undefined, { targetPersonaIds: ["ai-mira"] });
+
+    expect(store.registerPendingPublicTurn(trigger.id, {
+      targetPersonaIds: ["ai-mira", "ai-vale"],
+    })?.targets).toEqual([
+      { personaId: "ai-mira", attempts: 0 },
+      { personaId: "ai-vale", attempts: 0 },
+    ]);
+    expect(store.claimPendingPublicTurnTarget(trigger.id, "ai-mira")?.target).toEqual({
+      personaId: "ai-mira",
+      attempts: 1,
+      lastAttemptAt: "2026-07-17T12:00:00.000Z",
+    });
+    expect(store.claimPendingPublicTurnTarget(trigger.id, "ai-mira")).toBeUndefined();
+    expect(store.releasePendingPublicTurnTarget(trigger.id, "ai-mira")).toBe(true);
+    expect(store.releasePendingPublicTurnTarget(trigger.id, "ai-mira")).toBe(false);
+    expect(store.claimPendingPublicTurnTarget(trigger.id, "ai-mira")?.target.attempts).toBe(2);
+
+    expect(store.settlePendingPublicTurnTarget(trigger.id, "ai-mira")).toBe(true);
+    expect(store.settlePendingPublicTurnTarget(trigger.id, "ai-mira")).toBe(false);
+    expect(store.getPendingPublicTurns()[0]?.targets).toEqual([
+      { personaId: "ai-vale", attempts: 0 },
+    ]);
+    expect(store.settlePendingPublicTurnTarget(trigger.id, "ai-vale")).toBe(true);
+    expect(store.getPendingPublicTurns()).toEqual([]);
+    await store.flush();
+  });
+
+  it("drops process-local claims on restart while retaining durable attempt counts", async () => {
+    const now = Date.parse("2026-07-17T12:00:00.000Z");
+    const filePath = tempStorePath();
+    const first = new RoomStore(filePath, { now: () => now });
+    const trigger = createMessage("stock-market", "human-johan", "Mira?", {
+      createdAt: new Date(now).toISOString(),
+    });
+    first.addPublicMessage(trigger, undefined, { targetPersonaIds: ["ai-mira"] });
+    expect(first.claimPendingPublicTurnTarget(trigger.id, "ai-mira")?.target.attempts).toBe(1);
+    await first.flush();
+
+    const restored = new RoomStore(filePath, { now: () => now + 1_000 });
+    await restored.load();
+    expect(restored.claimPendingPublicTurnTarget(
+      trigger.id,
+      "ai-mira",
+      "2026-07-17T12:00:01.000Z",
+    )?.target.attempts).toBe(2);
+    await restored.flush();
+  });
+
+  it("reconciles completion only from the exact target replying in the same channel", async () => {
+    const now = Date.parse("2026-07-17T12:00:00.000Z");
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath, { now: () => now });
+    const trigger = createMessage("stock-market", "human-johan", "kan ni kolla Investor?", {
+      createdAt: new Date(now).toISOString(),
+    });
+    store.addPublicMessage(trigger, undefined, { targetPersonaIds: ["ai-mira", "ai-vale"] });
+
+    store.addPublicMessage(createMessage("stock-market", "ai-juno", "jag svarar på något annat", {
+      replyToId: trigger.id,
+      createdAt: "2026-07-17T12:00:01.000Z",
+    }));
+    store.addPublicMessage(createMessage("lobby", "ai-mira", "fel rum", {
+      replyToId: trigger.id,
+      createdAt: "2026-07-17T12:00:02.000Z",
+    }));
+    expect(store.getPendingPublicTurns()[0]?.targets.map((target) => target.personaId)).toEqual([
+      "ai-mira",
+      "ai-vale",
+    ]);
+
+    store.addPublicMessage(createMessage("stock-market", "ai-mira", "Jag kollade Investor.", {
+      replyToId: trigger.id,
+      createdAt: "2026-07-17T12:00:03.000Z",
+    }));
+    expect(store.getPendingPublicTurns()[0]?.targets).toEqual([
+      { personaId: "ai-vale", attempts: 0 },
+    ]);
+    store.addPublicMessage(createMessage("stock-market", "ai-vale", "Här är min bedömning.", {
+      replyToId: trigger.id,
+      createdAt: "2026-07-17T12:00:04.000Z",
+    }));
+    expect(store.getPendingPublicTurns()).toEqual([]);
+    await store.flush();
+
+    const restored = new RoomStore(filePath, { now: () => now });
+    await restored.load();
+    expect(restored.getPendingPublicTurns()).toEqual([]);
+  });
+
+  it("expires work, safely drops expired dangling rows and fails closed on active dangling rows", async () => {
+    let now = Date.parse("2026-07-17T12:00:00.000Z");
+    const runtime = new RoomStore(tempStorePath(), { now: () => now });
+    const trigger = createMessage("stock-market", "human-johan", "kortlivat", {
+      createdAt: new Date(now).toISOString(),
+    });
+    runtime.addPublicMessage(trigger, undefined, { targetPersonaIds: ["ai-mira"] });
+    now += 20 * 60_000;
+    expect(runtime.getPendingPublicTurns()).toEqual([]);
+    await runtime.flush();
+
+    const turn = {
+      messageId: "missing-trigger",
+      channelId: "stock-market",
+      authorId: "human-johan",
+      createdAt: "2026-07-17T11:00:00.000Z",
+      expiresAt: "2026-07-17T11:05:00.000Z",
+      targets: [{ personaId: "ai-mira", attempts: 0 }],
+    };
+    const expiredPath = tempStorePath();
+    await writeFile(expiredPath, JSON.stringify({
+      version: 4,
+      messages: [],
+      privateThreads: [],
+      autonomousPublications: [],
+      trustedChannelLanguages: [],
+      pendingPublicTurns: [turn],
+    }), "utf8");
+    const expired = new RoomStore(expiredPath, { now: () => now });
+    await expired.load();
+    expect(expired.getPendingPublicTurns()).toEqual([]);
+
+    const activePath = tempStorePath();
+    const activeBytes = JSON.stringify({
+      version: 4,
+      messages: [],
+      privateThreads: [],
+      autonomousPublications: [],
+      trustedChannelLanguages: [],
+      pendingPublicTurns: [{
+        ...turn,
+        createdAt: "2026-07-17T12:19:00.000Z",
+        expiresAt: "2026-07-17T12:30:00.000Z",
+      }],
+    });
+    await writeFile(activePath, activeBytes, "utf8");
+    const active = new RoomStore(activePath, { now: () => now });
+    await expect(active.load()).rejects.toBeInstanceOf(RoomStateLoadError);
+    expect(await readFile(activePath, "utf8")).toBe(activeBytes);
+  });
+
+  it("fails closed on malformed version 4 pending-turn state", async () => {
+    const trigger = createMessage("stock-market", "human-johan", "strict outbox", {
+      createdAt: "2026-07-17T12:00:00.000Z",
+    });
+    const validTurn = {
+      messageId: trigger.id,
+      channelId: trigger.channelId,
+      authorId: trigger.authorId,
+      createdAt: trigger.createdAt,
+      expiresAt: "2026-07-17T12:05:00.000Z",
+      targets: [{ personaId: "ai-mira", attempts: 0 }],
+    };
+    const root = {
+      version: 4,
+      messages: [trigger],
+      privateThreads: [],
+      autonomousPublications: [],
+      trustedChannelLanguages: [],
+    };
+    const malformedStates: unknown[] = [
+      root,
+      { ...root, autonomousPublications: undefined, pendingPublicTurns: [validTurn] },
+      { ...root, pendingPublicTurns: [{ ...validTurn, unexpected: true }] },
+      { ...root, pendingPublicTurns: [{
+        ...validTurn,
+        targets: [validTurn.targets[0], validTurn.targets[0]],
+      }] },
+      { ...root, pendingPublicTurns: [{ ...validTurn, channelId: "lobby" }] },
+      { ...root, pendingPublicTurns: [{ ...validTurn, expiresAt: "2026-07-17 12:05" }] },
+      { ...root, pendingPublicTurns: [{ ...validTurn, expiresAt: "2026-07-17T12:30:00.001Z" }] },
+      { ...root, pendingPublicTurns: [{
+        ...validTurn,
+        targets: [{ personaId: "ai-mira", attempts: 1 }],
+      }] },
+      { ...root, pendingPublicTurns: [{
+        ...validTurn,
+        targets: [{
+          personaId: "ai-mira",
+          attempts: 0,
+          lastAttemptAt: "2026-07-17T12:01:00.000Z",
+        }],
+      }] },
+      { ...root, pendingPublicTurns: [{
+        ...validTurn,
+        targets: [{
+          personaId: "ai-mira",
+          attempts: 1,
+          lastAttemptAt: "2026-07-17T11:59:59.000Z",
+        }],
+      }] },
+    ];
+
+    for (const [index, malformed] of malformedStates.entries()) {
+      const filePath = `${tempStorePath()}-v4-${index}`;
+      const originalBytes = JSON.stringify(malformed);
+      await writeFile(filePath, originalBytes, "utf8");
+      const store = new RoomStore(filePath, { now: () => Date.parse("2026-07-17T12:01:00.000Z") });
+      await expect(store.load()).rejects.toBeInstanceOf(RoomStateLoadError);
+      expect(await readFile(filePath, "utf8")).toBe(originalBytes);
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    }
+  });
+
+  it("pins active trigger rows through public-history trimming", async () => {
+    const now = Date.parse("2026-07-17T12:00:00.000Z");
+    const filePath = tempStorePath();
+    const retention = {
+      publicHistoryHardLimit: 600,
+      publicHistoryTrimTo: 500,
+      now: () => now,
+    };
+    const store = new RoomStore(filePath, retention);
+    const trigger = createMessage("stock-market", "human-johan", "do not trim me", {
+      createdAt: new Date(now).toISOString(),
+    });
+    store.addPublicMessage(trigger, undefined, { targetPersonaIds: ["ai-mira"] });
+    for (let index = 0; index < 650; index += 1) {
+      store.addPublicMessage(createMessage("stock-market", "human-busy", `busy ${index}`, {
+        createdAt: new Date(now + index + 1).toISOString(),
+      }));
+    }
+    expect(store.getMessage(trigger.id)).toBeDefined();
+    expect(store.getPendingPublicTurns()[0]?.messageId).toBe(trigger.id);
+    await store.flush();
+
+    const restored = new RoomStore(filePath, retention);
+    await restored.load();
+    expect(restored.getMessage(trigger.id)).toBeDefined();
+    expect(restored.getPendingPublicTurns()[0]?.messageId).toBe(trigger.id);
+  });
+
+  it("cancels pending authors and targets when actors are retired", async () => {
+    const now = Date.parse("2026-07-17T12:00:00.000Z");
+    const store = new RoomStore(tempStorePath(), { now: () => now });
+    const first = createMessage("stock-market", "human-retired", "old request", {
+      createdAt: new Date(now).toISOString(),
+    });
+    const second = createMessage("stock-market", "human-staying", "other request", {
+      createdAt: new Date(now + 1).toISOString(),
+    });
+    store.addPublicMessage(first, undefined, { targetPersonaIds: ["ai-mira", "ai-vale"] });
+    store.addPublicMessage(second, undefined, { targetPersonaIds: ["ai-mira", "ai-vale"] });
+
+    expect(store.cancelPendingPublicTurnsForActor("human-retired")).toBe(2);
+    expect(store.cancelPendingPublicTurnsForActor("ai-mira")).toBe(1);
+    expect(store.getPendingPublicTurns()).toEqual([expect.objectContaining({
+      messageId: second.id,
+      targets: [{ personaId: "ai-vale", attempts: 0 }],
+    })]);
+    await store.flush();
   });
 });

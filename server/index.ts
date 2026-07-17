@@ -39,7 +39,7 @@ import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { ActorPublicationGate } from "./actorPublicationGate.js";
-import { SocialDirector } from "./director.js";
+import { addressedPersonaIds, analyzeSocialSignals, SocialDirector } from "./director.js";
 import { AmbientEpisodeLedger } from "./ambientEpisodeLedger.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
 import { fetchRemoteImage, ImageStore, ImageStoreError } from "./imageStore.js";
@@ -653,6 +653,8 @@ const replyPreviewFor = (message: ChatMessage) => ({
     (message.system ? "room" : "someone"),
   content: (message.content || (message.attachments?.length ? "Shared an image" : "")).slice(0, 140),
 });
+const publicTurnTargetIds = (content: string, replyTarget?: ChatMessage): string[] =>
+  addressedPersonaIds(analyzeSocialSignals(content).mentionedIds, replyTarget);
 const onlineHumanCount = () => [...sessions.values()].filter((session) => session.member.status === "online").length;
 const getHealth = (): ServerHealth => ({
   ok: true,
@@ -978,6 +980,7 @@ const disconnectModeratedHuman = (
   const session = [...sessions.values()].find((candidate) => candidate.member.id === memberId);
   if (!session) return undefined;
   if (reconnectCooldown) adminModeration.kick(session.member.id, session.member.name);
+  store.cancelPendingPublicTurnsForActor(session.member.id);
   return disconnectHumanSockets(memberId, {
     action: reconnectCooldown ? "kick" : "ban",
     message: reason || (reconnectCooldown
@@ -1306,7 +1309,20 @@ const handleImageMessageUpload = async (
         authorSnapshot: { ...session.member, status: "offline" },
         attachments: [attachment],
       });
-      store.addPublicMessage(message);
+      const targetPersonaIds = publicTurnTargetIds(content, replied);
+      if (targetPersonaIds.length > 0) {
+        try {
+          await store.addPublicMessageDurably(message, undefined, { targetPersonaIds });
+        } catch (error) {
+          console.error(
+            "Could not durably accept a direct public image turn:",
+            error instanceof Error ? error.message : error,
+          );
+          throw new ImageStoreError("That direct image could not be saved safely. Please try again.", 503);
+        }
+      } else {
+        store.addPublicMessage(message);
+      }
       attachmentId = undefined;
       io.to("public").emit("message:new", message);
       if (message.content) humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
@@ -1849,7 +1865,7 @@ io.on("connection", (socket) => {
     acknowledge?.({ ok: true });
   });
 
-  socket.on("message:send", (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
+  socket.on("message:send", async (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
     const bucket = socketBuckets.get(socket.id)?.messages;
     if (!bucket?.take()) {
       acknowledge?.({ ok: false, error: "Slow down for a moment — the room is listening." });
@@ -1879,7 +1895,22 @@ io.on("connection", (socket) => {
         // fallback must never show a stale green dot after the guest leaves.
         authorSnapshot: { ...session.member, status: "offline" },
       });
-      store.addPublicMessage(message);
+      const targetPersonaIds = publicTurnTargetIds(content, replied);
+      if (targetPersonaIds.length > 0) {
+        try {
+          // The visible row and its per-resident response obligation cross the
+          // same durability barrier before either the browser or director can
+          // observe success. A deploy can no longer acknowledge and then lose
+          // the only work item that should answer an exact @mention/reply.
+          await store.addPublicMessageDurably(message, undefined, { targetPersonaIds });
+        } catch (error) {
+          console.error("Could not durably accept a direct public turn:", error instanceof Error ? error.message : error);
+          acknowledge?.({ ok: false, error: "That direct message could not be saved safely. Please try again." });
+          return;
+        }
+      } else {
+        store.addPublicMessage(message);
+      }
       io.to("public").emit("message:new", message);
       attachLinkPreview(message, session.member.id);
       humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
@@ -2045,6 +2076,11 @@ app.use((error: unknown, request: Request, response: Response, _next: unknown) =
 const humanMemoryLoad = await humanMemory.load();
 adminState.validateActiveCatalog();
 await store.load();
+let cancelledBannedPublicTurnTargets = 0;
+for (const ban of adminState.snapshot().bans) {
+  cancelledBannedPublicTurnTargets += store.cancelPendingPublicTurnsForActor(ban.memberId);
+}
+if (cancelledBannedPublicTurnTargets > 0) await store.flush();
 const socialActorInventory = socialMemoryStore.overview();
 const dmActorIds = store.getAllDmParticipantIds();
 const publicParticipantActorIds = store.getAllPublicParticipantActorIds();
@@ -2086,6 +2122,10 @@ actorChannels.restore(store.getAllMessages());
 await lm.probe();
 socialMemoryLifecycle.start();
 director.start();
+const recoveredDirectTurns = director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true });
+if (recoveredDirectTurns > 0) {
+  console.info(`Recovered ${recoveredDirectTurns} durable unanswered direct human turn(s) after startup.`);
+}
 
 const healthInterval = setInterval(async () => {
   const now = Date.now();

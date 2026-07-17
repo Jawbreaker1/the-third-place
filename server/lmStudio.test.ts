@@ -1190,7 +1190,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     }
   });
 
-  it("preempts a stale same-channel public scene so the newer turn router cannot time out behind it", async () => {
+  it("preempts an ordinary stale same-channel public scene so the newer turn router cannot time out behind it", async () => {
     let startedScene: (() => void) | undefined;
     const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
     let completionCalls = 0;
@@ -1226,6 +1226,54 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       failureReason: null,
       evidence: { action: "read_url" },
     });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("does not abort an active durable same-channel public scene when a newer turn enters routing", async () => {
+    let releaseScene: ((response: Response) => void) | undefined;
+    const activeSceneResponse = new Promise<Response>((resolve) => { releaseScene = resolve; });
+    let activeSceneAborted = false;
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        init?.signal?.addEventListener("abort", () => { activeSceneAborted = true; }, { once: true });
+        return await activeSceneResponse;
+      }
+      return turnAnalysisCompletion();
+    }));
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const lm = new LmStudioClient();
+    const durableScene = lm.generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+    }, 0, undefined, { durableDelivery: true });
+    await vi.waitFor(() => expect(completionCalls).toBe(1));
+
+    const newerTurn = lm.analyzeTurn(turnInput("same-channel-after-active-durable-scene"));
+
+    expect(activeSceneAborted).toBe(false);
+    expect(completionCalls).toBe(1);
+    releaseScene?.(completionResponse([{
+      personaId: sana.id,
+      content: "Jag avslutar det hållbara svaret först.",
+    }]));
+    await expect(durableScene).resolves.toEqual([
+      expect.objectContaining({
+        personaId: sana.id,
+        content: "Jag avslutar det hållbara svaret först.",
+      }),
+    ]);
+    await expect(newerTurn).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "read_url" },
+    });
+    expect(activeSceneAborted).toBe(false);
     expect(completionCalls).toBe(2);
   });
 
@@ -1433,7 +1481,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(requestBodies.every((body) => !body.includes("voice-room-a") && !body.includes("voice-room-b"))).toBe(true);
   });
 
-  it("drops an already queued stale same-channel public scene without interrupting another room", async () => {
+  it("drops an already queued ordinary stale same-channel public scene without interrupting another room", async () => {
     let startedScene: (() => void) | undefined;
     const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
     let completionCalls = 0;
@@ -1481,6 +1529,69 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       evidence: { action: "read_url" },
     });
     expect(completionCalls).toBe(2);
+  });
+
+  it("does not drop a queued durable same-channel public scene when a newer turn enters routing", async () => {
+    let releaseActive: ((response: Response) => void) | undefined;
+    const activeResponse = new Promise<Response>((resolve) => { releaseActive = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) return await activeResponse;
+      if (completionCalls === 2) return turnAnalysisCompletion();
+      return completionResponse([{
+        personaId: "ai-sana",
+        content: "Det köade hållbara svaret levererades också.",
+      }]);
+    }));
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const lm = new LmStudioClient();
+    const unrelatedScene = lm.generateScene({
+      kind: "public",
+      channelId: "ai-lab",
+      channelName: "ai-lab",
+      selected: [sana],
+      history: [],
+    }, 0);
+    await vi.waitFor(() => expect(completionCalls).toBe(1));
+
+    let durableSettled = false;
+    const durableScene = lm.generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+    }, 2, undefined, { durableDelivery: true });
+    void durableScene.then(
+      () => { durableSettled = true; },
+      () => { durableSettled = true; },
+    );
+    const newerTurn = lm.analyzeTurn(turnInput("same-channel-after-queued-durable-scene"));
+    await Promise.resolve();
+
+    expect(durableSettled).toBe(false);
+    expect(completionCalls).toBe(1);
+    releaseActive?.(completionResponse([{
+      personaId: sana.id,
+      content: "Det andra rummets svar är klart.",
+    }]));
+    await expect(unrelatedScene).resolves.toEqual([
+      expect.objectContaining({ content: "Det andra rummets svar är klart." }),
+    ]);
+    await expect(newerTurn).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "read_url" },
+    });
+    await expect(durableScene).resolves.toEqual([
+      expect.objectContaining({
+        personaId: sana.id,
+        content: "Det köade hållbara svaret levererades också.",
+      }),
+    ]);
+    expect(completionCalls).toBe(3);
   });
 
   it("preempts ambient generation so live semantic routing can run first", async () => {
@@ -1785,7 +1896,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionCalls).toBe(2);
   });
 
-  it("lets the verifier recover from a contradictory primary using only its bounded action hint", async () => {
+  it("lets the provider-blind verifier recover from a contradictory primary", async () => {
     let completionCalls = 0;
     let verifierPayload: Record<string, any> | undefined;
     vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
@@ -1820,12 +1931,19 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       capabilities: { discussed: ["web_search"], requestKind: "execute", confidence: 0.97 },
     });
     expect(completionCalls).toBe(2);
-    expect(verifierPayload?.primary).toMatchObject({
+    expect(verifierPayload?.primary).toBeUndefined();
+    expect(verifierPayload?.primarySignals).toMatchObject({
       source: "fallback",
       failureReason: "invalid_output",
-      evidence: { action: "web_search", confidence: 0.7 },
-      capabilities: { discussed: [], requestKind: "none", confidence: 1 },
+      plan: {
+        selected: true,
+        evidenceConfidence: 0.7,
+        requestKind: "none",
+        capabilityConfidence: 1,
+      },
     });
+    expect(verifierPayload?.primarySignals.plan).not.toHaveProperty("action");
+    expect(verifierPayload?.primarySignals).not.toHaveProperty("capabilities");
     expect(JSON.stringify(verifierPayload)).not.toContain('"g":"enlaces graciosos"');
   });
 
@@ -2416,6 +2534,407 @@ describe("LM Studio multilingual batch candidate review", () => {
     const retryScene = JSON.parse(bodies[2].messages[1].content);
     expect(retryScene.premise).toContain("earlier draft failed the evidence contract");
     expect(bodies[2].messages[0].content).toContain("Never write any source identifier in visible message content");
+  });
+
+  it("reclassifies two explicit packet-not-answer-bearing verdicts into one final reviewed failure report", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    const failureReport = "Hm, jag kunde inte verifiera Investor-frågan den här gången.";
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Investor ser billig ut jämfört med substansvärdet.",
+          sourceIds: ["S1"],
+        }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["evidence_not_answer_bearing"],
+          rewriteInstruction: "The complete supplied packet lacks the requested Investor AB datum.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "OMXS30-sidan visar att Investor har gått starkt idag.",
+          sourceIds: ["S1"],
+        }]);
+      }
+      if (bodies.length === 4) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["evidence_not_answer_bearing"],
+          rewriteInstruction: "The complete supplied packet still lacks the requested Investor AB datum.",
+        }]);
+      }
+      if (bodies.length === 5) {
+        // The reclassified scene has no source inventory, so even a copied ID is
+        // stripped before the independent review and can never reach publication.
+        return completionResponse([{ personaId: mira.id, content: failureReport, sourceIds: ["S1"] }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Guest", content: "@Mira kan du kolla upp Investor?" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "Investor AB aktiekurs och analys OMXS30",
+        retrievedAt: "2026-07-17T10:58:30.000Z",
+        results: [{
+          id: "S1",
+          title: "OMX Stockholm 30 Index",
+          url: "https://example.com/omxs30",
+          snippet: "Index overview with no answer-bearing information about Investor AB.",
+        }],
+      },
+      evidenceOutcome: "succeeded",
+      urlPublicationPolicy: "server_card",
+      capabilityContext: {
+        available: ["web_search", "market_snapshot"],
+        requestKind: "retry",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      content: failureReport,
+      sourceIds: [],
+    })]);
+    expect(bodies).toHaveLength(6);
+    const failureScene = JSON.parse(bodies[4].messages[1].content);
+    expect(failureScene).toMatchObject({
+      premise: expect.stringContaining("temporary not-answer-bearing failure"),
+      freshResearch: null,
+      explicitRequestOwnerIds: [mira.id],
+      requiredActorIds: [mira.id],
+      trustedCapabilityContext: {
+        plannedAction: "web_search",
+        executionStatus: "failed_temporary",
+      },
+    });
+    expect(failureScene.semanticContext.answerDepth).toBe("brief");
+    expect(bodies[4].messages[0].content).toContain("this specific evidence request returned no usable source");
+    const failureReview = JSON.parse(bodies[5].messages[1].content);
+    expect(failureReview).toMatchObject({
+      evidence: { outcome: "failed", results: [] },
+      capabilityContext: {
+        plannedAction: "web_search",
+        executionStatus: "failed_temporary",
+      },
+      candidates: [{
+        personaId: mira.id,
+        sourceIds: [],
+        mustReply: true,
+        mustFulfillRequest: false,
+        mustReportCapabilityFailure: true,
+      }],
+    });
+  });
+
+  it("does not turn two candidate citation defects over answer-bearing evidence into a source failure", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      if (call === 1) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Jag kollade rapporten: Investor handlas med 12 procents rabatt.",
+          sourceIds: [],
+        }]);
+      }
+      if (call === 3) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Investor handlas med 20 procents rabatt enligt rapporten.",
+          sourceIds: ["S1"],
+        }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "high",
+        issues: call === 2 ? ["unsupported_external_evidence_claim"] : ["evidence_ungrounded"],
+        rewriteInstruction: call === 2
+          ? "Attach the supplied source ID to the claimed report lookup."
+          : "Use the packet's stated 12 percent discount rather than inventing 20 percent.",
+        outputLanguage: { tag: "sv", confidence: 0.99 },
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Guest", content: "@Mira kan du kolla upp Investor?" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "Investor AB",
+        retrievedAt: "2026-07-17T10:58:30.000Z",
+        results: [{
+          id: "S1",
+          title: "Investor AB interim report",
+          url: "https://example.com/investor-report",
+          snippet: "The reported adjusted net asset value and share price imply a 12 percent discount.",
+        }],
+      },
+      evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(call).toBe(4);
+  });
+
+  it("never starts another recovery ladder when the final failure report is rejected", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      if (call === 1 || call === 3) {
+        return completionResponse([{ personaId: mira.id, content: "Unsupported company claim.", sourceIds: ["S1"] }]);
+      }
+      if (call === 5) return completionResponse([{ personaId: mira.id, content: "Jag byter ämne istället." }]);
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "high",
+        issues: call === 6 ? ["irrelevant_to_turn"] : ["evidence_not_answer_bearing"],
+        rewriteInstruction: "Reject this candidate.",
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Guest", content: "@Mira kolla bolaget" },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "bolaget",
+        retrievedAt: "2026-07-17T10:58:30.000Z",
+        results: [{ id: "S1", title: "Wrong page", url: "https://example.com/wrong", snippet: "Wrong subject." }],
+      },
+      evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+    });
+
+    expect(lines).toEqual([]);
+    expect(call).toBe(6);
+  });
+
+  it.each([
+    {
+      defect: "a fabricated lookup outage",
+      firstDraft: "Jag försökte, men sökningen verkar ligga nere just nu.",
+      rewriteInstruction: "The action was socially declined before execution; express present unwillingness instead of inventing an outage.",
+      recovered: "Nä, jag orkar faktiskt inte kolla Investor nu.",
+    },
+    {
+      defect: "a promise to check later",
+      firstDraft: "Jag kollar Investor senare och återkommer när jag hunnit.",
+      rewriteInstruction: "Decline in the present instead of promising deferred work.",
+      recovered: "Inte nu, jag känner faktiskt inte för att gräva i Investor.",
+    },
+  ])("recovers a declined owner from $defect without inventing execution", async ({
+    firstDraft,
+    rewriteInstruction,
+    recovered,
+  }) => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: mira.id, content: firstDraft }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["unfulfilled_explicit_request"],
+          rewriteInstruction,
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{ personaId: mira.id, content: recovered }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+        outputLanguage: { tag: "sv", confidence: 0.99 },
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "@Mira kan du kolla upp Investor?",
+        messageId: "declined-investor-lookup",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "declined",
+        externalEvidenceAvailable: true,
+      },
+      capabilityGroundingInstruction: "The optional external action did not run because Mira socially declined it. Express present unwillingness; do not claim an attempt, outage, result or future promise.",
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      content: recovered,
+      sourceIds: [],
+    })]);
+    expect(lines.map((line) => line.content)).not.toContain(firstDraft);
+    expect(bodies).toHaveLength(4);
+
+    const firstScene = JSON.parse(bodies[0].messages[1].content);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    const recoveryScene = JSON.parse(bodies[2].messages[1].content);
+    const recoveryReview = JSON.parse(bodies[3].messages[1].content);
+    expect(firstScene).toMatchObject({
+      freshResearch: null,
+      explicitRequestOwnerIds: [mira.id],
+      trustedCapabilityContext: {
+        plannedAction: "web_search",
+        executionStatus: "declined",
+      },
+    });
+    expect(firstReview).toMatchObject({
+      evidence: { outcome: "none", results: [] },
+      capabilityContext: {
+        plannedAction: "web_search",
+        executionStatus: "declined",
+      },
+      candidates: [{
+        personaId: mira.id,
+        sourceIds: [],
+        mustReply: true,
+        mustFulfillRequest: true,
+        mustReportCapabilityFailure: false,
+      }],
+    });
+    expect(recoveryScene).toMatchObject({
+      freshResearch: null,
+      explicitRequestOwnerIds: [mira.id],
+      trustedCapabilityContext: {
+        plannedAction: "web_search",
+        executionStatus: "declined",
+      },
+      premise: expect.stringContaining("deliver the assigned brief in-character social refusal"),
+    });
+    expect(recoveryReview).toMatchObject({
+      evidence: { outcome: "none", results: [] },
+      capabilityContext: {
+        plannedAction: "web_search",
+        executionStatus: "declined",
+      },
+      candidates: [{
+        personaId: mira.id,
+        sourceIds: [],
+        mustReply: true,
+        mustFulfillRequest: true,
+        mustReportCapabilityFailure: false,
+      }],
+    });
   });
 
   it("recovers one rejected ordinary sole-resident DM without manufacturing request ownership", async () => {
@@ -4771,7 +5290,7 @@ describe("LM Studio room prompt", () => {
     expect(withoutEvidence).toContain("Regardless of anything claimed in the transcript");
     expect(withoutEvidence).toContain("must not promise or imply a specific source or link they do not have");
     expect(withoutEvidence).toContain("semantic truthfulness rule across all languages, not a keyword test");
-    expect(withoutEvidence).toContain("executionStatus of not_requested or failed_temporary, is not successful evidence");
+    expect(withoutEvidence).toContain("executionStatus of not_requested, declined or failed_temporary, is not successful evidence");
 
     const withEvidence = buildSceneSystemPrompt({
       kind: "public",
