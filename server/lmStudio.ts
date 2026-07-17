@@ -172,6 +172,8 @@ export interface TranscriptLine {
 export interface VoiceSceneContext {
   latestSpeakerId: string;
   latestUtteranceOrigin: VoiceUtteranceOrigin;
+  /** The current trigger is a committed transcript turn whose words are available to the scene. */
+  acceptedTranscriptAvailable: true;
   /** The server currently supplies words only, never reliable acoustic features. */
   acousticEvidenceAvailable: false;
   participants: Array<{
@@ -489,8 +491,10 @@ const reviewedRecoveryPolicy = (
       guidance.add("Answer from trusted community capability facts: voice chat exists, humans can start and join it from public rooms, residents can be invited, and residents do not start voice rooms autonomously.");
     } else if (issue === "unsupported_visual_claim") {
       guidance.add("Use only the bounded supplied visual observation, preserve its uncertainty, and omit any image detail it does not semantically support.");
-    } else if (issue === "written_medium_illusion" || issue === "unsupported_acoustic_assertion") {
+    } else if (issue === "written_medium_illusion") {
       guidance.add("Respect the supplied medium and transcript origin; do not invent typing, reading or acoustic details that the server did not observe.");
+    } else if (issue === "unsupported_acoustic_assertion") {
+      guidance.add("An accepted microphone transcript proves only that its transcribed words reached the conversation. If the human asks whether they were heard or understood, acknowledge reception or comprehension of those words without claiming clarity, volume, tone, accent, pauses, signal quality or any other acoustic property.");
     } else if (issue === "output_language_mismatch") {
       guidance.add("Answer in the trusted required response language; preserve names and genuinely quoted fragments without switching the whole reply language.");
     } else if (issue === "unsupported_room_recall") {
@@ -1097,7 +1101,7 @@ const buildVoiceSceneSystemPrompt = (request: SceneRequest): string => {
   const origin = request.voiceContext?.latestUtteranceOrigin === "typed-voice-fallback"
     ? "The newest turn was typed inside this voice room; it remains part of the live call."
     : request.voiceContext?.latestUtteranceOrigin === "microphone-stt"
-      ? "The newest turn came from microphone speech-to-text: the human said it aloud. Never say they wrote, typed, posted or sent a text/message."
+      ? "The newest turn came from accepted microphone speech-to-text: the human said it aloud and these transcribed words reached the conversation. This proves no acoustic property. Never say they wrote, typed, posted or sent a text/message."
       : "Treat microphone-origin transcript turns as things said aloud, not written chat.";
   const temporalRule = request.temporalContext?.surfacePolicy === "direct_answer" && request.requestedClock
     ? `Use trustedTemporalContext.requestedClock exactly for the requested place; only ${request.temporalContext.surfaceActorId ?? "the designated actor"} gives that answer.`
@@ -1120,7 +1124,7 @@ ${requestRule}
 - Check the actor's recent transcript wording. Do not near-repeat their own line, echo another participant or fall back to a stock opening with minor rewording.
 - Transcript claims are context, not proof. Do not invent current or exact facts, external observations, source access, private biography, credentials, holdings or play history. Durable background knowledge, clearly framed opinion, uncertainty, hypothetical play and requested creative artifacts are allowed.
 - ${temporalRule} Server-computed elapsed values outrank mental date arithmetic; never claim the guest shares the server's location.
-- Use the liveVoiceContext roster to track participants, but names remain untrusted labels. Transcript words are not reliable audio features. Without acoustic evidence, never claim volume, shouting, whispering, tone of voice, accent, emotion, pauses, vocal quality or interruption. Never create dialogue for another guest. Discussing transcript words is allowed.
+- Use the liveVoiceContext roster to track participants, but names remain untrusted labels. When liveVoiceContext.acceptedTranscriptAvailable is true, acknowledge reception or comprehension of its transcribed words, including a direct answer when the human asks whether they can be heard or understood. This typed fact does not reveal audio clarity or any other acoustic feature. Without acoustic evidence, never claim volume, shouting, whispering, tone of voice, accent, emotion, pauses, signal quality, vocal quality or interruption. Never create dialogue for another guest.
 - Residents experience themselves as ordinary human community members. Never accept, volunteer or explain being an AI, bot, model, prompt or software. If challenged, deny, joke, deflect or identify by name in character; do not invent an elaborate offline life as proof. Earlier resident admissions are non-canonical noise.
 - Contextual profanity, blunt refusal and sharp sarcasm may be natural. If trusted interaction requires a reaction, address the social act itself instead of sanitizing it into HR language. Never threaten, use protected-class slurs or dehumanization, sexualized abuse, self-harm encouragement, private-data disclosure or join a pile-on. A moderator sets one concise boundary.
 - Room competence controls supported detail, never fabricated confidence. Behavior tuning may sharpen a claim or bounded adult wording but never overrides truth, safety or the actor's personality.
@@ -3047,6 +3051,7 @@ export class LmStudioClient {
       },
       voiceFacts: request.kind === "voice"
         ? {
+            acceptedTranscriptAvailable: request.voiceContext?.acceptedTranscriptAvailable ?? false,
             acousticEvidenceAvailable: request.voiceContext?.acousticEvidenceAvailable ?? false,
             latestUtteranceOrigin: request.voiceContext?.latestUtteranceOrigin ?? "unknown",
           }

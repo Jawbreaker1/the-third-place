@@ -736,7 +736,7 @@ describe("VoiceDirector", () => {
     expect(callOrder).toEqual(["promptNote", "analyze", "getRelation", "generate", "updateRelation"]);
   });
 
-  it("routes an acoustic question semantically and supplies trusted voice transport context", async () => {
+  it("routes an acoustic question and distinguishes an accepted transcript from unavailable acoustic evidence", async () => {
     const runtime = new VoiceRoomRuntime(["lobby"]);
     const created = runtime.createRoom("lobby", { socketId: "socket-jaw", memberId: "human-jaw", name: "Jaw_B" });
     expect(created.ok).toBe(true);
@@ -807,6 +807,7 @@ describe("VoiceDirector", () => {
     expect(seenVoiceContext).toEqual({
       latestSpeakerId: "human-jaw",
       latestUtteranceOrigin: "microphone-stt",
+      acceptedTranscriptAvailable: true,
       acousticEvidenceAvailable: false,
       participants: [
         { memberId: "human-jaw", name: "Jaw_B", kind: "human" },

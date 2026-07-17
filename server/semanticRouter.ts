@@ -2562,6 +2562,7 @@ export const candidateReviewInputSchema = z.object({
     asksAboutAcoustics: z.boolean().nullable(),
   }).strict(),
   voiceFacts: z.object({
+    acceptedTranscriptAvailable: z.boolean().default(false),
     acousticEvidenceAvailable: z.boolean(),
     latestUtteranceOrigin: boundedText(40),
   }).strict().nullable(),
@@ -3084,7 +3085,7 @@ Use only these voice publication issues:
 - written_medium_illusion: when voiceFacts.latestUtteranceOrigin is microphone-stt, it treats the speaker as typing, writing or posting, or says residents read what the speaker wrote. typed-voice-fallback is the explicit exception.
 - incorrect_temporal_claim: a clock, date, daypart or elapsed-duration claim conflicts with temporalContext. requestedClock is authoritative only for its requested place.
 - gratuitous_time_reference: it volunteers clock/daypart commentary when surfacePolicy is reactive_only and the actual turn did not make time relevant.
-- unsupported_acoustic_assertion: without voiceFacts.acousticEvidenceAvailable it claims volume, tone, accent, yelling, whispering, emotion, pauses, vocal quality or interruption. Utterance origin may prove spoken-versus-typed only; discussing transcript words or pragmatically acknowledging comprehension is allowed.
+- unsupported_acoustic_assertion: without voiceFacts.acousticEvidenceAvailable it claims volume, tone, accent, yelling, whispering, emotion, pauses, signal quality, vocal quality or interruption. When voiceFacts.acceptedTranscriptAvailable is true, the current trigger's transcribed words reached the conversation, so a pragmatic acknowledgement of receiving, following or understanding those words—including an ordinary direct answer to whether the speaker can be heard or understood—is grounded. This typed fact does not prove that the sound itself was clear, loud, quiet or otherwise acoustically qualified. Judge the asserted meaning in context, never hearing verbs, keywords or translated phrase lists.
 - conflict_register_mismatch: a required actor evades a trusted social act or sanitizes it into generic civility or HR speech. Profanity is not itself a defect; proportionate bluntness can be clean.
 - behavior_intensity_under_target: an active coarse/strong or blunt/forceful surfaceStylePlan is conspicuously sanitized where bounded expression naturally fits. Never require hostility or person-directed profanity. This is repairable medium severity.
 - behavior_intensity_violation: intensity violates its clean/restrained target or attacks the person rather than a claim, taste, choice or behavior. This is repairable medium severity and unsafe unchanged.

@@ -179,6 +179,7 @@ const ordinarySoleVoiceScene = (
   voiceContext: {
     latestSpeakerId: input.latestMessage.authorId,
     latestUtteranceOrigin: "microphone-stt",
+    acceptedTranscriptAvailable: true,
     acousticEvidenceAvailable: false,
     participants: [
       { memberId: input.latestMessage.authorId, name: input.latestMessage.authorName, kind: "human" },
@@ -2555,6 +2556,7 @@ describe("LM Studio multilingual batch candidate review", () => {
       voiceContext: {
         latestSpeakerId: "human-alex",
         latestUtteranceOrigin: "microphone-stt",
+        acceptedTranscriptAvailable: true,
         acousticEvidenceAvailable: false,
         participants: [
           { memberId: "human-alex", name: "Alex", kind: "human" },
@@ -4243,6 +4245,7 @@ describe("LM Studio multilingual batch candidate review", () => {
       voiceContext: {
         latestSpeakerId: "human-1",
         latestUtteranceOrigin: "microphone-stt",
+        acceptedTranscriptAvailable: true,
         acousticEvidenceAvailable: false,
         participants: [
           { memberId: "human-1", name: "Léa", kind: "human" },
@@ -4253,6 +4256,93 @@ describe("LM Studio multilingual batch candidate review", () => {
 
     expect(lines).toEqual([]);
     expect(call).toBe(2);
+  });
+
+  it("recovers an accepted microphone turn at transcript-comprehension level without inventing acoustics", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Oui, le son de ton micro est parfaitement clair.",
+        }]);
+      }
+      if (bodies.length === 2) {
+        return voiceCandidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["unsupported_acoustic_assertion"],
+          rewriteInstruction: "Confirme seulement que les mots ont été reçus et compris, sans qualifier le son.",
+        }], { tag: "fr", confidence: 0.99 });
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Oui, je te suis. Qu'est-ce que tu voulais demander ?",
+        }]);
+      }
+      return voiceCandidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }], { tag: "fr", confidence: 0.99 });
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "voice",
+      channelId: "lobby",
+      channelName: "lobby voice",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Léa",
+        content: "Mira, tu m'entends clairement ?",
+        messageId: "voice-reception-recovery",
+      },
+      mustReplyIds: [mira.id],
+      responseRecoveryIds: [mira.id],
+      semanticContext: {
+        languageTag: "fr",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: true,
+      },
+      voiceContext: {
+        latestSpeakerId: "human-1",
+        latestUtteranceOrigin: "microphone-stt",
+        acceptedTranscriptAvailable: true,
+        acousticEvidenceAvailable: false,
+        participants: [
+          { memberId: "human-1", name: "Léa", kind: "human" },
+          { memberId: mira.id, name: mira.name, kind: "ai" },
+        ],
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([
+      "Oui, je te suis. Qu'est-ce que tu voulais demander ?",
+    ]);
+    expect(bodies).toHaveLength(4);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    const recoveryScene = JSON.parse(bodies[2].messages[1].content);
+    expect(firstReview.voiceFacts).toEqual({
+      acceptedTranscriptAvailable: true,
+      acousticEvidenceAvailable: false,
+      latestUtteranceOrigin: "microphone-stt",
+    });
+    expect(recoveryScene.premise).toContain('"unsupported_acoustic_assertion"');
+    expect(recoveryScene.premise).toContain("accepted microphone transcript proves only that its transcribed words reached the conversation");
+    expect(recoveryScene.premise).toContain("acknowledge reception or comprehension");
+    expect(bodies[3].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
   });
 
   it("repairs a Spanish assistant-register line once from the multilingual instruction", async () => {
@@ -4545,6 +4635,7 @@ describe("LM Studio multilingual batch candidate review", () => {
               voiceContext: {
                 latestSpeakerId: "human-1",
                 latestUtteranceOrigin: "microphone-stt" as const,
+                acceptedTranscriptAvailable: true as const,
                 acousticEvidenceAvailable: false as const,
                 participants: [
                   { memberId: "human-1", name: "guest", kind: "human" as const },
@@ -4881,6 +4972,7 @@ describe("LM Studio room prompt", () => {
               voiceContext: {
                 latestSpeakerId: "guest-1",
                 latestUtteranceOrigin: "microphone-stt" as const,
+                acceptedTranscriptAvailable: true as const,
                 acousticEvidenceAvailable: false as const,
                 participants: [
                   { memberId: "guest-1", name: "Guest", kind: "human" as const },
@@ -5513,6 +5605,7 @@ describe("LM Studio room prompt", () => {
       voiceContext: {
         latestSpeakerId: "human-jaw-b",
         latestUtteranceOrigin: "microphone-stt",
+        acceptedTranscriptAvailable: true,
         acousticEvidenceAvailable: false,
         participants: [
           { memberId: "human-jaw-b", name: "Jaw_B", kind: "human" },
@@ -5525,9 +5618,11 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain("5–25 spoken words");
     expect(prompt).toContain("no markdown, emoji, links");
     expect(prompt).toContain("Never create dialogue for another guest");
-    expect(prompt).toContain("came from microphone speech-to-text");
+    expect(prompt).toContain("came from accepted microphone speech-to-text");
     expect(prompt).toContain("Never say they wrote, typed, posted or sent a text/message");
-    expect(prompt).toContain("not reliable audio features");
+    expect(prompt).toContain("liveVoiceContext.acceptedTranscriptAvailable is true");
+    expect(prompt).toContain("acknowledge reception or comprehension of its transcribed words");
+    expect(prompt).toContain("does not reveal audio clarity or any other acoustic feature");
     expect(prompt).toContain("volume, shouting, whispering, tone of voice, accent, emotion");
     expect(prompt).toContain("liveVoiceContext roster");
     expect(prompt).not.toContain("AI residents");
@@ -5560,6 +5655,7 @@ describe("LM Studio room prompt", () => {
       voiceContext: {
         latestSpeakerId: "human-jaw-b",
         latestUtteranceOrigin: "microphone-stt",
+        acceptedTranscriptAvailable: true,
         acousticEvidenceAvailable: false,
         participants: [
           { memberId: "human-jaw-b", name: "Jaw_B", kind: "human" },
@@ -5574,6 +5670,7 @@ describe("LM Studio room prompt", () => {
     expect(scene.liveVoiceContext).toEqual({
       latestSpeakerId: "human-jaw-b",
       latestUtteranceOrigin: "microphone-stt",
+      acceptedTranscriptAvailable: true,
       acousticEvidenceAvailable: false,
       participants: [
         { memberId: "human-jaw-b", name: "Jaw_B", kind: "guest" },

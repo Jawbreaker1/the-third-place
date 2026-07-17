@@ -2339,6 +2339,7 @@ describe("multilingual batch candidate-review contract", () => {
       ...base,
       sceneKind: "voice",
       voiceFacts: {
+        acceptedTranscriptAvailable: true,
         acousticEvidenceAvailable: false,
         latestUtteranceOrigin: "microphone-stt",
       },
@@ -2394,6 +2395,7 @@ describe("multilingual batch candidate-review contract", () => {
       ...base,
       sceneKind: "voice",
       voiceFacts: {
+        acceptedTranscriptAvailable: true,
         acousticEvidenceAvailable: false,
         latestUtteranceOrigin: "microphone-stt",
       },
@@ -2407,6 +2409,9 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("written_medium_illusion");
     expect(prompt).toContain("typed-voice-fallback is the explicit exception");
     expect(prompt).toContain("unsupported_acoustic_assertion");
+    expect(prompt).toContain("a pragmatic acknowledgement of receiving, following or understanding those words");
+    expect(prompt).toContain("This typed fact does not prove that the sound itself was clear, loud, quiet");
+    expect(prompt).toContain("never hearing verbs, keywords or translated phrase lists");
     expect(prompt).toContain("community_capability_contradiction");
     expect(prompt).toContain("output_language_mismatch");
     expect(prompt).not.toContain("ambient_action_mismatch");

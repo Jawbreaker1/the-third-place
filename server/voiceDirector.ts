@@ -710,6 +710,7 @@ export class VoiceDirector {
           voiceContext: {
             latestSpeakerId: entry.speakerId,
             latestUtteranceOrigin: entry.utteranceOrigin,
+            acceptedTranscriptAvailable: true,
             acousticEvidenceAvailable: false,
             participants: room.participants.map((participant) => ({
               memberId: participant.memberId,
