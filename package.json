@@ -25,6 +25,7 @@
     "smoke:weather": "node scripts/weather-smoke.mjs",
     "smoke:football": "node scripts/football-smoke.mjs",
     "smoke:history-links": "node scripts/history-link-smoke.mjs",
+    "smoke:identity": "node scripts/identity-recovery-smoke.mjs",
     "audit:humanity": "node scripts/humanity-audit.mjs",
     "audit:ambient": "node --import tsx scripts/ambient-audit.mjs",
     "eval:humanity": "node --import tsx scripts/humanity-live-eval.mjs",

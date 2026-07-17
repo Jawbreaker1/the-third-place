@@ -15,7 +15,6 @@ import type {
   ImageAnalysis,
   ImageAnalysisPayload,
   ImageMessageResult,
-  JoinResult,
   LinkPreviewPayload,
   Member,
   PublicPreview,
@@ -50,6 +49,12 @@ import {
   HumanMemoryStore,
   reconcilePendingActorForgets,
 } from "./humanMemory.js";
+import {
+  generateHumanIdentityRecoveryKey,
+  hashHumanIdentityRecoveryKey,
+  normalizeHumanIdentityRecoveryKey,
+} from "./humanIdentityRecovery.js";
+import { HumanIdentityMutationCoordinator } from "./humanIdentityMutation.js";
 import { LmStudioClient } from "./lmStudio.js";
 import { LmStudioBackend } from "./lmStudioBackend.js";
 import { CodexBackend } from "./codexBackend.js";
@@ -143,6 +148,8 @@ interface HumanSession {
   tokenHash: string;
   member: Member;
   socketIds: Set<string>;
+  /** Blocks HTTP and socket actions while a credential transfer commits. */
+  revoked: boolean;
   lastSeenAt: number;
   createdAt: number;
   historyBucket: TokenBucket;
@@ -180,6 +187,7 @@ const createHumanSession = (
   tokenHash,
   member: { ...member, avatar: { ...member.avatar }, status: "offline" },
   socketIds: new Set(),
+  revoked: false,
   lastSeenAt,
   createdAt,
   historyBucket: new TokenBucket(8, 1),
@@ -191,6 +199,12 @@ const joinSchema = z.object({
   name: z.string().min(1).max(128),
   inviteCode: z.string().max(100).optional(),
 });
+const recoverSessionSchema = z.object({
+  name: z.string().min(1).max(128),
+  recoveryKey: z.string().min(1).max(96),
+  inviteCode: z.string().max(100).optional(),
+  takeOver: z.boolean().optional(),
+}).strict();
 const messageSchema = z.object({
   channelId: z.string().min(1).max(160),
   content: z.string().min(1).max(500),
@@ -514,9 +528,11 @@ const voiceRooms = new VoiceRoomRuntime(
   },
 );
 const sessions = new Map<string, HumanSession>();
+const identityMutations = new HumanIdentityMutationCoordinator();
 const actorPublicationGate = new ActorPublicationGate();
 const isActiveHumanSession = (session: HumanSession): boolean =>
   sessions.get(session.tokenHash) === session &&
+  !session.revoked &&
   !adminState.isBanned(session.member.id, session.member.name) &&
   !adminModeration.isKicked(session.member.id, session.member.name);
 let actorForgetReconciliationTail: Promise<unknown> = Promise.resolve();
@@ -570,6 +586,12 @@ const synchronizeOfflineSessionsWithMemory = async (): Promise<void> => {
   await reconcilePendingHumanActorForgets();
 };
 const joinAttempts = new Map<string, number[]>();
+const recoveryAttempts = new Map<string, number[]>();
+const recoveryIpAttempts = new Map<string, number[]>();
+const selfRecoveryKeyRotations = new Map<string, number[]>();
+const RECOVERY_ATTEMPT_WINDOW_MS = 15 * 60_000;
+const SELF_RECOVERY_KEY_WINDOW_MS = 10 * 60_000;
+const RECOVERY_ATTEMPT_MAX_KEYS = 5_000;
 const socketBuckets = new Map<
   string,
   {
@@ -854,6 +876,49 @@ const allowJoinAttempt = (ip: string): boolean => {
   return true;
 };
 
+const allowRecoveryAttempt = (ip: string, name: string): boolean => {
+  const now = Date.now();
+  // Keep only opaque, process-local limiter keys. A per-IP ceiling prevents a
+  // source from bypassing the identity limit with unlimited invented names.
+  const ipKey = hashToken(ip);
+  const identityKey = hashToken(`${ip}\u0000${safeNameKey(name)}`);
+  const recentIp = (recoveryIpAttempts.get(ipKey) ?? [])
+    .filter((timestamp) => now - timestamp < RECOVERY_ATTEMPT_WINDOW_MS);
+  const recentIdentity = (recoveryAttempts.get(identityKey) ?? [])
+    .filter((timestamp) => now - timestamp < RECOVERY_ATTEMPT_WINDOW_MS);
+  if (recentIp.length >= 24 || recentIdentity.length >= 5) return false;
+  recentIp.push(now);
+  recentIdentity.push(now);
+  recoveryIpAttempts.set(ipKey, recentIp);
+  recoveryAttempts.set(identityKey, recentIdentity);
+
+  // The IP ceiling bounds ordinary abuse; this hard cap also bounds memory if
+  // an attacker can present a very large number of source addresses.
+  for (const attempts of [recoveryAttempts, recoveryIpAttempts]) {
+    while (attempts.size > RECOVERY_ATTEMPT_MAX_KEYS) {
+      const oldestKey = attempts.keys().next().value as string | undefined;
+      if (!oldestKey) break;
+      attempts.delete(oldestKey);
+    }
+  }
+  return true;
+};
+
+const allowSelfRecoveryKeyRotation = (actorId: string): boolean => {
+  const now = Date.now();
+  const recent = (selfRecoveryKeyRotations.get(actorId) ?? [])
+    .filter((timestamp) => now - timestamp < SELF_RECOVERY_KEY_WINDOW_MS);
+  if (recent.length >= 2) return false;
+  recent.push(now);
+  selfRecoveryKeyRotations.set(actorId, recent);
+  while (selfRecoveryKeyRotations.size > RECOVERY_ATTEMPT_MAX_KEYS) {
+    const oldestKey = selfRecoveryKeyRotations.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    selfRecoveryKeyRotations.delete(oldestKey);
+  }
+  return true;
+};
+
 const snapshotFor = (session: HumanSession): RoomSnapshot => {
   const pages = CHANNELS.map((channel) => historyPageFor(channel.id));
   return {
@@ -902,6 +967,7 @@ const adminHumans = (): AdminHumanMember[] => [...sessions.values()]
     id: session.member.id,
     name: session.member.name,
     status: session.member.status,
+    recoveryConfigured: humanMemory.hasRecoveryKey(session.member.id),
     joinedAt: new Date(session.createdAt).toISOString(),
   }))
   .sort((a, b) => a.name.localeCompare(b.name));
@@ -929,46 +995,49 @@ const socialMemoryAdmin = new SocialMemoryAdmin({
 
 const disconnectHumanSockets = (
   memberId: string,
-  notice: { action: "kick" | "ban" | "forget"; message: string },
+  notice: { action: "kick" | "ban" | "forget" | "recover"; message: string },
 ): AdminHumanMember | undefined => {
   // Revoke every already-admitted async HTTP publication before touching
   // sockets or durable state. A slow upload retains its old lease and fails at
   // the commit boundary even if its fetch/decoder ignores cancellation.
   actorPublicationGate.invalidate(memberId);
-  const session = [...sessions.values()].find((candidate) => candidate.member.id === memberId);
-  if (!session) return undefined;
-  for (const socketId of [...session.socketIds]) {
-    const socket = io.sockets.sockets.get(socketId);
-    socket?.emit("session:moderated", {
-      action: notice.action,
-      message: notice.message,
-    });
-    const voiceRoom = voiceRooms.getRoomForSocket(socketId);
-    const voiceResult = voiceRooms.leaveRoom(socketId);
-    if (voiceRoom && voiceResult.ok) {
-      if (voiceResult.closed) {
-        voiceDirector.forgetRoom(voiceResult.roomId);
-        forgetVoiceIngestRoom(voiceResult.roomId);
-        voiceSpeech.audioStore.deleteRoom(voiceResult.roomId);
-        io.to(voiceSocketRoom(voiceResult.roomId)).emit("voice:room:closed", { roomId: voiceResult.roomId });
-        publishVoiceRooms();
-      } else {
-        // Leaving changes the trusted participant set. Abort any reply or
-        // social-memory capture built against the previous audience before
-        // publishing the surviving room state.
-        voiceDirector.invalidateRoom(voiceResult.room.id);
-        publishVoiceRoom(voiceResult.room);
+  const matchingSessions = [...sessions.values()].filter((candidate) => candidate.member.id === memberId);
+  const first = matchingSessions[0];
+  if (!first) return undefined;
+  for (const session of matchingSessions) {
+    for (const socketId of [...session.socketIds]) {
+      const socket = io.sockets.sockets.get(socketId);
+      socket?.emit("session:moderated", {
+        action: notice.action,
+        message: notice.message,
+      });
+      const voiceRoom = voiceRooms.getRoomForSocket(socketId);
+      const voiceResult = voiceRooms.leaveRoom(socketId);
+      if (voiceRoom && voiceResult.ok) {
+        if (voiceResult.closed) {
+          voiceDirector.forgetRoom(voiceResult.roomId);
+          forgetVoiceIngestRoom(voiceResult.roomId);
+          voiceSpeech.audioStore.deleteRoom(voiceResult.roomId);
+          io.to(voiceSocketRoom(voiceResult.roomId)).emit("voice:room:closed", { roomId: voiceResult.roomId });
+          publishVoiceRooms();
+        } else {
+          // Leaving changes the trusted participant set. Abort any reply or
+          // social-memory capture built against the previous audience before
+          // publishing the surviving room state.
+          voiceDirector.invalidateRoom(voiceResult.room.id);
+          publishVoiceRoom(voiceResult.room);
+        }
       }
+      socket?.disconnect(true);
     }
-    socket?.disconnect(true);
+    session.member.status = "offline";
   }
-  session.member.status = "offline";
   io.to("public").emit("presence:update", { members: getMembers() });
   return {
-    id: session.member.id,
-    name: session.member.name,
-    status: session.member.status,
-    joinedAt: new Date(session.createdAt).toISOString(),
+    id: first.member.id,
+    name: first.member.name,
+    status: first.member.status,
+    joinedAt: new Date(first.createdAt).toISOString(),
   };
 };
 
@@ -989,7 +1058,13 @@ const disconnectModeratedHuman = (
   });
 };
 
-const forgetHumanActor = async (actorId: string): Promise<boolean> => {
+const currentIdentitySessionMatches = (actorId: string, expectedTokenHash: string): boolean => {
+  const runtime = sessions.get(expectedTokenHash);
+  const durable = humanMemory.findByHumanId(actorId);
+  return runtime?.member.id === actorId && !runtime.revoked && durable?.tokenHash === expectedTokenHash;
+};
+
+const forgetHumanActorUnlocked = async (actorId: string): Promise<boolean> => {
   if (PERSONAS.some((persona) => persona.id === actorId)) return false;
   const profile = humanMemory.findByHumanId(actorId);
   const runtimeSessions = [...sessions.entries()].filter(([, session]) => session.member.id === actorId);
@@ -1028,6 +1103,58 @@ const forgetHumanActor = async (actorId: string): Promise<boolean> => {
   await reconcilePendingHumanActorForgets();
   io.to("public").emit("presence:update", { members: getMembers() });
   return true;
+};
+
+const forgetHumanActor = async (
+  actorId: string,
+  expectedTokenHash?: string,
+): Promise<boolean> => await identityMutations.run(async () => {
+  if (expectedTokenHash && !currentIdentitySessionMatches(actorId, expectedTokenHash)) return false;
+  return await forgetHumanActorUnlocked(actorId);
+});
+
+type HumanRecoveryKeyIssueResult =
+  | { status: "issued"; name: string; recoveryKey: string }
+  | { status: "not_found" | "session_changed" | "rate_limited" };
+
+const issueHumanRecoveryKeyMutation = async (
+  actorId: string,
+  expectedTokenHash?: string,
+  enforceSelfServiceLimit = false,
+): Promise<HumanRecoveryKeyIssueResult> => {
+  return await identityMutations.run(async () => {
+    const current = humanMemory.findByHumanId(actorId);
+    if (!current) return { status: "not_found" };
+    if (expectedTokenHash && !currentIdentitySessionMatches(actorId, expectedTokenHash)) {
+      return { status: "session_changed" };
+    }
+    // Charge only after the expected token is revalidated inside the identity
+    // transaction. Stale requests queued before takeover cannot consume the
+    // recovered owner's rotation allowance.
+    if (enforceSelfServiceLimit && !allowSelfRecoveryKeyRotation(actorId)) {
+      return { status: "rate_limited" };
+    }
+    const recoveryKey = generateHumanIdentityRecoveryKey();
+    const recoveryKeyHash = hashHumanIdentityRecoveryKey(recoveryKey);
+    const previousHash = humanMemory.replaceRecoveryKeyHash(actorId, recoveryKeyHash);
+    try {
+      await humanMemory.flush();
+    } catch (error) {
+      humanMemory.replaceRecoveryKeyHash(actorId, previousHash);
+      await humanMemory.flush().catch(() => undefined);
+      throw error;
+    }
+    return { status: "issued", name: current.member.name, recoveryKey };
+  });
+};
+
+const issueHumanRecoveryKey = async (
+  actorId: string,
+): Promise<{ name: string; recoveryKey: string } | undefined> => {
+  const result = await issueHumanRecoveryKeyMutation(actorId);
+  return result.status === "issued"
+    ? { name: result.name, recoveryKey: result.recoveryKey }
+    : undefined;
 };
 
 adminState.setHooks({
@@ -1088,6 +1215,7 @@ app.use("/api/admin", createAdminRouter({
   configuredOrigins: adminOrigins,
   getHumans: adminHumans,
   getAutonomousResearchDiagnostics: () => director.getAutonomousResearchDiagnostics(),
+  issueHumanRecoveryKey,
   kickHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, true),
   banHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, false),
   isSecure: (request) => request.secure || publicOrigin?.startsWith("https://") === true,
@@ -1515,7 +1643,7 @@ app.delete("/api/session", async (request, response) => {
     response.status(401).json({ ok: false, error: "That saved identity is no longer active." });
     return;
   }
-  if (!await forgetHumanActor(authenticated.session.member.id)) {
+  if (!await forgetHumanActor(authenticated.session.member.id, authenticated.session.tokenHash)) {
     clearSessionCookie(request, response);
     response.status(404).json({ ok: false, error: "That saved identity is no longer retained." });
     return;
@@ -1548,15 +1676,186 @@ app.delete("/api/session/memory", async (request, response) => {
     response.status(401).json({ ok: false, error: "Join the room before clearing saved memory." });
     return;
   }
-  authenticated.session.lastSeenAt = Date.now();
-  humanMemory.resetRememberedDetails(authenticated.session.member.id, authenticated.session.lastSeenAt);
-  await socialMemory.forgetActor(authenticated.session.member.id);
-  await humanMemory.flush();
+  const memory = await identityMutations.run(async () => {
+    if (!currentIdentitySessionMatches(authenticated.session.member.id, authenticated.session.tokenHash)) {
+      return undefined;
+    }
+    authenticated.session.lastSeenAt = Date.now();
+    humanMemory.resetRememberedDetails(authenticated.session.member.id, authenticated.session.lastSeenAt);
+    await socialMemory.forgetActor(authenticated.session.member.id);
+    await humanMemory.flush();
+    return humanMemory.clientSummary(authenticated.session.member.id);
+  });
+  if (!memory) {
+    clearSessionCookie(request, response);
+    response.status(409).json({ ok: false, error: "That identity moved while its memory was being cleared. Reopen it and try again." });
+    return;
+  }
   setSessionCookie(request, response, authenticated.token);
-  response.json({ ok: true, memory: humanMemory.clientSummary(authenticated.session.member.id) });
+  response.json({ ok: true, memory });
+});
+
+app.post("/api/session/recovery-key", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, error: "That return-key request did not come from the room." });
+    return;
+  }
+  if (!z.object({}).strict().safeParse(request.body ?? {}).success) {
+    response.status(400).json({ ok: false, error: "That return-key request is invalid." });
+    return;
+  }
+  const authenticated = authenticatedSessionFromRequest(request);
+  if (!authenticated) {
+    response.status(401).json({ ok: false, error: "Join the room before creating a return key." });
+    return;
+  }
+  const issued = await issueHumanRecoveryKeyMutation(
+    authenticated.session.member.id,
+    authenticated.session.tokenHash,
+    true,
+  );
+  if (issued.status === "rate_limited") {
+    response.status(429).json({ ok: false, error: "Too many return-key changes. Wait a few minutes and try again." });
+    return;
+  }
+  if (issued.status !== "issued") {
+    clearSessionCookie(request, response);
+    response.status(409).json({ ok: false, error: "That identity moved before a return key could be created. Reopen it and try again." });
+    return;
+  }
+  setSessionCookie(request, response, authenticated.token);
+  response.status(201).json({ ok: true, recoveryKey: issued.recoveryKey });
+});
+
+app.post("/api/session/recover", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, code: "ORIGIN_REQUIRED", error: "That return request did not come from the room." });
+    return;
+  }
+  const parsed = recoverSessionSchema.safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).json({ ok: false, code: "VALIDATION", error: "Enter a display name and its complete return key." });
+    return;
+  }
+  if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
+    response.status(403).json({ ok: false, code: "INVITE_INVALID", error: "That invite code doesn't open this room." });
+    return;
+  }
+  const name = normalizeDisplayName(parsed.data.name);
+  if (!validDisplayName(name)) {
+    response.status(400).json({ ok: false, code: "VALIDATION", error: "Use the same valid display name that was saved before." });
+    return;
+  }
+  if (!allowRecoveryAttempt(clientIp(request), name)) {
+    response.status(429).json({ ok: false, code: "RECOVERY_RATE_LIMITED", error: "Too many return attempts. Wait a while and try again." });
+    return;
+  }
+
+  const normalizedRecoveryKey = normalizeHumanIdentityRecoveryKey(parsed.data.recoveryKey);
+  const recoveryKeyHash = normalizedRecoveryKey
+    ? hashHumanIdentityRecoveryKey(normalizedRecoveryKey)
+    : "invalid";
+  const result = await identityMutations.run(async () => {
+    const current = humanMemory.findByRecoveryKey(name, recoveryKeyHash);
+    if (!current) {
+      return {
+        ok: false as const,
+        status: 401,
+        code: "RECOVERY_INVALID",
+        error: "That display name and return key did not match a saved identity.",
+      };
+    }
+    if (adminState.isBanned(current.member.id, current.member.name)) {
+      return { ok: false as const, status: 403, code: "BANNED", error: "That identity is banned from this room." };
+    }
+    if (adminModeration.isKicked(current.member.id, current.member.name)) {
+      return { ok: false as const, status: 429, code: "KICK_COOLDOWN", error: "That identity is on a short reconnect cooldown." };
+    }
+    const identityIsOnline = [...sessions.values()].some(
+      (session) => session.member.id === current.member.id && session.socketIds.size > 0,
+    );
+    if (identityIsOnline && parsed.data.takeOver !== true) {
+      return {
+        ok: false as const,
+        status: 409,
+        code: "IDENTITY_ONLINE",
+        error: "That identity is connected in another browser. Confirm that you want to move it here.",
+      };
+    }
+
+    // Quiesce the old credential before the first await. HTTP authentication
+    // and socket packet middleware now reject it, while the live connection is
+    // kept long enough to receive an accurate success notice. On a failed
+    // durable commit, clearing this flag makes the previous login usable again.
+    const previousRuntimeSessions = [...sessions.values()].filter(
+      (session) => session.member.id === current.member.id,
+    );
+    for (const session of previousRuntimeSessions) session.revoked = true;
+    actorPublicationGate.invalidate(current.member.id);
+
+    const token = randomBytes(32).toString("base64url");
+    const tokenHash = hashToken(token);
+    const recoveredAt = Date.now();
+    const rotated = humanMemory.rotateSessionToken(
+      current.member.id,
+      current.tokenHash,
+      tokenHash,
+      recoveredAt,
+    );
+    if (!rotated) {
+      for (const session of previousRuntimeSessions) session.revoked = false;
+      return {
+        ok: false as const,
+        status: 409,
+        code: "RECOVERY_CHANGED",
+        error: "That identity changed during the return attempt. Try the key again.",
+      };
+    }
+    try {
+      await humanMemory.flush();
+    } catch {
+      humanMemory.rotateSessionToken(current.member.id, tokenHash, current.tokenHash, current.lastSeenAt);
+      await humanMemory.flush().catch(() => undefined);
+      for (const session of previousRuntimeSessions) session.revoked = false;
+      return {
+        ok: false as const,
+        status: 503,
+        code: "RECOVERY_UNAVAILABLE",
+        error: "The identity could not be moved safely. Its previous login remains valid; try again shortly.",
+      };
+    }
+
+    disconnectHumanSockets(current.member.id, {
+      action: "recover",
+      message: "This saved identity was opened in another browser. Use the return key to move it back here.",
+    });
+    for (const [existingHash, session] of [...sessions]) {
+      if (session.member.id === current.member.id) sessions.delete(existingHash);
+    }
+    const replacement = createHumanSession(
+      tokenHash,
+      rotated.member,
+      recoveredAt,
+      rotated.createdAt,
+    );
+    sessions.set(tokenHash, replacement);
+    return { ok: true as const, token, session: replacement };
+  });
+
+  if (!result.ok) {
+    response.status(result.status).json({ ok: false, code: result.code, error: result.error });
+    return;
+  }
+  setSessionCookie(request, response, result.token);
+  response.status(201).json({ ok: true, me: result.session.member });
 });
 
 app.post("/api/session", async (request, response) => {
+  // A successful first visit discloses the raw return key exactly once.
+  // Prevent browsers and intermediaries from retaining that credential.
+  response.setHeader("Cache-Control", "private, no-store");
   if (!allowJoinAttempt(clientIp(request))) {
     response.status(429).json({ ok: false, error: "Too many join attempts. Wait a few minutes and try again." });
     return;
@@ -1584,46 +1883,105 @@ app.post("/api/session", async (request, response) => {
     response.status(429).json({ ok: false, error: "That identity is on a short reconnect cooldown." });
     return;
   }
-  const reserved = new Set([
-    ...PERSONAS.map((persona) => safeNameKey(persona.name)),
-    ...humanMemory.listRestorableProfiles().map((profile) => safeNameKey(profile.member.name)),
-  ]);
-  if (reserved.has(safeNameKey(name))) {
-    response.status(409).json({ ok: false, error: "That name is already in the room. Try a small variation." });
+  const identityKey = safeNameKey(name);
+  if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey)) {
+    response.status(409).json({
+      ok: false,
+      code: "NAME_RESERVED",
+      error: "That display name belongs to an AI resident. Choose another name.",
+    });
     return;
   }
+  await identityMutations.run(async () => {
+    if (adminState.isBanned(undefined, name)) {
+      response.status(403).json({ ok: false, code: "BANNED", error: "That identity is banned from this room." });
+      return;
+    }
+    if (adminModeration.isKicked(undefined, name)) {
+      response.status(429).json({ ok: false, code: "KICK_COOLDOWN", error: "That identity is on a short reconnect cooldown." });
+      return;
+    }
+    // Persona edits are validated against humans too, but repeat this check
+    // after waiting for the identity transaction so simultaneous catalog/name
+    // changes cannot create a human/resident collision.
+    if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey)) {
+      response.status(409).json({
+        ok: false,
+        code: "NAME_RESERVED",
+        error: "That display name belongs to an AI resident. Choose another name.",
+      });
+      return;
+    }
+    const retainedMatches = humanMemory.listRestorableProfiles()
+      .filter((profile) => safeNameKey(profile.member.name) === identityKey);
+    if (retainedMatches.length > 0) {
+      const retained = retainedMatches.length === 1 ? retainedMatches[0] : undefined;
+      const recoveryConfigured = retainedMatches.some((profile) => humanMemory.hasRecoveryKey(profile.member.id));
+      const retainedIds = new Set(retainedMatches.map((profile) => profile.member.id));
+      const online = [...sessions.values()].some(
+        (session) => retainedIds.has(session.member.id) && session.socketIds.size > 0,
+      );
+      response.status(409).json({
+        ok: false,
+        code: "RETURNING_IDENTITY",
+        error: retainedMatches.length === 1
+          ? recoveryConfigured
+            ? "That name belongs to a saved identity. Use its return key instead of creating a variation."
+            : "That name belongs to a saved identity without a return key yet. Ask the server host to issue one."
+          : recoveryConfigured
+            ? "More than one legacy identity matches that name. A matching return key can select the right one; otherwise ask the server owner."
+            : "More than one legacy identity matches that name and none has a return key yet. Ask the server owner for help restoring it safely.",
+        online,
+        recoveryConfigured,
+      });
+      return;
+    }
 
-  const token = randomBytes(32).toString("base64url");
-  const tokenHash = hashToken(token);
-  const avatar = randomAvatar();
-  avatar.glyph = displayNameGlyph(name);
-  const session = createHumanSession(tokenHash, {
-    id: `human-${randomUUID()}`,
-    name,
-    kind: "human",
-    status: "offline",
-    avatar,
-    role: "Guest",
-    bio: "A real person visiting The Third Place.",
+    const token = randomBytes(32).toString("base64url");
+    const tokenHash = hashToken(token);
+    const recoveryKey = generateHumanIdentityRecoveryKey();
+    const recoveryKeyHash = hashHumanIdentityRecoveryKey(recoveryKey);
+    const avatar = randomAvatar();
+    avatar.glyph = displayNameGlyph(name);
+    const session = createHumanSession(tokenHash, {
+      id: `human-${randomUUID()}`,
+      name,
+      kind: "human",
+      status: "offline",
+      avatar,
+      role: "Guest",
+      bio: "A real person visiting The Third Place.",
+    });
+    sessions.set(tokenHash, session);
+    humanMemory.upsertSession({
+      tokenHash,
+      member: session.member,
+      seenAt: session.lastSeenAt,
+      protectedHumanIds: new Set(
+        [session.member.id, ...[...sessions.values()]
+          .filter((candidate) => candidate.socketIds.size > 0 || candidate.revoked)
+          .map((candidate) => candidate.member.id)],
+      ),
+    });
+    humanMemory.replaceRecoveryKeyHash(session.member.id, recoveryKeyHash);
+    try {
+      await synchronizeOfflineSessionsWithMemory();
+      await humanMemory.flush();
+    } catch (error) {
+      sessions.delete(tokenHash);
+      humanMemory.forgetProfile(session.member.id);
+      await humanMemory.flush().catch(() => undefined);
+      throw error;
+    }
+    setSessionCookie(request, response, token);
+    response.status(201).json({ ok: true, me: session.member, recoveryKey });
   });
-  sessions.set(tokenHash, session);
-  humanMemory.upsertSession({ tokenHash, member: session.member, seenAt: session.lastSeenAt });
-  await synchronizeOfflineSessionsWithMemory();
-  try {
-    await humanMemory.flush();
-  } catch (error) {
-    sessions.delete(tokenHash);
-    humanMemory.forgetProfile(session.member.id);
-    throw error;
-  }
-  setSessionCookie(request, response, token);
-  response.status(201).json({ ok: true, me: session.member });
 });
 
 io.use((socket, next) => {
   const token = parseCookies(socket.handshake.headers.cookie)[SESSION_COOKIE];
   const session = token ? sessions.get(hashToken(token)) : undefined;
-  if (!session) {
+  if (!session || session.revoked) {
     next(new Error("AUTH_REQUIRED"));
     return;
   }
@@ -1642,6 +2000,13 @@ io.use((socket, next) => {
 io.on("connection", (socket) => {
   const session = sessions.get(socket.data.sessionHash as string);
   if (!session) return socket.disconnect(true);
+  socket.use((_packet, next) => {
+    if (!isActiveHumanSession(session)) {
+      next(new Error("AUTH_REQUIRED"));
+      return;
+    }
+    next();
+  });
   const wasOffline = session.socketIds.size === 0;
   session.socketIds.add(socket.id);
   session.member.status = "online";
@@ -2129,24 +2494,50 @@ if (recoveredDirectTurns > 0) {
 
 const healthInterval = setInterval(async () => {
   const now = Date.now();
-  for (const [tokenHash, session] of sessions) {
+  for (const session of sessions.values()) {
     if (session.socketIds.size > 0) {
       if (now - session.lastSeenAt >= SESSION_HEARTBEAT_MS) {
         session.lastSeenAt = now;
         humanMemory.noteSeen(session.member.id, now);
       }
-      continue;
-    }
-    if (session.socketIds.size === 0 && now - session.lastSeenAt > SESSION_RETENTION_MS) {
-      sessions.delete(tokenHash);
-      humanMemory.forgetProfile(session.member.id);
     }
   }
-  humanMemory.prune(now);
   adminAuth.prune(now);
   adminModeration.prune(now);
   try {
-    await synchronizeOfflineSessionsWithMemory();
+    await identityMutations.run(async () => {
+      // Derive expiry only after obtaining the same transaction used by
+      // recovery. Revalidate immediately before the synchronous revocation in
+      // forgetHumanActorUnlocked so a freshly recovered/connected identity can
+      // never be erased from a stale health-cycle snapshot.
+      const expiredActorIds = new Set(
+        [...sessions.values()]
+          .filter((session) => session.socketIds.size === 0 && now - session.lastSeenAt > SESSION_RETENTION_MS)
+          .map((session) => session.member.id),
+      );
+      for (const actorId of expiredActorIds) {
+        const currentSessions = [...sessions.values()].filter((session) => session.member.id === actorId);
+        if (
+          currentSessions.length === 0 ||
+          currentSessions.some(
+            (session) => session.revoked || session.socketIds.size > 0 || now - session.lastSeenAt <= SESSION_RETENTION_MS,
+          )
+        ) continue;
+        await forgetHumanActorUnlocked(actorId);
+      }
+      // All retained profiles have a reconstructed runtime session. This pass
+      // now primarily expires bounded facts and catches configured overflow,
+      // while still sharing the identity transaction boundary.
+      humanMemory.prune(
+        now,
+        new Set(
+          [...sessions.values()]
+            .filter((session) => session.socketIds.size > 0 || session.revoked)
+            .map((session) => session.member.id),
+        ),
+      );
+      await synchronizeOfflineSessionsWithMemory();
+    });
   } catch (error) {
     console.warn(
       "Deferred actor-memory erasure will be retried from its durable tombstone.",
@@ -2157,6 +2548,21 @@ const healthInterval = setInterval(async () => {
     const recent = timestamps.filter((timestamp) => now - timestamp < 10 * 60_000);
     if (recent.length > 0) joinAttempts.set(ip, recent);
     else joinAttempts.delete(ip);
+  }
+  for (const [key, timestamps] of recoveryAttempts) {
+    const recent = timestamps.filter((timestamp) => now - timestamp < RECOVERY_ATTEMPT_WINDOW_MS);
+    if (recent.length > 0) recoveryAttempts.set(key, recent);
+    else recoveryAttempts.delete(key);
+  }
+  for (const [key, timestamps] of recoveryIpAttempts) {
+    const recent = timestamps.filter((timestamp) => now - timestamp < RECOVERY_ATTEMPT_WINDOW_MS);
+    if (recent.length > 0) recoveryIpAttempts.set(key, recent);
+    else recoveryIpAttempts.delete(key);
+  }
+  for (const [actorId, timestamps] of selfRecoveryKeyRotations) {
+    const recent = timestamps.filter((timestamp) => now - timestamp < SELF_RECOVERY_KEY_WINDOW_MS);
+    if (recent.length > 0) selfRecoveryKeyRotations.set(actorId, recent);
+    else selfRecoveryKeyRotations.delete(actorId);
   }
   try {
     await lm.probe();

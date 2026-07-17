@@ -146,6 +146,33 @@ describe("persistent human memory", () => {
     ]);
   });
 
+  it("never evicts runtime-protected identities at the profile cap", async () => {
+    const { store } = await tempStore({
+      maxProfiles: 1,
+      retentionMs: 10 * day,
+    });
+    store.upsertSession({
+      tokenHash: hash("protected-a"),
+      member: member("human-protected-a", "Protected A"),
+      seenAt: 1,
+    });
+    store.upsertSession({
+      tokenHash: hash("protected-b"),
+      member: member("human-protected-b", "Protected B"),
+      seenAt: 2,
+      protectedHumanIds: new Set(["human-protected-a", "human-protected-b"]),
+    });
+
+    expect(store.listRestorableProfiles().map((profile) => profile.member.id).sort()).toEqual([
+      "human-protected-a",
+      "human-protected-b",
+    ]);
+
+    store.prune(3, new Set(["human-protected-a"]));
+    expect(store.listRestorableProfiles().map((profile) => profile.member.id)).toEqual(["human-protected-a"]);
+    expect(store.listPendingActorForgets()).toContain("human-protected-b");
+  });
+
   it("never permits configuration to retain more than four facts per profile", async () => {
     const { store } = await tempStore({ maxFactsPerProfile: 999 });
     store.upsertSession({ tokenHash: hash("hard-fact-bound"), member: member() });

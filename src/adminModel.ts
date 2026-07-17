@@ -188,6 +188,7 @@ const normalizeHuman = (value: unknown, index: number): AdminHumanMember => {
     id: asString(input.id ?? input.memberId, `human-${index + 1}`),
     name: asString(input.name, `Guest ${index + 1}`),
     status: normalizePresence(input.status),
+    ...(typeof input.recoveryConfigured === "boolean" ? { recoveryConfigured: input.recoveryConfigured } : {}),
     ...(asOptionalString(input.activeChannelId) ? { activeChannelId: asOptionalString(input.activeChannelId) } : {}),
     ...(asOptionalString(input.joinedAt) ? { joinedAt: asOptionalString(input.joinedAt) } : {}),
   };

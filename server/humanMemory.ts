@@ -8,6 +8,11 @@ import {
   stripDangerousTextControls,
   unicodeCaselessKey,
 } from "../shared/unicodeSafety.js";
+import {
+  humanIdentityRecoveryKeyHashesMatch,
+  isHumanIdentityRecoveryKeyHash,
+} from "./humanIdentityRecovery.js";
+import { participantIdentityKey } from "./participantIdentity.js";
 
 export const HUMAN_MEMORY_DEFAULTS = {
   retentionMs: 90 * 24 * 60 * 60_000,
@@ -87,6 +92,8 @@ export interface HumanMemoryProfile {
   facts: HumanMemoryFact[];
   channelScores: HumanChannelScore[];
   relations: Record<string, HumanPersonaRelation>;
+  /** Safe capability metadata; the recovery-key digest is never exposed. */
+  recoveryConfigured: boolean;
 }
 
 /** Minimal server-only data needed to rebuild the in-memory session map after restart. */
@@ -167,6 +174,8 @@ export interface UpsertHumanSessionInput {
   tokenHash: string;
   member: Member;
   seenAt?: number;
+  /** Runtime actors that capacity/retention pruning must not evict. */
+  protectedHumanIds?: ReadonlySet<string>;
 }
 
 /** Small integration surface used by the HTTP/session layer and social director. */
@@ -181,6 +190,15 @@ export interface HumanMemory {
   listRestorableProfiles(): RestorableHumanProfile[];
   findByHumanId(humanId: string): HumanMemoryProfile | undefined;
   findByTokenHash(tokenHash: string): HumanMemoryProfile | undefined;
+  findByRecoveryKey(name: string, recoveryKeyHash: string): HumanMemoryProfile | undefined;
+  replaceRecoveryKeyHash(humanId: string, nextHash: string | undefined): string | undefined;
+  hasRecoveryKey(humanId: string): boolean;
+  rotateSessionToken(
+    humanId: string,
+    expectedOldHash: string,
+    nextHash: string,
+    seenAt?: number,
+  ): HumanMemoryProfile | undefined;
   noteVisit(humanId: string, at?: number): HumanVisitResult | undefined;
   noteSeen(humanId: string, at?: number): boolean;
   notePublicMessage(humanId: string, channelId: string, content: string, at?: number): void;
@@ -207,7 +225,7 @@ export interface HumanMemory {
   clientSummary(humanId: string): HumanMemoryClientSummary | undefined;
   resetRememberedDetails(humanId: string, at?: number): boolean;
   forgetProfile(humanId: string): boolean;
-  prune(at?: number): HumanMemoryPruneResult;
+  prune(at?: number, protectedHumanIds?: ReadonlySet<string>): HumanMemoryPruneResult;
 }
 
 export interface HumanMemoryStoreOptions {
@@ -223,8 +241,10 @@ export interface HumanMemoryStoreOptions {
   persistDelayMs?: number;
 }
 
-interface InternalProfile extends Omit<HumanMemoryProfile, "relations"> {
+interface InternalProfile extends Omit<HumanMemoryProfile, "relations" | "recoveryConfigured"> {
   relations: Map<string, HumanPersonaRelation>;
+  /** Server-only digest of the high-entropy copy/paste recovery credential. */
+  recoveryKeyHash?: string;
 }
 
 interface PersistedHumanMemory {
@@ -233,6 +253,7 @@ interface PersistedHumanMemory {
   pendingActorForgetIds: string[];
   profiles: Array<{
     tokenHash: string;
+    recoveryKeyHash?: string;
     member: Member & { kind: "human" };
     createdAt: number;
     lastSeenAt: number;
@@ -495,6 +516,7 @@ const profileSnapshot = (profile: InternalProfile): HumanMemoryProfile => ({
   facts: profile.facts.map(cloneFact),
   channelScores: profile.channelScores.map(cloneChannelScore),
   relations: Object.fromEntries([...profile.relations].map(([id, relation]) => [id, cloneRelation(relation)])),
+  recoveryConfigured: profile.recoveryKeyHash !== undefined,
 });
 
 export class HumanMemoryStore implements HumanMemory {
@@ -739,7 +761,7 @@ export class HumanMemoryStore implements HumanMemory {
     }
     this.profilesByHumanId.set(profile.member.id, profile);
     this.humanIdByTokenHash.set(tokenHash, profile.member.id);
-    this.pruneInternal(at);
+    this.pruneInternal(at, input.protectedHumanIds);
     this.schedulePersist();
     return profileSnapshot(profile);
   }
@@ -764,6 +786,70 @@ export class HumanMemoryStore implements HumanMemory {
     if (!TOKEN_HASH.test(normalizedHash)) return undefined;
     const humanId = this.humanIdByTokenHash.get(normalizedHash);
     return humanId ? this.findByHumanId(humanId) : undefined;
+  }
+
+  findByRecoveryKey(name: string, recoveryKeyHash: string): HumanMemoryProfile | undefined {
+    const normalizedName = normalizeDisplayName(name);
+    if (!validDisplayName(normalizedName)) {
+      // Keep the digest comparison shape even when the display name cannot
+      // identify a profile. Authentication callers get no distinction between
+      // malformed, missing, ambiguous, and mismatched identities.
+      humanIdentityRecoveryKeyHashesMatch(recoveryKeyHash, undefined);
+      return undefined;
+    }
+    const identityKey = participantIdentityKey(normalizedName);
+    const matches = [...this.profilesByHumanId.values()].filter(
+      (profile) => participantIdentityKey(profile.member.name) === identityKey,
+    );
+    if (matches.length === 0) {
+      humanIdentityRecoveryKeyHashesMatch(recoveryKeyHash, undefined);
+      return undefined;
+    }
+    // Legacy data may contain names that collapse to the same compatibility
+    // identity. Compare every matching digest and recover only when the secret
+    // itself selects exactly one actor; a duplicated digest remains ambiguous.
+    const authenticated = matches.filter((profile) =>
+      humanIdentityRecoveryKeyHashesMatch(recoveryKeyHash, profile.recoveryKeyHash));
+    return authenticated.length === 1 ? profileSnapshot(authenticated[0]!) : undefined;
+  }
+
+  replaceRecoveryKeyHash(humanId: string, nextHash: string | undefined): string | undefined {
+    if (nextHash !== undefined && !isHumanIdentityRecoveryKeyHash(nextHash)) {
+      throw new TypeError("Human memory accepts only a SHA-256 recovery-key digest.");
+    }
+    const profile = this.profilesByHumanId.get(humanId);
+    if (!profile) return undefined;
+    const previous = profile.recoveryKeyHash;
+    if (nextHash === undefined) delete profile.recoveryKeyHash;
+    else profile.recoveryKeyHash = nextHash;
+    if (previous !== nextHash) this.schedulePersist();
+    return previous;
+  }
+
+  hasRecoveryKey(humanId: string): boolean {
+    return this.profilesByHumanId.get(humanId)?.recoveryKeyHash !== undefined;
+  }
+
+  rotateSessionToken(
+    humanId: string,
+    expectedOldHash: string,
+    nextHash: string,
+    seenAt = this.now(),
+  ): HumanMemoryProfile | undefined {
+    const expected = expectedOldHash.toLowerCase();
+    const next = nextHash.toLowerCase();
+    if (!TOKEN_HASH.test(expected) || !TOKEN_HASH.test(next) || expected === next) return undefined;
+    const profile = this.profilesByHumanId.get(humanId);
+    if (!profile || profile.tokenHash !== expected) return undefined;
+    const nextOwner = this.humanIdByTokenHash.get(next);
+    if (nextOwner && nextOwner !== humanId) return undefined;
+
+    this.humanIdByTokenHash.delete(expected);
+    profile.tokenHash = next;
+    profile.lastSeenAt = Math.max(profile.lastSeenAt, Math.max(0, finiteNumber(seenAt, this.now())));
+    this.humanIdByTokenHash.set(next, humanId);
+    this.schedulePersist();
+    return profileSnapshot(profile);
   }
 
   noteVisit(humanId: string, at = this.now()): HumanVisitResult | undefined {
@@ -994,8 +1080,8 @@ export class HumanMemoryStore implements HumanMemory {
     return removed;
   }
 
-  prune(at = this.now()): HumanMemoryPruneResult {
-    const result = this.pruneInternal(Math.max(0, finiteNumber(at, this.now())));
+  prune(at = this.now(), protectedHumanIds?: ReadonlySet<string>): HumanMemoryPruneResult {
+    const result = this.pruneInternal(Math.max(0, finiteNumber(at, this.now())), protectedHumanIds);
     if (result.profilesRemoved > 0 || result.factsRemoved > 0) this.schedulePersist();
     return result;
   }
@@ -1004,6 +1090,7 @@ export class HumanMemoryStore implements HumanMemory {
     const value = asRecord(raw);
     if (!value) return undefined;
     const tokenHash = boundedString(value.tokenHash, 64)?.toLowerCase();
+    const recoveryKeyHash = value.recoveryKeyHash;
     const legacyMember = value.member ?? {
       id: value.humanId,
       name: value.name,
@@ -1013,7 +1100,12 @@ export class HumanMemoryStore implements HumanMemory {
       bio: value.bio,
     };
     const member = sanitizeMember(legacyMember);
-    if (!tokenHash || !TOKEN_HASH.test(tokenHash) || !member) return undefined;
+    if (
+      !tokenHash ||
+      !TOKEN_HASH.test(tokenHash) ||
+      !member ||
+      (recoveryKeyHash !== undefined && !isHumanIdentityRecoveryKeyHash(recoveryKeyHash))
+    ) return undefined;
 
     const createdAt = Math.max(0, finiteNumber(value.createdAt ?? value.firstSeenAt, now));
     const lastSeenAt = Math.max(createdAt, finiteNumber(value.lastSeenAt, createdAt));
@@ -1059,6 +1151,7 @@ export class HumanMemoryStore implements HumanMemory {
 
     const profile: InternalProfile = {
       tokenHash,
+      ...(typeof recoveryKeyHash === "string" ? { recoveryKeyHash } : {}),
       member,
       createdAt,
       lastSeenAt,
@@ -1098,19 +1191,23 @@ export class HumanMemoryStore implements HumanMemory {
     return before - profile.facts.length;
   }
 
-  private pruneInternal(at: number): HumanMemoryPruneResult {
+  private pruneInternal(at: number, protectedHumanIds: ReadonlySet<string> = new Set()): HumanMemoryPruneResult {
     let profilesRemoved = 0;
     let factsRemoved = 0;
     for (const profile of [...this.profilesByHumanId.values()]) {
-      if (at - profile.lastSeenAt > this.retentionMs) {
+      if (at - profile.lastSeenAt > this.retentionMs && !protectedHumanIds.has(profile.member.id)) {
         if (this.removeInternal(profile.member.id)) profilesRemoved += 1;
       } else {
         factsRemoved += this.removeExpiredFacts(profile, at);
       }
     }
+    const protectedCount = [...this.profilesByHumanId.values()]
+      .filter((profile) => protectedHumanIds.has(profile.member.id)).length;
+    const allowedUnprotected = Math.max(0, this.maxProfiles - protectedCount);
     const overflow = [...this.profilesByHumanId.values()]
+      .filter((profile) => !protectedHumanIds.has(profile.member.id))
       .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
-      .slice(this.maxProfiles);
+      .slice(allowedUnprotected);
     for (const profile of overflow) {
       if (this.removeInternal(profile.member.id)) profilesRemoved += 1;
     }
@@ -1142,6 +1239,7 @@ export class HumanMemoryStore implements HumanMemory {
         .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
         .map((profile) => ({
           tokenHash: profile.tokenHash,
+          ...(profile.recoveryKeyHash !== undefined ? { recoveryKeyHash: profile.recoveryKeyHash } : {}),
           member: cloneMember(profile.member),
           createdAt: profile.createdAt,
           lastSeenAt: profile.lastSeenAt,

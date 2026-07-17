@@ -34,6 +34,7 @@ import {
   getAdminMemoryActor,
   getAdminSession,
   getAdminState,
+  issueAdminHumanRecoveryKey,
   moderateAdminHuman,
   patchAdminBehavior,
   patchAdminChannel,
@@ -68,6 +69,7 @@ type ConfirmRequest = {
   confirmLabel: string;
   action: () => Promise<boolean>;
 };
+type IssuedRecoveryKey = { name: string; recoveryKey: string; copied: boolean };
 
 const sections: Array<{ id: AdminSection; label: string; hint: string }> = [
   { id: "overview", label: "Overview", hint: "Live controls" },
@@ -279,6 +281,48 @@ function ConfirmDialog({
   );
 }
 
+function RecoveryKeyDialog({
+  issued,
+  onClose,
+  onCopied,
+}: {
+  issued: IssuedRecoveryKey;
+  onClose: () => void;
+  onCopied: () => void;
+}) {
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    closeRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(issued.recoveryKey);
+      onCopied();
+    } catch {
+      // The key stays selectable when clipboard permission is unavailable.
+    }
+  };
+  return (
+    <div className="admin-dialog-backdrop">
+      <section aria-labelledby="admin-recovery-key-title" aria-modal="true" className="admin-dialog admin-recovery-dialog" role="dialog">
+        <p className="admin-kicker">Shown once</p>
+        <h2 id="admin-recovery-key-title">Return key for {issued.name}</h2>
+        <p>Send this privately to the identity owner. It restores the same profile, relationships and DMs on another browser. Issuing another key invalidates this one.</p>
+        <code>{issued.recoveryKey}</code>
+        <div className="admin-dialog-actions">
+          <button className="admin-button subtle" onClick={() => { void copy(); }} type="button">{issued.copied ? "Copied" : "Copy key"}</button>
+          <button className="admin-button primary" onClick={onClose} ref={closeRef} type="button">Done</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function LoginView({
   password,
   busy,
@@ -342,6 +386,7 @@ export default function AdminApp() {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice>();
   const [confirm, setConfirm] = useState<ConfirmRequest>();
+  const [issuedRecoveryKey, setIssuedRecoveryKey] = useState<IssuedRecoveryKey>();
   const [globalDraft, setGlobalDraft] = useState<AdminBehaviorTuning>({ ...DEFAULT_ADMIN_TUNING });
   const [behaviorChannelId, setBehaviorChannelId] = useState("");
   const [channelTuningDraft, setChannelTuningDraft] = useState<AdminBehaviorTuning>({ ...DEFAULT_ADMIN_TUNING });
@@ -1350,15 +1395,51 @@ export default function AdminApp() {
   const humans = (
     <div className="admin-control-grid">
       <section className="admin-card" aria-labelledby="connected-humans-title">
-        <div className="admin-card-heading"><div><p className="admin-kicker">Current sessions</p><h2 id="connected-humans-title">Humans</h2></div><span className="admin-count-badge">{snapshot.humans.length}</span></div>
+        <div className="admin-card-heading"><div><p className="admin-kicker">Retained identities</p><h2 id="connected-humans-title">Humans</h2></div><span className="admin-count-badge">{snapshot.humans.length}</span></div>
         {snapshot.humans.length ? (
           <div className="admin-people-list">
             {snapshot.humans.map((human) => (
               <article key={human.id}>
                 <span className={`admin-presence ${human.status}`} aria-label={human.status} />
-                <div><strong>{human.name}</strong><small>{human.activeChannelId ? `#${human.activeChannelId}` : human.status}{human.joinedAt ? ` · joined ${formatDateTime(human.joinedAt)}` : ""}</small></div>
+                <div><strong>{human.name}</strong><small>{human.activeChannelId ? `#${human.activeChannelId}` : human.status === "offline" ? "saved identity · not connected" : human.status}{` · ${human.recoveryConfigured ? "return key configured" : "no return key"}`}{human.joinedAt ? ` · recorded ${formatDateTime(human.joinedAt)}` : ""}</small></div>
                 <div className="admin-row-actions">
-                  <button className="admin-button subtle compact" onClick={() => setConfirm({
+                  <button
+                    className="admin-button subtle compact"
+                    disabled={Boolean(busy)}
+                    onClick={() => setConfirm({
+                      title: `${human.recoveryConfigured ? "Rotate" : "Issue"} return key for ${human.name}?`,
+                      message: human.recoveryConfigured
+                        ? "This immediately invalidates the guest's previously saved return key. The replacement is shown only once."
+                        : "The new private return key is shown only once. Send it to the identity owner through a private channel.",
+                      confirmLabel: human.recoveryConfigured ? "Rotate return key" : "Issue return key",
+                      action: async () => {
+                        setBusy(`return-key-${human.id}`);
+                        setNotice(undefined);
+                        try {
+                          const issued = await issueAdminHumanRecoveryKey(human.id);
+                          setIssuedRecoveryKey({ ...issued, copied: false });
+                          // Issuance is already committed when this resolves.
+                          // Update the local capability flag directly so a
+                          // later snapshot refresh failure can never invite a
+                          // destructive retry that invalidates the shown key.
+                          setSnapshot((current) => current ? {
+                            ...current,
+                            humans: current.humans.map((candidate) => candidate.id === human.id
+                              ? { ...candidate, recoveryConfigured: true }
+                              : candidate),
+                          } : current);
+                          return true;
+                        } catch (error) {
+                          setNotice({ tone: "error", message: mutationErrorMessage(error) });
+                          return false;
+                        } finally {
+                          setBusy(null);
+                        }
+                      },
+                    })}
+                    type="button"
+                  >{busy === `return-key-${human.id}` ? "Working…" : human.recoveryConfigured ? "Rotate return key" : "Issue return key"}</button>
+                  <button className="admin-button subtle compact" disabled={human.status === "offline"} onClick={() => setConfirm({
                     title: `Kick ${human.name}?`,
                     message: "Their current sockets will be disconnected. They may join again unless banned.",
                     confirmLabel: "Kick user",
@@ -1374,7 +1455,7 @@ export default function AdminApp() {
               </article>
             ))}
           </div>
-        ) : <EmptyState title="Nobody is connected">Human sessions will appear here as guests join.</EmptyState>}
+        ) : <EmptyState title="No saved identities">Human identities will appear here as guests join.</EmptyState>}
       </section>
       <section className="admin-card" aria-labelledby="bans-title">
         <div className="admin-card-heading"><div><p className="admin-kicker">Access control</p><h2 id="bans-title">Bans</h2></div><span className="admin-count-badge danger">{snapshot.bans.length}</span></div>
@@ -1770,6 +1851,11 @@ export default function AdminApp() {
         </div>
       </main>
       {confirm && <ConfirmDialog busy={Boolean(busy)} onCancel={() => { if (!busy) setConfirm(undefined); }} request={confirm} />}
+      {issuedRecoveryKey && <RecoveryKeyDialog
+        issued={issuedRecoveryKey}
+        onClose={() => setIssuedRecoveryKey(undefined)}
+        onCopied={() => setIssuedRecoveryKey((current) => current ? { ...current, copied: true } : current)}
+      />}
     </div>
   );
 }

@@ -180,8 +180,26 @@ export interface JoinPayload {
 }
 
 export type JoinResult =
-  | { ok: true; snapshot: RoomSnapshot }
-  | { ok: false; error: string; code?: "NAME_TAKEN" | "INVITE_INVALID" | "VALIDATION" };
+  | { ok: true; me: Member; recoveryKey?: string }
+  | {
+      ok: false;
+      error: string;
+      code?:
+        | "NAME_RESERVED"
+        | "RETURNING_IDENTITY"
+        | "IDENTITY_ONLINE"
+        | "RECOVERY_INVALID"
+        | "RECOVERY_CHANGED"
+        | "RECOVERY_UNAVAILABLE"
+        | "RECOVERY_RATE_LIMITED"
+        | "ORIGIN_REQUIRED"
+        | "BANNED"
+        | "KICK_COOLDOWN"
+        | "INVITE_INVALID"
+        | "VALIDATION";
+      recoveryConfigured?: boolean;
+      online?: boolean;
+    };
 
 export interface SendMessagePayload {
   channelId: string;

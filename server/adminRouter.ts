@@ -27,6 +27,8 @@ export interface AdminRouterDependencies {
   getAutonomousResearchDiagnostics?: () => AdminAutonomousResearchDiagnostics;
   kickHuman: (memberId: string, reason?: string) => AdminHumanMember | undefined;
   banHuman: (memberId: string, reason?: string) => AdminHumanMember | undefined;
+  /** Issues a new one-time-disclosed portable return key for a retained human identity. */
+  issueHumanRecoveryKey?: (memberId: string) => Promise<{ name: string; recoveryKey: string } | undefined>;
   isSecure?: (request: Request) => boolean;
   now?: () => number;
   llmProviders?: AdminLlmProviderControl;
@@ -300,6 +302,31 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
       response.json({ ok: true, state: stateResponse() });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.post("/humans/:id/recovery-key", async (request, response, next) => {
+    const parsedBody = emptyBodySchema.safeParse(request.body ?? {});
+    const parsedId = idParam.safeParse(request.params.id);
+    if (!parsedBody.success || !parsedId.success) {
+      response.status(400).json({ ok: false, error: "That return-key request is invalid." });
+      return;
+    }
+    if (!dependencies.issueHumanRecoveryKey) {
+      response.status(503).json({ ok: false, error: "Identity recovery is unavailable." });
+      return;
+    }
+    try {
+      const issued = await dependencies.issueHumanRecoveryKey(parsedId.data);
+      if (!issued) {
+        response.status(404).json({ ok: false, error: "That saved human identity was not found." });
+        return;
+      }
+      // The raw key is deliberately returned once and is never included in a
+      // later state snapshot. The router-wide private/no-store headers apply.
+      response.status(201).json({ ok: true, ...issued });
+    } catch (error) {
+      next(error);
     }
   });
 

@@ -143,6 +143,19 @@ export async function moderateAdminHuman(id: string, action: "kick" | "ban"): Pr
   await request(`/api/admin/humans/${encodeURIComponent(id)}/${action}`, { method: "POST" });
 }
 
+export async function issueAdminHumanRecoveryKey(id: string): Promise<{ name: string; recoveryKey: string }> {
+  const body = await request(`/api/admin/humans/${encodeURIComponent(id)}/recovery-key`, {
+    method: "POST",
+    body: jsonBody({}),
+  });
+  if (!body || typeof body !== "object") throw new AdminApiError("The return-key response was invalid.", 502);
+  const record = body as Record<string, unknown>;
+  if (typeof record.name !== "string" || typeof record.recoveryKey !== "string") {
+    throw new AdminApiError("The return-key response was invalid.", 502);
+  }
+  return { name: record.name, recoveryKey: record.recoveryKey };
+}
+
 export async function deleteAdminBan(memberId: string): Promise<void> {
   await request(`/api/admin/bans/${encodeURIComponent(memberId)}`, { method: "DELETE" });
 }

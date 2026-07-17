@@ -349,6 +349,7 @@ body { background: var(--admin-bg); color: var(--admin-text); }
 .admin-people-list article > div:nth-child(2) { display: grid; min-width: 0; gap: 3px; }
 .admin-people-list strong { font-size: 13px; }
 .admin-people-list small { overflow: hidden; color: var(--admin-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.admin-people-list .admin-row-actions { flex-wrap: wrap; justify-content: flex-end; }
 .admin-presence { width: 9px; height: 9px; border-radius: 50%; background: #626b7a; }
 .admin-presence.online { background: var(--admin-mint); }
 .admin-presence.idle { background: #e9bd65; }
@@ -372,6 +373,7 @@ body { background: var(--admin-bg); color: var(--admin-text); }
 .admin-dialog { width: min(440px, 100%); padding: 24px; border: 1px solid rgba(255, 255, 255, .13); border-radius: 15px; background: #171c24; box-shadow: 0 30px 90px rgba(0, 0, 0, .55); }
 .admin-dialog p:not(.admin-kicker) { color: var(--admin-muted); font-size: 12px; line-height: 1.55; }
 .admin-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
+.admin-recovery-dialog code { display: block; margin-top: 17px; padding: 13px 14px; overflow-wrap: anywhere; border: 1px solid rgba(98, 216, 179, .24); border-radius: 9px; color: #c6f6e7; background: rgba(4, 12, 12, .55); font: 700 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
 
 .admin-loading, .admin-login-shell { display: grid; min-height: 100dvh; place-items: center; padding: 24px; background: radial-gradient(circle at 50% 5%, rgba(169, 140, 245, .15), transparent 35%), var(--admin-bg); }
 .admin-loading { align-content: center; gap: 12px; color: var(--admin-muted); }

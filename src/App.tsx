@@ -46,6 +46,14 @@ import { clearChannelNotice, firstUnreadDmMessageId, nextDmUnread, noteChannelMe
 import { reduceTypingPresence, TypingPresenceExpiry } from "./typingPresence";
 import { EmojiPicker } from "./EmojiPicker";
 import { insertEmojiAtSelection } from "./emoji";
+import {
+  identityJoinError,
+  needsIdentityTakeover,
+  returnedRecoveryKey,
+  type IdentityJoinMode,
+  type RecoveryKeyResult,
+  type SessionResult,
+} from "./returnIdentity";
 
 const CLIENT_CHANNEL_MESSAGE_LIMIT = 600;
 
@@ -331,8 +339,16 @@ export default function App() {
   const [typing, setTyping] = useState<Record<string, string[]>>({});
   const [joinName, setJoinName] = useState("");
   const [inviteCode, setInviteCode] = useState("");
+  const [identityJoinMode, setIdentityJoinMode] = useState<IdentityJoinMode>("new");
+  const [returnKey, setReturnKey] = useState("");
   const [joinError, setJoinError] = useState("");
   const [joining, setJoining] = useState(false);
+  const [takeoverRequired, setTakeoverRequired] = useState(false);
+  const [recoveryKeyNotice, setRecoveryKeyNotice] = useState<string | null>(null);
+  const [recoveryKeyCopied, setRecoveryKeyCopied] = useState(false);
+  const [recoveryKeyCopyHelp, setRecoveryKeyCopyHelp] = useState(false);
+  const [returnKeyIssueConfirming, setReturnKeyIssueConfirming] = useState(false);
+  const [issuingRecoveryKey, setIssuingRecoveryKey] = useState(false);
   const [showDirector, setShowDirector] = useState(false);
   const [profile, setProfile] = useState<Member | null>(null);
   const [forgettingMemory, setForgettingMemory] = useState(false);
@@ -399,6 +415,7 @@ export default function App() {
   const dragDepth = useRef(0);
   const lightboxCloseRef = useRef<HTMLButtonElement | null>(null);
   const lightboxTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const recoveryKeyInputRef = useRef<HTMLInputElement | null>(null);
   const emojiPickerAnchorRef = useRef<HTMLButtonElement | null>(null);
   const imageObjectUrls = useRef(new Set<string>());
   const localVoiceStreamRef = useRef<MediaStream | null>(null);
@@ -1063,15 +1080,26 @@ export default function App() {
       });
     });
     socket.on("toast", pushToast);
-    socket.on("session:moderated", (payload: { action: "kick" | "ban" | "forget"; message?: string }) => {
+    socket.on("session:moderated", (payload: { action: "kick" | "ban" | "forget" | "recover"; message?: string }) => {
+      if (payload.action === "recover") {
+        const currentIdentity = meRef.current;
+        if (currentIdentity) setJoinName(currentIdentity.name);
+        setIdentityJoinMode("returning");
+        setJoinError("");
+        setTakeoverRequired(false);
+      }
       pushToast({
         tone: "warning",
-        title: payload.action === "forget"
+        title: payload.action === "recover"
+          ? "Identity moved"
+          : payload.action === "forget"
           ? "Saved identity removed"
           : payload.action === "ban"
             ? "Access removed"
             : "Disconnected by an administrator",
-        message: payload.message ?? (payload.action === "forget"
+        message: payload.message ?? (payload.action === "recover"
+          ? "This saved identity was opened in another browser. You can return here again with its return key."
+          : payload.action === "forget"
           ? "Your saved profile and private history were removed."
           : payload.action === "ban"
             ? "You have been banned from this room."
@@ -1164,6 +1192,19 @@ export default function App() {
       socketRef.current?.disconnect();
     };
   }, [clearVoiceMedia, connectSocket]);
+
+  useEffect(() => {
+    if (!profile || !me || profile.id !== me.id) setReturnKeyIssueConfirming(false);
+  }, [me, profile]);
+
+  useEffect(() => {
+    if (!recoveryKeyNotice) return;
+    const frame = requestAnimationFrame(() => {
+      recoveryKeyInputRef.current?.focus();
+      recoveryKeyInputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [recoveryKeyNotice]);
 
   useEffect(() => {
     const onPageHide = () => {
@@ -1491,27 +1532,109 @@ export default function App() {
     };
   }, []);
 
-  const join = async (event: FormEvent) => {
-    event.preventDefault();
+  const submitIdentityJoin = async (takeOver = false) => {
+    if (joining) return;
     setJoinError("");
     setJoining(true);
     try {
-      const response = await fetch("/api/session", {
+      const returning = identityJoinMode === "returning";
+      const response = await fetch(returning ? "/api/session/recover" : "/api/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: joinName, inviteCode: inviteCode || undefined }),
+        credentials: "same-origin",
+        body: JSON.stringify(returning
+          ? {
+            name: joinName,
+            recoveryKey: returnKey,
+            inviteCode: inviteCode || undefined,
+            takeOver: takeOver || undefined,
+          }
+          : { name: joinName, inviteCode: inviteCode || undefined }),
       });
-      const result = (await response.json()) as { ok: boolean; error?: string };
-      if (!response.ok || !result.ok) {
-        setJoinError(result.error ?? "Could not join the room.");
+      const result = await response.json().catch(() => null) as SessionResult<Member> | null;
+      if (!response.ok || !result?.ok) {
+        if (!takeOver && result && needsIdentityTakeover(identityJoinMode, response.status, result)) {
+          setTakeoverRequired(true);
+          return;
+        }
+        setTakeoverRequired(false);
+        setJoinError(identityJoinError(identityJoinMode, result));
         return;
       }
+      const issuedKey = returnedRecoveryKey(result);
+      if (issuedKey) {
+        setRecoveryKeyCopied(false);
+        setRecoveryKeyCopyHelp(false);
+        setRecoveryKeyNotice(issuedKey);
+      }
+      setTakeoverRequired(false);
+      setReturnKey("");
       connectSocket();
     } catch {
       setJoinError("The room is unreachable right now.");
     } finally {
       setJoining(false);
     }
+  };
+
+  const join = (event: FormEvent) => {
+    event.preventDefault();
+    void submitIdentityJoin(false);
+  };
+
+  const switchIdentityJoinMode = () => {
+    if (identityJoinMode === "returning") setReturnKey("");
+    setIdentityJoinMode(identityJoinMode === "new" ? "returning" : "new");
+    setJoinError("");
+    setTakeoverRequired(false);
+  };
+
+  const issueRecoveryKey = async () => {
+    if (issuingRecoveryKey) return;
+    setIssuingRecoveryKey(true);
+    try {
+      const response = await fetch("/api/session/recovery-key", {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      });
+      const result = await response.json().catch(() => null) as RecoveryKeyResult | null;
+      const issuedKey = returnedRecoveryKey(result);
+      if (!response.ok || !issuedKey) {
+        throw new Error(result && !result.ok ? result.error : undefined);
+      }
+      setReturnKeyIssueConfirming(false);
+      setRecoveryKeyCopied(false);
+      setRecoveryKeyCopyHelp(false);
+      setRecoveryKeyNotice(issuedKey);
+    } catch (error) {
+      pushToast({
+        tone: "warning",
+        title: "Return key not created",
+        message: error instanceof Error && error.message ? error.message : "Try again in a moment.",
+      });
+    } finally {
+      setIssuingRecoveryKey(false);
+    }
+  };
+
+  const copyRecoveryKey = async () => {
+    if (!recoveryKeyNotice) return;
+    try {
+      await navigator.clipboard.writeText(recoveryKeyNotice);
+      setRecoveryKeyCopied(true);
+      setRecoveryKeyCopyHelp(false);
+    } catch {
+      recoveryKeyInputRef.current?.focus();
+      recoveryKeyInputRef.current?.select();
+      setRecoveryKeyCopyHelp(true);
+    }
+  };
+
+  const closeRecoveryKeyNotice = () => {
+    setRecoveryKeyNotice(null);
+    setRecoveryKeyCopied(false);
+    setRecoveryKeyCopyHelp(false);
   };
 
   const forgetAiMemory = async () => {
@@ -2280,13 +2403,13 @@ export default function App() {
             <button type="button" className="voice-quick-leave" onClick={leaveVoiceRoom} aria-label="Disconnect from voice"><Icon name="phoneOff" size={16} /></button>
           </div>
         )}
-        <div className="sidebar-foot">
-          {me ? (
-            <><Avatar member={me} size="sm" /><div><strong dir="auto">{me.name}</strong><span>Guest · connected</span></div><span className="signal-bars"><i /><i /><i /></span></>
-          ) : (
-            <><span className="preview-eye"><Icon name="users" size={16} /></span><div><strong>Live preview</strong><span>Join to take part</span></div></>
-          )}
-        </div>
+        {me ? (
+          <button className="sidebar-foot sidebar-foot-button" type="button" onClick={() => setProfile(me)} aria-label="Open your profile and return-key settings">
+            <Avatar member={me} size="sm" /><div><strong dir="auto">{me.name}</strong><span>Guest · connected</span></div><span className="signal-bars" aria-hidden="true"><i /><i /><i /></span>
+          </button>
+        ) : (
+          <div className="sidebar-foot"><span className="preview-eye"><Icon name="users" size={16} /></span><div><strong>Live preview</strong><span>Join to take part</span></div></div>
+        )}
       </aside>
 
       <main
@@ -2839,15 +2962,40 @@ export default function App() {
             <div className="join-live"><i /> LIVE ROOM <span>{preview?.health.onlineHumans ?? 0} real guests here now</span></div>
             <div className="join-logo"><BrandMark large /></div>
             <p className="join-kicker">THE THIRD PLACE</p>
-            <h2>Join the conversation.</h2>
-            <p className="join-copy">A living online room populated by distinct AI characters — and real people like you.</p>
-            <label><span>Display name</span><input autoFocus dir="auto" value={joinName} onChange={(event) => setJoinName(event.target.value)} placeholder="What should everyone call you?" maxLength={24} /></label>
-            {preview?.inviteRequired && <label><span>Invite code</span><input value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="Enter the code" type="password" /></label>}
-            {joinError && <div className="join-error">{joinError}</div>}
-            <button className="join-button" type="submit" disabled={joining || !validDisplayName(normalizeDisplayName(joinName))}>{joining ? <><span className="spinner" />Opening the door…</> : <>Enter the room <Icon name="chevron" size={17} /></>}</button>
+            <h2>{identityJoinMode === "returning" ? "Welcome back." : "Join the conversation."}</h2>
+            <p className="join-copy">{identityJoinMode === "returning" ? "Use the name and private return key from your earlier visit." : "A living online room populated by distinct AI characters — and real people like you."}</p>
+            <label><span>Display name</span><input autoFocus dir="auto" value={joinName} onChange={(event) => { setJoinName(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder={identityJoinMode === "returning" ? "The exact name you used before" : "What should everyone call you?"} maxLength={24} /></label>
+            {identityJoinMode === "returning" && <label><span>Return key</span><input value={returnKey} onChange={(event) => { setReturnKey(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Paste your private return key" type="password" autoComplete="off" spellCheck={false} /></label>}
+            {preview?.inviteRequired && <label><span>Invite code</span><input value={inviteCode} onChange={(event) => { setInviteCode(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Enter the code" type="password" /></label>}
+            {joinError && <div className="join-error" role="alert">{joinError}</div>}
+            {takeoverRequired ? (
+              <div className="join-takeover" role="alert">
+                <div><Icon name="info" size={17} /><span><strong>Already open somewhere else</strong>This return key is valid, but the identity is currently connected. Taking over will sign out the other browser.</span></div>
+                <div className="join-takeover-actions"><button type="button" onClick={() => setTakeoverRequired(false)} disabled={joining}>Not now</button><button type="button" onClick={() => void submitIdentityJoin(true)} disabled={joining}>{joining ? <><span className="button-spinner" />Moving…</> : "Take over identity"}</button></div>
+              </div>
+            ) : (
+              <button className="join-button" type="submit" disabled={joining || !validDisplayName(normalizeDisplayName(joinName)) || (identityJoinMode === "returning" && !returnKey.trim())}>{joining ? <><span className="spinner" />Opening the door…</> : <>{identityJoinMode === "returning" ? "Return to the room" : "Enter the room"} <Icon name="chevron" size={17} /></>}</button>
+            )}
+            <button className="join-mode-toggle" type="button" onClick={switchIdentityJoinMode} disabled={joining}>{identityJoinMode === "returning" ? "I’m new here" : "I have a return key"}<Icon name="chevron" size={14} /></button>
             <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Humans and AI are always labelled.</strong> This server keeps a small local memory of return visits, rooms you use most, and non-sensitive preferences, activities or technical tools you explicitly share. No account or email is required, and you can erase it from your profile. AI runs locally; optional research, link previews and explicit linked-page reads use the web.</span></div>
             <p className="preview-hint"><i /><span>You're seeing the real room live behind this card.</span></p>
           </form>
+        </div>
+      )}
+
+      {recoveryKeyNotice && (
+        <div className="recovery-key-backdrop" role="presentation">
+          <article className="recovery-key-card" role="dialog" aria-modal="true" aria-labelledby="recovery-key-title">
+            <span className="recovery-key-icon"><Icon name="lock" size={23} /></span>
+            <p className="join-kicker">YOUR RETURN KEY</p>
+            <h2 id="recovery-key-title">Save this somewhere private.</h2>
+            <p>This key lets you return as the same person — with the same conversations and relationships — from another browser or device while this identity is retained.</p>
+            <label><span>Return key</span><input ref={recoveryKeyInputRef} readOnly value={recoveryKeyNotice} autoComplete="off" spellCheck={false} onFocus={(event) => event.currentTarget.select()} /></label>
+            <button className="recovery-key-copy" type="button" onClick={() => void copyRecoveryKey()}><Icon name={recoveryKeyCopied ? "spark" : "lock"} size={16} />{recoveryKeyCopied ? "Copied" : "Copy return key"}</button>
+            {recoveryKeyCopyHelp && <span className="recovery-key-copy-help" role="status">Automatic copy was blocked. The full key is selected; copy it with your browser or keyboard.</span>}
+            <div className="recovery-key-warning"><Icon name="info" size={16} /><span><strong>Shown once.</strong> The server cannot reveal this key later. Anyone who has it can open this identity.</span></div>
+            <button className="recovery-key-done" type="button" onClick={closeRecoveryKeyNotice}>I’ve saved it</button>
+          </article>
         </div>
       )}
 
@@ -2881,7 +3029,7 @@ export default function App() {
             <div className="profile-cover" style={{ "--profile": profile.avatar.color, "--accent": profile.avatar.accent } as React.CSSProperties} />
             <button className="profile-close" onClick={() => setProfile(null)}><Icon name="close" /></button>
             <Avatar member={profile} size="xl" />
-            <div className="profile-body"><div className="profile-name"><h2 dir="auto">{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div><p className="profile-role" dir="auto">{profile.role}</p><p className="profile-bio" dir="auto">{profile.bio}</p><div className="profile-facts"><span><small>STATUS</small><b dir="auto"><i className={`presence-${profile.status}`} />{profile.status}</b></span>{profile.activity && <span><small>CURRENTLY</small><b dir="auto">{profile.activity}</b></span>}<span><small>MEMORY</small><b>{me && profile.id === me.id ? "Small local memory" : profile.kind === "ai" ? "Recent room context" : "Human guest"}</b></span></div>{me && profile.id === me.id && <button type="button" className="profile-forget" onClick={() => void forgetAiMemory()} disabled={forgettingMemory} aria-busy={forgettingMemory}>{forgettingMemory ? <><span className="button-spinner" aria-hidden="true" />Forgetting…</> : "Forget what AI remembers"}</button>}{me && profile.id !== me.id && profile.status !== "offline" && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message <span dir="auto">{profile.name}</span></button>}</div>
+            <div className="profile-body"><div className="profile-name"><h2 dir="auto">{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div><p className="profile-role" dir="auto">{profile.role}</p><p className="profile-bio" dir="auto">{profile.bio}</p><div className="profile-facts"><span><small>STATUS</small><b dir="auto"><i className={`presence-${profile.status}`} />{profile.status}</b></span>{profile.activity && <span><small>CURRENTLY</small><b dir="auto">{profile.activity}</b></span>}<span><small>MEMORY</small><b>{me && profile.id === me.id ? "Small local memory" : profile.kind === "ai" ? "Recent room context" : "Human guest"}</b></span></div>{me && profile.id === me.id && <div className="profile-return-key"><div><Icon name="lock" size={16} /><span><strong>Return on another device</strong><small>A new key replaces any key you saved earlier.</small></span></div>{returnKeyIssueConfirming ? <div className="profile-return-key-confirm"><span>Generate a fresh private key now?</span><div><button type="button" onClick={() => setReturnKeyIssueConfirming(false)} disabled={issuingRecoveryKey}>Cancel</button><button type="button" onClick={() => void issueRecoveryKey()} disabled={issuingRecoveryKey}>{issuingRecoveryKey ? <><span className="button-spinner" />Creating…</> : "Create new key"}</button></div></div> : <button type="button" onClick={() => setReturnKeyIssueConfirming(true)}>Create or rotate return key</button>}</div>}{me && profile.id === me.id && <button type="button" className="profile-forget" onClick={() => void forgetAiMemory()} disabled={forgettingMemory} aria-busy={forgettingMemory}>{forgettingMemory ? <><span className="button-spinner" aria-hidden="true" />Forgetting…</> : "Forget what AI remembers"}</button>}{me && profile.id !== me.id && profile.status !== "offline" && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message <span dir="auto">{profile.name}</span></button>}</div>
           </article>
         </div>
       )}

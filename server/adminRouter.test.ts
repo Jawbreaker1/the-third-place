@@ -86,6 +86,7 @@ describe("admin HTTP API", () => {
     const kicked: Array<{ memberId: string; reason?: string }> = [];
     const banned: Array<{ memberId: string; reason?: string }> = [];
     const forgotten: string[] = [];
+    const recoveryKeysIssued: string[] = [];
     const memoryMutations: string[] = [];
     const memoryOverview = {
       stats: { actors: 1, memories: 1, relationships: 1, openLoops: 0, auditEntries: 0 },
@@ -140,6 +141,11 @@ describe("admin HTTP API", () => {
         if (memberId !== human.id) return undefined;
         banned.push({ memberId, ...(reason ? { reason } : {}) });
         return human;
+      },
+      issueHumanRecoveryKey: async (memberId) => {
+        if (memberId !== human.id) return undefined;
+        recoveryKeysIssued.push(memberId);
+        return { name: human.name, recoveryKey: "ttp_admin-once-only-return-key" };
       },
       socialMemory: {
         getOverview: () => memoryOverview,
@@ -215,6 +221,29 @@ describe("admin HTTP API", () => {
         },
       },
     });
+
+    const issuedRecoveryKey = await dispatch(app, {
+      method: "POST",
+      path: `/api/admin/humans/${human.id}/recovery-key`,
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    });
+    expect(issuedRecoveryKey.status).toBe(201);
+    expect(issuedRecoveryKey.headers["cache-control"]).toContain("no-store");
+    expect(issuedRecoveryKey.body).toEqual({
+      ok: true,
+      name: human.name,
+      recoveryKey: "ttp_admin-once-only-return-key",
+    });
+    expect(recoveryKeysIssued).toEqual([human.id]);
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/humans/missing/recovery-key",
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    })).status).toBe(404);
 
     const memory = await dispatch(app, { method: "GET", path: "/api/admin/memory", cookie });
     expect(memory.status).toBe(200);

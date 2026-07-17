@@ -48,7 +48,7 @@ describe("admin model boundary", () => {
           ambientMode: "casual",
           ambientPremises: ["one", "one", "two"],
         }],
-        humans: [{ memberId: "guest-1", name: "Johan", status: "online" }],
+        humans: [{ memberId: "guest-1", name: "Johan", status: "online", recoveryConfigured: true }],
         bans: [{ id: "guest-2", name: "Nope", bannedAt: "2026-07-14T12:00:00Z" }],
         voiceOptions: { voices: [{ voiceId: "sv-voice", name: "Swedish", languageTags: ["sv"] }] },
       },
@@ -104,6 +104,12 @@ describe("admin model boundary", () => {
     expect(snapshot.voiceOptions).toEqual({
       languages: ["sv"],
       voices: [{ id: "sv-voice", label: "Swedish", languages: ["sv"] }],
+    });
+    expect(snapshot.humans[0]).toMatchObject({
+      id: "guest-1",
+      name: "Johan",
+      status: "online",
+      recoveryConfigured: true,
     });
   });
 

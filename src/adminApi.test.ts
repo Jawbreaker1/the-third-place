@@ -8,6 +8,7 @@ import {
   getAdminLlmState,
   getAdminMemory,
   getAdminMemoryActor,
+  issueAdminHumanRecoveryKey,
   patchAdminBehavior,
   patchAdminLlmProvider,
   patchAdminMemoryItem,
@@ -110,6 +111,35 @@ describe("admin session API", () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(networkError));
 
     await expect(deleteAdminSession()).rejects.toBe(networkError);
+  });
+});
+
+describe("admin human identity recovery API", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("requests and returns a one-time key without putting it in the URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ok: true,
+      name: "Telefon-Johan",
+      recoveryKey: "ttp_one-time-admin-key",
+    }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(issueAdminHumanRecoveryKey("human/phone")).resolves.toEqual({
+      name: "Telefon-Johan",
+      recoveryKey: "ttp_one-time-admin-key",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/humans/human%2Fphone/recovery-key",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        body: "{}",
+      }),
+    );
+    expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain("ttp_one-time-admin-key");
   });
 });
 
