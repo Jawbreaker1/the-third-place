@@ -20,11 +20,11 @@ export const EXPERTISE_RANK: Record<ExpertiseLevel, number> = {
 const LEVELS_DESCENDING: ExpertiseLevel[] = ["specialist", "advanced", "competent", "casual", "basic"];
 
 const behaviorByLevel: Record<ExpertiseLevel, string> = {
-  basic: "You know the common vocabulary and broad premise, but not the fine points. Prefer a reaction or honest question to a confident technical claim.",
-  casual: "You follow ordinary conversation and common concepts, but should hedge on edge cases and let stronger residents handle deep corrections.",
-  competent: "You can make practical, specific contributions and spot common mistakes, while acknowledging uncertainty outside your strengths.",
-  advanced: "You can add strong technical nuance and challenge weak claims, but you are not omniscient and should not dominate every exchange.",
-  specialist: "You have unusually deep command of your specialties and may correct subtle misconceptions concisely. Expertise does not make you omniscient or long-winded.",
+  basic: "You know the common vocabulary and broad premise, but not the fine points. Prefer one honest reaction, honest question or clearly limited contribution to a confident technical claim or generic filler.",
+  casual: "You follow ordinary conversation and common concepts, but should hedge on edge cases and let stronger residents handle deep corrections. If assigned a direct question, contribute the specific part you do understand rather than paraphrasing it.",
+  competent: "You can make practical, specific contributions and spot common mistakes, while acknowledging uncertainty outside your strengths. When assigned a feasible domain question, deliver the requested explanation or artifact at its trusted semantic depth instead of compressing it into vague advice.",
+  advanced: "You can add strong technical nuance, trace mechanisms and challenge weak claims, but you are not omniscient and should not dominate every exchange. When assigned a feasible domain question, deliver the requested explanation or artifact at its trusted semantic depth, separating assumptions from evidence-dependent claims.",
+  specialist: "You have unusually deep command of your specialties and may correct subtle misconceptions. Expertise does not make every turn long, but when a trusted request calls for a worked answer, deliver the actual mechanism, example or comparison at the supplied depth rather than a summary or generic warning.",
 };
 
 const stableUnit = (value: string): number => {

@@ -199,7 +199,10 @@ describe("actor channel runtime", () => {
 
     expect(runtime.expertise("ai-aya", "ai-hacking")).toMatchObject({
       level: "specialist",
-      specialties: expect.arrayContaining(["AI-agent threat modelling", "prompt-injection boundaries"]),
+      specialties: expect.arrayContaining([
+        "AI-agent and application threat modelling",
+        "prompt-injection and retrieval boundaries",
+      ]),
     });
     expect(runtime.expertise("ai-nox", "ai-hacking").level).toBe("advanced");
     expect(runtime.expertise("ai-zed", "ai-hacking").level).toBe("advanced");

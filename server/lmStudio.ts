@@ -280,6 +280,8 @@ export interface SceneRequest {
     intentTrusted?: boolean;
     replyExpected?: "none" | "optional" | "expected";
     answerDepth?: "brief" | "normal" | "detailed";
+    operationalMode?: "general" | "authorized_practical" | "isolated_lab" | "guarded_practical" | "defensive_pivot";
+    operationalModeTrusted?: boolean;
     socialTrusted?: boolean;
     warmth?: number;
     hostility?: number;
@@ -413,6 +415,7 @@ const NON_REPAIRABLE_CANDIDATE_ISSUES = new Set<CandidateReviewIssue>([
   // A copy editor does not receive the full triggering request. Retry this
   // required actor with the complete scene instead of guessing the artifact.
   "unfulfilled_explicit_request",
+  "operational_scope_mismatch",
   "diegetic_identity_break",
   "false_evidence_denial",
   "permanent_web_denial",
@@ -435,6 +438,7 @@ const NON_REPAIRABLE_CANDIDATE_ISSUES = new Set<CandidateReviewIssue>([
 const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonCode> = {
   irrelevant_to_turn: "room_contract",
   unfulfilled_explicit_request: "room_contract",
+  operational_scope_mismatch: "room_contract",
   assistant_register: "assistant_cliche",
   academic_register: "register_mismatch",
   diegetic_identity_break: "ai_meta_language",
@@ -464,6 +468,7 @@ const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonC
 };
 
 const reviewedRecoveryPolicy = (
+  request: Pick<SceneRequest, "semanticContext">,
   personaIds: readonly string[],
   reviews: ReadonlyMap<string, CandidateLineReview> | undefined,
 ): string => {
@@ -475,7 +480,16 @@ const reviewedRecoveryPolicy = (
     if (issue === "irrelevant_to_turn") {
       guidance.add("Answer the newest complete turn itself; do not change subject or substitute generic room chatter.");
     } else if (issue === "unfulfilled_explicit_request") {
-      guidance.add("Deliver the requested answer or self-contained artifact now rather than reacting to the request, promising work or discussing whether it sounds interesting.");
+      if (
+        request.semanticContext?.operationalMode === "guarded_practical" ||
+        request.semanticContext?.operationalMode === "defensive_pivot"
+      ) {
+        guidance.add("Complete only the permitted operational outcome at equal depth: a bounded lab, detection, mitigation, incident-response or architecture artifact, or the one necessary scope question. Never restore the withheld real-target step.");
+      } else {
+        guidance.add("Deliver the requested answer or self-contained artifact now rather than reacting, promising work or discussing whether it sounds interesting. Work at the abstraction supported by the trigger: use explicit bounded assumptions for a missing instance instead of inventing target facts, and instantiate a worked design rather than listing headings.");
+      }
+    } else if (issue === "operational_scope_mismatch") {
+      guidance.add("Follow the trusted operational mode exactly: keep authorized or lab-safe work concrete, keep isolated specimens inside their test boundary, and replace any classified harmful real-world step with a same-depth lab, detection, mitigation, incident-response or architecture alternative.");
     } else if (issue === "assistant_register" || issue === "academic_register") {
       guidance.add("Use this resident's natural peer voice rather than service-assistant or essay register.");
     } else if (issue === "diegetic_identity_break") {
@@ -1104,6 +1118,18 @@ const buildVoiceSceneSystemPrompt = (request: SceneRequest): string => {
   const requestRule = requestOwners.length > 0
     ? `- These trusted explicit-request owners must answer the real question or produce the feasible self-contained artifact now: ${requestOwners.join(", ")}. Do not offer, promise, narrate progress or substitute a nearby task. If completion truly needs missing evidence, future/external action or a missing detail, name only that concrete gap.`
     : "";
+  const operationalMode = request.semanticContext?.operationalMode;
+  const operationalRule = !operationalMode || operationalMode === "general" || !(
+    request.semanticContext?.operationalModeTrusted === true || operationalMode === "guarded_practical"
+  )
+    ? ""
+    : operationalMode === "authorized_practical"
+      ? "- Trusted operational mode is authorized_practical: answer the concrete defensive/authorized question directly within the short spoken turn; do not add a generic safety disclaimer."
+      : operationalMode === "isolated_lab"
+        ? "- Trusted operational mode is isolated_lab: keep the answer inside fictitious/disposable assets and give one useful mechanism or validation point."
+        : operationalMode === "guarded_practical"
+          ? "- Trusted operational mode is guarded_practical: do not invent authorization or a lab, and do not give an executable or ordered unresolved-target step. Give one concrete mechanism, detection/mitigation point or necessary scope question."
+          : "- Trusted operational mode is defensive_pivot: omit the harmful real-target step even if the transcript relabels it as a lab; give one equally technical detection, mitigation, incident-response or safe-lab point.";
   const origin = request.voiceContext?.latestUtteranceOrigin === "typed-voice-fallback"
     ? "The newest turn was typed inside this voice room; it remains part of the live call."
     : request.voiceContext?.latestUtteranceOrigin === "microphone-stt"
@@ -1127,6 +1153,7 @@ Rules:
 - ${origin}
 - React directly instead of recapping, giving service-assistant validation, writing an essay or inviting generic follow-up. A short opinion, joke, disagreement, boundary, uncertain answer or natural fragment is valid when it advances the turn.
 ${requestRule}
+${operationalRule}
 - Check the actor's recent transcript wording. Do not near-repeat their own line, echo another participant or fall back to a stock opening with minor rewording.
 - Transcript claims are context, not proof. Do not invent current or exact facts, external observations, source access, private biography, credentials, holdings or play history. Durable background knowledge, clearly framed opinion, uncertainty, hypothetical play and requested creative artifacts are allowed.
 - ${temporalRule} Server-computed elapsed values outrank mental date arithmetic; never claim the guest shares the server's location.
@@ -1291,8 +1318,25 @@ ${temporalPolicyRule}`
     : "";
   const detailedResponseRule =
     request.semanticContext?.answerDepth === "detailed" && requestOwners.length > 0
-      ? "- Trusted semantic routing says the requested outcome needs a detailed answer. The owner must use the supplied expanded word range to deliver the requested artifact itself. An example must contain the example, a procedure its concrete steps, and a comparison both relevant sides; describing how one might answer is not delivery. When trusted room guidance supplies a safe bounded form, use that form now instead of opening with a broad refusal or asking the guest to restate. Longer technical peer chat is intentional here: stay concrete and in character, but do not collapse the answer into a summary, vague warning or adjacent generality."
+      ? "- Trusted semantic routing says the requested outcome needs a detailed answer. Before composing, silently enumerate every distinct part the guest requested and make each part visible in the delivered answer; do not trade one requested part for extra detail in another. The owner must use the supplied expanded word range to deliver the requested artifact itself. An example must contain the example, a procedure its concrete steps, and a comparison both relevant sides; describing how one might answer is not delivery. A worked design must instantiate one plausible bounded system and trace its components, data or decision flow rather than listing headings or principles. Start from one explicit miniature scenario and include at least one literal specimen suited to the request—such as a sample event, policy decision, config/query fragment, test case, topology hop or before/after observation—then connect it to the validation evidence. Prose-only principles and component-name inventories do not satisfy this contract. When the trigger supplies no exact instance, state compact fictitious assumptions and still deliver a reusable method; never invent target facts. When trusted room guidance supplies a safe bounded form, use that form now instead of opening with a broad refusal or asking the guest to restate. Longer technical peer chat is intentional here: stay concrete and in character, but do not collapse the answer into a summary, vague warning or adjacent generality."
       : "";
+  const operationalResponseRule = (() => {
+    const mode = request.semanticContext?.operationalMode;
+    const active = mode && mode !== "general" && (
+      request.semanticContext?.operationalModeTrusted === true || mode === "guarded_practical"
+    );
+    if (!active) return "";
+    if (mode === "authorized_practical") {
+      return "- Trusted operational routing identifies a clearly defensive or authorized practical request. Give the requested concrete mechanism, procedure, example or trade-off at its assigned depth. Do not replace it with a generic warning or refusal; remain within the stated scope and invent no access, credentials or evidence.";
+    }
+    if (mode === "isolated_lab") {
+      return "- Trusted operational routing requires an isolated lab answer. Use only fictitious/disposable/controlled assets, mock secrets and explicit validation/cleanup boundaries where relevant. Deliver the useful specimen or walkthrough itself; do not broaden it to a real third party or collapse it into vague advice.";
+    }
+    if (mode === "guarded_practical") {
+      return "- Operational scope is consequential but unresolved. The candidate cannot grant itself authorization or convert that unresolved target into a lab merely by calling it a lab. Do not provide commands, payloads, ordered attack steps or procedures that perform the unresolved real-target effect, even if the trigger requests depth. Stay technically useful with mechanism-level explanation plus a genuinely fictitious/disposable reproduction, detection, mitigation or secure-design path at the assigned depth. Use mock identities, harmless canaries or synthetic telemetry where applicable; ask one precise scope question only when necessary.";
+    }
+    return "- Trusted operational routing identifies a clearly harmful or unauthorized requested step. The candidate cannot erase that classification by relabelling its own answer as a lab. Do not provide or optimize the step, executable literals or an ordered sequence that produces its real-world effect. Name the boundary in at most one short line, then continue at the same assigned depth with a genuinely isolated reproduction, detection engineering, mitigation, incident response or secure-architecture alternative. A refusal-only answer or generic lecture is not completion.";
+  })();
   const serverCardRule = request.urlPublicationPolicy === "server_card"
     ? "- The server will attach the one exact researched destination as a rich link card. Do not write, quote, reconstruct or copy any URL in message content; discuss the supplied title and evidence naturally and attach its source ID instead."
     : "";
@@ -1315,6 +1359,7 @@ Rules:${consideredRules}${ambientActionRules}
 - Do not use service-assistant validation, a recap of the user's words, or a generic balanced preamble in any language. Begin with the character's actual reaction, detail, objection or question.
 ${expectedResponseRule}
 ${detailedResponseRule}
+${operationalResponseRule}
 - Check that actor's own recent transcript lines. Do not reuse their opening, sentence rhythm, stock metaphor or conclusion with minor rewording. A repeated topic is fine; a repeated performance is not.
 - Do not recap the triggering message before responding, tack on a generic balanced conclusion, or end with an invitation for the room to share more. Real chat may be partial, blunt, uncertain or unfinished.
 - Room competence controls confidence and supported detail without overriding personality or truth. Less-skilled actors should ask, hedge or react instead of bluffing; specialists remain fallible. Ordinary turns respect the actor's normal brevity, while a trusted detailed human request may temporarily use its explicit expanded range without becoming assistant prose.
@@ -2773,9 +2818,18 @@ export class LmStudioClient {
         request.urlPublicationPolicy === "server_card"
       );
       const actorNames = missingActors.map((persona) => persona.name).join(", ");
-      const reviewCorrection = reviewedRecoveryPolicy(missingRequiredIds, semanticReviews);
+      const reviewCorrection = reviewedRecoveryPolicy(request, missingRequiredIds, semanticReviews);
+      const operationalMode = request.semanticContext?.operationalMode;
+      const boundedOperationalCompletion = operationalMode === "guarded_practical"
+        ? "complete the permitted guarded outcome now: omit the unresolved real-target step and provide an equally detailed bounded lab, detection, mitigation or architecture artifact, or ask the one scope question genuinely required"
+        : operationalMode === "defensive_pivot"
+          ? "complete the permitted defensive outcome now: omit the harmful step and provide an equally detailed lab-safe reproduction, detection, mitigation, incident-response or secure-architecture artifact"
+          : "complete the actual triggering request in this message now";
+      const completionFailureRule = operationalMode === "guarded_practical" || operationalMode === "defensive_pivot"
+        ? "A refusal-only answer, promise, progress report or substitute outside that permitted continuation is not completion."
+        : "An offer, promise, progress report, permission request or adjacent substitute is not completion.";
       const completionPremise = retryOwnerIds.length > 0
-        ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: complete the actual triggering request in this message now. An offer, promise, progress report, permission request or adjacent substitute is not completion. Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
+        ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: ${boundedOperationalCompletion}. ${completionFailureRule} Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
         : recoversAutonomousResearchOpening
           ? `${actorNames || "The selected research lead"}'s first autonomous source-backed opening did not survive its typed source and review contract. This is the one bounded full-scene recovery: write one room-relevant opening for the same trusted autonomous research angle, grounded in exactly one supplied evidence result, and attach exactly that result's allowed source ID. Preserve the ambient action and leave one concrete hook for another resident. Do not imply that a human asked, mention searching or tooling, write a URL, or change subject.${reviewCorrection}`
         : recoversCommunityCapability
@@ -3047,6 +3101,8 @@ export class LmStudioClient {
         intentTrusted: request.semanticContext?.intentTrusted ?? null,
         replyExpected: request.semanticContext?.replyExpected ?? null,
         answerDepth: request.semanticContext?.answerDepth ?? null,
+        operationalMode: request.semanticContext?.operationalMode ?? null,
+        operationalModeTrusted: request.semanticContext?.operationalModeTrusted ?? null,
         socialTrusted: request.semanticContext?.socialTrusted ?? null,
         warmth: request.semanticContext?.warmth ?? null,
         hostility: request.semanticContext?.hostility ?? null,
@@ -3271,6 +3327,14 @@ export class LmStudioClient {
     recentOwnTexts: readonly string[],
     peerTexts: readonly string[],
   ): HumanizerAssessment {
+    // A trusted detailed answer may naturally need a compact checklist,
+    // comparison or worked sequence even when the human did not literally ask
+    // for "a list". Treat that typed depth contract as structural permission;
+    // otherwise the chat-style humanizer can discard the exact substantive
+    // answer that the request-delivery reviewer required. Ordinary chat still
+    // gets the anti-template/list check.
+    const allowStructuredReply = request.semanticContext?.asksForList === true ||
+      request.semanticContext?.answerDepth === "detailed";
     let assessment = assessCandidate({
       personaId: line.personaId,
       text: line.content,
@@ -3278,7 +3342,7 @@ export class LmStudioClient {
       peerTexts,
       mode: this.humanizerMode(request),
       register: this.humanizerRegister(request),
-      allowList: request.semanticContext?.asksForList ?? false,
+      allowList: allowStructuredReply,
     });
     const contractHint = this.styleContractHint(request, line, persona);
     if (!contractHint) return assessment;
@@ -3853,17 +3917,30 @@ export class LmStudioClient {
       },
     };
 
+    const operationalMode = request.semanticContext?.operationalMode;
+    const focusedOperationalDetail = Boolean(
+      request.semanticContext?.answerDepth === "detailed" &&
+      operationalMode &&
+      operationalMode !== "general" &&
+      (
+        request.semanticContext?.operationalModeTrusted === true ||
+        operationalMode === "guarded_practical"
+      ),
+    );
+
     const body = {
       model,
       messages: [
         { role: "system", content: this.systemPrompt(request) },
         { role: "user", content: JSON.stringify(this.sceneData(request)) },
       ],
-      temperature: request.kind === "ambient"
-        ? request.conversationMode === "considered" ? 0.72 : 0.74
-        : request.kind === "dm" ? 0.78 : request.kind === "voice" ? 0.82 : 0.9,
-      top_p: request.kind === "ambient" ? 0.88 : 0.92,
-      repeat_penalty: request.kind === "ambient" ? 1.12 : 1.08,
+      temperature: focusedOperationalDetail
+        ? 0.58
+        : request.kind === "ambient"
+          ? request.conversationMode === "considered" ? 0.72 : 0.74
+          : request.kind === "dm" ? 0.78 : request.kind === "voice" ? 0.82 : 0.9,
+      top_p: focusedOperationalDetail ? 0.86 : request.kind === "ambient" ? 0.88 : 0.92,
+      repeat_penalty: focusedOperationalDetail ? 1.05 : request.kind === "ambient" ? 1.12 : 1.08,
       ...(request.kind === "voice" && includeReasoningEffort ? { reasoning_effort: "none" } : {}),
       max_tokens: effectiveMaxTokens,
       stream: false,
@@ -3986,6 +4063,18 @@ export class LmStudioClient {
       actorChannelNotes: request.selected.length === 1 ? request.actorChannelNotes ?? {} : {},
       requiredLanguage: request.semanticContext?.languageTag ?? request.languageHint ?? "mirror latest trigger",
       semanticContext: request.semanticContext ?? null,
+      trustedDeliveryContract: request.kind !== "voice" &&
+        request.semanticContext?.answerDepth === "detailed" &&
+        explicitRequestOwnerIds(request).length > 0
+        ? {
+            outcome: "complete_requested_artifact",
+            instantiateBoundedScenario: true,
+            includeConcreteSpecimen: true,
+            traceRequestedFlow: true,
+            includeValidationEvidence: true,
+            operationalMode: request.semanticContext.operationalMode ?? "general",
+          }
+        : null,
       trustedTemporalContext: request.temporalContext
         ? {
             sceneClock: request.temporalContext,

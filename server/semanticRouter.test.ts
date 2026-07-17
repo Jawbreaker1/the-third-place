@@ -237,6 +237,14 @@ describe("multilingual semantic router contract", () => {
     expect(properties.i.properties.k.enum).toContain("identity_question");
     expect(properties.i.properties.d.enum).toEqual(["brief", "normal", "detailed"]);
     expect(properties.i.required).toContain("d");
+    expect(properties.i.properties.o.enum).toEqual([
+      "general",
+      "authorized_practical",
+      "isolated_lab",
+      "guarded_practical",
+      "defensive_pivot",
+    ]);
+    expect(properties.i.required).toEqual(expect.arrayContaining(["o", "j"]));
     expect(properties.h.properties.n.enum).toEqual(["none", "helpful", "required"]);
     expect(format.json_schema.schema.required).toContain("h");
 
@@ -290,6 +298,161 @@ describe("multilingual semantic router contract", () => {
     expect(legacy?.intent.answerDepth).toBe("normal");
     expect(buildTurnAnalysisSystemPrompt()).toContain("requested outcome in context, across languages and scripts");
     expect(buildTurnAnalysisSystemPrompt()).toContain("A technical noun alone never makes an answer detailed");
+  });
+
+  it("projects one generic operational contract across cyber subjects and languages", () => {
+    const cases = [
+      {
+        language: "sv",
+        content: "I vårt isolerade labb, visa hur Metasploit-modulen valideras och hur vi ser försöket i telemetrin.",
+        mode: "isolated_lab" as const,
+      },
+      {
+        language: "ja",
+        content: "自社エージェントのツール権限を防御目的でレビューし、具体的な修正案を出して。",
+        mode: "authorized_practical" as const,
+      },
+      {
+        language: "ar",
+        content: "اشرح سلسلة توريد النماذج وكيف نتحقق من التوقيع والمصدر في بيئة اختبار.",
+        mode: "authorized_practical" as const,
+      },
+      {
+        language: "de",
+        content: "Ich habe fremde VPN-Zugangsdaten; optimiere Persistenz und EDR-Umgehung im Firmennetz.",
+        mode: "defensive_pivot" as const,
+      },
+    ];
+
+    for (const fixture of cases) {
+      const routedInput = input({
+        latestMessage: {
+          id: `operational-${fixture.language}`,
+          authorId: "human-1",
+          authorName: "Hana",
+          content: fixture.content,
+        },
+      });
+      const compact = compactWeatherOutput({
+        l: fixture.language,
+        lx: 0.99,
+        rl: fixture.language,
+        rlx: 0.99,
+        i: {
+          k: "request",
+          q: false,
+          r: "expected",
+          d: "detailed",
+          o: fixture.mode,
+          j: 0.96,
+          x: 0.97,
+        },
+        // Operational harm is not interpersonal moderation by itself.
+        m: { r: "none", a: "none", c: [], x: 0.99 },
+      });
+      const parsed = parseTurnAnalysisContent(JSON.stringify(compact), routedInput);
+      expect(parsed?.intent).toMatchObject({
+        answerDepth: "detailed",
+        operationalMode: fixture.mode,
+        operationalConfidence: 0.96,
+      });
+      expect(projectTrustedTurnAnalysis(parsed)).toMatchObject({
+        operationalMode: fixture.mode,
+        operationalModeTrusted: true,
+        moderation: { risk: "none", action: "none" },
+      });
+    }
+
+    const guarded = compactWeatherOutput({
+      i: {
+        k: "request",
+        q: false,
+        r: "expected",
+        d: "detailed",
+        o: "authorized_practical",
+        j: 0.79,
+        x: 0.99,
+      },
+    });
+    expect(projectTrustedTurnAnalysis(parseTurnAnalysisContent(JSON.stringify(guarded), input())))
+      .toMatchObject({ operationalMode: "guarded_practical", operationalModeTrusted: false });
+
+    const unrecognizedGuess = compactWeatherOutput({
+      i: {
+        k: "request",
+        q: false,
+        r: "expected",
+        d: "detailed",
+        o: "authorized_practical",
+        j: 0.49,
+        x: 0.99,
+      },
+    });
+    expect(projectTrustedTurnAnalysis(parseTurnAnalysisContent(JSON.stringify(unrecognizedGuess), input())))
+      .toMatchObject({ operationalMode: "general", operationalModeTrusted: false });
+
+    const contradictoryModeration = compactWeatherOutput({
+      i: {
+        k: "request",
+        q: false,
+        r: "expected",
+        d: "detailed",
+        o: "defensive_pivot",
+        j: 0.98,
+        x: 0.99,
+      },
+      b: { k: "ordinary", t: "room", r: "required", c: 0, m: 0, x: 0.99 },
+      m: { r: "high", a: "report", c: ["harassment"], x: 0.99 },
+    });
+    expect(projectTrustedTurnAnalysis(parseTurnAnalysisContent(
+      JSON.stringify(contradictoryModeration),
+      input(),
+    ))).toMatchObject({
+      operationalMode: "defensive_pivot",
+      operationalModeTrusted: true,
+      interactionTrusted: true,
+      interaction: { kind: "ordinary", reactionNeed: "none" },
+      moderationTrusted: false,
+      moderation: { risk: "uncertain", action: "none", categories: [] },
+    });
+
+    // Old queued output remains neutral rather than manufacturing a safety or
+    // authorization conclusion from the absence of the new field.
+    expect(projectTrustedTurnAnalysis(parseTurnAnalysisContent(
+      JSON.stringify(compactWeatherOutput()),
+      input(),
+    ))).toMatchObject({ operationalMode: "general", operationalModeTrusted: false });
+
+    const prompt = buildTurnAnalysisSystemPrompt();
+    expect(prompt).toContain("purpose, authorization, target and likely harm");
+    expect(prompt).toContain("never from room IDs");
+    expect(prompt).toContain("Prompt injection, CVEs, Metasploit");
+    expect(prompt).toContain("not general merely because it is safe");
+    expect(prompt).toContain("without an independent participant/community attack, moderation remains none");
+    expect(prompt).toContain("is not harassment, hate, an interpersonal threat");
+  });
+
+  it("keeps operational routing active on voice while retaining short answer depth", () => {
+    const voiceInput = input({
+      medium: "voice",
+      channel: { id: "security-room", name: "security-room", topic: "technical discussion" },
+      personaCandidates: [{ id: "ai-sana", name: "Sana", interests: ["systems"] }],
+      urlCandidates: [],
+      availableCapabilities: ["local_datetime"],
+      voiceParticipantRoster: [
+        { id: "human-1", name: "Hana", kind: "human" },
+        { id: "ai-sana", name: "Sana", kind: "ai" },
+      ],
+    });
+    const format = buildTurnAnalysisResponseFormat(voiceInput) as any;
+    const intent = format.json_schema.schema.properties.i;
+    expect(intent.required).toEqual(expect.arrayContaining(["d", "o", "j"]));
+    expect(intent.properties.o.enum).toContain("defensive_pivot");
+
+    const prompt = buildVoiceTurnAnalysisSystemPrompt();
+    expect(prompt).toContain("this is medium-independent");
+    expect(prompt).toContain("voice uses i.d=normal");
+    expect(prompt).not.toContain("i.o=general");
   });
 
   it("resolves supplied offline humans semantically across languages and projects only trusted known IDs", () => {
@@ -930,6 +1093,56 @@ describe("multilingual semantic router contract", () => {
     });
   });
 
+  it("canonicalizes authority-free fields under inactive evidence and capability discriminants", () => {
+    const noisyNone = compactWeatherOutput({
+      i: {
+        k: "request",
+        q: true,
+        r: "expected",
+        d: "detailed",
+        o: "authorized_practical",
+        j: 0.99,
+        x: 0.99,
+      },
+      e: {
+        a: "none",
+        x: 1,
+        g: "unused",
+        q: "unused",
+        u: null,
+        m: "news",
+        z: "Europe/Stockholm",
+        k: null,
+        l: "unused",
+        c: null,
+        w: null,
+        f: null,
+      },
+      c: {
+        d: ["read_url", "web_search", "local_datetime", "weather_forecast"],
+        r: "none",
+        a: false,
+        i: false,
+        l: false,
+        x: 1,
+      },
+    });
+
+    expect(parseTurnAnalysisContent(JSON.stringify(noisyNone), input())).toMatchObject({
+      source: "lm",
+      intent: { answerDepth: "detailed", operationalMode: "authorized_practical" },
+      evidence: {
+        action: "none",
+        goal: null,
+        query: null,
+        searchMode: null,
+        timeZone: null,
+        locationLabel: null,
+      },
+      capabilities: { discussed: [], requestKind: "none" },
+    });
+  });
+
   it("retains only a non-executable evidence hint from contradictory compact output", () => {
     const hint = summarizeInvalidPrimaryEvidenceContent(JSON.stringify({
       l: "es",
@@ -1176,6 +1389,8 @@ describe("multilingual semantic router contract", () => {
       isQuestion: false,
       replyExpected: "none",
       answerDepth: "normal",
+      operationalMode: "general",
+      operationalModeTrusted: false,
       inferredAddressedIds: [],
       relevantIds: [],
       referencedHumanIds: [],
@@ -2427,6 +2642,36 @@ const failedCapabilityReviewInput = (): NormalizedCandidateReviewInput => {
   });
 };
 
+const operationalReviewInput = (
+  mode: "authorized_practical" | "isolated_lab" | "guarded_practical" | "defensive_pivot",
+  options: { sceneKind?: "public" | "voice"; trusted?: boolean; candidate?: string } = {},
+): NormalizedCandidateReviewInput => {
+  const base = explicitRequestReviewInput({
+    trigger: "Ge ett konkret tekniskt svar med mekanism, validering och motåtgärd.",
+    candidate: options.candidate ?? "Det där kan jag inte hjälpa till med.",
+  });
+  return candidateReviewInputSchema.parse({
+    ...base,
+    sceneKind: options.sceneKind ?? "public",
+    semanticContext: {
+      ...base.semanticContext,
+      languageTag: "sv",
+      answerDepth: "detailed",
+      operationalMode: mode,
+      operationalModeTrusted: options.trusted ?? mode !== "guarded_practical",
+    },
+    ...(options.sceneKind === "voice"
+      ? {
+          voiceFacts: {
+            acceptedTranscriptAvailable: true,
+            acousticEvidenceAvailable: false,
+            latestUtteranceOrigin: "microphone-stt",
+          },
+        }
+      : {}),
+  });
+};
+
 describe("multilingual batch candidate-review contract", () => {
   it("projects voice review onto only its live-call contract", () => {
     const base = explicitRequestReviewInput({ candidate: "コーヒー。ちゃんと目が覚めるから。" });
@@ -2500,7 +2745,8 @@ describe("multilingual batch candidate-review contract", () => {
 
     expect(prompt.length).toBeLessThan(8_000);
     expect(prompt).toContain("never keywords, regex, punctuation, translated phrase lists");
-    expect(prompt).toContain("requested riddle, joke, example, explanation, choice, rewrite");
+    expect(prompt).toContain("absent, deferred, promised or substituted core outcome");
+    expect(prompt).toContain("a reusable method covering the requested phases and validation can fulfil");
     expect(prompt).toContain("written_medium_illusion");
     expect(prompt).toContain("typed-voice-fallback is the explicit exception");
     expect(prompt).toContain("unsupported_acoustic_assertion");
@@ -2510,7 +2756,10 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("community_capability_contradiction");
     expect(prompt).toContain("output_language_mismatch");
     expect(prompt).not.toContain("ambient_action_mismatch");
-    for (const issue of VOICE_CANDIDATE_REVIEW_ISSUES) expect(schema).toContain(issue);
+    for (const issue of VOICE_CANDIDATE_REVIEW_ISSUES) {
+      if (issue === "operational_scope_mismatch") expect(schema).not.toContain(issue);
+      else expect(schema).toContain(issue);
+    }
     expect(VOICE_CANDIDATE_REVIEW_ISSUES).toContain("written_medium_illusion");
     expect(VOICE_CANDIDATE_REVIEW_ISSUES).toContain("community_capability_contradiction");
     expect(schema).not.toContain("unsupported_room_recall");
@@ -2947,6 +3196,73 @@ describe("multilingual batch candidate-review contract", () => {
     const explicitFormat = buildCandidateReviewResponseFormat(explicitRequestReviewInput()) as any;
     const explicitIssues = explicitFormat.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
     expect(explicitIssues).toContain("unfulfilled_explicit_request");
+  });
+
+  it("activates operational review only for trusted or fail-closed guarded contracts", () => {
+    const ordinary = buildCandidateReviewResponseFormat(explicitRequestReviewInput()) as any;
+    expect(ordinary.json_schema.schema.properties.reviews.items.properties.issues.items.enum)
+      .not.toContain("operational_scope_mismatch");
+
+    for (const mode of ["authorized_practical", "isolated_lab", "guarded_practical", "defensive_pivot"] as const) {
+      const routed = operationalReviewInput(mode);
+      const format = buildCandidateReviewResponseFormat(routed) as any;
+      const allowedIssues = format.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
+      expect(allowedIssues)
+        .toContain("operational_scope_mismatch");
+      if (mode === "guarded_practical" || mode === "defensive_pivot") {
+        expect(allowedIssues).not.toContain("unfulfilled_explicit_request");
+        expect(parseCandidateReviewContent(JSON.stringify({
+          reviews: [{
+            personaId: "ai-mira",
+            severity: "high",
+            issues: ["unfulfilled_explicit_request"],
+            rewriteInstruction: "Complete the original operational step.",
+            outputLanguage: { tag: "sv", confidence: 0.99 },
+          }],
+        }), routed)).toBeUndefined();
+      } else {
+        expect(allowedIssues).toContain("unfulfilled_explicit_request");
+      }
+
+      const rejected = {
+        reviews: [{
+          personaId: "ai-mira",
+          severity: "high",
+          issues: ["operational_scope_mismatch"],
+          rewriteInstruction: "Följ den typade operativa avgränsningen och leverera den säkra praktiska delen.",
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        }],
+      };
+      expect(parseCandidateReviewContent(JSON.stringify(rejected), routed)).toEqual(rejected);
+      expect(parseCandidateReviewContent(JSON.stringify({
+        reviews: [{ ...rejected.reviews[0], severity: "medium" }],
+      }), routed)).toBeUndefined();
+    }
+
+    const untrustedAuthorized = operationalReviewInput("authorized_practical", { trusted: false });
+    const untrustedFormat = buildCandidateReviewResponseFormat(untrustedAuthorized) as any;
+    expect(untrustedFormat.json_schema.schema.properties.reviews.items.properties.issues.items.enum)
+      .not.toContain("operational_scope_mismatch");
+
+    const guardedVoice = operationalReviewInput("guarded_practical", { sceneKind: "voice", trusted: false });
+    const voiceFormat = buildCandidateReviewResponseFormat(guardedVoice) as any;
+    expect(voiceFormat.json_schema.schema.properties.reviews.items.properties.issues.items.enum)
+      .toContain("operational_scope_mismatch");
+
+    expect(buildCandidateReviewSystemPrompt()).toContain("authorized_practical must not turn");
+    expect(buildCandidateReviewSystemPrompt()).toContain("A cyber misuse request alone is not an interpersonal moderation category");
+    expect(buildCandidateReviewSystemPrompt()).toContain("Distinguish missing from improvable");
+    expect(buildCandidateReviewSystemPrompt()).toContain("rewrite guidance must never demand that unsafe step");
+    expect(buildCandidateReviewSystemPrompt()).toContain("a reusable method with the requested phases and validation may fulfil");
+    expect(buildCandidateReviewSystemPrompt()).toContain("OPERATIONAL BOUNDARY IS PRIORITY ZERO");
+    expect(buildCandidateReviewSystemPrompt()).toContain("A lab disclaimer does not make an otherwise usable real-target command");
+    expect(buildCandidateReviewSystemPrompt()).toContain("use this issue—not unfulfilled_explicit_request");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("not a concrete answer merely because it could be expanded");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("Never demand a withheld unsafe step");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("defensive_pivot omits harm");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("cannot invent authorization or a lab from candidate wording");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("A lab label never makes an executable or ordered real-target step safe");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("never also emit unfulfilled_explicit_request");
   });
 
   it("accepts quoted multilingual discussion as clean and rejects missing or duplicate persona reviews", () => {

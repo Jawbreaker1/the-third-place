@@ -23,6 +23,7 @@ import {
   type AutonomousResearchSeed,
   type ConversationRegister,
 } from "./channels.js";
+import { EXPERTISE_RANK } from "./roomExpertise.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import {
   BackgroundWorkPreemptedError,
@@ -372,6 +373,72 @@ export function selectResponders(
 
   if (selected.length === 0 && scored[0] && (strongPeerReaction || rng() < 0.74)) selected.push(scored[0].persona);
   return selected.slice(0, maxResponders);
+}
+
+/**
+ * A trusted detailed request is the one place where room competence should
+ * outweigh ordinary posting propensity. This uses only the catalog's typed
+ * expertise levels and the semantic router's existing person relevance; it
+ * never inspects message text, language, topic words or room IDs. Exact
+ * mentions are handled before this policy and deliberately disable it.
+ */
+function prioritizeDetailedRequestExpert(input: {
+  selected: readonly Persona[];
+  candidates: readonly Persona[];
+  channelId: string;
+  signals: Pick<SocialSignals, "mentionedIds" | "relevantIds" | "reactionNeed" | "moderationAction">;
+  responseExpected: boolean;
+  answerDepth: "brief" | "normal" | "detailed";
+  actorChannels: ActorChannelRuntime;
+  lastSpoke: ReadonlyMap<string, number>;
+  now: number;
+}): { selected: Persona[]; preferredOwner?: Persona } {
+  if (
+    !input.responseExpected ||
+    input.answerDepth !== "detailed" ||
+    input.signals.mentionedIds.length > 0 ||
+    input.signals.reactionNeed === "required" ||
+    MODERATOR_ACTIONS.has(input.signals.moderationAction)
+  ) {
+    return { selected: [...input.selected] };
+  }
+
+  const nonModeratorCandidates = input.candidates.filter((persona) => persona.id !== "ai-runa");
+  const candidatePool = nonModeratorCandidates.length > 0 ? nonModeratorCandidates : [...input.candidates];
+  const sufficientlySkilled = candidatePool.filter(
+    (persona) => EXPERTISE_RANK[input.actorChannels.expertise(persona.id, input.channelId).level] >= EXPERTISE_RANK.competent,
+  );
+  const skillPool = sufficientlySkilled.length > 0 ? sufficientlySkilled : candidatePool;
+  const outsideCooldown = skillPool.filter(
+    (persona) => input.now - (input.lastSpoke.get(persona.id) ?? 0) >= persona.cooldownMs,
+  );
+  const available = outsideCooldown.length > 0 ? outsideCooldown : skillPool;
+  const preferredOwner = [...available].sort((left, right) => {
+    const expertiseDelta =
+      EXPERTISE_RANK[input.actorChannels.expertise(right.id, input.channelId).level] -
+      EXPERTISE_RANK[input.actorChannels.expertise(left.id, input.channelId).level];
+    if (expertiseDelta !== 0) return expertiseDelta;
+    const relevanceDelta = Number(input.signals.relevantIds.includes(right.id)) -
+      Number(input.signals.relevantIds.includes(left.id));
+    if (relevanceDelta !== 0) return relevanceDelta;
+    const attentionDelta = input.actorChannels.affinity(right.id, input.channelId) -
+      input.actorChannels.affinity(left.id, input.channelId);
+    if (attentionDelta !== 0) return attentionDelta;
+    const depthDelta = right.style.complexityAppetite - left.style.complexityAppetite;
+    if (depthDelta !== 0) return depthDelta;
+    const careDelta = right.conscientiousness - left.conscientiousness;
+    return careDelta !== 0 ? careDelta : left.id.localeCompare(right.id);
+  })[0];
+  if (!preferredOwner) return { selected: [...input.selected] };
+
+  const selectedCount = Math.max(1, input.selected.length);
+  return {
+    preferredOwner,
+    selected: [
+      preferredOwner,
+      ...input.selected.filter((persona) => persona.id !== preferredOwner.id),
+    ].slice(0, selectedCount),
+  };
 }
 
 /** Keeps direct structural obligations ahead of a newly discovered memory owner. */
@@ -797,7 +864,7 @@ export function detailedHumanResponseWordLimits(
     if (!owners.has(persona.id)) return [];
     const maximum = Math.max(
       roomMinimum,
-      Math.min(roomMaximum, persona.style.hardMaxWords * 4),
+      Math.min(roomMaximum, persona.style.hardMaxWords * 5),
     );
     const minimum = Math.min(roomMinimum, persona.style.hardMaxWords + 12, maximum);
     return [[persona.id, { minimum, maximum }] as const];
@@ -1755,6 +1822,18 @@ const semanticUrlCandidates = (candidateSet: PageReadCandidateSet): TurnAnalysis
 const semanticFlagsPremise = (analysis: TurnAnalysis): string => {
   const trusted = projectTrustedTurnAnalysis(analysis);
   const activeModeration = trusted.moderationTrusted && MODERATOR_ACTIONS.has(trusted.moderation.action);
+  const operationalPolicyActive = trusted.operationalModeTrusted || trusted.operationalMode === "guarded_practical";
+  const operationalPremise = !operationalPolicyActive
+    ? ""
+    : trusted.operationalMode === "authorized_practical"
+      ? "The semantic route identifies a clearly defensive or authorized practical request. Give the requested concrete mechanism, procedure, example or trade-off at its assigned depth instead of substituting a generic safety warning. Stay inside the stated scope; this classification grants no tools, access or invented real-world authorization."
+      : trusted.operationalMode === "isolated_lab"
+        ? "The requested dual-use detail is scoped to an isolated lab, CTF, fictitious target or disposable test environment. Deliver a useful self-contained lab specimen or walkthrough at the assigned depth, with mock data and explicit validation/cleanup boundaries where relevant; do not replace it with vague advice or extend it to a real third party."
+        : trusted.operationalMode === "guarded_practical"
+          ? "The practical request has an unresolved target, authorization or harmful-use boundary. Keep the answer technically useful: explain the mechanism and provide an isolated reproduction, detection, mitigation or secure-design path at the assigned depth. Withhold only the consequential unresolved step, and ask one precise scope question only if it is genuinely necessary."
+          : trusted.operationalMode === "defensive_pivot"
+            ? "The requested operational step has a clearly unauthorized or harmful purpose. Do not provide or optimize that step. Name that boundary in at most one short line, then continue at the same assigned technical depth with an isolated reproduction, detection engineering, mitigation, incident response or secure-architecture alternative; a blanket refusal or generic lecture is not completion."
+            : "";
   const interactionPremise = !trusted.interactionTrusted
     ? ""
     : trusted.interaction.kind === "ambient_profanity"
@@ -1777,6 +1856,7 @@ const semanticFlagsPremise = (analysis: TurnAnalysis): string => {
     trusted.asksAboutAcoustics
       ? "The human is explicitly asking about acoustic evidence. This text-chat scene has no reliable audio evidence; do not infer any."
       : "",
+    operationalPremise,
     interactionPremise,
   ].filter(Boolean).join(" ");
 };
@@ -1791,6 +1871,8 @@ const semanticSceneContext = (analysis: TurnAnalysis) => {
     intentTrusted: trusted.intentTrusted,
     replyExpected: trusted.replyExpected,
     answerDepth: trusted.answerDepth,
+    operationalMode: trusted.operationalMode,
+    operationalModeTrusted: trusted.operationalModeTrusted,
     socialTrusted: trusted.socialTrusted,
     warmth: trusted.social.warmth,
     hostility: trusted.social.hostility,
@@ -3367,6 +3449,18 @@ export class SocialDirector {
         )[0];
       if (accountable) selected = [accountable];
     }
+    const detailedExpertPlan = prioritizeDetailedRequestExpert({
+      selected,
+      candidates,
+      channelId: trigger.channelId,
+      signals,
+      responseExpected,
+      answerDepth: trustedTurn.answerDepth,
+      actorChannels: this.actorChannels,
+      lastSpoke: this.lastSpoke,
+      now: this.now(),
+    });
+    selected = detailedExpertPlan.selected;
     if (visualEvidence.length > 0 && selected.length === 0) {
       const mostRelevant = [...candidates].sort(
         (a, b) =>
@@ -3507,7 +3601,11 @@ export class SocialDirector {
           ? referencedHumanMemoryOwner
         : signals.mentionedIds.length === 0 && recallResponder
           ? recallResponder
-          : selected[0]
+          : detailedExpertPlan.preferredOwner && selected.some(
+              (persona) => persona.id === detailedExpertPlan.preferredOwner!.id,
+            )
+            ? detailedExpertPlan.preferredOwner
+            : selected[0]
       : undefined;
     const requestOwnerIds = requestOwner ? [requestOwner.id] : [];
     const directDetailedOwnerOnly = Boolean(

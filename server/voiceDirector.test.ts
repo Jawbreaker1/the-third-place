@@ -27,6 +27,9 @@ const routedAnalysis = (
     addressConfidence?: number;
     asksAboutAcoustics?: boolean;
     asksAboutAiIdentity?: boolean;
+    answerDepth?: TurnAnalysis["intent"]["answerDepth"];
+    operationalMode?: TurnAnalysis["intent"]["operationalMode"];
+    operationalConfidence?: number;
   } = {},
 ): TurnAnalysis => {
   const fallback = createFailClosedTurnAnalysis("model_unavailable");
@@ -36,11 +39,15 @@ const routedAnalysis = (
     failureReason: null,
     language: { tag: languageTag, confidence: 0.99 },
     intent: {
+      ...fallback.intent,
       kind: options.asksAboutAiIdentity
         ? "identity_question"
         : "question",
       isQuestion: true,
       replyExpected: "expected",
+      answerDepth: options.answerDepth ?? fallback.intent.answerDepth,
+      operationalMode: options.operationalMode ?? fallback.intent.operationalMode,
+      operationalConfidence: options.operationalConfidence ?? fallback.intent.operationalConfidence,
       confidence: 0.95,
     },
     personas: {
@@ -121,6 +128,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
   let sceneLanguage: string | undefined;
   let scenePremise: string | undefined;
   let sceneRelationshipNote: string | undefined;
+  let sceneSemanticContext: Parameters<ConstructorParameters<typeof VoiceDirector>[0]["lm"]["generateScene"]>[0]["semanticContext"];
   const syntheses: Array<Record<string, unknown>> = [];
   const payloads: Array<Record<string, unknown>> = [];
   const director = new VoiceDirector({
@@ -133,6 +141,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
         return options.analysis;
       },
       generateScene: async (request) => {
+        sceneSemanticContext = request.semanticContext;
         sceneLanguage = request.semanticContext?.languageTag;
         scenePremise = request.premise;
         sceneRelationshipNote = request.relationshipNotes?.["ai-sana"];
@@ -199,6 +208,7 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
     sceneLanguage,
     scenePremise,
     sceneRelationshipNote,
+    sceneSemanticContext,
     syntheses,
   };
 };
@@ -213,6 +223,44 @@ const installCustomPersona = (id: string, name: string): (() => void) => {
 };
 
 describe("VoiceDirector", () => {
+  it("forwards trusted operational depth into the voice scene contract", async () => {
+    const result = await runLanguageTurn({
+      analysis: routedAnalysis("de-DE", {
+        addressedIds: ["ai-sana"],
+        answerDepth: "detailed",
+        operationalMode: "isolated_lab",
+        operationalConfidence: 0.96,
+      }),
+      utterance: "Zeig mir das in einer isolierten Testumgebung.",
+      reply: "Klar, wir halten das komplett in einer isolierten Testumgebung.",
+    });
+
+    expect(result.sceneSemanticContext).toMatchObject({
+      answerDepth: "detailed",
+      operationalMode: "isolated_lab",
+      operationalModeTrusted: true,
+    });
+  });
+
+  it("forwards the generic guarded projection when operational scope is recognized but not trusted", async () => {
+    const result = await runLanguageTurn({
+      analysis: routedAnalysis("ja-JP", {
+        addressedIds: ["ai-sana"],
+        answerDepth: "detailed",
+        operationalMode: "authorized_practical",
+        operationalConfidence: 0.6,
+      }),
+      utterance: "この実践的な手順を詳しく説明して。",
+      reply: "対象範囲を確認しつつ、安全な検証環境で仕組みから進めよう。",
+    });
+
+    expect(result.sceneSemanticContext).toMatchObject({
+      answerDepth: "detailed",
+      operationalMode: "guarded_practical",
+      operationalModeTrusted: false,
+    });
+  });
+
   it("persists only the voice exchange that reached transcript and reuses scoped resident memory", async () => {
     const promptNote = vi.fn(() => "remembered that Alex likes odd film trivia");
     const enqueueDeliveredEpisode = vi.fn(async () => ({

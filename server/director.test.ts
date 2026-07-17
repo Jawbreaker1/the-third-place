@@ -3092,6 +3092,8 @@ describe("social director", () => {
         moderationRisk: "low",
         moderationAction: "watch",
         moderationCategories: ["harassment"],
+        operationalMode: "general",
+        operationalModeTrusted: false,
         asksForList: false,
         asksAboutAiIdentity: false,
         asksAboutAcoustics: false,
@@ -4557,7 +4559,7 @@ describe("social director", () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
 
     expect(detailedHumanResponseWordLimits([aya, mira], [aya.id], "technical")).toEqual({
-      [aya.id]: { minimum: 52, maximum: 150 },
+      [aya.id]: { minimum: 52, maximum: 200 },
     });
     expect(detailedHumanResponseWordLimits([aya, mira], [aya.id], "everyday")).toEqual({
       [aya.id]: { minimum: 38, maximum: 90 },
@@ -4621,6 +4623,8 @@ describe("social director", () => {
               isQuestion: true,
               replyExpected: "expected",
               answerDepth: "detailed",
+              operationalMode: "isolated_lab",
+              operationalConfidence: 0.99,
               confidence: 0.99,
             },
             personas: {
@@ -4669,14 +4673,149 @@ describe("social director", () => {
       expect(requests[0]?.mustReplyIds).toEqual([aya.id]);
       expect(requests[0]?.requestOwnerIds).toEqual([aya.id]);
       expect(requests[0]?.semanticContext?.answerDepth).toBe("detailed");
+      expect(requests[0]?.semanticContext).toMatchObject({
+        operationalMode: "isolated_lab",
+        operationalModeTrusted: true,
+      });
+      expect((requests[0] as { premise?: string })?.premise).toContain("isolated lab");
       expect(requests[0]?.wordLimits).toEqual({
-        [aya.id]: { minimum: 52, maximum: 150 },
+        [aya.id]: { minimum: 52, maximum: 200 },
       });
       expect(store.getRecent("ai-hacking", 10).at(-1)).toMatchObject({
         authorId: aya.id,
         content: fullReply,
         replyToId: incoming.id,
       });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses typed room expertise for an unmentioned detailed request while exact mentions still own their reply", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-17T11:15:00.000Z");
+      const human = {
+        id: "guest-expertise-routing",
+        name: "Jaw_B",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "J" },
+      };
+      const aya = PERSONAS.find((persona) => persona.id === "ai-aya")!;
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const scenarios = [
+        {
+          id: "unmentioned",
+          content: "Kan någon ge en detaljerad hotmodell och ett konkret valideringsupplägg?",
+          addressedIds: [] as string[],
+          requestedReplyIds: [] as string[],
+          // Even a fallible semantic relevance preference for the more
+          // talkative resident must not erase typed room competence here.
+          relevantIds: [mira.id],
+          expectedOwnerId: aya.id,
+        },
+        {
+          id: "direct-mira",
+          content: "@mira kan du ge en detaljerad hotmodell och ett konkret valideringsupplägg?",
+          addressedIds: [mira.id],
+          requestedReplyIds: [mira.id],
+          relevantIds: [aya.id],
+          expectedOwnerId: mira.id,
+        },
+      ];
+
+      for (const scenario of scenarios) {
+        const incoming = createMessage("ai-hacking", human.id, scenario.content);
+        const store = new RoomStore(
+          `/tmp/director-expertise-routing-${scenario.id}-${process.pid}-${Math.random()}.json`,
+        );
+        store.addPublicMessage(incoming);
+        const requests: Array<{
+          selected: Array<(typeof PERSONAS)[number]>;
+          mustReplyIds: string[];
+          requestOwnerIds: string[];
+          actorExpertiseNotes?: Record<string, string>;
+        }> = [];
+        const generateScene = vi.fn(async (request: (typeof requests)[number]) => {
+          requests.push(request);
+          const ownerId = request.requestOwnerIds[0]!;
+          return [{
+            personaId: ownerId,
+            content: "Här är den konkreta analysen med antaganden, mekanism, kontrollpunkt och ett tydligt valideringssteg för den avgränsade miljön.",
+            source: "lm" as const,
+            sourceIds: [],
+          }];
+        });
+        const actorChannels = new ActorChannelRuntime([aya, mira]);
+        const director = new SocialDirector(
+          { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+          store,
+          {
+            health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+            analyzeTurn: vi.fn(async () => classifiedTurn({
+              intent: {
+                kind: "request",
+                isQuestion: true,
+                replyExpected: "expected",
+                answerDepth: "detailed",
+                operationalMode: "authorized_practical",
+                operationalConfidence: 0.99,
+                confidence: 0.99,
+              },
+              personas: {
+                addressedIds: scenario.addressedIds,
+                requestedReplyIds: scenario.requestedReplyIds,
+                relevantIds: scenario.relevantIds,
+                addressConfidence: scenario.addressedIds.length > 0 ? 0.99 : 0,
+                relevanceConfidence: 0.99,
+              },
+            })),
+            generateScene,
+            rememberDeliveredLine: vi.fn(),
+          } as never,
+          actorChannels,
+          {} as never,
+          {
+            getRelation: vi.fn(() => undefined),
+            updateRelation: vi.fn(),
+            promptNote: vi.fn(() => undefined),
+            noteClassifiedMemoryFact: vi.fn(),
+          } as never,
+          () => [human, aya, mira],
+          () => 1,
+          {
+            now: () => now,
+            rng: () => 0.99,
+            consideredConversationChance: 0,
+            pageReader: {
+              collectCandidates: vi.fn(() => ({
+                requestedAt: new Date(now).toISOString(),
+                candidates: [],
+              })),
+            } as never,
+          },
+        );
+
+        const pending = (director as unknown as {
+          handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+        }).handleHumanBurst([incoming], human);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await pending;
+        director.stop();
+
+        expect(generateScene).toHaveBeenCalledTimes(1);
+        expect(requests[0]?.requestOwnerIds).toEqual([scenario.expectedOwnerId]);
+        expect(requests[0]?.mustReplyIds).toContain(scenario.expectedOwnerId);
+        expect(requests[0]?.selected[0]?.id).toBe(scenario.expectedOwnerId);
+        expect(requests[0]?.actorExpertiseNotes?.[scenario.expectedOwnerId]).toContain(
+          scenario.expectedOwnerId === aya.id
+            ? "private competence level here is specialist"
+            : "private competence level here is",
+        );
+        expect(store.getRecent("ai-hacking", 10).at(-1)?.authorId).toBe(scenario.expectedOwnerId);
+      }
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
