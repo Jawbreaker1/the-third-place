@@ -9,6 +9,7 @@ import type {
   DmThread,
   DmUpdatePayload,
   HistoryPage,
+  HumanSessionIdentity,
   ImageAnalysisPayload,
   ImageAttachment,
   ImageMessageResult,
@@ -43,7 +44,7 @@ import {
   type VoiceAiSpeechPayload,
   type VoicePlaybackController,
 } from "./voicePlayback";
-import { clearChannelNotice, firstUnreadDmMessageId, nextDmUnread, noteChannelMessage, type ChannelNotices } from "./unread";
+import { clearChannelNotice, firstUnreadDmMessageId, noteChannelMessage, type ChannelNotices } from "./unread";
 import { reduceTypingPresence, TypingPresenceExpiry } from "./typingPresence";
 import { EmojiPicker } from "./EmojiPicker";
 import { insertEmojiAtSelection } from "./emoji";
@@ -51,7 +52,6 @@ import {
   identityJoinError,
   needsIdentityTakeover,
   returnedRecoveryKey,
-  type IdentityJoinMode,
   type RecoveryKeyResult,
   type SessionResult,
 } from "./returnIdentity";
@@ -60,6 +60,10 @@ const CLIENT_CHANNEL_MESSAGE_LIMIT = 600;
 
 type ConnectionState = "preview" | "connecting" | "live" | "reconnecting" | "offline";
 type Panel = "rooms" | "people" | null;
+type AuthJoinMode = "login" | "register" | "guest" | "legacy";
+type AuthSessionResult =
+  | { ok: true; me: Member; identity?: HumanSessionIdentity; recoveryKey?: string }
+  | { ok: false; error?: string; code?: string; recoveryConfigured?: boolean; online?: boolean };
 type VoiceJoinState = "idle" | "requesting-permission" | "joining" | "connected" | "reconnecting" | "leaving" | "error";
 type VoiceRecordingState = "idle" | "recording" | "uploading" | "error";
 type ActiveVoiceCapture = {
@@ -340,7 +344,11 @@ export default function App() {
   const [typing, setTyping] = useState<Record<string, string[]>>({});
   const [joinName, setJoinName] = useState("");
   const [inviteCode, setInviteCode] = useState("");
-  const [identityJoinMode, setIdentityJoinMode] = useState<IdentityJoinMode>("new");
+  const [authJoinMode, setAuthJoinMode] = useState<AuthJoinMode>("login");
+  const [loginHandle, setLoginHandle] = useState("");
+  const [accountPassword, setAccountPassword] = useState("");
+  const [accountPasswordConfirm, setAccountPasswordConfirm] = useState("");
+  const [sessionIdentity, setSessionIdentity] = useState<HumanSessionIdentity | null>(null);
   const [returnKey, setReturnKey] = useState("");
   const [joinError, setJoinError] = useState("");
   const [joining, setJoining] = useState(false);
@@ -350,6 +358,12 @@ export default function App() {
   const [recoveryKeyCopyHelp, setRecoveryKeyCopyHelp] = useState(false);
   const [returnKeyIssueConfirming, setReturnKeyIssueConfirming] = useState(false);
   const [issuingRecoveryKey, setIssuingRecoveryKey] = useState(false);
+  const [upgradeLoginHandle, setUpgradeLoginHandle] = useState("");
+  const [upgradePassword, setUpgradePassword] = useState("");
+  const [upgradePasswordConfirm, setUpgradePasswordConfirm] = useState("");
+  const [upgradeError, setUpgradeError] = useState("");
+  const [upgradingAccount, setUpgradingAccount] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
   const [showDirector, setShowDirector] = useState(false);
   const [profile, setProfile] = useState<Member | null>(null);
   const [forgettingMemory, setForgettingMemory] = useState(false);
@@ -523,6 +537,29 @@ export default function App() {
     URL.revokeObjectURL(draft.previewUrl);
     imageObjectUrls.current.delete(draft.previewUrl);
   }, []);
+
+  const clearPrivateSessionState = useCallback(() => {
+    dmThreadsRef.current = [];
+    setDmThreads([]);
+    setReplyTo(null);
+    setComposer("");
+    setUnreadDividers({});
+    setLightbox(null);
+    setSearch("");
+    setImageUrlOpen(false);
+    setImageUrlValue("");
+    setImageDrafts((current) => {
+      for (const draft of Object.values(current)) revokeDraftPreview(draft);
+      return {};
+    });
+    viewportByConversation.current.clear();
+    pendingConversationEntry.current = undefined;
+    const fallbackId = channelsRef.current.find((channel) => channel.id === "lobby")?.id
+      ?? channelsRef.current[0]?.id
+      ?? "lobby";
+    activeChannelRef.current = fallbackId;
+    setActiveChannelId(fallbackId);
+  }, [revokeDraftPreview]);
 
   useEffect(() => () => {
     for (const url of imageObjectUrls.current) URL.revokeObjectURL(url);
@@ -726,12 +763,30 @@ export default function App() {
     getVoicePlayback().enqueue(speech);
   }, [getVoicePlayback]);
 
+  const acknowledgeDmRead = useCallback((threadId: string, messageId?: string) => {
+    socketRef.current?.emit("dm:read", {
+      threadId,
+      ...(messageId ? { messageId } : {}),
+    });
+    setDmThreads((current) => {
+      let changed = false;
+      const next = current.map((thread) => {
+        if (thread.id !== threadId || thread.unread === 0) return thread;
+        changed = true;
+        return { ...thread, unread: 0 };
+      });
+      if (changed) dmThreadsRef.current = next;
+      return changed ? next : current;
+    });
+  }, []);
+
   const applySnapshot = useCallback((snapshot: RoomSnapshot) => {
     typingExpiryRef.current?.clear();
     setTyping({});
     shouldStickToBottom.current = true;
     meRef.current = snapshot.me;
     setMe(snapshot.me);
+    setSessionIdentity(snapshot.identity);
     membersRef.current = snapshot.members;
     setMembers(snapshot.members);
     channelsRef.current = snapshot.channels;
@@ -768,7 +823,9 @@ export default function App() {
     socketRef.current = socket;
     presenceActivityCleanupRef.current = attachBrowserHumanPresenceActivity(socket, presenceReporter);
 
-    socket.on("room:snapshot", applySnapshot);
+    socket.on("room:snapshot", (snapshot: RoomSnapshot) => {
+      if (socketRef.current === socket) applySnapshot(snapshot);
+    });
     socket.on("message:new", (message: ChatMessage) => {
       const activeChannelId = activeChannelRef.current;
       const activeChannelIsRead = message.channelId !== activeChannelId || shouldStickToBottom.current;
@@ -942,8 +999,8 @@ export default function App() {
       setChannels(payload.channels);
       membersRef.current = payload.members;
       setMembers(payload.members);
-      // Catalog updates omit offline humans, so only remove a DM when a
-      // previously known AI resident has actually left the catalog.
+      // Registered humans remain in the catalog while offline. Only remove a
+      // DM when a previously known AI resident has actually left the cast.
       const survivingThreads = dmThreadsRef.current.filter((thread) => !removedAiIds.has(thread.peerId));
       dmThreadsRef.current = survivingThreads;
       setDmThreads(survivingThreads);
@@ -979,20 +1036,13 @@ export default function App() {
     socket.on("health:update", (nextHealth: ServerHealth) => setHealth(nextHealth));
     socket.on("dm:update", (payload: DmUpdatePayload) => {
       const activeChannelId = activeChannelRef.current;
-      const activeThreadIsRead = payload.thread.id !== activeChannelId || shouldStickToBottom.current;
+      const activeThreadIsRead = payload.thread.id === activeChannelId
+        && shouldStickToBottom.current
+        && document.visibilityState === "visible";
+      const nextThread = activeThreadIsRead
+        ? { ...payload.thread, unread: 0 }
+        : payload.thread;
       setDmThreads((current) => {
-        const previousUnread = current.find((thread) => thread.id === payload.thread.id)?.unread ?? 0;
-        const nextThread = {
-          ...payload.thread,
-          unread: nextDmUnread(
-            previousUnread,
-            payload.message,
-            payload.thread.id,
-            activeChannelId,
-            meRef.current?.id,
-            activeThreadIsRead,
-          ),
-        };
         const exists = current.some((thread) => thread.id === payload.thread.id);
         const next = exists
           ? current.map((thread) => (thread.id === payload.thread.id ? nextThread : thread))
@@ -1000,6 +1050,9 @@ export default function App() {
         dmThreadsRef.current = next;
         return next;
       });
+      if (activeThreadIsRead) {
+        acknowledgeDmRead(payload.thread.id, payload.message?.id ?? payload.thread.messages.at(-1)?.id);
+      }
       if (
         payload.message &&
         payload.thread.id === activeChannelId &&
@@ -1010,6 +1063,17 @@ export default function App() {
           ? current
           : { ...current, [payload.thread.id]: payload.message!.id });
       }
+    });
+    socket.on("dm:read:update", (payload: { thread: DmThread }) => {
+      if (!payload.thread?.id) return;
+      setDmThreads((current) => {
+        const exists = current.some((thread) => thread.id === payload.thread.id);
+        const next = exists
+          ? current.map((thread) => thread.id === payload.thread.id ? payload.thread : thread)
+          : [...current, payload.thread];
+        dmThreadsRef.current = next;
+        return next;
+      });
     });
     socket.on("dm:removed", (payload: { threadId: string }) => {
       const threadId = payload.threadId;
@@ -1111,11 +1175,52 @@ export default function App() {
       });
     });
     socket.on("toast", pushToast);
+    socket.on("session:upgraded", () => {
+      // The upgrade response installs a new HttpOnly cookie and reconnects the
+      // initiating tab. Every socket admitted under the old guest credential
+      // must stop here instead of inheriting the account session.
+      if (socketRef.current !== socket) {
+        socket.disconnect();
+        return;
+      }
+      clearVoiceMedia();
+      clearPrivateSessionState();
+      joinedVoiceRoomRef.current = null;
+      setJoinedVoiceRoomId(null);
+      setVoiceJoinState("idle");
+      meRef.current = null;
+      setMe(null);
+      setSessionIdentity(null);
+      setProfile(null);
+      setConnection("preview");
+      setAuthJoinMode("login");
+      presenceActivityCleanupRef.current?.();
+      presenceActivityCleanupRef.current = null;
+      socket.disconnect();
+    });
+    socket.on("session:ended", () => {
+      if (socketRef.current !== socket) return;
+      clearVoiceMedia();
+      clearPrivateSessionState();
+      joinedVoiceRoomRef.current = null;
+      setJoinedVoiceRoomId(null);
+      setVoiceJoinState("idle");
+      meRef.current = null;
+      setMe(null);
+      setSessionIdentity(null);
+      setProfile(null);
+      setConnection("preview");
+      setAuthJoinMode("login");
+      presenceActivityCleanupRef.current?.();
+      presenceActivityCleanupRef.current = null;
+      socket.disconnect();
+    });
     socket.on("session:moderated", (payload: { action: "kick" | "ban" | "forget" | "recover"; message?: string }) => {
+      if (socketRef.current !== socket) return;
       if (payload.action === "recover") {
         const currentIdentity = meRef.current;
         if (currentIdentity) setJoinName(currentIdentity.name);
-        setIdentityJoinMode("returning");
+        setAuthJoinMode("legacy");
         setJoinError("");
         setTakeoverRequired(false);
       }
@@ -1137,17 +1242,20 @@ export default function App() {
             : "You can reconnect after a short cooldown."),
       });
       clearVoiceMedia();
+      clearPrivateSessionState();
       joinedVoiceRoomRef.current = null;
       setJoinedVoiceRoomId(null);
       setVoiceJoinState("idle");
       meRef.current = null;
       setMe(null);
+      setSessionIdentity(null);
       setConnection("preview");
       presenceActivityCleanupRef.current?.();
       presenceActivityCleanupRef.current = null;
       socket.disconnect();
     });
     socket.on("disconnect", (reason) => {
+      if (socketRef.current !== socket) return;
       typingExpiryRef.current?.clear();
       setTyping({});
       voiceInvitingBotIdRef.current = null;
@@ -1162,6 +1270,7 @@ export default function App() {
       }
     });
     socket.on("connect", () => {
+      if (socketRef.current !== socket) return;
       setConnection((current) => (current === "live" ? current : "connecting"));
       const roomId = joinedVoiceRoomRef.current;
       const member = meRef.current;
@@ -1180,7 +1289,9 @@ export default function App() {
       });
     });
     socket.on("connect_error", (error) => {
+      if (socketRef.current !== socket) return;
       if (["AUTH_REQUIRED", "BANNED", "KICK_COOLDOWN"].includes(error.message)) {
+        clearPrivateSessionState();
         setMe(null);
         meRef.current = null;
         clearVoiceMedia();
@@ -1204,7 +1315,7 @@ export default function App() {
         setConnection("offline");
       }
     });
-  }, [applySnapshot, clearVoiceMedia, createVoiceMesh, playVoiceAiSpeech, pushToast, queueConversationEntry, revokeDraftPreview, upsertVoiceRoom]);
+  }, [acknowledgeDmRead, applySnapshot, clearPrivateSessionState, clearVoiceMedia, createVoiceMesh, playVoiceAiSpeech, pushToast, queueConversationEntry, revokeDraftPreview, upsertVoiceRoom]);
 
   useEffect(() => {
     let alive = true;
@@ -1221,8 +1332,12 @@ export default function App() {
       })
       .catch(() => setConnection("offline"));
     void fetch("/api/session")
-      .then((response) => {
-        if (response.ok && alive) connectSocket();
+      .then(async (response) => {
+        if (!response.ok || !alive) return;
+        const result = await response.json().catch(() => null) as AuthSessionResult | null;
+        if (!result?.ok || !alive) return;
+        if (result.identity) setSessionIdentity(result.identity);
+        connectSocket();
       })
       .catch(() => undefined);
     return () => {
@@ -1237,7 +1352,12 @@ export default function App() {
   }, [clearVoiceMedia, connectSocket]);
 
   useEffect(() => {
-    if (!profile || !me || profile.id !== me.id) setReturnKeyIssueConfirming(false);
+    if (!profile || !me || profile.id !== me.id) {
+      setReturnKeyIssueConfirming(false);
+      setUpgradePassword("");
+      setUpgradePasswordConfirm("");
+      setUpgradeError("");
+    }
   }, [me, profile]);
 
   useEffect(() => {
@@ -1248,6 +1368,22 @@ export default function App() {
     });
     return () => cancelAnimationFrame(frame);
   }, [recoveryKeyNotice]);
+
+  useEffect(() => {
+    const acknowledgeVisibleThread = () => {
+      if (document.visibilityState !== "visible" || !shouldStickToBottom.current) return;
+      const thread = dmThreadsRef.current.find((candidate) => candidate.id === activeChannelRef.current);
+      if (thread?.unread) acknowledgeDmRead(thread.id, thread.messages.at(-1)?.id);
+    };
+    document.addEventListener("visibilitychange", acknowledgeVisibleThread);
+    return () => document.removeEventListener("visibilitychange", acknowledgeVisibleThread);
+  }, [acknowledgeDmRead]);
+
+  useEffect(() => {
+    if (document.visibilityState !== "visible" || !shouldStickToBottom.current) return;
+    const thread = dmThreads.find((candidate) => candidate.id === activeChannelId);
+    if (thread?.unread) acknowledgeDmRead(thread.id, thread.messages.at(-1)?.id);
+  }, [acknowledgeDmRead, activeChannelId, dmThreads]);
 
   useEffect(() => {
     const onPageHide = () => {
@@ -1559,7 +1695,7 @@ export default function App() {
     const observer = new ResizeObserver(() => {
       // Compact layout, the software keyboard, reply banners and attachments
       // can all change the viewport without adding a message. Preserve the
-      // bottom anchor only when the guest was already following the latest
+      // bottom anchor only when the reader was already following the latest
       // messages; never pull someone down while they are reading history.
       if (!shouldStickToBottom.current) return;
       cancelAnimationFrame(frame);
@@ -1580,28 +1716,53 @@ export default function App() {
     setJoinError("");
     setJoining(true);
     try {
-      const returning = identityJoinMode === "returning";
-      const response = await fetch(returning ? "/api/session/recover" : "/api/session", {
+      const endpoint = authJoinMode === "login"
+        ? "/api/auth/login"
+        : authJoinMode === "register"
+          ? "/api/auth/register"
+          : authJoinMode === "legacy"
+            ? "/api/session/recover"
+            : "/api/session";
+      const body = authJoinMode === "login"
+        ? { loginHandle, password: accountPassword, inviteCode: inviteCode || undefined }
+        : authJoinMode === "register"
+          ? { loginHandle, displayName: joinName, password: accountPassword, inviteCode: inviteCode || undefined }
+          : authJoinMode === "legacy"
+            ? {
+              name: joinName,
+              recoveryKey: returnKey,
+              inviteCode: inviteCode || undefined,
+              takeOver: takeOver || undefined,
+            }
+            : { name: joinName, inviteCode: inviteCode || undefined };
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "same-origin",
-        body: JSON.stringify(returning
-          ? {
-            name: joinName,
-            recoveryKey: returnKey,
-            inviteCode: inviteCode || undefined,
-            takeOver: takeOver || undefined,
-          }
-          : { name: joinName, inviteCode: inviteCode || undefined }),
+        body: JSON.stringify(body),
       });
-      const result = await response.json().catch(() => null) as SessionResult<Member> | null;
+      const result = await response.json().catch(() => null) as AuthSessionResult | null;
       if (!response.ok || !result?.ok) {
-        if (!takeOver && result && needsIdentityTakeover(identityJoinMode, response.status, result)) {
+        if (!takeOver && result && needsIdentityTakeover(
+          authJoinMode === "legacy" ? "returning" : "new",
+          response.status,
+          result as SessionResult<Member>,
+        )) {
           setTakeoverRequired(true);
           return;
         }
         setTakeoverRequired(false);
-        setJoinError(identityJoinError(identityJoinMode, result));
+        setJoinError(
+          authJoinMode === "legacy"
+            ? identityJoinError("returning", result as SessionResult<Member> | null)
+            : authJoinMode === "guest"
+              ? identityJoinError("new", result as SessionResult<Member> | null)
+              : result && !result.ok && result.error
+                ? result.error
+                : authJoinMode === "login"
+                  ? "That username and password did not match."
+                  : "The local account could not be created.",
+        );
         return;
       }
       const issuedKey = returnedRecoveryKey(result);
@@ -1611,6 +1772,12 @@ export default function App() {
         setRecoveryKeyNotice(issuedKey);
       }
       setTakeoverRequired(false);
+      setSessionIdentity(result.identity ?? {
+        kind: authJoinMode === "login" || authJoinMode === "register" ? "registered" : authJoinMode === "legacy" ? "legacy" : "guest",
+        ...(authJoinMode === "login" || authJoinMode === "register" ? { loginHandle } : {}),
+      });
+      setAccountPassword("");
+      setAccountPasswordConfirm("");
       setReturnKey("");
       connectSocket();
     } catch {
@@ -1622,12 +1789,16 @@ export default function App() {
 
   const join = (event: FormEvent) => {
     event.preventDefault();
+    if (authJoinMode === "register" && (
+      !loginHandle.trim() || [...accountPassword].length < 8 || accountPassword !== accountPasswordConfirm
+    )) return;
     void submitIdentityJoin(false);
   };
 
-  const switchIdentityJoinMode = () => {
-    if (identityJoinMode === "returning") setReturnKey("");
-    setIdentityJoinMode(identityJoinMode === "new" ? "returning" : "new");
+  const selectAuthJoinMode = (mode: AuthJoinMode) => {
+    if (authJoinMode === mode) return;
+    if (authJoinMode === "legacy") setReturnKey("");
+    setAuthJoinMode(mode);
     setJoinError("");
     setTakeoverRequired(false);
   };
@@ -1707,6 +1878,73 @@ export default function App() {
       });
     } finally {
       setForgettingMemory(false);
+    }
+  };
+
+  const upgradeCurrentIdentity = async (event: FormEvent) => {
+    event.preventDefault();
+    if (upgradingAccount || sessionIdentity?.kind === "registered") return;
+    if (!upgradeLoginHandle.trim() || [...upgradePassword].length < 8 || upgradePassword !== upgradePasswordConfirm) {
+      setUpgradeError("Choose a username and enter the same password twice (at least 8 characters).");
+      return;
+    }
+    setUpgradeError("");
+    setUpgradingAccount(true);
+    try {
+      const response = await fetch("/api/auth/upgrade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ loginHandle: upgradeLoginHandle, password: upgradePassword }),
+      });
+      const result = await response.json().catch(() => null) as AuthSessionResult | null;
+      if (!response.ok || !result?.ok || result.identity?.kind !== "registered") {
+        throw new Error(result && !result.ok && result.error
+          ? result.error
+          : "The local account could not be created.");
+      }
+      setSessionIdentity(result.identity);
+      meRef.current = result.me;
+      setMe(result.me);
+      setProfile(null);
+      setUpgradePassword("");
+      setUpgradePasswordConfirm("");
+      setUpgradeError("");
+      pushToast({
+        tone: "success",
+        title: "Identity kept",
+        message: "Your relationships, private conversations and history now belong to this local account.",
+      });
+      connectSocket();
+    } catch (error) {
+      setUpgradeError(error instanceof Error ? error.message : "Try again in a moment.");
+    } finally {
+      setUpgradingAccount(false);
+    }
+  };
+
+  const logOut = async () => {
+    if (loggingOut || !sessionIdentity) return;
+    setLoggingOut(true);
+    try {
+      const response = await fetch("/api/session", {
+        method: "DELETE",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      });
+      if (!response.ok && response.status !== 401 && response.status !== 404) {
+        const result = await response.json().catch(() => null) as { error?: string } | null;
+        throw new Error(result?.error ?? "The session could not be closed.");
+      }
+      socketRef.current?.disconnect();
+      window.location.reload();
+    } catch (error) {
+      pushToast({
+        tone: "warning",
+        title: "Could not leave",
+        message: error instanceof Error ? error.message : "Try again in a moment.",
+      });
+      setLoggingOut(false);
     }
   };
 
@@ -2268,7 +2506,7 @@ export default function App() {
         return;
       }
       captureCurrentViewport();
-      const currentThread = dmThreads.find((thread) => thread.id === result.thread!.id);
+      const currentThread = dmThreadsRef.current.find((thread) => thread.id === result.thread!.id);
       queueConversationEntry(result.thread.id, firstUnreadDmMessageId(currentThread));
       setDmThreads((current) => {
         const next = current.some((thread) => thread.id === result.thread!.id)
@@ -2332,15 +2570,16 @@ export default function App() {
 
   const selectChannel = (id: string) => {
     captureCurrentViewport();
+    const selectedDm = dmThreadsRef.current.find((thread) => thread.id === id);
     const firstUnreadMessageId = channelNotices[id]?.firstUnreadMessageId
-      ?? firstUnreadDmMessageId(dmThreads.find((thread) => thread.id === id));
+      ?? firstUnreadDmMessageId(selectedDm);
     queueConversationEntry(id, firstUnreadMessageId);
     setVoiceViewRoomId(null);
     setVoiceCreateOpen(false);
     activeChannelRef.current = id;
     setActiveChannelId(id);
     setChannelNotices((current) => clearChannelNotice(current, id));
-    setDmThreads((current) => current.map((thread) => (thread.id === id ? { ...thread, unread: 0 } : thread)));
+    if (selectedDm) acknowledgeDmRead(id, selectedDm.messages.at(-1)?.id);
     setReplyTo(null);
     setSearch("");
     setImageUrlOpen(false);
@@ -2353,10 +2592,34 @@ export default function App() {
 
   const onlineHumans = members.filter((member) => member.kind === "human" && member.status === "online");
   const idleHumans = members.filter((member) => member.kind === "human" && member.status === "idle");
+  const offlineHumans = members.filter((member) => member.kind === "human" && member.status === "offline");
   const connectedHumans = [...onlineHumans, ...idleHumans];
   const activeResidents = members.filter((member) => member.kind === "ai" && member.status === "online");
   const quietResidents = members.filter((member) => member.kind === "ai" && member.status !== "online");
   const displayMembers = members.length ? members : preview?.members ?? [];
+  const normalizedJoinName = normalizeDisplayName(joinName);
+  const joinNameReady = validDisplayName(normalizedJoinName);
+  const identityJoinReady = authJoinMode === "login"
+    ? Boolean(loginHandle.trim() && accountPassword)
+    : authJoinMode === "register"
+      ? Boolean(joinNameReady && loginHandle.trim() && [...accountPassword].length >= 8 && accountPassword === accountPasswordConfirm)
+      : authJoinMode === "legacy"
+        ? Boolean(joinNameReady && returnKey.trim())
+        : joinNameReady;
+  const joinHeading = authJoinMode === "login"
+    ? "Welcome back."
+    : authJoinMode === "register"
+      ? "Make this place yours."
+      : authJoinMode === "legacy"
+        ? "Return with an old key."
+        : "Drop in as a guest.";
+  const joinCopy = authJoinMode === "login"
+    ? "Sign in to the local account stored by this server."
+    : authJoinMode === "register"
+      ? "Keep your identity, relationships and private conversations between visits."
+      : authJoinMode === "legacy"
+        ? "Use the display name and private return key from an earlier version of The Third Place."
+        : "No account needed. This identity and its private data are erased when you explicitly log out.";
 
   return (
     <div className="app-shell">
@@ -2449,8 +2712,8 @@ export default function App() {
           </div>
         )}
         {me ? (
-          <button className="sidebar-foot sidebar-foot-button" type="button" onClick={() => setProfile(me)} aria-label="Open your profile and return-key settings">
-            <Avatar member={me} size="sm" /><div><strong dir="auto">{me.name}</strong><span>Guest · {me.status === "offline" ? "reconnecting" : me.status}</span></div><span className="signal-bars" aria-hidden="true"><i /><i /><i /></span>
+          <button className="sidebar-foot sidebar-foot-button" type="button" onClick={() => setProfile(me)} aria-label="Open your profile and identity settings">
+            <Avatar member={me} size="sm" /><div><strong dir="auto">{me.name}</strong><span>{sessionIdentity?.kind === "registered" ? "Member" : sessionIdentity?.kind === "legacy" ? "Saved identity" : "Guest"} · {me.status === "offline" ? "reconnecting" : me.status}</span></div><span className="signal-bars" aria-hidden="true"><i /><i /><i /></span>
           </button>
         ) : (
           <div className="sidebar-foot"><span className="preview-eye"><Icon name="users" size={16} /></span><div><strong>Live preview</strong><span>Join to take part</span></div></div>
@@ -2472,7 +2735,7 @@ export default function App() {
                 <header className="voice-stage-header">
                   <button type="button" className="icon-button mobile-only" onClick={() => setMobilePanel("rooms")} aria-label="Open rooms"><Icon name="menu" /></button>
                   <span className="voice-stage-icon"><Icon name="speaker" size={19} /></span>
-                  <div><strong dir="auto">{channels.find((channel) => channel.id === voiceRoomInView.channelId)?.name ?? "Voice room"}</strong><span>{voiceRoomInView.participants.length} connected · started by <span dir="auto">{memberMap.get(voiceRoomInView.createdByMemberId)?.name ?? "a guest"}</span></span></div>
+                  <div><strong dir="auto">{channels.find((channel) => channel.id === voiceRoomInView.channelId)?.name ?? "Voice room"}</strong><span>{voiceRoomInView.participants.length} connected · started by <span dir="auto">{memberMap.get(voiceRoomInView.createdByMemberId)?.name ?? "a person"}</span></span></div>
                   <button type="button" className="voice-back-chat" onClick={() => setVoiceViewRoomId(null)}><Icon name="message" size={15} /> Back to chat</button>
                 </header>
 
@@ -2663,9 +2926,10 @@ export default function App() {
             shouldStickToBottom.current = atBottom;
             if (atBottom) {
               setChannelNotices((current) => clearChannelNotice(current, activeChannelId));
-              setDmThreads((current) => current.map((thread) =>
-                thread.id === activeChannelId && thread.unread > 0 ? { ...thread, unread: 0 } : thread,
-              ));
+              const thread = dmThreadsRef.current.find((candidate) => candidate.id === activeChannelId);
+              if (thread?.unread && document.visibilityState === "visible") {
+                acknowledgeDmRead(thread.id, thread.messages.at(-1)?.id);
+              }
               setUnreadDividers((current) => current[activeChannelId]
                 ? { ...current, [activeChannelId]: undefined }
                 : current);
@@ -2687,7 +2951,7 @@ export default function App() {
             <div className="intro-icon">{activePeer ? <Avatar member={activePeer} size="xl" showStatus={false} /> : <Icon name="hash" size={28} />}</div>
             <h1 dir="auto">{activePeer ? activePeer.name : `Welcome to #${activeTitle}`}</h1>
             <p dir="auto">{activeDescription}</p>
-            {activePeer?.kind === "ai" && <div className="transparency-note"><AiBadge label="AI RESIDENT" /><span>This character is generated by a local language model and remembers this private thread only while the server is running.</span></div>}
+            {activePeer?.kind === "ai" && <div className="transparency-note"><AiBadge label="AI RESIDENT" /><span>This character is generated by a local language model. Private history is stored locally by this server.</span></div>}
           </div>}
           {activeMessages.length === 0 && <div className="empty-conversation"><Icon name="message" size={22} /><strong>Quiet, for once.</strong><span>Say something and see who notices.</span></div>}
           {activeMessages.map((message, index) => {
@@ -2985,14 +3249,14 @@ export default function App() {
       )}
 
       <aside className={`member-panel ${mobilePanel === "people" ? "mobile-open" : ""}`}>
-        <div className="member-panel-head"><div><strong>{voiceRoomInView ? "In voice" : "In the room"}</strong><span>{voiceRoomInView ? `${voiceRoomInView.participants.length} connected` : `${connectedHumans.length} guests · ${activeResidents.length} active residents`}</span></div><button className="icon-button mobile-only" onClick={() => setMobilePanel(null)}><Icon name="close" /></button></div>
+        <div className="member-panel-head"><div><strong>{voiceRoomInView ? "In voice" : "In the room"}</strong><span>{voiceRoomInView ? `${voiceRoomInView.participants.length} connected` : `${connectedHumans.length} people here · ${offlineHumans.length} offline members · ${activeResidents.length} active residents`}</span></div><button className="icon-button mobile-only" onClick={() => setMobilePanel(null)}><Icon name="close" /></button></div>
         {!voiceRoomInView && <div className="room-pulse-card" onClick={() => setShowDirector(true)} role="button" tabIndex={0}>
           <div className="pulse-orb"><i /><i /><i /></div>
           <div><strong>Room pulse</strong><span>{typingMembers.length ? `${typingMembers.length} composing now` : directorEvents.at(-1)?.summary ?? "Quietly paying attention"}</span></div>
           <Icon name="chevron" size={15} />
         </div>}
         <div className="member-scroll">
-          {voiceRoomInView ? <><MemberGroup title="Connected" members={voicePanelMembers} onSelect={setProfile} /><MemberGroup title="Available AI residents" members={availableVoiceBots.slice(0, 10)} onSelect={setProfile} /></> : <><MemberGroup title="Online guests" members={onlineHumans} onSelect={setProfile} /><MemberGroup title="Idle guests" members={idleHumans} onSelect={setProfile} /><MemberGroup title="Active residents" members={activeResidents} onSelect={setProfile} /><MemberGroup title="Around · quieter" members={quietResidents} onSelect={setProfile} /></>}
+          {voiceRoomInView ? <><MemberGroup title="Connected" members={voicePanelMembers} onSelect={setProfile} /><MemberGroup title="Available AI residents" members={availableVoiceBots.slice(0, 10)} onSelect={setProfile} /></> : <><MemberGroup title="Online people" members={onlineHumans} onSelect={setProfile} /><MemberGroup title="Idle" members={idleHumans} onSelect={setProfile} /><MemberGroup title="Offline members" members={offlineHumans} onSelect={setProfile} /><MemberGroup title="Active residents" members={activeResidents} onSelect={setProfile} /><MemberGroup title="Around · quieter" members={quietResidents} onSelect={setProfile} /></>}
         </div>
         <div className="model-card">
           <div className="model-icon"><Icon name="spark" size={15} /></div>
@@ -3004,13 +3268,21 @@ export default function App() {
       {!me && (
         <div className="join-overlay">
           <form className="join-card" onSubmit={join}>
-            <div className="join-live"><i /> LIVE ROOM <span>{(preview?.health.onlineHumans ?? 0) + (preview?.health.idleHumans ?? 0)} real guests connected</span></div>
+            <div className="join-live"><i /> LIVE ROOM <span>{(preview?.health.onlineHumans ?? 0) + (preview?.health.idleHumans ?? 0)} real people connected</span></div>
             <div className="join-logo"><BrandMark large /></div>
             <p className="join-kicker">THE THIRD PLACE</p>
-            <h2>{identityJoinMode === "returning" ? "Welcome back." : "Join the conversation."}</h2>
-            <p className="join-copy">{identityJoinMode === "returning" ? "Use the name and private return key from your earlier visit." : "A living online room populated by distinct AI characters — and real people like you."}</p>
-            <label><span>Display name</span><input autoFocus dir="auto" value={joinName} onChange={(event) => { setJoinName(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder={identityJoinMode === "returning" ? "The exact name you used before" : "What should everyone call you?"} maxLength={24} /></label>
-            {identityJoinMode === "returning" && <label><span>Return key</span><input value={returnKey} onChange={(event) => { setReturnKey(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Paste your private return key" type="password" autoComplete="off" spellCheck={false} /></label>}
+            <h2>{joinHeading}</h2>
+            <p className="join-copy">{joinCopy}</p>
+            <div className="join-auth-tabs" role="group" aria-label="Account options">
+              <button type="button" aria-pressed={authJoinMode === "login"} className={authJoinMode === "login" ? "active" : ""} onClick={() => selectAuthJoinMode("login")} disabled={joining}>Log in</button>
+              <button type="button" aria-pressed={authJoinMode === "register"} className={authJoinMode === "register" ? "active" : ""} onClick={() => selectAuthJoinMode("register")} disabled={joining}>Create account</button>
+            </div>
+            {(authJoinMode === "register" || authJoinMode === "guest" || authJoinMode === "legacy") && <label><span>Display name</span><input autoFocus dir="auto" value={joinName} onChange={(event) => { setJoinName(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder={authJoinMode === "legacy" ? "The exact name you used before" : "What should everyone call you?"} maxLength={24} autoComplete="nickname" /></label>}
+            {(authJoinMode === "login" || authJoinMode === "register") && <label><span>Username</span><input autoFocus={authJoinMode === "login"} value={loginHandle} onChange={(event) => { setLoginHandle(event.target.value); setJoinError(""); }} placeholder="Your local username" maxLength={64} autoCapitalize="none" autoComplete="username" spellCheck={false} /></label>}
+            {(authJoinMode === "login" || authJoinMode === "register") && <label><span>Password</span><input value={accountPassword} onChange={(event) => { setAccountPassword(event.target.value); setJoinError(""); }} placeholder={authJoinMode === "register" ? "At least 8 characters" : "Your password"} type="password" autoComplete={authJoinMode === "register" ? "new-password" : "current-password"} maxLength={1024} /></label>}
+            {authJoinMode === "register" && <label><span>Confirm password</span><input value={accountPasswordConfirm} onChange={(event) => { setAccountPasswordConfirm(event.target.value); setJoinError(""); }} placeholder="Type it once more" type="password" autoComplete="new-password" maxLength={1024} /></label>}
+            {authJoinMode === "register" && accountPasswordConfirm && accountPassword !== accountPasswordConfirm && <span className="join-field-hint error" role="alert">The passwords do not match.</span>}
+            {authJoinMode === "legacy" && <label><span>Old return key</span><input value={returnKey} onChange={(event) => { setReturnKey(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Paste your private return key" type="password" autoComplete="off" spellCheck={false} /></label>}
             {preview?.inviteRequired && <label><span>Invite code</span><input value={inviteCode} onChange={(event) => { setInviteCode(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Enter the code" type="password" /></label>}
             {joinError && <div className="join-error" role="alert">{joinError}</div>}
             {takeoverRequired ? (
@@ -3019,10 +3291,14 @@ export default function App() {
                 <div className="join-takeover-actions"><button type="button" onClick={() => setTakeoverRequired(false)} disabled={joining}>Not now</button><button type="button" onClick={() => void submitIdentityJoin(true)} disabled={joining}>{joining ? <><span className="button-spinner" />Moving…</> : "Take over identity"}</button></div>
               </div>
             ) : (
-              <button className="join-button" type="submit" disabled={joining || !validDisplayName(normalizeDisplayName(joinName)) || (identityJoinMode === "returning" && !returnKey.trim())}>{joining ? <><span className="spinner" />Opening the door…</> : <>{identityJoinMode === "returning" ? "Return to the room" : "Enter the room"} <Icon name="chevron" size={17} /></>}</button>
+              <button className="join-button" type="submit" disabled={joining || !identityJoinReady}>{joining ? <><span className="spinner" />Opening the door…</> : <>{authJoinMode === "login" ? "Log in" : authJoinMode === "register" ? "Create local account" : authJoinMode === "legacy" ? "Return to the room" : "Enter as guest"} <Icon name="chevron" size={17} /></>}</button>
             )}
-            <button className="join-mode-toggle" type="button" onClick={switchIdentityJoinMode} disabled={joining}>{identityJoinMode === "returning" ? "I’m new here" : "I have a return key"}<Icon name="chevron" size={14} /></button>
-            <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Humans and AI are always labelled.</strong> This server keeps a small local memory of return visits, rooms you use most, and non-sensitive preferences, activities or technical tools you explicitly share. No account or email is required, and you can erase it from your profile. AI runs locally; optional research, link previews and explicit linked-page reads use the web.</span></div>
+            <div className="join-secondary-actions">
+              <button type="button" className={authJoinMode === "guest" ? "active" : ""} onClick={() => selectAuthJoinMode(authJoinMode === "guest" ? "login" : "guest")} disabled={joining}>{authJoinMode === "guest" ? "Use a local account" : "Continue as guest"}</button>
+              <span aria-hidden="true">·</span>
+              <button type="button" className={authJoinMode === "legacy" ? "active" : ""} onClick={() => selectAuthJoinMode(authJoinMode === "legacy" ? "login" : "legacy")} disabled={joining}>{authJoinMode === "legacy" ? "Use a local account" : "I have an old return key"}</button>
+            </div>
+            <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Accounts stay on this computer.</strong> Passwords, sessions, memories and private chats are stored by this server; no email or external identity service is used. Guests are temporary and erased on explicit logout. AI runs locally; optional research and link reads may use the web.</span></div>
             <p className="preview-hint"><i /><span>You're seeing the real room live behind this card.</span></p>
           </form>
         </div>
@@ -3074,7 +3350,62 @@ export default function App() {
             <div className="profile-cover" style={{ "--profile": profile.avatar.color, "--accent": profile.avatar.accent } as React.CSSProperties} />
             <button className="profile-close" onClick={() => setProfile(null)}><Icon name="close" /></button>
             <Avatar member={profile} size="xl" />
-            <div className="profile-body"><div className="profile-name"><h2 dir="auto">{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div><p className="profile-role" dir="auto">{profile.role}</p><p className="profile-bio" dir="auto">{profile.bio}</p><div className="profile-facts"><span><small>STATUS</small><b dir="auto"><i className={`presence-${profile.status}`} />{profile.status}</b></span>{profile.activity && <span><small>CURRENTLY</small><b dir="auto">{profile.activity}</b></span>}<span><small>MEMORY</small><b>{me && profile.id === me.id ? "Small local memory" : profile.kind === "ai" ? "Recent room context" : "Human guest"}</b></span></div>{me && profile.id === me.id && <div className="profile-return-key"><div><Icon name="lock" size={16} /><span><strong>Return on another device</strong><small>A new key replaces any key you saved earlier.</small></span></div>{returnKeyIssueConfirming ? <div className="profile-return-key-confirm"><span>Generate a fresh private key now?</span><div><button type="button" onClick={() => setReturnKeyIssueConfirming(false)} disabled={issuingRecoveryKey}>Cancel</button><button type="button" onClick={() => void issueRecoveryKey()} disabled={issuingRecoveryKey}>{issuingRecoveryKey ? <><span className="button-spinner" />Creating…</> : "Create new key"}</button></div></div> : <button type="button" onClick={() => setReturnKeyIssueConfirming(true)}>Create or rotate return key</button>}</div>}{me && profile.id === me.id && <button type="button" className="profile-forget" onClick={() => void forgetAiMemory()} disabled={forgettingMemory} aria-busy={forgettingMemory}>{forgettingMemory ? <><span className="button-spinner" aria-hidden="true" />Forgetting…</> : "Forget what AI remembers"}</button>}{me && profile.id !== me.id && profile.status !== "offline" && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message <span dir="auto">{profile.name}</span></button>}</div>
+            <div className="profile-body">
+              <div className="profile-name"><h2 dir="auto">{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div>
+              <p className="profile-role" dir="auto">{profile.role}</p>
+              <p className="profile-bio" dir="auto">{profile.bio}</p>
+              <div className="profile-facts">
+                <span><small>STATUS</small><b dir="auto"><i className={`presence-${profile.status}`} />{profile.status}</b></span>
+                {profile.activity && <span><small>CURRENTLY</small><b dir="auto">{profile.activity}</b></span>}
+                <span><small>MEMORY</small><b>{me && profile.id === me.id
+                  ? sessionIdentity?.kind === "registered"
+                    ? "Persistent local account"
+                    : sessionIdentity?.kind === "legacy"
+                      ? "Legacy saved identity"
+                      : "Temporary guest identity"
+                  : profile.kind === "ai"
+                    ? "Recent room context"
+                    : profile.status === "offline"
+                      ? "Local member"
+                      : "Human visitor"}</b></span>
+              </div>
+              {me && profile.id === me.id && sessionIdentity?.kind === "registered" && (
+                <div className="profile-account-status">
+                  <Icon name="lock" size={16} />
+                  <span><strong>Local account</strong><small>@{sessionIdentity.loginHandle} · Your identity and private chats remain after logout.</small></span>
+                </div>
+              )}
+              {me && profile.id === me.id && sessionIdentity && sessionIdentity.kind !== "registered" && (
+                <form className="profile-upgrade" onSubmit={upgradeCurrentIdentity}>
+                  <div><Icon name="lock" size={16} /><span><strong>Keep this identity</strong><small>Create a local account without losing relationships, memories or DMs.</small></span></div>
+                  <label><span>Username</span><input value={upgradeLoginHandle} onChange={(event) => { setUpgradeLoginHandle(event.target.value); setUpgradeError(""); }} autoCapitalize="none" autoComplete="username" maxLength={64} spellCheck={false} /></label>
+                  <label><span>Password</span><input value={upgradePassword} onChange={(event) => { setUpgradePassword(event.target.value); setUpgradeError(""); }} type="password" autoComplete="new-password" maxLength={1024} placeholder="At least 8 characters" /></label>
+                  <label><span>Confirm password</span><input value={upgradePasswordConfirm} onChange={(event) => { setUpgradePasswordConfirm(event.target.value); setUpgradeError(""); }} type="password" autoComplete="new-password" maxLength={1024} placeholder="Type it once more" /></label>
+                  {upgradePasswordConfirm && upgradePassword !== upgradePasswordConfirm && <span className="profile-upgrade-error" role="alert">The passwords do not match.</span>}
+                  {upgradeError && <span className="profile-upgrade-error" role="alert">{upgradeError}</span>}
+                  <button type="submit" disabled={upgradingAccount || !upgradeLoginHandle.trim() || [...upgradePassword].length < 8 || upgradePassword !== upgradePasswordConfirm}>{upgradingAccount ? <><span className="button-spinner" />Creating…</> : "Create account and keep everything"}</button>
+                </form>
+              )}
+              {me && profile.id === me.id && sessionIdentity?.kind === "legacy" && (
+                <div className="profile-return-key">
+                  <div><Icon name="lock" size={16} /><span><strong>Legacy return key</strong><small>A new key replaces any key you saved earlier.</small></span></div>
+                  {returnKeyIssueConfirming ? <div className="profile-return-key-confirm"><span>Generate a fresh private key now?</span><div><button type="button" onClick={() => setReturnKeyIssueConfirming(false)} disabled={issuingRecoveryKey}>Cancel</button><button type="button" onClick={() => void issueRecoveryKey()} disabled={issuingRecoveryKey}>{issuingRecoveryKey ? <><span className="button-spinner" />Creating…</> : "Create new key"}</button></div></div> : <button type="button" onClick={() => setReturnKeyIssueConfirming(true)}>Create or rotate return key</button>}
+                </div>
+              )}
+              {me && profile.id === me.id && <button type="button" className="profile-forget" onClick={() => void forgetAiMemory()} disabled={forgettingMemory} aria-busy={forgettingMemory}>{forgettingMemory ? <><span className="button-spinner" aria-hidden="true" />Forgetting…</> : "Forget what AI remembers"}</button>}
+              {me && profile.id === me.id && sessionIdentity && (
+                <button type="button" className={`profile-logout ${sessionIdentity.kind === "registered" ? "" : "destructive"}`} onClick={() => void logOut()} disabled={loggingOut} aria-busy={loggingOut}>
+                  {loggingOut
+                    ? <><span className="button-spinner" />Leaving…</>
+                    : sessionIdentity.kind === "registered"
+                      ? "Log out — keep account and DMs"
+                      : sessionIdentity.kind === "guest"
+                        ? "Leave and erase this guest identity"
+                        : "Leave and erase this legacy identity"}
+                </button>
+              )}
+              {me && profile.id !== me.id && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message <span dir="auto">{profile.name}</span></button>}
+            </div>
           </article>
         </div>
       )}

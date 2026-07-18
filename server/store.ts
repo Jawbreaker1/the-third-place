@@ -15,6 +15,7 @@ import type {
 } from "../shared/types.js";
 import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
+import { preservePreMigrationState } from "./persistenceMigrationBackup.js";
 
 export interface PendingPublicTurnTarget {
   personaId: string;
@@ -56,7 +57,7 @@ export interface UncommittedPublicMessageAppend {
 export type PublicMessageRollbackResult = "rolled_back" | "already_durable" | "missing";
 
 interface PersistedState {
-  version: 1 | 2 | 3 | 4;
+  version: 1 | 2 | 3 | 4 | 5;
   messages: ChatMessage[];
   /** Private conversations stay server-only and are never included in room snapshots. */
   privateThreads?: PrivateThread[];
@@ -89,6 +90,12 @@ interface PrivateThread {
   id: string;
   participantIds: [string, string];
   messages: ChatMessage[];
+  readReceipts: DmReadReceipt[];
+}
+
+interface DmReadReceipt {
+  participantId: string;
+  readThrough?: HistoryPosition;
 }
 
 interface UncommittedPublicMessageState {
@@ -296,6 +303,7 @@ const PERSISTED_STATE_V4_KEYS = new Set([
   ...PERSISTED_STATE_V3_KEYS,
   "pendingPublicTurns",
 ]);
+const PERSISTED_STATE_V5_KEYS = PERSISTED_STATE_V4_KEYS;
 
 const isReaction = (value: unknown): value is Reaction => {
   if (!isRecord(value) || !hasOnlyKeys(value, REACTION_KEYS)) return false;
@@ -469,7 +477,11 @@ const isPersistedMessage = (value: unknown): value is ChatMessage => {
   return true;
 };
 
-const restorePrivateThread = (value: unknown, hardLimit: number): PrivateThread | undefined => {
+const restorePrivateThread = (
+  value: unknown,
+  hardLimit: number,
+  requireReadReceipts: boolean,
+): PrivateThread | undefined => {
   if (!isRecord(value)) return undefined;
   const record = value as Partial<PrivateThread>;
   if (!Array.isArray(record.participantIds) || record.participantIds.length !== 2) return undefined;
@@ -488,10 +500,46 @@ const restorePrivateThread = (value: unknown, hardLimit: number): PrivateThread 
   // Never silently repair a partially corrupt private thread: dropping even
   // one invalid row would make startup's DM actor inventory incomplete.
   if (messages.length !== record.messages.length) return undefined;
+  const rawReceipts = record.readReceipts;
+  if (requireReadReceipts && !Array.isArray(rawReceipts)) return undefined;
+  let readReceipts: DmReadReceipt[];
+  if (Array.isArray(rawReceipts)) {
+    if (rawReceipts.length !== participantIds.length) return undefined;
+    readReceipts = rawReceipts.flatMap((candidate) => {
+      if (!isRecord(candidate) || !hasOnlyKeys(candidate, new Set(["participantId", "readThrough"])) ||
+          !participants.has(candidate.participantId as string)) return [];
+      const readThrough = candidate.readThrough;
+      if (readThrough !== undefined && (
+        !isRecord(readThrough) || !hasOnlyKeys(readThrough, new Set(["createdAt", "id"])) ||
+        !isCanonicalIsoTimestamp(readThrough.createdAt) || !isBoundedIdentifier(readThrough.id)
+      )) return [];
+      return [{
+        participantId: candidate.participantId as string,
+        ...(readThrough === undefined ? {} : {
+          readThrough: { createdAt: readThrough.createdAt as string, id: readThrough.id as string },
+        }),
+      }];
+    });
+    if (readReceipts.length !== participantIds.length ||
+        new Set(readReceipts.map((receipt) => receipt.participantId)).size !== participantIds.length) return undefined;
+    const latest = messages.slice().sort(compareMessages).at(-1);
+    if (readReceipts.some((receipt) => receipt.readThrough && (
+      !latest || compareMessages(receipt.readThrough, latest) > 0
+    ))) return undefined;
+  } else {
+    // Existing private history predates durable unread state. Treat it as
+    // already read so migration never floods people with historical badges.
+    const latest = messages.slice().sort(compareMessages).at(-1);
+    readReceipts = participantIds.map((participantId) => ({
+      participantId,
+      ...(latest ? { readThrough: { createdAt: latest.createdAt, id: latest.id } } : {}),
+    }));
+  }
   return {
     id: canonicalId,
     participantIds: participantIds as [string, string],
     messages: messages.slice(-hardLimit),
+    readReceipts,
   };
 };
 
@@ -500,10 +548,12 @@ const parsePersistedState = (value: unknown): PersistedState => {
     throw new TypeError("Room state root must be an object.");
   }
   const state = value as Partial<PersistedState>;
-  if (state.version !== 1 && state.version !== 2 && state.version !== 3 && state.version !== 4) {
+  if (state.version !== 1 && state.version !== 2 && state.version !== 3 && state.version !== 4 && state.version !== 5) {
     throw new TypeError("Room state version is unsupported.");
   }
-  const allowedKeys = state.version === 4
+  const allowedKeys = state.version === 5
+    ? PERSISTED_STATE_V5_KEYS
+    : state.version === 4
     ? PERSISTED_STATE_V4_KEYS
     : state.version === 3
       ? PERSISTED_STATE_V3_KEYS
@@ -528,7 +578,7 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state private history exceeds its retention envelope.");
   }
-  if ((state.version === 2 || state.version === 3 || state.version === 4) && !Array.isArray(state.privateThreads)) {
+  if ((state.version === 2 || state.version === 3 || state.version === 4 || state.version === 5) && !Array.isArray(state.privateThreads)) {
     throw new TypeError(`Version ${state.version} room state is missing its private-thread collection.`);
   }
   if (state.autonomousPublications !== undefined && (
@@ -538,10 +588,10 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state contains invalid autonomous-publication accounting.");
   }
-  if (state.version === 4 && !Array.isArray(state.autonomousPublications)) {
-    throw new TypeError("Version 4 room state is missing autonomous-publication accounting.");
+  if ((state.version === 4 || state.version === 5) && !Array.isArray(state.autonomousPublications)) {
+    throw new TypeError(`Version ${state.version} room state is missing autonomous-publication accounting.`);
   }
-  if ((state.version === 3 || state.version === 4) && !Array.isArray(state.trustedChannelLanguages)) {
+  if ((state.version === 3 || state.version === 4 || state.version === 5) && !Array.isArray(state.trustedChannelLanguages)) {
     throw new TypeError(`Version ${state.version} room state is missing its trusted channel-language collection.`);
   }
   if (state.trustedChannelLanguages !== undefined && (
@@ -556,8 +606,8 @@ const parsePersistedState = (value: unknown): PersistedState => {
         state.trustedChannelLanguages.length) {
     throw new TypeError("Room state contains duplicate trusted channel-language observations.");
   }
-  if (state.version === 4 && !Array.isArray(state.pendingPublicTurns)) {
-    throw new TypeError("Version 4 room state is missing its pending public-turn collection.");
+  if ((state.version === 4 || state.version === 5) && !Array.isArray(state.pendingPublicTurns)) {
+    throw new TypeError(`Version ${state.version} room state is missing its pending public-turn collection.`);
   }
   if (state.pendingPublicTurns !== undefined && (
     !Array.isArray(state.pendingPublicTurns) ||
@@ -927,6 +977,7 @@ export class RoomStore {
     try {
       const raw = await readFile(this.filePath, "utf8");
       const parsed = parsePersistedState(JSON.parse(raw) as unknown);
+      const migrationSource = parsed.version === 5 ? undefined : { raw, version: parsed.version };
       const builtInScene = seedMessages();
       this.messages = parsed.messages;
       this.autonomousPublications = Array.isArray(parsed.autonomousPublications)
@@ -944,7 +995,7 @@ export class RoomStore {
       }
       this.privateThreads.clear();
       for (const candidate of parsed.privateThreads ?? []) {
-        const restored = restorePrivateThread(candidate, this.dmHistoryHardLimit);
+        const restored = restorePrivateThread(candidate, this.dmHistoryHardLimit, parsed.version === 5);
         if (!restored || this.privateThreads.has(restored.id)) {
           throw new TypeError("Room state contains an invalid or duplicate private thread.");
         }
@@ -964,7 +1015,12 @@ export class RoomStore {
       await chmod(this.filePath, 0o600).catch((error) => {
         console.warn("Could not restrict room-state file permissions.", error);
       });
-      if (missingChannelSeeds.length > 0 || pendingPublicTurnsChanged || parsed.version !== 4) await this.flush();
+      if (missingChannelSeeds.length > 0 || pendingPublicTurnsChanged || parsed.version !== 5) {
+        if (migrationSource) {
+          await preservePreMigrationState(this.filePath, migrationSource.raw, migrationSource.version, 5);
+        }
+        await this.flush();
+      }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") {
@@ -1691,22 +1747,49 @@ export class RoomStore {
     const id = `dm:${participantIds.join(":")}`;
     let thread = this.privateThreads.get(id);
     if (!thread) {
-      thread = { id, participantIds, messages: [] };
+      thread = {
+        id,
+        participantIds,
+        messages: [],
+        readReceipts: participantIds.map((participantId) => ({ participantId })),
+      };
       this.privateThreads.set(id, thread);
       this.schedulePersist();
     }
-    return { id, peerId, messages: [...thread.messages], unread: 0 };
+    this.markDmRead(id, viewerId);
+    return this.dmThreadView(thread, viewerId);
   }
 
   getDmThreads(viewerId: string): DmThread[] {
     return [...this.privateThreads.values()]
       .filter((thread) => thread.participantIds.includes(viewerId))
-      .map((thread) => ({
-        id: thread.id,
-        peerId: thread.participantIds.find((id) => id !== viewerId) ?? viewerId,
-        messages: [...thread.messages],
-        unread: 0,
-      }));
+      .map((thread) => this.dmThreadView(thread, viewerId));
+  }
+
+  /** Returns current unread state without marking the conversation as read. */
+  getDmThread(viewerId: string, peerId: string): DmThread | undefined {
+    const id = `dm:${[viewerId, peerId].sort().join(":")}`;
+    const thread = this.privateThreads.get(id);
+    return thread?.participantIds.includes(viewerId) ? this.dmThreadView(thread, viewerId) : undefined;
+  }
+
+  markDmRead(threadId: string, viewerId: string, messageId?: string): DmThread | undefined {
+    const thread = this.privateThreads.get(threadId);
+    if (!thread?.participantIds.includes(viewerId)) return undefined;
+    const message = messageId
+      ? thread.messages.find((candidate) => candidate.id === messageId)
+      : thread.messages.slice().sort(compareMessages).at(-1);
+    if (!message && messageId) return undefined;
+    const receipt = thread.readReceipts.find((candidate) => candidate.participantId === viewerId);
+    if (!receipt) return undefined;
+    if (message) {
+      const next = { createdAt: message.createdAt, id: message.id };
+      if (!receipt.readThrough || compareMessages(next, receipt.readThrough) > 0) {
+        receipt.readThrough = next;
+        this.schedulePersist();
+      }
+    }
+    return this.dmThreadView(thread, viewerId);
   }
 
   addDmMessage(
@@ -1742,6 +1825,19 @@ export class RoomStore {
 
   getDmParticipants(threadId: string): [string, string] | undefined {
     return this.privateThreads.get(threadId)?.participantIds;
+  }
+
+  private dmThreadView(thread: PrivateThread, viewerId: string): DmThread {
+    const readThrough = thread.readReceipts.find((receipt) => receipt.participantId === viewerId)?.readThrough;
+    const unread = thread.messages.filter((message) =>
+      message.authorId !== viewerId && (!readThrough || compareMessages(message, readThrough) > 0)
+    ).length;
+    return {
+      id: thread.id,
+      peerId: thread.participantIds.find((id) => id !== viewerId) ?? viewerId,
+      messages: [...thread.messages],
+      unread,
+    };
   }
 
   /**
@@ -1859,7 +1955,7 @@ export class RoomStore {
         )
       );
       const payload: PersistedState = {
-        version: 4,
+        version: 5,
         messages: this.messages,
         privateThreads: [...this.privateThreads.values()],
         autonomousPublications: this.autonomousPublications,

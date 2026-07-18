@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -17,6 +17,7 @@ import type {
   ImageMessageResult,
   LinkPreviewPayload,
   Member,
+  HumanSessionIdentity,
   PresenceActivityPayload,
   PublicPreview,
   RoomSnapshot,
@@ -35,6 +36,7 @@ import { displayNameGlyph, normalizeDisplayName, validDisplayName } from "../sha
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { HUMAN_IDLE_AFTER_MS } from "../shared/presence.js";
 import { AdminAuthManager } from "./adminAuth.js";
+import { AccountStore, type AuthenticatedAccountSession } from "./accountStore.js";
 import { AdminModerationGuard } from "./adminModeration.js";
 import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
@@ -100,6 +102,8 @@ import { SocialMemoryLifecycleManager } from "./socialMemoryLifecycle.js";
 import { VoiceIngestGate, VoiceIngestGateError, type VoiceIngestRelease } from "./voiceIngestGate.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
 import { VoiceSpeechError, VoiceSpeechService } from "./voiceSpeech.js";
+import { parseCookieHeader } from "./cookies.js";
+import { buildAdminHumanCatalog } from "./adminHumanCatalog.js";
 
 dotenv.config();
 
@@ -149,6 +153,10 @@ const readVoiceIceServers = (): VoiceIceServer[] => {
 
 interface HumanSession {
   tokenHash: string;
+  identityKind: HumanSessionIdentity["kind"];
+  accountId?: string;
+  accountSessionId?: string;
+  expiresAt?: number;
   member: Member;
   socketIds: Set<string>;
   presence: HumanPresenceRuntime;
@@ -159,6 +167,13 @@ interface HumanSession {
   historyBucket: TokenBucket;
   imageBucket: TokenBucket;
   voiceBucket: TokenBucket;
+}
+
+interface HumanSessionCredential {
+  kind: HumanSessionIdentity["kind"];
+  accountId?: string;
+  accountSessionId?: string;
+  expiresAt?: number;
 }
 
 class TokenBucket {
@@ -187,8 +202,13 @@ const createHumanSession = (
   member: Member,
   lastSeenAt = Date.now(),
   createdAt = lastSeenAt,
+  identity: HumanSessionCredential = { kind: "legacy" },
 ): HumanSession => ({
   tokenHash,
+  identityKind: identity.kind,
+  ...(identity.accountId ? { accountId: identity.accountId } : {}),
+  ...(identity.accountSessionId ? { accountSessionId: identity.accountSessionId } : {}),
+  ...(identity.expiresAt ? { expiresAt: identity.expiresAt } : {}),
   member: { ...member, avatar: { ...member.avatar }, status: "offline" },
   socketIds: new Set(),
   presence: new HumanPresenceRuntime(HUMAN_IDLE_AFTER_MS),
@@ -204,6 +224,24 @@ const joinSchema = z.object({
   name: z.string().min(1).max(128),
   inviteCode: z.string().max(100).optional(),
 });
+const accountRegisterSchema = z.object({
+  loginHandle: z.string().min(1).max(128),
+  displayName: z.string().min(1).max(128),
+  password: z.string().min(1).max(1_024),
+  inviteCode: z.string().max(100).optional(),
+}).strict();
+const accountLoginSchema = z.object({
+  loginHandle: z.string().min(1).max(128),
+  password: z.string().min(1).max(1_024),
+  inviteCode: z.string().max(100).optional(),
+}).strict();
+const accountUpgradeSchema = z.object({
+  loginHandle: z.string().min(1).max(128),
+  password: z.string().min(1).max(1_024),
+}).strict();
+const accountDeleteSchema = z.object({
+  password: z.string().min(1).max(1_024),
+}).strict();
 const recoverSessionSchema = z.object({
   name: z.string().min(1).max(128),
   recoveryKey: z.string().min(1).max(96),
@@ -382,17 +420,6 @@ const parseVoiceTurnForm = async (request: Request): Promise<VoiceTurnForm> =>
     request.pipe(parser);
   });
 
-const parseCookies = (header?: string): Record<string, string> =>
-  Object.fromEntries(
-    (header ?? "")
-      .split(";")
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .map((part) => {
-        const separator = part.indexOf("=");
-        return [decodeURIComponent(part.slice(0, separator)), decodeURIComponent(part.slice(separator + 1))];
-      }),
-  );
 const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 const safeNameKey = participantIdentityKey;
 const randomAvatar = (): Member["avatar"] => {
@@ -458,6 +485,7 @@ const io = new Server(httpServer, {
 
 const store = new RoomStore();
 const humanMemory = new HumanMemoryStore();
+const accountStore = new AccountStore();
 const socialMemoryStore = new SocialMemoryStore({
   filePath: resolve(process.env.SOCIAL_MEMORY_PATH ?? "./data/social-memory.sqlite"),
 });
@@ -538,11 +566,23 @@ const voiceRooms = new VoiceRoomRuntime(
   },
 );
 const sessions = new Map<string, HumanSession>();
+const protectedHumanActorIds = (...extraActorIds: string[]): Set<string> => new Set([
+  ...accountStore.listAccounts().map((account) => account.actorId),
+  ...extraActorIds,
+  ...[...sessions.values()]
+    .filter((session) => session.socketIds.size > 0 || session.revoked)
+    .map((session) => session.member.id),
+]);
 const identityMutations = new HumanIdentityMutationCoordinator();
 const actorPublicationGate = new ActorPublicationGate();
 const isActiveHumanSession = (session: HumanSession): boolean =>
   sessions.get(session.tokenHash) === session &&
   !session.revoked &&
+  (session.expiresAt === undefined || session.expiresAt > Date.now()) &&
+  (session.identityKind !== "registered" || Boolean(
+    session.accountId && session.accountSessionId &&
+    accountStore.isSessionActive(session.accountId, session.accountSessionId)
+  )) &&
   !adminState.isBanned(session.member.id, session.member.name) &&
   !adminModeration.isKicked(session.member.id, session.member.name);
 let actorForgetReconciliationTail: Promise<unknown> = Promise.resolve();
@@ -558,6 +598,8 @@ const reconcilePendingHumanActorForgets = (): Promise<number> => {
       humanMemory.listPendingActorForgets(),
       {
         forgetActor: async (actorId) => {
+          const account = accountStore.getAccountByActorId(actorId);
+          if (account) await accountStore.deleteAccount(account.id);
           await socialMemory.forgetActor(actorId);
           const removed = store.forgetDmParticipant(actorId);
           removedPrivateThreads.push(...removed.map((thread) => ({
@@ -589,6 +631,10 @@ const reconcilePendingHumanActorForgets = (): Promise<number> => {
 const synchronizeOfflineSessionsWithMemory = async (): Promise<void> => {
   const rememberedTokenHashes = new Set(humanMemory.listRestorableProfiles().map((profile) => profile.tokenHash));
   for (const [tokenHash, session] of sessions) {
+    if (session.identityKind === "registered") {
+      if (!accountStore.getAccountByActorId(session.member.id)) sessions.delete(tokenHash);
+      continue;
+    }
     if (session.socketIds.size > 0 || rememberedTokenHashes.has(tokenHash)) continue;
     sessions.delete(tokenHash);
     humanMemory.queuePendingActorForget(session.member.id);
@@ -596,6 +642,20 @@ const synchronizeOfflineSessionsWithMemory = async (): Promise<void> => {
   await reconcilePendingHumanActorForgets();
 };
 const joinAttempts = new Map<string, number[]>();
+const joinAttemptHashKey = randomBytes(32);
+const JOIN_ATTEMPT_SOURCE_CAPACITY = 512;
+const MAX_ACTIVE_ACCOUNT_CRYPTO = 2;
+let activeAccountCrypto = 0;
+type AccountCryptoAttempt<T> = { accepted: true; value: T } | { accepted: false };
+const runAccountCrypto = async <T>(operation: () => Promise<T>): Promise<AccountCryptoAttempt<T>> => {
+  if (activeAccountCrypto >= MAX_ACTIVE_ACCOUNT_CRYPTO) return { accepted: false };
+  activeAccountCrypto += 1;
+  try {
+    return { accepted: true, value: await operation() };
+  } finally {
+    activeAccountCrypto -= 1;
+  }
+};
 const recoveryAttempts = new Map<string, number[]>();
 const recoveryIpAttempts = new Map<string, number[]>();
 const selfRecoveryKeyRotations = new Map<string, number[]>();
@@ -672,12 +732,37 @@ const historyPageFor = (channelId: string, before?: HistoryPosition, limit = 40)
   };
 };
 
-const getMembers = (): Member[] => [
-  ...PERSONAS.map((persona) => ({ ...memberView(persona), activity: actorChannels.activityLabel(persona) })),
-  ...[...sessions.values()]
-    .filter((session) => session.member.status !== "offline")
-    .map((session) => ({ ...session.member })),
-];
+const humanPresenceRank = (status: Member["status"]): number =>
+  status === "online" ? 3 : status === "idle" ? 2 : status === "dnd" ? 1 : 0;
+const getMembers = (): Member[] => {
+  const humans = new Map<string, Member>();
+  // A registered account is durable community membership, not a connection.
+  // Keep it visible while offline without admitting legacy/guest profiles to
+  // the member directory merely because they have old local memory.
+  for (const account of accountStore.listAccounts()) {
+    if (account.profileState !== "ready" || adminState.isBanned(account.actorId, account.displayName)) continue;
+    const profile = humanMemory.findByHumanId(account.actorId);
+    if (!profile) continue;
+    humans.set(account.actorId, {
+      ...profile.member,
+      name: account.displayName,
+      status: "offline",
+      avatar: { ...profile.member.avatar },
+    });
+  }
+  for (const session of sessions.values()) {
+    if (!isActiveHumanSession(session) ||
+        (session.identityKind !== "registered" && session.member.status === "offline")) continue;
+    const current = humans.get(session.member.id);
+    if (!current || humanPresenceRank(session.member.status) > humanPresenceRank(current.status)) {
+      humans.set(session.member.id, { ...session.member, avatar: { ...session.member.avatar } });
+    }
+  }
+  return [
+    ...PERSONAS.map((persona) => ({ ...memberView(persona), activity: actorChannels.activityLabel(persona) })),
+    ...humans.values(),
+  ];
+};
 const replyPreviewFor = (message: ChatMessage) => ({
   authorId: message.authorId,
   authorName:
@@ -688,14 +773,31 @@ const replyPreviewFor = (message: ChatMessage) => ({
 });
 const publicTurnTargetIds = (content: string, replyTarget?: ChatMessage): string[] =>
   addressedPersonaIds(analyzeSocialSignals(content).mentionedIds, replyTarget);
-const onlineHumanCount = () => [...sessions.values()].filter((session) => session.member.status === "online").length;
-const idleHumanCount = () => [...sessions.values()].filter((session) => session.member.status === "idle").length;
-const connectedHumanCount = () => [...sessions.values()].filter((session) => session.socketIds.size > 0).length;
+const countHumanActorsWith = (predicate: (session: HumanSession) => boolean): number =>
+  new Set([...sessions.values()].filter(predicate).map((session) => session.member.id)).size;
+const onlineHumanCount = () => countHumanActorsWith((session) => isActiveHumanSession(session) && session.member.status === "online");
+const idleHumanCount = () => countHumanActorsWith((session) => isActiveHumanSession(session) && session.member.status === "idle");
+const connectedHumanCount = () => countHumanActorsWith((session) => isActiveHumanSession(session) && session.socketIds.size > 0);
 const refreshHumanPresence = (session: HumanSession, now = Date.now()): boolean => {
-  const next = session.presence.status(now);
-  if (session.member.status === next) return false;
-  session.member.status = next;
-  return true;
+  const actorSessions = [...sessions.values()].filter((candidate) =>
+    candidate.member.id === session.member.id && isActiveHumanSession(candidate)
+  );
+  const aggregate = actorSessions.reduce<Member["status"]>(
+    (best, candidate) => {
+      const raw = candidate.presence.status(now);
+      return humanPresenceRank(raw) > humanPresenceRank(best)
+        ? raw
+        : best;
+    },
+    "offline",
+  );
+  let changed = false;
+  for (const candidate of actorSessions) {
+    if (candidate.member.status === aggregate) continue;
+    candidate.member.status = aggregate;
+    changed = true;
+  }
+  return changed;
 };
 const publishHumanPresenceIfChanged = (session: HumanSession, now = Date.now()): void => {
   if (refreshHumanPresence(session, now)) {
@@ -856,27 +958,84 @@ const analyzeImageMessage = (
   });
 };
 
+const hydrateRegisteredSession = (
+  token: string,
+  authenticated: AuthenticatedAccountSession,
+): HumanSession | undefined => {
+  const tokenHash = hashToken(token);
+  const existing = sessions.get(tokenHash);
+  if (existing) return existing;
+  const profile = humanMemory.findByHumanId(authenticated.account.actorId);
+  if (!profile) return undefined;
+  const member: Member = {
+    ...profile.member,
+    name: authenticated.account.displayName,
+    status: "offline",
+    avatar: { ...profile.member.avatar },
+  };
+  const session = createHumanSession(
+    tokenHash,
+    member,
+    Date.now(),
+    Date.parse(authenticated.session.createdAt),
+    {
+      kind: "registered",
+      accountId: authenticated.account.id,
+      accountSessionId: authenticated.session.id,
+      expiresAt: Date.parse(authenticated.session.expiresAt),
+    },
+  );
+  sessions.set(tokenHash, session);
+  return session;
+};
+
+const disconnectEvictedAccountSessions = (accountId: string): boolean => {
+  let disconnected = false;
+  for (const runtime of [...sessions.values()]) {
+    if (runtime.identityKind !== "registered" || runtime.accountId !== accountId ||
+        !runtime.accountSessionId || accountStore.isSessionActive(accountId, runtime.accountSessionId)) continue;
+    runtime.revoked = true;
+    for (const socketId of [...runtime.socketIds]) {
+      const socket = io.sockets.sockets.get(socketId);
+      socket?.emit("session:ended", { reason: "device-limit" });
+      socket?.disconnect(true);
+    }
+    runtime.socketIds.clear();
+    runtime.presence.clear();
+    sessions.delete(runtime.tokenHash);
+    disconnected = true;
+  }
+  return disconnected;
+};
+
+const sessionForToken = (token: string | undefined): HumanSession | undefined => {
+  if (!token) return undefined;
+  const tokenHash = hashToken(token);
+  const runtime = sessions.get(tokenHash);
+  if (runtime) return runtime;
+  const authenticated = accountStore.authenticateSession(token);
+  return authenticated ? hydrateRegisteredSession(token, authenticated) : undefined;
+};
+
 const sessionFromRequest = (request: Request): HumanSession | undefined => {
-  const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
-  const session = token ? sessions.get(hashToken(token)) : undefined;
+  const token = parseCookieHeader(request.headers.cookie)[SESSION_COOKIE];
+  const session = sessionForToken(token);
   return session && isActiveHumanSession(session) ? session : undefined;
 };
 
 const authenticatedSessionFromRequest = (
   request: Request,
 ): { session: HumanSession; token: string } | undefined => {
-  const token = parseCookies(request.headers.cookie)[SESSION_COOKIE];
+  const token = parseCookieHeader(request.headers.cookie)[SESSION_COOKIE];
   if (!token) return undefined;
-  const session = sessions.get(hashToken(token));
+  const session = sessionForToken(token);
   if (!session || !isActiveHumanSession(session)) return undefined;
   return { session, token };
 };
 
 const clientIp = (request: Request): string => {
-  if (process.env.TRUST_PROXY === "true") {
-    const cloudflareIp = request.headers["cf-connecting-ip"];
-    if (typeof cloudflareIp === "string") return cloudflareIp;
-  }
+  // Express derives this from the configured trusted-proxy hop. Never accept
+  // vendor-specific forwarding headers directly from an untrusted caller.
   return request.ip || request.socket.remoteAddress || "unknown";
 };
 
@@ -894,10 +1053,26 @@ const hasAllowedOrigin = (request: Request): boolean => {
 
 const allowJoinAttempt = (ip: string): boolean => {
   const now = Date.now();
-  const recent = (joinAttempts.get(ip) ?? []).filter((timestamp) => now - timestamp < 10 * 60_000);
+  const sourceKey = createHmac("sha256", joinAttemptHashKey)
+    .update((ip || "unknown").slice(0, 512), "utf8")
+    .digest("hex");
+  const existing = joinAttempts.get(sourceKey);
+  if (!existing && joinAttempts.size >= JOIN_ATTEMPT_SOURCE_CAPACITY) {
+    let oldestKey: string | undefined;
+    let oldestTimestamp = Number.POSITIVE_INFINITY;
+    for (const [key, timestamps] of joinAttempts) {
+      const lastSeenAt = timestamps.at(-1) ?? 0;
+      if (lastSeenAt < oldestTimestamp) {
+        oldestKey = key;
+        oldestTimestamp = lastSeenAt;
+      }
+    }
+    if (oldestKey) joinAttempts.delete(oldestKey);
+  }
+  const recent = (existing ?? []).filter((timestamp) => now - timestamp < 10 * 60_000);
   if (recent.length >= 8) return false;
   recent.push(now);
-  joinAttempts.set(ip, recent);
+  joinAttempts.set(sourceKey, recent);
   return true;
 };
 
@@ -946,8 +1121,13 @@ const allowSelfRecoveryKeyRotation = (actorId: string): boolean => {
 
 const snapshotFor = (session: HumanSession): RoomSnapshot => {
   const pages = CHANNELS.map((channel) => historyPageFor(channel.id));
+  const account = session.accountId ? accountStore.getAccount(session.accountId) : undefined;
   return {
     me: { ...session.member },
+    identity: {
+      kind: session.identityKind,
+      ...(account ? { loginHandle: account.loginHandle } : {}),
+    },
     members: getMembers(),
     channels: CHANNELS,
     messages: pages
@@ -971,12 +1151,29 @@ const attachLinkPreview = (message: ChatMessage, requesterId: string): void => {
   });
 };
 
-const setSessionCookie = (request: Request, response: Response, token: string): void => {
+const setSessionCookie = (
+  request: Request,
+  response: Response,
+  token: string,
+  maxAgeSeconds = SESSION_COOKIE_MAX_AGE_SECONDS,
+): void => {
   const secure = request.secure || publicOrigin?.startsWith("https://");
   response.setHeader(
     "Set-Cookie",
-    `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_COOKIE_MAX_AGE_SECONDS}${secure ? "; Secure" : ""}`,
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}${secure ? "; Secure" : ""}`,
   );
+};
+
+const refreshSessionCookie = (
+  request: Request,
+  response: Response,
+  token: string,
+  session: HumanSession,
+): void => {
+  const remainingSeconds = session.expiresAt === undefined
+    ? SESSION_COOKIE_MAX_AGE_SECONDS
+    : Math.max(0, Math.floor((session.expiresAt - Date.now()) / 1_000));
+  setSessionCookie(request, response, token, remainingSeconds);
 };
 
 const clearSessionCookie = (request: Request, response: Response): void => {
@@ -987,15 +1184,12 @@ const clearSessionCookie = (request: Request, response: Response): void => {
   );
 };
 
-const adminHumans = (): AdminHumanMember[] => [...sessions.values()]
-  .map((session) => ({
-    id: session.member.id,
-    name: session.member.name,
-    status: session.member.status,
-    recoveryConfigured: humanMemory.hasRecoveryKey(session.member.id),
-    joinedAt: new Date(session.createdAt).toISOString(),
-  }))
-  .sort((a, b) => a.name.localeCompare(b.name));
+const adminHumans = (): AdminHumanMember[] => buildAdminHumanCatalog({
+  profiles: humanMemory.listProfiles(),
+  visibleMembers: getMembers(),
+  accounts: accountStore.listAccounts(),
+  hasRecoveryKey: (actorId) => humanMemory.hasRecoveryKey(actorId),
+});
 
 const socialMemoryAdmin = new SocialMemoryAdmin({
   store: socialMemoryStore,
@@ -1008,7 +1202,7 @@ const socialMemoryAdmin = new SocialMemoryAdmin({
     for (const persona of PERSONAS) {
       actors.set(persona.id, { id: persona.id, name: persona.name, kind: "resident" });
     }
-    for (const profile of humanMemory.listRestorableProfiles()) {
+    for (const profile of humanMemory.listProfiles()) {
       actors.set(profile.member.id, { id: profile.member.id, name: profile.member.name, kind: "human" });
     }
     for (const session of sessions.values()) {
@@ -1145,7 +1339,7 @@ const forgetHumanActor = async (
 
 type HumanRecoveryKeyIssueResult =
   | { status: "issued"; name: string; recoveryKey: string }
-  | { status: "not_found" | "session_changed" | "rate_limited" };
+  | { status: "not_found" | "account_owned" | "session_changed" | "rate_limited" };
 
 const issueHumanRecoveryKeyMutation = async (
   actorId: string,
@@ -1155,6 +1349,7 @@ const issueHumanRecoveryKeyMutation = async (
   return await identityMutations.run(async () => {
     const current = humanMemory.findByHumanId(actorId);
     if (!current) return { status: "not_found" };
+    if (!current.tokenHash) return { status: "account_owned" };
     if (expectedTokenHash && !currentIdentitySessionMatches(actorId, expectedTokenHash)) {
       return { status: "session_changed" };
     }
@@ -1203,7 +1398,7 @@ adminState.setHooks({
   validatePersonaNames: (personas) => {
     const humansByName = new Map<string, string>();
     for (const session of sessions.values()) humansByName.set(safeNameKey(session.member.name), session.member.name);
-    for (const profile of humanMemory.listRestorableProfiles()) {
+    for (const profile of humanMemory.listProfiles()) {
       humansByName.set(safeNameKey(profile.member.name), profile.member.name);
     }
     for (const persona of personas) {
@@ -1644,6 +1839,362 @@ app.get("/api/channels/:channelId/messages", (request, response) => {
   response.json({ ok: true, page: historyPageFor(channelId, before, limit) });
 });
 
+app.post("/api/auth/login", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, code: "ORIGIN_REQUIRED", error: "That login did not come from the room." });
+    return;
+  }
+  const parsed = accountLoginSchema.safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).json({ ok: false, code: "VALIDATION", error: "Enter your username and password." });
+    return;
+  }
+  if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
+    response.status(403).json({ ok: false, code: "INVITE_INVALID", error: "That invite code doesn't open this room." });
+    return;
+  }
+  const attempted = await runAccountCrypto(() => accountStore.login({
+    loginHandle: parsed.data.loginHandle,
+    password: parsed.data.password,
+    sourceIdentity: clientIp(request),
+  }));
+  if (!attempted.accepted) {
+    response.setHeader("Retry-After", "2");
+    response.status(503).json({ ok: false, code: "AUTH_BUSY", error: "Local account verification is busy. Try again in a moment." });
+    return;
+  }
+  const result = attempted.value;
+  if (!result.ok) {
+    if (result.code === "RATE_LIMITED") {
+      response.setHeader("Retry-After", String(Math.max(1, Math.ceil(result.retryAfterMs / 1_000))));
+      response.status(429).json({ ok: false, code: result.code, error: "Too many login attempts. Wait a moment and try again." });
+      return;
+    }
+    response.status(401).json({ ok: false, code: result.code, error: "That username and password did not match." });
+    return;
+  }
+  if (adminState.isBanned(result.account.actorId, result.account.displayName)) {
+    await accountStore.revokeSession(result.token);
+    response.status(403).json({ ok: false, code: "BANNED", error: "That account is banned from this room." });
+    return;
+  }
+  if (adminModeration.isKicked(result.account.actorId, result.account.displayName)) {
+    await accountStore.revokeSession(result.token);
+    response.status(429).json({ ok: false, code: "KICK_COOLDOWN", error: "That account is on a short reconnect cooldown." });
+    return;
+  }
+  const evictedAccountSession = disconnectEvictedAccountSessions(result.account.id);
+  const authenticated = accountStore.authenticateSession(result.token);
+  const session = authenticated ? hydrateRegisteredSession(result.token, authenticated) : undefined;
+  if (!session) {
+    await accountStore.revokeSession(result.token);
+    response.status(503).json({ ok: false, code: "ACCOUNT_UNAVAILABLE", error: "That account's local social profile is unavailable." });
+    return;
+  }
+  const maxAgeSeconds = Math.max(1, Math.floor((Date.parse(result.expiresAt) - Date.now()) / 1_000));
+  setSessionCookie(request, response, result.token, maxAgeSeconds);
+  if (evictedAccountSession) io.to("public").emit("presence:update", { members: getMembers() });
+  response.status(201).json({
+    ok: true,
+    me: session.member,
+    identity: { kind: "registered", loginHandle: result.account.loginHandle } satisfies HumanSessionIdentity,
+  });
+});
+
+app.post("/api/auth/register", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, code: "ORIGIN_REQUIRED", error: "That registration did not come from the room." });
+    return;
+  }
+  if (!allowJoinAttempt(clientIp(request))) {
+    response.status(429).json({ ok: false, code: "RATE_LIMITED", error: "Too many account attempts. Wait a few minutes." });
+    return;
+  }
+  const parsed = accountRegisterSchema.safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).json({ ok: false, code: "VALIDATION", error: "Enter a username, display name and password." });
+    return;
+  }
+  if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
+    response.status(403).json({ ok: false, code: "INVITE_INVALID", error: "That invite code doesn't open this room." });
+    return;
+  }
+  const name = normalizeDisplayName(parsed.data.displayName);
+  if (!validDisplayName(name)) {
+    response.status(400).json({ ok: false, code: "VALIDATION", error: "Choose a display name of 1–24 readable characters." });
+    return;
+  }
+  const identityKey = safeNameKey(name);
+  if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey)) {
+    response.status(409).json({ ok: false, code: "NAME_RESERVED", error: "That display name belongs to an AI resident." });
+    return;
+  }
+  if (adminState.isBanned(undefined, name)) {
+    response.status(403).json({ ok: false, code: "BANNED", error: "That identity is banned from this room." });
+    return;
+  }
+
+  const attempted = await runAccountCrypto(() => identityMutations.run(async () => {
+    const existingProfile = humanMemory.listProfiles().find((profile) =>
+      safeNameKey(profile.member.name) === identityKey
+    );
+    if (existingProfile) {
+      return {
+        ok: false as const,
+        status: 409,
+        code: "SAVED_IDENTITY",
+        error: "That display name belongs to an existing local identity. Sign in if it is yours, use an existing return key, ask the host, or choose another name.",
+      };
+    }
+    const actorId = `human-${randomUUID()}`;
+    const registration = await accountStore.register({
+      loginHandle: parsed.data.loginHandle,
+      displayName: name,
+      password: parsed.data.password,
+      actorId,
+    });
+    if (!registration.ok) {
+      const status = registration.code === "HANDLE_TAKEN" || registration.code === "ACTOR_ALREADY_LINKED" ? 409 : 400;
+      return {
+        ok: false as const,
+        status,
+        code: registration.code,
+        error: registration.code === "HANDLE_TAKEN"
+          ? "That username is already registered."
+          : registration.code === "WEAK_PASSWORD"
+            ? "Use a password with at least 8 characters."
+            : "Choose a username containing letters, numbers, dots, dashes or underscores.",
+      };
+    }
+    const avatar = randomAvatar();
+    avatar.glyph = displayNameGlyph(name);
+    const member: Member = {
+      id: actorId,
+      name,
+      kind: "human",
+      status: "offline",
+      avatar,
+      role: "Member",
+      bio: "A member of The Third Place.",
+    };
+    humanMemory.upsertProfile({
+      member,
+      seenAt: Date.now(),
+      protectedHumanIds: protectedHumanActorIds(actorId),
+    });
+    try {
+      await synchronizeOfflineSessionsWithMemory();
+      await humanMemory.flush();
+      if (!await accountStore.markProfileReady(registration.account.id)) {
+        throw new Error("The pending local account disappeared before its social profile committed.");
+      }
+    } catch (error) {
+      humanMemory.forgetProfile(actorId);
+      await humanMemory.flush().catch(() => undefined);
+      await accountStore.deleteAccount(registration.account.id).catch(() => undefined);
+      throw error;
+    }
+    const issued = await accountStore.issueSession(registration.account.id);
+    if (!issued) {
+      return { ok: false as const, status: 503, code: "ACCOUNT_UNAVAILABLE", error: "The local account could not open a session." };
+    }
+    const authenticated = accountStore.authenticateSession(issued.token);
+    const session = authenticated ? hydrateRegisteredSession(issued.token, authenticated) : undefined;
+    if (!session) {
+      await accountStore.revokeSession(issued.token);
+      return { ok: false as const, status: 503, code: "ACCOUNT_UNAVAILABLE", error: "The local account could not open its social profile." };
+    }
+    return { ok: true as const, issued, session };
+  }));
+
+  if (!attempted.accepted) {
+    response.setHeader("Retry-After", "2");
+    response.status(503).json({ ok: false, code: "AUTH_BUSY", error: "Local account creation is busy. Try again in a moment." });
+    return;
+  }
+  const result = attempted.value;
+
+  if (!result.ok) {
+    response.status(result.status).json({ ok: false, code: result.code, error: result.error });
+    return;
+  }
+  const maxAgeSeconds = Math.max(1, Math.floor((Date.parse(result.issued.expiresAt) - Date.now()) / 1_000));
+  setSessionCookie(request, response, result.issued.token, maxAgeSeconds);
+  response.status(201).json({
+    ok: true,
+    me: result.session.member,
+    identity: { kind: "registered", loginHandle: result.issued.account.loginHandle } satisfies HumanSessionIdentity,
+  });
+});
+
+app.post("/api/auth/upgrade", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, code: "ORIGIN_REQUIRED", error: "That account upgrade did not come from the room." });
+    return;
+  }
+  const parsed = accountUpgradeSchema.safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).json({ ok: false, code: "VALIDATION", error: "Enter a username and a password of at least 8 characters." });
+    return;
+  }
+  const authenticated = authenticatedSessionFromRequest(request);
+  if (!authenticated) {
+    response.status(401).json({ ok: false, code: "AUTH_REQUIRED", error: "Join the room before keeping this identity." });
+    return;
+  }
+  if (authenticated.session.identityKind === "registered") {
+    response.status(409).json({ ok: false, code: "ALREADY_REGISTERED", error: "This identity already belongs to a local account." });
+    return;
+  }
+  if (!allowJoinAttempt(clientIp(request))) {
+    response.status(429).json({ ok: false, code: "RATE_LIMITED", error: "Too many account attempts. Wait a few minutes." });
+    return;
+  }
+
+  const attempted = await runAccountCrypto(() => identityMutations.run(async () => {
+    const session = authenticated.session;
+    if (!currentIdentitySessionMatches(session.member.id, session.tokenHash)) {
+      return {
+        ok: false as const,
+        status: 409,
+        code: "IDENTITY_CHANGED",
+        error: "That identity changed while the account was being created. Reopen it and try again.",
+      };
+    }
+    const registration = await accountStore.register({
+      loginHandle: parsed.data.loginHandle,
+      displayName: session.member.name,
+      password: parsed.data.password,
+      actorId: session.member.id,
+    });
+    if (!registration.ok) {
+      return {
+        ok: false as const,
+        status: registration.code === "HANDLE_TAKEN" || registration.code === "ACTOR_ALREADY_LINKED" ? 409 : 400,
+        code: registration.code,
+        error: registration.code === "HANDLE_TAKEN"
+          ? "That username is already registered."
+          : registration.code === "WEAK_PASSWORD"
+            ? "Use a password with at least 8 characters."
+            : registration.code === "ACTOR_ALREADY_LINKED"
+              ? "This identity is already linked to a local account. Log in with that account instead."
+              : "Choose a username containing letters, numbers, dots, dashes or underscores.",
+      };
+    }
+
+    let issued: Awaited<ReturnType<AccountStore["issueSession"]>>;
+    try {
+      issued = await accountStore.issueSession(registration.account.id, { allowPendingProfile: true });
+    } catch (error) {
+      await accountStore.deleteAccount(registration.account.id).catch(() => undefined);
+      throw error;
+    }
+    if (!issued) {
+      await accountStore.deleteAccount(registration.account.id).catch(() => undefined);
+      return {
+        ok: false as const,
+        status: 503,
+        code: "ACCOUNT_UNAVAILABLE",
+        error: "The local account could not open a session.",
+      };
+    }
+
+    const previousMember: Member = { ...session.member, avatar: { ...session.member.avatar } };
+    const upgradedMember: Member = {
+      ...previousMember,
+      role: "Member",
+      bio: "A member of The Third Place.",
+    };
+    session.revoked = true;
+    humanMemory.upsertProfile({
+      member: upgradedMember,
+      seenAt: Date.now(),
+      protectedHumanIds: protectedHumanActorIds(session.member.id),
+    });
+    const detached = humanMemory.detachCredential(session.member.id, session.tokenHash);
+    if (!detached) {
+      humanMemory.upsertProfile({ member: previousMember, protectedHumanIds: protectedHumanActorIds(session.member.id) });
+      session.revoked = false;
+      await accountStore.deleteAccount(registration.account.id).catch(() => undefined);
+      return {
+        ok: false as const,
+        status: 409,
+        code: "IDENTITY_CHANGED",
+        error: "That identity changed while the account was being created. Reopen it and try again.",
+      };
+    }
+    try {
+      await humanMemory.flush();
+      if (!await accountStore.markProfileReady(registration.account.id)) {
+        throw new Error("The pending local account disappeared before its social profile committed.");
+      }
+    } catch {
+      humanMemory.upsertProfile({ member: previousMember, protectedHumanIds: protectedHumanActorIds(session.member.id) });
+      humanMemory.restoreCredential(session.member.id, detached);
+      await humanMemory.flush().catch(() => undefined);
+      await accountStore.deleteAccount(registration.account.id).catch(() => undefined);
+      session.revoked = false;
+      return {
+        ok: false as const,
+        status: 503,
+        code: "UPGRADE_UNAVAILABLE",
+        error: "The account could not be saved safely. Your guest identity is still active; try again shortly.",
+      };
+    }
+
+    // A credential transfer is a hard session boundary. Never re-key the same
+    // mutable runtime object: every socket admitted with the guest credential
+    // closes over it and would otherwise inherit account authority.
+    const previousTokenHash = session.tokenHash;
+    for (const socketId of [...session.socketIds]) {
+      const socket = io.sockets.sockets.get(socketId);
+      socket?.emit("session:upgraded");
+      socket?.disconnect(true);
+    }
+    session.socketIds.clear();
+    session.presence.clear();
+    sessions.delete(previousTokenHash);
+
+    const registeredSession = createHumanSession(
+      hashToken(issued.token),
+      { ...upgradedMember, status: "offline", avatar: { ...upgradedMember.avatar } },
+      Date.now(),
+      Date.parse(issued.account.createdAt),
+      {
+        kind: "registered",
+        accountId: issued.account.id,
+        accountSessionId: issued.sessionId,
+        expiresAt: Date.parse(issued.expiresAt),
+      },
+    );
+    sessions.set(registeredSession.tokenHash, registeredSession);
+    return { ok: true as const, issued, session: registeredSession };
+  }));
+
+  if (!attempted.accepted) {
+    response.setHeader("Retry-After", "2");
+    response.status(503).json({ ok: false, code: "AUTH_BUSY", error: "Local account creation is busy. Try again in a moment." });
+    return;
+  }
+  const result = attempted.value;
+
+  if (!result.ok) {
+    response.status(result.status).json({ ok: false, code: result.code, error: result.error });
+    return;
+  }
+  const maxAgeSeconds = Math.max(1, Math.floor((Date.parse(result.issued.expiresAt) - Date.now()) / 1_000));
+  setSessionCookie(request, response, result.issued.token, maxAgeSeconds);
+  io.to("public").emit("presence:update", { members: getMembers() });
+  response.status(201).json({
+    ok: true,
+    me: result.session.member,
+    identity: { kind: "registered", loginHandle: result.issued.account.loginHandle } satisfies HumanSessionIdentity,
+  });
+});
+
 app.get("/api/session", (request, response) => {
   response.setHeader("Cache-Control", "private, no-store");
   const authenticated = authenticatedSessionFromRequest(request);
@@ -1653,14 +2204,68 @@ app.get("/api/session", (request, response) => {
   }
   authenticated.session.lastSeenAt = Date.now();
   humanMemory.noteSeen(authenticated.session.member.id, authenticated.session.lastSeenAt);
-  setSessionCookie(request, response, authenticated.token);
-  response.json({ ok: true, me: authenticated.session.member });
+  refreshSessionCookie(request, response, authenticated.token, authenticated.session);
+  const account = authenticated.session.accountId
+    ? accountStore.getAccount(authenticated.session.accountId)
+    : undefined;
+  response.json({
+    ok: true,
+    me: authenticated.session.member,
+    identity: {
+      kind: authenticated.session.identityKind,
+      ...(account ? { loginHandle: account.loginHandle } : {}),
+    } satisfies HumanSessionIdentity,
+  });
 });
 
-// A complete identity retirement endpoint, used by ephemeral smoke clients and
-// available to a human who wants the server-side identity removed. This is not
-// the lighter "clear remembered details" operation below: it uses the same
-// durable erasure coordinator as the admin memory inspector.
+app.delete("/api/account", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, error: "That account request did not come from the room." });
+    return;
+  }
+  if (!allowJoinAttempt(clientIp(request))) {
+    response.status(429).json({ ok: false, error: "Too many account checks. Wait a few minutes and try again." });
+    return;
+  }
+  const parsed = accountDeleteSchema.safeParse(request.body);
+  const authenticated = authenticatedSessionFromRequest(request);
+  if (!parsed.success || !authenticated || authenticated.session.identityKind !== "registered" ||
+      !authenticated.session.accountId) {
+    response.status(authenticated ? 400 : 401).json({ ok: false, error: "A registered local account is required." });
+    return;
+  }
+  const verification = await runAccountCrypto(() =>
+    accountStore.verifyPassword(authenticated.session.accountId!, parsed.data.password)
+  );
+  if (!verification.accepted) {
+    response.setHeader("Retry-After", "2");
+    response.status(503).json({ ok: false, error: "Local account verification is busy. Try again in a moment." });
+    return;
+  }
+  if (!verification.value) {
+    response.status(401).json({ ok: false, error: "That password did not match this local account." });
+    return;
+  }
+  const removed = await identityMutations.run(async () => {
+    const account = accountStore.getAccount(authenticated.session.accountId!);
+    if (!account || account.actorId !== authenticated.session.member.id || !isActiveHumanSession(authenticated.session)) {
+      return false;
+    }
+    return await forgetHumanActorUnlocked(account.actorId);
+  });
+  clearSessionCookie(request, response);
+  if (!removed) {
+    response.status(409).json({ ok: false, error: "That account changed while it was being removed." });
+    return;
+  }
+  response.status(204).end();
+});
+
+// Registered sessions log out here while retaining the account. Ephemeral
+// guest/legacy sessions use the durable erasure coordinator, so explicit
+// logout removes their private history and social identity rather than merely
+// hiding it from the member list.
 app.delete("/api/session", async (request, response) => {
   response.setHeader("Cache-Control", "private, no-store");
   if (!hasAllowedOrigin(request)) {
@@ -1671,6 +2276,26 @@ app.delete("/api/session", async (request, response) => {
   if (!authenticated) {
     clearSessionCookie(request, response);
     response.status(401).json({ ok: false, error: "That saved identity is no longer active." });
+    return;
+  }
+  if (authenticated.session.identityKind === "registered") {
+    authenticated.session.revoked = true;
+    await accountStore.revokeSession(authenticated.token);
+    for (const socketId of [...authenticated.session.socketIds]) {
+      const socket = io.sockets.sockets.get(socketId);
+      socket?.emit("session:ended", { reason: "logout" });
+      socket?.disconnect(true);
+    }
+    authenticated.session.socketIds.clear();
+    authenticated.session.presence.clear();
+    sessions.delete(authenticated.session.tokenHash);
+    const sibling = [...sessions.values()].find((candidate) =>
+      candidate.member.id === authenticated.session.member.id && isActiveHumanSession(candidate)
+    );
+    if (sibling) refreshHumanPresence(sibling);
+    io.to("public").emit("presence:update", { members: getMembers() });
+    clearSessionCookie(request, response);
+    response.status(204).end();
     return;
   }
   if (!await forgetHumanActor(authenticated.session.member.id, authenticated.session.tokenHash)) {
@@ -1691,7 +2316,7 @@ app.get("/api/session/memory", (request, response) => {
   }
   authenticated.session.lastSeenAt = Date.now();
   humanMemory.noteSeen(authenticated.session.member.id, authenticated.session.lastSeenAt);
-  setSessionCookie(request, response, authenticated.token);
+  refreshSessionCookie(request, response, authenticated.token, authenticated.session);
   response.json({ ok: true, memory: humanMemory.clientSummary(authenticated.session.member.id) });
 });
 
@@ -1707,7 +2332,11 @@ app.delete("/api/session/memory", async (request, response) => {
     return;
   }
   const memory = await identityMutations.run(async () => {
-    if (!currentIdentitySessionMatches(authenticated.session.member.id, authenticated.session.tokenHash)) {
+    const sessionStillOwnsActor = authenticated.session.identityKind === "registered"
+      ? isActiveHumanSession(authenticated.session) &&
+        accountStore.getAccount(authenticated.session.accountId ?? "")?.actorId === authenticated.session.member.id
+      : currentIdentitySessionMatches(authenticated.session.member.id, authenticated.session.tokenHash);
+    if (!sessionStillOwnsActor) {
       return undefined;
     }
     authenticated.session.lastSeenAt = Date.now();
@@ -1721,7 +2350,7 @@ app.delete("/api/session/memory", async (request, response) => {
     response.status(409).json({ ok: false, error: "That identity moved while its memory was being cleared. Reopen it and try again." });
     return;
   }
-  setSessionCookie(request, response, authenticated.token);
+  refreshSessionCookie(request, response, authenticated.token, authenticated.session);
   response.json({ ok: true, memory });
 });
 
@@ -1738,6 +2367,15 @@ app.post("/api/session/recovery-key", async (request, response) => {
   const authenticated = authenticatedSessionFromRequest(request);
   if (!authenticated) {
     response.status(401).json({ ok: false, error: "Join the room before creating a return key." });
+    return;
+  }
+  if (authenticated.session.identityKind !== "legacy") {
+    response.status(409).json({
+      ok: false,
+      error: authenticated.session.identityKind === "registered"
+        ? "This account already returns with its username and password."
+        : "Create an account to keep this guest identity across devices.",
+    });
     return;
   }
   const issued = await issueHumanRecoveryKeyMutation(
@@ -1883,8 +2521,8 @@ app.post("/api/session/recover", async (request, response) => {
 });
 
 app.post("/api/session", async (request, response) => {
-  // A successful first visit discloses the raw return key exactly once.
-  // Prevent browsers and intermediaries from retaining that credential.
+  // Guest credentials are carried only by the HttpOnly cookie. Prevent
+  // browsers and intermediaries from retaining identity responses.
   response.setHeader("Cache-Control", "private, no-store");
   if (!allowJoinAttempt(clientIp(request))) {
     response.status(429).json({ ok: false, error: "Too many join attempts. Wait a few minutes and try again." });
@@ -1942,10 +2580,12 @@ app.post("/api/session", async (request, response) => {
       });
       return;
     }
-    const retainedMatches = humanMemory.listRestorableProfiles()
+    const retainedMatches = humanMemory.listProfiles()
       .filter((profile) => safeNameKey(profile.member.name) === identityKey);
     if (retainedMatches.length > 0) {
-      const retained = retainedMatches.length === 1 ? retainedMatches[0] : undefined;
+      const registered = retainedMatches.some((profile) =>
+        accountStore.getAccountByActorId(profile.member.id) !== undefined
+      );
       const recoveryConfigured = retainedMatches.some((profile) => humanMemory.hasRecoveryKey(profile.member.id));
       const retainedIds = new Set(retainedMatches.map((profile) => profile.member.id));
       const online = [...sessions.values()].some(
@@ -1954,7 +2594,9 @@ app.post("/api/session", async (request, response) => {
       response.status(409).json({
         ok: false,
         code: "RETURNING_IDENTITY",
-        error: retainedMatches.length === 1
+        error: registered
+          ? "That display name belongs to a local account. Log in instead of creating a guest variation."
+          : retainedMatches.length === 1
           ? recoveryConfigured
             ? "That name belongs to a saved identity. Use its return key instead of creating a variation."
             : "That name belongs to a saved identity without a return key yet. Ask the server host to issue one."
@@ -1969,8 +2611,6 @@ app.post("/api/session", async (request, response) => {
 
     const token = randomBytes(32).toString("base64url");
     const tokenHash = hashToken(token);
-    const recoveryKey = generateHumanIdentityRecoveryKey();
-    const recoveryKeyHash = hashHumanIdentityRecoveryKey(recoveryKey);
     const avatar = randomAvatar();
     avatar.glyph = displayNameGlyph(name);
     const session = createHumanSession(tokenHash, {
@@ -1981,19 +2621,14 @@ app.post("/api/session", async (request, response) => {
       avatar,
       role: "Guest",
       bio: "A real person visiting The Third Place.",
-    });
+    }, undefined, undefined, { kind: "guest" });
     sessions.set(tokenHash, session);
     humanMemory.upsertSession({
       tokenHash,
       member: session.member,
       seenAt: session.lastSeenAt,
-      protectedHumanIds: new Set(
-        [session.member.id, ...[...sessions.values()]
-          .filter((candidate) => candidate.socketIds.size > 0 || candidate.revoked)
-          .map((candidate) => candidate.member.id)],
-      ),
+      protectedHumanIds: protectedHumanActorIds(session.member.id),
     });
-    humanMemory.replaceRecoveryKeyHash(session.member.id, recoveryKeyHash);
     try {
       await synchronizeOfflineSessionsWithMemory();
       await humanMemory.flush();
@@ -2004,14 +2639,18 @@ app.post("/api/session", async (request, response) => {
       throw error;
     }
     setSessionCookie(request, response, token);
-    response.status(201).json({ ok: true, me: session.member, recoveryKey });
+    response.status(201).json({
+      ok: true,
+      me: session.member,
+      identity: { kind: "guest" } satisfies HumanSessionIdentity,
+    });
   });
 });
 
 io.use((socket, next) => {
-  const token = parseCookies(socket.handshake.headers.cookie)[SESSION_COOKIE];
-  const session = token ? sessions.get(hashToken(token)) : undefined;
-  if (!session || session.revoked) {
+  const token = parseCookieHeader(socket.handshake.headers.cookie)[SESSION_COOKIE];
+  const session = sessionForToken(token);
+  if (!session || !isActiveHumanSession(session)) {
     next(new Error("AUTH_REQUIRED"));
     return;
   }
@@ -2037,7 +2676,9 @@ io.on("connection", (socket) => {
     }
     next();
   });
-  const wasOffline = session.socketIds.size === 0;
+  const wasOffline = ![...sessions.values()].some((candidate) =>
+    candidate.member.id === session.member.id && candidate.socketIds.size > 0
+  );
   const connectedAt = Date.now();
   const initialPresence = presenceHandshakeSchema.safeParse(socket.handshake.auth?.presence);
   session.socketIds.add(socket.id);
@@ -2342,13 +2983,17 @@ io.on("connection", (socket) => {
       acknowledge?.({ ok: false, error: "That private conversation isn't available." });
       return;
     }
+    const peerId = participants.find((id) => id !== session.member.id);
+    if (!peerId || !getMembers().some((member) => member.id === peerId)) {
+      acknowledge?.({ ok: false, error: "That person isn't available for a private message." });
+      return;
+    }
     const message = store.addDmMessage(parsed.data.channelId, session.member.id, content, parsed.data.replyToId);
     if (!message) {
       acknowledge?.({ ok: false, error: "Could not send that private message." });
       return;
     }
     emitDmUpdate(participants, message);
-    const peerId = participants.find((id) => id !== session.member.id);
     const persona = PERSONAS.find((candidate) => candidate.id === peerId);
     if (persona) void director.onDirectMessage(message, session.member, persona);
     acknowledge?.({ ok: true });
@@ -2357,11 +3002,31 @@ io.on("connection", (socket) => {
   socket.on("dm:open", (raw: unknown, acknowledge?: (result: unknown) => void) => {
     const parsed = z.object({ peerId: z.string().min(1).max(100) }).safeParse(raw);
     const peer = parsed.success ? getMembers().find((member) => member.id === parsed.data.peerId) : undefined;
-    if (!peer || peer.id === session.member.id || peer.status === "offline") {
+    if (!peer || peer.id === session.member.id) {
       acknowledge?.({ ok: false, error: "That person isn't available for a private chat." });
       return;
     }
-    acknowledge?.({ ok: true, thread: store.openDm(session.member.id, peer.id) });
+    const thread = store.openDm(session.member.id, peer.id);
+    io.to(`user:${session.member.id}`).emit("dm:read:update", { thread });
+    acknowledge?.({ ok: true, thread });
+  });
+
+  socket.on("dm:read", (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
+    const parsed = z.object({
+      threadId: z.string().min(1).max(256),
+      messageId: z.string().min(1).max(100).optional(),
+    }).strict().safeParse(raw);
+    if (!parsed.success) {
+      acknowledge?.({ ok: false, error: "That private read position is invalid." });
+      return;
+    }
+    const thread = store.markDmRead(parsed.data.threadId, session.member.id, parsed.data.messageId);
+    if (!thread) {
+      acknowledge?.({ ok: false, error: "That private conversation isn't available." });
+      return;
+    }
+    io.to(`user:${session.member.id}`).emit("dm:read:update", { thread });
+    acknowledge?.({ ok: true });
   });
 
   socket.on("reaction:toggle", (raw: unknown, acknowledge?: (result: ActionResult) => void) => {
@@ -2448,9 +3113,11 @@ io.on("connection", (socket) => {
 function emitDmUpdate(participants: [string, string], message: ChatMessage): void {
   for (const viewerId of participants) {
     const peerId = participants.find((id) => id !== viewerId);
-    if (!peerId || viewerId.startsWith("ai-")) continue;
+    if (!peerId || PERSONAS.some((persona) => persona.id === viewerId)) continue;
+    const thread = store.getDmThread(viewerId, peerId);
+    if (!thread) continue;
     io.to(`user:${viewerId}`).emit("dm:update", {
-      thread: store.openDm(viewerId, peerId),
+      thread,
       message,
     });
   }
@@ -2492,6 +3159,7 @@ app.use((error: unknown, request: Request, response: Response, _next: unknown) =
   });
 });
 
+await accountStore.load();
 const humanMemoryLoad = await humanMemory.load();
 adminState.validateActiveCatalog();
 await store.load();
@@ -2503,16 +3171,86 @@ if (cancelledBannedPublicTurnTargets > 0) await store.flush();
 const socialActorInventory = socialMemoryStore.overview();
 const dmActorIds = store.getAllDmParticipantIds();
 const publicParticipantActorIds = store.getAllPublicParticipantActorIds();
+// Registration/upgrade spans two local stores. A durable pending bit makes
+// recovery precise: a pending account with no profile and no downstream actor
+// evidence was never usable and can be rolled back; a ready account whose
+// profile vanished is corruption and must stop startup rather than inventing
+// a blank person with lost memories.
+const downstreamActorIds = new Set([
+  ...socialActorInventory.actorIds,
+  ...dmActorIds,
+  ...publicParticipantActorIds,
+]);
+const pendingForgetActorIds = new Set(humanMemoryLoad.pendingActorForgetIds);
+const accountsNeedingProfileCommit: string[] = [];
+let reconciledAccountProfiles = false;
+for (const account of accountStore.listAccounts()) {
+  if (pendingForgetActorIds.has(account.actorId)) continue;
+  const profile = humanMemory.findByHumanId(account.actorId);
+  if (!profile) {
+    if (account.profileState === "pending" && !downstreamActorIds.has(account.actorId)) {
+      await accountStore.deleteAccount(account.id);
+      console.warn(`Rolled back incomplete local account ${account.id}; its social profile was never committed.`);
+      continue;
+    }
+    throw new Error(
+      `Local account continuity is incomplete for actor ${account.actorId}. ` +
+      "Restore the human-memory file before starting the server.",
+    );
+  }
+  if (
+    profile.member.name !== account.displayName ||
+    profile.member.role !== "Member" ||
+    profile.member.bio !== "A member of The Third Place."
+  ) {
+    humanMemory.upsertProfile({
+      member: {
+        ...profile.member,
+        name: account.displayName,
+        role: "Member",
+        bio: "A member of The Third Place.",
+      },
+      protectedHumanIds: protectedHumanActorIds(account.actorId),
+    });
+    reconciledAccountProfiles = true;
+  }
+  if (profile.tokenHash && humanMemory.detachCredential(account.actorId, profile.tokenHash)) {
+    reconciledAccountProfiles = true;
+  }
+  if (account.profileState === "pending") accountsNeedingProfileCommit.push(account.id);
+}
+if (reconciledAccountProfiles) await humanMemory.flush();
+for (const accountId of accountsNeedingProfileCommit) {
+  if (!await accountStore.markProfileReady(accountId)) {
+    throw new Error(`Pending local account ${accountId} disappeared during startup reconciliation.`);
+  }
+}
+const accountActorIds = new Set(accountStore.listAccounts().map((account) => account.actorId));
+const orphanedAccountProfiles = humanMemory.listProfiles().filter((profile) =>
+  profile.tokenHash === undefined &&
+  !accountActorIds.has(profile.member.id) &&
+  !pendingForgetActorIds.has(profile.member.id)
+);
+if (orphanedAccountProfiles.length > 0) {
+  throw new Error(
+    "Local account continuity is incomplete: credentialless social profiles have no matching account record. " +
+    "Restore the account-state file before starting the server.",
+  );
+}
 assertHumanMemoryContinuity({
   continuityVerified: humanMemoryLoad.continuityVerified,
   socialActorIds: socialActorInventory.actorIds,
   socialActorCount: socialActorInventory.stats.actors,
-  retainedHumanActorIds: humanMemory.listRestorableProfiles().map((profile) => profile.member.id),
+  retainedHumanActorIds: humanMemory.listProfiles().map((profile) => profile.member.id),
   residentActorIds: PERSONAS.map((persona) => persona.id),
   pendingActorForgetIds: humanMemoryLoad.pendingActorForgetIds,
   additionalActorInventories: [
     { actorIds: dmActorIds, actorCount: dmActorIds.length },
     { actorIds: publicParticipantActorIds, actorCount: publicParticipantActorIds.length },
+    {
+      actorIds: accountStore.listAccounts().map((account) => account.actorId),
+      actorCount: accountStore.listAccounts().length,
+    },
   ],
 });
 await reconcilePendingHumanActorForgets();
@@ -2521,7 +3259,13 @@ if (!humanMemoryLoad.continuityVerified) {
   await humanMemory.flush();
 }
 for (const profile of humanMemory.listRestorableProfiles()) {
-  sessions.set(profile.tokenHash, createHumanSession(profile.tokenHash, profile.member, profile.lastSeenAt));
+  sessions.set(profile.tokenHash, createHumanSession(
+    profile.tokenHash,
+    profile.member,
+    profile.lastSeenAt,
+    undefined,
+    { kind: humanMemory.hasRecoveryKey(profile.member.id) ? "legacy" : "guest" },
+  ));
 }
 await imageStore.initialize(store.getAllImageMessages());
 store.onMessagesRemoved((removed) => {
@@ -2549,7 +3293,20 @@ if (recoveredDirectTurns > 0) {
 const healthInterval = setInterval(async () => {
   const now = Date.now();
   let presenceChanged = false;
-  for (const session of sessions.values()) {
+  for (const session of [...sessions.values()]) {
+    if (session.identityKind === "registered" && session.expiresAt !== undefined && session.expiresAt <= now) {
+      session.revoked = true;
+      for (const socketId of [...session.socketIds]) {
+        const socket = io.sockets.sockets.get(socketId);
+        socket?.emit("session:ended", { reason: "expired" });
+        socket?.disconnect(true);
+      }
+      session.socketIds.clear();
+      session.presence.clear();
+      sessions.delete(session.tokenHash);
+      presenceChanged = true;
+      continue;
+    }
     if (session.socketIds.size > 0) {
       if (now - session.lastSeenAt >= SESSION_HEARTBEAT_MS) {
         session.lastSeenAt = now;
@@ -2569,7 +3326,11 @@ const healthInterval = setInterval(async () => {
       // never be erased from a stale health-cycle snapshot.
       const expiredActorIds = new Set(
         [...sessions.values()]
-          .filter((session) => session.socketIds.size === 0 && now - session.lastSeenAt > SESSION_RETENTION_MS)
+          .filter((session) =>
+            session.identityKind !== "registered" &&
+            session.socketIds.size === 0 &&
+            now - session.lastSeenAt > SESSION_RETENTION_MS
+          )
           .map((session) => session.member.id),
       );
       for (const actorId of expiredActorIds) {
@@ -2601,10 +3362,10 @@ const healthInterval = setInterval(async () => {
       error instanceof Error ? error.message : error,
     );
   }
-  for (const [ip, timestamps] of joinAttempts) {
+  for (const [sourceKey, timestamps] of joinAttempts) {
     const recent = timestamps.filter((timestamp) => now - timestamp < 10 * 60_000);
-    if (recent.length > 0) joinAttempts.set(ip, recent);
-    else joinAttempts.delete(ip);
+    if (recent.length > 0) joinAttempts.set(sourceKey, recent);
+    else joinAttempts.delete(sourceKey);
   }
   for (const [key, timestamps] of recoveryAttempts) {
     const recent = timestamps.filter((timestamp) => now - timestamp < RECOVERY_ATTEMPT_WINDOW_MS);
@@ -2643,6 +3404,7 @@ const shutdown = async (signal: string) => {
   await socialMemory.close();
   await socialMemoryLifecycle.close();
   await Promise.all([
+    accountStore.flush(),
     store.flush(),
     humanMemory.flush(),
     ambientEpisodeLedger.flush(),

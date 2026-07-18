@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -94,6 +94,55 @@ describe("persistent human memory", () => {
     ]);
     expect(restarted.findByHumanId("human-one")?.facts[0]?.value).toBe("TypeScript");
     expect(restarted.getRelation("human-one", "ai-sana")?.affinity).toBeCloseTo(0.4, 4);
+  });
+
+  it("persists an account-owned social profile without inventing a restorable credential", async () => {
+    const { filePath, store } = await tempStore({
+      retentionMs: day,
+      factRetentionMs: 1_000 * day,
+      maxProfiles: 1,
+      now: () => 1_000,
+    });
+    const accountMember = { ...member("human-account", "Account"), role: "Member" };
+    const created = store.upsertProfile({ member: accountMember, seenAt: 1_000 });
+    store.noteVisit("human-account", 1_000);
+    remember(store, "human-account", "lobby", "likes", "TypeScript", 1_100);
+    store.updateRelation("human-account", "ai-mira", { familiarity: 0.7, affinity: 0.4 }, 1_200);
+
+    expect(created).not.toHaveProperty("tokenHash");
+    expect(created.recoveryConfigured).toBe(false);
+    expect(store.listProfiles().map((profile) => profile.member.id)).toEqual(["human-account"]);
+    expect(store.listRestorableProfiles()).toEqual([]);
+    expect(store.replaceRecoveryKeyHash("human-account", hash("not-a-login"))).toBeUndefined();
+    expect(store.rotateSessionToken("human-account", hash("old"), hash("new"))).toBeUndefined();
+    expect(store.prune(100 * day)).toEqual({ profilesRemoved: 0, factsRemoved: 0 });
+    await store.flush();
+
+    const serialized = JSON.parse(await readFile(filePath, "utf8")) as {
+      version: number;
+      profiles: Array<Record<string, unknown>>;
+    };
+    expect(serialized.version).toBe(2);
+    expect(serialized.profiles[0]).not.toHaveProperty("credential");
+    expect(serialized.profiles[0]).not.toHaveProperty("tokenHash");
+
+    const restarted = new HumanMemoryStore({
+      filePath,
+      now: () => 100 * day,
+      retentionMs: day,
+      factRetentionMs: 1_000 * day,
+      maxProfiles: 1,
+      persistDelayMs: 60_000,
+    });
+    await restarted.load();
+    expect(restarted.listRestorableProfiles()).toEqual([]);
+    expect(restarted.findByHumanId("human-account")).toMatchObject({
+      member: { id: "human-account", name: "Account" },
+      visitCount: 1,
+      facts: [expect.objectContaining({ value: "TypeScript" })],
+      relations: { "ai-mira": expect.objectContaining({ affinity: 0.4 }) },
+      recoveryConfigured: false,
+    });
   });
 
   it("counts a reconnect as a new visit only after the four-hour threshold", async () => {
@@ -423,7 +472,7 @@ describe("persistent human memory", () => {
     const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-migration-"));
     const filePath = join(directory, "human-memory.json");
     const tokenHash = hash("legacy");
-    await writeFile(filePath, JSON.stringify({
+    const legacyBytes = JSON.stringify({
       profiles: [
         {
           tokenHash,
@@ -443,7 +492,8 @@ describe("persistent human memory", () => {
         },
         { tokenHash: "raw-token-not-a-hash", humanId: "human-bad" },
       ],
-    }), "utf8");
+    });
+    await writeFile(filePath, legacyBytes, "utf8");
 
     const store = new HumanMemoryStore({ filePath, now: () => 3_000, persistDelayMs: 60_000 });
     const loadResult = await store.load();
@@ -459,9 +509,14 @@ describe("persistent human memory", () => {
       pendingActorForgetIds: string[];
       profiles: Array<{ facts: unknown[] }>;
     };
-    expect(migrated).toMatchObject({ version: 1 });
+    expect(migrated).toMatchObject({ version: 2 });
     expect(migrated.pendingActorForgetIds).toEqual(["human-bad"]);
     expect(migrated.profiles[0]?.facts).toHaveLength(1);
+    const backupName = (await readdir(directory)).find((name) =>
+      name.startsWith("human-memory.json.pre-v2-from-legacy-")
+    );
+    expect(backupName).toBeDefined();
+    expect(await readFile(join(directory, backupName!), "utf8")).toBe(legacyBytes);
   });
 
   it("durably hands expired and overflow profile IDs to downstream memory erasure", async () => {
@@ -699,7 +754,7 @@ describe("persistent human memory", () => {
     await unlink(blocker);
     await mkdir(blocker);
     await expect(store.flush()).resolves.toBeUndefined();
-    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ version: 1 });
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ version: 2 });
   });
 
   it("fails closed on corrupt JSON without destroying or permitting replacement of the companion", async () => {
@@ -724,7 +779,7 @@ describe("persistent human memory", () => {
     const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-schema-"));
     const cases = [
       ["root", []],
-      ["version", { version: 2, continuityVerified: true, pendingActorForgetIds: [], profiles: [] }],
+      ["version", { version: 3, continuityVerified: true, pendingActorForgetIds: [], profiles: [] }],
       ["profile", { version: 1, continuityVerified: true, pendingActorForgetIds: [], profiles: [{}] }],
       ["tombstones", { version: 1, continuityVerified: true, pendingActorForgetIds: [" unsafe "], profiles: [] }],
     ] as const;

@@ -13,6 +13,7 @@ import {
   isHumanIdentityRecoveryKeyHash,
 } from "./humanIdentityRecovery.js";
 import { participantIdentityKey } from "./participantIdentity.js";
+import { preservePreMigrationState } from "./persistenceMigrationBackup.js";
 
 export const HUMAN_MEMORY_DEFAULTS = {
   retentionMs: 90 * 24 * 60 * 60_000,
@@ -82,8 +83,12 @@ export type HumanPersonaRelationUpdate = Partial<
 >;
 
 export interface HumanMemoryProfile {
-  /** SHA-256 session-token digest. A raw session token is never accepted or persisted. */
-  tokenHash: string;
+  /**
+   * Legacy/guest recovery credential. Registered accounts deliberately have no
+   * session token in social memory: their independently revocable sessions are
+   * owned by the local account store.
+   */
+  tokenHash?: string;
   member: Member & { kind: "human" };
   createdAt: number;
   lastSeenAt: number;
@@ -94,6 +99,15 @@ export interface HumanMemoryProfile {
   relations: Record<string, HumanPersonaRelation>;
   /** Safe capability metadata; the recovery-key digest is never exposed. */
   recoveryConfigured: boolean;
+}
+
+/** A legacy/guest profile whose single recovery credential can restore a session. */
+export type CredentialedHumanMemoryProfile = HumanMemoryProfile & { tokenHash: string };
+
+/** Server-only rollback material; never expose either digest to a client. */
+export interface DetachedHumanMemoryCredential {
+  tokenHash: string;
+  recoveryKeyHash?: string;
 }
 
 /** Minimal server-only data needed to rebuild the in-memory session map after restart. */
@@ -178,6 +192,13 @@ export interface UpsertHumanSessionInput {
   protectedHumanIds?: ReadonlySet<string>;
 }
 
+export interface UpsertHumanProfileInput {
+  member: Member;
+  seenAt?: number;
+  /** Runtime/account actors that capacity/retention pruning must not evict. */
+  protectedHumanIds?: ReadonlySet<string>;
+}
+
 /** Small integration surface used by the HTTP/session layer and social director. */
 export interface HumanMemory {
   load(): Promise<HumanMemoryLoadResult>;
@@ -186,11 +207,13 @@ export interface HumanMemory {
   queuePendingActorForget(actorId: string): boolean;
   acknowledgePendingActorForgets(actorIds: readonly string[]): number;
   confirmContinuityBaseline(): boolean;
-  upsertSession(input: UpsertHumanSessionInput): HumanMemoryProfile;
+  upsertProfile(input: UpsertHumanProfileInput): HumanMemoryProfile;
+  upsertSession(input: UpsertHumanSessionInput): CredentialedHumanMemoryProfile;
+  listProfiles(): HumanMemoryProfile[];
   listRestorableProfiles(): RestorableHumanProfile[];
   findByHumanId(humanId: string): HumanMemoryProfile | undefined;
-  findByTokenHash(tokenHash: string): HumanMemoryProfile | undefined;
-  findByRecoveryKey(name: string, recoveryKeyHash: string): HumanMemoryProfile | undefined;
+  findByTokenHash(tokenHash: string): CredentialedHumanMemoryProfile | undefined;
+  findByRecoveryKey(name: string, recoveryKeyHash: string): CredentialedHumanMemoryProfile | undefined;
   replaceRecoveryKeyHash(humanId: string, nextHash: string | undefined): string | undefined;
   hasRecoveryKey(humanId: string): boolean;
   rotateSessionToken(
@@ -198,7 +221,14 @@ export interface HumanMemory {
     expectedOldHash: string,
     nextHash: string,
     seenAt?: number,
-  ): HumanMemoryProfile | undefined;
+  ): CredentialedHumanMemoryProfile | undefined;
+  /** Removes only the legacy/guest credential while preserving actor memory. */
+  detachCredential(
+    humanId: string,
+    expectedTokenHash?: string,
+  ): DetachedHumanMemoryCredential | undefined;
+  /** Transaction rollback helper for a failed guest/legacy account upgrade. */
+  restoreCredential(humanId: string, credential: DetachedHumanMemoryCredential): boolean;
   noteVisit(humanId: string, at?: number): HumanVisitResult | undefined;
   noteSeen(humanId: string, at?: number): boolean;
   notePublicMessage(humanId: string, channelId: string, content: string, at?: number): void;
@@ -241,19 +271,23 @@ export interface HumanMemoryStoreOptions {
   persistDelayMs?: number;
 }
 
-interface InternalProfile extends Omit<HumanMemoryProfile, "relations" | "recoveryConfigured"> {
-  relations: Map<string, HumanPersonaRelation>;
+interface HumanMemoryCredential {
+  tokenHash: string;
   /** Server-only digest of the high-entropy copy/paste recovery credential. */
   recoveryKeyHash?: string;
 }
 
-interface PersistedHumanMemory {
-  version: 1;
+interface InternalProfile extends Omit<HumanMemoryProfile, "tokenHash" | "relations" | "recoveryConfigured"> {
+  relations: Map<string, HumanPersonaRelation>;
+  credential?: HumanMemoryCredential;
+}
+
+interface PersistedHumanMemoryV2 {
+  version: 2;
   continuityVerified: boolean;
   pendingActorForgetIds: string[];
   profiles: Array<{
-    tokenHash: string;
-    recoveryKeyHash?: string;
+    credential?: HumanMemoryCredential;
     member: Member & { kind: "human" };
     createdAt: number;
     lastSeenAt: number;
@@ -290,7 +324,7 @@ interface ValidatedPersistedRoot {
 const validatePersistedRoot = (value: unknown): ValidatedPersistedRoot => {
   const root = asRecord(value);
   if (!root) throw new TypeError("Human-memory root must be an object.");
-  if (root.version !== undefined && root.version !== 1) {
+  if (root.version !== undefined && root.version !== 1 && root.version !== 2) {
     throw new TypeError("Human-memory version is unsupported.");
   }
   if (!Array.isArray(root.profiles)) {
@@ -507,7 +541,7 @@ const safeRelation = (raw: unknown, now: number): HumanPersonaRelation | undefin
 };
 
 const profileSnapshot = (profile: InternalProfile): HumanMemoryProfile => ({
-  tokenHash: profile.tokenHash,
+  ...(profile.credential ? { tokenHash: profile.credential.tokenHash } : {}),
   member: cloneMember(profile.member),
   createdAt: profile.createdAt,
   lastSeenAt: profile.lastSeenAt,
@@ -516,8 +550,13 @@ const profileSnapshot = (profile: InternalProfile): HumanMemoryProfile => ({
   facts: profile.facts.map(cloneFact),
   channelScores: profile.channelScores.map(cloneChannelScore),
   relations: Object.fromEntries([...profile.relations].map(([id, relation]) => [id, cloneRelation(relation)])),
-  recoveryConfigured: profile.recoveryKeyHash !== undefined,
+  recoveryConfigured: profile.credential?.recoveryKeyHash !== undefined,
 });
+
+const credentialedProfileSnapshot = (profile: InternalProfile): CredentialedHumanMemoryProfile => {
+  if (!profile.credential) throw new Error("Credentialed profile snapshot requires a credential.");
+  return { ...profileSnapshot(profile), tokenHash: profile.credential.tokenHash };
+};
 
 export class HumanMemoryStore implements HumanMemory {
   private readonly filePath: string;
@@ -589,16 +628,19 @@ export class HumanMemoryStore implements HumanMemory {
     this.pendingActorForgetIds.clear();
     this.continuityVerified = false;
     let shouldRewrite = false;
+    let migrationSource: { raw: string; version: string | number } | undefined;
     try {
-      const parsed = JSON.parse(await readFile(this.filePath, "utf8")) as unknown;
+      const raw = await readFile(this.filePath, "utf8");
+      const parsed = JSON.parse(raw) as unknown;
       const { root, rawProfiles, pendingActorForgetIds } = validatePersistedRoot(parsed);
-      const currentSchema = root.version === 1;
+      if (root.version !== 2) migrationSource = { raw, version: root.version === 1 ? 1 : "legacy" };
+      const currentSchema = root.version === 1 || root.version === 2;
       // Additive marker: a structurally valid legacy file predating the marker
       // is trusted because it is itself the durable companion being migrated.
       this.continuityVerified = root.continuityVerified === undefined
         ? true
         : root.continuityVerified === true;
-      shouldRewrite = root.version !== 1 ||
+      shouldRewrite = root.version !== 2 ||
         root.continuityVerified === undefined ||
         root.pendingActorForgetIds === undefined;
       for (const actorId of pendingActorForgetIds) this.pendingActorForgetIds.add(actorId);
@@ -612,7 +654,7 @@ export class HumanMemoryStore implements HumanMemory {
         }
         const rawActorId = persistedActorId(rawProfile);
         if (rawActorId) persistedProfileIds.add(rawActorId);
-        const profile = this.sanitizeProfile(rawProfile, now);
+        const profile = this.sanitizeProfile(rawProfile, now, root.version);
         if (!profile) {
           if (currentSchema) {
             throw new TypeError("Current human-memory schema contains an invalid stable profile identity.");
@@ -631,7 +673,9 @@ export class HumanMemoryStore implements HumanMemory {
           ? rawProfileRecord.facts.length
           : 0;
         if (rawFactCount !== profile.facts.length) shouldRewrite = true;
-        const existingHumanId = this.humanIdByTokenHash.get(profile.tokenHash);
+        const existingHumanId = profile.credential
+          ? this.humanIdByTokenHash.get(profile.credential.tokenHash)
+          : undefined;
         const existing = this.profilesByHumanId.get(profile.member.id);
         if (existingHumanId || existing) {
           if (currentSchema) {
@@ -648,7 +692,9 @@ export class HumanMemoryStore implements HumanMemory {
           }
         }
         this.profilesByHumanId.set(profile.member.id, profile);
-        this.humanIdByTokenHash.set(profile.tokenHash, profile.member.id);
+        if (profile.credential) {
+          this.humanIdByTokenHash.set(profile.credential.tokenHash, profile.member.id);
+        }
       }
       const pruned = this.pruneInternal(now);
       for (const actorId of persistedProfileIds) {
@@ -670,7 +716,12 @@ export class HumanMemoryStore implements HumanMemory {
       // one missing-companion startup into a trusted empty baseline.
       shouldRewrite = true;
     }
-    if (shouldRewrite) await this.flush();
+    if (shouldRewrite) {
+      if (migrationSource) {
+        await preservePreMigrationState(this.filePath, migrationSource.raw, migrationSource.version, 2);
+      }
+      await this.flush();
+    }
     return this.loadResult();
   }
 
@@ -722,7 +773,37 @@ export class HumanMemoryStore implements HumanMemory {
     return true;
   }
 
-  upsertSession(input: UpsertHumanSessionInput): HumanMemoryProfile {
+  upsertProfile(input: UpsertHumanProfileInput): HumanMemoryProfile {
+    const member = sanitizeMember(input.member);
+    if (!member || input.member.kind !== "human") {
+      throw new TypeError("A valid server-issued human Member is required.");
+    }
+    if (this.pendingActorForgetIds.has(member.id)) {
+      throw new Error(`Human actor ${member.id} is still pending durable memory erasure.`);
+    }
+    const at = Math.max(0, finiteNumber(input.seenAt, this.now()));
+    let profile = this.profilesByHumanId.get(member.id);
+    if (profile) {
+      profile.member = { ...member, id: profile.member.id, status: "offline" };
+      profile.lastSeenAt = Math.max(profile.lastSeenAt, at);
+    } else {
+      profile = {
+        member,
+        createdAt: at,
+        lastSeenAt: at,
+        visitCount: 0,
+        facts: [],
+        channelScores: [],
+        relations: new Map(),
+      };
+    }
+    this.profilesByHumanId.set(profile.member.id, profile);
+    this.pruneInternal(at, input.protectedHumanIds);
+    this.schedulePersist();
+    return profileSnapshot(profile);
+  }
+
+  upsertSession(input: UpsertHumanSessionInput): CredentialedHumanMemoryProfile {
     const tokenHash = input.tokenHash.toLowerCase();
     if (!TOKEN_HASH.test(tokenHash)) throw new TypeError("Human memory accepts only a SHA-256 tokenHash, never a raw session token.");
     const member = sanitizeMember(input.member);
@@ -743,13 +824,20 @@ export class HumanMemoryStore implements HumanMemory {
     if (profile) {
       // The existing token mapping owns the stable identity; caller-supplied IDs cannot replace it.
       if (byToken && byHuman && byToken !== byHuman) this.removeInternal(byHuman.member.id);
-      if (!byToken && profile.tokenHash !== tokenHash) this.humanIdByTokenHash.delete(profile.tokenHash);
-      profile.tokenHash = tokenHash;
+      if (!byToken && profile.credential?.tokenHash !== tokenHash && profile.credential) {
+        this.humanIdByTokenHash.delete(profile.credential.tokenHash);
+      }
+      profile.credential = {
+        tokenHash,
+        ...(profile.credential?.recoveryKeyHash !== undefined
+          ? { recoveryKeyHash: profile.credential.recoveryKeyHash }
+          : {}),
+      };
       profile.member = { ...member, id: profile.member.id, status: "offline" };
       profile.lastSeenAt = Math.max(profile.lastSeenAt, at);
     } else {
       profile = {
-        tokenHash,
+        credential: { tokenHash },
         member,
         createdAt: at,
         lastSeenAt: at,
@@ -763,14 +851,21 @@ export class HumanMemoryStore implements HumanMemory {
     this.humanIdByTokenHash.set(tokenHash, profile.member.id);
     this.pruneInternal(at, input.protectedHumanIds);
     this.schedulePersist();
-    return profileSnapshot(profile);
+    return credentialedProfileSnapshot(profile);
+  }
+
+  listProfiles(): HumanMemoryProfile[] {
+    return [...this.profilesByHumanId.values()]
+      .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
+      .map(profileSnapshot);
   }
 
   listRestorableProfiles(): RestorableHumanProfile[] {
     return [...this.profilesByHumanId.values()]
+      .filter((profile): profile is InternalProfile & { credential: HumanMemoryCredential } => Boolean(profile.credential))
       .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
       .map((profile) => ({
-        tokenHash: profile.tokenHash,
+        tokenHash: profile.credential.tokenHash,
         member: cloneMember(profile.member),
         lastSeenAt: profile.lastSeenAt,
       }));
@@ -781,14 +876,15 @@ export class HumanMemoryStore implements HumanMemory {
     return profile ? profileSnapshot(profile) : undefined;
   }
 
-  findByTokenHash(tokenHash: string): HumanMemoryProfile | undefined {
+  findByTokenHash(tokenHash: string): CredentialedHumanMemoryProfile | undefined {
     const normalizedHash = tokenHash.toLowerCase();
     if (!TOKEN_HASH.test(normalizedHash)) return undefined;
     const humanId = this.humanIdByTokenHash.get(normalizedHash);
-    return humanId ? this.findByHumanId(humanId) : undefined;
+    const profile = humanId ? this.profilesByHumanId.get(humanId) : undefined;
+    return profile?.credential ? credentialedProfileSnapshot(profile) : undefined;
   }
 
-  findByRecoveryKey(name: string, recoveryKeyHash: string): HumanMemoryProfile | undefined {
+  findByRecoveryKey(name: string, recoveryKeyHash: string): CredentialedHumanMemoryProfile | undefined {
     const normalizedName = normalizeDisplayName(name);
     if (!validDisplayName(normalizedName)) {
       // Keep the digest comparison shape even when the display name cannot
@@ -799,7 +895,8 @@ export class HumanMemoryStore implements HumanMemory {
     }
     const identityKey = participantIdentityKey(normalizedName);
     const matches = [...this.profilesByHumanId.values()].filter(
-      (profile) => participantIdentityKey(profile.member.name) === identityKey,
+      (profile): profile is InternalProfile & { credential: HumanMemoryCredential } =>
+        Boolean(profile.credential) && participantIdentityKey(profile.member.name) === identityKey,
     );
     if (matches.length === 0) {
       humanIdentityRecoveryKeyHashesMatch(recoveryKeyHash, undefined);
@@ -809,8 +906,8 @@ export class HumanMemoryStore implements HumanMemory {
     // identity. Compare every matching digest and recover only when the secret
     // itself selects exactly one actor; a duplicated digest remains ambiguous.
     const authenticated = matches.filter((profile) =>
-      humanIdentityRecoveryKeyHashesMatch(recoveryKeyHash, profile.recoveryKeyHash));
-    return authenticated.length === 1 ? profileSnapshot(authenticated[0]!) : undefined;
+      humanIdentityRecoveryKeyHashesMatch(recoveryKeyHash, profile.credential.recoveryKeyHash));
+    return authenticated.length === 1 ? credentialedProfileSnapshot(authenticated[0]!) : undefined;
   }
 
   replaceRecoveryKeyHash(humanId: string, nextHash: string | undefined): string | undefined {
@@ -818,16 +915,16 @@ export class HumanMemoryStore implements HumanMemory {
       throw new TypeError("Human memory accepts only a SHA-256 recovery-key digest.");
     }
     const profile = this.profilesByHumanId.get(humanId);
-    if (!profile) return undefined;
-    const previous = profile.recoveryKeyHash;
-    if (nextHash === undefined) delete profile.recoveryKeyHash;
-    else profile.recoveryKeyHash = nextHash;
+    if (!profile?.credential) return undefined;
+    const previous = profile.credential.recoveryKeyHash;
+    if (nextHash === undefined) delete profile.credential.recoveryKeyHash;
+    else profile.credential.recoveryKeyHash = nextHash;
     if (previous !== nextHash) this.schedulePersist();
     return previous;
   }
 
   hasRecoveryKey(humanId: string): boolean {
-    return this.profilesByHumanId.get(humanId)?.recoveryKeyHash !== undefined;
+    return this.profilesByHumanId.get(humanId)?.credential?.recoveryKeyHash !== undefined;
   }
 
   rotateSessionToken(
@@ -835,21 +932,55 @@ export class HumanMemoryStore implements HumanMemory {
     expectedOldHash: string,
     nextHash: string,
     seenAt = this.now(),
-  ): HumanMemoryProfile | undefined {
+  ): CredentialedHumanMemoryProfile | undefined {
     const expected = expectedOldHash.toLowerCase();
     const next = nextHash.toLowerCase();
     if (!TOKEN_HASH.test(expected) || !TOKEN_HASH.test(next) || expected === next) return undefined;
     const profile = this.profilesByHumanId.get(humanId);
-    if (!profile || profile.tokenHash !== expected) return undefined;
+    if (!profile?.credential || profile.credential.tokenHash !== expected) return undefined;
     const nextOwner = this.humanIdByTokenHash.get(next);
     if (nextOwner && nextOwner !== humanId) return undefined;
 
     this.humanIdByTokenHash.delete(expected);
-    profile.tokenHash = next;
+    profile.credential.tokenHash = next;
     profile.lastSeenAt = Math.max(profile.lastSeenAt, Math.max(0, finiteNumber(seenAt, this.now())));
     this.humanIdByTokenHash.set(next, humanId);
     this.schedulePersist();
-    return profileSnapshot(profile);
+    return credentialedProfileSnapshot(profile);
+  }
+
+  detachCredential(
+    humanId: string,
+    expectedTokenHash?: string,
+  ): DetachedHumanMemoryCredential | undefined {
+    const profile = this.profilesByHumanId.get(humanId);
+    if (!profile?.credential) return undefined;
+    if (expectedTokenHash !== undefined) {
+      const expected = expectedTokenHash.toLowerCase();
+      if (!TOKEN_HASH.test(expected) || profile.credential.tokenHash !== expected) return undefined;
+    }
+    const detached = { ...profile.credential };
+    this.humanIdByTokenHash.delete(detached.tokenHash);
+    delete profile.credential;
+    this.schedulePersist();
+    return detached;
+  }
+
+  restoreCredential(humanId: string, credential: DetachedHumanMemoryCredential): boolean {
+    const profile = this.profilesByHumanId.get(humanId);
+    const tokenHash = credential.tokenHash.toLowerCase();
+    if (!profile || profile.credential || !TOKEN_HASH.test(tokenHash)) return false;
+    if (credential.recoveryKeyHash !== undefined &&
+        !isHumanIdentityRecoveryKeyHash(credential.recoveryKeyHash)) return false;
+    const existingOwner = this.humanIdByTokenHash.get(tokenHash);
+    if (existingOwner && existingOwner !== humanId) return false;
+    profile.credential = {
+      tokenHash,
+      ...(credential.recoveryKeyHash ? { recoveryKeyHash: credential.recoveryKeyHash } : {}),
+    };
+    this.humanIdByTokenHash.set(tokenHash, humanId);
+    this.schedulePersist();
+    return true;
   }
 
   noteVisit(humanId: string, at = this.now()): HumanVisitResult | undefined {
@@ -1086,11 +1217,43 @@ export class HumanMemoryStore implements HumanMemory {
     return result;
   }
 
-  private sanitizeProfile(raw: unknown, now: number): InternalProfile | undefined {
+  private sanitizeProfile(raw: unknown, now: number, schemaVersion: unknown): InternalProfile | undefined {
     const value = asRecord(raw);
     if (!value) return undefined;
-    const tokenHash = boundedString(value.tokenHash, 64)?.toLowerCase();
-    const recoveryKeyHash = value.recoveryKeyHash;
+    let credential: HumanMemoryCredential | undefined;
+    if (schemaVersion === 2) {
+      // v2 owns credentials in one explicit optional record. Accepting old
+      // top-level fields here would silently reintroduce dual authentication.
+      if (value.tokenHash !== undefined || value.recoveryKeyHash !== undefined) return undefined;
+      if (value.credential !== undefined) {
+        const rawCredential = asRecord(value.credential);
+        const tokenHash = boundedString(rawCredential?.tokenHash, 64)?.toLowerCase();
+        const recoveryKeyHash = rawCredential?.recoveryKeyHash;
+        if (
+          !rawCredential ||
+          !tokenHash ||
+          !TOKEN_HASH.test(tokenHash) ||
+          (recoveryKeyHash !== undefined && !isHumanIdentityRecoveryKeyHash(recoveryKeyHash))
+        ) return undefined;
+        credential = {
+          tokenHash,
+          ...(typeof recoveryKeyHash === "string" ? { recoveryKeyHash } : {}),
+        };
+      }
+    } else {
+      // Legacy/v1 companions always represented a recoverable guest session.
+      const tokenHash = boundedString(value.tokenHash, 64)?.toLowerCase();
+      const recoveryKeyHash = value.recoveryKeyHash;
+      if (
+        !tokenHash ||
+        !TOKEN_HASH.test(tokenHash) ||
+        (recoveryKeyHash !== undefined && !isHumanIdentityRecoveryKeyHash(recoveryKeyHash))
+      ) return undefined;
+      credential = {
+        tokenHash,
+        ...(typeof recoveryKeyHash === "string" ? { recoveryKeyHash } : {}),
+      };
+    }
     const legacyMember = value.member ?? {
       id: value.humanId,
       name: value.name,
@@ -1100,12 +1263,7 @@ export class HumanMemoryStore implements HumanMemory {
       bio: value.bio,
     };
     const member = sanitizeMember(legacyMember);
-    if (
-      !tokenHash ||
-      !TOKEN_HASH.test(tokenHash) ||
-      !member ||
-      (recoveryKeyHash !== undefined && !isHumanIdentityRecoveryKeyHash(recoveryKeyHash))
-    ) return undefined;
+    if (!member) return undefined;
 
     const createdAt = Math.max(0, finiteNumber(value.createdAt ?? value.firstSeenAt, now));
     const lastSeenAt = Math.max(createdAt, finiteNumber(value.lastSeenAt, createdAt));
@@ -1150,8 +1308,7 @@ export class HumanMemoryStore implements HumanMemory {
     }
 
     const profile: InternalProfile = {
-      tokenHash,
-      ...(typeof recoveryKeyHash === "string" ? { recoveryKeyHash } : {}),
+      ...(credential ? { credential } : {}),
       member,
       createdAt,
       lastSeenAt,
@@ -1195,17 +1352,18 @@ export class HumanMemoryStore implements HumanMemory {
     let profilesRemoved = 0;
     let factsRemoved = 0;
     for (const profile of [...this.profilesByHumanId.values()]) {
-      if (at - profile.lastSeenAt > this.retentionMs && !protectedHumanIds.has(profile.member.id)) {
+      const protectedProfile = !profile.credential || protectedHumanIds.has(profile.member.id);
+      if (at - profile.lastSeenAt > this.retentionMs && !protectedProfile) {
         if (this.removeInternal(profile.member.id)) profilesRemoved += 1;
       } else {
         factsRemoved += this.removeExpiredFacts(profile, at);
       }
     }
     const protectedCount = [...this.profilesByHumanId.values()]
-      .filter((profile) => protectedHumanIds.has(profile.member.id)).length;
+      .filter((profile) => !profile.credential || protectedHumanIds.has(profile.member.id)).length;
     const allowedUnprotected = Math.max(0, this.maxProfiles - protectedCount);
     const overflow = [...this.profilesByHumanId.values()]
-      .filter((profile) => !protectedHumanIds.has(profile.member.id))
+      .filter((profile) => profile.credential && !protectedHumanIds.has(profile.member.id))
       .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
       .slice(allowedUnprotected);
     for (const profile of overflow) {
@@ -1218,7 +1376,7 @@ export class HumanMemoryStore implements HumanMemory {
     const profile = this.profilesByHumanId.get(humanId);
     if (!profile) return false;
     this.profilesByHumanId.delete(humanId);
-    this.humanIdByTokenHash.delete(profile.tokenHash);
+    if (profile.credential) this.humanIdByTokenHash.delete(profile.credential.tokenHash);
     if (queueForget) this.pendingActorForgetIds.add(humanId);
     return true;
   }
@@ -1230,16 +1388,17 @@ export class HumanMemoryStore implements HumanMemory {
     };
   }
 
-  private serialize(): PersistedHumanMemory {
+  private serialize(): PersistedHumanMemoryV2 {
     return {
-      version: 1,
+      version: 2,
       continuityVerified: this.continuityVerified,
       pendingActorForgetIds: [...this.pendingActorForgetIds].sort(),
       profiles: [...this.profilesByHumanId.values()]
         .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
         .map((profile) => ({
-          tokenHash: profile.tokenHash,
-          ...(profile.recoveryKeyHash !== undefined ? { recoveryKeyHash: profile.recoveryKeyHash } : {}),
+          ...(profile.credential
+            ? { credential: { ...profile.credential } }
+            : {}),
           member: cloneMember(profile.member),
           createdAt: profile.createdAt,
           lastSeenAt: profile.lastSeenAt,

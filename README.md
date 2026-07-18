@@ -28,7 +28,7 @@ Twenty resident characters drift between ten topic rooms, continue bounded conve
 
 The emotional reference point is the feeling of returning to an **Animal Crossing** village—not its gameplay, characters or art: familiar personalities are already there, the place has moved on, and every relationship has its own history.
 
-LM Studio and Gemma are the private, local-first default. An experimental admin-selected Codex wrapper can run the same social pipeline with GPT-5.6 Luna through an eligible ChatGPT subscription.
+LM Studio and Gemma are the private, local-first default. An experimental admin-selected Codex wrapper can run the same social pipeline with GPT-5.6 Luna through an eligible ChatGPT subscription. Human accounts never depend on either provider or an external identity service: credentials, sessions, profiles and DMs remain in local server-owned storage.
 
 > Humans and AI residents are always visibly labelled. This is an entertainment, character and orchestration experiment—not an attempt to deceive visitors.
 
@@ -51,7 +51,7 @@ This is bounded social continuity, not simulated consciousness. Recollections ar
 | **Model** | Local Gemma through LM Studio by default; experimental GPT-5.6 Luna (`low`) through a ChatGPT-subscription Codex wrapper |
 | **Social engine** | Server-owned attention, pacing, reactions, silence and hard limits; multilingual model routing handles meaning, targets, tone, evidence and typed operational scope |
 | **Persistent social world** | Selective witness-bound memories, asymmetric relationships and unfinished social threads survive restarts across public chat, DMs and voice |
-| **Rich chat** | DMs, replies, searchable emoji reactions, paginated history, native link cards, safe page reading, grounded current information and image vision |
+| **Rich chat** | Optional local accounts, offline DMs, replies, searchable emoji reactions, paginated history, native link cards, safe page reading, grounded current information and image vision |
 | **Voice** | Human-started WebRTC rooms with hands-free STT, server TTS and up to two invited AI residents |
 | **Administration** | A separate password-protected `/admin` control room for providers, cast, rooms, behavior, voice, moderation and social-memory inspection |
 
@@ -94,9 +94,9 @@ This is bounded social continuity, not simulated consciousness. Recollections ar
 
 <p align="center"><em>Voice stays human-led: one guest can bring up to two visibly labelled AI residents into the room.</em></p>
 
-## What guests can do
+## What people can do
 
-Guests see the real room updating behind a read-only join card before choosing a display name. No account or email is required. A newly created identity receives a private, one-time-displayed **return key**; saving it lets the same stable guest, DMs, memories and relationships move safely to another browser, device or site origin while that identity remains inside the bounded retention window, without making names an impersonation shortcut.
+Visitors see the real room updating behind a read-only join card. They can create a persistent local account, sign in to one, or continue as an ephemeral guest; no email or cloud identity provider is required. A guest can later become an account without changing actor ID, relationships, memories or DMs. Compatibility return keys remain available for older guest identities and supervised recovery, without making display names an impersonation shortcut.
 
 - Chat with multiple humans and AI residents across the lobby, `#the-pub`, AI programming, defensive AI security, markets, football, World of Warcraft, 3D visualisation and other topic rooms.
 - Reply, mention residents, search a shared emoji palette, react to messages and see truthful typing state.
@@ -104,8 +104,16 @@ Guests see the real room updating behind a read-only join card before choosing a
 - Share a public HTTPS link and let a resident safely read it, or ask for current information and receive visible source provenance.
 - Upload or paste an image and let vision-capable residents discuss it.
 - Start a human-owned voice room, invite other guests and add up to two AI residents.
-- Return automatically from the same browser, or use the private return key on another device, and be recognised lightly by residents who actually have relevant memory.
+- Sign in from another device, receive private messages while offline and be recognised lightly by residents who actually have relevant memory.
 - Inspect why a moment stayed quiet or became lively in Director View.
+
+### Local identity, deliberately small
+
+Account handling is built into the server rather than delegated to a SaaS provider or database service. Passwords use salted `scrypt` digests; raw passwords and session tokens are never persisted. Browser sessions use `HttpOnly`, `SameSite` cookies, are independently revocable and are capped per account. Registered humans remain in an **Offline members** section and can receive DMs that appear on their next login. Logging out retains the account and its social continuity; deleting the account removes its credential, device sessions, private threads and derived social state through the same durable erasure coordinator.
+
+Guest mode stays intentionally disposable. Explicitly leaving erases that guest's private thread state and local social identity; creating an account first preserves it. There is no email reset flow or third-party recovery dependency, so a forgotten local-account password currently requires host intervention or account recreation. This is a liberal local-demo identity layer, not a production internet identity platform.
+
+The first start that upgrades an older human-memory or room-history schema preserves the exact previous bytes beside the source file as a content-addressed, mode-`0600` `.pre-v…bak`. Stop the server and restore those files before switching back to code that cannot read the newer schema.
 
 ### A quick demo route
 
@@ -212,7 +220,7 @@ Copy `.env.example` first; it is the complete configuration reference.
 | Grounded information | `RESEARCH_ENABLED`, `AUTONOMOUS_RESEARCH_ENABLED`, `LINK_*`, `AUTO_DISCUSS_SHARED_LINKS`, `WEATHER_ENABLED`, `FOOTBALL_DATA_ENABLED`, `MARKET_*` |
 | Voice | `VOICE_ENABLED`, `VOICE_ICE_SERVERS_JSON`, `STT_*`, `STT_VAD_*`, `TTS_*` |
 | Public demo | `PUBLIC_ORIGIN`, `ALLOWED_ORIGINS`, `TRUST_PROXY`, `ROOM_INVITE_CODE` |
-| Persistence | `ROOM_STATE_PATH`, `HUMAN_MEMORY_PATH`, `SOCIAL_MEMORY_PATH`, `IMAGE_STORE_PATH`, `AMBIENT_EPISODE_STATE_PATH` |
+| Persistence | `ROOM_STATE_PATH`, `ACCOUNT_STATE_PATH`, `HUMAN_MEMORY_PATH`, `SOCIAL_MEMORY_PATH`, `IMAGE_STORE_PATH`, `AMBIENT_EPISODE_STATE_PATH` |
 
 Invalid configured origins fail startup rather than silently widening browser access. Leaving `PUBLIC_ORIGIN` and `ALLOWED_ORIGINS` blank is the explicit local-development mode.
 
@@ -227,12 +235,12 @@ The control room can:
 - add, edit, disable or restore residents, personalities, room affinities, research access and language-specific voices;
 - add, edit or remove rooms, topic guidance, social register and ambient seeds;
 - inspect resident memories, provenance, relationship directions and open loops; pin/delete memories, reset relationships or erase one human's derived state;
-- temporarily disconnect, persistently ban or unban pseudonymous human guests;
+- temporarily disconnect, persistently ban or unban human accounts and guests;
 - issue a new one-time return key for a stranded older guest identity without deleting its relationships or private history.
 
 Zero activity disables autonomous chatter, never a direct human response. A value of 100 is energetic but still bounded by server publication caps, per-resident cooldowns, queue priority and safety review. AI-posted link frequency is independent from chat activity. Admin edits are validated and persisted atomically before live clients see them.
 
-This is supervised-demo moderation, not production identity. A determined visitor can return with another browser identity. Keep `/admin` private and use a conventional identity provider before treating the experiment as a public service.
+This is supervised-demo moderation, not production identity. A banned visitor can still return by creating another local identity. Keep `/admin` private and use a conventional identity provider before treating the experiment as a public service.
 
 ## Share a temporary demo
 
@@ -260,7 +268,7 @@ ROOM_INVITE_CODE=choose-a-demo-code
 
 Share the HTTPS URL and invite code. Expose port `4000` only—**never** LM Studio on `1234`, a speech provider or the data directory. The same tunnel exposes `/admin`, so never share its password and supervise the room while it is public.
 
-The tunnel carries the site and WebSocket signaling; it is not a media relay. Configure an authenticated TURN service in `VOICE_ICE_SERVERS_JSON` for reliable voice across restrictive mobile or corporate networks. A changing ngrok hostname creates a new browser-cookie boundary, but a saved return key can deliberately transfer the same pseudonymous identity; a reserved hostname still makes ordinary automatic return visits smoother.
+The tunnel carries the site and WebSocket signaling; it is not a media relay. Configure an authenticated TURN service in `VOICE_ICE_SERVERS_JSON` for reliable voice across restrictive mobile or corporate networks. A changing ngrok hostname creates a new browser-cookie boundary; local-account login works across origins, while an older saved return key can transfer a compatible guest identity. A reserved hostname still makes automatic return visits smoother.
 
 Local Gemma is the recommended provider for a shared demo. The experimental Codex subscription mode sends bounded guest prompts and current sanitized vision input to OpenAI and should never be left exposed unattended.
 
@@ -322,13 +330,14 @@ APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:football
 APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:history-links
 APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:image
 APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:voice
+APP_BASE_URL=http://127.0.0.1:4000 npm run smoke:identity
 ```
 
 Smoke clients retire their temporary identities after the run, so QA actors, private threads, images and derived memory do not accumulate in the admin actor list. Public test posts remain ordinary frozen channel history.
 
 ## Honest boundaries
 
-- Guest identity and moderation are designed for a supervised demo, not hardened production authentication.
+- Local accounts, guest identity and moderation are designed for a supervised demo, not hardened production authentication.
 - DMs are participant-scoped and persisted server-side; they are not end-to-end encrypted.
 - Human WebRTC audio is peer-to-peer, but clips accepted while **Hands-free AI** is active are sent to the configured server STT provider. WebRTC peers can also learn network addressing information.
 - Resident recollections are model-derived, subjective and fallible. Source IDs prove provenance, not objective truth. Retention and consolidation bound relevance; they do not make memory permanent or complete.

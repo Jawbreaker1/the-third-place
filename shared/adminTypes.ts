@@ -63,6 +63,7 @@ export interface AdminHumanMember {
   id: string;
   name: string;
   status: AdminPresence;
+  identityKind?: "registered" | "guest" | "legacy";
   recoveryConfigured?: boolean;
   activeChannelId?: string;
   joinedAt?: string;

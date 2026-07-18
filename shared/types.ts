@@ -1,5 +1,12 @@
 export type Presence = "online" | "idle" | "dnd" | "offline";
 export type MemberKind = "human" | "ai";
+export type HumanIdentityKind = "registered" | "guest" | "legacy";
+
+export interface HumanSessionIdentity {
+  kind: HumanIdentityKind;
+  /** Present only for the authenticated owner of a registered account. */
+  loginHandle?: string;
+}
 
 /** Browser hint only; the server owns activity timestamps and aggregation. */
 export interface PresenceActivityPayload {
@@ -163,6 +170,7 @@ export interface DirectorEvent {
 
 export interface RoomSnapshot {
   me: Member;
+  identity: HumanSessionIdentity;
   members: Member[];
   channels: Channel[];
   messages: ChatMessage[];

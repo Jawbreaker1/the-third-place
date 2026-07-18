@@ -1401,9 +1401,9 @@ export default function AdminApp() {
             {snapshot.humans.map((human) => (
               <article key={human.id}>
                 <span className={`admin-presence ${human.status}`} aria-label={human.status} />
-                <div><strong>{human.name}</strong><small>{human.activeChannelId ? `#${human.activeChannelId}` : human.status === "offline" ? "saved identity · not connected" : human.status}{` · ${human.recoveryConfigured ? "return key configured" : "no return key"}`}{human.joinedAt ? ` · recorded ${formatDateTime(human.joinedAt)}` : ""}</small></div>
+                <div><strong>{human.name}</strong><small>{human.activeChannelId ? `#${human.activeChannelId}` : human.status === "offline" ? "saved identity · not connected" : human.status}{human.identityKind === "registered" ? " · local account" : ` · ${human.recoveryConfigured ? "return key configured" : "no return key"}`}{human.joinedAt ? ` · recorded ${formatDateTime(human.joinedAt)}` : ""}</small></div>
                 <div className="admin-row-actions">
-                  <button
+                  {human.identityKind !== "registered" && <button
                     className="admin-button subtle compact"
                     disabled={Boolean(busy)}
                     onClick={() => setConfirm({
@@ -1438,7 +1438,7 @@ export default function AdminApp() {
                       },
                     })}
                     type="button"
-                  >{busy === `return-key-${human.id}` ? "Working…" : human.recoveryConfigured ? "Rotate return key" : "Issue return key"}</button>
+                  >{busy === `return-key-${human.id}` ? "Working…" : human.recoveryConfigured ? "Rotate return key" : "Issue return key"}</button>}
                   <button className="admin-button subtle compact" disabled={human.status === "offline"} onClick={() => setConfirm({
                     title: `Kick ${human.name}?`,
                     message: "Their current sockets will be disconnected. They may join again unless banned.",

@@ -159,10 +159,95 @@ describe("room history", () => {
     ]);
     expect(restored.getAllMessages().some((message) => message.channelId === thread.id)).toBe(false);
     expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
-      version: 4,
+      version: 5,
       trustedChannelLanguages: [],
       pendingPublicTurns: [],
     });
+  });
+
+  it("persists unread private messages for an offline participant and advances read state explicitly", async () => {
+    const filePath = tempStorePath();
+    const first = new RoomStore(filePath);
+    await first.load();
+    const thread = first.openDm("human-alice", "human-bob");
+    const sent = first.addDmMessage(thread.id, "human-alice", "Det här väntar tills du kommer tillbaka.");
+    expect(sent).toBeDefined();
+    expect(first.getDmThreads("human-bob")[0]?.unread).toBe(1);
+    expect(first.getDmThreads("human-alice")[0]?.unread).toBe(0);
+    await first.flush();
+
+    const restarted = new RoomStore(filePath);
+    await restarted.load();
+    expect(restarted.getDmThreads("human-bob")[0]?.unread).toBe(1);
+    expect(restarted.markDmRead(thread.id, "human-bob", sent!.id)?.unread).toBe(0);
+    await restarted.flush();
+
+    const readRestart = new RoomStore(filePath);
+    await readRestart.load();
+    expect(readRestart.getDmThreads("human-bob")[0]?.unread).toBe(0);
+  });
+
+  it("migrates legacy private threads as read without creating historical unread badges", async () => {
+    const filePath = tempStorePath();
+    const threadId = "dm:human-alice:human-bob";
+    const historical = createMessage(threadId, "human-alice", "gammalt meddelande");
+    const legacyBytes = JSON.stringify({
+      version: 4,
+      messages: [],
+      privateThreads: [{
+        id: threadId,
+        participantIds: ["human-alice", "human-bob"],
+        messages: [historical],
+      }],
+      autonomousPublications: [],
+      trustedChannelLanguages: [],
+      pendingPublicTurns: [],
+    });
+    await writeFile(filePath, legacyBytes, "utf8");
+
+    const migrated = new RoomStore(filePath);
+    await migrated.load();
+    expect(migrated.getDmThreads("human-bob")[0]?.unread).toBe(0);
+    const persisted = JSON.parse(await readFile(filePath, "utf8")) as {
+      version: number;
+      privateThreads: Array<{ readReceipts?: unknown[] }>;
+    };
+    expect(persisted.version).toBe(5);
+    expect(persisted.privateThreads[0]?.readReceipts).toHaveLength(2);
+    const backupName = (await readdir(dirname(filePath))).find((name) =>
+      name.startsWith(`${basename(filePath)}.pre-v5-from-4-`)
+    );
+    expect(backupName).toBeDefined();
+    expect(await readFile(`${dirname(filePath)}/${backupName}`, "utf8")).toBe(legacyBytes);
+  });
+
+  it("fails closed on a private read cursor beyond the durable thread tail", async () => {
+    const filePath = tempStorePath();
+    const threadId = "dm:human-alice:human-bob";
+    const message = createMessage(threadId, "human-alice", "bounded cursor", {
+      createdAt: "2026-07-18T12:00:00.000Z",
+    });
+    const bytes = JSON.stringify({
+      version: 5,
+      messages: [],
+      privateThreads: [{
+        id: threadId,
+        participantIds: ["human-alice", "human-bob"],
+        messages: [message],
+        readReceipts: [
+          { participantId: "human-alice", readThrough: { createdAt: message.createdAt, id: message.id } },
+          { participantId: "human-bob", readThrough: { createdAt: "2099-01-01T00:00:00.000Z", id: "future" } },
+        ],
+      }],
+      autonomousPublications: [],
+      trustedChannelLanguages: [],
+      pendingPublicTurns: [],
+    });
+    await writeFile(filePath, bytes, "utf8");
+
+    const store = new RoomStore(filePath);
+    await expect(store.load()).rejects.toBeInstanceOf(RoomStateLoadError);
+    expect(await readFile(filePath, "utf8")).toBe(bytes);
   });
 
   it("persists private image rows and authorizes only their exact DM participants", async () => {
@@ -342,7 +427,7 @@ describe("room history", () => {
       trustedChannelLanguages: unknown[];
     };
     expect(persisted).toMatchObject({
-      version: 4,
+      version: 5,
       trustedChannelLanguages: [{
         channelId: "lobby",
         languageTag: "sv",
@@ -732,7 +817,7 @@ describe("room history", () => {
       version: number;
       messages: Array<{ id: string }>;
     };
-    expect(persisted.version).toBe(4);
+    expect(persisted.version).toBe(5);
     expect(persisted.messages.map((message) => message.id)).toEqual(expectedIds);
 
     const temporaryPrefix = `${basename(filePath)}.`;
@@ -760,7 +845,7 @@ describe("room history", () => {
       messages: Array<{ id: string }>;
       pendingPublicTurns: Array<{ messageId: string; targets: Array<{ personaId: string }> }>;
     };
-    expect(persisted.version).toBe(4);
+    expect(persisted.version).toBe(5);
     expect(persisted.messages.some((message) => message.id === trigger.id)).toBe(true);
     expect(persisted.pendingPublicTurns).toEqual([expect.objectContaining({
       messageId: trigger.id,

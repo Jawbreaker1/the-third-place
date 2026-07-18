@@ -3510,8 +3510,8 @@ export class SocialDirector {
         result.linkPreview,
       );
       if (!reply) return;
-      const thread = this.store.openDm(result.human.id, result.persona.id);
-      this.io.to(`user:${result.human.id}`).emit("dm:update", { thread, message: reply });
+      const thread = this.store.getDmThread(result.human.id, result.persona.id);
+      if (thread) this.io.to(`user:${result.human.id}`).emit("dm:update", { thread, message: reply });
       this.lm.rememberDeliveredLine(result.persona.id, result.content, {
         kind: "dm",
         channelId: result.threadId,
