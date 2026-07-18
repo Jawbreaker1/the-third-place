@@ -160,11 +160,11 @@ const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_BASE_MS = 60_000;
 const AUTONOMOUS_RESEARCH_FAILURE_BACKOFF_MAX_MS = 4 * 60_000;
 const AUTONOMOUS_RESEARCH_SEED_BACKOFF_BASE_MS = 30 * 60_000;
 const AUTONOMOUS_RESEARCH_SEED_BACKOFF_MAX_MS = 6 * 60 * 60_000;
-const AUTONOMOUS_RESEARCH_RECENT_HUMAN_WINDOW_MS = 10 * 60_000;
-const AUTONOMOUS_RESEARCH_RECENT_CHANCE_WEIGHT = 1.35;
-const AUTONOMOUS_RESEARCH_RECENT_SELECTION_WEIGHT = 1.4;
-const AUTONOMOUS_RESEARCH_RECENT_GLOBAL_COOLDOWN_FACTOR = 0.8;
-const AUTONOMOUS_RESEARCH_BACKGROUND_DAILY_CAP_FACTOR = 0.75;
+const AUTONOMOUS_RESEARCH_RECENT_HUMAN_WINDOW_MS = 45 * 60_000;
+const AUTONOMOUS_RESEARCH_RECENT_SELECTION_WEIGHT = 3;
+const AUTONOMOUS_RESEARCH_RECENT_CHANNEL_COOLDOWN_FACTOR = 0.75;
+const AUTONOMOUS_RESEARCH_ATTENDANCE_CREDIT_MS = 45 * 60_000;
+const AUTONOMOUS_RESEARCH_PRIORITY_CREDIT_MS = 5 * 60_000;
 const AMBIENT_BUSY_RETRY_MIN_MS = 4_000;
 const AMBIENT_BUSY_RETRY_MAX_MS = 8_000;
 const HUMAN_REACTION_STATE_LIMIT = 1_000;
@@ -614,6 +614,10 @@ export function selectAmbientSeed(
   recentSeeds: readonly string[],
   rng: () => number,
   families: readonly string[] = [],
+  recency?: {
+    lastUsedAtBySeed: ReadonlyMap<string, number>;
+    lastUsedAtByFamily: ReadonlyMap<string, number>;
+  },
 ): string | undefined {
   if (premises.length === 0) return undefined;
   const recent = new Set(recentSeeds.slice(-Math.min(AMBIENT_RECENT_SEED_WINDOW, Math.max(0, premises.length - 1))));
@@ -631,7 +635,18 @@ export function selectAmbientSeed(
     const previous = recentSeeds.at(-1);
     pool = premises.filter((seed) => premises.length === 1 || seed !== previous);
   }
-  return choose([...(pool.length > 0 ? pool : premises)], rng);
+  pool = [...(pool.length > 0 ? pool : premises)];
+  if (recency && pool.length > 1) {
+    const familyAge = (seed: string): number =>
+      recency.lastUsedAtByFamily.get(familyBySeed.get(seed) ?? "") ?? Number.NEGATIVE_INFINITY;
+    const oldestFamilyUse = Math.min(...pool.map(familyAge));
+    pool = pool.filter((seed) => familyAge(seed) === oldestFamilyUse);
+    const seedAge = (seed: string): number =>
+      recency.lastUsedAtBySeed.get(seed) ?? Number.NEGATIVE_INFINITY;
+    const oldestSeedUse = Math.min(...pool.map(seedAge));
+    pool = pool.filter((seed) => seedAge(seed) === oldestSeedUse);
+  }
+  return choose(pool, rng);
 }
 
 export function ambientChannelScore(input: {
@@ -1175,34 +1190,28 @@ export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boo
 }
 
 export interface AutonomousResearchActivityPolicy extends AutonomousLinkPolicy {
-  /** Affects only weighted room ordering; it never changes room cooldowns. */
+  /** Bounded attendance preference used after every ordinary safety gate. */
   selectionWeight: number;
 }
 
 /**
  * A content- and language-blind attendance overlay. A recently participating
- * human gives only that room a modest opportunity/ordering lift. Background
- * rooms retain the ordinary cadence but stop at three quarters of the same
- * global rolling cap, leaving capacity for a later attended session.
+ * human gives only that room a bounded channel/ordering lift. Every room uses
+ * the same global cadence and rolling cap: candidate-specific global clocks
+ * can otherwise let several attended rooms reset the shared timer forever
+ * before a background room becomes eligible, or create a cap cliff on logout.
  */
 export function autonomousResearchActivityPolicy(
   policy: AutonomousLinkPolicy,
   recentHumanActivity: boolean,
 ): AutonomousResearchActivityPolicy {
   if (!policy.enabled) return { ...policy, chance: 0, dailyCap: 0, selectionWeight: 1 };
-  if (!recentHumanActivity) {
-    return {
-      ...policy,
-      dailyCap: Math.max(1, Math.floor(policy.dailyCap * AUTONOMOUS_RESEARCH_BACKGROUND_DAILY_CAP_FACTOR)),
-      selectionWeight: 1,
-    };
-  }
+  if (!recentHumanActivity) return { ...policy, selectionWeight: 1 };
   return {
     ...policy,
-    chance: 1 - (1 - clamp(policy.chance, 0, 1)) ** AUTONOMOUS_RESEARCH_RECENT_CHANCE_WEIGHT,
-    globalCooldownMs: Math.max(
+    channelCooldownMs: Math.max(
       60_000,
-      Math.round(policy.globalCooldownMs * AUTONOMOUS_RESEARCH_RECENT_GLOBAL_COOLDOWN_FACTOR),
+      Math.round(policy.channelCooldownMs * AUTONOMOUS_RESEARCH_RECENT_CHANNEL_COOLDOWN_FACTOR),
     ),
     selectionWeight: AUTONOMOUS_RESEARCH_RECENT_SELECTION_WEIGHT,
   };
@@ -1216,6 +1225,34 @@ export function weightAutonomousResearchSelection(
   const key = clamp(selectionKey, Number.EPSILON, 1);
   const weight = clamp(selectionWeight, 1, AUTONOMOUS_RESEARCH_RECENT_SELECTION_WEIGHT);
   return key ** (1 / weight);
+}
+
+export interface AutonomousResearchOpportunityOrder {
+  recentHumanActivity: boolean;
+  lastChannelSuccessAt?: number;
+  selectionKey: number;
+}
+
+/**
+ * Waiting time remains authoritative. Recent human activity and declarative
+ * room priority can make a room appear only a bounded amount older, so they
+ * improve responsiveness without forming an absolute lane that can starve
+ * quieter rooms while one or more people remain active elsewhere.
+ */
+export function compareAutonomousResearchOpportunities(
+  left: AutonomousResearchOpportunityOrder,
+  right: AutonomousResearchOpportunityOrder,
+): number {
+  const creditedAt = (opportunity: AutonomousResearchOpportunityOrder): number => {
+    if (opportunity.lastChannelSuccessAt === undefined) return Number.NEGATIVE_INFINITY;
+    return opportunity.lastChannelSuccessAt -
+      (opportunity.recentHumanActivity ? AUTONOMOUS_RESEARCH_ATTENDANCE_CREDIT_MS : 0) -
+      clamp(opportunity.selectionKey, 0, 1) * AUTONOMOUS_RESEARCH_PRIORITY_CREDIT_MS;
+  };
+  const leftAt = creditedAt(left);
+  const rightAt = creditedAt(right);
+  if (leftAt !== rightAt) return leftAt - rightAt;
+  return right.selectionKey - left.selectionKey;
 }
 
 export interface PrioritizedAutonomousResearchPolicy {
@@ -1502,11 +1539,19 @@ export function selectAutonomousResearchSeed(
   seeds: readonly AutonomousResearchSeed[],
   recentIds: readonly string[],
   rng: () => number,
+  lastUsedAtById?: ReadonlyMap<string, number>,
 ): AutonomousResearchSeed | undefined {
   if (seeds.length === 0) return undefined;
   const blocked = new Set(recentIds.slice(-Math.min(2, Math.max(0, seeds.length - 1))));
   const fresh = seeds.filter((seed) => !blocked.has(seed.id));
-  return choose([...(fresh.length > 0 ? fresh : seeds)], rng);
+  let pool = [...(fresh.length > 0 ? fresh : seeds)];
+  if (lastUsedAtById && pool.length > 1) {
+    const oldestUse = Math.min(...pool.map((seed) =>
+      lastUsedAtById.get(seed.id) ?? Number.NEGATIVE_INFINITY));
+    pool = pool.filter((seed) =>
+      (lastUsedAtById.get(seed.id) ?? Number.NEGATIVE_INFINITY) === oldestUse);
+  }
+  return choose(pool, rng);
 }
 
 export interface TemporalCueGate {
@@ -2044,6 +2089,8 @@ export class SocialDirector {
   private readonly lastHumanMessageAtByChannel = new Map<string, number>();
   /** Human message, reaction or accepted voice transcript; joins alone do not qualify. */
   private readonly lastHumanResearchActivityAtByChannel = new Map<string, number>();
+  /** Presence-aware owners prevent an unrelated online human from boosting this room. */
+  private readonly lastHumanResearchActivityAtByChannelActor = new Map<string, Map<string, number>>();
   private readonly lastTrustedLanguageByChannel = new Map<string, string>();
   private lastAmbientChannelId?: string;
   private started = false;
@@ -2234,6 +2281,7 @@ export class SocialDirector {
           message.channelId,
           Math.max(this.lastHumanResearchActivityAtByChannel.get(message.channelId) ?? 0, timestamp),
         );
+        this.rememberHumanResearchActivity(message.channelId, message.authorId, timestamp);
       }
       if (PERSONAS.some((persona) => persona.id === message.authorId)) {
         this.lastSpoke.set(
@@ -2571,10 +2619,11 @@ export class SocialDirector {
     }
   }
 
-  noteHumanVoiceActivity(channelId: string): void {
+  noteHumanVoiceActivity(channelId: string, humanActorId?: string): void {
     const now = this.now();
     this.lastHumanMessageAtByChannel.set(channelId, now);
     this.lastHumanResearchActivityAtByChannel.set(channelId, now);
+    if (humanActorId) this.rememberHumanResearchActivity(channelId, humanActorId, now);
     this.invalidateAmbientChannel(channelId, "human_preempted");
   }
 
@@ -2793,6 +2842,7 @@ export class SocialDirector {
     const now = this.now();
     this.lastHumanMessageAtByChannel.set(event.channelId, now);
     this.lastHumanResearchActivityAtByChannel.set(event.channelId, now);
+    this.rememberHumanResearchActivity(event.channelId, human.id, now);
     this.invalidateAmbientChannel(event.channelId, "human_preempted");
 
     const pendingKey = `${event.channelId}:${event.messageId}:${human.id}`;
@@ -3016,6 +3066,7 @@ export class SocialDirector {
     const now = this.now();
     this.lastHumanMessageAtByChannel.set(message.channelId, now);
     this.lastHumanResearchActivityAtByChannel.set(message.channelId, now);
+    this.rememberHumanResearchActivity(message.channelId, message.authorId, now);
     const epoch = this.invalidateAmbientChannel(message.channelId, "human_preempted");
     this.actorChannels.noteChannelEvent(message);
     this.humanMessageEpochById.set(message.id, epoch);
@@ -4651,12 +4702,34 @@ export class SocialDirector {
     };
   }
 
+  private rememberHumanResearchActivity(channelId: string, actorId: string, at: number): void {
+    const observedAt = Number.isFinite(at) ? at : this.now();
+    const byActor = this.lastHumanResearchActivityAtByChannelActor.get(channelId) ?? new Map<string, number>();
+    byActor.set(actorId, Math.max(byActor.get(actorId) ?? 0, observedAt));
+    this.lastHumanResearchActivityAtByChannelActor.set(channelId, byActor);
+  }
+
   private hasRecentHumanResearchActivity(channelId: string, now = this.now()): boolean {
     if (this.getOnlineHumanCount() < 1) return false;
-    const lastActivityAt = this.lastHumanResearchActivityAtByChannel.get(channelId);
-    return lastActivityAt !== undefined &&
-      lastActivityAt <= now &&
-      now - lastActivityAt <= AUTONOMOUS_RESEARCH_RECENT_HUMAN_WINDOW_MS;
+    const onlineHumanIds = new Set(this.getMembers()
+      .filter((member) => member.kind === "human" && member.status === "online")
+      .map((member) => member.id));
+    if (onlineHumanIds.size === 0) return false;
+    const byActor = this.lastHumanResearchActivityAtByChannelActor.get(channelId);
+    if (!byActor) return false;
+    let active = false;
+    for (const [actorId, lastActivityAt] of byActor) {
+      if (
+        lastActivityAt > now ||
+        now - lastActivityAt > AUTONOMOUS_RESEARCH_RECENT_HUMAN_WINDOW_MS
+      ) {
+        byActor.delete(actorId);
+        continue;
+      }
+      if (onlineHumanIds.has(actorId)) active = true;
+    }
+    if (byActor.size === 0) this.lastHumanResearchActivityAtByChannelActor.delete(channelId);
+    return active;
   }
 
   /**
@@ -4739,6 +4812,8 @@ export class SocialDirector {
         seeds,
         available,
         failureState,
+        recentHumanActivity,
+        lastChannelSuccessAt: this.lastAutonomousResearchSuccessAtByChannel.get(channel.id),
         basePolicy: activityPolicy,
         prioritized,
       }];
@@ -4815,7 +4890,15 @@ export class SocialDirector {
         chance: candidate.prioritized.chance,
         rng: this.rng,
       }),
-    ).sort((a, b) => b.prioritized.selectionKey - a.prioritized.selectionKey);
+    ).sort((a, b) => compareAutonomousResearchOpportunities({
+      recentHumanActivity: a.recentHumanActivity,
+      lastChannelSuccessAt: a.lastChannelSuccessAt,
+      selectionKey: a.prioritized.selectionKey,
+    }, {
+      recentHumanActivity: b.recentHumanActivity,
+      lastChannelSuccessAt: b.lastChannelSuccessAt,
+      selectionKey: b.prioritized.selectionKey,
+    }));
 
     for (const candidate of candidates) {
       const thread = this.getOrStartAmbientThread(candidate.channel.id, now);
@@ -4851,7 +4934,20 @@ export class SocialDirector {
           semanticFamily: semanticKey,
         }) ?? false);
       });
-      seed ??= selectAutonomousResearchSeed(eligibleResearchSeeds, recentSeeds, this.rng);
+      const researchSeedRecency = new Map(
+        eligibleResearchSeeds.flatMap((researchSeed) => {
+          const usedAt = this.ambientEpisodeLedger?.semanticLastUsedAt(candidate.channel.id, {
+            semanticKey: `research:${researchSeed.id}`,
+          });
+          return usedAt === undefined ? [] : [[researchSeed.id, usedAt] as const];
+        }),
+      );
+      seed ??= selectAutonomousResearchSeed(
+        eligibleResearchSeeds,
+        recentSeeds,
+        this.rng,
+        researchSeedRecency,
+      );
       if (!seed) {
         this.abandonAmbientThread(candidate.channel.id, thread);
         continue;
@@ -4986,11 +5082,28 @@ export class SocialDirector {
         : [{ premise, semanticKey, semanticFamily }];
     });
     if (eligibleSeeds.length === 0) return undefined;
+    const lastUsedAtBySeed = new Map(
+      eligibleSeeds.flatMap((candidate) => {
+        const usedAt = this.ambientEpisodeLedger?.semanticLastUsedAt(channelId, {
+          semanticKey: candidate.semanticKey,
+        });
+        return usedAt === undefined ? [] : [[candidate.premise, usedAt] as const];
+      }),
+    );
+    const lastUsedAtByFamily = new Map(
+      eligibleSeeds.flatMap((candidate) => {
+        const usedAt = this.ambientEpisodeLedger?.semanticLastUsedAt(channelId, {
+          semanticFamily: candidate.semanticFamily,
+        });
+        return usedAt === undefined ? [] : [[candidate.semanticFamily, usedAt] as const];
+      }),
+    );
     const seed = selectAmbientSeed(
       eligibleSeeds.map((candidate) => candidate.premise),
       recentSeeds,
       this.rng,
       eligibleSeeds.map((candidate) => candidate.semanticFamily),
+      { lastUsedAtBySeed, lastUsedAtByFamily },
     );
     if (!seed) return undefined;
     const selectedSeed = eligibleSeeds.find((candidate) => candidate.premise === seed)!;
@@ -5311,7 +5424,10 @@ export class SocialDirector {
 
   private recentPublishedUrlKeys(): Set<string> {
     return new Set(
-      CHANNELS.flatMap((channel) => this.store.getRecent(channel.id, 160)).flatMap((message) => [
+      // Public history is already bounded and persistent. Scanning that compact
+      // archive prevents a busy room from re-posting the same destination as
+      // soon as 160 newer messages have displaced it from a short window.
+      this.store.getAllMessages().flatMap((message) => [
         ...(message.sources ?? []).map((source) => source.url),
         ...(message.linkPreview ? [message.linkPreview.url] : []),
       ]).flatMap((url) => canonicalAutonomousResearchUrl(url) ?? []),
@@ -5473,6 +5589,10 @@ export class SocialDirector {
         id: `S${safelyReadResults.length + 1}`,
         ...(publishedAt ? { publishedAt } : {}),
       });
+      // Keep a tiny provider-ranked fallback pool, but never expose the pool
+      // to one generation. runAutonomousResearchConversation tries each page
+      // as an independent, fully reviewed single-source scene so an irrelevant
+      // first hit cannot force cross-source blending or hide a useful second.
       if (safelyReadResults.length >= 2) break;
     }
     return safelyReadResults.length > 0 && retrievedAt
@@ -5597,57 +5717,66 @@ export class SocialDirector {
       if (!readOutcome.research) {
         return this.recordAutonomousResearchFailure(channel.id, seed, readOutcome.failureReason);
       }
-      research = readOutcome.research;
-      if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1)) {
-        throw new AutonomousResearchDeferredError(
-          "Autonomous research yielded because its publication gates changed",
-        );
-      }
       const limits = ambientSceneWordLimits(lead, undefined, false, mode);
-      const evidenceIntroduction = research.kind === "market"
-        ? `A trusted typed market provider supplied one latest-reported observation for this server-authored angle: “${seed.discussionAngle}”. Treat its level/change and absolute timestamp as evidence, but do not invent a cause, related headline, market-open state or future move.`
-        : `A trusted server-side lookup and safe page read found candidate sources for this server-authored angle: “${seed.discussionAngle}”.`;
-      lines = await this.lm.generateScene({
-        kind: "ambient",
-        ambientAction,
-        channelId: channel.id,
-        channelName: channel.name,
-        selected: [lead],
-        history: this.ambientTranscript(channel.id, 18),
-        premise: [
-          evidenceIntroduction,
-          `${lead.name} chooses exactly one supplied source ID, shares one concrete supported detail from it and immediately adds a personal take; a title-only reaction, vague hype or capability statement is invalid.`,
-          "This tick publishes only that source-backed opening. Leave one concrete implication, disagreement or question for another resident to pick up later from actual room history.",
-          "Do not announce that a search happened, explain tooling, copy a URL, or invite the whole room to answer.",
-          ambientActionInstruction("open_topic", mode),
-        ].join(" "),
-        mustReplyIds: [lead.id],
-        responseRecoveryIds: [lead.id],
-        wordLimits: limits,
-        languageHint: thread.languageHint,
-        semanticContext: thread.languageTag ? {
-          languageTag: thread.languageTag,
-          asksForList: false,
-          asksAboutAiIdentity: false,
-          asksAboutAcoustics: false,
-        } : undefined,
-        actorChannelNotes: this.actorChannels.promptNotes([lead], channel.id),
-        actorExpertiseNotes: this.actorChannels.expertiseNotes([lead], channel.id),
-        ...this.residentRelationshipSceneContext(
-          [lead],
-          [responder],
-          { kind: "public", channelId: channel.id },
-        ),
-        research,
-        autonomousResearchContext: {
-          seedId: seed.id,
-          roomTopic: profile?.topic.brief ?? channel.description,
-          discussionAngle: seed.discussionAngle,
-        },
-        evidenceOutcome: "succeeded",
-        urlPublicationPolicy: "server_card",
-        temporalPolicy: "ambient_silent",
-      }, 4);
+      for (const result of readOutcome.research.results.slice(0, 2)) {
+        if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1)) {
+          throw new AutonomousResearchDeferredError(
+            "Autonomous research yielded because its publication gates changed",
+          );
+        }
+        const candidateResearch: ResearchPacket = {
+          ...readOutcome.research,
+          results: [result],
+        };
+        const evidenceIntroduction = candidateResearch.kind === "market"
+          ? `A trusted typed market provider supplied one latest-reported observation for this server-authored angle: “${seed.discussionAngle}”. Treat its level/change and absolute timestamp as evidence, but do not invent a cause, related headline, market-open state or future move.`
+          : `A trusted server-side lookup and safe page read supplied one source for this server-authored angle: “${seed.discussionAngle}”.`;
+        const candidateLines = await this.lm.generateScene({
+          kind: "ambient",
+          ambientAction,
+          channelId: channel.id,
+          channelName: channel.name,
+          selected: [lead],
+          history: this.ambientTranscript(channel.id, 18),
+          premise: [
+            evidenceIntroduction,
+            `${lead.name} uses the sole supplied source, shares one concrete supported detail from it and immediately adds a personal take; a title-only reaction, vague hype or capability statement is invalid. The server owns the destination card.`,
+            "This tick publishes only that source-backed opening. Leave one concrete implication, disagreement or question for another resident to pick up later from actual room history.",
+            "Do not announce that a search happened, explain tooling, copy a URL, or invite the whole room to answer.",
+            ambientActionInstruction("open_topic", mode),
+          ].join(" "),
+          mustReplyIds: [lead.id],
+          responseRecoveryIds: [lead.id],
+          wordLimits: limits,
+          languageHint: thread.languageHint,
+          semanticContext: thread.languageTag ? {
+            languageTag: thread.languageTag,
+            asksForList: false,
+            asksAboutAiIdentity: false,
+            asksAboutAcoustics: false,
+          } : undefined,
+          actorChannelNotes: this.actorChannels.promptNotes([lead], channel.id),
+          actorExpertiseNotes: this.actorChannels.expertiseNotes([lead], channel.id),
+          ...this.residentRelationshipSceneContext(
+            [lead],
+            [responder],
+            { kind: "public", channelId: channel.id },
+          ),
+          research: candidateResearch,
+          autonomousResearchContext: {
+            seedId: seed.id,
+            roomTopic: profile?.topic.brief ?? channel.description,
+            discussionAngle: seed.discussionAngle,
+          },
+          evidenceOutcome: "succeeded",
+          urlPublicationPolicy: "server_card",
+          temporalPolicy: "ambient_silent",
+        }, 4);
+        if (!candidateLines.some((line) => line.personaId === lead.id)) continue;
+        research = candidateResearch;
+        lines = candidateLines;
+        break;
+      }
     } catch (error) {
       if (
         isBackgroundWorkPreemptedError(error) ||
@@ -5665,9 +5794,11 @@ export class SocialDirector {
     }
 
     const leadLine = lines.find((line) => line.personaId === lead.id);
-    const leadSourceIds = leadLine ? [...new Set(leadLine.sourceIds)] : [];
-    const selectedSourceId = leadSourceIds.length === 1 && research?.results.some((result) => result.id === leadSourceIds[0])
-      ? leadSourceIds[0]
+    // This workflow deliberately supplies one safely read destination. Keep
+    // ownership here as well as in the LM adapter so another provider wrapper
+    // cannot suppress, replace or multiply the server-authored source card.
+    const selectedSourceId = research?.results.length === 1
+      ? research.results[0]?.id
       : undefined;
     if (!research || !leadLine) {
       return this.recordAutonomousResearchFailure(channel.id, seed, "invalid_generated_lines");

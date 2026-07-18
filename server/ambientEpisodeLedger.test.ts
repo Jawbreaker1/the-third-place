@@ -6,6 +6,7 @@ import {
   AmbientEpisodeLedger,
   JsonFileAmbientEpisodePersistence,
   MemoryAmbientEpisodePersistence,
+  type AmbientEpisodePersistedState,
   type OpenAmbientEpisodeInput,
 } from "./ambientEpisodeLedger.js";
 
@@ -124,6 +125,8 @@ describe("AmbientEpisodeLedger", () => {
       sourceMessageIds: ["message-reply"],
       updatedAt: NOW + 2_000,
     })]);
+    expect(ledger.semanticLastUsedAt("lobby", { semanticKey: "community:shared-memory" }))
+      .toBeUndefined();
 
     // Returned objects are snapshots and cannot mutate authoritative state.
     retried!.facets.push("outside-mutation");
@@ -166,6 +169,86 @@ describe("AmbientEpisodeLedger", () => {
     expect(ledger.current("lobby")).toBeUndefined();
   });
 
+  it("persists bounded publication recency beyond the full episode window across restart", async () => {
+    let now = NOW;
+    const persistence = new MemoryAmbientEpisodePersistence();
+    const options = {
+      persistence,
+      now: () => now,
+      maxRecentEpisodesPerChannel: 48,
+      maxSemanticRecencyEntriesPerChannel: 96,
+      persistDelayMs: 60_000,
+    };
+    const ledger = new AmbientEpisodeLedger(options);
+    ledger.openEpisode(episodeInput("old-published-seed", {
+      semanticFamily: "old-family",
+      semanticKey: "seed:old-published",
+      sourceKind: "room_seed",
+    }));
+
+    for (let index = 1; index <= 60; index += 1) {
+      now += 1;
+      ledger.openEpisode(episodeInput(`later-${index}`, {
+        semanticFamily: `family-${index}`,
+        semanticKey: `seed:later-${index}`,
+        sourceKind: index % 2 === 0 ? "room_seed" : "autonomous_research",
+      }));
+    }
+
+    expect(ledger.recent("lobby", 96)).toHaveLength(48);
+    expect(ledger.episode("old-published-seed")).toBeUndefined();
+    expect(ledger.semanticLastUsedAt("lobby", { semanticKey: "SEED:OLD-PUBLISHED" })).toBe(NOW);
+    expect(ledger.semanticLastUsedAt("lobby", { semanticFamily: "old-family" })).toBe(NOW);
+
+    const lastPublicationAt = now;
+
+    // Looking up a selected/rejected seed cannot create a publication record.
+    expect(ledger.isCoolingDown("lobby", { semanticKey: "seed:failed-generation" })).toBe(false);
+    expect(ledger.semanticLastUsedAt("lobby", { semanticKey: "seed:failed-generation" }))
+      .toBeUndefined();
+
+    // Published human-led topics remain full episodes but cannot churn the
+    // authored-seed LRU that room_seed/autonomous_research selection consumes.
+    for (let index = 1; index <= 120; index += 1) {
+      now += 1;
+      ledger.openEpisode(episodeInput(`human-topic-${index}`, {
+        semanticFamily: `human-family-${index}`,
+        semanticKey: `human-topic:${index}`,
+        sourceKind: "human_topic",
+      }));
+    }
+    expect(ledger.semanticLastUsedAt("lobby", { semanticKey: "human-topic:120" }))
+      .toBeUndefined();
+
+    await ledger.flush();
+    const persisted = await persistence.load() as AmbientEpisodePersistedState;
+    expect(persisted.channels[0]?.semanticRecency).toHaveLength(61);
+    expect(persisted.channels[0]?.semanticRecency).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ semanticKey: "seed:failed-generation" }),
+    ]));
+
+    const restarted = new AmbientEpisodeLedger(options);
+    await restarted.load();
+    expect(restarted.semanticLastUsedAt("lobby", { semanticKey: "seed:old-published" })).toBe(NOW);
+    expect(restarted.semanticLastUsedAt("lobby", { semanticKey: "seed:later-60" }))
+      .toBe(lastPublicationAt);
+    expect(restarted.semanticLastUsedAt("lobby", { semanticKey: "seed:failed-generation" }))
+      .toBeUndefined();
+
+    // The compact index itself remains bounded even as full publications keep arriving.
+    for (let index = 61; index <= 120; index += 1) {
+      now += 1;
+      restarted.openEpisode(episodeInput(`later-${index}`, {
+        semanticFamily: `family-${index}`,
+        semanticKey: `seed:later-${index}`,
+        sourceKind: "room_seed",
+      }));
+    }
+    await restarted.flush();
+    const bounded = await persistence.load() as AmbientEpisodePersistedState;
+    expect(bounded.channels[0]?.semanticRecency).toHaveLength(96);
+  });
+
   it("anchors stale closure, cooldown and relevance decay to the injected clock", () => {
     let now = NOW;
     const ledger = new AmbientEpisodeLedger({
@@ -196,9 +279,13 @@ describe("AmbientEpisodeLedger", () => {
       cooldownUntil: NOW + 3_000,
     });
     expect(ledger.isCoolingDown("lobby", { semanticKey: "SAME:KEY" })).toBe(true);
+    expect(ledger.semanticLastUsedAt("lobby", { semanticKey: "SAME:KEY" })).toBe(NOW);
+    expect(ledger.semanticLastUsedAt("lobby", { semanticFamily: "same family" })).toBe(NOW);
+    expect(ledger.semanticLastUsedAt("lobby", { semanticFamily: "different" })).toBeUndefined();
 
     now = NOW + 3_001;
     expect(ledger.isCoolingDown("lobby", { semanticFamily: "same family" })).toBe(false);
+    expect(ledger.semanticLastUsedAt("lobby", { semanticFamily: "same family" })).toBe(NOW);
     expect(ledger.relevance("episode-stale")).toBeCloseTo(0.5, 3);
     expect(ledger.recallCandidates("lobby")[0]).toMatchObject({
       episode: { id: "episode-stale" },
@@ -297,16 +384,49 @@ describe("AmbientEpisodeLedger", () => {
       await ledger.flush();
 
       const raw = await readFile(path, "utf8");
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const parsed = JSON.parse(raw) as AmbientEpisodePersistedState;
       expect(parsed).toMatchObject({ version: 1 });
       expect(raw).toContain("authoritative-room-message");
       expect(raw).not.toContain('"content"');
       expect(raw).not.toContain('"reactions"');
       expect(raw).not.toContain('"authorSnapshot"');
 
+      // A legacy version-1 file has no compact semantic index. Loading it
+      // reconstructs the best available publication recency from retained
+      // episodes and writes the migrated shape without a version bump.
+      delete parsed.channels[0]?.semanticRecency;
+      await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+
       const restarted = new AmbientEpisodeLedger({ persistence, now: () => NOW, persistDelayMs: 60_000 });
       await restarted.load();
       expect(restarted.current("lobby")?.id).toBe("json-episode");
+      expect(restarted.semanticLastUsedAt("lobby", { semanticKey: "community-design:json-episode" }))
+        .toBe(NOW);
+      await restarted.flush();
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+        version: 1,
+        channels: [{
+          semanticRecency: [{
+            semanticFamily: "community-design",
+            semanticKey: "community-design:json-episode",
+            lastPublishedAt: NOW,
+          }],
+        }],
+      });
+
+      const lagged = JSON.parse(await readFile(path, "utf8")) as AmbientEpisodePersistedState;
+      lagged.channels[0]!.semanticRecency = [];
+      await writeFile(path, `${JSON.stringify(lagged, null, 2)}\n`, "utf8");
+      const repaired = new AmbientEpisodeLedger({ persistence, now: () => NOW, persistDelayMs: 60_000 });
+      await repaired.load();
+      expect(repaired.semanticLastUsedAt("lobby", { semanticKey: "community-design:json-episode" }))
+        .toBe(NOW);
+      await repaired.flush();
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+        channels: [{ semanticRecency: [expect.objectContaining({
+          semanticKey: "community-design:json-episode",
+        })] }],
+      });
 
       await writeFile(path, "{not-json", "utf8");
       const recovered = new AmbientEpisodeLedger({ persistence, now: () => NOW, persistDelayMs: 60_000 });

@@ -5597,6 +5597,20 @@ describe("LM Studio room prompt", () => {
         selected: [sana],
         history: [],
         mustReplyIds: [sana.id],
+        ambientAction: {
+          episodeId: "episode-server-card-url",
+          causalRootId: "episode-server-card-url",
+          semanticFamily: "research:server-card-url",
+          kind: "open_topic",
+          turnIndex: 0,
+          openHook: true,
+          previousActions: [],
+        },
+        autonomousResearchContext: {
+          seedId: "server-card-url",
+          roomTopic: "practical AI software development",
+          discussionAngle: "Discuss the supported recovery benchmark detail.",
+        },
         urlPublicationPolicy: "server_card",
         research: {
           kind: "page",
@@ -5613,7 +5627,9 @@ describe("LM Studio room prompt", () => {
 
       expect(lines).toEqual([]);
       expect(bodies).toHaveLength(1);
-      expect(bodies[0].messages[0].content).toContain("server will attach the one exact researched destination");
+      expect(bodies[0].messages[0].content).toContain("server owns and will attach the one exact researched destination");
+      expect(bodies[0].response_format.json_schema.schema.properties.messages.items.properties.sourceIds)
+        .toMatchObject({ minItems: 0, maxItems: 0 });
       const sceneData = JSON.parse(bodies[0].messages[1].content);
       expect(sceneData.freshResearch.results[0]).not.toHaveProperty("url");
       expect(sceneData.freshResearch.results[0]).toMatchObject({ id: "S1", title: "Recovery benchmark" });
@@ -8198,10 +8214,18 @@ describe("LM Studio one-pass humanizer", () => {
         }]);
       }
       if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["evidence_ungrounded"],
+          rewriteInstruction: "Ground the disagreement in the supplied practical-effects and ending detail.",
+        }]);
+      }
+      if (bodies.length === 3) {
         return completionResponse([{
           personaId: mira.id,
           content: "Praktiska effekterna hyllas men slutet sågas; jag köper faktiskt den splittringen.",
-          sourceIds: ["S1"],
+          sourceIds: [],
         }]);
       }
       return candidateReviewCompletion([{
@@ -8253,23 +8277,29 @@ describe("LM Studio one-pass humanizer", () => {
       personaId: mira.id,
       sourceIds: ["S1"],
     })]);
-    expect(bodies).toHaveLength(3);
-    for (const body of bodies.slice(0, 2)) {
+    expect(bodies).toHaveLength(4);
+    for (const body of [bodies[0], bodies[2]]) {
       const sourceSchema = body.response_format.json_schema.schema.properties.messages.items.properties.sourceIds;
-      expect(sourceSchema).toMatchObject({ minItems: 1, maxItems: 1, items: { enum: ["S1"] } });
+      expect(sourceSchema).toMatchObject({ minItems: 0, maxItems: 0 });
+      expect(sourceSchema).not.toHaveProperty("items");
     }
-    const recoveryScene = JSON.parse(bodies[1].messages[1].content);
+    const initialReviewInput = JSON.parse(bodies[1].messages[1].content);
+    const recoveryScene = JSON.parse(bodies[2].messages[1].content);
     expect(recoveryScene.premise).toContain("autonomous source-backed opening");
-    expect(recoveryScene.premise).toContain("exactly one supplied evidence result");
+    expect(recoveryScene.premise).toContain("sole supplied evidence result");
+    expect(recoveryScene.premise).toContain("server binds its destination card");
     expect(recoveryScene.premise).not.toContain("human-triggered scene");
-    const reviewInput = JSON.parse(bodies[2].messages[1].content);
-    expect(reviewInput).toMatchObject({
-      urlPublicationPolicy: "server_card",
-      candidates: [{ sourceIds: ["S1"] }],
-    });
+    const recoveryReviewInput = JSON.parse(bodies[3].messages[1].content);
+    for (const reviewInput of [initialReviewInput, recoveryReviewInput]) {
+      expect(reviewInput).toMatchObject({
+        urlPublicationPolicy: "server_card",
+        evidence: { results: [{ id: "S1" }] },
+        candidates: [{ sourceIds: ["S1"] }],
+      });
+    }
   });
 
-  it("uses the same single-source recovery when semantic review is disabled", async () => {
+  it("binds the sole server source without a source-contract recovery when semantic review is disabled", async () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     let call = 0;
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -8323,10 +8353,10 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(lines).toEqual([expect.objectContaining({ sourceIds: ["S1"] })]);
-    expect(call).toBe(2);
+    expect(call).toBe(1);
   });
 
-  it("stops after one autonomous source-contract recovery when the retry is still invalid", async () => {
+  it("stops after one autonomous recovery when both attempts leak the server-owned URL", async () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     let call = 0;
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -8335,7 +8365,7 @@ describe("LM Studio one-pass humanizer", () => {
       call += 1;
       return completionResponse([{
         personaId: mira.id,
-        content: "Folk verkar fortfarande rätt oense om den.",
+        content: "Folk verkar fortfarande rätt oense om den på https://example.com/film.",
         sourceIds: [],
       }]);
     }));
@@ -8393,7 +8423,7 @@ describe("LM Studio one-pass humanizer", () => {
         return completionResponse([{
           personaId: mira.id,
           content: "Windows visar en lista över filer man nyligen öppnat.",
-          sourceIds: ["S1"],
+          sourceIds: [],
         }]);
       }
       const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
@@ -8412,14 +8442,25 @@ describe("LM Studio one-pass humanizer", () => {
       channelName: "the-pub",
       selected: [mira],
       history: [],
+      ambientAction: {
+        episodeId: "episode-irrelevant-source",
+        causalRootId: "episode-irrelevant-source",
+        semanticFamily: "research:pub-film-festival-reaction",
+        kind: "open_topic",
+        turnIndex: 0,
+        openHook: true,
+        previousActions: [],
+      },
       research: {
         kind: "page",
         query: "recent film festival premieres",
         retrievedAt: "2026-07-14T12:00:00.000Z",
-        results: [
-          { id: "S1", title: "Windows Recent Files", url: "https://example.com/windows", snippet: "Operating-system file history." },
-          { id: "S2", title: "A divided premiere", url: "https://example.com/film", snippet: "Critics split over one practical-effect choice." },
-        ],
+        results: [{
+          id: "S1",
+          title: "Windows Recent Files",
+          url: "https://example.com/windows",
+          snippet: "Operating-system file history.",
+        }],
       },
       autonomousResearchContext: {
         seedId: "pub-film-festival-reaction",
@@ -8434,30 +8475,37 @@ describe("LM Studio one-pass humanizer", () => {
     expect(call).toBe(2);
     expect(reviewPayload).toMatchObject({
       autonomousResearchContext: { seedId: "pub-film-festival-reaction" },
-      evidence: { results: [{ id: "S1" }, { id: "S2" }] },
+      evidence: { results: [{ id: "S1" }] },
       candidates: [{ personaId: mira.id, sourceIds: ["S1"] }],
     });
   });
 
-  it("preserves the one semantically approved autonomous source ID", async () => {
+  it.each([
+    ["missing", []],
+    ["wrong", ["S999"]],
+  ])("server-binds the sole approved autonomous source when model source IDs are %s", async (_case, modelSourceIds) => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     let call = 0;
-    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+    let reviewPayload: Record<string, any> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
       call += 1;
-      return call === 1
-        ? completionResponse([{
-            personaId: mira.id,
-            content: "Den där praktiska effekten låter värd att försvara, även om slutet tydligen delar folk helt.",
-            sourceIds: ["S2"],
-          }])
-        : candidateReviewCompletion([{
-            personaId: mira.id,
-            severity: "none",
-            issues: [],
-            rewriteInstruction: null,
-          }]);
+      if (call === 1) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Den där praktiska effekten låter värd att försvara, även om slutet tydligen delar folk helt.",
+          sourceIds: modelSourceIds,
+        }]);
+      }
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+      reviewPayload = JSON.parse(body.messages[1]!.content) as Record<string, any>;
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
     }));
 
     const lines = await new LmStudioClient().generateScene({
@@ -8466,14 +8514,25 @@ describe("LM Studio one-pass humanizer", () => {
       channelName: "the-pub",
       selected: [mira],
       history: [],
+      ambientAction: {
+        episodeId: `episode-source-binding-${_case}`,
+        causalRootId: `episode-source-binding-${_case}`,
+        semanticFamily: "research:pub-film-festival-reaction",
+        kind: "open_topic",
+        turnIndex: 0,
+        openHook: true,
+        previousActions: [],
+      },
       research: {
         kind: "page",
         query: "recent film festival premieres",
         retrievedAt: "2026-07-14T12:00:00.000Z",
-        results: [
-          { id: "S1", title: "Windows Recent Files", url: "https://example.com/windows", snippet: "Operating-system file history." },
-          { id: "S2", title: "A divided premiere", url: "https://example.com/film", snippet: "Critics split over one practical-effect choice." },
-        ],
+        results: [{
+          id: "S1",
+          title: "A divided premiere",
+          url: "https://example.com/film",
+          snippet: "Critics split over one practical-effect choice.",
+        }],
       },
       autonomousResearchContext: {
         seedId: "pub-film-festival-reaction",
@@ -8484,7 +8543,11 @@ describe("LM Studio one-pass humanizer", () => {
     });
 
     expect(lines).toHaveLength(1);
-    expect(lines[0]?.sourceIds).toEqual(["S2"]);
+    expect(lines[0]?.sourceIds).toEqual(["S1"]);
+    expect(reviewPayload).toMatchObject({
+      evidence: { results: [{ id: "S1" }] },
+      candidates: [{ personaId: mira.id, sourceIds: ["S1"] }],
+    });
     expect(call).toBe(2);
   });
 
@@ -8500,7 +8563,7 @@ describe("LM Studio one-pass humanizer", () => {
         return completionResponse([{
           personaId: farah.id,
           content: "S&P 500 var senast rapporterad upp 3,2 procent; jag hade kollat om rörelsen faktiskt bar brett innan jag drog stora slutsatser.",
-          sourceIds: ["S1"],
+          sourceIds: [],
         }]);
       }
       const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
@@ -8519,6 +8582,15 @@ describe("LM Studio one-pass humanizer", () => {
       channelName: "stock-market",
       selected: [farah],
       history: [],
+      ambientAction: {
+        episodeId: "episode-market-pulse",
+        causalRootId: "episode-market-pulse",
+        semanticFamily: "research:market-pulse-move-sp500",
+        kind: "open_topic",
+        turnIndex: 0,
+        openHook: true,
+        previousActions: [],
+      },
       research: {
         kind: "market",
         query: "validated major equity-index movement",

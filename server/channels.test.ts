@@ -21,6 +21,7 @@ const NEW_ROOM_IDS = [
   "3d-visualisation",
 ];
 const RESEARCH_ROOM_IDS = [
+  "lobby",
   "the-pub",
   "ai-lab",
   "ai-programming",
@@ -29,7 +30,32 @@ const RESEARCH_ROOM_IDS = [
   "football-talk",
   "world-of-warcraft",
   "3d-visualisation",
+  "side-quests",
 ];
+const EXPECTED_AMBIENT_COUNTS: Record<string, number> = {
+  lobby: 32,
+  "the-pub": 40,
+  "ai-lab": 32,
+  "ai-programming": 32,
+  "ai-hacking": 40,
+  "stock-market": 32,
+  "football-talk": 40,
+  "world-of-warcraft": 32,
+  "3d-visualisation": 32,
+  "side-quests": 32,
+};
+const EXPECTED_AMBIENT_FAMILY_COUNTS: Record<string, number> = {
+  lobby: 9,
+  "the-pub": 12,
+  "ai-lab": 9,
+  "ai-programming": 9,
+  "ai-hacking": 10,
+  "stock-market": 8,
+  "football-talk": 10,
+  "world-of-warcraft": 8,
+  "3d-visualisation": 8,
+  "side-quests": 9,
+};
 
 const normalizedContentKey = (value: string): string => value.normalize("NFKC").trim().toLocaleLowerCase("und");
 
@@ -43,7 +69,7 @@ describe("channel profiles", () => {
     for (const profile of CHANNEL_PROFILES) {
       expect(profile.topic.brief.length).toBeGreaterThan(20);
       expect(profile.topic.tags.length).toBeGreaterThan(2);
-      expect(profile.ambientPremises.length).toBeGreaterThanOrEqual(profile.public.id === "the-pub" ? 20 : 16);
+      expect(profile.ambientPremises, profile.public.id).toHaveLength(EXPECTED_AMBIENT_COUNTS[profile.public.id]);
       expect(new Set(profile.ambientPremises.map(normalizedContentKey)).size).toBe(profile.ambientPremises.length);
       expect(profile.ambientPremiseFamilies, profile.public.id).toBeDefined();
       const premiseFamilies = profile.ambientPremiseFamilies!;
@@ -53,10 +79,10 @@ describe("channel profiles", () => {
       for (const family of premiseFamilies) {
         familyCounts.set(family, (familyCounts.get(family) ?? 0) + 1);
       }
-      expect(familyCounts.size, profile.public.id).toBeGreaterThanOrEqual(
-        Math.ceil(profile.ambientPremises.length * 0.75),
+      expect(familyCounts.size, profile.public.id).toBe(
+        EXPECTED_AMBIENT_FAMILY_COUNTS[profile.public.id],
       );
-      expect(Math.max(...familyCounts.values()), profile.public.id).toBeLessThanOrEqual(2);
+      expect(Math.max(...familyCounts.values()), profile.public.id).toBeLessThanOrEqual(4);
       if (profile.autonomousResearchPriority !== undefined) {
         expect(profile.autonomousResearchPriority, profile.public.id).toBeGreaterThanOrEqual(0.25);
         expect(profile.autonomousResearchPriority, profile.public.id).toBeLessThanOrEqual(4);
@@ -84,6 +110,7 @@ describe("channel profiles", () => {
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
     }
     const allPremises = CHANNEL_PROFILES.flatMap((profile) => profile.ambientPremises.map(normalizedContentKey));
+    expect(allPremises).toHaveLength(344);
     expect(new Set(allPremises).size).toBe(allPremises.length);
   });
 
@@ -105,8 +132,7 @@ describe("channel profiles", () => {
     for (const profile of CHANNEL_PROFILES) {
       const seeds = profile.autonomousResearchSeeds ?? [];
       if (RESEARCH_ROOM_IDS.includes(profile.public.id)) {
-        expect(seeds.length, profile.public.id).toBeGreaterThanOrEqual(3);
-        expect(seeds.length, profile.public.id).toBeLessThanOrEqual(8);
+        expect(seeds, profile.public.id).toHaveLength(8);
       }
       for (const seed of seeds) {
         expect(seed.id, profile.public.id).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u);
@@ -250,26 +276,22 @@ describe("channel profiles", () => {
     const programming = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")!;
     const security = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-hacking")!;
     expect(aiLab.ambientPremiseFamilies).toEqual(expect.arrayContaining([
-      "multimodal",
-      "voice-interaction",
-      "privacy-deployment",
-      "safety",
+      "ai-lab-agent-systems",
+      "ai-lab-interfaces",
+      "ai-lab-data-governance",
+      "ai-lab-alignment",
     ]));
     expect(programming.ambientPremiseFamilies).toEqual(expect.arrayContaining([
-      "language-contracts",
-      "accessibility-ui",
-      "python-runtime",
-      "local-hardware",
-      "api-backpressure",
-      "open-source-delivery",
+      "ai-code-contracts",
+      "ai-code-interface-delivery",
+      "ai-code-runtime",
+      "ai-code-evolution",
     ]));
     expect(security.ambientPremiseFamilies).toEqual(expect.arrayContaining([
-      "agent-tool-boundaries",
-      "indirect-prompt-injection",
-      "cve-prioritisation",
-      "metasploit-lab",
-      "detection-engineering",
-      "incident-containment",
+      "security-prompt-injection",
+      "security-vulnerability-priority",
+      "security-offensive-lab",
+      "security-detection-response",
     ]));
   });
 
@@ -314,8 +336,8 @@ describe("channel profiles", () => {
     expect(security.conversationGuidance).toContain("isolated reproduction, detection, mitigation or architecture analysis");
     expect(security.conversationGuidance).toContain("untrusted evidence");
     expect(security.conversationGuidance?.length).toBeLessThanOrEqual(2_000);
-    expect(security.ambientPremises).toHaveLength(28);
-    expect(new Set(security.ambientPremiseFamilies).size).toBe(28);
+    expect(security.ambientPremises).toHaveLength(40);
+    expect(new Set(security.ambientPremiseFamilies).size).toBe(10);
     expect(security.autonomousResearchSeeds).toHaveLength(8);
     expect(security.autonomousResearchSeeds?.map((seed) => seed.id)).toEqual(expect.arrayContaining([
       "ai-hacking-cisa-kev",
@@ -336,7 +358,7 @@ describe("channel profiles", () => {
     expect(pub.transientSceneTexture).toBe("bounded");
     expect(CHANNEL_PROFILES.filter((profile) => profile.public.id !== "the-pub"))
       .toSatisfy((profiles: ChannelProfile[]) => profiles.every((profile) => profile.transientSceneTexture === undefined));
-    expect(pub.ambientPremises.length).toBeGreaterThanOrEqual(20);
+    expect(pub.ambientPremises).toHaveLength(40);
     expect(pub.topic.tags).toEqual(expect.arrayContaining(["film", "music", "work", "politics", "memes", "food", "beer", "pubs"]));
     expect(pub.topic.brief).toContain("brewing craft");
     expect(pub.topic.brief).toContain("pub history");
@@ -404,15 +426,14 @@ describe("channel profiles", () => {
     expect(football.conversationGuidance).toContain("do not make the room converge politely");
     expect(football.conversationGuidance).toContain("Never invent attending a match");
 
-    expect(football.ambientPremises).toHaveLength(24);
-    expect(football.ambientPremiseFamilies).toHaveLength(24);
-    expect(new Set(football.ambientPremiseFamilies).size).toBe(24);
+    expect(football.ambientPremises).toHaveLength(40);
+    expect(football.ambientPremiseFamilies).toHaveLength(40);
+    expect(new Set(football.ambientPremiseFamilies).size).toBe(10);
     expect(football.ambientPremiseFamilies).toEqual(expect.arrayContaining([
-      "pressing-triggers",
-      "expected-goals",
-      "supporter-culture",
-      "penalty-shootouts",
-      "knockout-momentum",
+      "football-pressing-transition",
+      "football-human-analysis",
+      "football-set-pieces",
+      "football-tournament-dynamics",
     ]));
 
     expect(football.autonomousResearchSeeds).toHaveLength(8);

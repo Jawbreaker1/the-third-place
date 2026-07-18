@@ -185,7 +185,7 @@ describe("persistent admin overlay state", () => {
     const footballConfig = store.snapshot().channels.find((channel) => channel.id === "football-talk")!;
     const footballProfile = CHANNEL_PROFILES.find((profile) => profile.public.id === "football-talk")!;
 
-    expect(footballConfig.seeds).toHaveLength(24);
+    expect(footballConfig.seeds).toHaveLength(40);
     expect(footballProfile.autonomousResearchSeeds).toHaveLength(8);
     expect(footballProfile.autonomousResearchPriority).toBeGreaterThan(1);
     expect(footballProfile.ambientActivityPriority).toBeGreaterThan(1);

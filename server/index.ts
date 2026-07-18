@@ -1613,7 +1613,7 @@ app.post("/api/voice/:roomId/turns", async (request, response) => {
     if (completedKey) completedVoiceTurns.set(completedKey, { expiresAt: now + VOICE_TURN_DEDUP_TTL_MS, entry: appended.entry });
     io.to(voiceSocketRoom(roomId)).emit("voice:transcript:final", appended.entry);
     const room = voiceRooms.getRoom(roomId);
-    if (room) director.noteHumanVoiceActivity(room.channelId);
+    if (room) director.noteHumanVoiceActivity(room.channelId, session.member.id);
     voiceDirector.onHumanFinal(appended.entry);
     response.status(201).json({ ok: true, text: appended.entry.text, entry: appended.entry });
   } catch (error) {
@@ -3074,7 +3074,7 @@ io.on("connection", (socket) => {
     }
     io.to(voiceSocketRoom(parsed.data.roomId)).emit("voice:transcript:final", appended.entry);
     const room = voiceRooms.getRoom(parsed.data.roomId);
-    if (room) director.noteHumanVoiceActivity(room.channelId);
+    if (room) director.noteHumanVoiceActivity(room.channelId, session.member.id);
     voiceDirector.onHumanFinal(appended.entry);
     acknowledge?.({ ok: true });
   });

@@ -18,6 +18,7 @@ export const AMBIENT_EPISODE_LEDGER_DEFAULTS = Object.freeze({
   relevanceHalfLifeMs: 36 * HOUR_MS,
   maxChannels: 64,
   maxRecentEpisodesPerChannel: 48,
+  maxSemanticRecencyEntriesPerChannel: 96,
   maxFacetsPerEpisode: 12,
   maxEntitiesPerEpisode: 12,
   maxStancesPerEpisode: 16,
@@ -34,6 +35,7 @@ export const AMBIENT_EPISODE_LEDGER_DEFAULTS = Object.freeze({
 const HARD_LIMITS = Object.freeze({
   maxChannels: 128,
   maxRecentEpisodesPerChannel: 96,
+  maxSemanticRecencyEntriesPerChannel: 96,
   maxFacetsPerEpisode: 24,
   maxEntitiesPerEpisode: 24,
   maxStancesPerEpisode: 32,
@@ -109,10 +111,17 @@ interface StoredAmbientEpisode extends AmbientEpisode {
   operationIds: string[];
 }
 
+export interface AmbientSemanticRecencyEntry {
+  semanticFamily: string;
+  semanticKey: string;
+  lastPublishedAt: number;
+}
+
 interface StoredAmbientChannel {
   channelId: string;
   current?: StoredAmbientEpisode;
   recent: StoredAmbientEpisode[];
+  semanticRecency: AmbientSemanticRecencyEntry[];
 }
 
 export interface AmbientEpisodePersistedState {
@@ -121,6 +130,8 @@ export interface AmbientEpisodePersistedState {
     channelId: string;
     current?: AmbientEpisode & { operationIds: string[] };
     recent: Array<AmbientEpisode & { operationIds: string[] }>;
+    /** Optional so existing version-1 JSON remains valid and is migrated on load. */
+    semanticRecency?: AmbientSemanticRecencyEntry[];
   }>;
 }
 
@@ -183,6 +194,7 @@ export interface AmbientEpisodeLedgerOptions {
   relevanceHalfLifeMs?: number;
   maxChannels?: number;
   maxRecentEpisodesPerChannel?: number;
+  maxSemanticRecencyEntriesPerChannel?: number;
   maxFacetsPerEpisode?: number;
   maxEntitiesPerEpisode?: number;
   maxStancesPerEpisode?: number;
@@ -395,6 +407,29 @@ const compareRecent = (left: StoredAmbientEpisode, right: StoredAmbientEpisode):
   right.lastActivityAt - left.lastActivityAt ||
   left.id.localeCompare(right.id);
 
+const compareSemanticRecency = (
+  left: AmbientSemanticRecencyEntry,
+  right: AmbientSemanticRecencyEntry,
+): number =>
+  right.lastPublishedAt - left.lastPublishedAt ||
+  semanticIdentity(left.semanticFamily).localeCompare(semanticIdentity(right.semanticFamily)) ||
+  semanticIdentity(left.semanticKey).localeCompare(semanticIdentity(right.semanticKey));
+
+const semanticRecencyIdentity = (
+  semanticFamily: string,
+  semanticKey: string,
+): string => `${semanticIdentity(semanticFamily)}\u241f${semanticIdentity(semanticKey)}`;
+
+const AUTHORED_NOVELTY_SOURCE_KINDS = new Set([
+  "room_seed",
+  "autonomous_research",
+  // Backward compatibility for ledgers written before room_seed was named.
+  "idle_seed",
+]);
+
+const contributesAuthoredNovelty = (sourceKind: string): boolean =>
+  AUTHORED_NOVELTY_SOURCE_KINDS.has(semanticIdentity(sourceKind));
+
 /**
  * Persistent, bounded metadata for ambient conversation episodes. It never
  * stores message bodies, reply previews, reactions or member snapshots; the
@@ -410,6 +445,7 @@ export class AmbientEpisodeLedger {
   private readonly relevanceHalfLifeMs: number;
   private readonly maxChannels: number;
   private readonly maxRecentEpisodesPerChannel: number;
+  private readonly maxSemanticRecencyEntriesPerChannel: number;
   private readonly maxFacetsPerEpisode: number;
   private readonly maxEntitiesPerEpisode: number;
   private readonly maxStancesPerEpisode: number;
@@ -455,6 +491,11 @@ export class AmbientEpisodeLedger {
       AMBIENT_EPISODE_LEDGER_DEFAULTS.maxRecentEpisodesPerChannel,
       HARD_LIMITS.maxRecentEpisodesPerChannel,
     );
+    this.maxSemanticRecencyEntriesPerChannel = boundedCount(
+      options.maxSemanticRecencyEntriesPerChannel,
+      AMBIENT_EPISODE_LEDGER_DEFAULTS.maxSemanticRecencyEntriesPerChannel,
+      HARD_LIMITS.maxSemanticRecencyEntriesPerChannel,
+    );
     this.maxFacetsPerEpisode = boundedCount(options.maxFacetsPerEpisode, AMBIENT_EPISODE_LEDGER_DEFAULTS.maxFacetsPerEpisode, HARD_LIMITS.maxFacetsPerEpisode);
     this.maxEntitiesPerEpisode = boundedCount(options.maxEntitiesPerEpisode, AMBIENT_EPISODE_LEDGER_DEFAULTS.maxEntitiesPerEpisode, HARD_LIMITS.maxEntitiesPerEpisode);
     this.maxStancesPerEpisode = boundedCount(options.maxStancesPerEpisode, AMBIENT_EPISODE_LEDGER_DEFAULTS.maxStancesPerEpisode, HARD_LIMITS.maxStancesPerEpisode);
@@ -474,12 +515,32 @@ export class AmbientEpisodeLedger {
     const root = asRecord(loaded);
     const now = this.now();
     const seenEpisodeIds = new Set<string>();
+    let semanticRecencyNeedsPersist = false;
     if (root?.version === 1 && Array.isArray(root.channels)) {
       for (const rawChannel of root.channels.slice(0, HARD_LIMITS.maxChannels * 2)) {
         const record = asRecord(rawChannel);
         const channelId = safeId(record?.channelId);
         if (!channelId || this.channels.has(channelId)) continue;
-        const channel: StoredAmbientChannel = { channelId, recent: [] };
+        const channel: StoredAmbientChannel = { channelId, recent: [], semanticRecency: [] };
+        const rawSemanticRecency = record?.semanticRecency;
+        const hasPersistedSemanticRecency = Array.isArray(rawSemanticRecency);
+        if (hasPersistedSemanticRecency) {
+          for (const rawEntry of rawSemanticRecency.slice(
+            0,
+            HARD_LIMITS.maxSemanticRecencyEntriesPerChannel * 2,
+          )) {
+            const entry = this.sanitizeSemanticRecencyEntry(rawEntry, now);
+            if (!entry) continue;
+            this.rememberSemanticPublication(
+              channel,
+              entry.semanticFamily,
+              entry.semanticKey,
+              entry.lastPublishedAt,
+            );
+          }
+        } else {
+          semanticRecencyNeedsPersist = true;
+        }
         const current = this.sanitizeEpisode(record?.current, channelId, now);
         if (current && !seenEpisodeIds.has(current.id)) {
           seenEpisodeIds.add(current.id);
@@ -503,14 +564,29 @@ export class AmbientEpisodeLedger {
         }
         channel.recent.sort(compareRecent);
         channel.recent = channel.recent.slice(0, this.maxRecentEpisodesPerChannel);
-        if (channel.current || channel.recent.length > 0) this.channels.set(channelId, channel);
+        // Legacy files are bootstrapped from retained authored publications.
+        // New files merge those publications too, repairing an index that was
+        // partially written or sanitized while preserving older compact rows.
+        for (const episode of [...channel.recent, ...(channel.current ? [channel.current] : [])]) {
+          if (!contributesAuthoredNovelty(episode.sourceKind)) continue;
+          const repaired = this.rememberSemanticPublication(
+            channel,
+            episode.semanticFamily,
+            episode.semanticKey,
+            episode.lastActivityAt,
+          );
+          if (hasPersistedSemanticRecency && repaired) semanticRecencyNeedsPersist = true;
+        }
+        if (channel.current || channel.recent.length > 0 || channel.semanticRecency.length > 0) {
+          this.channels.set(channelId, channel);
+        }
       }
     }
     const result = this.pruneInternal(now);
     const channelsTrimmed = this.trimChannels();
     if (
       result.episodesClosed > 0 || result.episodesRemoved > 0 ||
-      result.channelsRemoved > 0 || channelsTrimmed > 0
+      result.channelsRemoved > 0 || channelsTrimmed > 0 || semanticRecencyNeedsPersist
     ) {
       this.schedulePersist();
     }
@@ -546,11 +622,19 @@ export class AmbientEpisodeLedger {
 
     let channel = this.channels.get(normalized.channelId);
     if (!channel) {
-      channel = { channelId: normalized.channelId, recent: [] };
+      channel = { channelId: normalized.channelId, recent: [], semanticRecency: [] };
       this.channels.set(normalized.channelId, channel);
     }
     if (channel.current) this.closeStored(channel, channel.current, "superseded", now, this.semanticCooldownMs);
     channel.current = normalized;
+    if (contributesAuthoredNovelty(normalized.sourceKind)) {
+      this.rememberSemanticPublication(
+        channel,
+        normalized.semanticFamily,
+        normalized.semanticKey,
+        observedNow,
+      );
+    }
     this.trimChannels();
     // A replayed, already-expired episode becomes bounded recent history
     // immediately instead of temporarily reviving as a current conversation.
@@ -574,13 +658,17 @@ export class AmbientEpisodeLedger {
       episode.lastActivityAt,
       Math.min(observedNow, safeTimestamp(input.activityAt, observedNow)),
     );
+    const incomingMessageIds = safeIds(input.messageIds, this.maxMessageIdsPerEpisode);
+    const hasNewPublishedMessage = incomingMessageIds.some((messageId) =>
+      !episode.messageIds.includes(messageId)
+    );
 
     episode.facets = safeSemantics(input.facets, this.maxFacetsPerEpisode, episode.facets);
     episode.entities = safeSemantics(input.entities, this.maxEntitiesPerEpisode, episode.entities);
     episode.sourceUrls = safeSourceUrls(input.sourceUrls, this.maxSourceUrlsPerEpisode, episode.sourceUrls);
     episode.participantIds = safeIds(input.participantIds, this.maxParticipantsPerEpisode, episode.participantIds);
     episode.witnessIds = safeIds(input.witnessIds, this.maxWitnessesPerEpisode, episode.witnessIds);
-    episode.messageIds = safeIds(input.messageIds, this.maxMessageIdsPerEpisode, episode.messageIds);
+    episode.messageIds = safeIds(incomingMessageIds, this.maxMessageIdsPerEpisode, episode.messageIds);
     this.mergeStances(episode, input.stances, at);
     this.mergeHooks(episode, input.hooks, at);
     this.changeHookStatuses(episode, input.resolveHookIds, "resolved", at);
@@ -588,6 +676,14 @@ export class AmbientEpisodeLedger {
     this.includeProvenanceMessageIds(episode);
     episode.lastActivityAt = at;
     this.rememberOperation(episode, operationId);
+    if (hasNewPublishedMessage && contributesAuthoredNovelty(episode.sourceKind)) {
+      this.rememberSemanticPublication(
+        found.channel,
+        episode.semanticFamily,
+        episode.semanticKey,
+        at,
+      );
+    }
     this.schedulePersist();
     return snapshot(episode);
   }
@@ -752,6 +848,38 @@ export class AmbientEpisodeLedger {
       if (semanticKey && semanticIdentity(episode.semanticKey) === semanticIdentity(semanticKey)) return true;
       return Boolean(semanticFamily && semanticIdentity(episode.semanticFamily) === semanticIdentity(semanticFamily));
     });
+  }
+
+  /**
+   * Returns publication-derived semantic recency without inspecting message
+   * prose. The director uses this to prefer the least recently used authored
+   * topic across restarts; a selected or rejected generation never appears in
+   * this ledger and therefore cannot consume novelty.
+   */
+  semanticLastUsedAt(
+    channelId: string,
+    semantic: { semanticKey?: string; semanticFamily?: string },
+    at = this.now(),
+  ): number | undefined {
+    const safeChannelId = safeId(channelId);
+    const semanticKey = safeSemantic(semantic.semanticKey);
+    const semanticFamily = safeSemantic(semantic.semanticFamily);
+    if (!safeChannelId || (!semanticKey && !semanticFamily)) return undefined;
+    this.pruneAndSchedule(at);
+    const channel = this.channels.get(safeChannelId);
+    if (!channel) return undefined;
+    return channel.semanticRecency.reduce<number | undefined>(
+      (latest, entry) => {
+        const matchesKey = semanticKey &&
+          semanticIdentity(entry.semanticKey) === semanticIdentity(semanticKey);
+        const matchesFamily = semanticFamily &&
+          semanticIdentity(entry.semanticFamily) === semanticIdentity(semanticFamily);
+        if (!matchesKey && !matchesFamily) return latest;
+        const usedAt = Math.min(at, entry.lastPublishedAt);
+        return latest === undefined ? usedAt : Math.max(latest, usedAt);
+      },
+      undefined,
+    );
   }
 
   relevance(episodeId: string, at = this.now()): number {
@@ -957,8 +1085,12 @@ export class AmbientEpisodeLedger {
         .filter((episode) => at - (episode.closedAt ?? episode.lastActivityAt) <= this.retentionMs)
         .sort(compareRecent)
         .slice(0, this.maxRecentEpisodesPerChannel);
+      channel.semanticRecency = channel.semanticRecency
+        .filter((entry) => at - entry.lastPublishedAt <= this.retentionMs)
+        .sort(compareSemanticRecency)
+        .slice(0, this.maxSemanticRecencyEntriesPerChannel);
       episodesRemoved += before - channel.recent.length;
-      if (!channel.current && channel.recent.length === 0) {
+      if (!channel.current && channel.recent.length === 0 && channel.semanticRecency.length === 0) {
         this.channels.delete(channelId);
         channelsRemoved += 1;
       }
@@ -971,8 +1103,10 @@ export class AmbientEpisodeLedger {
     const ordered = [...this.channels.values()].sort((left, right) => {
       const currentPreference = Number(Boolean(right.current)) - Number(Boolean(left.current));
       if (currentPreference !== 0) return currentPreference;
-      const leftTime = left.current?.lastActivityAt ?? left.recent[0]?.lastActivityAt ?? 0;
-      const rightTime = right.current?.lastActivityAt ?? right.recent[0]?.lastActivityAt ?? 0;
+      const leftTime = left.current?.lastActivityAt ?? left.recent[0]?.lastActivityAt ??
+        left.semanticRecency[0]?.lastPublishedAt ?? 0;
+      const rightTime = right.current?.lastActivityAt ?? right.recent[0]?.lastActivityAt ??
+        right.semanticRecency[0]?.lastPublishedAt ?? 0;
       return rightTime - leftTime || left.channelId.localeCompare(right.channelId);
     });
     const keep = new Set(ordered.slice(0, this.maxChannels).map((channel) => channel.channelId));
@@ -981,6 +1115,48 @@ export class AmbientEpisodeLedger {
       if (!keep.has(channelId) && this.channels.delete(channelId)) removed += 1;
     }
     return removed;
+  }
+
+  private sanitizeSemanticRecencyEntry(
+    raw: unknown,
+    now: number,
+  ): AmbientSemanticRecencyEntry | undefined {
+    const value = asRecord(raw);
+    const semanticFamily = safeSemantic(value?.semanticFamily);
+    const semanticKey = safeSemantic(value?.semanticKey);
+    if (
+      !semanticFamily || !semanticKey ||
+      typeof value?.lastPublishedAt !== "number" || !Number.isFinite(value.lastPublishedAt)
+    ) return undefined;
+    return {
+      semanticFamily,
+      semanticKey,
+      lastPublishedAt: Math.min(now, Math.max(0, value.lastPublishedAt)),
+    };
+  }
+
+  private rememberSemanticPublication(
+    channel: StoredAmbientChannel,
+    rawSemanticFamily: string,
+    rawSemanticKey: string,
+    rawPublishedAt: number,
+  ): boolean {
+    const semanticFamily = safeSemantic(rawSemanticFamily);
+    const semanticKey = safeSemantic(rawSemanticKey);
+    if (!semanticFamily || !semanticKey || !Number.isFinite(rawPublishedAt)) return false;
+    const lastPublishedAt = Math.max(0, rawPublishedAt);
+    const identity = semanticRecencyIdentity(semanticFamily, semanticKey);
+    const existingIndex = channel.semanticRecency.findIndex((entry) =>
+      semanticRecencyIdentity(entry.semanticFamily, entry.semanticKey) === identity
+    );
+    const existing = existingIndex >= 0 ? channel.semanticRecency[existingIndex] : undefined;
+    if (existing && existing.lastPublishedAt >= lastPublishedAt) return false;
+    if (existingIndex >= 0) channel.semanticRecency.splice(existingIndex, 1);
+    channel.semanticRecency.push({ semanticFamily, semanticKey, lastPublishedAt });
+    channel.semanticRecency = channel.semanticRecency
+      .sort(compareSemanticRecency)
+      .slice(0, this.maxSemanticRecencyEntriesPerChannel);
+    return true;
   }
 
   private sanitizeEpisode(raw: unknown, channelId: string, now: number): StoredAmbientEpisode | undefined {
@@ -1092,6 +1268,7 @@ export class AmbientEpisodeLedger {
           channelId: channel.channelId,
           ...(channel.current ? { current: structuredClone(channel.current) } : {}),
           recent: channel.recent.map((episode) => structuredClone(episode)),
+          semanticRecency: channel.semanticRecency.map((entry) => ({ ...entry })),
         })),
     };
   }

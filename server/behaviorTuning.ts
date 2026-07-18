@@ -222,39 +222,47 @@ export const autonomousLinkPolicy = (frequency: number): AutonomousLinkPolicy =>
       dailyCap: 0,
     };
   }
-  const belowBaseline = level < 50;
-  const position = belowBaseline ? (level - 1) / 49 : (level - 50) / 50;
-  // Preserve the established 50/60 calibration, then make the explicitly
-  // selected upper range materially different. Even at 100, hard cooldowns,
-  // the rolling success cap and the director's global activity limits remain.
-  const upperPosition = level > 60 ? (level - 60) / 40 : undefined;
+  const anchors = level <= 50
+    ? {
+        position: (level - 1) / 49,
+        from: { globalMinutes: 360, channelMinutes: 720, quietSeconds: 300 },
+        to: { globalMinutes: 90, channelMinutes: 180, quietSeconds: 120 },
+      }
+    : level <= 60
+      ? {
+          position: (level - 50) / 10,
+          from: { globalMinutes: 90, channelMinutes: 180, quietSeconds: 120 },
+          to: { globalMinutes: 60, channelMinutes: 120, quietSeconds: 90 },
+        }
+      : {
+          position: (level - 60) / 40,
+          from: { globalMinutes: 60, channelMinutes: 120, quietSeconds: 90 },
+          to: { globalMinutes: 12, channelMinutes: 40, quietSeconds: 40 },
+        };
+  const globalMinutes = interpolate(
+    anchors.from.globalMinutes,
+    anchors.to.globalMinutes,
+    anchors.position,
+  );
+  const globalCooldownMs = Math.round(globalMinutes * 60_000);
   return {
     enabled: true,
-    chance: belowBaseline
-      ? interpolate(0.015, 0.07, position)
-      : upperPosition === undefined
-        ? interpolate(0.07, 0.22, position)
-        : interpolate(0.10, 0.65, upperPosition),
-    globalCooldownMs: Math.round((belowBaseline
-      ? interpolate(60, 30, position)
-      : upperPosition === undefined
-        ? interpolate(30, 12, position)
-        : interpolate(26.4, 5, upperPosition)) * 60_000),
-    channelCooldownMs: Math.round((belowBaseline
-      ? interpolate(240, 120, position)
-      : upperPosition === undefined
-        ? interpolate(120, 40, position)
-        : interpolate(104, 20, upperPosition)) * 60_000),
-    humanQuietMs: Math.round((belowBaseline
-      ? interpolate(300, 180, position)
-      : upperPosition === undefined
-        ? interpolate(180, 75, position)
-        : interpolate(159, 45, upperPosition)) * 1_000),
-    dailyCap: Math.round(belowBaseline
-      ? interpolate(2, 6, position)
-      : upperPosition === undefined
-        ? interpolate(6, 16, position)
-        : interpolate(8, 36, upperPosition)),
+    // Cadence, rather than a Bernoulli lottery, owns frequency. This makes the
+    // rolling cap refill at the same rate instead of producing bursts followed
+    // by a long quota cliff.
+    chance: 1,
+    globalCooldownMs,
+    channelCooldownMs: Math.round(interpolate(
+      anchors.from.channelMinutes,
+      anchors.to.channelMinutes,
+      anchors.position,
+    ) * 60_000),
+    humanQuietMs: Math.round(interpolate(
+      anchors.from.quietSeconds,
+      anchors.to.quietSeconds,
+      anchors.position,
+    ) * 1_000),
+    dailyCap: Math.ceil(24 * 60 * 60_000 / globalCooldownMs),
   };
 };
 
