@@ -1121,20 +1121,33 @@ describe("persistent social memory store", () => {
         relationshipDeltas: [{
           ownerId: "resident-mira",
           subjectId: "resident-sana",
+          familiarity: 1,
           warmth: 1,
           trust: 1,
           respect: 1,
+          friction: 1,
         }],
         openLoops: [],
       }));
     }
     expect(store.getRelationship("resident-mira", "resident-sana")).toMatchObject({
-      warmth: expect.closeTo(0.3, 8),
-      trust: expect.closeTo(0.25, 8),
-      respect: expect.closeTo(0.25, 8),
+      familiarity: expect.closeTo(0.45, 8),
+      warmth: expect.closeTo(0.4, 8),
+      trust: expect.closeTo(0.4, 8),
+      respect: expect.closeTo(0.4, 8),
+      friction: expect.closeTo(0.6, 8),
+    });
+    expect(projectRelationshipBehavior(
+      store.getRelationship("resident-mira", "resident-sana"),
+    ).bands).toMatchObject({
+      familiarity: "familiar",
+      warmth: "positive",
+      trust: "positive",
+      respect: "positive",
+      friction: "high",
     });
 
-    for (let index = 0; index < 100; index += 1) {
+    for (let index = 0; index < 170; index += 1) {
       store.recordEvent(baseEvent(`autonomous-lifetime-down-${index}`, {
         origin: "autonomous",
         occurredAt: 1_800_000_000_000 + (index + 100) * day,
@@ -1145,17 +1158,21 @@ describe("persistent social memory store", () => {
         relationshipDeltas: [{
           ownerId: "resident-mira",
           subjectId: "resident-sana",
+          familiarity: -1,
           warmth: -1,
           trust: -1,
           respect: -1,
+          friction: -1,
         }],
         openLoops: [],
       }));
     }
     expect(store.getRelationship("resident-mira", "resident-sana")).toMatchObject({
-      warmth: expect.closeTo(-0.3, 8),
-      trust: expect.closeTo(-0.25, 8),
-      respect: expect.closeTo(-0.25, 8),
+      familiarity: 0,
+      warmth: expect.closeTo(-0.4, 8),
+      trust: expect.closeTo(-0.4, 8),
+      respect: expect.closeTo(-0.4, 8),
+      friction: 0,
     });
   });
 
@@ -1675,7 +1692,7 @@ describe("persistent social memory store", () => {
       store.recordEvent(event(`human-triggered-ai-pair-day-${day}`, 1_800_000_000_000 + day * DAY_MS));
     }
     expect(store.getRelationship("resident-mira", "resident-sana")).toMatchObject({
-      warmth: expect.closeTo(0.3, 8),
+      warmth: expect.closeTo(0.4, 8),
       romanticInterest: expect.closeTo(0.65, 8),
     });
   });
@@ -2472,7 +2489,7 @@ describe("persistent social memory store", () => {
 
     const afterForget = store.recordEvent(autonomous("envelope-next-positive", 3, 1));
     expect(afterForget.appliedRelationshipDeltas[0]?.warmth).toBe(0);
-    expect(store.getRelationship("resident-mira", "resident-sana")?.warmth).toBeCloseTo(0.3);
+    expect(store.getRelationship("resident-mira", "resident-sana")?.warmth).toBeCloseTo(0.4);
   });
 
   it("bounds relationship checkpoints per pair and expires their contribution with provenance", async () => {

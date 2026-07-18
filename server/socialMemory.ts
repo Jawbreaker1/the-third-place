@@ -514,11 +514,15 @@ const DEFAULT_AUTONOMOUS_CAPS: RelationshipVector = {
  * hostility. Human-origin events are deliberately not subject to this guard.
  */
 const AUTONOMOUS_LIFETIME_ENVELOPES: RelationshipVector = {
-  familiarity: 0.35,
-  warmth: 0.3,
-  trust: 0.25,
-  respect: 0.25,
-  friction: 0.3,
+  // The daily caps above remain the primary speed limit. These envelopes are
+  // only high enough for roughly 45–67 distinct, maximally evidence-bearing
+  // days to cross a useful coarse behavior band; autonomous chatter still
+  // cannot manufacture extreme closeness or hostility from 24/7 activity.
+  familiarity: 0.45,
+  warmth: 0.4,
+  trust: 0.4,
+  respect: 0.4,
+  friction: 0.6,
   romanticInterest: 0.65,
 };
 

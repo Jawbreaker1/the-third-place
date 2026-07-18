@@ -323,11 +323,11 @@ npm run audit:ambient
 npm run eval:humanity -- --strict
 npm run eval:semantics
 npm run eval:ambient
-npm run eval:relationships -- --samples=3 --judge-passes=2
+npm run eval:relationships -- --medium=both --samples=3 --judge-passes=2
 npm run eval:security
 ```
 
-The relationship evaluation keeps production memory untouched. It runs controlled directed-relationship states through the full reviewed Gemma scene pipeline, performs blind semantic comparisons, simulates responder-selection effects and writes the detailed ignored report under `data/evals/`.
+The relationship evaluation keeps production memory untouched. It can run the same controlled directed-relationship states through both real public and DM scene contracts, performs blind semantic comparisons, simulates responder-selection effects and writes the detailed ignored report under `data/evals/`. Use `--medium=dm` for the focused private-chat matrix.
 
 Integration smokes exercise real public/DM chat, research, weather, football, history, links, images and voice. Research expects the running server to have `RESEARCH_ENABLED=true`:
 

@@ -30,9 +30,11 @@ import { capabilitiesForMedium, type TurnCapability } from "./capabilities/catal
 import type { SocialMemoryCoordinator } from "./socialMemoryCoordinator.js";
 import type { SocialMemoryScope } from "./socialMemory.js";
 import {
+  deriveRelationshipStylePlan,
   RELATIONSHIP_DECISION_BIAS_LIMITS,
   type RelationshipBehaviorProjection,
   type RelationshipPromptCue,
+  type RelationshipStylePlan,
 } from "./relationshipBehavior.js";
 
 export interface VoiceAiSpeechPayload {
@@ -548,6 +550,14 @@ export class VoiceDirector {
     return coarseVoiceRelationshipNote(this.relationshipBehavior(ownerPersonaId, subjectActorId));
   }
 
+  private voiceRelationshipStylePlan(
+    ownerPersonaId: string,
+    subjectActorId: string,
+  ): RelationshipStylePlan | undefined {
+    const projection = this.relationshipBehavior(ownerPersonaId, subjectActorId);
+    return projection ? deriveRelationshipStylePlan(projection, "voice") : undefined;
+  }
+
   private romanceEligibleActor(actorId: string, kind: "human" | "resident"): boolean {
     try {
       return this.options.romanceEligibleActor?.(actorId, kind) === true;
@@ -568,16 +578,14 @@ export class VoiceDirector {
   }
 
   private romanticInteractionPolicy(
-    residentId: string,
-    subjectId: string,
-    subjectKind: "human" | "resident",
-  ): "ordinary_only" | undefined {
-    if (this.romanticSceneEligibility(residentId, subjectId, subjectKind) === "ineligible") {
-      return "ordinary_only";
-    }
-    return this.relationshipBehavior(residentId, subjectId)?.romanticBoundary.state === "closed"
-      ? "ordinary_only"
-      : undefined;
+    _residentId: string,
+    _subjectId: string,
+    _subjectKind: "human" | "resident",
+  ): "ordinary_only" {
+    // Voice has no rare romantic-scene gate yet. Eligibility and an unspecified
+    // boundary are not permission, so ordinary peer warmth remains allowed but
+    // romantic escalation stays fail-closed.
+    return "ordinary_only";
   }
 
   private selectPersona(
@@ -832,6 +840,7 @@ export class VoiceDirector {
             },
           ),
         );
+    const relationshipStylePlan = this.voiceRelationshipStylePlan(persona.id, entry.speakerId);
     const previousRelation = this.options.humanMemory?.getRelation(entry.speakerId, persona.id);
     const actorChannelNotes = this.options.actorChannels.promptNotes([persona], room.channelId);
     const actorExpertiseNotes = this.options.actorChannels.expertiseNotes([persona], room.channelId);
@@ -921,6 +930,9 @@ export class VoiceDirector {
             })),
           },
           ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
+          ...(relationshipStylePlan
+            ? { relationshipStylePlans: { [persona.id]: relationshipStylePlan } }
+            : {}),
           ...(this.romanticInteractionPolicy(
             persona.id,
             entry.speakerId,
@@ -1203,6 +1215,7 @@ export class VoiceDirector {
         },
       ),
     );
+    const relationshipStylePlan = this.voiceRelationshipStylePlan(persona.id, sourceEntry.speakerId);
     let spoken = "";
     let utteranceLanguage = canonicalRegisteredLanguageTag(language);
     const generationAbort = new AbortController();
@@ -1255,6 +1268,9 @@ export class VoiceDirector {
             })),
           },
           ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
+          ...(relationshipStylePlan
+            ? { relationshipStylePlans: { [persona.id]: relationshipStylePlan } }
+            : {}),
           ...(this.romanticInteractionPolicy(
             persona.id,
             sourceEntry.speakerId,

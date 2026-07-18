@@ -5,6 +5,21 @@ export type SignedRelationshipBand = "negative" | "neutral" | "positive";
 export type FrictionBand = "low" | "present" | "high";
 export type RomanticInterestBand = "none" | "emerging" | "established";
 export type RomanticBoundaryBand = "unspecified" | "closed";
+export type RelationshipStyleMedium = "public" | "dm" | "ambient" | "welcome" | "voice";
+export type RelationshipSocialEase = "unfamiliar" | "recognizes" | "relaxed" | "close";
+export type RelationshipGoodwill = "cool" | "ordinary" | "warm";
+export type RelationshipOpenness = "guarded" | "ordinary" | "candid";
+export type RelationshipRegard = "doubtful" | "ordinary" | "takes_seriously";
+export type RelationshipTension = "easy" | "charged" | "strained";
+export type RelationshipExpression = "background" | "light" | "clear";
+export type RelationshipStyleMove =
+  | "allow_subtle_romantic_undertone"
+  | "keep_distance"
+  | "challenge_claim"
+  | "assume_goodwill"
+  | "share_small_uncertainty"
+  | "engage_strongest_point"
+  | "recognize_familiarity";
 export type RelationshipStance =
   | "neutral"
   | "comfortable"
@@ -52,9 +67,29 @@ export interface RelationshipPromptCue {
   rapport: FamiliarityBand;
   stance: RelationshipStance;
   friction: FrictionBand;
+  /** Independent prompt-safe projections of warmth, trust and respect. */
+  affection: SignedRelationshipBand;
+  openness: SignedRelationshipBand;
+  regard: SignedRelationshipBand;
   /** Prompt-safe veto only. It contains neither the blocker nor internal IDs. */
   romanticBoundary?: "closed";
   romanticInterest?: Exclude<RomanticInterestBand, "none">;
+}
+
+/**
+ * Prompt-safe behavioral posture for one medium. Every field is categorical;
+ * there are no measurements, actor IDs or lists of competing moves for a
+ * model to turn into a checklist.
+ */
+export interface RelationshipStylePlan {
+  socialEase: RelationshipSocialEase;
+  goodwill: RelationshipGoodwill;
+  openness: RelationshipOpenness;
+  regard: RelationshipRegard;
+  tension: RelationshipTension;
+  expression: RelationshipExpression;
+  /** At most one optional behavior nudge. The current turn still decides whether it fits naturally. */
+  move?: RelationshipStyleMove;
 }
 
 export interface RelationshipBehaviorProjection {
@@ -143,6 +178,102 @@ const relationshipValues = (edge: RelationshipEdge | undefined) => ({
 const uniqueBlockerIds = (edge: RelationshipEdge | undefined): string[] =>
   [...new Set((edge?.romanticBoundaryBlockerIds ?? []).filter((id) => id.length > 0))].sort();
 
+const socialEaseFor = (rapport: FamiliarityBand): RelationshipSocialEase => {
+  switch (rapport) {
+    case "new": return "unfamiliar";
+    case "known": return "recognizes";
+    case "familiar": return "relaxed";
+    case "close": return "close";
+  }
+};
+
+const goodwillFor = (affection: SignedRelationshipBand): RelationshipGoodwill =>
+  affection === "negative" ? "cool" : affection === "positive" ? "warm" : "ordinary";
+
+const opennessFor = (openness: SignedRelationshipBand): RelationshipOpenness =>
+  openness === "negative" ? "guarded" : openness === "positive" ? "candid" : "ordinary";
+
+const regardFor = (regard: SignedRelationshipBand): RelationshipRegard =>
+  regard === "negative" ? "doubtful" : regard === "positive" ? "takes_seriously" : "ordinary";
+
+const tensionFor = (friction: FrictionBand): RelationshipTension =>
+  friction === "high" ? "strained" : friction === "present" ? "charged" : "easy";
+
+const styleMoveFor = (
+  cue: RelationshipPromptCue,
+  socialEase: RelationshipSocialEase,
+): RelationshipStyleMove | undefined => {
+  // The romantic move is reachable only through the already-authorized prompt
+  // cue. A stored numeric band, eligibility flag or unspecified boundary can
+  // never manufacture it here.
+  if (cue.romanticInterest !== undefined) return "allow_subtle_romantic_undertone";
+  if (cue.affection === "negative" || cue.openness === "negative") {
+    return "keep_distance";
+  }
+  if (cue.friction !== "low" || cue.regard === "negative") return "challenge_claim";
+  if (cue.affection === "positive") return "assume_goodwill";
+  if (cue.openness === "positive") return "share_small_uncertainty";
+  if (cue.regard === "positive") return "engage_strongest_point";
+  if (socialEase !== "unfamiliar") return "recognize_familiarity";
+  return undefined;
+};
+
+const clearRelationshipMove = (
+  move: RelationshipStyleMove,
+  cue: RelationshipPromptCue,
+  socialEase: RelationshipSocialEase,
+): boolean => {
+  if (move === "allow_subtle_romantic_undertone") return true;
+  if (move === "keep_distance") {
+    return cue.friction === "high" || cue.affection === "negative" || cue.openness === "negative";
+  }
+  if (move === "challenge_claim") return cue.regard === "negative" || cue.friction === "high";
+  if (move === "assume_goodwill") return cue.affection === "positive";
+  if (move === "share_small_uncertainty") return cue.openness === "positive";
+  if (move === "engage_strongest_point") return cue.regard === "positive";
+  return socialEase === "close";
+};
+
+/**
+ * Derives one medium-specific, prompt-safe behavioral plan from an already
+ * trusted coarse projection. Neutral relationships stay in the background;
+ * a genuinely non-neutral axis marks one base micro-move as clear, mere
+ * recognition stays light outside DM, and an already rare-authorized romantic
+ * undertone is clear. The scene layer may deterministically rotate or soften
+ * ordinary clear moves between turns to avoid a repeated tell. This function
+ * is pure and never exposes server-only boundary IDs or numeric scores.
+ */
+export function deriveRelationshipStylePlan(
+  projection: RelationshipBehaviorProjection,
+  medium: RelationshipStyleMedium,
+): RelationshipStylePlan {
+  const cue = projection.promptCue;
+  const socialEase = socialEaseFor(cue.rapport);
+  const goodwill = goodwillFor(cue.affection);
+  const openness = opennessFor(cue.openness);
+  const regard = regardFor(cue.regard);
+  const tension = tensionFor(cue.friction);
+  const move = styleMoveFor(cue, socialEase);
+  const expression: RelationshipExpression = move === undefined
+    ? "background"
+    : move === "allow_subtle_romantic_undertone" || (
+        clearRelationshipMove(move, cue, socialEase) &&
+        (move !== "recognize_familiarity" || medium === "dm")
+      )
+      ? "clear"
+      : "light";
+
+  return {
+    socialEase,
+    goodwill,
+    openness,
+    regard,
+    tension,
+    expression,
+    ...(move === undefined ? {} : { move }),
+  };
+}
+
 export function projectRelationshipBehavior(
   edge: RelationshipEdge | undefined,
   options: RelationshipBehaviorProjectionOptions = {},
@@ -206,6 +337,9 @@ export function projectRelationshipBehavior(
     rapport: bands.familiarity,
     stance: stanceFor(bands),
     friction: bands.friction,
+    affection: bands.warmth,
+    openness: bands.trust,
+    regard: bands.respect,
     ...(romanticBoundaryClosed ? { romanticBoundary: "closed" as const } : {}),
     ...(
       options.allowRomanticSurface === true &&

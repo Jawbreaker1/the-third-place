@@ -5,6 +5,7 @@ import { PERSONAS } from "./personas.js";
 import { createFailClosedTurnAnalysis } from "./semanticRouter.js";
 import { createMessage, RoomStore } from "./store.js";
 import type { DeliveredSocialEpisode } from "./socialMemoryCoordinator.js";
+import { projectRelationshipBehavior } from "./relationshipBehavior.js";
 
 const human = {
   id: "guest-social-memory",
@@ -46,6 +47,7 @@ const analyzedTurn = () => ({
 
 const setup = (options: {
   now?: () => number;
+  rng?: () => number;
   coordinator?: {
     enqueueDeliveredEpisode: ReturnType<typeof vi.fn>;
     promptNote: ReturnType<typeof vi.fn>;
@@ -91,7 +93,7 @@ const setup = (options: {
     () => 1,
     {
       now: options.now,
-      rng: () => 0.5,
+      rng: options.rng ?? (() => 0.5),
       socialMemory: {
         enqueueDeliveredEpisode,
         promptNote,
@@ -462,7 +464,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     director.stop();
   });
 
-  it("projects a stored boundary only onto the affected resident's prompt-safe policy", () => {
+  it("keeps every actor ordinary-only unless the exact rare scene gate authorizes one", () => {
     const [mira, sana] = PERSONAS.slice(0, 2);
     const behaviorProjection = vi.fn((ownerId: string) => ({
       romanticBoundary: { state: ownerId === sana!.id ? "closed" : "unspecified", blockerActorIds: [] },
@@ -488,7 +490,113 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       ) => Record<string, "ordinary_only">;
     }).humanRomanticInteractionPolicies([mira!, sana!], human);
 
-    expect(policies).toEqual({ [sana!.id]: "ordinary_only" });
+    expect(policies).toEqual({
+      [mira!.id]: "ordinary_only",
+      [sana!.id]: "ordinary_only",
+    });
+    director.stop();
+  });
+
+  it("uses one rare gate result for both the DM style cue and exact actor policy", () => {
+    const [mira, sana] = PERSONAS.slice(0, 2);
+    const rng = vi.fn(() => 0);
+    const promptNote = vi.fn(() => "PRIVATE DIRECTED RELATIONSHIP NOTE");
+    const behaviorProjection = vi.fn((_ownerId: string, _subjectId: string, options = {}) =>
+      projectRelationshipBehavior({
+        ownerId: mira!.id,
+        subjectId: human.id,
+        familiarity: 0.9,
+        warmth: 0.8,
+        trust: 0.8,
+        respect: 0.8,
+        friction: 0.05,
+        romanticInterest: 0.9,
+        romanticBoundaryClosed: false,
+        romanticBoundaryBlockerIds: [],
+        updatedAt: 1_800_000_000_000,
+      }, options),
+    );
+    const { director } = setup({
+      now: () => 1_800_000_000_000,
+      rng,
+      romanceEligibleHumanActor: () => true,
+      romanceEligibleResidentActor: () => true,
+      coordinator: {
+        enqueueDeliveredEpisode: vi.fn(async () => ({
+          status: "no_events",
+          episodeId: "test",
+          eventIds: [],
+          createdEventIds: [],
+        })),
+        promptNote,
+        behaviorProjection,
+      },
+    });
+    const romanticTurn = {
+      context: "dm" as const,
+      gateForPersona: () => ({
+        semanticTrusted: true,
+        semanticKind: "romantic_invitation" as const,
+        addressedToResident: true,
+        socialTrusted: true,
+        hostility: 0,
+        urgency: 0,
+        interactionTrusted: true,
+        interactionKind: "ordinary" as const,
+        moderationTrusted: true,
+        moderationRisk: "none" as const,
+        moderationAction: "none" as const,
+        moderationCategories: [],
+      }),
+    };
+    const internals = director as unknown as {
+      humanRelationshipSceneContext: (
+        personas: typeof PERSONAS,
+        member: typeof human,
+        scope: { kind: "dm"; threadId: string; participantIds: string[] },
+        medium: "dm",
+        turn: typeof romanticTurn,
+      ) => {
+        relationshipNotes: Record<string, string>;
+        relationshipStylePlans: Record<string, { move?: string; expression: string }>;
+        romanticInteractionPolicies: Record<string, "ordinary_only">;
+      };
+    };
+    const scope = {
+      kind: "dm" as const,
+      threadId: "dm-romance-gate",
+      participantIds: [human.id, mira!.id],
+    };
+
+    const surfaced = internals.humanRelationshipSceneContext(
+      [mira!, sana!],
+      human,
+      scope,
+      "dm",
+      romanticTurn,
+    );
+    expect(surfaced.relationshipNotes).toEqual({ [mira!.id]: "PRIVATE DIRECTED RELATIONSHIP NOTE" });
+    expect(surfaced.relationshipStylePlans[mira!.id]).toMatchObject({
+      expression: "clear",
+      move: "allow_subtle_romantic_undertone",
+    });
+    expect(surfaced.romanticInteractionPolicies).toEqual({ [sana!.id]: "ordinary_only" });
+    expect(promptNote).toHaveBeenCalledWith(mira!.id, human.id, scope, {
+      romanticSceneEligibility: "eligible",
+      allowRomanticSurface: true,
+    });
+    expect(rng).toHaveBeenCalledTimes(1);
+
+    const cooledDown = internals.humanRelationshipSceneContext(
+      [mira!],
+      human,
+      scope,
+      "dm",
+      romanticTurn,
+    );
+    expect(cooledDown.romanticInteractionPolicies).toEqual({ [mira!.id]: "ordinary_only" });
+    expect(cooledDown.relationshipStylePlans[mira!.id]?.move).toBe("assume_goodwill");
+    expect(rng).toHaveBeenCalledTimes(1);
     director.stop();
   });
 
@@ -638,6 +746,72 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     expect(notes[owner!.id]).toContain(first!.name);
     expect(notes[owner!.id]).toContain(second!.name);
     expect(notes[owner!.id]).not.toContain(omitted!.name);
+    director.stop();
+  });
+
+  it("keeps typed ambient relationship posture aimed at the immediate counterpart in a larger thread", () => {
+    const [owner, immediate, second, third] = PERSONAS.slice(0, 4);
+    const promptNote = vi.fn((ownerId: string, subjectId: string) =>
+      `DIRECTED MEMORY ${ownerId} -> ${subjectId}`
+    );
+    const behaviorProjection = vi.fn((ownerId: string, subjectId: string, options = {}) =>
+      projectRelationshipBehavior({
+        ownerId,
+        subjectId,
+        familiarity: 0.82,
+        warmth: 0.76,
+        trust: 0.7,
+        respect: 0.68,
+        friction: 0.08,
+        romanticInterest: 0,
+        romanticBoundaryClosed: false,
+        romanticBoundaryBlockerIds: [],
+        updatedAt: 1_800_000_000_000,
+      }, options),
+    );
+    const { director } = setup({
+      coordinator: {
+        enqueueDeliveredEpisode: vi.fn(async () => ({
+          status: "no_events",
+          episodeId: "test",
+          eventIds: [],
+          createdEventIds: [],
+        })),
+        promptNote,
+        behaviorProjection,
+      },
+    });
+    const internals = director as unknown as {
+      residentRelationshipSceneContext: (
+        owners: typeof PERSONAS,
+        counterparts: typeof PERSONAS,
+        scope: { kind: "public"; channelId: string },
+      ) => {
+        relationshipNotes: Record<string, string>;
+        relationshipStylePlans: Record<string, { move?: string; expression: string }>;
+        romanticInteractionPolicies: Record<string, "ordinary_only">;
+      };
+    };
+
+    const context = internals.residentRelationshipSceneContext(
+      [owner!],
+      [immediate!, second!, third!],
+      { kind: "public", channelId: "the-pub" },
+    );
+
+    expect(context.relationshipNotes[owner!.id]).toContain(immediate!.name);
+    expect(context.relationshipNotes[owner!.id]).toContain(second!.name);
+    expect(context.relationshipNotes[owner!.id]).not.toContain(third!.name);
+    expect(context.relationshipStylePlans[owner!.id]).toMatchObject({
+      move: "assume_goodwill",
+      expression: "clear",
+    });
+    expect(behaviorProjection).toHaveBeenCalledTimes(1);
+    expect(behaviorProjection).toHaveBeenCalledWith(owner!.id, immediate!.id, {
+      romanticSceneEligibility: "eligible",
+      allowRomanticSurface: false,
+    });
+    expect(context.romanticInteractionPolicies).toEqual({ [owner!.id]: "ordinary_only" });
     director.stop();
   });
 

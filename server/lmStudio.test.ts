@@ -7,6 +7,7 @@ import {
   deriveActiveRoomSocialMode,
   deriveRoomSharedRitualActorIds,
   deriveSceneBehaviorStylePlan,
+  resolveSceneRelationshipStylePlans,
   LmStudioClient,
   sanitizeObservationText,
   type GeneratedLine,
@@ -6324,6 +6325,112 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain("mention internal labels");
   });
 
+  it("treats one categorical relationship plan as trusted posture without making it a topic", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "dm",
+      channelName: "private chat with Alex",
+      selected: [mira],
+      history: [],
+      relationshipStylePlans: {
+        [mira.id]: {
+          socialEase: "close",
+          goodwill: "warm",
+          openness: "candid",
+          regard: "takes_seriously",
+          tension: "easy",
+          expression: "clear",
+          move: "assume_goodwill",
+        },
+      },
+    });
+
+    expect(prompt).toContain("Trusted directed relationship style plan");
+    expect(prompt).toContain('"move":"assume_goodwill"');
+    expect(prompt).toContain("changes conversational probabilities, never facts, consent, obligations");
+    expect(prompt).toContain("Never stack several axes into a performance");
+    expect(prompt).toContain("A single ordinary-looking line is often correct");
+  });
+
+  it("keeps posture stable while rotating and sometimes softening visible relationship moves by turn", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const plans = Array.from({ length: 48 }, (_, index) => resolveSceneRelationshipStylePlans({
+      kind: "dm",
+      channelName: "private chat with Alex",
+      selected: [mira],
+      history: [],
+      trigger: { author: "Alex", content: "samma sorts fråga", messageId: `relationship-turn-${index}` },
+      relationshipStylePlans: {
+        [mira.id]: {
+          socialEase: "close",
+          goodwill: "warm",
+          openness: "candid",
+          regard: "takes_seriously",
+          tension: "easy",
+          expression: "clear",
+          move: "assume_goodwill",
+        },
+      },
+    })?.[mira.id]);
+
+    expect(plans.every((plan) => plan?.socialEase === "close" && plan.goodwill === "warm")).toBe(true);
+    expect(new Set(plans.map((plan) => plan?.move)).size).toBeGreaterThan(1);
+    expect(new Set(plans.map((plan) => plan?.expression))).toEqual(new Set(["clear", "light"]));
+  });
+
+  it("never probabilistically hides a scene-authorized romantic undertone", () => {
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const resolved = resolveSceneRelationshipStylePlans({
+      kind: "public",
+      channelName: "lobby",
+      selected: [juno],
+      history: [],
+      trigger: { author: "Alex", content: "hej", messageId: "authorized-romance-turn" },
+      relationshipStylePlans: {
+        [juno.id]: {
+          socialEase: "close",
+          goodwill: "warm",
+          openness: "candid",
+          regard: "takes_seriously",
+          tension: "easy",
+          expression: "clear",
+          move: "allow_subtle_romantic_undertone",
+        },
+      },
+    })?.[juno.id];
+
+    expect(resolved).toMatchObject({
+      expression: "clear",
+      move: "allow_subtle_romantic_undertone",
+    });
+  });
+
+  it("varies guarded distance by turn instead of creating a permanent no-question fingerprint", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const expressions = Array.from({ length: 48 }, (_, index) =>
+      resolveSceneRelationshipStylePlans({
+        kind: "dm",
+        channelName: "private chat with Alex",
+        selected: [mira],
+        history: [],
+        trigger: { author: "Alex", content: "kan du hjälpa mig?", messageId: `guarded-turn-${index}` },
+        relationshipStylePlans: {
+          [mira.id]: {
+            socialEase: "close",
+            goodwill: "warm",
+            openness: "guarded",
+            regard: "takes_seriously",
+            tension: "charged",
+            expression: "clear",
+            move: "keep_distance",
+          },
+        },
+      })?.[mira.id]?.expression
+    );
+
+    expect(new Set(expressions)).toEqual(new Set(["clear", "light"]));
+  });
+
   it("keeps an ordinary multi-resident scene to one generation call when no private relationship note exists", async () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
@@ -6404,6 +6511,17 @@ describe("LM Studio room prompt", () => {
       relationshipNotes: {
         [mira.id]: `Private memory: ${miraOnlyDetail}`,
       },
+      relationshipStylePlans: {
+        [mira.id]: {
+          socialEase: "close",
+          goodwill: "warm",
+          openness: "candid",
+          regard: "takes_seriously",
+          tension: "easy",
+          expression: "clear",
+          move: "share_small_uncertainty",
+        },
+      },
       actorChannelNotes: {
         [mira.id]: `Mira channel state also contains ${miraOnlyDetail}`,
         [sana.id]: "Sana has no unread rooms.",
@@ -6433,19 +6551,27 @@ describe("LM Studio room prompt", () => {
     const reviewPayloads = bodies
       .filter((body) => body.messages[0]?.content.includes("publication reviewer"))
       .map((body) => JSON.parse(body.messages[1]!.content) as {
-        candidates: Array<{ personaId: string; privateRelationshipNote: string | null }>;
+        candidates: Array<{
+          personaId: string;
+          privateRelationshipNote: string | null;
+          surfaceStylePlan: { relationshipStyle?: { move?: string } };
+        }>;
       });
     expect(reviewPayloads).toEqual([
       expect.objectContaining({
         candidates: [expect.objectContaining({
           personaId: mira.id,
           privateRelationshipNote: expect.stringContaining(miraOnlyDetail),
+          surfaceStylePlan: expect.objectContaining({
+            relationshipStyle: expect.objectContaining({ move: "share_small_uncertainty" }),
+          }),
         })],
       }),
       expect.objectContaining({
         candidates: [expect.objectContaining({
           personaId: sana.id,
           privateRelationshipNote: null,
+          surfaceStylePlan: expect.not.objectContaining({ relationshipStyle: expect.anything() }),
         })],
       }),
     ]);

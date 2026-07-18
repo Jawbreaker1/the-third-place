@@ -4226,6 +4226,67 @@ describe("multilingual batch candidate-review contract", () => {
       }],
     }), ordinary)).toBeUndefined();
 
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [{
+        personaId: ordinary.candidates[0].personaId,
+        severity: "medium",
+        issues: ["behavior_intensity_violation"],
+        rewriteInstruction: "Reject an intensity violation that has no trusted active target.",
+        ...undeterminedOutputLanguage,
+      }],
+    }), ordinary)).toBeUndefined();
+
+    const clearRelationshipMove = candidateReviewInputSchema.parse({
+      ...ordinary,
+      candidates: [{
+        ...ordinary.candidates[0],
+        surfaceStylePlan: {
+          ...ordinary.candidates[0].surfaceStylePlan,
+          relationshipStyle: {
+            socialEase: "close",
+            goodwill: "warm",
+            openness: "candid",
+            regard: "takes_seriously",
+            tension: "easy",
+            expression: "clear",
+            move: "assume_goodwill",
+          },
+        },
+      }],
+    });
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [{
+        personaId: clearRelationshipMove.candidates[0].personaId,
+        severity: "medium",
+        issues: ["behavior_intensity_under_target"],
+        rewriteInstruction: "Låt en liten välvilja märkas utan att göra relationen till ämnet.",
+        ...undeterminedOutputLanguage,
+      }],
+    }), clearRelationshipMove)?.reviews[0].issues).toEqual(["behavior_intensity_under_target"]);
+
+    const lightRelationshipMove = candidateReviewInputSchema.parse({
+      ...clearRelationshipMove,
+      candidates: [{
+        ...clearRelationshipMove.candidates[0],
+        surfaceStylePlan: {
+          ...clearRelationshipMove.candidates[0].surfaceStylePlan,
+          relationshipStyle: {
+            ...clearRelationshipMove.candidates[0].surfaceStylePlan.relationshipStyle!,
+            expression: "light",
+          },
+        },
+      }],
+    });
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [{
+        personaId: lightRelationshipMove.candidates[0].personaId,
+        severity: "medium",
+        issues: ["behavior_intensity_under_target"],
+        rewriteInstruction: "Tvinga fram en relationsmarkör.",
+        ...undeterminedOutputLanguage,
+      }],
+    }), lightRelationshipMove)).toBeUndefined();
+
     const restrainedClean = candidateReviewInputSchema.parse({
       ...base,
       candidates: [{

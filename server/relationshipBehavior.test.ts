@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RelationshipEdge } from "./socialMemory.js";
 import {
+  deriveRelationshipStylePlan,
   RELATIONSHIP_DECISION_BIAS_LIMITS,
   projectRelationshipBehavior,
 } from "./relationshipBehavior.js";
@@ -39,7 +40,14 @@ describe("relationship behavior projection", () => {
         ambientContinuation: 0,
         voiceTieBreak: 0,
       },
-      promptCue: { rapport: "new", stance: "neutral", friction: "low" },
+      promptCue: {
+        rapport: "new",
+        stance: "neutral",
+        friction: "low",
+        affection: "neutral",
+        openness: "neutral",
+        regard: "neutral",
+      },
     });
   });
 
@@ -75,6 +83,11 @@ describe("relationship behavior projection", () => {
       friction: "high",
     });
     expect(projection.promptCue.stance).toBe("warm_but_tense");
+    expect(projection.promptCue).toMatchObject({
+      affection: "positive",
+      openness: "positive",
+      regard: "positive",
+    });
     expect(projection.decisionBiases.conflictChallengeReply).toBeGreaterThan(0);
     expect(projection.decisionBiases.ordinaryPublicReply)
       .toBeLessThan(projectRelationshipBehavior(edge({
@@ -210,5 +223,114 @@ describe("relationship behavior projection", () => {
     }), { allowRomanticSurface: true, romanticSceneEligibility: "eligible" }).promptCue;
     expect(JSON.stringify(cue)).not.toMatch(/\d/u);
     expect(Object.values(cue).every((value) => typeof value === "string")).toBe(true);
+  });
+
+  it("keeps warmth, trust and respect as independent style axes", () => {
+    const projection = projectRelationshipBehavior(edge({
+      familiarity: 0.5,
+      warmth: 0.8,
+      trust: -0.8,
+      respect: 0.8,
+      friction: 0.3,
+    }));
+    const plan = deriveRelationshipStylePlan(projection, "public");
+
+    expect(projection.promptCue).toMatchObject({
+      affection: "positive",
+      openness: "negative",
+      regard: "positive",
+    });
+    expect(plan).toMatchObject({
+      socialEase: "relaxed",
+      goodwill: "warm",
+      openness: "guarded",
+      regard: "takes_seriously",
+      tension: "charged",
+    });
+  });
+
+  it("returns no more than one categorical move and never leaks numbers or actor IDs", () => {
+    const projection = projectRelationshipBehavior(edge({
+      familiarity: 1,
+      warmth: 1,
+      trust: -1,
+      respect: 1,
+      friction: 1,
+      romanticInterest: 1,
+      romanticBoundaryBlockerIds: ["human-johan"],
+    }), { allowRomanticSurface: true, romanticSceneEligibility: "eligible" });
+    const plan = deriveRelationshipStylePlan(projection, "dm");
+    const serialized = JSON.stringify(plan);
+
+    expect(typeof plan.move === "string" || plan.move === undefined).toBe(true);
+    expect(Object.keys(plan).filter((key) => key === "move")).toHaveLength(1);
+    expect(serialized).not.toMatch(/\d/u);
+    expect(serialized).not.toContain("human-johan");
+    expect(serialized).not.toContain("ai-mira");
+  });
+
+  it("keeps neutral plans in the background and makes only one strong move clear", () => {
+    const neutral = projectRelationshipBehavior(undefined);
+    for (const medium of ["public", "dm", "ambient", "welcome", "voice"] as const) {
+      expect(deriveRelationshipStylePlan(neutral, medium)).toEqual({
+        socialEase: "unfamiliar",
+        goodwill: "ordinary",
+        openness: "ordinary",
+        regard: "ordinary",
+        tension: "easy",
+        expression: "background",
+      });
+    }
+
+    const warm = projectRelationshipBehavior(edge({ warmth: 0.9 }));
+    expect(deriveRelationshipStylePlan(warm, "dm")).toMatchObject({
+      expression: "clear",
+      move: "assume_goodwill",
+    });
+    for (const medium of ["public", "ambient", "welcome", "voice"] as const) {
+      expect(deriveRelationshipStylePlan(warm, medium)).toMatchObject({
+        expression: "clear",
+        move: "assume_goodwill",
+      });
+    }
+
+    const merelyKnown = projectRelationshipBehavior(edge({ familiarity: 0.2 }));
+    expect(deriveRelationshipStylePlan(merelyKnown, "dm")).toMatchObject({
+      expression: "light",
+      move: "recognize_familiarity",
+    });
+  });
+
+  it("derives a romantic move only from an explicitly authorized prompt cue", () => {
+    const storedOnly = projectRelationshipBehavior(edge({ romanticInterest: 1 }));
+    expect(deriveRelationshipStylePlan(storedOnly, "dm")).not.toHaveProperty("move");
+
+    const eligibleButNotSurfaced = projectRelationshipBehavior(
+      edge({ romanticInterest: 1 }),
+      { romanticSceneEligibility: "eligible" },
+    );
+    expect(deriveRelationshipStylePlan(eligibleButNotSurfaced, "dm")).not.toHaveProperty("move");
+
+    const authorized = projectRelationshipBehavior(
+      edge({ romanticInterest: 1 }),
+      { allowRomanticSurface: true, romanticSceneEligibility: "eligible" },
+    );
+    expect(deriveRelationshipStylePlan(authorized, "dm")).toMatchObject({
+      expression: "clear",
+      move: "allow_subtle_romantic_undertone",
+    });
+    expect(deriveRelationshipStylePlan(authorized, "public")).toMatchObject({
+      expression: "clear",
+      move: "allow_subtle_romantic_undertone",
+    });
+
+    const blocked = projectRelationshipBehavior(edge({
+      romanticInterest: 1,
+      romanticBoundaryClosed: true,
+    }), { allowRomanticSurface: true, romanticSceneEligibility: "eligible" });
+    expect(deriveRelationshipStylePlan(blocked, "dm")).not.toHaveProperty(
+      "move",
+      "allow_subtle_romantic_undertone",
+    );
   });
 });
