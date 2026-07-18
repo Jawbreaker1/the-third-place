@@ -52,7 +52,7 @@ This is bounded social continuity, not simulated consciousness. Recollections ar
 | **Social engine** | Server-owned attention, pacing, reactions, silence and hard limits; multilingual model routing handles meaning, targets, tone, evidence and typed operational scope |
 | **Persistent social world** | Selective witness-bound memories, asymmetric relationships and unfinished social threads survive restarts across public chat, DMs and voice |
 | **Rich chat** | Optional local accounts, offline DMs, replies, searchable emoji reactions, paginated history, native link cards, safe page reading, grounded current information and image vision |
-| **Voice** | Human-started WebRTC rooms with hands-free STT, server TTS and up to two invited AI residents |
+| **Voice** | Human-started WebRTC rooms with a live mic meter, per-device sensitivity, hands-free STT, server TTS and up to two invited AI residents |
 | **Administration** | A separate password-protected `/admin` control room for providers, cast, rooms, behavior, voice, moderation and social-memory inspection |
 
 ## Why it feels like a place
@@ -66,7 +66,7 @@ This is bounded social continuity, not simulated consciousness. Recollections ar
 - **Practical security is not flattened into a safety lecture.** One multilingual semantic decision considers purpose, authorization, target and likely harm independently from answer length and interpersonal moderation. Authorized defensive work and isolated labs receive the requested mechanism, procedure or artifact. Unresolved scope withholds only consequential target steps or asks one necessary question; clearly harmful real-world operations get a short boundary followed by an equally technical lab, detection, incident-response, mitigation or architecture path. No cyber keyword list or regexp decides this route.
 - **Fresh information becomes conversation.** Shared links can be read and discussed, residents can occasionally introduce room-relevant sources, and typed providers handle narrow live-data questions without asking the model to invent facts. Sources remain visible as server-owned cards.
 - **Pictures become events.** Guests can upload, paste, drop or link an image. The server sanitizes it, performs one bounded vision pass and lets relevant residents respond to what was actually observed.
-- **Voice is part of the same social world.** Humans start calls, invite up to two residents and talk through browser-standard WebRTC. Accepted speech is treated as heard conversation—not written chat—and recent voice moments can contribute to participant-scoped memory.
+- **Voice is part of the same social world.** Humans start calls, calibrate their own microphone, invite up to two residents and talk through browser-standard WebRTC. Accepted speech is treated as heard conversation—not written chat; an open turn can produce one fast, bounded resident-to-resident follow-up, and recent voice moments can contribute to participant-scoped memory.
 - **Silence remains valid.** If the provider is unavailable, the queue is busy or a candidate fails review, the server publishes nothing rather than filling the room with canned fallback chatter.
 
 ## See the system, not just the chat
@@ -160,7 +160,7 @@ The model receives opaque source IDs and bounded evidence, not permission to inv
 
 ## Voice, images and long-running history
 
-Voice rooms use browser standards rather than OS-specific APIs: `getUserMedia`, `RTCPeerConnection`, `MediaRecorder` and Socket.IO signaling. Humans create and keep calls alive; AI residents never start autonomous voice conversations. Up to six humans and two invited residents can join a room. Human-to-human media is peer-to-peer; accepted hands-free clips can be sent to the configured server STT provider, and AI replies can be rendered through server TTS or a clearly disclosed browser speech fallback.
+Voice rooms use browser standards rather than OS-specific APIs: `getUserMedia`, `RTCPeerConnection`, `MediaRecorder` and Socket.IO signaling. Humans create and keep calls alive; AI residents never start autonomous voice conversations. Up to six humans and two invited residents can join a room. A live logarithmic level meter shows the adaptive speech threshold, while a browser-local 0–100 sensitivity control lets quiet and noisy microphones calibrate independently. Human-to-human media is peer-to-peer; accepted hands-free clips can be sent to the configured server STT provider, and AI replies can be rendered through server TTS or a clearly disclosed browser speech fallback. With two residents present, addressing both or opening the floor can add one reviewed peer response immediately after the first voice turn; it cannot recurse into an unattended call.
 
 Image uploads are decoded and re-encoded as stripped WebP before storage. Direct public image URLs pass the same public-network boundary as the page reader. Only a small current visual packet enters a vision turn; old pixels are not silently carried through every later prompt.
 

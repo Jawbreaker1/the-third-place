@@ -36,6 +36,14 @@ import { normalizeDisplayName, validDisplayName } from "../shared/displayName";
 import { unicodeCaselessKey } from "../shared/unicodeSafety";
 import { VoicePeerMesh } from "./voicePeer";
 import { VoiceActivityDetector, type VoiceActivityEvent } from "./voiceActivity";
+import {
+  DEFAULT_VOICE_SENSITIVITY,
+  normalizeVoiceSensitivity,
+  voiceInputMeter,
+  voiceSensitivityThresholdMultiplier,
+  VOICE_SENSITIVITY_STORAGE_KEY,
+  type VoiceInputMeter,
+} from "./voiceSensitivity";
 import { attachBrowserHumanPresenceActivity, HumanPresenceActivityReporter } from "./humanPresenceActivity";
 import { conversationEntryTarget, type ConversationViewport, type PendingConversationEntry } from "./chatScroll";
 import { formatSourceDate, linkPreviewAriaLabel, linkPreviewDomainLabel } from "./linkPreview";
@@ -97,6 +105,21 @@ type ImageDraft = {
 type EmojiPickerTarget =
   | { kind: "reaction"; messageId: string }
   | { kind: "composer" };
+
+const storedVoiceSensitivity = (): number => {
+  if (typeof window === "undefined") return DEFAULT_VOICE_SENSITIVITY;
+  try {
+    return normalizeVoiceSensitivity(window.localStorage.getItem(VOICE_SENSITIVITY_STORAGE_KEY));
+  } catch {
+    return DEFAULT_VOICE_SENSITIVITY;
+  }
+};
+
+const initialVoiceInputMeter = (sensitivity: number): VoiceInputMeter => {
+  const detector = new VoiceActivityDetector();
+  detector.setThresholdMultiplier(voiceSensitivityThresholdMultiplier(sensitivity));
+  return voiceInputMeter(0, detector.snapshot().startThreshold);
+};
 
 const Icon = ({ name, size = 18 }: { name: string; size?: number }) => {
   const paths: Record<string, ReactNode> = {
@@ -398,6 +421,8 @@ export default function App() {
   const [voiceRemoteAudioBlocked, setVoiceRemoteAudioBlocked] = useState(false);
   const [voiceBrowserSpeech, setVoiceBrowserSpeech] = useState(false);
   const [voiceVadPaused, setVoiceVadPaused] = useState(false);
+  const [voiceSensitivity, setVoiceSensitivity] = useState(storedVoiceSensitivity);
+  const [voiceMicMeter, setVoiceMicMeter] = useState<VoiceInputMeter>(() => initialVoiceInputMeter(voiceSensitivity));
   const [voiceTranscripts, setVoiceTranscripts] = useState<Record<string, VoiceTranscriptEntry[]>>({});
   const [voiceTypedTurn, setVoiceTypedTurn] = useState("");
   const [voiceInvitingBotId, setVoiceInvitingBotId] = useState<string | null>(null);
@@ -464,6 +489,9 @@ export default function App() {
   const voiceActivityEventRef = useRef<(event: VoiceActivityEvent) => void>(() => undefined);
   const voiceVadFrameRef = useRef<number | undefined>(undefined);
   const voiceVadSpeakingRef = useRef(false);
+  const voiceSensitivityRef = useRef(voiceSensitivity);
+  const voiceMicRmsRef = useRef(0);
+  const voiceMicMeterPaintAtRef = useRef(0);
   const voiceInvitingBotIdRef = useRef<string | null>(null);
   const voiceAudioBlocked = voiceAiAudioBlocked || voiceRemoteAudioBlocked;
   voiceHasAiListenerRef.current = voiceRooms.some(
@@ -474,6 +502,7 @@ export default function App() {
       (participant) => participant.kind === "human" && participant.memberId !== me?.id && participant.speaking,
     ),
   );
+  voiceSensitivityRef.current = voiceSensitivity;
 
   const captureCurrentViewport = useCallback(() => {
     const scroller = scrollRef.current;
@@ -600,6 +629,8 @@ export default function App() {
     voiceAudioContextRef.current = null;
     if (context) context.onstatechange = null;
     if (context && context.state !== "closed") void context.close();
+    voiceMicRmsRef.current = 0;
+    setVoiceMicMeter(voiceInputMeter(0, voiceActivityRef.current.snapshot().startThreshold));
     setVoiceVadPaused(false);
   }, []);
 
@@ -623,6 +654,9 @@ export default function App() {
     // the server remains authoritative, while this browser gate only decides
     // when to cut a recording segment.
     voiceActivityRef.current = new VoiceActivityDetector();
+    voiceActivityRef.current.setThresholdMultiplier(
+      voiceSensitivityThresholdMultiplier(voiceSensitivityRef.current),
+    );
     const samples = new Float32Array(analyser.fftSize);
     const sample = () => {
       analyser.getFloatTimeDomainData(samples);
@@ -630,20 +664,45 @@ export default function App() {
       for (const value of samples) energy += value * value;
       const rms = Math.sqrt(energy / samples.length);
       const now = performance.now();
+      const playbackActive = voicePlaybackActiveRef.current || voiceRemoteSpeakingRef.current;
       const events = voiceActivityRef.current.push({
         nowMs: now,
         rms,
         suppressed: !joinedVoiceRoomRef.current || voiceMutedRef.current || voiceDeafenedRef.current,
-        playbackActive: voicePlaybackActiveRef.current || voiceRemoteSpeakingRef.current,
+        playbackActive,
       });
       for (const event of events) {
         voiceActivityEventRef.current(event);
+      }
+      voiceMicRmsRef.current = rms;
+      // React does not need audio-rate updates. A short throttle plus the CSS
+      // transition keeps the meter legible without rerendering the app at RAF speed.
+      if (now - voiceMicMeterPaintAtRef.current >= 90 || events.length > 0) {
+        voiceMicMeterPaintAtRef.current = now;
+        const snapshot = voiceActivityRef.current.snapshot(playbackActive);
+        setVoiceMicMeter(voiceInputMeter(rms, snapshot.startThreshold));
       }
       voiceVadFrameRef.current = requestAnimationFrame(sample);
     };
     void ensureVoiceVadRunning();
     voiceVadFrameRef.current = requestAnimationFrame(sample);
   }, [ensureVoiceVadRunning, stopVoiceVad]);
+
+  const changeVoiceSensitivity = (value: number) => {
+    const next = normalizeVoiceSensitivity(value);
+    setVoiceSensitivity(next);
+    voiceSensitivityRef.current = next;
+    try {
+      window.localStorage.setItem(VOICE_SENSITIVITY_STORAGE_KEY, String(next));
+    } catch {
+      // Private browsing or storage policy can make localStorage unavailable.
+    }
+    voiceActivityRef.current.setThresholdMultiplier(voiceSensitivityThresholdMultiplier(next));
+    const snapshot = voiceActivityRef.current.snapshot(
+      voicePlaybackActiveRef.current || voiceRemoteSpeakingRef.current,
+    );
+    setVoiceMicMeter(voiceInputMeter(voiceMicRmsRef.current, snapshot.startThreshold));
+  };
 
   const clearVoiceMedia = useCallback(() => {
     voiceSessionGenerationRef.current += 1;
@@ -1432,6 +1491,19 @@ export default function App() {
   const voiceBotSlotsRemaining = Math.max(0, voiceBotLimit - voiceBotCount);
   const displayedVoiceBots = voiceInviteExpanded ? availableVoiceBots : availableVoiceBots.slice(0, 8);
   const voicePanelMembers = voiceRoomInView?.participants.map((participant) => memberMap.get(participant.memberId)).filter((member): member is Member => Boolean(member)) ?? [];
+  const voiceSensitivityCopy = voiceSensitivity < 34
+    ? "Low pickup"
+    : voiceSensitivity > 66
+      ? "High pickup"
+      : "Balanced";
+  const voiceMicDetected = !voiceMuted && (voiceMicMeter.aboveThreshold || voiceRecording === "recording");
+  const voiceMicStatus = voiceMuted
+    ? "Muted"
+    : !localVoiceStreamRef.current?.active
+      ? "No microphone"
+      : voiceMicDetected
+        ? "Voice detected"
+        : "Below speech threshold";
 
   useEffect(() => setVoiceInviteExpanded(false), [voiceViewRoomId]);
 
@@ -2780,13 +2852,53 @@ export default function App() {
                     </div>
                   )}
 
+                  {joinedVoiceRoomId === voiceRoomInView.id && (
+                    <section className={`voice-mic-setup ${voiceMicDetected ? "detecting" : ""} ${voiceMuted ? "muted" : ""}`} aria-labelledby="voice-mic-level-title">
+                      <div className="voice-mic-level-copy">
+                        <span><Icon name={voiceMuted ? "micOff" : "mic"} size={15} /><strong id="voice-mic-level-title">Microphone level</strong></span>
+                        <output>{voiceMicStatus}</output>
+                      </div>
+                      <div
+                        className="voice-input-meter"
+                        role="meter"
+                        aria-label="Live microphone input level"
+                        aria-describedby="voice-mic-meter-help"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={Math.round(voiceMicMeter.level * 100)}
+                      >
+                        <span style={{ width: `${voiceMicMeter.level * 100}%` }} />
+                        <i style={{ left: `${voiceMicMeter.threshold * 100}%` }} title="Current speech start threshold" />
+                      </div>
+                      <div className="voice-sensitivity-head">
+                        <label htmlFor="voice-sensitivity">Mic sensitivity</label>
+                        <output htmlFor="voice-sensitivity">{voiceSensitivityCopy} · {voiceSensitivity}</output>
+                      </div>
+                      <input
+                        id="voice-sensitivity"
+                        className="voice-sensitivity-slider"
+                        type="range"
+                        min="0"
+                        max="100"
+                        step="1"
+                        value={voiceSensitivity}
+                        onChange={(event) => changeVoiceSensitivity(event.currentTarget.valueAsNumber)}
+                        aria-valuetext={`${voiceSensitivityCopy}; higher sensitivity picks up quieter speech`}
+                      />
+                      <div className="voice-sensitivity-scale" aria-hidden="true"><span>Less pickup</span><span>Balanced</span><span>Quieter voices</span></div>
+                      <small id="voice-mic-meter-help">The marker is the live speech threshold. Higher sensitivity lowers it and is saved in this browser.</small>
+                    </section>
+                  )}
+
                   {joinedVoiceRoomId === voiceRoomInView.id && voiceRoomInView.hostMemberId === me?.id && (
                     <section className="voice-invite-panel" aria-labelledby="voice-invite-title" aria-describedby="voice-invite-description">
                       <header className="voice-invite-head">
                         <span className="voice-invite-icon"><Icon name="users" size={19} /></span>
                         <div className="voice-invite-copy">
                           <strong id="voice-invite-title">Invite an AI friend</strong>
-                          <span id="voice-invite-description">Choose a resident below. One tap invites them straight into this call.</span>
+                          <span id="voice-invite-description">{voiceBotCount >= 2
+                            ? "Ask the room or address both residents. They can answer each other once without starting an autonomous loop."
+                            : "Choose a resident below. Invite two and ask the room to hear a quick resident-to-resident exchange."}</span>
                         </div>
                         <span className={`voice-invite-capacity ${voiceBotSlotsRemaining === 0 ? "full" : ""}`} aria-live="polite">
                           <strong>{voiceBotCount}</strong><span> / {voiceBotLimit} AI seats</span>
@@ -2853,7 +2965,9 @@ export default function App() {
                             : voiceMuted
                             ? "Hands-free AI is ready and starts only when you unmute."
                             : voiceRoomInView.participants.some((participant) => participant.kind === "ai")
-                              ? "Hands-free AI listening is on. Natural pauses send each spoken turn for transcription."
+                              ? voiceRoomInView.participants.filter((participant) => participant.kind === "ai").length >= 2
+                                ? "Hands-free listening is on. Ask the room or address both residents and the second may follow the first immediately."
+                                : "Hands-free AI listening is on. Natural pauses send each spoken turn for transcription."
                               : "Hands-free is ready. Invite an AI resident to let them hear transcribed turns."}</span>
                         </div>
                       )}

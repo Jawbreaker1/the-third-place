@@ -8,6 +8,7 @@ import { CHANNELS, getChannelProfile } from "./channels.js";
 import type { HumanMemory } from "./humanMemory.js";
 import {
   diegeticIdentityTurnPremise,
+  isBackgroundWorkPreemptedError,
   type ModelWorkScope,
   type SceneCapabilityContext,
   type TranscriptLine,
@@ -79,6 +80,12 @@ export interface VoiceDirectorOptions {
   recentChannelMessages?: (channelId: string) => readonly VoiceChannelRecentMessage[];
   /** Live admin calibration shared with scene generation and the sole-resident router draft. */
   behaviorTuningProvider?: BehaviorTuningProvider;
+  /** One bounded resident-to-resident follow-up after a human turn when two residents are present. */
+  residentFollowUpEnabled?: boolean;
+  /** Natural floor gap after the first resident finishes speaking. */
+  residentFollowUpGapMs?: number;
+  /** Defers optional publication briefly after a browser human-floor transition. */
+  residentFollowUpFloorGraceMs?: number;
 }
 
 export const mentionsPersona = containsExactMention;
@@ -125,6 +132,12 @@ const MAX_ROUTER_RECENT_MESSAGES = 6;
 const MAX_ROUTER_CHANNEL_MESSAGES = 3;
 const VOICE_LANGUAGE_SWITCH_CONFIDENCE = 0.9;
 const VOICE_CAPABILITY_INVENTORY = capabilitiesForMedium("voice");
+const DEFAULT_RESIDENT_FOLLOW_UP_GAP_MS = 180;
+const MIN_RESIDENT_FOLLOW_UP_GAP_MS = 80;
+const MAX_RESIDENT_FOLLOW_UP_GAP_MS = 1_500;
+const DEFAULT_RESIDENT_FOLLOW_UP_FLOOR_GRACE_MS = 450;
+const MAX_RESIDENT_FOLLOW_UP_FLOOR_GRACE_MS = 2_000;
+const RESIDENT_FOLLOW_UP_MAX_LATENESS_MS = 4_000;
 type VoiceRouterRecentMessage = NonNullable<TurnAnalysisInput["recentMessages"]>[number];
 interface VoiceChannelContextSnapshot {
   establishedLanguage?: string;
@@ -245,6 +258,9 @@ const analysisInputFor = (
         : {}),
     })),
     voiceParticipantRoster: soleDraftContext?.participants ?? [],
+    mechanicalAddressedPersonaIds: invited
+      .filter((persona) => explicitlyMentionsPersona(entry.text, persona.name))
+      .map((persona) => persona.id),
     // The medium-owned registry inventory is trusted runtime state. Voice
     // never advertises capabilities outside that explicitly scoped list.
     availableCapabilities: [...availableCapabilities],
@@ -290,6 +306,16 @@ export const routedLanguage = (
 const routedLanguageHint = (language: string | undefined): string =>
   language ?? "infer and mirror the language of the latest human utterance directly";
 
+const estimatedSpeechDurationMs = (spoken: string, language?: string): number => Math.max(
+  1_200,
+  Math.min(12_000, 550 + speechTimingUnits(spoken, language) * 310),
+);
+
+const voiceRosterFingerprint = (room: VoiceRoomView): string => room.participants
+  .map((participant) => `${participant.kind}:${participant.memberId}`)
+  .sort()
+  .join("\n");
+
 const voiceRoomWorkScope = (roomId: string): ModelWorkScope => ({
   kind: "voice-room",
   id: roomId,
@@ -309,6 +335,7 @@ export class VoiceDirector {
   private readonly speechAbortByRoom = new Map<string, AbortController>();
   private readonly generationAbortByRoom = new Map<string, AbortController>();
   private readonly pendingResponseTimerByRoom = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly pendingResidentFollowUpTimerByRoom = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly now: () => number;
 
   constructor(private readonly options: VoiceDirectorOptions) {
@@ -331,6 +358,9 @@ export class VoiceDirector {
     const pending = this.pendingResponseTimerByRoom.get(roomId);
     if (pending) clearTimeout(pending);
     this.pendingResponseTimerByRoom.delete(roomId);
+    const residentFollowUp = this.pendingResidentFollowUpTimerByRoom.get(roomId);
+    if (residentFollowUp) clearTimeout(residentFollowUp);
+    this.pendingResidentFollowUpTimerByRoom.delete(roomId);
     this.analysisAbortByRoom.get(roomId)?.abort(new Error("Voice turn superseded"));
     this.analysisAbortByRoom.delete(roomId);
     this.generationAbortByRoom.get(roomId)?.abort(new Error("Voice turn superseded"));
@@ -363,6 +393,9 @@ export class VoiceDirector {
     const pending = this.pendingResponseTimerByRoom.get(roomId);
     if (pending) clearTimeout(pending);
     this.pendingResponseTimerByRoom.delete(roomId);
+    const residentFollowUp = this.pendingResidentFollowUpTimerByRoom.get(roomId);
+    if (residentFollowUp) clearTimeout(residentFollowUp);
+    this.pendingResidentFollowUpTimerByRoom.delete(roomId);
     this.analysisAbortByRoom.get(roomId)?.abort(new Error("Voice room closed"));
     this.analysisAbortByRoom.delete(roomId);
     this.generationAbortByRoom.get(roomId)?.abort(new Error("Voice room closed"));
@@ -868,14 +901,340 @@ export class VoiceDirector {
       }));
     }
 
-    const estimatedSpeakingMs = Math.max(
-      1_200,
-      Math.min(12_000, 550 + speechTimingUnits(spoken, utteranceLanguage) * 310),
-    );
+    const estimatedSpeakingMs = estimatedSpeechDurationMs(spoken, utteranceLanguage);
     const timer = setTimeout(() => {
       if (this.isCurrent(room.id, epoch, persona.id)) this.setBotState(room.id, persona.id, "listening");
     }, estimatedSpeakingMs);
     timer.unref();
+    // Prepare, review and synthesize the other resident while this line is
+    // playing. Publication is held until the estimated floor is free, so the
+    // second resident follows naturally without paying another router pass or
+    // the minute-scale cadence used by autonomous public rooms.
+    const invitedIds = new Set(invited.map((candidate) => candidate.id));
+    const exactAddressedIds = invited
+      .filter((candidate) => explicitlyMentionsPersona(entry.text, candidate.name))
+      .map((candidate) => candidate.id);
+    // Structural exact mentions are authoritative. Semantic address inference
+    // is used only when the transport supplied no exact target, so an
+    // over-broad router result can never turn a private @mention into a pile-on.
+    const addressedResidents = [...new Set(
+      exactAddressedIds.length > 0 ? exactAddressedIds : trusted.inferredAddressedIds,
+    )].filter((id) => invitedIds.has(id));
+    const relevantResidents = trusted.relevantIds.filter((id) => invitedIds.has(id));
+    const semanticallySharedFloor = addressedResidents.length >= 2 ||
+      (addressedResidents.length === 0 && relevantResidents.length >= 2) ||
+      (trusted.interactionTrusted && ["room", "group"].includes(trusted.interaction.targetScope));
+    const moderationOwnsTurn = trusted.moderationTrusted && trusted.moderation.action !== "none";
+    const pileOnRisk = trusted.socialTrusted && trusted.social.pileOnRisk >= 0.45;
+    // A single trusted addressee owns a private/direct question. The other
+    // resident joins only a semantically open/plural floor and never a
+    // moderation or likely pile-on turn.
+    if (invited.length === 2 && addressedResidents.length !== 1 && semanticallySharedFloor && !moderationOwnsTurn && !pileOnRisk) {
+      void this.prepareResidentFollowUp(
+        room.id,
+        appended.entry,
+        epoch,
+        utteranceLanguage,
+        this.now() + estimatedSpeakingMs,
+      );
+    }
+  }
+
+  private residentFollowUpPersona(
+    roomId: string,
+    sourceEntry: VoiceTranscriptEntry,
+  ): { room: VoiceRoomView; persona: Persona } | undefined {
+    if (this.options.residentFollowUpEnabled !== true || sourceEntry.speakerKind !== "ai") return undefined;
+    const room = this.options.runtime.getRoom(roomId);
+    if (!room || !room.participants.some((participant) => participant.kind === "human" && !participant.deafened)) {
+      return undefined;
+    }
+    const residents = room.participants.filter((participant) => participant.kind === "ai");
+    // The runtime already caps AI guests at two. Requiring exactly two here
+    // makes the continuation contract explicit and prevents fan-out if that
+    // transport limit ever changes.
+    if (residents.length !== 2) return undefined;
+    const target = residents.find((participant) =>
+      participant.memberId !== sourceEntry.speakerId &&
+      sourceEntry.heardByPersonaIds.includes(participant.memberId) &&
+      ["listening", "thinking", "speaking"].includes(participant.botState ?? "")
+    );
+    if (!target) return undefined;
+    const persona = PERSONAS.find((candidate) => candidate.id === target.memberId);
+    return persona ? { room, persona } : undefined;
+  }
+
+  /**
+   * Produce at most one resident-to-resident continuation for a human-rooted
+   * voice turn. This method never calls itself: AI transcript entries remain
+   * transport-ineligible triggers, so the chain is structurally bounded.
+   */
+  private async prepareResidentFollowUp(
+    roomId: string,
+    sourceEntry: VoiceTranscriptEntry,
+    epoch: number,
+    language: string | undefined,
+    floorAvailableAt: number,
+  ): Promise<void> {
+    const selected = this.residentFollowUpPersona(roomId, sourceEntry);
+    if (!selected || this.epochByRoom.get(roomId) !== epoch) return;
+    const { room, persona } = selected;
+    const sourceRosterFingerprint = voiceRosterFingerprint(room);
+    const configuredGap = this.options.residentFollowUpGapMs ?? DEFAULT_RESIDENT_FOLLOW_UP_GAP_MS;
+    const gapMs = Math.max(MIN_RESIDENT_FOLLOW_UP_GAP_MS, Math.min(MAX_RESIDENT_FOLLOW_UP_GAP_MS, configuredGap));
+    const publicationTargetAt = floorAvailableAt + gapMs;
+    // Optional voice texture is useful only as an immediate floor handoff. A
+    // slow local model must never surface it as an unrelated interruption a
+    // minute later, even though ordinary LM calls have a much larger timeout.
+    const publicationDeadlineAt = publicationTargetAt + RESIDENT_FOLLOW_UP_MAX_LATENESS_MS;
+    const deadlineExpired = (): boolean => this.now() >= publicationDeadlineAt;
+    const armDeadlineAbort = (controller: AbortController): ReturnType<typeof setTimeout> | undefined => {
+      const remainingMs = publicationDeadlineAt - this.now();
+      if (remainingMs <= 0) {
+        controller.abort(new Error("Resident voice follow-up deadline exceeded"));
+        return undefined;
+      }
+      const timer = setTimeout(() => {
+        controller.abort(new Error("Resident voice follow-up deadline exceeded"));
+      }, remainingMs);
+      timer.unref();
+      return timer;
+    };
+    this.setBotState(roomId, persona.id, "thinking");
+
+    const behaviorTuning = resolveBehaviorTuning(
+      this.options.behaviorTuningProvider,
+      room.channelId,
+    ).effective;
+    const actorChannelNotes = this.options.actorChannels.promptNotes([persona], room.channelId);
+    const actorExpertiseNotes = this.options.actorChannels.expertiseNotes([persona], room.channelId);
+    const relationshipNote = this.options.socialMemory?.promptNote(
+      persona.id,
+      sourceEntry.speakerId,
+      voiceSocialScope(room),
+    );
+    let spoken = "";
+    let utteranceLanguage = canonicalRegisteredLanguageTag(language);
+    const generationAbort = new AbortController();
+    this.generationAbortByRoom.set(roomId, generationAbort);
+    const generationDeadlineTimer = armDeadlineAbort(generationAbort);
+    try {
+      const generated = await this.options.lm.generateScene(
+        {
+          kind: "voice",
+          channelId: room.channelId,
+          channelName: CHANNELS.find((channel) => channel.id === room.channelId)?.name ?? room.channelId,
+          selected: [persona],
+          history: transcriptFor(this.options.runtime.getTranscript(roomId), persona.id),
+          trigger: {
+            author: sourceEntry.speakerName,
+            content: sourceEntry.text,
+            messageId: sourceEntry.id,
+            createdAt: sourceEntry.endedAt,
+          },
+          mustReplyIds: [persona.id],
+          responseRecoveryIds: [persona.id],
+          languageHint: utteranceLanguage ?? "continue in the established language of this live voice conversation",
+          semanticContext: {
+            ...(utteranceLanguage ? { languageTag: utteranceLanguage } : {}),
+            intentTrusted: false,
+            replyExpected: "optional",
+            answerDepth: "brief",
+            operationalMode: "general",
+            operationalModeTrusted: false,
+            socialTrusted: false,
+            interactionTrusted: false,
+            moderationTrusted: false,
+            asksForList: false,
+            asksAboutAiIdentity: false,
+            asksAboutAcoustics: false,
+          },
+          actorChannelNotes,
+          actorExpertiseNotes,
+          behaviorTuning,
+          voiceContext: {
+            latestSpeakerId: sourceEntry.speakerId,
+            latestSpeakerKind: "ai",
+            latestUtteranceOrigin: "ai-tts",
+            acceptedTranscriptAvailable: true,
+            acousticEvidenceAvailable: false,
+            participants: room.participants.map((participant) => ({
+              memberId: participant.memberId,
+              name: participant.name,
+              kind: participant.kind,
+            })),
+          },
+          ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
+          capabilityContext: {
+            available: [],
+            externalEvidenceAvailable: false,
+            requestKind: "none",
+            discussed: [],
+            plannedAction: null,
+            executionStatus: "not_requested",
+          },
+          temporalPolicy: "reactive_only",
+          humanizerBudget: { repairsRemaining: 0 },
+          premise: `${persona.name} gives one brief, direct peer reaction to ${sourceEntry.speakerName}'s immediately preceding spoken turn. Add a disagreement, question, joke, or concrete thought only if it follows naturally. Do not restart the topic, answer on behalf of a guest, invite a response, or produce more than this single follow-up.`,
+        },
+        2,
+        generationAbort.signal,
+        { preemptibleBackground: true },
+      );
+      const generatedLine = generated.find((line) => line.personaId === persona.id);
+      const reviewedOutputLanguage = generatedLine?.reviewedOutputLanguage &&
+        generatedLine.reviewedOutputLanguage.confidence >= CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE
+        ? canonicalRegisteredLanguageTag(generatedLine.reviewedOutputLanguage.tag)
+        : undefined;
+      if (!utteranceLanguage && reviewedOutputLanguage) utteranceLanguage = reviewedOutputLanguage;
+      const languageConflict = Boolean(
+        utteranceLanguage &&
+        reviewedOutputLanguage &&
+        primaryLanguage(utteranceLanguage) !== primaryLanguage(reviewedOutputLanguage),
+      );
+      spoken = languageConflict ? "" : sanitizeSpokenLine(generatedLine?.content ?? "", utteranceLanguage);
+    } catch (error) {
+      if (!generationAbort.signal.aborted && !isBackgroundWorkPreemptedError(error)) {
+        console.warn("Resident voice follow-up was skipped:", error instanceof Error ? error.message : error);
+      }
+    } finally {
+      if (generationDeadlineTimer) clearTimeout(generationDeadlineTimer);
+      if (this.generationAbortByRoom.get(roomId) === generationAbort) {
+        this.generationAbortByRoom.delete(roomId);
+      }
+    }
+    if (!spoken || deadlineExpired() || !this.isCurrent(roomId, epoch, persona.id)) {
+      if (this.isCurrent(roomId, epoch, persona.id)) this.setBotState(roomId, persona.id, "listening");
+      return;
+    }
+
+    const voiceProfile = voiceProfileForPersona(persona.id, utteranceLanguage);
+    let audio: { id: string; mimeType: string } | undefined;
+    let browserFallbackAllowed = false;
+    const speechAbort = new AbortController();
+    this.speechAbortByRoom.set(roomId, speechAbort);
+    const speechDeadlineTimer = armDeadlineAbort(speechAbort);
+    try {
+      const capabilities = await this.options.speech.capabilities();
+      browserFallbackAllowed = capabilities.browserFallbackAllowed;
+      if (
+        capabilities.tts.available &&
+        ttsModelSupportsLanguage(capabilities.tts.supportedLanguages, utteranceLanguage)
+      ) {
+        const mappedVoice = mappedProviderVoiceForPersona(persona.id, utteranceLanguage);
+        const providerVoice = mappedVoice
+          ?? (capabilities.tts.model === "piper-sv" ? voiceProfile?.providerVoice : undefined)
+          ?? capabilities.tts.defaultVoice;
+        if (!providerVoice) throw new Error("TTS provider has no configured voice for this turn");
+        const stored = await this.options.speech.synthesize({
+          roomId,
+          text: spoken,
+          language: utteranceLanguage,
+          voice: providerVoice,
+          speed: voiceProfile?.speed ?? 1,
+          signal: speechAbort.signal,
+        });
+        audio = { id: stored.id, mimeType: stored.mimeType };
+      }
+    } catch (error) {
+      if (!speechAbort.signal.aborted) {
+        console.warn("Resident follow-up TTS unavailable; clients may use browser speech:", error instanceof Error ? error.message : error);
+      }
+    } finally {
+      if (speechDeadlineTimer) clearTimeout(speechDeadlineTimer);
+      if (this.speechAbortByRoom.get(roomId) === speechAbort) this.speechAbortByRoom.delete(roomId);
+    }
+    if (deadlineExpired() || !this.isCurrent(roomId, epoch, persona.id)) {
+      if (this.isCurrent(roomId, epoch, persona.id)) this.setBotState(roomId, persona.id, "listening");
+      return;
+    }
+
+    const delayMs = Math.max(0, publicationTargetAt - this.now());
+    const configuredFloorGrace = this.options.residentFollowUpFloorGraceMs ?? DEFAULT_RESIDENT_FOLLOW_UP_FLOOR_GRACE_MS;
+    const floorGraceMs = Math.max(0, Math.min(MAX_RESIDENT_FOLLOW_UP_FLOOR_GRACE_MS, configuredFloorGrace));
+    let publicationTimer: ReturnType<typeof setTimeout> | undefined;
+    const schedulePublication = (delay: number): void => {
+      publicationTimer = setTimeout(attemptPublication, delay);
+      publicationTimer.unref();
+      this.pendingResidentFollowUpTimerByRoom.set(roomId, publicationTimer);
+    };
+    const attemptPublication = (): void => {
+      if (!publicationTimer || this.pendingResidentFollowUpTimerByRoom.get(roomId) !== publicationTimer) return;
+      this.pendingResidentFollowUpTimerByRoom.delete(roomId);
+      const stillEligible = this.residentFollowUpPersona(roomId, sourceEntry);
+      const humanOwnsFloor = stillEligible?.room.participants.some(
+        (participant) => participant.kind === "human" && participant.speaking,
+      ) ?? false;
+      if (
+        deadlineExpired() ||
+        !stillEligible ||
+        stillEligible.persona.id !== persona.id ||
+        voiceRosterFingerprint(stillEligible.room) !== sourceRosterFingerprint ||
+        !this.isCurrent(roomId, epoch, persona.id) ||
+        humanOwnsFloor ||
+        this.options.hasPendingHumanIngest?.(roomId)
+      ) {
+        if (this.isCurrent(roomId, epoch, persona.id)) this.setBotState(roomId, persona.id, "listening");
+        return;
+      }
+      const lastFloorActivityAt = this.options.runtime.lastHumanFloorActivityAt(roomId);
+      const floorGraceRemainingMs = lastFloorActivityAt === undefined
+        ? 0
+        : Math.max(0, lastFloorActivityAt + floorGraceMs - this.now());
+      if (floorGraceRemainingMs > 0) {
+        // A browser may mark speaking=false a fraction before its HTTP upload
+        // reaches the server. Keep the already prepared optional line warm for
+        // this short bridge instead of racing the incoming accepted turn.
+        schedulePublication(Math.min(
+          floorGraceRemainingMs,
+          Math.max(1, publicationDeadlineAt - this.now()),
+        ));
+        return;
+      }
+      const currentRoom = stillEligible.room;
+      const appended = this.options.runtime.appendFinalTranscript(roomId, persona.id, spoken, {
+        utteranceOrigin: "ai-tts",
+        ...(utteranceLanguage ? { language: utteranceLanguage } : {}),
+      });
+      if (!appended.ok) {
+        this.setBotState(roomId, persona.id, "listening");
+        return;
+      }
+      if (utteranceLanguage) this.establishedLanguageByRoom.set(roomId, utteranceLanguage);
+      this.options.lm.rememberDeliveredLine?.(persona.id, spoken, {
+        kind: "voice",
+        channelId: currentRoom.channelId,
+        channelName: currentRoom.channelId,
+      });
+      this.options.actorChannels.markSpoke(persona.id, currentRoom.channelId, sourceEntry.id);
+      this.lastSpokeAtByPersona.set(persona.id, this.now());
+      this.setBotState(roomId, persona.id, "speaking");
+      this.options.events.transcriptFinal(appended.entry);
+      this.options.events.aiSpeech({
+        roomId,
+        memberId: persona.id,
+        text: spoken,
+        utteranceId: appended.entry.id,
+        browserFallbackAllowed,
+        ...(utteranceLanguage ? { language: utteranceLanguage } : {}),
+        ...(voiceProfile ? {
+          browserRate: voiceProfile.browserRate,
+          browserPitch: voiceProfile.browserPitch,
+        } : {}),
+        ...(audio ? {
+          audioUrl: `/api/voice/audio/${encodeURIComponent(audio.id)}?roomId=${encodeURIComponent(roomId)}`,
+          mimeType: audio.mimeType,
+        } : {}),
+      });
+      const speakingMs = estimatedSpeechDurationMs(spoken, utteranceLanguage);
+      const listeningTimer = setTimeout(() => {
+        if (this.isCurrent(roomId, epoch, persona.id)) this.setBotState(roomId, persona.id, "listening");
+      }, speakingMs);
+      listeningTimer.unref();
+    };
+    const previous = this.pendingResidentFollowUpTimerByRoom.get(roomId);
+    if (previous) clearTimeout(previous);
+    schedulePublication(delayMs);
   }
 
   private captureDeliveredVoiceEpisode(

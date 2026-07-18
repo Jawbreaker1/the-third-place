@@ -897,6 +897,13 @@ const voiceDirector = new VoiceDirector({
   // accepted real speech. Start immediately; a later accepted human turn may
   // supersede this one, but an untrusted RMS hint never can.
   floorSilenceMs: 0,
+  // With two invited residents, prepare one reviewed peer follow-up while the
+  // first answer is playing. This is a human-rooted, non-recursive voice beat,
+  // independent of the much slower autonomous public-channel cadence.
+  residentFollowUpEnabled: true,
+  residentFollowUpGapMs: 220,
+  residentFollowUpFloorGraceMs: 450,
+  hasPendingHumanIngest: (roomId) => (pendingVoiceIngestsByRoom.get(roomId) ?? 0) > 0,
   events: {
     roomChanged: publishVoiceRoom,
     transcriptFinal: (entry) => io.to(voiceSocketRoom(entry.roomId)).emit("voice:transcript:final", entry),

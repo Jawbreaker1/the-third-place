@@ -116,6 +116,8 @@ interface InternalRoom {
   transcript: VoiceTranscriptEntry[];
   nextTranscriptSequence: number;
   nextJoinOrder: number;
+  /** Last browser floor transition; used only as a short anti-overlap grace. */
+  lastHumanFloorActivityAt?: number;
 }
 
 const failure = (code: VoiceActionFailure["code"], error: string): VoiceActionFailure => ({ ok: false, code, error });
@@ -249,6 +251,10 @@ export class VoiceRoomRuntime {
 
   getSocketIdForMember(roomId: string, memberId: string): string | undefined {
     return this.rooms.get(roomId)?.participants.get(memberId)?.socketId;
+  }
+
+  lastHumanFloorActivityAt(roomId: string): number | undefined {
+    return this.rooms.get(roomId)?.lastHumanFloorActivityAt;
   }
 
   createRoom(channelId: string, human: VoiceHumanIdentity): VoiceCreateResult {
@@ -450,6 +456,7 @@ export class VoiceRoomRuntime {
       const value = normalized[key];
       if (participant.view[key] !== value) {
         participant.view[key] = value;
+        if (key === "speaking") room.lastHumanFloorActivityAt = this.now();
         changed = true;
       }
     }

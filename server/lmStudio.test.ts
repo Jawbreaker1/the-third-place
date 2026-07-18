@@ -1629,6 +1629,38 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionCalls).toBe(2);
   });
 
+  it("preempts an optional resident voice follow-up so a new live turn routes immediately", async () => {
+    let startedFollowUp: (() => void) | undefined;
+    const followUpStarted = new Promise<void>((resolve) => { startedFollowUp = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        startedFollowUp?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const lm = new LmStudioClient();
+    const input = soleVoiceTurnInput("optional-resident-follow-up");
+    const optionalFollowUp = lm.generateScene(
+      ordinarySoleVoiceScene(input, sana),
+      2,
+      undefined,
+      { preemptibleBackground: true },
+    );
+    await followUpStarted;
+
+    const analysis = lm.analyzeTurn(turnInput("live-turn-after-optional-voice"));
+    await expect(optionalFollowUp).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
+    await expect(analysis).resolves.toMatchObject({ source: "lm", evidence: { action: "read_url" } });
+    expect(completionCalls).toBe(2);
+  });
+
   it("hands a completed voice router turn to its scene before queued ambient work", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "false";
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;

@@ -87,6 +87,7 @@ export interface VoiceActivitySnapshot {
   noiseFloor: number;
   startThreshold: number;
   continueThreshold: number;
+  thresholdMultiplier: number;
 }
 
 export const DEFAULT_VOICE_ACTIVITY_OPTIONS: Readonly<VoiceActivityOptions> = {
@@ -163,6 +164,7 @@ export class VoiceActivityDetector {
   private lastVoicedAt?: number;
   private segmentStartedAt?: number;
   private segmentVoicedMs = 0;
+  private thresholdMultiplier = 1;
 
   constructor(options: Partial<VoiceActivityOptions> = {}) {
     this.options = normalizedOptions(options);
@@ -250,6 +252,17 @@ export class VoiceActivityDetector {
   }
 
   /**
+   * Changes acoustic sensitivity without interrupting an active utterance.
+   * A value below one hears quieter input; a value above one is more selective.
+   */
+  setThresholdMultiplier(multiplier: number): void {
+    if (!Number.isFinite(multiplier) || multiplier <= 0) {
+      throw new RangeError("thresholdMultiplier must be a finite positive number");
+    }
+    this.thresholdMultiplier = clamp(multiplier, 0.25, 4);
+  }
+
+  /**
    * Clears transient activity. The learned room noise is retained by default,
    * which makes leave/rejoin and device restarts less twitchy.
    */
@@ -271,6 +284,7 @@ export class VoiceActivityDetector {
       noiseFloor: this.noiseFloor,
       startThreshold: this.startThreshold(playbackActive),
       continueThreshold: this.continueThreshold(),
+      thresholdMultiplier: this.thresholdMultiplier,
     };
   }
 
@@ -284,10 +298,10 @@ export class VoiceActivityDetector {
     const ambient = Math.max(
       this.options.minStartRms,
       this.noiseFloor * this.options.startNoiseMultiplier,
-    );
+    ) * this.thresholdMultiplier;
     return playbackActive
       ? Math.max(
-          this.options.playbackMinStartRms,
+          this.options.playbackMinStartRms * this.thresholdMultiplier,
           ambient * this.options.playbackThresholdMultiplier,
         )
       : ambient;
@@ -297,7 +311,7 @@ export class VoiceActivityDetector {
     return Math.max(
       this.options.minContinueRms,
       this.noiseFloor * this.options.continueNoiseMultiplier,
-    );
+    ) * this.thresholdMultiplier;
   }
 
   private adaptNoiseFloor(rms: number): void {

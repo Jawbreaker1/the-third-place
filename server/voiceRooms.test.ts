@@ -217,6 +217,29 @@ describe("voice room runtime", () => {
     expect(runtime.isMemberInRoom(created.room.id, "ai-sana")).toBe(false);
   });
 
+  it("timestamps only actual human speaking-floor transitions", () => {
+    let now = 1_000;
+    const runtime = runtimeFactory(() => now);
+    const created = runtime.createRoom("lobby", human(1));
+    if (!created.ok) throw new Error(created.error);
+
+    expect(runtime.lastHumanFloorActivityAt(created.room.id)).toBeUndefined();
+    expect(runtime.setHumanState(created.room.id, "socket-1", { muted: false }).ok).toBe(true);
+    expect(runtime.lastHumanFloorActivityAt(created.room.id)).toBeUndefined();
+
+    expect(runtime.setHumanState(created.room.id, "socket-1", { speaking: true }).ok).toBe(true);
+    expect(runtime.lastHumanFloorActivityAt(created.room.id)).toBe(1_000);
+    now = 1_200;
+    expect(runtime.setHumanState(created.room.id, "socket-1", { speaking: true }).ok).toBe(true);
+    expect(runtime.lastHumanFloorActivityAt(created.room.id)).toBe(1_000);
+
+    expect(runtime.setHumanState(created.room.id, "socket-1", { speaking: false }).ok).toBe(true);
+    expect(runtime.lastHumanFloorActivityAt(created.room.id)).toBe(1_200);
+    now = 1_500;
+    expect(runtime.setHumanState(created.room.id, "socket-1", { deafened: false }).ok).toBe(true);
+    expect(runtime.lastHumanFloorActivityAt(created.room.id)).toBe(1_200);
+  });
+
   it("strictly validates and unicasts signaling with a server-derived sender", () => {
     const runtime = runtimeFactory();
     const created = runtime.createRoom("lobby", human(1));

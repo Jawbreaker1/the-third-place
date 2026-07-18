@@ -167,4 +167,20 @@ describe("VoiceActivityDetector", () => {
     detector.push({ nowMs: 100, rms: 0.001 });
     expect(() => detector.push({ nowMs: 99, rms: 0.001 })).toThrow(/monotonic/iu);
   });
+
+  it("updates threshold sensitivity without resetting active speech", () => {
+    const detector = new VoiceActivityDetector();
+    beginSpeech(detector);
+    const before = detector.snapshot();
+
+    detector.setThresholdMultiplier(0.5);
+    const after = detector.snapshot();
+
+    expect(after.speechActive).toBe(true);
+    expect(after.segmentActive).toBe(true);
+    expect(after.thresholdMultiplier).toBe(0.5);
+    expect(after.startThreshold).toBeCloseTo(before.startThreshold / 2);
+    expect(after.continueThreshold).toBeCloseTo(before.continueThreshold / 2);
+    expect(() => detector.setThresholdMultiplier(0)).toThrow(/positive/iu);
+  });
 });
