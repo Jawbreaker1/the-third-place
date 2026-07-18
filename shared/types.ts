@@ -7,10 +7,10 @@ export interface HumanSessionIdentity {
   /** Present only for the authenticated owner of a registered account. */
   loginHandle?: string;
   /**
-   * Registered-adult eligibility for subtle romantic storylines. This is an
-   * owner-only preference, never consent to a particular interaction.
+   * Owner-only acknowledgement that The Third Place is an adult community.
+   * This is not identity verification or consent to a particular interaction.
    */
-  romanticInteractionsOptIn?: boolean;
+  adultConfirmed?: boolean;
 }
 
 /** Browser hint only; the server owns activity timestamps and aggregation. */

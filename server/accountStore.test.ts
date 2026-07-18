@@ -1,6 +1,7 @@
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ACCOUNT_PASSWORD_MIN_CHARACTERS,
@@ -52,7 +53,7 @@ describe("local account store", () => {
         actorId: "human-existing-johan",
         loginHandle: "Jöhän",
         displayName: "Johan på telefon",
-        romanticInteractionsOptIn: false,
+        adultConfirmed: false,
       },
     });
     if (!registration.ok) return;
@@ -87,83 +88,215 @@ describe("local account store", () => {
     expect(JSON.parse(persistedAfterLogin).sessions[0].tokenHash).toMatch(/^[a-f0-9]{64}$/u);
   });
 
-  it("persists registered-adult romantic storyline eligibility across restarts without treating it as consent", async () => {
+  it("persists a one-way adult-community confirmation across restarts", async () => {
     const path = await makePath();
     let now = Date.UTC(2026, 6, 18, 10, 0, 0);
     const first = new AccountStore(path, { now: () => now, scrypt: fastScrypt });
     await first.load();
     const registration = await first.register({
-      loginHandle: "storyline-opt-in",
-      displayName: "Storyline opt in",
-      password: "storyline-password",
-      actorId: "human-storyline-opt-in",
+      loginHandle: "adult-confirmation",
+      displayName: "Adult confirmation",
+      password: "confirmation-password",
+      actorId: "human-adult-confirmation",
     });
     expect(registration.ok).toBe(true);
     if (!registration.ok) return;
 
-    expect(registration.account.romanticInteractionsOptIn).toBe(false);
-    expect(JSON.parse(await readFile(path, "utf8")).accounts[0].romanticInteractionsOptIn).toBe(false);
+    expect(registration.account.adultConfirmed).toBe(false);
+    expect(JSON.parse(await readFile(path, "utf8")).accounts[0].adultConfirmed).toBe(false);
 
     now += 1_000;
-    const enabled = await first.setRomanticInteractionsOptIn(registration.account.id, true);
-    expect(enabled).toMatchObject({
+    const confirmed = await first.confirmAdult(registration.account.id);
+    expect(confirmed).toMatchObject({
       id: registration.account.id,
-      actorId: "human-storyline-opt-in",
-      romanticInteractionsOptIn: true,
+      actorId: "human-adult-confirmation",
+      adultConfirmed: true,
       updatedAt: new Date(now).toISOString(),
     });
-    expect(JSON.parse(await readFile(path, "utf8")).accounts[0].romanticInteractionsOptIn).toBe(true);
+    expect(JSON.parse(await readFile(path, "utf8")).accounts[0].adultConfirmed).toBe(true);
 
     now += 1_000;
-    const unchanged = await first.setRomanticInteractionsOptIn(registration.account.id, true);
-    expect(unchanged?.updatedAt).toBe(enabled?.updatedAt);
-    expect(await first.setRomanticInteractionsOptIn("account-missing", true)).toBeUndefined();
-    await expect(first.setRomanticInteractionsOptIn(
-      registration.account.id,
-      "true" as never,
-    )).rejects.toThrow(TypeError);
+    const unchanged = await first.confirmAdult(registration.account.id);
+    expect(unchanged?.updatedAt).toBe(confirmed?.updatedAt);
+    expect(await first.confirmAdult("account-missing")).toBeUndefined();
 
     const restored = new AccountStore(path, { now: () => now, scrypt: fastScrypt });
     await restored.load();
-    expect(restored.getAccountByActorId("human-storyline-opt-in")?.romanticInteractionsOptIn).toBe(true);
-
-    now += 1_000;
-    expect(await restored.setRomanticInteractionsOptIn(registration.account.id, false)).toMatchObject({
-      romanticInteractionsOptIn: false,
-      updatedAt: new Date(now).toISOString(),
-    });
-    expect(JSON.parse(await readFile(path, "utf8")).accounts[0].romanticInteractionsOptIn).toBe(false);
+    expect(restored.getAccountByActorId("human-adult-confirmation")?.adultConfirmed).toBe(true);
   });
 
-  it("loads legacy version 1 accounts without the preference as safely opted out", async () => {
+  it("can persist an adult confirmation atomically when registering", async () => {
+    const path = await makePath();
+    const store = new AccountStore(path, { scrypt: fastScrypt });
+    await store.load();
+    const registration = await store.register({
+      loginHandle: "confirmed-at-entry",
+      displayName: "Confirmed at entry",
+      password: "confirmed-password",
+      adultConfirmed: true,
+    });
+    expect(registration).toMatchObject({ ok: true, account: { adultConfirmed: true } });
+    expect(JSON.parse(await readFile(path, "utf8")).accounts[0]).toMatchObject({
+      adultConfirmed: true,
+    });
+    await expect(store.register({
+      loginHandle: "invalid-confirmation",
+      displayName: "Invalid confirmation",
+      password: "confirmed-password",
+      adultConfirmed: "true" as never,
+    })).rejects.toThrow(TypeError);
+  });
+
+  it("confirms an existing account only after a valid login and returns the confirmed account", async () => {
+    const path = await makePath();
+    let now = Date.UTC(2026, 6, 18, 11, 0, 0);
+    const store = new AccountStore(path, {
+      now: () => now,
+      scrypt: fastScrypt,
+      randomToken: () => "adult_confirmation_login_token_aaaaaaaaaaaaaa",
+    });
+    await store.load();
+    const registration = await store.register({
+      loginHandle: "confirm-on-login",
+      displayName: "Confirm on login",
+      password: "confirmation-password",
+    });
+    expect(registration.ok).toBe(true);
+    if (!registration.ok) return;
+    await store.markProfileReady(registration.account.id);
+    expect(store.getAccount(registration.account.id)?.adultConfirmed).toBe(false);
+
+    const failed = await store.login({
+      loginHandle: "confirm-on-login",
+      password: "wrong-password",
+      adultConfirmed: true,
+      sourceIdentity: "failed-source",
+    });
+    expect(failed).toEqual({ ok: false, code: "INVALID_CREDENTIALS" });
+    expect(store.getAccount(registration.account.id)?.adultConfirmed).toBe(false);
+
+    now += 1_000;
+    const login = await store.login({
+      loginHandle: "confirm-on-login",
+      password: "confirmation-password",
+      adultConfirmed: true,
+      sourceIdentity: "valid-source",
+    });
+    expect(login).toMatchObject({
+      ok: true,
+      account: {
+        id: registration.account.id,
+        adultConfirmed: true,
+        updatedAt: new Date(now).toISOString(),
+      },
+    });
+    if (!login.ok) return;
+    expect(store.authenticateSession(login.token)?.account.adultConfirmed).toBe(true);
+    expect(JSON.parse(await readFile(path, "utf8")).accounts[0].adultConfirmed).toBe(true);
+
+    await expect(store.login({
+      loginHandle: "confirm-on-login",
+      password: "confirmation-password",
+      adultConfirmed: "true" as never,
+      sourceIdentity: "invalid-input",
+    })).rejects.toThrow(TypeError);
+  });
+
+  it("migrates v1 romantic eligibility to v2 with an exact, private rollback backup", async () => {
+    const path = await makePath();
+    const first = new AccountStore(path, { scrypt: fastScrypt });
+    await first.load();
+    for (const suffix of ["true", "false", "missing"] as const) {
+      const registration = await first.register({
+        loginHandle: `legacy-${suffix}`,
+        displayName: `Legacy ${suffix}`,
+        password: "legacy-password",
+      });
+      expect(registration.ok).toBe(true);
+    }
+
+    const legacy = JSON.parse(await readFile(path, "utf8"));
+    expect(legacy.version).toBe(2);
+    legacy.version = 1;
+    for (const account of legacy.accounts) delete account.adultConfirmed;
+    legacy.accounts[0].romanticInteractionsOptIn = true;
+    legacy.accounts[1].romanticInteractionsOptIn = false;
+    delete legacy.accounts[2].profileState;
+    const legacyBytes = ` ${JSON.stringify(legacy, null, 1)}\n`;
+    await writeFile(path, legacyBytes, "utf8");
+
+    const restored = new AccountStore(path, { scrypt: fastScrypt });
+    await restored.load();
+    expect(restored.getAccountByActorId(legacy.accounts[0].actorId)?.adultConfirmed).toBe(true);
+    expect(restored.getAccountByActorId(legacy.accounts[1].actorId)?.adultConfirmed).toBe(false);
+    expect(restored.getAccountByActorId(legacy.accounts[2].actorId)?.adultConfirmed).toBe(false);
+
+    const normalized = JSON.parse(await readFile(path, "utf8"));
+    expect(normalized.version).toBe(2);
+    expect(normalized.accounts.map((account: Record<string, unknown>) => account.adultConfirmed)).toEqual([
+      true,
+      false,
+      false,
+    ]);
+    expect(normalized.accounts[2].profileState).toBe("ready");
+    expect(normalized.accounts.every((account: Record<string, unknown>) =>
+      !("romanticInteractionsOptIn" in account))).toBe(true);
+
+    const backupNames = (await readdir(dirname(path))).filter((name) =>
+      name.startsWith("accounts.json.pre-v2-from-1-") && name.endsWith(".bak")
+    );
+    expect(backupNames).toHaveLength(1);
+    const backupPath = join(dirname(path), backupNames[0]!);
+    expect(await readFile(backupPath, "utf8")).toBe(legacyBytes);
+    expect((await stat(backupPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it("leaves valid v1 bytes untouched when its rollback backup cannot be secured", async () => {
     const path = await makePath();
     const first = new AccountStore(path, { scrypt: fastScrypt });
     await first.load();
     const registration = await first.register({
-      loginHandle: "legacy-opt-out",
-      displayName: "Legacy opt out",
-      password: "legacy-password",
+      loginHandle: "backup-failure",
+      displayName: "Backup failure",
+      password: "backup-password",
     });
     expect(registration.ok).toBe(true);
-    if (!registration.ok) return;
 
     const legacy = JSON.parse(await readFile(path, "utf8"));
-    expect(legacy.version).toBe(1);
-    delete legacy.accounts[0].romanticInteractionsOptIn;
-    await writeFile(path, `${JSON.stringify(legacy)}\n`, "utf8");
+    legacy.version = 1;
+    delete legacy.accounts[0].adultConfirmed;
+    legacy.accounts[0].romanticInteractionsOptIn = true;
+    const legacyBytes = `${JSON.stringify(legacy)}\n`;
+    await writeFile(path, legacyBytes, "utf8");
+
+    const digest = createHash("sha256").update(legacyBytes, "utf8").digest("hex").slice(0, 16);
+    const backupPath = `${path}.pre-v2-from-1-${digest}.bak`;
+    // A directory at the content-addressed target deterministically simulates
+    // a backup write failure without monkey-patching filesystem primitives.
+    await mkdir(backupPath);
 
     const restored = new AccountStore(path, { scrypt: fastScrypt });
-    await restored.load();
-    expect(restored.getAccount(registration.account.id)?.romanticInteractionsOptIn).toBe(false);
-
-    // The next ordinary account mutation writes the normalized, explicit value.
-    await restored.markProfileReady(registration.account.id);
-    expect(JSON.parse(await readFile(path, "utf8")).accounts[0].romanticInteractionsOptIn).toBe(false);
+    await expect(restored.load()).rejects.toBeInstanceOf(AccountStoreLoadError);
+    expect(restored.listAccounts()).toEqual([]);
+    expect(await readFile(path, "utf8")).toBe(legacyBytes);
+    expect(JSON.parse(await readFile(path, "utf8")).version).toBe(1);
+    expect((await readdir(dirname(path))).some((name) => name.endsWith(".tmp"))).toBe(false);
   });
 
   it.each([
-    ["a non-boolean preference", (account: Record<string, unknown>) => {
+    ["a non-boolean adult confirmation", (account: Record<string, unknown>) => {
+      account.adultConfirmed = "false";
+    }],
+    ["a missing adult confirmation", (account: Record<string, unknown>) => {
+      delete account.adultConfirmed;
+    }],
+    ["a non-boolean legacy preference", (account: Record<string, unknown>) => {
+      delete account.adultConfirmed;
       account.romanticInteractionsOptIn = "false";
+    }],
+    ["both the new and legacy fields", (account: Record<string, unknown>) => {
+      account.adultConfirmed = true;
+      account.romanticInteractionsOptIn = true;
     }],
     ["a consent-shaped unknown field", (account: Record<string, unknown>) => {
       account.romanticInteractionsConsent = true;

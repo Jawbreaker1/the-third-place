@@ -27,7 +27,7 @@ const emitAck = (socket, event, payload) =>
 const response = await fetch(`${baseUrl}/api/session`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ name: `Research-${marker}` }),
+  body: JSON.stringify({ name: `Research-${marker}`, adultConfirmed: true }),
 });
 if (!response.ok) throw new Error(`Could not create research session: ${response.status}`);
 const cookie = response.headers.get("set-cookie")?.split(";")[0];

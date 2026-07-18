@@ -51,7 +51,7 @@ const isFootballSource = (source) => {
 const response = await fetch(`${baseUrl}/api/session`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ name: `Football-${marker}` }),
+  body: JSON.stringify({ name: `Football-${marker}`, adultConfirmed: true }),
 });
 const body = await response.json();
 if (!response.ok) throw new Error(`Session failed: ${body.error ?? response.status}`);

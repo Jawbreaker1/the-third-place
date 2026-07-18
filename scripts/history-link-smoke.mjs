@@ -29,7 +29,7 @@ const emitAck = (socket, event, payload) =>
 const sessionResponse = await fetch(`${baseUrl}/api/session`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ name: `History-${marker}` }),
+  body: JSON.stringify({ name: `History-${marker}`, adultConfirmed: true }),
 });
 if (!sessionResponse.ok) throw new Error(`Could not create history session: ${sessionResponse.status}`);
 const cookie = sessionResponse.headers.get("set-cookie")?.split(";")[0];

@@ -109,6 +109,14 @@ import { VoiceRoomRuntime } from "./voiceRooms.js";
 import { VoiceSpeechError, VoiceSpeechService } from "./voiceSpeech.js";
 import { parseCookieHeader } from "./cookies.js";
 import { buildAdminHumanCatalog } from "./adminHumanCatalog.js";
+import {
+  adultConfirmationSchema,
+  accountLoginSchema,
+  accountRegisterSchema,
+  guestJoinSchema,
+  hasAdultCommunityConfirmation,
+  recoverSessionSchema,
+} from "./adultCommunityEntry.js";
 
 dotenv.config();
 
@@ -159,6 +167,8 @@ const readVoiceIceServers = (): VoiceIceServer[] => {
 interface HumanSession {
   tokenHash: string;
   identityKind: HumanSessionIdentity["kind"];
+  /** Runtime admission state. Guest acknowledgement is deliberately not persisted. */
+  adultConfirmed: boolean;
   accountId?: string;
   accountSessionId?: string;
   expiresAt?: number;
@@ -176,6 +186,7 @@ interface HumanSession {
 
 interface HumanSessionCredential {
   kind: HumanSessionIdentity["kind"];
+  adultConfirmed?: boolean;
   accountId?: string;
   accountSessionId?: string;
   expiresAt?: number;
@@ -211,6 +222,7 @@ const createHumanSession = (
 ): HumanSession => ({
   tokenHash,
   identityKind: identity.kind,
+  adultConfirmed: identity.adultConfirmed === true,
   ...(identity.accountId ? { accountId: identity.accountId } : {}),
   ...(identity.accountSessionId ? { accountSessionId: identity.accountSessionId } : {}),
   ...(identity.expiresAt ? { expiresAt: identity.expiresAt } : {}),
@@ -225,37 +237,12 @@ const createHumanSession = (
   voiceBucket: new TokenBucket(12, 0.5),
 });
 
-const joinSchema = z.object({
-  name: z.string().min(1).max(128),
-  inviteCode: z.string().max(100).optional(),
-});
-const accountRegisterSchema = z.object({
-  loginHandle: z.string().min(1).max(128),
-  displayName: z.string().min(1).max(128),
-  password: z.string().min(1).max(1_024),
-  inviteCode: z.string().max(100).optional(),
-}).strict();
-const accountLoginSchema = z.object({
-  loginHandle: z.string().min(1).max(128),
-  password: z.string().min(1).max(1_024),
-  inviteCode: z.string().max(100).optional(),
-}).strict();
 const accountUpgradeSchema = z.object({
   loginHandle: z.string().min(1).max(128),
   password: z.string().min(1).max(1_024),
 }).strict();
 const accountDeleteSchema = z.object({
   password: z.string().min(1).max(1_024),
-}).strict();
-const accountRomancePreferenceSchema = z.object({
-  romanticInteractionsOptIn: z.boolean(),
-  adultConfirmed: z.boolean().optional(),
-}).strict();
-const recoverSessionSchema = z.object({
-  name: z.string().min(1).max(128),
-  recoveryKey: z.string().min(1).max(96),
-  inviteCode: z.string().max(100).optional(),
-  takeOver: z.boolean().optional(),
 }).strict();
 const messageSchema = z.object({
   channelId: z.string().min(1).max(160),
@@ -603,6 +590,8 @@ const isActiveHumanSession = (session: HumanSession): boolean =>
   )) &&
   !adminState.isBanned(session.member.id, session.member.name) &&
   !adminModeration.isKicked(session.member.id, session.member.name);
+const isAdmittedHumanSession = (session: HumanSession): boolean =>
+  isActiveHumanSession(session) && session.adultConfirmed;
 let actorForgetReconciliationTail: Promise<unknown> = Promise.resolve();
 const reconcilePendingHumanActorForgets = (): Promise<number> => {
   const operation = actorForgetReconciliationTail.then(async () => {
@@ -866,7 +855,7 @@ const director = new SocialDirector(
     ambientEpisodeLedger,
     socialMemory,
     romanceEligibleHumanActor: (actorId) =>
-      accountStore.getAccountByActorId(actorId)?.romanticInteractionsOptIn === true,
+      accountStore.getAccountByActorId(actorId)?.adultConfirmed === true,
     romanceEligibleResidentActor: (actorId) => adminState.isRomanceEligibleResident(actorId),
   },
 );
@@ -904,7 +893,7 @@ const voiceDirector = new VoiceDirector({
     socialMemory.behaviorProjection(ownerPersonaId, subjectActorId),
   romanceEligibleActor: (actorId, kind) => kind === "resident"
     ? adminState.isRomanceEligibleResident(actorId)
-    : accountStore.getAccountByActorId(actorId)?.romanticInteractionsOptIn === true,
+    : accountStore.getAccountByActorId(actorId)?.adultConfirmed === true,
   behaviorTuningProvider,
   establishedChannelLanguage: (channelId) => director.trustedLanguageForChannel(channelId),
   recentChannelMessages: (channelId) => store.getRecent(channelId, 6)
@@ -1020,6 +1009,7 @@ const hydrateRegisteredSession = (
       accountId: authenticated.account.id,
       accountSessionId: authenticated.session.id,
       expiresAt: Date.parse(authenticated.session.expiresAt),
+      adultConfirmed: authenticated.account.adultConfirmed,
     },
   );
   sessions.set(tokenHash, session);
@@ -1057,10 +1047,10 @@ const sessionForToken = (token: string | undefined): HumanSession | undefined =>
 const sessionFromRequest = (request: Request): HumanSession | undefined => {
   const token = parseCookieHeader(request.headers.cookie)[SESSION_COOKIE];
   const session = sessionForToken(token);
-  return session && isActiveHumanSession(session) ? session : undefined;
+  return session && isAdmittedHumanSession(session) ? session : undefined;
 };
 
-const authenticatedSessionFromRequest = (
+const rawAuthenticatedSessionFromRequest = (
   request: Request,
 ): { session: HumanSession; token: string } | undefined => {
   const token = parseCookieHeader(request.headers.cookie)[SESSION_COOKIE];
@@ -1068,6 +1058,13 @@ const authenticatedSessionFromRequest = (
   const session = sessionForToken(token);
   if (!session || !isActiveHumanSession(session)) return undefined;
   return { session, token };
+};
+
+const authenticatedSessionFromRequest = (
+  request: Request,
+): { session: HumanSession; token: string } | undefined => {
+  const authenticated = rawAuthenticatedSessionFromRequest(request);
+  return authenticated?.session.adultConfirmed ? authenticated : undefined;
 };
 
 const clientIp = (request: Request): string => {
@@ -1089,12 +1086,21 @@ const hasAllowedOrigin = (request: Request): boolean => {
 };
 
 const registeredIdentityFor = (
-  account: Pick<AccountRecord, "loginHandle" | "romanticInteractionsOptIn">,
+  account: Pick<AccountRecord, "loginHandle" | "adultConfirmed">,
 ): HumanSessionIdentity => ({
   kind: "registered",
   loginHandle: account.loginHandle,
-  romanticInteractionsOptIn: account.romanticInteractionsOptIn,
+  adultConfirmed: account.adultConfirmed,
 });
+
+const identityForSession = (session: HumanSession): HumanSessionIdentity => {
+  const account = session.accountId ? accountStore.getAccount(session.accountId) : undefined;
+  return {
+    kind: session.identityKind,
+    ...(account ? { loginHandle: account.loginHandle } : {}),
+    adultConfirmed: session.adultConfirmed,
+  };
+};
 
 const allowJoinAttempt = (ip: string): boolean => {
   const now = Date.now();
@@ -1166,16 +1172,9 @@ const allowSelfRecoveryKeyRotation = (actorId: string): boolean => {
 
 const snapshotFor = (session: HumanSession): RoomSnapshot => {
   const pages = CHANNELS.map((channel) => historyPageFor(channel.id));
-  const account = session.accountId ? accountStore.getAccount(session.accountId) : undefined;
   return {
     me: { ...session.member },
-    identity: {
-      kind: session.identityKind,
-      ...(account ? {
-        loginHandle: account.loginHandle,
-        romanticInteractionsOptIn: account.romanticInteractionsOptIn,
-      } : {}),
-    },
+    identity: identityForSession(session),
     members: getMembers(),
     channels: CHANNELS,
     messages: pages
@@ -1895,7 +1894,14 @@ app.post("/api/auth/login", async (request, response) => {
   }
   const parsed = accountLoginSchema.safeParse(request.body);
   if (!parsed.success) {
-    response.status(400).json({ ok: false, code: "VALIDATION", error: "Enter your username and password." });
+    const confirmationMissing = !hasAdultCommunityConfirmation(request.body);
+    response.status(400).json({
+      ok: false,
+      code: confirmationMissing ? "ADULT_CONFIRMATION_REQUIRED" : "VALIDATION",
+      error: confirmationMissing
+        ? "Confirm that you are 18 or older to enter this adult community."
+        : "Enter your username and password.",
+    });
     return;
   }
   if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
@@ -1906,6 +1912,7 @@ app.post("/api/auth/login", async (request, response) => {
     loginHandle: parsed.data.loginHandle,
     password: parsed.data.password,
     sourceIdentity: clientIp(request),
+    adultConfirmed: parsed.data.adultConfirmed,
   }));
   if (!attempted.accepted) {
     response.setHeader("Retry-After", "2");
@@ -1962,7 +1969,14 @@ app.post("/api/auth/register", async (request, response) => {
   }
   const parsed = accountRegisterSchema.safeParse(request.body);
   if (!parsed.success) {
-    response.status(400).json({ ok: false, code: "VALIDATION", error: "Enter a username, display name and password." });
+    const confirmationMissing = !hasAdultCommunityConfirmation(request.body);
+    response.status(400).json({
+      ok: false,
+      code: confirmationMissing ? "ADULT_CONFIRMATION_REQUIRED" : "VALIDATION",
+      error: confirmationMissing
+        ? "Confirm that you are 18 or older to enter this adult community."
+        : "Enter a username, display name and password.",
+    });
     return;
   }
   if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
@@ -2002,6 +2016,7 @@ app.post("/api/auth/register", async (request, response) => {
       displayName: name,
       password: parsed.data.password,
       actorId,
+      adultConfirmed: parsed.data.adultConfirmed,
     });
     if (!registration.ok) {
       const status = registration.code === "HANDLE_TAKEN" || registration.code === "ACTOR_ALREADY_LINKED" ? 409 : 400;
@@ -2117,6 +2132,9 @@ app.post("/api/auth/upgrade", async (request, response) => {
       displayName: session.member.name,
       password: parsed.data.password,
       actorId: session.member.id,
+      // The guest already made the same server-validated acknowledgement on
+      // entry; upgrading preserves that identity rather than asking twice.
+      adultConfirmed: true,
     });
     if (!registration.ok) {
       return {
@@ -2216,6 +2234,7 @@ app.post("/api/auth/upgrade", async (request, response) => {
         accountId: issued.account.id,
         accountSessionId: issued.sessionId,
         expiresAt: Date.parse(issued.expiresAt),
+        adultConfirmed: true,
       },
     );
     sessions.set(registeredSession.tokenHash, registeredSession);
@@ -2243,66 +2262,90 @@ app.post("/api/auth/upgrade", async (request, response) => {
   });
 });
 
+app.post("/api/session/adult-confirmation", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({
+      ok: false,
+      code: "ORIGIN_REQUIRED",
+      error: "That confirmation did not come from the room.",
+    });
+    return;
+  }
+  const parsed = adultConfirmationSchema.safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).json({
+      ok: false,
+      code: "ADULT_CONFIRMATION_REQUIRED",
+      error: "Confirm that you are 18 or older to enter this adult community.",
+    });
+    return;
+  }
+  const authenticated = rawAuthenticatedSessionFromRequest(request);
+  if (!authenticated) {
+    response.status(401).json({ ok: false, code: "AUTH_REQUIRED", error: "That saved identity is no longer active." });
+    return;
+  }
+
+  if (authenticated.session.identityKind === "registered") {
+    const accountId = authenticated.session.accountId;
+    if (!accountId) {
+      response.status(409).json({ ok: false, code: "IDENTITY_CHANGED", error: "That account identity is incomplete." });
+      return;
+    }
+    const account = await accountStore.confirmAdult(accountId);
+    if (!account || account.actorId !== authenticated.session.member.id ||
+        !isActiveHumanSession(authenticated.session)) {
+      response.status(409).json({
+        ok: false,
+        code: "IDENTITY_CHANGED",
+        error: "That identity changed while the confirmation was being saved. Reopen it and try again.",
+      });
+      return;
+    }
+  }
+
+  // Registered confirmation becomes durable in AccountStore above. Guest and
+  // legacy confirmation intentionally lives only in this runtime session.
+  authenticated.session.adultConfirmed = true;
+  authenticated.session.lastSeenAt = Date.now();
+  humanMemory.noteSeen(authenticated.session.member.id, authenticated.session.lastSeenAt);
+  refreshSessionCookie(request, response, authenticated.token, authenticated.session);
+  response.json({
+    ok: true,
+    me: authenticated.session.member,
+    identity: identityForSession(authenticated.session),
+  });
+});
+
 app.get("/api/session", (request, response) => {
   response.setHeader("Cache-Control", "private, no-store");
-  const authenticated = authenticatedSessionFromRequest(request);
+  const authenticated = rawAuthenticatedSessionFromRequest(request);
   if (!authenticated) {
     response.status(401).json({ ok: false });
+    return;
+  }
+  if (!authenticated.session.adultConfirmed) {
+    response.status(428).json({
+      ok: false,
+      code: "ADULT_CONFIRMATION_REQUIRED",
+      error: "Confirm that you are 18 or older to enter this adult community.",
+      // The cookie already owns this identity. Returning only its ordinary
+      // owner-visible member and identity fields lets the client preserve it
+      // without exposing room history, DMs or any admitted-session snapshot.
+      me: authenticated.session.member,
+      identity: identityForSession(authenticated.session),
+    });
     return;
   }
   authenticated.session.lastSeenAt = Date.now();
   humanMemory.noteSeen(authenticated.session.member.id, authenticated.session.lastSeenAt);
   refreshSessionCookie(request, response, authenticated.token, authenticated.session);
-  const account = authenticated.session.accountId
-    ? accountStore.getAccount(authenticated.session.accountId)
-    : undefined;
   response.json({
     ok: true,
     me: authenticated.session.member,
-    identity: {
-      kind: authenticated.session.identityKind,
-      ...(account ? {
-        loginHandle: account.loginHandle,
-        romanticInteractionsOptIn: account.romanticInteractionsOptIn,
-      } : {}),
-    } satisfies HumanSessionIdentity,
+    identity: identityForSession(authenticated.session),
   });
-});
-
-app.patch("/api/account/preferences", async (request, response) => {
-  response.setHeader("Cache-Control", "private, no-store");
-  if (!hasAllowedOrigin(request)) {
-    response.status(403).json({ ok: false, error: "That account request did not come from the room." });
-    return;
-  }
-  const parsed = accountRomancePreferenceSchema.safeParse(request.body);
-  const authenticated = authenticatedSessionFromRequest(request);
-  if (!parsed.success || !authenticated || authenticated.session.identityKind !== "registered" ||
-      !authenticated.session.accountId) {
-    response.status(!parsed.success ? 400 : 401).json({
-      ok: false,
-      error: !parsed.success
-        ? "Choose whether subtle adult romantic storylines may appear."
-        : "A registered local account is required for this preference.",
-    });
-    return;
-  }
-  if (parsed.data.romanticInteractionsOptIn && parsed.data.adultConfirmed !== true) {
-    response.status(400).json({
-      ok: false,
-      error: "Confirm that this local account belongs to an adult before enabling this preference.",
-    });
-    return;
-  }
-  const account = await accountStore.setRomanticInteractionsOptIn(
-    authenticated.session.accountId,
-    parsed.data.romanticInteractionsOptIn,
-  );
-  if (!account || account.actorId !== authenticated.session.member.id) {
-    response.status(409).json({ ok: false, error: "That account preference could not be updated." });
-    return;
-  }
-  response.json({ ok: true, identity: registeredIdentityFor(account) });
 });
 
 app.delete("/api/account", async (request, response) => {
@@ -2359,7 +2402,9 @@ app.delete("/api/session", async (request, response) => {
     response.status(403).json({ ok: false, error: "This identity request did not come from the room." });
     return;
   }
-  const authenticated = authenticatedSessionFromRequest(request);
+  // Logout/erase remains available to a valid pre-gate cookie so its owner is
+  // never trapped behind the acknowledgement merely to discard the identity.
+  const authenticated = rawAuthenticatedSessionFromRequest(request);
   if (!authenticated) {
     clearSessionCookie(request, response);
     response.status(401).json({ ok: false, error: "That saved identity is no longer active." });
@@ -2491,7 +2536,14 @@ app.post("/api/session/recover", async (request, response) => {
   }
   const parsed = recoverSessionSchema.safeParse(request.body);
   if (!parsed.success) {
-    response.status(400).json({ ok: false, code: "VALIDATION", error: "Enter a display name and its complete return key." });
+    const confirmationMissing = !hasAdultCommunityConfirmation(request.body);
+    response.status(400).json({
+      ok: false,
+      code: confirmationMissing ? "ADULT_CONFIRMATION_REQUIRED" : "VALIDATION",
+      error: confirmationMissing
+        ? "Confirm that you are 18 or older to enter this adult community."
+        : "Enter a display name and its complete return key.",
+    });
     return;
   }
   if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
@@ -2594,6 +2646,7 @@ app.post("/api/session/recover", async (request, response) => {
       rotated.member,
       recoveredAt,
       rotated.createdAt,
+      { kind: "legacy", adultConfirmed: true },
     );
     sessions.set(tokenHash, replacement);
     return { ok: true as const, token, session: replacement };
@@ -2604,7 +2657,11 @@ app.post("/api/session/recover", async (request, response) => {
     return;
   }
   setSessionCookie(request, response, result.token);
-  response.status(201).json({ ok: true, me: result.session.member });
+  response.status(201).json({
+    ok: true,
+    me: result.session.member,
+    identity: identityForSession(result.session),
+  });
 });
 
 app.post("/api/session", async (request, response) => {
@@ -2615,9 +2672,16 @@ app.post("/api/session", async (request, response) => {
     response.status(429).json({ ok: false, error: "Too many join attempts. Wait a few minutes and try again." });
     return;
   }
-  const parsed = joinSchema.safeParse(request.body);
+  const parsed = guestJoinSchema.safeParse(request.body);
   if (!parsed.success) {
-    response.status(400).json({ ok: false, error: "Choose a display name between 1 and 24 graphemes." });
+    const confirmationMissing = !hasAdultCommunityConfirmation(request.body);
+    response.status(400).json({
+      ok: false,
+      code: confirmationMissing ? "ADULT_CONFIRMATION_REQUIRED" : "VALIDATION",
+      error: confirmationMissing
+        ? "Confirm that you are 18 or older to enter this adult community."
+        : "Choose a display name between 1 and 24 graphemes.",
+    });
     return;
   }
   if (INVITE_CODE && parsed.data.inviteCode !== INVITE_CODE) {
@@ -2708,7 +2772,7 @@ app.post("/api/session", async (request, response) => {
       avatar,
       role: "Guest",
       bio: "A real person visiting The Third Place.",
-    }, undefined, undefined, { kind: "guest" });
+    }, undefined, undefined, { kind: "guest", adultConfirmed: true });
     sessions.set(tokenHash, session);
     humanMemory.upsertSession({
       tokenHash,
@@ -2729,7 +2793,7 @@ app.post("/api/session", async (request, response) => {
     response.status(201).json({
       ok: true,
       me: session.member,
-      identity: { kind: "guest" } satisfies HumanSessionIdentity,
+      identity: identityForSession(session),
     });
   });
 });
@@ -2739,6 +2803,10 @@ io.use((socket, next) => {
   const session = sessionForToken(token);
   if (!session || !isActiveHumanSession(session)) {
     next(new Error("AUTH_REQUIRED"));
+    return;
+  }
+  if (!session.adultConfirmed) {
+    next(new Error("ADULT_CONFIRMATION_REQUIRED"));
     return;
   }
   if (adminState.isBanned(session.member.id, session.member.name)) {
@@ -2757,7 +2825,7 @@ io.on("connection", (socket) => {
   const session = sessions.get(socket.data.sessionHash as string);
   if (!session) return socket.disconnect(true);
   socket.use((_packet, next) => {
-    if (!isActiveHumanSession(session)) {
+    if (!isAdmittedHumanSession(session)) {
       next(new Error("AUTH_REQUIRED"));
       return;
     }
@@ -3346,6 +3414,8 @@ if (!humanMemoryLoad.continuityVerified) {
   await humanMemory.flush();
 }
 for (const profile of humanMemory.listRestorableProfiles()) {
+  // Guest acknowledgement is not durable. Restored guest/legacy cookies keep
+  // their identity but must explicitly acknowledge the adult community again.
   sessions.set(profile.tokenHash, createHumanSession(
     profile.tokenHash,
     profile.member,

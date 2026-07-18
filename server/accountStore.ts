@@ -10,6 +10,7 @@ import {
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { unicodeCaselessKey } from "../shared/unicodeSafety.js";
+import { preservePreMigrationState } from "./persistenceMigrationBackup.js";
 
 export const ACCOUNT_PASSWORD_MIN_CHARACTERS = 8;
 export const ACCOUNT_PASSWORD_MAX_CHARACTERS = 1_024;
@@ -32,11 +33,11 @@ export interface AccountRecord {
   loginHandle: string;
   displayName: string;
   /**
-   * Eligibility preference for a registered adult account to appear in subtle,
-   * non-sexual romantic storylines. This is never consent to an interaction;
-   * every interaction must still respect current boundaries and context.
+   * The account owner has acknowledged that The Third Place is an adult
+   * community. This is a local age attestation, not identity verification and
+   * not consent to any particular topic or interaction.
    */
-  romanticInteractionsOptIn: boolean;
+  adultConfirmed: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -69,7 +70,7 @@ interface PersistedSession extends AccountSession {
 }
 
 interface PersistedAccountState {
-  version: 1;
+  version: 2;
   accounts: PersistedAccount[];
   sessions: PersistedSession[];
 }
@@ -108,6 +109,8 @@ export interface RegisterAccountInput {
   loginHandle: string;
   displayName: string;
   password: string;
+  /** Optional so trusted callers can persist the entry acknowledgement atomically. */
+  adultConfirmed?: boolean;
   /** Used only by trusted migration code to preserve an existing social actor. */
   actorId?: string;
 }
@@ -127,6 +130,8 @@ export type RegisterAccountResult =
 export interface AccountLoginInput {
   loginHandle: string;
   password: string;
+  /** Optional so entry routes can persist the acknowledgement after authentication succeeds. */
+  adultConfirmed?: boolean;
   /** Usually a trusted proxy-aware remote address. It is HMACed and never persisted. */
   sourceIdentity: string;
 }
@@ -174,7 +179,7 @@ export class AccountStoreLoadError extends Error {
   }
 }
 
-const emptyState = (): PersistedAccountState => ({ version: 1, accounts: [], sessions: [] });
+const emptyState = (): PersistedAccountState => ({ version: 2, accounts: [], sessions: [] });
 
 const hasOnlyKeys = (value: Record<string, unknown>, keys: ReadonlySet<string>): boolean =>
   Object.keys(value).every((key) => keys.has(key));
@@ -240,7 +245,7 @@ const publicAccount = (account: PersistedAccount): AccountRecord => ({
   actorId: account.actorId,
   loginHandle: account.loginHandle,
   displayName: account.displayName,
-  romanticInteractionsOptIn: account.romanticInteractionsOptIn,
+  adultConfirmed: account.adultConfirmed,
   createdAt: account.createdAt,
   updatedAt: account.updatedAt,
 });
@@ -252,9 +257,13 @@ const publicSession = (session: PersistedSession): AccountSession => ({
   expiresAt: session.expiresAt,
 });
 
-const ACCOUNT_KEYS = new Set([
+const LEGACY_ACCOUNT_KEYS = new Set([
   "id", "kind", "profileState", "actorId", "loginHandle", "normalizedHandle", "displayName",
   "romanticInteractionsOptIn", "createdAt", "updatedAt", "password",
+]);
+const CURRENT_ACCOUNT_KEYS = new Set([
+  "id", "kind", "profileState", "actorId", "loginHandle", "normalizedHandle", "displayName",
+  "adultConfirmed", "createdAt", "updatedAt", "password",
 ]);
 const PASSWORD_KEYS = new Set(["algorithm", "salt", "digest", "keyLength", "N", "r", "p", "maxmem"]);
 const SESSION_KEYS = new Set(["id", "accountId", "tokenHash", "createdAt", "expiresAt"]);
@@ -279,21 +288,28 @@ const parsePasswordDigest = (value: unknown): PasswordDigest => {
 };
 
 const parseState = (value: unknown): PersistedAccountState => {
-  if (!isRecord(value) || !hasOnlyKeys(value, STATE_KEYS) || value.version !== 1 ||
+  if (!isRecord(value) || !hasOnlyKeys(value, STATE_KEYS) ||
+      (value.version !== 1 && value.version !== 2) ||
       !Array.isArray(value.accounts) || value.accounts.length > MAX_ACCOUNTS ||
       !Array.isArray(value.sessions) || value.sessions.length > MAX_SESSIONS) {
     throw new TypeError("Account store has an invalid root structure.");
   }
+  const sourceVersion = value.version;
+  const accountKeys = sourceVersion === 1 ? LEGACY_ACCOUNT_KEYS : CURRENT_ACCOUNT_KEYS;
 
   const accounts: PersistedAccount[] = value.accounts.map((candidate) => {
-    if (!isRecord(candidate) || !hasOnlyKeys(candidate, ACCOUNT_KEYS) || candidate.kind !== "registered" ||
-        (candidate.profileState !== undefined && candidate.profileState !== "pending" && candidate.profileState !== "ready") ||
+    if (!isRecord(candidate) || !hasOnlyKeys(candidate, accountKeys) || candidate.kind !== "registered" ||
+        (sourceVersion === 1
+          ? candidate.profileState !== undefined && candidate.profileState !== "pending" && candidate.profileState !== "ready"
+          : candidate.profileState !== "pending" && candidate.profileState !== "ready") ||
         !isSafeIdentifier(candidate.id) || !isSafeIdentifier(candidate.actorId) ||
         typeof candidate.loginHandle !== "string" || typeof candidate.normalizedHandle !== "string" ||
         typeof candidate.displayName !== "string" || !isCanonicalTimestamp(candidate.createdAt) ||
         !isCanonicalTimestamp(candidate.updatedAt) ||
-        (candidate.romanticInteractionsOptIn !== undefined &&
-          typeof candidate.romanticInteractionsOptIn !== "boolean")) {
+        (sourceVersion === 1
+          ? candidate.romanticInteractionsOptIn !== undefined &&
+            typeof candidate.romanticInteractionsOptIn !== "boolean"
+          : typeof candidate.adultConfirmed !== "boolean")) {
       throw new TypeError("Account store contains an invalid registered account.");
     }
     const normalized = normalizeLoginHandle(candidate.loginHandle);
@@ -305,16 +321,18 @@ const parseState = (value: unknown): PersistedAccountState => {
     return {
       id: candidate.id,
       kind: "registered",
-      // Compatibility for account files created by the pre-merge feature
-      // branch. No released version existed without this field.
-      profileState: candidate.profileState ?? "ready",
+      // Version 1 predates the two-store account/profile transaction marker.
+      profileState: candidate.profileState === "pending" ? "pending" : "ready",
       actorId: candidate.actorId,
       loginHandle: candidate.loginHandle,
       normalizedHandle: candidate.normalizedHandle,
       displayName: candidate.displayName,
-      // Version 1 account files predate this preference. Missing is the safe,
-      // fail-closed value; no guest or legacy identity is promoted by parsing.
-      romanticInteractionsOptIn: candidate.romanticInteractionsOptIn ?? false,
+      // Version 1 used romantic storyline eligibility as an adult-account
+      // proxy. Preserve an explicit true acknowledgement; false or missing is
+      // migrated fail-closed. Version 2 stores only the neutral attestation.
+      adultConfirmed: sourceVersion === 1
+        ? candidate.romanticInteractionsOptIn === true
+        : candidate.adultConfirmed === true,
       createdAt: candidate.createdAt,
       updatedAt: candidate.updatedAt,
       password: parsePasswordDigest(candidate.password),
@@ -357,7 +375,7 @@ const parseState = (value: unknown): PersistedAccountState => {
     tokenHashes.add(session.tokenHash);
     return session;
   });
-  return { version: 1, accounts, sessions };
+  return { version: 2, accounts, sessions };
 };
 
 const deriveScrypt = (
@@ -430,8 +448,14 @@ export class AccountStore {
     return this.enqueue(async () => {
       let next: PersistedAccountState;
       let fileExists = true;
+      let migrationSource: string | undefined;
       try {
-        next = parseState(JSON.parse(await readFile(this.path, "utf8")) as unknown);
+        const raw = await readFile(this.path, "utf8");
+        const persisted = JSON.parse(raw) as unknown;
+        next = parseState(persisted);
+        // parseState validates the root version before this branch. Keep the
+        // exact bytes until the v2 replacement has committed successfully.
+        if ((persisted as { version: number }).version === 1) migrationSource = raw;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new AccountStoreLoadError(error);
         next = emptyState();
@@ -441,8 +465,15 @@ export class AccountStore {
       const sessions = next.sessions.filter((session) => Date.parse(session.expiresAt) > now);
       const pruned = sessions.length !== next.sessions.length;
       next = { ...next, sessions };
-      if (!fileExists || pruned) await this.persist(next);
-      else await chmod(this.path, 0o600);
+      try {
+        if (migrationSource !== undefined) {
+          await preservePreMigrationState(this.path, migrationSource, 1, 2);
+        }
+        if (!fileExists || pruned || migrationSource !== undefined) await this.persist(next);
+        else await chmod(this.path, 0o600);
+      } catch (error) {
+        throw new AccountStoreLoadError(error);
+      }
       this.state = next;
     });
   }
@@ -499,6 +530,9 @@ export class AccountStore {
         codePointLength(input.password) > ACCOUNT_PASSWORD_MAX_CHARACTERS) {
       return { ok: false, code: "WEAK_PASSWORD" };
     }
+    if (input.adultConfirmed !== undefined && typeof input.adultConfirmed !== "boolean") {
+      throw new TypeError("Adult confirmation must be boolean.");
+    }
     if (input.actorId !== undefined && !isSafeIdentifier(input.actorId)) {
       return { ok: false, code: "ACTOR_ALREADY_LINKED" };
     }
@@ -526,7 +560,7 @@ export class AccountStore {
         loginHandle: normalized.handle,
         normalizedHandle: normalized.key,
         displayName,
-        romanticInteractionsOptIn: false,
+        adultConfirmed: input.adultConfirmed ?? false,
         createdAt: timestamp,
         updatedAt: timestamp,
         password: {
@@ -544,6 +578,9 @@ export class AccountStore {
   }
 
   async login(input: AccountLoginInput): Promise<AccountLoginResult> {
+    if (input.adultConfirmed !== undefined && typeof input.adultConfirmed !== "boolean") {
+      throw new TypeError("Adult confirmation must be boolean.");
+    }
     return this.enqueue(async () => {
       const now = this.now();
       const sourceHash = this.sourceHash(input.sourceIdentity);
@@ -595,15 +632,26 @@ export class AccountStore {
       const createdAt = new Date(now).toISOString();
       const expiresAt = new Date(now + this.sessionTtlMs).toISOString();
       const session: PersistedSession = { id, accountId: account.id, tokenHash, createdAt, expiresAt };
-      const next = parseState({ ...this.state, sessions: this.sessionsAfterIssuing(session, now) });
+      const accounts = input.adultConfirmed === true && !account.adultConfirmed
+        ? this.state.accounts.map((candidate) => candidate.id === account.id
+          ? { ...candidate, adultConfirmed: true, updatedAt: createdAt }
+          : candidate)
+        : this.state.accounts;
+      const next = parseState({
+        ...this.state,
+        accounts,
+        sessions: this.sessionsAfterIssuing(session, now),
+      });
       await this.persist(next);
       this.state = next;
+      const authenticatedAccount = next.accounts.find((candidate) => candidate.id === account.id);
+      if (!authenticatedAccount) throw new Error("Authenticated account disappeared during session issuance.");
       return {
         ok: true,
         token,
         expiresAt,
         sessionId: session.id,
-        account: publicAccount(account),
+        account: publicAccount(authenticatedAccount),
       };
     });
   }
@@ -676,23 +724,20 @@ export class AccountStore {
   }
 
   /**
-   * Stores registered-adult storyline eligibility only. A true value is not
-   * consent to any interaction and must never bypass live boundary checks.
+   * Records the account owner's adult-community acknowledgement. Confirmation
+   * is intentionally one-way; account deletion remains the way to remove the
+   * durable local identity and its acknowledgement.
    */
-  async setRomanticInteractionsOptIn(
-    accountId: string,
-    enabled: boolean,
-  ): Promise<AccountRecord | undefined> {
-    if (typeof enabled !== "boolean") throw new TypeError("Romantic interaction preference must be boolean.");
+  async confirmAdult(accountId: string): Promise<AccountRecord | undefined> {
     return this.enqueue(async () => {
       const account = this.state.accounts.find((candidate) => candidate.id === accountId);
       if (!account) return undefined;
-      if (account.romanticInteractionsOptIn === enabled) return publicAccount(account);
+      if (account.adultConfirmed) return publicAccount(account);
       const updatedAt = new Date(this.now()).toISOString();
       const next = parseState({
         ...this.state,
         accounts: this.state.accounts.map((candidate) => candidate.id === accountId
-          ? { ...candidate, romanticInteractionsOptIn: enabled, updatedAt }
+          ? { ...candidate, adultConfirmed: true, updatedAt }
           : candidate),
       });
       await this.persist(next);
@@ -837,8 +882,8 @@ export class AccountStore {
     const temporary = `${this.path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     try {
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await chmod(temporary, 0o600);
       await rename(temporary, this.path);
-      await chmod(this.path, 0o600);
     } catch (error) {
       await unlink(temporary).catch(() => undefined);
       throw error;

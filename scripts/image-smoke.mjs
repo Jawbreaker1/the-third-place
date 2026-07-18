@@ -24,7 +24,7 @@ const waitForEvent = (socket, event, predicate, timeoutMs) =>
 const sessionResponse = await fetch(`${baseUrl}/api/session`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ name: `Vision-${marker}` }),
+  body: JSON.stringify({ name: `Vision-${marker}`, adultConfirmed: true }),
 });
 const sessionBody = await sessionResponse.json();
 if (!sessionResponse.ok) throw new Error(sessionBody.error ?? `Session failed: ${sessionResponse.status}`);

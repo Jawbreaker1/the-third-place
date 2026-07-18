@@ -104,7 +104,7 @@ const createConnection = async (caseId, index) => {
     const response = await fetch(`${baseUrl}/api/session`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: `Weather-${marker}-${index + 1}` }),
+      body: JSON.stringify({ name: `Weather-${marker}-${index + 1}`, adultConfirmed: true }),
     });
     const body = await response.json();
     if (!response.ok) throw new Error(`${caseId}: session failed: ${body.error ?? response.status}`);

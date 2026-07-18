@@ -45,7 +45,7 @@ const emitAck = (socket, event, payload) => new Promise((resolve, reject) => {
   socket.emit(event, payload, (result) => { clearTimeout(timer); resolve(result); });
 });
 const login = () => request("/api/auth/login", {
-  body: { loginHandle, password, ...(inviteCode ? { inviteCode } : {}) },
+  body: { loginHandle, password, adultConfirmed: true, ...(inviteCode ? { inviteCode } : {}) },
 });
 
 let accountCookie;
@@ -80,7 +80,7 @@ try {
   assert(healthAfterMalformedCookies.response.status === 200, "server crashed after malformed cookie handshakes");
 
   const guest = await request("/api/session", {
-    body: { name: guestName, ...(inviteCode ? { inviteCode } : {}) },
+    body: { name: guestName, adultConfirmed: true, ...(inviteCode ? { inviteCode } : {}) },
   });
   const guestCookie = cookieFrom(guest.response);
   cleanupGuestCookie = guestCookie;
@@ -131,7 +131,7 @@ try {
   await request("/api/session", { method: "DELETE", cookie: secondDeviceCookie });
 
   const sender = await request("/api/session", {
-    body: { name: senderName, ...(inviteCode ? { inviteCode } : {}) },
+    body: { name: senderName, adultConfirmed: true, ...(inviteCode ? { inviteCode } : {}) },
   });
   senderCookie = cookieFrom(sender.response);
   assert(sender.response.status === 201 && senderCookie, "offline-DM sender creation failed");

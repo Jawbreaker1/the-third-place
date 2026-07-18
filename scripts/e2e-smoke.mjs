@@ -43,7 +43,7 @@ const createSession = async (name) => {
   const response = await fetch(`${baseUrl}/api/session`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, adultConfirmed: true }),
   });
   const body = await response.json();
   if (!response.ok) throw new Error(`Could not create ${name}: ${body.error ?? response.status}`);

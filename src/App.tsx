@@ -72,7 +72,15 @@ type Panel = "rooms" | "people" | null;
 type AuthJoinMode = "login" | "register" | "guest" | "legacy";
 type AuthSessionResult =
   | { ok: true; me: Member; identity?: HumanSessionIdentity; recoveryKey?: string }
-  | { ok: false; error?: string; code?: string; recoveryConfigured?: boolean; online?: boolean };
+  | {
+      ok: false;
+      error?: string;
+      code?: string;
+      recoveryConfigured?: boolean;
+      online?: boolean;
+      me?: Member;
+      identity?: HumanSessionIdentity;
+    };
 type VoiceJoinState = "idle" | "requesting-permission" | "joining" | "connected" | "reconnecting" | "leaving" | "error";
 type VoiceRecordingState = "idle" | "recording" | "uploading" | "error";
 type ActiveVoiceCapture = {
@@ -372,6 +380,11 @@ export default function App() {
   const [loginHandle, setLoginHandle] = useState("");
   const [accountPassword, setAccountPassword] = useState("");
   const [accountPasswordConfirm, setAccountPasswordConfirm] = useState("");
+  const [adultConfirmed, setAdultConfirmed] = useState(false);
+  const [pendingAdultAdmission, setPendingAdultAdmission] = useState<{
+    me: Member;
+    identity?: HumanSessionIdentity;
+  } | null>(null);
   const [sessionIdentity, setSessionIdentity] = useState<HumanSessionIdentity | null>(null);
   const [returnKey, setReturnKey] = useState("");
   const [joinError, setJoinError] = useState("");
@@ -391,7 +404,6 @@ export default function App() {
   const [showDirector, setShowDirector] = useState(false);
   const [profile, setProfile] = useState<Member | null>(null);
   const [forgettingMemory, setForgettingMemory] = useState(false);
-  const [updatingRomancePreference, setUpdatingRomancePreference] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<Panel>(null);
   const [toasts, setToasts] = useState<Array<ToastPayload & { id: number }>>([]);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -1395,8 +1407,15 @@ export default function App() {
       .catch(() => setConnection("offline"));
     void fetch("/api/session")
       .then(async (response) => {
-        if (!response.ok || !alive) return;
         const result = await response.json().catch(() => null) as AuthSessionResult | null;
+        if (!alive) return;
+        if (response.status === 428 && result && !result.ok &&
+            result.code === "ADULT_CONFIRMATION_REQUIRED" && result.me) {
+          setPendingAdultAdmission({ me: result.me, identity: result.identity });
+          setJoinName(result.me.name);
+          return;
+        }
+        if (!response.ok) return;
         if (!result?.ok || !alive) return;
         if (result.identity) setSessionIdentity(result.identity);
         connectSocket();
@@ -1799,6 +1818,10 @@ export default function App() {
 
   const submitIdentityJoin = async (takeOver = false) => {
     if (joining) return;
+    if (!adultConfirmed) {
+      setJoinError("Confirm that you are 18 or older to enter this adult community.");
+      return;
+    }
     setJoinError("");
     setJoining(true);
     try {
@@ -1810,17 +1833,18 @@ export default function App() {
             ? "/api/session/recover"
             : "/api/session";
       const body = authJoinMode === "login"
-        ? { loginHandle, password: accountPassword, inviteCode: inviteCode || undefined }
+        ? { loginHandle, password: accountPassword, inviteCode: inviteCode || undefined, adultConfirmed }
         : authJoinMode === "register"
-          ? { loginHandle, displayName: joinName, password: accountPassword, inviteCode: inviteCode || undefined }
+          ? { loginHandle, displayName: joinName, password: accountPassword, inviteCode: inviteCode || undefined, adultConfirmed }
           : authJoinMode === "legacy"
             ? {
               name: joinName,
               recoveryKey: returnKey,
               inviteCode: inviteCode || undefined,
               takeOver: takeOver || undefined,
+              adultConfirmed,
             }
-            : { name: joinName, inviteCode: inviteCode || undefined };
+            : { name: joinName, inviteCode: inviteCode || undefined, adultConfirmed };
       const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1860,7 +1884,7 @@ export default function App() {
       setTakeoverRequired(false);
       setSessionIdentity(result.identity ?? {
         kind: authJoinMode === "login" || authJoinMode === "register" ? "registered" : authJoinMode === "legacy" ? "legacy" : "guest",
-        ...(authJoinMode === "login" || authJoinMode === "register" ? { loginHandle } : {}),
+        ...(authJoinMode === "login" || authJoinMode === "register" ? { loginHandle, adultConfirmed: true } : {}),
       });
       setAccountPassword("");
       setAccountPasswordConfirm("");
@@ -1879,6 +1903,38 @@ export default function App() {
       !loginHandle.trim() || [...accountPassword].length < 8 || accountPassword !== accountPasswordConfirm
     )) return;
     void submitIdentityJoin(false);
+  };
+
+  const confirmPendingAdultAdmission = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!pendingAdultAdmission || joining) return;
+    if (!adultConfirmed) {
+      setJoinError("Confirm that you are 18 or older to enter this adult community.");
+      return;
+    }
+    setJoinError("");
+    setJoining(true);
+    try {
+      const response = await fetch("/api/session/adult-confirmation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ adultConfirmed }),
+      });
+      const result = await response.json().catch(() => null) as AuthSessionResult | null;
+      if (!response.ok || !result?.ok) {
+        throw new Error(result && !result.ok && result.error
+          ? result.error
+          : "The community age acknowledgement could not be saved.");
+      }
+      setSessionIdentity(result.identity ?? pendingAdultAdmission.identity ?? { kind: "guest" });
+      setPendingAdultAdmission(null);
+      connectSocket();
+    } catch (error) {
+      setJoinError(error instanceof Error ? error.message : "The room is unreachable right now.");
+    } finally {
+      setJoining(false);
+    }
   };
 
   const selectAuthJoinMode = (mode: AuthJoinMode) => {
@@ -1964,46 +2020,6 @@ export default function App() {
       });
     } finally {
       setForgettingMemory(false);
-    }
-  };
-
-  const updateRomancePreference = async (enabled: boolean) => {
-    if (updatingRomancePreference || sessionIdentity?.kind !== "registered") return;
-    setUpdatingRomancePreference(true);
-    try {
-      const response = await fetch("/api/account/preferences", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
-        body: JSON.stringify({
-          romanticInteractionsOptIn: enabled,
-          ...(enabled ? { adultConfirmed: true } : {}),
-        }),
-      });
-      const result = await response.json().catch(() => null) as {
-        ok?: boolean;
-        identity?: HumanSessionIdentity;
-        error?: string;
-      } | null;
-      if (!response.ok || result?.ok !== true || result.identity?.kind !== "registered") {
-        throw new Error(result?.error ?? "That story preference could not be updated.");
-      }
-      setSessionIdentity(result.identity);
-      pushToast({
-        tone: "success",
-        title: enabled ? "Romantic storylines allowed" : "Romantic storylines paused",
-        message: enabled
-          ? "This only makes subtle adult storylines eligible. It never overrides your boundaries."
-          : "Residents will no longer express romantic interest toward this account.",
-      });
-    } catch (error) {
-      pushToast({
-        tone: "warning",
-        title: "Preference not changed",
-        message: error instanceof Error ? error.message : "Try again in a moment.",
-      });
-    } finally {
-      setUpdatingRomancePreference(false);
     }
   };
 
@@ -2725,21 +2741,27 @@ export default function App() {
   const displayMembers = members.length ? members : preview?.members ?? [];
   const normalizedJoinName = normalizeDisplayName(joinName);
   const joinNameReady = validDisplayName(normalizedJoinName);
-  const identityJoinReady = authJoinMode === "login"
-    ? Boolean(loginHandle.trim() && accountPassword)
-    : authJoinMode === "register"
-      ? Boolean(joinNameReady && loginHandle.trim() && [...accountPassword].length >= 8 && accountPassword === accountPasswordConfirm)
-      : authJoinMode === "legacy"
-        ? Boolean(joinNameReady && returnKey.trim())
-        : joinNameReady;
-  const joinHeading = authJoinMode === "login"
+  const identityJoinReady = adultConfirmed && (pendingAdultAdmission
+    ? true
+    : authJoinMode === "login"
+      ? Boolean(loginHandle.trim() && accountPassword)
+      : authJoinMode === "register"
+        ? Boolean(joinNameReady && loginHandle.trim() && [...accountPassword].length >= 8 && accountPassword === accountPasswordConfirm)
+        : authJoinMode === "legacy"
+          ? Boolean(joinNameReady && returnKey.trim())
+          : joinNameReady);
+  const joinHeading = pendingAdultAdmission
+    ? "Welcome back."
+    : authJoinMode === "login"
     ? "Welcome back."
     : authJoinMode === "register"
       ? "Make this place yours."
       : authJoinMode === "legacy"
         ? "Return with an old key."
         : "Drop in as a guest.";
-  const joinCopy = authJoinMode === "login"
+  const joinCopy = pendingAdultAdmission
+    ? `Confirm the community age boundary below to continue as ${pendingAdultAdmission.me.name}.`
+    : authJoinMode === "login"
     ? "Sign in to the local account stored by this server."
     : authJoinMode === "register"
       ? "Keep your identity, relationships and private conversations between visits."
@@ -3435,37 +3457,56 @@ export default function App() {
 
       {!me && (
         <div className="join-overlay">
-          <form className="join-card" onSubmit={join}>
+          <form className="join-card" onSubmit={pendingAdultAdmission ? confirmPendingAdultAdmission : join}>
             <div className="join-live"><i /> LIVE ROOM <span>{(preview?.health.onlineHumans ?? 0) + (preview?.health.idleHumans ?? 0)} real people connected</span></div>
             <div className="join-logo"><BrandMark large /></div>
             <p className="join-kicker">THE THIRD PLACE</p>
             <h2>{joinHeading}</h2>
             <p className="join-copy">{joinCopy}</p>
-            <div className="join-auth-tabs" role="group" aria-label="Account options">
-              <button type="button" aria-pressed={authJoinMode === "login"} className={authJoinMode === "login" ? "active" : ""} onClick={() => selectAuthJoinMode("login")} disabled={joining}>Log in</button>
-              <button type="button" aria-pressed={authJoinMode === "register"} className={authJoinMode === "register" ? "active" : ""} onClick={() => selectAuthJoinMode("register")} disabled={joining}>Create account</button>
-            </div>
-            {(authJoinMode === "register" || authJoinMode === "guest" || authJoinMode === "legacy") && <label><span>Display name</span><input autoFocus dir="auto" value={joinName} onChange={(event) => { setJoinName(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder={authJoinMode === "legacy" ? "The exact name you used before" : "What should everyone call you?"} maxLength={24} autoComplete="nickname" /></label>}
-            {(authJoinMode === "login" || authJoinMode === "register") && <label><span>Username</span><input autoFocus={authJoinMode === "login"} value={loginHandle} onChange={(event) => { setLoginHandle(event.target.value); setJoinError(""); }} placeholder="Your local username" maxLength={64} autoCapitalize="none" autoComplete="username" spellCheck={false} /></label>}
-            {(authJoinMode === "login" || authJoinMode === "register") && <label><span>Password</span><input value={accountPassword} onChange={(event) => { setAccountPassword(event.target.value); setJoinError(""); }} placeholder={authJoinMode === "register" ? "At least 8 characters" : "Your password"} type="password" autoComplete={authJoinMode === "register" ? "new-password" : "current-password"} maxLength={1024} /></label>}
-            {authJoinMode === "register" && <label><span>Confirm password</span><input value={accountPasswordConfirm} onChange={(event) => { setAccountPasswordConfirm(event.target.value); setJoinError(""); }} placeholder="Type it once more" type="password" autoComplete="new-password" maxLength={1024} /></label>}
-            {authJoinMode === "register" && accountPasswordConfirm && accountPassword !== accountPasswordConfirm && <span className="join-field-hint error" role="alert">The passwords do not match.</span>}
-            {authJoinMode === "legacy" && <label><span>Old return key</span><input value={returnKey} onChange={(event) => { setReturnKey(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Paste your private return key" type="password" autoComplete="off" spellCheck={false} /></label>}
-            {preview?.inviteRequired && <label><span>Invite code</span><input value={inviteCode} onChange={(event) => { setInviteCode(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Enter the code" type="password" /></label>}
+            {!pendingAdultAdmission && (
+              <>
+                <div className="join-auth-tabs" role="group" aria-label="Account options">
+                  <button type="button" aria-pressed={authJoinMode === "login"} className={authJoinMode === "login" ? "active" : ""} onClick={() => selectAuthJoinMode("login")} disabled={joining}>Log in</button>
+                  <button type="button" aria-pressed={authJoinMode === "register"} className={authJoinMode === "register" ? "active" : ""} onClick={() => selectAuthJoinMode("register")} disabled={joining}>Create account</button>
+                </div>
+                {(authJoinMode === "register" || authJoinMode === "guest" || authJoinMode === "legacy") && <label><span>Display name</span><input autoFocus dir="auto" value={joinName} onChange={(event) => { setJoinName(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder={authJoinMode === "legacy" ? "The exact name you used before" : "What should everyone call you?"} maxLength={24} autoComplete="nickname" /></label>}
+                {(authJoinMode === "login" || authJoinMode === "register") && <label><span>Username</span><input autoFocus={authJoinMode === "login"} value={loginHandle} onChange={(event) => { setLoginHandle(event.target.value); setJoinError(""); }} placeholder="Your local username" maxLength={64} autoCapitalize="none" autoComplete="username" spellCheck={false} /></label>}
+                {(authJoinMode === "login" || authJoinMode === "register") && <label><span>Password</span><input value={accountPassword} onChange={(event) => { setAccountPassword(event.target.value); setJoinError(""); }} placeholder={authJoinMode === "register" ? "At least 8 characters" : "Your password"} type="password" autoComplete={authJoinMode === "register" ? "new-password" : "current-password"} maxLength={1024} /></label>}
+                {authJoinMode === "register" && <label><span>Confirm password</span><input value={accountPasswordConfirm} onChange={(event) => { setAccountPasswordConfirm(event.target.value); setJoinError(""); }} placeholder="Type it once more" type="password" autoComplete="new-password" maxLength={1024} /></label>}
+                {authJoinMode === "register" && accountPasswordConfirm && accountPassword !== accountPasswordConfirm && <span className="join-field-hint error" role="alert">The passwords do not match.</span>}
+                {authJoinMode === "legacy" && <label><span>Old return key</span><input value={returnKey} onChange={(event) => { setReturnKey(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Paste your private return key" type="password" autoComplete="off" spellCheck={false} /></label>}
+                {preview?.inviteRequired && <label><span>Invite code</span><input value={inviteCode} onChange={(event) => { setInviteCode(event.target.value); setJoinError(""); setTakeoverRequired(false); }} placeholder="Enter the code" type="password" /></label>}
+              </>
+            )}
+            <label className="join-age-confirmation">
+              <input
+                type="checkbox"
+                checked={adultConfirmed}
+                onChange={(event) => {
+                  setAdultConfirmed(event.target.checked);
+                  setJoinError("");
+                  setTakeoverRequired(false);
+                }}
+              />
+              <span>
+                <strong>I confirm that I’m 18 or older</strong>
+                <small>The Third Place is an adult community. Conversations may include strong language and mature themes.</small>
+              </span>
+            </label>
             {joinError && <div className="join-error" role="alert">{joinError}</div>}
-            {takeoverRequired ? (
+            {!pendingAdultAdmission && takeoverRequired ? (
               <div className="join-takeover" role="alert">
                 <div><Icon name="info" size={17} /><span><strong>Already open somewhere else</strong>This return key is valid, but the identity is currently connected. Taking over will sign out the other browser.</span></div>
-                <div className="join-takeover-actions"><button type="button" onClick={() => setTakeoverRequired(false)} disabled={joining}>Not now</button><button type="button" onClick={() => void submitIdentityJoin(true)} disabled={joining}>{joining ? <><span className="button-spinner" />Moving…</> : "Take over identity"}</button></div>
+                <div className="join-takeover-actions"><button type="button" onClick={() => setTakeoverRequired(false)} disabled={joining}>Not now</button><button type="button" onClick={() => void submitIdentityJoin(true)} disabled={joining || !identityJoinReady}>{joining ? <><span className="button-spinner" />Moving…</> : "Take over identity"}</button></div>
               </div>
             ) : (
-              <button className="join-button" type="submit" disabled={joining || !identityJoinReady}>{joining ? <><span className="spinner" />Opening the door…</> : <>{authJoinMode === "login" ? "Log in" : authJoinMode === "register" ? "Create local account" : authJoinMode === "legacy" ? "Return to the room" : "Enter as guest"} <Icon name="chevron" size={17} /></>}</button>
+              <button className="join-button" type="submit" disabled={joining || !identityJoinReady}>{joining ? <><span className="spinner" />Opening the door…</> : <>{pendingAdultAdmission ? `Continue as ${pendingAdultAdmission.me.name}` : authJoinMode === "login" ? "Log in" : authJoinMode === "register" ? "Create local account" : authJoinMode === "legacy" ? "Return to the room" : "Enter as guest"} <Icon name="chevron" size={17} /></>}</button>
             )}
-            <div className="join-secondary-actions">
+            {!pendingAdultAdmission && <div className="join-secondary-actions">
               <button type="button" className={authJoinMode === "guest" ? "active" : ""} onClick={() => selectAuthJoinMode(authJoinMode === "guest" ? "login" : "guest")} disabled={joining}>{authJoinMode === "guest" ? "Use a local account" : "Continue as guest"}</button>
               <span aria-hidden="true">·</span>
               <button type="button" className={authJoinMode === "legacy" ? "active" : ""} onClick={() => selectAuthJoinMode(authJoinMode === "legacy" ? "login" : "legacy")} disabled={joining}>{authJoinMode === "legacy" ? "Use a local account" : "I have an old return key"}</button>
-            </div>
+            </div>}
             <div className="join-disclosure"><Icon name="info" size={16} /><span><strong>Accounts stay on this computer.</strong> Passwords, sessions, memories and private chats are stored by this server; no email or external identity service is used. Guests are temporary and erased on explicit logout. AI runs locally; optional research and link reads may use the web.</span></div>
             <p className="preview-hint"><i /><span>You're seeing the real room live behind this card.</span></p>
           </form>
@@ -3538,24 +3579,10 @@ export default function App() {
                       : "Human visitor"}</b></span>
               </div>
               {me && profile.id === me.id && sessionIdentity?.kind === "registered" && (
-                <>
-                  <div className="profile-account-status">
-                    <Icon name="lock" size={16} />
-                    <span><strong>Local account</strong><small>@{sessionIdentity.loginHandle} · Your identity and private chats remain after logout.</small></span>
-                  </div>
-                  <label className="profile-romance-preference">
-                    <span className="profile-romance-copy">
-                      <span><Icon name="spark" size={15} /><strong>Allow subtle romantic storylines (18+)</strong></span>
-                      <small>Optional, slow-burn moments between adults. This is eligibility—not consent—and a boundary always wins.</small>
-                    </span>
-                    <input
-                      type="checkbox"
-                      checked={sessionIdentity.romanticInteractionsOptIn === true}
-                      disabled={updatingRomancePreference}
-                      onChange={(event) => void updateRomancePreference(event.target.checked)}
-                    />
-                  </label>
-                </>
+                <div className="profile-account-status">
+                  <Icon name="lock" size={16} />
+                  <span><strong>Local account</strong><small>@{sessionIdentity.loginHandle} · Your identity and private chats remain after logout.</small></span>
+                </div>
               )}
               {me && profile.id === me.id && sessionIdentity && sessionIdentity.kind !== "registered" && (
                 <form className="profile-upgrade" onSubmit={upgradeCurrentIdentity}>
