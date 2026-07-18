@@ -4,6 +4,9 @@ import type {
   ActionResult,
   CatalogUpdatePayload,
   Channel,
+  ChannelFeedCard,
+  ChannelFeedPublisher,
+  ChannelFeedUpdatePayload,
   ChatMessage,
   DirectorEvent,
   DmThread,
@@ -55,6 +58,15 @@ import {
 } from "./voicePlayback";
 import { clearChannelNotice, firstUnreadDmMessageId, noteChannelMessage, type ChannelNotices } from "./unread";
 import { reduceTypingPresence, TypingPresenceExpiry } from "./typingPresence";
+import {
+  channelFeedsFor,
+  formatMarketChangePercent,
+  formatMarketLevel,
+  formatMarketObservationTime,
+  marketCardStatus,
+  marketDirection,
+  upsertChannelFeed,
+} from "./channelFeeds";
 import { EmojiPicker } from "./EmojiPicker";
 import { insertEmojiAtSelection } from "./emoji";
 import {
@@ -224,6 +236,74 @@ const BrandMark = ({ large = false }: { large?: boolean }) => (
 
 const AiBadge = ({ label = "AI" }: { label?: string }) => <span className="ai-badge"><Icon name="spark" size={10} />{label}</span>;
 
+const BotBadge = () => <span className="bot-badge"><Icon name="radio" size={10} />BOT</span>;
+
+const FeedAvatar = ({ publisher }: { publisher: ChannelFeedPublisher }) => {
+  const imageUrl = resolveAvatarImageUrl(publisher.avatar.imageUrl);
+  return (
+    <span
+      aria-label={`${publisher.name} integration avatar`}
+      className="feed-avatar"
+      role="img"
+      style={{ "--avatar": publisher.avatar.color, "--accent": publisher.avatar.accent } as React.CSSProperties}
+    >
+      {imageUrl
+        ? <img alt="" src={imageUrl} decoding="async" draggable={false} referrerPolicy="no-referrer" />
+        : <span aria-hidden="true">{publisher.avatar.glyph}</span>}
+    </span>
+  );
+};
+
+const ChannelFeedPost = ({ card }: { card: ChannelFeedCard }) => {
+  if (card.kind !== "market_ticker") return null;
+  const experimental = card.observations.some((observation) => observation.source.experimental);
+  const sourceCount = new Set(card.observations.map((observation) => observation.source.id)).size;
+  return (
+    <article className={`channel-feed-post channel-feed-${card.state}`} data-channel-feed-id={card.id}>
+      <FeedAvatar publisher={card.publisher} />
+      <div className="channel-feed-body">
+        <div className="channel-feed-meta">
+          <strong>{card.publisher.name}</strong><BotBadge />
+          <time dateTime={card.updatedAt}>{formatRelative(card.updatedAt)}</time>
+        </div>
+        <section className="market-ticker-card" aria-label={`${card.publisher.name}: ${card.title}`}>
+          <header>
+            <div><span>MARKET SNAPSHOT</span><strong>{card.title}</strong></div>
+            <span className={`feed-state feed-state-${card.state}`}>{card.state === "ready" ? "reported" : card.state}</span>
+          </header>
+          <p className="market-ticker-status">{marketCardStatus(card)}</p>
+          {card.observations.length > 0 && (
+            <div className="market-ticker-grid">
+              {card.observations.map((observation) => {
+                const direction = marketDirection(observation);
+                return (
+                  <a
+                    href={observation.source.url}
+                    key={observation.indexId}
+                    rel="noopener noreferrer nofollow"
+                    referrerPolicy="no-referrer"
+                    target="_blank"
+                    title={`Open ${observation.source.label} source for ${observation.displayName}`}
+                  >
+                    <span className="market-name">{observation.shortName}</span>
+                    <span className="market-value">{formatMarketLevel(observation)}</span>
+                    <span className={`market-change market-${direction}`}>{direction === "up" ? "▲" : direction === "down" ? "▼" : "•"} {formatMarketChangePercent(observation)}</span>
+                    <small>{formatMarketObservationTime(observation)}</small>
+                  </a>
+                );
+              })}
+            </div>
+          )}
+          <footer>
+            <span>Change from previous close · latest reported, not live</span>
+            <span>{sourceCount > 0 ? `${sourceCount} validated ${sourceCount === 1 ? "source" : "sources"}` : "Waiting for a validated source"}{experimental ? " · experimental data provider" : ""}</span>
+          </footer>
+        </section>
+      </div>
+    </article>
+  );
+};
+
 const formatTime = (iso: string) =>
   new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
 
@@ -365,6 +445,7 @@ export default function App() {
   const [me, setMe] = useState<Member | null>(null);
   const [members, setMembers] = useState<Member[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [channelFeeds, setChannelFeeds] = useState<ChannelFeedCard[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [dmThreads, setDmThreads] = useState<DmThread[]>([]);
   const [directorEvents, setDirectorEvents] = useState<DirectorEvent[]>([]);
@@ -865,6 +946,7 @@ export default function App() {
     setMembers(snapshot.members);
     channelsRef.current = snapshot.channels;
     setChannels(snapshot.channels);
+    setChannelFeeds(snapshot.channelFeeds ?? []);
     setMessages(snapshot.messages);
     setHistoryPageInfo(snapshot.historyPageInfo ?? {});
     dmThreadsRef.current = snapshot.dmThreads;
@@ -921,6 +1003,12 @@ export default function App() {
         setUnreadDividers((current) => current[message.channelId]
           ? current
           : { ...current, [message.channelId]: message.id });
+      }
+    });
+    socket.on("channel-feed:update", (payload: ChannelFeedUpdatePayload) => {
+      setChannelFeeds((current) => upsertChannelFeed(current, payload.card));
+      if (payload.card.channelId === activeChannelRef.current && shouldStickToBottom.current) {
+        requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }));
       }
     });
     socket.on("reaction:update", (payload: ReactionPayload) => {
@@ -1398,9 +1486,14 @@ export default function App() {
       .then((data: PublicPreview) => {
         if (!alive) return;
         setPreview(data);
+        // `/api/preview` and `/api/session` start together. Once an
+        // authenticated socket owns the screen, a slower anonymous preview
+        // must not replace its newer snapshot or feed revisions.
+        if (meRef.current) return;
         setMembers(data.members);
         channelsRef.current = data.channels;
         setChannels(data.channels);
+        setChannelFeeds(data.channelFeeds ?? []);
         setMessages(data.messages);
         setHealth(data.health);
       })
@@ -1478,6 +1571,23 @@ export default function App() {
   }, [acknowledgeDmRead, activeChannelId, dmThreads]);
 
   useEffect(() => {
+    if (!me || connection !== "live" || !channelsRef.current.some((channel) => channel.id === activeChannelId)) return;
+    const reportFocusedChannel = () => {
+      if (document.visibilityState !== "visible" || !document.hasFocus()) return;
+      socketRef.current?.emit("channel:focus", { channelId: activeChannelId });
+    };
+    reportFocusedChannel();
+    const timer = window.setInterval(reportFocusedChannel, 60_000);
+    window.addEventListener("focus", reportFocusedChannel);
+    document.addEventListener("visibilitychange", reportFocusedChannel);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", reportFocusedChannel);
+      document.removeEventListener("visibilitychange", reportFocusedChannel);
+    };
+  }, [activeChannelId, connection, me]);
+
+  useEffect(() => {
     const onPageHide = () => {
       const roomId = joinedVoiceRoomRef.current;
       if (roomId) socketRef.current?.emit("voice:room:leave", { roomId });
@@ -1500,6 +1610,10 @@ export default function App() {
     if (!foldedSearch) return source;
     return source.filter((message) => unicodeCaselessKey(message.content).includes(foldedSearch));
   }, [activeChannelId, activeThread, foldedSearch, messages]);
+  const activeChannelFeeds = useMemo(
+    () => activeThread || foldedSearch ? [] : channelFeedsFor(channelFeeds, activeChannelId),
+    [activeChannelId, activeThread, channelFeeds, foldedSearch],
+  );
   const activeTitle = activeChannel?.name ?? activePeer?.name ?? "conversation";
   const activeDescription = activeChannel?.description ?? (activePeer?.kind === "ai" ? "Private chat with an AI resident" : "Private conversation");
   const typingMembers = (typing[activeChannelId] ?? []).map((id) => memberMap.get(id)).filter((member): member is Member => Boolean(member));
@@ -1791,7 +1905,7 @@ export default function App() {
     if (foldedSearch) return;
     if (!shouldStickToBottom.current) return;
     requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }));
-  }, [activeMessages.length, activeChannelId, foldedSearch]);
+  }, [activeMessages.length, activeChannelFeeds, activeChannelId, foldedSearch]);
 
   useEffect(() => {
     const scroller = scrollRef.current;
@@ -3143,7 +3257,7 @@ export default function App() {
             <p dir="auto">{activeDescription}</p>
             {activePeer?.kind === "ai" && <div className="transparency-note"><AiBadge label="AI RESIDENT" /><span>This character is generated by a local language model. Private history is stored locally by this server.</span></div>}
           </div>}
-          {activeMessages.length === 0 && <div className="empty-conversation"><Icon name="message" size={22} /><strong>Quiet, for once.</strong><span>Say something and see who notices.</span></div>}
+          {activeMessages.length === 0 && activeChannelFeeds.length === 0 && <div className="empty-conversation"><Icon name="message" size={22} /><strong>Quiet, for once.</strong><span>Say something and see who notices.</span></div>}
           {activeMessages.map((message, index) => {
             const author = memberMap.get(message.authorId) ?? message.authorSnapshot;
             const previous = activeMessages[index - 1];
@@ -3313,6 +3427,7 @@ export default function App() {
               </Fragment>
             );
           })}
+          {activeChannelFeeds.map((card) => <ChannelFeedPost card={card} key={card.id} />)}
           <div className="scroll-pad" />
         </div>
 

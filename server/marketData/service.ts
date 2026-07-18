@@ -216,7 +216,7 @@ export class MarketSnapshotService {
     this.partialCacheTtlMs = boundedInteger(options.partialCacheTtlMs, 15_000, 500, this.cacheTtlMs);
     this.failureCacheTtlMs = boundedInteger(options.failureCacheTtlMs, 5_000, 250, this.partialCacheTtlMs);
     this.maxCacheEntries = boundedInteger(options.maxCacheEntries, 32, 4, 64);
-    this.providerCallTimeoutMs = boundedInteger(options.providerCallTimeoutMs, 8_000, 10, 30_000);
+    this.providerCallTimeoutMs = boundedInteger(options.providerCallTimeoutMs, 15_000, 10, 30_000);
     this.circuitFailureThreshold = boundedInteger(options.circuitFailureThreshold, 2, 1, 5);
     this.circuitCooldownMs = boundedInteger(options.circuitCooldownMs, 60_000, 1_000, 5 * 60_000);
   }

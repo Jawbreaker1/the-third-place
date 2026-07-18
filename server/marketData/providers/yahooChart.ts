@@ -54,7 +54,7 @@ export const YAHOO_CHART_TIME_ZONES: Readonly<Record<MarketIndexId, string>> = O
 }) as Readonly<Record<MarketIndexId, string>>;
 
 const yahooJsonPolicy: SafeHttpsFetchPolicy = Object.freeze({
-  timeoutMs: 4_000,
+  timeoutMs: 2_000,
   maxRedirects: 0,
   maxBodyBytes: 256 * 1024,
   acceptedMediaTypes: ["application/json"],
@@ -63,9 +63,9 @@ const yahooJsonPolicy: SafeHttpsFetchPolicy = Object.freeze({
 });
 
 const MAX_TARGETS_PER_READ = 8;
-// Yahoo's undocumented endpoint is markedly less reliable under small bursts;
-// a fixed basket is therefore read sequentially behind the service cache.
-const MAX_CONCURRENT_READS = 1;
+// Keep the burst deliberately small, but finish a six-index basket inside the
+// enclosing provider deadline even when one fixed host fallback is needed.
+const MAX_CONCURRENT_READS = 2;
 
 type JsonRecord = Record<string, unknown>;
 
