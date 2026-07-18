@@ -380,6 +380,8 @@ const runtimeChannelFromConfig = (
     delete profile.autonomousResearchPriority;
     delete profile.ambientActivityPriority;
     delete profile.marketPulseSourceSet;
+    delete profile.scheduledSocialModes;
+    delete profile.transientSceneTexture;
   }
   return profile;
 };

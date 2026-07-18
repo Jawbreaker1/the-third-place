@@ -30,6 +30,7 @@
     "audit:ambient": "node --import tsx scripts/ambient-audit.mjs",
     "eval:humanity": "node --import tsx scripts/humanity-live-eval.mjs",
     "eval:ambient": "node --import tsx scripts/ambient-live-eval.mjs",
+    "eval:pub": "node --import tsx scripts/pub-live-eval.mjs",
     "eval:semantics": "node --import tsx scripts/semantic-router-live-eval.mjs",
     "eval:security": "node --import tsx scripts/security-room-live-eval.mjs",
     "test:audit:humanity": "node --test scripts/humanity-audit.node-test.mjs",

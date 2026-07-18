@@ -127,6 +127,41 @@ describe("persona style fingerprints", () => {
     }
   });
 
+  it("lets a trusted scene mode override only the visible-affect budget", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const falseKey = Array.from({ length: 2_000 }, (_, index) => `affect-off:${index}`)
+      .find((key) => !derivePersonaStyleTurnPolicy(mira, key).visibleAffect)!;
+    const trueKey = Array.from({ length: 2_000 }, (_, index) => `affect-on:${index}`)
+      .find((key) => derivePersonaStyleTurnPolicy(mira, key).visibleAffect)!;
+    const ordinaryFalse = derivePersonaStyleTurnPolicy(mira, falseKey);
+    const forcedVisible = derivePersonaStyleTurnPolicy(
+      mira,
+      falseKey,
+      "text",
+      undefined,
+      undefined,
+      true,
+    );
+    const ordinaryTrue = derivePersonaStyleTurnPolicy(mira, trueKey);
+    const forcedHidden = derivePersonaStyleTurnPolicy(
+      mira,
+      trueKey,
+      "text",
+      undefined,
+      undefined,
+      false,
+    );
+
+    expect(ordinaryFalse.visibleAffect).toBe(false);
+    expect(forcedVisible).toEqual({ ...ordinaryFalse, visibleAffect: true });
+    expect(ordinaryTrue.visibleAffect).toBe(true);
+    expect(forcedHidden).toEqual({ ...ordinaryTrue, visibleAffect: false });
+    expect(buildPersonaStylePromptNote(mira, {
+      turnKey: falseKey,
+      visibleAffectOverride: true,
+    })).toContain("it may show briefly through word choice or rhythm");
+  });
+
   it("realizes each persona's affect and texture rates while leaving most turns clean", () => {
     const samples = 2_000;
     for (const persona of PERSONAS) {

@@ -99,6 +99,13 @@ describe("social-memory consolidation contract", () => {
     })] }, malicious)).toBeUndefined();
   });
 
+  it("does not semantically collapse passing scene state into durable preference or identity", () => {
+    const prompt = buildSocialMemoryConsolidationSystemPrompt();
+    expect(prompt).toContain("A momentary scene state and an explicitly lasting preference");
+    expect(prompt).toContain("Repeated transient episodes do not become a stable trait");
+    expect(prompt).toContain("occurrences at different times are not duplicates");
+  });
+
   it("rejects generated summaries, paraphrases, URLs, credentials and other unsupported prose", () => {
     expect(parse({ actions: [action({ perspective: "Johan will definitely move. https://evil.example/token" })] }))
       .toBeUndefined();

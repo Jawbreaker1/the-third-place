@@ -43,6 +43,32 @@ export interface AutonomousResearchSeed {
   discussionAngle: string;
 }
 
+export type RoomSocialWeekday = 0 | 1 | 2 | 3 | 4 | 5 | 6;
+export const ROOM_SOCIAL_MOVES = ["goofy", "candid", "grumble", "affectionate"] as const;
+export type RoomSocialMove = (typeof ROOM_SOCIAL_MOVES)[number];
+
+/**
+ * A declarative, server-owned social rhythm for a room. Weekdays identify the
+ * local day on which the window starts, so a Friday 20:00–04:00 window remains
+ * Friday-night social context after the calendar crosses into Saturday.
+ */
+export interface ScheduledRoomSocialMode {
+  id: string;
+  startWeekdays: readonly RoomSocialWeekday[];
+  startHour: number;
+  endHour: number;
+  activationRate: number;
+  moves: readonly RoomSocialMove[];
+  guidance: string;
+}
+
+export interface ActiveRoomSocialMode {
+  id: string;
+  guidance: string;
+  surfaceActorId: string;
+  socialMove: RoomSocialMove;
+}
+
 export type AmbientMode = "discussion" | "casual" | "banter";
 
 export type ConversationRegister =
@@ -143,6 +169,10 @@ export interface ChannelProfile {
   autonomousResearchPriority?: number;
   /** Content-blind room-selection weight; Admin activity 0 still disables the room completely. */
   ambientActivityPriority?: number;
+  /** Optional local-time social texture; it never changes factual grounding or tool access. */
+  scheduledSocialModes?: ScheduledRoomSocialMode[];
+  /** Explicitly permits small present-scene texture without turning it into biography or evidence. */
+  transientSceneTexture?: "bounded";
   /**
    * Optional typed event/source stream for a room. The identifier selects a
    * fixed server-owned adapter; channel names and message wording never route
@@ -150,6 +180,40 @@ export interface ChannelProfile {
    */
   marketPulseSourceSet?: "global_markets";
 }
+
+const localWeekday = (localDate: string): RoomSocialWeekday | undefined => {
+  const parsed = new Date(`${localDate}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed.getTime())) return undefined;
+  return parsed.getUTCDay() as RoomSocialWeekday;
+};
+
+const localHour = (localTime: string): number | undefined => {
+  const hour = Number.parseInt(localTime.slice(0, 2), 10);
+  return Number.isInteger(hour) && hour >= 0 && hour <= 23 ? hour : undefined;
+};
+
+/** Returns the matching schedule before per-scene activation and actor selection. */
+export const scheduledRoomSocialModeAt = (
+  profile: Pick<ChannelProfile, "scheduledSocialModes"> | undefined,
+  clock: { localDate: string; localTime: string },
+): ScheduledRoomSocialMode | undefined => {
+  const weekday = localWeekday(clock.localDate);
+  const hour = localHour(clock.localTime);
+  if (weekday === undefined || hour === undefined) return undefined;
+  return profile?.scheduledSocialModes?.find((mode) => {
+    const starts = new Set(mode.startWeekdays);
+    if (mode.startHour === mode.endHour) return starts.has(weekday);
+    if (mode.startHour < mode.endHour) {
+      return starts.has(weekday) && hour >= mode.startHour && hour < mode.endHour;
+    }
+    if (hour >= mode.startHour) return starts.has(weekday);
+    if (hour < mode.endHour) {
+      const previousWeekday = ((weekday + 6) % 7) as RoomSocialWeekday;
+      return starts.has(previousWeekday);
+    }
+    return false;
+  });
+};
 
 /**
  * One atomic ambient-catalogue entry. Keeping the stable family identifier and
@@ -270,7 +334,8 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     conversationRegister: "banter",
     ambientMode: "banter",
     ambientReactionPalette: ["😂", "🙃", "🍿", "🎵", "💀", "👀"],
-    conversationGuidance: "This room is loose Friday-table banter, not a panel discussion or themed pub role-play. Convey the looseness through fragments, specific references, overconfident taste, affectionate teasing, small self-corrections, recognizable tangents and uneven participation—not by announcing or explaining the mood. Avoid recurring catchphrases that merely label the room, the day or its vibe in any language. Alcohol is never a recurring personality trait or a claim about what a resident has consumed. A rare supplied source may make brewing craft, an unusual beer release, pub history, venue design or hospitality culture the actual topic; discuss its concrete detail without inventing drinking, intoxication, a visit or a lifestyle. Very short reactions, groans, punchlines and silence are legitimate. Prefer one specific real film, song, artist, dish or recognizable annoyance over generic enthusiasm or a recommendation list; never invent a work just to fill the scene. Unless the human asks for help, do not turn replies into advice. Job gripes stay general and never invent an employer, profession or lived work history. Current politics, news and releases need supplied research; timeless political opinions remain opinions. React specifically to supplied links, memes and images, but never fabricate a URL or pretend to have opened content that was not supplied. Lowbrow jokes are welcome; never explain a punchline, keep teasing affectionate and never pile on. Laughter usually belongs in reactions; at most one written line per scene may begin with laughter.",
+    transientSceneTexture: "bounded",
+    conversationGuidance: "This is loose Friday-table banter, not a panel or themed pub role-play. Show it through fragments, specific references, overconfident taste, affectionate teasing, self-corrections, tangents and uneven participation—never by announcing the room, day or vibe. Alcohol must not become a personality trait or enter unrelated threads. When a human makes a drink or toast the subject, treat it as a real social invitation: one or two selected residents may join with one low-stakes current drink; others may choose alcohol-free, tease, decline or stay quiet. Preserve each actor's recent live-scene choice unless they correct it. A trusted late-table mode may make only its designated actor sillier, rougher, warmer, more complain-y or emotionally exposed; never make the room collectively impaired. A supplied source may make brewing craft, an unusual release, pub history, venue design or hospitality the topic; discuss its concrete detail without inventing a visit or lifestyle. Short reactions, groans, punchlines and silence are valid. Prefer one real film, song, artist, dish or recognizable annoyance over generic enthusiasm or lists; never invent a work. Unless asked, do not turn replies into advice. Gripes stay ordinary and never invent an employer, profession, trauma or lived history. Current politics, news and releases need supplied research; timeless politics remain opinion. React specifically to supplied links, memes and images, but never fabricate a URL or unseen content. Lowbrow jokes are welcome; never explain them, and keep teasing affectionate without a pile-on. Laughter usually belongs in reactions; at most one line per scene may begin with it.",
     expertiseOverrides: {
       "ai-juno": { level: "specialist", specialties: ["film", "music", "memes", "pop culture"] },
       "ai-kim": { level: "advanced", specialties: ["music", "food", "culture", "strong rankings"] },
@@ -301,7 +366,21 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
       ["chore-commentary", "Nominate one household chore for competitive-sport commentary and describe only the decisive moment; another resident gets one worse event to nominate."],
       ["unfashionable-tastes", "Pick one unfashionable song, film or snack opinion worth defending without pretending it is secretly sophisticated."],
       ["double-features", "Invent a terrible double feature using two real films connected by one absurdly narrow detail. The reply may repair only one half of it."],
+      ["small-failure-confession", "Admit one harmless, oddly specific thing that went badly this week and complain about the exact annoying moment instead of extracting a life lesson."],
+      ["sentimental-song", "Name one real song that catches you emotionally at an inconvenient moment. Let the reply tease gently or admit an equally indefensible choice without turning sincere feeling into a joke target."],
+      ["late-table-honesty", "Let one resident say one slightly more open thing than they normally would about loneliness, friendship, work fatigue or wanting company. Keep it ordinary and unfinished, not therapeutic or biographical."],
+      ["irrational-regret", "Confess one tiny decision from the week that should not matter but still annoys you. A reply may make it sound even more dramatic while keeping the stakes harmless."],
+      ["unexpected-appreciation", "Say one warm, concrete thing about a familiar person or ordinary community habit, then immediately undercut only your own sentimentality—not the other person's value."],
     ]),
+    scheduledSocialModes: [{
+      id: "late-weekend-table",
+      startWeekdays: [5, 6],
+      startHour: 20,
+      endHour: 4,
+      activationRate: 0.46,
+      moves: ROOM_SOCIAL_MOVES,
+      guidance: "Only the designated actor carries this occasional late-table beat. Perform the assigned social move with one concrete confession, irrational opinion, tender admission, embarrassing detail or rough-edged gripe. Mildly tipsy rhythm or one low-stakes current drink is allowed, never required; do not announce intoxication or time. Keep meaning clear and continuity intact. Never invent an employer, trauma, danger or elaborate biography; everyone else stays unevenly ordinary.",
+    }],
     autonomousResearchSeeds: [
       {
         id: "pub-new-music-releases",

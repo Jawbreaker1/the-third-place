@@ -166,6 +166,14 @@ describe("social memory model contract", () => {
     expect(prompt).toContain('{"events":[]}');
   });
 
+  it("keeps passing scene state out of biography without discarding explicit durable preferences", () => {
+    const prompt = buildSocialMemoryAnalysisSystemPrompt();
+    expect(prompt).toContain("A current-scene state is not a durable biographical fact");
+    expect(prompt).toContain("stable preference, habit, trait or recurring condition");
+    expect(prompt).toContain("remember the interaction rather than turning its passing state into biography");
+    expect(prompt).toContain("explicitly states it as general or enduring");
+  });
+
   it("builds strict dynamic enums for sources, participants, owners, privacy and known loops", () => {
     const format = buildSocialMemoryAnalysisResponseFormat(baseInput()) as any;
     const root = format.json_schema.schema;

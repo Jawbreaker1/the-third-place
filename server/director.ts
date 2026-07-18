@@ -797,7 +797,7 @@ export function ambientConversationPremise(
         ? `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words with one countertake, adjacent recommendation, punchline or incompatible concrete preference. Keep it table-talk blunt or playful; do not politely agree, summarize or declare a formal debate.`
         : `${responder.name} replies directly in ${responseLimit!.minimum}–${responseLimit!.maximum} words with one distinct move: a countertake, adjacent recommendation, punchline, groan or genuine specific question.`
       : "";
-    return `${opening} ${leadRole} ${responseRole} ${action ? ambientActionInstruction(action, mode) : ""} Do not recap, broadly agree, offer advice or an assistant-style overview, explain a punchline, introduce alcohol, perform the room's Friday mood or invite the whole room to answer. Exactly the selected residents speak in order; short fragments and silence remain valid.`.replace(/\s+/g, " ").trim();
+    return `${opening} ${leadRole} ${responseRole} ${action ? ambientActionInstruction(action, mode) : ""} Do not recap, broadly agree, offer advice or an assistant-style overview, explain a punchline, perform a generic room mood or invite the whole room to answer. Exactly the selected residents speak in order; short fragments and silence remain valid. Room-local policy and any trusted scheduled social mode decide which transient social details are appropriate.`.replace(/\s+/g, " ").trim();
   }
   if (mode === "casual") {
     const opening = continuation
@@ -1588,7 +1588,7 @@ export function consideredConversationLeadPremise(
       ? { minimum: 18, maximum: 42 }
       : { minimum: 24, maximum: 52 });
   if (mode === "banter") {
-    return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens with one unusually substantive but still conversational ${words.minimum}–${words.maximum}-word recommendation, gripe, story-shaped observation or opinion. Anchor it in a concrete title, detail, ritual or trade-off. No essay framing, advice service, room-performance commentary or alcohol. Only ${plan.lead.name} speaks in this generation.`.trim();
+    return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens with one unusually substantive but still conversational ${words.minimum}–${words.maximum}-word recommendation, gripe, story-shaped observation or opinion. Anchor it in a concrete title, detail, ritual or trade-off. No essay framing, advice service or room-performance commentary. Room-local policy and any trusted scheduled social mode decide transient social texture. Only ${plan.lead.name} speaks in this generation.`.trim();
   }
   if (mode === "casual") {
     return `${consideredSeedAnchor(seed)} ${plan.lead.name} opens a slightly deeper but still off-the-cuff chat turn in ${words.minimum}–${words.maximum} words. Use one recognizable example, ordinary phrase or concrete disagreement; leave some conversational rough edge instead of resolving it like an essay. Only ${plan.lead.name} speaks in this generation.`.trim();

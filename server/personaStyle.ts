@@ -164,6 +164,8 @@ export interface PersonaStylePromptOptions {
   endingOverride?: PersonaStyleTurnPolicy["ending"];
   /** A trusted live room policy may replace the persona's ordinary texture lottery for this turn. */
   surfaceTextureOverride?: TurnSurfaceTexture | null;
+  /** A trusted scene mode may expose one actor's existing feeling more visibly for this turn. */
+  visibleAffectOverride?: boolean;
   /** Trusted per-scene intensity, assigned to at most one actor unless deliberately restrained. */
   stanceIntensity?: PersonaStanceIntensity;
   /** Whether this turn is clean, persona-led, or carries a bounded coarse-language target. */
@@ -190,6 +192,7 @@ export const derivePersonaStyleTurnPolicy = (
   medium: "text" | "voice" = "text",
   endingOverride?: PersonaStyleTurnPolicy["ending"],
   surfaceTextureOverride?: TurnSurfaceTexture | null,
+  visibleAffectOverride?: boolean,
 ): PersonaStyleTurnPolicy => {
   const key = `${turnKey}\u0000${persona.id}`;
   const palette = persona.style.emojiPalette ?? [];
@@ -214,7 +217,8 @@ export const derivePersonaStyleTurnPolicy = (
         Math.floor(hashUnit(`${key}\u0000habit-choice`) * eligibleHabits.length)
       ]?.habit
     : undefined;
-  const visibleAffect = hashUnit(`${key}\u0000visible-affect`) < persona.style.visibleAffectRate;
+  const visibleAffect = visibleAffectOverride
+    ?? hashUnit(`${key}\u0000visible-affect`) < persona.style.visibleAffectRate;
   const eligibleTextures = persona.style.surfaceTexturePalette.filter((texture) =>
     medium !== "voice" || voiceSurfaceTextures.has(texture),
   );
@@ -348,6 +352,7 @@ export const buildPersonaStylePromptNote = (
       options.medium ?? "text",
       options.endingOverride,
       options.surfaceTextureOverride,
+      options.visibleAffectOverride,
     )
     : undefined;
   const policy = derivedPolicy;

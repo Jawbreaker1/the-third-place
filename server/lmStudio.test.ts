@@ -4,6 +4,8 @@ import {
   BackgroundWorkPreemptedError,
   buildSceneSystemPrompt,
   MAX_VISUAL_EVIDENCE_ENTRIES,
+  deriveActiveRoomSocialMode,
+  deriveRoomSharedRitualActorIds,
   deriveSceneBehaviorStylePlan,
   LmStudioClient,
   sanitizeObservationText,
@@ -11,6 +13,7 @@ import {
   type SceneRequest,
 } from "./lmStudio.js";
 import { PERSONAS } from "./personas.js";
+import { ROOM_SOCIAL_MOVES } from "./channels.js";
 import {
   buildTurnAnalysisSystemPrompt,
   buildVoiceCandidateReviewSystemPrompt,
@@ -3459,6 +3462,7 @@ describe("LM Studio multilingual batch candidate review", () => {
       surfaceTexture: expect.toSatisfy((value: unknown) => value === null || typeof value === "string"),
       stanceIntensity: "gentle",
       explicitnessTarget: "persona",
+      socialMove: null,
     });
     expect(secondReview.candidates[0].surfaceStylePlan).toEqual(firstReview.candidates[0].surfaceStylePlan);
   });
@@ -4729,6 +4733,141 @@ describe("LM Studio multilingual batch candidate review", () => {
 
     expect(lines.map((line) => line.personaId)).toEqual([juno.id]);
     expect(call).toBe(2);
+  });
+
+  it("publishes bounded human-led Pub participation even outside the scheduled late-table mode", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    let call = 0;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      call += 1;
+      bodies.push(JSON.parse(String(init?.body)));
+      return call === 1
+        ? completionResponse([{
+            personaId: juno.id,
+            content: "skål då. kall lager här, och jaaaa, den veckan fick faktiskt gärna ta slut.",
+          }])
+        : candidateReviewCompletion([{
+            personaId: juno.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            outputLanguage: { tag: "sv", confidence: 0.99 },
+          }]);
+    }));
+
+    const lines = await new LmStudioClient({
+      now: () => Date.parse("2026-07-14T12:00:00.000Z"),
+      communityTimeZone: "Europe/Stockholm",
+    }).generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [juno],
+      history: [],
+      trigger: { author: "guest", content: "Skål! Vad dricker du ikväll?" },
+      mustReplyIds: [juno.id],
+      semanticContext: {
+        languageTag: "sv",
+        socialTrusted: true,
+        warmth: 0.8,
+        playfulness: 0.7,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({ personaId: juno.id, content: expect.stringContaining("lager") })]);
+    expect(call).toBe(2);
+    const reviewData = JSON.parse(bodies[1].messages[1].content);
+    expect(reviewData.room.socialMode).toBeNull();
+    expect(reviewData.trigger.content).toContain("Skål");
+  });
+
+  it("clears a different actor's Pub social mode on focused required-response recovery", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: sana.id, content: "Jag tänker mest på morgondagens väder." }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: sana.id,
+          severity: "high",
+          issues: ["irrelevant_to_turn"],
+          rewriteInstruction: "Answer the newest complete human turn directly.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{ personaId: sana.id, content: "skål, men jag håller mig till tonic ikväll" }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: sana.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira, sana],
+      history: [],
+      trigger: { author: "Guest", content: "Skålar ni med mig?" },
+      mustReplyIds: [sana.id],
+      responseRecoveryIds: [sana.id],
+      roomSocialMode: {
+        id: "pub-late-table",
+        guidance: "One resident may loosen up slightly.",
+        surfaceActorId: mira.id,
+        socialMove: "candid",
+      },
+      roomSharedRitualActorIds: [mira.id, sana.id],
+      semanticContext: {
+        languageTag: "sv",
+        socialTrusted: true,
+        playfulness: 0.8,
+        warmth: 0.8,
+        urgency: 0,
+        hostility: 0,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: sana.id,
+      content: "skål, men jag håller mig till tonic ikväll",
+    })]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[0]!.messages[0]!.content).toContain("Active room social mode pub-late-table");
+    const firstReview = JSON.parse(bodies[1]!.messages[1]!.content);
+    expect(firstReview.room.socialMode).toMatchObject({ surfaceActorId: mira.id, socialMove: "candid" });
+    expect(firstReview.candidates).toEqual([
+      expect.objectContaining({
+        personaId: sana.id,
+        surfaceStylePlan: expect.objectContaining({ socialMove: null }),
+      }),
+    ]);
+    expect(bodies[2]!.messages[0]!.content).not.toContain("Active room social mode pub-late-table");
+    const recoveryReview = JSON.parse(bodies[3]!.messages[1]!.content);
+    expect(recoveryReview.room).toMatchObject({
+      socialMode: null,
+      sharedRitualActorIds: [mira.id, sana.id],
+    });
   });
 
   it("drops an unsupported acoustic assertion in voice without style repair", async () => {
@@ -6193,6 +6332,84 @@ describe("LM Studio room prompt", () => {
     ]);
   });
 
+  it("preserves one scene-wide two-actor Pub ritual cap across isolated actor batches", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      if (body.messages[0]?.content.includes("publication reviewer")) {
+        const reviewInput = JSON.parse(body.messages[1]!.content) as {
+          candidates: Array<{ personaId: string }>;
+        };
+        return candidateReviewCompletion(reviewInput.candidates.map((candidate) => ({
+          personaId: candidate.personaId,
+          severity: "none" as const,
+          issues: [],
+          rewriteInstruction: null,
+        })));
+      }
+      const scene = JSON.parse(body.messages[1]!.content) as { requiredActorIds: string[] };
+      return completionResponse(scene.requiredActorIds.map((personaId) => ({
+        personaId,
+        content: `${personaId} hänger med en stund`,
+      })));
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira, sana, bosse],
+      history: [],
+      trigger: { author: "Guest", content: "Skål på er!" },
+      mustReplyIds: [bosse.id, mira.id, sana.id],
+      relationshipNotes: {
+        [mira.id]: "Mira remembers one private, bounded detail about this guest.",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        socialTrusted: true,
+        playfulness: 0.8,
+        warmth: 0.8,
+        urgency: 0,
+        hostility: 0,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.personaId)).toEqual([mira.id, sana.id, bosse.id]);
+    const generationBodies = bodies.filter((body) =>
+      !body.messages[0]?.content.includes("publication reviewer")
+    );
+    expect(generationBodies).toHaveLength(2);
+    for (const body of generationBodies) {
+      expect(body.messages[0]?.content).toContain(
+        `only these actor IDs may join it in first person: ${bosse.id}, ${mira.id}`,
+      );
+      expect(body.messages[0]?.content).not.toContain(
+        `only these actor IDs may join it in first person: ${sana.id}`,
+      );
+    }
+    const reviewPayloads = bodies
+      .filter((body) => body.messages[0]?.content.includes("publication reviewer"))
+      .map((body) => JSON.parse(body.messages[1]!.content) as {
+        room: { sharedRitualActorIds: string[] };
+      });
+    expect(reviewPayloads).toHaveLength(2);
+    expect(reviewPayloads.map((payload) => payload.room.sharedRitualActorIds)).toEqual([
+      [bosse.id, mira.id],
+      [bosse.id, mira.id],
+    ]);
+  });
+
   it("preserves an earlier reviewed isolated line when a later redacted batch fails", async () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
@@ -6429,12 +6646,117 @@ describe("LM Studio room prompt", () => {
       selected: [juno],
       history: [],
     });
-    expect(prompt).toContain("loose Friday-table banter, not a panel discussion");
-    expect(prompt).toContain("A rare supplied source may make brewing craft");
-    expect(prompt).toContain("without inventing drinking, intoxication, a visit or a lifestyle");
+    expect(prompt).toContain("loose Friday-table banter, not a panel or themed pub role-play");
+    expect(prompt).toContain("A supplied source may make brewing craft");
+    expect(prompt).toContain("without inventing a visit or lifestyle");
     expect(prompt).toContain("do not turn replies into advice");
-    expect(prompt).toContain("never explain a punchline");
+    expect(prompt).toContain("never explain them");
     expect(prompt).toContain("Never invent, autocomplete or guess a URL");
+  });
+
+  it("assigns one deterministic late-table move to a required Pub actor and exempts grounded or serious turns", () => {
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const base: SceneRequest = {
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [juno, bosse],
+      mustReplyIds: [bosse.id],
+      history: [],
+      trigger: { author: "guest", content: "säg nåt då" },
+      semanticContext: {
+        socialTrusted: true,
+        playfulness: 0.7,
+        urgency: 0.2,
+        hostility: 0.1,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    };
+    let active: ReturnType<typeof deriveActiveRoomSocialMode> = null;
+    let activeRequest: SceneRequest | undefined;
+    for (let index = 0; index < 100 && !active; index += 1) {
+      activeRequest = {
+        ...base,
+        trigger: { ...base.trigger!, messageId: `late-pub-${index}` },
+      };
+      active = deriveActiveRoomSocialMode(activeRequest, {
+        localDate: "2026-07-17",
+        localTime: "23:30:00",
+      });
+    }
+
+    expect(active).not.toBeNull();
+    expect(active?.surfaceActorId).toBe(bosse.id);
+    expect(ROOM_SOCIAL_MOVES).toContain(active?.socialMove);
+    expect(deriveActiveRoomSocialMode(activeRequest!, {
+      localDate: "2026-07-17",
+      localTime: "23:30:00",
+    })).toEqual(active);
+    expect(deriveActiveRoomSocialMode(activeRequest!, {
+      localDate: "2026-07-18",
+      localTime: "14:00:00",
+    })).toBeNull();
+    expect(deriveActiveRoomSocialMode({
+      ...activeRequest!,
+      research: { query: "current film release", retrievedAt: "2026-07-17T21:30:00.000Z", results: [] },
+    }, { localDate: "2026-07-17", localTime: "23:30:00" })).toBeNull();
+    expect(deriveActiveRoomSocialMode({
+      ...activeRequest!,
+      semanticContext: {
+        ...activeRequest!.semanticContext!,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+        moderationTrusted: true,
+        moderationAction: "deescalate",
+      },
+    }, { localDate: "2026-07-17", localTime: "23:30:00" })).toBeNull();
+    expect(deriveActiveRoomSocialMode({
+      ...activeRequest!,
+      semanticContext: {
+        ...activeRequest!.semanticContext!,
+        playfulness: 0.05,
+        urgency: 0.95,
+      },
+    }, { localDate: "2026-07-17", localTime: "23:30:00" })).toBeNull();
+    expect(deriveActiveRoomSocialMode({
+      ...activeRequest!,
+      semanticContext: {
+        ...activeRequest!.semanticContext!,
+        hostility: 0.85,
+      },
+    }, { localDate: "2026-07-17", localTime: "23:30:00" })).toBeNull();
+    expect(deriveActiveRoomSocialMode({
+      ...activeRequest!,
+      semanticContext: {
+        ...activeRequest!.semanticContext!,
+        moderationRisk: "medium",
+      },
+    }, { localDate: "2026-07-17", localTime: "23:30:00" })).toBeNull();
+  });
+
+  it("designates at most two Pub actors for one human-led shared ritual", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const request: SceneRequest = {
+      kind: "public",
+      channelId: "the-pub",
+      channelName: "the-pub",
+      selected: [mira, juno, bosse],
+      mustReplyIds: [bosse.id, mira.id, juno.id, bosse.id],
+      history: [],
+      trigger: { author: "guest", content: "Skål på er" },
+    };
+
+    expect(deriveRoomSharedRitualActorIds(request)).toEqual([bosse.id, mira.id]);
+    expect(deriveRoomSharedRitualActorIds({ ...request, kind: "voice" })).toEqual([bosse.id, mira.id]);
+    expect(deriveRoomSharedRitualActorIds({ ...request, kind: "ambient" })).toEqual([]);
+    expect(deriveRoomSharedRitualActorIds({ ...request, channelId: "lobby" })).toEqual([]);
+    expect(deriveRoomSharedRitualActorIds({ ...request, trigger: undefined })).toEqual([]);
   });
 
   it("uses the shorter conversational considered contract in the pub", () => {

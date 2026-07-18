@@ -4,6 +4,8 @@ import {
   CHANNELS,
   CONVERSATION_REGISTERS,
   defineAmbientPremiseCatalog,
+  ROOM_SOCIAL_MOVES,
+  scheduledRoomSocialModeAt,
   type ChannelProfile,
 } from "./channels.js";
 import { PERSONAS, type Persona } from "./personas.js";
@@ -62,6 +64,21 @@ describe("channel profiles", () => {
       if (profile.ambientActivityPriority !== undefined) {
         expect(profile.ambientActivityPriority, profile.public.id).toBeGreaterThanOrEqual(0.25);
         expect(profile.ambientActivityPriority, profile.public.id).toBeLessThanOrEqual(4);
+      }
+      for (const mode of profile.scheduledSocialModes ?? []) {
+        expect(mode.id, profile.public.id).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u);
+        expect(mode.startWeekdays.length, mode.id).toBeGreaterThan(0);
+        expect(new Set(mode.startWeekdays).size, mode.id).toBe(mode.startWeekdays.length);
+        expect(mode.startHour, mode.id).toBeGreaterThanOrEqual(0);
+        expect(mode.startHour, mode.id).toBeLessThanOrEqual(23);
+        expect(mode.endHour, mode.id).toBeGreaterThanOrEqual(0);
+        expect(mode.endHour, mode.id).toBeLessThanOrEqual(23);
+        expect(mode.activationRate, mode.id).toBeGreaterThan(0);
+        expect(mode.activationRate, mode.id).toBeLessThanOrEqual(1);
+        expect(mode.moves.length, mode.id).toBeGreaterThan(0);
+        expect(new Set(mode.moves).size, mode.id).toBe(mode.moves.length);
+        expect(mode.moves.every((move) => ROOM_SOCIAL_MOVES.includes(move)), mode.id).toBe(true);
+        expect(mode.guidance.length, mode.id).toBeGreaterThan(80);
       }
       expect(CONVERSATION_REGISTERS[profile.conversationRegister].guidance.length).toBeGreaterThan(40);
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
@@ -316,14 +333,43 @@ describe("channel profiles", () => {
   it("gives the pub a broad subject mix and a room-local banter contract", () => {
     const pub = CHANNEL_PROFILES.find((profile) => profile.public.id === "the-pub")!;
     expect(pub.ambientMode).toBe("banter");
+    expect(pub.transientSceneTexture).toBe("bounded");
+    expect(CHANNEL_PROFILES.filter((profile) => profile.public.id !== "the-pub"))
+      .toSatisfy((profiles: ChannelProfile[]) => profiles.every((profile) => profile.transientSceneTexture === undefined));
     expect(pub.ambientPremises.length).toBeGreaterThanOrEqual(20);
     expect(pub.topic.tags).toEqual(expect.arrayContaining(["film", "music", "work", "politics", "memes", "food", "beer", "pubs"]));
     expect(pub.topic.brief).toContain("brewing craft");
     expect(pub.topic.brief).toContain("pub history");
-    expect(pub.conversationGuidance).toContain("A rare supplied source may make brewing craft");
-    expect(pub.conversationGuidance).toContain("without inventing drinking, intoxication, a visit or a lifestyle");
-    expect(pub.conversationGuidance).toContain("never explain a punchline");
+    expect(pub.conversationGuidance).toContain("A supplied source may make brewing craft");
+    expect(pub.conversationGuidance).toContain("treat it as a real social invitation");
+    expect(pub.conversationGuidance).toContain("one or two selected residents may join");
+    expect(pub.conversationGuidance).toContain("Preserve each actor's recent live-scene choice");
+    expect(pub.conversationGuidance).toContain("never explain them");
+    expect(pub.conversationGuidance?.length).toBeLessThanOrEqual(2_000);
+    expect(pub.scheduledSocialModes).toEqual([
+      expect.objectContaining({
+        id: "late-weekend-table",
+        startWeekdays: [5, 6],
+        startHour: 20,
+        endHour: 4,
+        moves: ROOM_SOCIAL_MOVES,
+      }),
+    ]);
     expect(pub.ambientReactionPalette).toEqual(expect.arrayContaining(["😂", "🍿", "🎵"]));
+  });
+
+  it("keeps a wrapping social window attached to the evening when it started", () => {
+    const pub = CHANNEL_PROFILES.find((profile) => profile.public.id === "the-pub")!;
+    expect(scheduledRoomSocialModeAt(pub, { localDate: "2026-07-17", localTime: "22:15:00" })?.id)
+      .toBe("late-weekend-table");
+    expect(scheduledRoomSocialModeAt(pub, { localDate: "2026-07-18", localTime: "01:45:00" })?.id)
+      .toBe("late-weekend-table");
+    expect(scheduledRoomSocialModeAt(pub, { localDate: "2026-07-19", localTime: "02:30:00" })?.id)
+      .toBe("late-weekend-table");
+    expect(scheduledRoomSocialModeAt(pub, { localDate: "2026-07-18", localTime: "14:00:00" }))
+      .toBeUndefined();
+    expect(scheduledRoomSocialModeAt(pub, { localDate: "2026-07-20", localTime: "01:45:00" }))
+      .toBeUndefined();
   });
 
   it("gives football-talk deep seed variety and a strict current-evidence contract", () => {

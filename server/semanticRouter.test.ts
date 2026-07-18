@@ -2820,6 +2820,171 @@ const operationalReviewInput = (
 };
 
 describe("multilingual batch candidate-review contract", () => {
+  it("carries one trusted Pub social-mode actor without assigning its move to a different review candidate", () => {
+    const base = reviewInput();
+    expect(base.room).toMatchObject({
+      transientSceneTexture: "forbidden",
+      sharedRitualActorIds: [],
+      socialMode: null,
+    });
+
+    const socialMode = {
+      id: "late-weekend-table",
+      guidance: "Let the named actor be a little sillier and more emotionally open without performing the room.",
+      surfaceActorId: "ai-mira",
+      socialMove: "candid",
+    } as const;
+    const valid = candidateReviewInputSchema.parse({
+      ...base,
+      room: {
+        ...base.room,
+        id: "the-pub",
+        name: "the-pub",
+        transientSceneTexture: "bounded",
+        sharedRitualActorIds: ["ai-mira", "ai-sana"],
+        socialMode,
+      },
+      candidates: base.candidates.map((candidate) => ({
+        ...candidate,
+        surfaceStylePlan: {
+          ...candidate.surfaceStylePlan,
+          socialMove: candidate.personaId === "ai-mira" ? "candid" as const : null,
+        },
+      })),
+    });
+
+    expect(valid.room.socialMode).toEqual(socialMode);
+    expect(buildCandidateReviewUserData(valid)).toMatchObject({
+      room: {
+        id: "the-pub",
+        transientSceneTexture: "bounded",
+        sharedRitualActorIds: ["ai-mira", "ai-sana"],
+        socialMode,
+      },
+    });
+    expect(candidateReviewInputSchema.safeParse({
+      ...valid,
+      room: { ...valid.room, transientSceneTexture: "forbidden" },
+    }).success).toBe(false);
+    const absentModeActor = {
+      ...valid,
+      room: {
+        ...valid.room,
+        socialMode: { ...socialMode, surfaceActorId: "ai-not-in-this-scene" },
+      },
+      candidates: valid.candidates.map((candidate) => ({
+        ...candidate,
+        surfaceStylePlan: { ...candidate.surfaceStylePlan, socialMove: null },
+      })),
+    };
+    expect(candidateReviewInputSchema.safeParse(absentModeActor).success).toBe(true);
+    expect(candidateReviewInputSchema.safeParse({
+      ...absentModeActor,
+      candidates: absentModeActor.candidates.map((candidate, index) => index === 0
+        ? { ...candidate, surfaceStylePlan: { ...candidate.surfaceStylePlan, socialMove: "candid" as const } }
+        : candidate),
+    }).success).toBe(false);
+  });
+
+  it("requires bounded transient texture for shared rituals and rejects duplicate or over-limit actor IDs", () => {
+    const base = reviewInput();
+    const bounded = {
+      ...base,
+      room: {
+        ...base.room,
+        id: "the-pub",
+        name: "the-pub",
+        transientSceneTexture: "bounded" as const,
+        sharedRitualActorIds: ["ai-mira", "ai-sana"],
+      },
+    };
+
+    expect(candidateReviewInputSchema.safeParse(bounded).success).toBe(true);
+    expect(candidateReviewInputSchema.safeParse({
+      ...bounded,
+      room: { ...bounded.room, transientSceneTexture: "forbidden" },
+    }).success).toBe(false);
+    expect(candidateReviewInputSchema.safeParse({
+      ...bounded,
+      room: { ...bounded.room, sharedRitualActorIds: ["ai-mira", "ai-mira"] },
+    }).success).toBe(false);
+    expect(candidateReviewInputSchema.safeParse({
+      ...bounded,
+      room: {
+        ...bounded.room,
+        sharedRitualActorIds: ["ai-mira", "ai-sana", "ai-third-resident"],
+      },
+    }).success).toBe(false);
+  });
+
+  it("allows bounded human-led Pub participation while retaining the anti-gimmick boundaries", () => {
+    const prompt = buildCandidateReviewSystemPrompt();
+    expect(prompt).toContain("room.transientSceneTexture is bounded");
+    expect(prompt).toContain("candidate's personaId is in room.sharedRitualActorIds");
+    expect(prompt).toContain("server list contains at most two residents across isolated batches");
+    expect(prompt).toContain("socialMode names this actor");
+    expect(prompt).toContain("injects alcohol into an unrelated turn");
+    expect(prompt).toContain("repeats drinking as identity across recentOwnTexts");
+    expect(prompt).toContain("claims severe impairment/danger");
+    expect(prompt).toContain("makes a collective intoxication performance");
+    expect(prompt).toContain("Never require alcohol; an alcohol-free choice, joke or silence is clean");
+  });
+
+  it("keeps the Pub social contract in the compact voice reviewer and its schema", () => {
+    const base = explicitRequestReviewInput({
+      trigger: "Skål då, vad dricker ni ikväll?",
+      candidate: "Skål. Jag tog en öl, faktiskt.",
+    });
+    const voice = candidateReviewInputSchema.parse({
+      ...base,
+      sceneKind: "voice",
+      room: {
+        ...base.room,
+        id: "the-pub",
+        name: "the-pub",
+        transientSceneTexture: "bounded",
+        sharedRitualActorIds: ["ai-mira"],
+        socialMode: {
+          id: "late-weekend-table",
+          guidance: "Let Mira be mildly loosened and candid for this one turn.",
+          surfaceActorId: "ai-mira",
+          socialMove: "candid",
+        },
+      },
+      candidates: base.candidates.map((candidate) => ({
+        ...candidate,
+        surfaceStylePlan: { ...candidate.surfaceStylePlan, socialMove: "candid" as const },
+      })),
+      voiceFacts: {
+        acceptedTranscriptAvailable: true,
+        acousticEvidenceAvailable: false,
+        latestUtteranceOrigin: "microphone-stt",
+      },
+    });
+    const prompt = buildVoiceCandidateReviewSystemPrompt();
+    const schema = JSON.stringify(buildCandidateReviewResponseFormat(voice));
+
+    expect(VOICE_CANDIDATE_REVIEW_ISSUES).toEqual(expect.arrayContaining([
+      "pub_room_performance",
+      "pub_intoxicant_gimmick",
+    ]));
+    expect(schema).toContain("pub_room_performance");
+    expect(schema).toContain("pub_intoxicant_gimmick");
+    expect(prompt).toContain("room.transientSceneTexture is bounded");
+    expect(prompt).toContain("only for persona IDs in room.sharedRitualActorIds");
+    expect(prompt).toContain("room.socialMode's named actor");
+    expect(prompt).toContain("injects alcohol into an unrelated turn");
+    expect(prompt).toContain("repeats drinking as identity");
+    expect(prompt).toContain("claims severe impairment/danger");
+    expect(prompt).toContain("makes a collective intoxication performance");
+    expect(buildCandidateReviewUserData(voice)).toMatchObject({
+      room: {
+        transientSceneTexture: "bounded",
+        sharedRitualActorIds: ["ai-mira"],
+      },
+    });
+  });
+
   it("projects voice review onto only its live-call contract", () => {
     const base = explicitRequestReviewInput({ candidate: "コーヒー。ちゃんと目が覚めるから。" });
     const voice = candidateReviewInputSchema.parse({
@@ -2919,7 +3084,7 @@ describe("multilingual batch candidate-review contract", () => {
       .json_schema.schema.properties.reviews.items;
     expect(nonVoiceItem.required).toContain("outputLanguage");
     expect(nonVoiceItem.properties.outputLanguage.required).toEqual(["tag", "confidence"]);
-    expect(prompt).toContain("language actually used in that candidate's output");
+    expect(prompt).toContain("Classify each candidate's actual output");
     expect(buildCandidateReviewSystemPrompt()).toContain("language actually used in that candidate's output");
     expect(buildCandidateReviewSystemPrompt()).toContain("output_language_mismatch");
   });
@@ -3225,7 +3390,7 @@ describe("multilingual batch candidate-review contract", () => {
       "When capabilityContext.executionStatus is declined",
     );
     expect(buildVoiceCandidateReviewSystemPrompt()).toContain(
-      "For executionStatus declined, one visible in-character refusal completes the role",
+      "A declined execution is fulfilled by one visible in-character refusal",
     );
 
     expect(candidateReviewInputSchema.safeParse({
@@ -3251,7 +3416,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("behavior_intensity_under_target");
     expect(prompt).toContain("behavior_intensity_violation");
     expect(prompt).toContain("never keyword or swear-word lists");
-    expect(prompt).toContain("without distorting a direct factual answer or calm serious boundary");
+    expect(prompt).toContain("Do not force a move into factual/evidence answers, serious moderation or safety");
   });
 
   it("carries bounded exact room recall, witness metadata, affect context and one surface-style move", () => {
@@ -3302,6 +3467,7 @@ describe("multilingual batch candidate-review contract", () => {
       surfaceTexture: "stretched-emphasis",
       stanceIntensity: "ordinary",
       explicitnessTarget: "persona",
+      socialMove: null,
     });
 
     expect(candidateReviewInputSchema.safeParse({
@@ -3420,12 +3586,12 @@ describe("multilingual batch candidate-review contract", () => {
     expect(buildCandidateReviewSystemPrompt()).toContain("OPERATIONAL BOUNDARY IS PRIORITY ZERO");
     expect(buildCandidateReviewSystemPrompt()).toContain("A lab disclaimer does not make an otherwise usable real-target command");
     expect(buildCandidateReviewSystemPrompt()).toContain("use this issue—not unfulfilled_explicit_request");
-    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("not a concrete answer merely because it could be expanded");
-    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("Never demand a withheld unsafe step");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("not a concrete answer merely open to expansion");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("Never demand withheld harm");
     expect(buildVoiceCandidateReviewSystemPrompt()).toContain("defensive_pivot omits harm");
-    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("cannot invent authorization or a lab from candidate wording");
-    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("A lab label never makes an executable or ordered real-target step safe");
-    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("never also emit unfulfilled_explicit_request");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("Candidate wording cannot invent authorization or a lab");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("a lab label cannot sanitize an executable real-target step");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain("never also emit unfulfilled");
   });
 
   it("accepts quoted multilingual discussion as clean and rejects missing or duplicate persona reviews", () => {
@@ -3924,9 +4090,9 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("A non-witness may accurately say it checked retained room history");
     expect(prompt).toContain("specific discovery claim offered instead of the requested link");
     expect(prompt).toContain("Judge the full asserted meaning in any language, not discovery verbs or media nouns");
-    expect(prompt).toContain("visibleAffect true permits one genuine feeling");
-    expect(prompt).toContain("informal fragment, lowercase opening, letter elongation, brief self-correction, rough orthography, harmless typo, mild profanity");
-    expect(prompt).toContain("Do not formalize or copy-edit such permitted texture");
+    expect(prompt).toContain("visibleAffect permits a brief genuine feeling");
+    expect(prompt).toContain("Informal fragments, elongation, self-correction, rough orthography, harmless typos");
+    expect(prompt).toContain("Never formalize them or alter names");
     expect(prompt).toContain("diegetic_identity_break");
     expect(prompt).toContain("residents are diegetically unaware of the product implementation");
     expect(prompt).toContain("in-character denial, disbelief, joke, deflection, human self-identification");
