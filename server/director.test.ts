@@ -18,6 +18,7 @@ import {
   detailedHumanResponseWordLimits,
   classifiedLanguage,
   collectReadyVisualEvidence,
+  compareAutonomousResearchOpportunities,
   conductResponderIds,
   ensureEvidenceResponder,
   autonomousResearchActivityPolicy,
@@ -6002,6 +6003,40 @@ describe("social director", () => {
     expect(selectAmbientSeed(seeds, ["trace one", "memory one"], () => 0, families)).toBe("voice one");
   });
 
+  it("prefers publication-derived least-recently-used families and exact seeds", () => {
+    const seeds = ["trace old", "trace newer", "memory used", "voice unseen"];
+    const families = ["observability", "observability", "memory", "voice"];
+    const recency = {
+      lastUsedAtBySeed: new Map([
+        ["trace old", 100],
+        ["trace newer", 300],
+        ["memory used", 200],
+      ]),
+      lastUsedAtByFamily: new Map([
+        ["observability", 300],
+        ["memory", 200],
+      ]),
+    };
+    expect(selectAmbientSeed(seeds, [], () => 0.99, families, recency)).toBe("voice unseen");
+
+    recency.lastUsedAtByFamily.set("voice", 400);
+    recency.lastUsedAtBySeed.set("voice unseen", 400);
+    expect(selectAmbientSeed(seeds, [], () => 0.99, families, recency)).toBe("memory used");
+
+    const researchSeeds: AutonomousResearchSeed[] = ["a", "b", "c"].map((id) => ({
+      id,
+      query: `query ${id}`,
+      mode: "web",
+      discussionAngle: `angle ${id}`,
+    }));
+    expect(selectAutonomousResearchSeed(
+      researchSeeds,
+      [],
+      () => 0.99,
+      new Map([["a", 300], ["b", 100]]),
+    )?.id).toBe("c");
+  });
+
   it("keeps real disagreement in casual and banter registers without making it academic", () => {
     const lead = PERSONAS.find((persona) => persona.id === "ai-juno")!;
     const responder = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
@@ -6079,29 +6114,31 @@ describe("social director", () => {
     expect(disabled.chance).toBe(0);
   });
 
-  it("reserves background link capacity and modestly favors a recently active human room", () => {
+  it("keeps one global cadence through attendance changes and gives only a bounded room lift", () => {
     const maximum = autonomousLinkPolicy(100);
     const background = autonomousResearchActivityPolicy(maximum, false);
     expect(background).toMatchObject({
       enabled: true,
-      chance: 0.65,
-      globalCooldownMs: 5 * 60_000,
-      channelCooldownMs: 20 * 60_000,
-      humanQuietMs: 45_000,
-      dailyCap: 27,
+      chance: 1,
+      globalCooldownMs: 12 * 60_000,
+      channelCooldownMs: 40 * 60_000,
+      humanQuietMs: 40_000,
+      dailyCap: 120,
       selectionWeight: 1,
     });
 
     const recent = autonomousResearchActivityPolicy(maximum, true);
-    expect(recent.chance).toBeCloseTo(1 - 0.35 ** 1.35);
+    expect(recent.chance).toBe(1);
     expect(recent).toMatchObject({
       enabled: true,
-      globalCooldownMs: 4 * 60_000,
-      channelCooldownMs: 20 * 60_000,
-      humanQuietMs: 45_000,
-      dailyCap: 36,
-      selectionWeight: 1.4,
+      globalCooldownMs: 12 * 60_000,
+      channelCooldownMs: 30 * 60_000,
+      humanQuietMs: 40_000,
+      dailyCap: 120,
+      selectionWeight: 3,
     });
+    expect(recent.globalCooldownMs).toBe(background.globalCooldownMs);
+    expect(recent.dailyCap).toBe(background.dailyCap);
     expect(weightAutonomousResearchSelection(0.5, recent.selectionWeight)).toBeGreaterThan(0.5);
 
     expect(autonomousResearchActivityPolicy(autonomousLinkPolicy(0), true)).toMatchObject({
@@ -6182,7 +6219,8 @@ describe("social director", () => {
 
   it("recognizes only online, recent target-room human participation for the research overlay", () => {
     let now = Date.parse("2026-07-17T08:00:00.000Z");
-    let onlineHumans = 1;
+    let primaryOnline = true;
+    let otherOnline = false;
     const store = new RoomStore(`/tmp/director-recent-research-human-${process.pid}.json`);
     const human = {
       id: "guest-recent-research",
@@ -6191,6 +6229,11 @@ describe("social director", () => {
       status: "online" as const,
       avatar: { color: "#123", accent: "#456", glyph: "G" },
     };
+    const otherHuman = {
+      ...human,
+      id: "guest-recent-research-other",
+      name: "Other guest",
+    };
     const director = new SocialDirector(
       { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
       store,
@@ -6198,8 +6241,12 @@ describe("social director", () => {
       new ActorChannelRuntime(),
       {} as never,
       {} as never,
-      () => [...PERSONAS, human],
-      () => onlineHumans,
+      () => [
+        ...PERSONAS,
+        { ...human, status: primaryOnline ? "online" as const : "offline" as const },
+        { ...otherHuman, status: otherOnline ? "online" as const : "offline" as const },
+      ],
+      () => Number(primaryOnline) + Number(otherOnline),
       { now: () => now, autonomousResearchEnabled: true },
     );
     const recent = (channelId: string) => (director as unknown as {
@@ -6211,16 +6258,19 @@ describe("social director", () => {
     director.onHumanMessage(humanMessage, human);
     expect(recent("lobby")).toBe(true);
     expect(recent("the-pub")).toBe(false);
-    onlineHumans = 0;
+    primaryOnline = false;
+    otherOnline = true;
+    // An unrelated online human does not keep Lobby in the attended lane.
     expect(recent("lobby")).toBe(false);
 
-    onlineHumans = 1;
-    now += 10 * 60_000 + 1;
+    primaryOnline = true;
+    otherOnline = false;
+    now += 45 * 60_000 + 1;
     expect(recent("lobby")).toBe(false);
-    director.noteHumanVoiceActivity("stock-market");
+    director.noteHumanVoiceActivity("stock-market", human.id);
     expect(recent("stock-market")).toBe(true);
 
-    now += 10 * 60_000 + 1;
+    now += 45 * 60_000 + 1;
     const persona = PERSONAS.find((candidate) => candidate.id === "ai-mira")!;
     const target = createMessage("lobby", persona.id, "react to this");
     store.addPublicMessage(target);
@@ -6270,7 +6320,7 @@ describe("social director", () => {
     internals.runAutonomousResearchConversation = run;
     director.noteHumanVoiceActivity("lobby");
 
-    now += 44_999;
+    now += 39_999;
     expect(await internals.maybeRunAutonomousResearch(now, {
       activity: 50,
       autonomousLinkFrequency: 100,
@@ -6292,42 +6342,145 @@ describe("social director", () => {
     director.stop();
   });
 
-  it("maps autonomous-link frequency onto a bounded cadence with the former cadence at 50", () => {
+  it("maps autonomous-link frequency onto a smooth bounded cadence", () => {
     expect(autonomousLinkPolicy(0)).toMatchObject({ enabled: false, chance: 0, dailyCap: 0 });
     expect(autonomousLinkPolicy(50)).toEqual({
       enabled: true,
-      chance: 0.07,
-      globalCooldownMs: 30 * 60_000,
-      channelCooldownMs: 2 * 60 * 60_000,
-      humanQuietMs: 3 * 60_000,
-      dailyCap: 6,
+      chance: 1,
+      globalCooldownMs: 90 * 60_000,
+      channelCooldownMs: 3 * 60 * 60_000,
+      humanQuietMs: 2 * 60_000,
+      dailyCap: 16,
     });
     const raisedDefault = autonomousLinkPolicy(60);
     expect(raisedDefault).toEqual({
       enabled: true,
-      chance: 0.1,
-      globalCooldownMs: 26.4 * 60_000,
-      channelCooldownMs: 104 * 60_000,
-      humanQuietMs: 159_000,
-      dailyCap: 8,
+      chance: 1,
+      globalCooldownMs: 60 * 60_000,
+      channelCooldownMs: 2 * 60 * 60_000,
+      humanQuietMs: 90_000,
+      dailyCap: 24,
     });
     const maximum = autonomousLinkPolicy(100);
     expect(maximum).toEqual({
       enabled: true,
-      chance: 0.65,
-      globalCooldownMs: 5 * 60_000,
-      channelCooldownMs: 20 * 60_000,
-      humanQuietMs: 45_000,
-      dailyCap: 36,
+      chance: 1,
+      globalCooldownMs: 12 * 60_000,
+      channelCooldownMs: 40 * 60_000,
+      humanQuietMs: 40_000,
+      dailyCap: 120,
     });
-    expect(maximum.chance).toBeGreaterThan(raisedDefault.chance * 6);
-    expect(maximum.globalCooldownMs).toBeLessThan(raisedDefault.globalCooldownMs / 5);
-    expect(maximum.channelCooldownMs).toBeLessThan(raisedDefault.channelCooldownMs / 5);
-    expect(maximum.dailyCap).toBeGreaterThan(raisedDefault.dailyCap * 4);
-    expect(maximum.chance).toBeLessThanOrEqual(0.7);
-    expect(maximum.globalCooldownMs).toBeGreaterThanOrEqual(5 * 60_000);
-    expect(maximum.channelCooldownMs).toBeGreaterThanOrEqual(20 * 60_000);
-    expect(maximum.dailyCap).toBeLessThanOrEqual(36);
+    expect(maximum.globalCooldownMs).toBeLessThan(raisedDefault.globalCooldownMs / 2);
+    expect(maximum.channelCooldownMs).toBeLessThan(raisedDefault.channelCooldownMs / 2);
+    expect(maximum.dailyCap).toBe(raisedDefault.dailyCap * 5);
+    expect(maximum.chance).toBeLessThanOrEqual(1);
+    expect(maximum.globalCooldownMs).toBeGreaterThanOrEqual(12 * 60_000);
+    expect(maximum.channelCooldownMs).toBeGreaterThanOrEqual(40 * 60_000);
+    expect(maximum.dailyCap).toBeLessThanOrEqual(120);
+    expect(maximum.dailyCap * maximum.globalCooldownMs).toBe(24 * 60 * 60_000);
+  });
+
+  it("keeps cadence and rolling capacity monotonic without quota-only droughts", () => {
+    const dayMs = 24 * 60 * 60_000;
+    let previousBase = autonomousLinkPolicy(1);
+    let previousBackground = autonomousResearchActivityPolicy(previousBase, false);
+    for (let level = 1; level <= 100; level += 1) {
+      const base = autonomousLinkPolicy(level);
+      const background = autonomousResearchActivityPolicy(base, false);
+      expect(base.chance, `base chance at ${level}`).toBe(1);
+      expect(background.chance, `background chance at ${level}`).toBe(1);
+      expect(background.globalCooldownMs, `shared global cooldown at ${level}`).toBe(base.globalCooldownMs);
+      expect(background.dailyCap, `shared rolling cap at ${level}`).toBe(base.dailyCap);
+      expect(base.globalCooldownMs, `base cooldown at ${level}`).toBeLessThanOrEqual(previousBase.globalCooldownMs);
+      expect(background.globalCooldownMs, `background cooldown at ${level}`)
+        .toBeLessThanOrEqual(previousBackground.globalCooldownMs);
+      expect(base.dailyCap, `base cap at ${level}`).toBeGreaterThanOrEqual(previousBase.dailyCap);
+      expect(background.dailyCap, `background cap at ${level}`).toBeGreaterThanOrEqual(previousBackground.dailyCap);
+      expect(base.dailyCap * base.globalCooldownMs, `base capacity at ${level}`).toBeGreaterThanOrEqual(dayMs);
+      expect((base.dailyCap - 1) * base.globalCooldownMs, `base minimality at ${level}`).toBeLessThan(dayMs);
+      expect(background.dailyCap * background.globalCooldownMs, `background capacity at ${level}`)
+        .toBeGreaterThanOrEqual(dayMs);
+      expect((background.dailyCap - 1) * background.globalCooldownMs, `background minimality at ${level}`)
+        .toBeLessThan(dayMs);
+      previousBase = base;
+      previousBackground = background;
+    }
+  });
+
+  it("cannot strand background rooms behind an attended-only global gate or logout cap", () => {
+    const maximum = autonomousLinkPolicy(100);
+    const attended = autonomousResearchActivityPolicy(maximum, true);
+    const background = autonomousResearchActivityPolicy(maximum, false);
+    const now = Date.parse("2026-07-18T12:00:00.000Z");
+    const lastSuccessAt = now - maximum.globalCooldownMs;
+    const sharedGate = {
+      enabled: true,
+      now,
+      lastGlobalSuccessAt: lastSuccessAt,
+      lastChannelSuccessAt: now - 2 * maximum.channelCooldownMs,
+      globalCooldownMs: maximum.globalCooldownMs,
+      channelCooldownMs: maximum.channelCooldownMs,
+      humanQuietMs: maximum.humanQuietMs,
+      queueDepth: 0,
+      availableMessageSlots: 1,
+      dailySuccesses: maximum.dailyCap - 1,
+      dailyCap: maximum.dailyCap,
+      freshThread: true,
+      availableActors: 2,
+      chance: 1,
+      rng: () => 0,
+    };
+
+    // Three attended rooms may have used prior shared slots, but at the next
+    // global boundary a background room passes the same clock and cap.
+    expect(shouldStartAutonomousResearch({
+      ...sharedGate,
+      globalCooldownMs: attended.globalCooldownMs,
+      channelCooldownMs: attended.channelCooldownMs,
+      dailyCap: attended.dailyCap,
+    })).toBe(true);
+    expect(shouldStartAutonomousResearch({
+      ...sharedGate,
+      globalCooldownMs: background.globalCooldownMs,
+      channelCooldownMs: background.channelCooldownMs,
+      dailyCap: background.dailyCap,
+    })).toBe(true);
+
+    // Logging out never lowers the cap under the already-counted successes.
+    expect(background.dailyCap).toBe(attended.dailyCap);
+  });
+
+  it("gives attendance bounded age credit without starving an older background room", () => {
+    const oldBackground = { recentHumanActivity: false, lastChannelSuccessAt: 1_000, selectionKey: 0.1 };
+    const recentRoom = {
+      recentHumanActivity: true,
+      lastChannelSuccessAt: 1_000 + 30 * 60_000,
+      selectionKey: 0.1,
+    };
+    expect(compareAutonomousResearchOpportunities(recentRoom, oldBackground)).toBeLessThan(0);
+
+    const starvedBackground = { recentHumanActivity: false, lastChannelSuccessAt: 1_000, selectionKey: 0.1 };
+    const tooNewRecentRoom = {
+      recentHumanActivity: true,
+      lastChannelSuccessAt: 1_000 + 60 * 60_000,
+      selectionKey: 1,
+    };
+    expect(compareAutonomousResearchOpportunities(starvedBackground, tooNewRecentRoom)).toBeLessThan(0);
+
+    const newerBackground = {
+      recentHumanActivity: false,
+      lastChannelSuccessAt: 10 * 60_000,
+      selectionKey: 1,
+    };
+    const olderBackground = { recentHumanActivity: false, lastChannelSuccessAt: 100, selectionKey: 0.9 };
+    expect(compareAutonomousResearchOpportunities(olderBackground, newerBackground)).toBeLessThan(0);
+
+    const equalAgeLowPriority = {
+      recentHumanActivity: false,
+      lastChannelSuccessAt: newerBackground.lastChannelSuccessAt,
+      selectionKey: 0.2,
+    };
+    expect(compareAutonomousResearchOpportunities(newerBackground, equalAgeLowPriority)).toBeLessThan(0);
   });
 
   it("uses a short bounded exponential backoff for repeated autonomous research failures", () => {
@@ -6464,6 +6617,11 @@ describe("social director", () => {
 
     const staleAfterRead = await safelyRead("another bounded item");
     expect(read).toHaveBeenCalledTimes(5);
+    expect(read).toHaveBeenNthCalledWith(
+      5,
+      expect.objectContaining({ url: new URL(laterStaleUrl) }),
+      "ambient-research:lobby",
+    );
     expect(staleAfterRead).toEqual({ failureReason: "freshness_rejected_after_read" });
   });
 
@@ -6472,6 +6630,39 @@ describe("social director", () => {
       .toBe("https://example.com/story?a=1&b=2");
     expect(canonicalAutonomousResearchUrl("http://example.com/story")).toBeUndefined();
     expect(canonicalAutonomousResearchUrl("not a url")).toBeUndefined();
+  });
+
+  it("retains source and preview URL dedupe after more than 160 newer room messages", () => {
+    const store = new RoomStore(`/tmp/director-autonomous-url-history-${process.pid}.json`);
+    const sourced = createMessage("lobby", "ai-mira", "an old sourced post");
+    sourced.sources = [{ title: "Old source", url: "https://EXAMPLE.com/story?b=2&a=1#old" }];
+    store.addPublicMessage(sourced);
+    const previewed = createMessage("the-pub", "ai-juno", "an old preview post");
+    previewed.linkPreview = {
+      url: "https://example.com/preview?z=2&y=1#card",
+      title: "Old preview",
+      description: "A bounded preview",
+      siteName: "example.com",
+    };
+    store.addPublicMessage(previewed);
+    for (let index = 0; index < 200; index += 1) {
+      store.addPublicMessage(createMessage("lobby", "ai-bosse", `newer post ${index}`));
+    }
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      {} as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 0,
+    );
+    const keys = (director as unknown as { recentPublishedUrlKeys: () => Set<string> })
+      .recentPublishedUrlKeys();
+    expect(keys).toContain("https://example.com/story?a=1&b=2");
+    expect(keys).toContain("https://example.com/preview?y=1&z=2");
+    director.stop();
   });
 
   it("keeps autonomous research disabled unless both environment switches explicitly opt in", () => {
@@ -7108,7 +7299,7 @@ describe("social director", () => {
     }
   });
 
-  it("publishes only the semantically selected safe source when two candidates were read", async () => {
+  it("tries safely read sources one at a time and publishes the first reviewed source", async () => {
     vi.useFakeTimers();
     try {
       const now = Date.parse("2026-07-14T12:00:00.000Z");
@@ -7154,14 +7345,17 @@ describe("social director", () => {
       const actorChannels = new ActorChannelRuntime();
       const lm = {
         health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
-        generateScene: vi.fn(async (request: { selected: typeof PERSONAS; urlPublicationPolicy?: string }) => [
-          {
-            personaId: request.selected[0]!.id,
-            content: "Det intressanta är återställningen efter verktygsfelet, inte den snygga sluttexten.",
-            source: "lm" as const,
-            sourceIds: ["S2"],
-          },
-        ]),
+        generateScene: vi.fn(async (request: {
+          selected: typeof PERSONAS;
+          research?: { results: Array<{ url: string }> };
+          urlPublicationPolicy?: string;
+        }) => request.research?.results[0]?.url === offTopicUrl ? [] : [{
+          personaId: request.selected[0]!.id,
+          content: "Det intressanta är återställningen efter verktygsfelet, inte den snygga sluttexten.",
+          source: "lm" as const,
+          // A provider wrapper cannot override the sole server-owned card.
+          sourceIds: ["S999"],
+        }]),
         rememberDeliveredLine: vi.fn(),
       };
       const director = new SocialDirector(
@@ -7252,16 +7446,24 @@ describe("social director", () => {
         expect.objectContaining({ url: new URL(sourceUrl), retry: false, initiator: "automatic" }),
         "ambient-research:ai-programming",
       );
-      expect(lm.generateScene).toHaveBeenCalledWith(
+      expect(lm.generateScene).toHaveBeenCalledTimes(2);
+      expect(lm.generateScene).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          research: expect.objectContaining({
+            results: [expect.objectContaining({ id: "S1", url: offTopicUrl })],
+          }),
+        }),
+        4,
+      );
+      expect(lm.generateScene).toHaveBeenNthCalledWith(
+        2,
         expect.objectContaining({
           urlPublicationPolicy: "server_card",
           responseRecoveryIds: [expect.any(String)],
           research: expect.objectContaining({
             query: "recent practical agent testing",
-            results: [
-              expect.objectContaining({ id: "S1", url: offTopicUrl }),
-              expect.objectContaining({ id: "S2", url: sourceUrl }),
-            ],
+            results: [expect.objectContaining({ id: "S2", url: sourceUrl })],
           }),
           autonomousResearchContext: expect.objectContaining({
             seedId: "agent-recovery",
@@ -8362,16 +8564,18 @@ describe("social director", () => {
     const safe = () => internals.autonomousResearchIsStillSafe("lobby", 0, [actor], 1);
     expect(internals.autonomousResearchPolicy("lobby")).toMatchObject({
       enabled: true,
-      chance: 0.1,
-      dailyCap: 8,
+      chance: 1,
+      globalCooldownMs: 60 * 60_000,
+      channelCooldownMs: 2 * 60 * 60_000,
+      dailyCap: 24,
     });
     autonomousLinkFrequency = 100;
     expect(internals.autonomousResearchPolicy("lobby")).toMatchObject({
       enabled: true,
-      chance: 0.65,
-      globalCooldownMs: 5 * 60_000,
-      channelCooldownMs: 20 * 60_000,
-      dailyCap: 36,
+      chance: 1,
+      globalCooldownMs: 12 * 60_000,
+      channelCooldownMs: 40 * 60_000,
+      dailyCap: 120,
     });
     autonomousLinkFrequency = 60;
     expect(safe()).toBe(true);
@@ -8384,7 +8588,7 @@ describe("social director", () => {
     internals.lastHumanMessageAtByChannel.set("lobby", now);
     expect(safe()).toBe(false);
     internals.lastHumanMessageAtByChannel.delete("lobby");
-    internals.autonomousResearchSuccessTimestamps.push(now, now, now, now, now, now);
+    internals.autonomousResearchSuccessTimestamps.push(...Array.from({ length: 24 }, () => now));
     expect(safe()).toBe(false);
     internals.autonomousResearchSuccessTimestamps.length = 0;
     internals.autonomousAiTimestamps.push(now, now, now);

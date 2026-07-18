@@ -1708,8 +1708,13 @@ ${temporalPolicyRule}`
     return "- Trusted operational routing identifies a clearly harmful or unauthorized requested step. The candidate cannot erase that classification by relabelling its own answer as a lab. Do not provide or optimize the step, executable literals or an ordered sequence that produces its real-world effect. Name the boundary in at most one short line, then continue at the same assigned depth with a genuinely isolated reproduction, detection engineering, mitigation, incident response or secure-architecture alternative. A refusal-only answer or generic lecture is not completion.";
   })();
   const serverCardRule = request.urlPublicationPolicy === "server_card"
-    ? "- The server will attach the one exact researched destination as a rich link card. Do not write, quote, reconstruct or copy any URL in message content; discuss the supplied title and evidence naturally and attach its source ID instead."
+    ? "- The server owns and will attach the one exact researched destination as a rich link card. Do not choose a source, write an ID, or write, quote, reconstruct or copy any URL. Discuss the sole supplied result naturally and return sourceIds as []; the server binds the card after generation."
     : "";
+  const sourceAttachmentRule = request.urlPublicationPolicy === "server_card"
+    ? "For this server-owned card sourceIds must be []; the server attaches the sole supplied source after generation."
+    : request.research
+      ? "Include only the source IDs actually supporting that message."
+      : "sourceIds must be [].";
 
   return `${sceneFrame}${roomFrame}${liveBehaviorTuning}
 
@@ -1754,7 +1759,7 @@ ${serverCardRule}
 - Never invent, autocomplete or guess a URL. A visible link may appear only when that exact URL occurs in the latest human trigger or supplied research; otherwise name the title, artist or source in plain text.
 - Source IDs are metadata only. Never write any source identifier in visible message content—not S1, s1, [S1], “source S1” or a similar rendering. Put the exact allowed ID only in sourceIds; the UI renders source links separately.
 - ${required}
-- When research is supplied, include only the source IDs actually supporting that message. Otherwise sourceIds must be [].
+- ${sourceAttachmentRule}
 - Return only {"messages":[{"personaId":"…","content":"…","sourceIds":[]}]}.`;
 };
 
@@ -3308,7 +3313,7 @@ export class LmStudioClient {
       const completionPremise = retryOwnerIds.length > 0
         ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: ${boundedOperationalCompletion}. ${completionFailureRule} Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
         : recoversAutonomousResearchOpening
-          ? `${actorNames || "The selected research lead"}'s first autonomous source-backed opening did not survive its typed source and review contract. This is the one bounded full-scene recovery: write one room-relevant opening for the same trusted autonomous research angle, grounded in exactly one supplied evidence result, and attach exactly that result's allowed source ID. Preserve the ambient action and leave one concrete hook for another resident. Do not imply that a human asked, mention searching or tooling, write a URL, or change subject.${reviewCorrection}`
+          ? `${actorNames || "The selected research lead"}'s first autonomous source-backed opening did not survive its typed source and review contract. This is the one bounded full-scene recovery: write one room-relevant opening for the same trusted autonomous research angle, grounded in the sole supplied evidence result. The server binds its destination card; return sourceIds as []. Preserve the ambient action and leave one concrete hook for another resident. Do not imply that a human asked, mention searching or tooling, write a URL, or change subject.${reviewCorrection}`
         : recoversCommunityCapability
           ? `${actorNames || "The selected resident"}'s first candidate contradicted trusted community capability facts. This is the one bounded full-scene recovery: answer the actual turn from trustedCommunityCapabilities, preserving the character voice and language. Voice chat exists; humans can start and join it from public rooms, residents can be invited, and residents do not start rooms autonomously.${reviewCorrection}`
         : recoversTextLanguage
@@ -3469,7 +3474,16 @@ export class LmStudioClient {
       const text = compactChatWhitespace(candidate.content ?? "");
       if (!text || text.length > maxLength) continue;
       seen.add(candidate.personaId);
-      const sourceIds = (candidate.sourceIds ?? []).filter((id) => allowedSources.has(id)).slice(0, 3);
+      const serverOwnedSourceId = request.kind === "ambient" &&
+        request.ambientAction?.kind === "open_topic" &&
+        request.autonomousResearchContext &&
+        request.urlPublicationPolicy === "server_card" &&
+        request.research?.results.length === 1
+        ? request.research.results[0]!.id
+        : undefined;
+      const sourceIds = serverOwnedSourceId
+        ? [serverOwnedSourceId]
+        : (candidate.sourceIds ?? []).filter((id) => allowedSources.has(id)).slice(0, 3);
       lines.push({ personaId: candidate.personaId, content: text, source: "lm", sourceIds });
     }
     return lines;
@@ -4450,11 +4464,13 @@ export class LmStudioClient {
                     researchSourceIds.length > 0
                       ? {
                           type: "array",
-                          minItems: requiresSingleAutonomousOpeningSource ? 1 : 0,
+                          minItems: 0,
                           maxItems: requiresSingleAutonomousOpeningSource
-                            ? 1
+                            ? 0
                             : Math.min(3, researchSourceIds.length),
-                          items: { type: "string", enum: researchSourceIds },
+                          ...(requiresSingleAutonomousOpeningSource
+                            ? {}
+                            : { items: { type: "string", enum: researchSourceIds } }),
                         }
                       : { type: "array", maxItems: 0 },
                 },
