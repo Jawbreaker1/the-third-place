@@ -29,6 +29,11 @@ import { CapabilityRegistry } from "./capabilities/registry.js";
 import { capabilitiesForMedium, type TurnCapability } from "./capabilities/catalog.js";
 import type { SocialMemoryCoordinator } from "./socialMemoryCoordinator.js";
 import type { SocialMemoryScope } from "./socialMemory.js";
+import {
+  RELATIONSHIP_DECISION_BIAS_LIMITS,
+  type RelationshipBehaviorProjection,
+  type RelationshipPromptCue,
+} from "./relationshipBehavior.js";
 
 export interface VoiceAiSpeechPayload {
   roomId: string;
@@ -80,6 +85,23 @@ export interface VoiceDirectorOptions {
   recentChannelMessages?: (channelId: string) => readonly VoiceChannelRecentMessage[];
   /** Live admin calibration shared with scene generation and the sole-resident router draft. */
   behaviorTuningProvider?: BehaviorTuningProvider;
+  /**
+   * Optional server-owned directed relationship projection. Voice consumes
+   * only its bounded tie-break and coarse prompt cue; absence/failure is
+   * neutral and never changes direct response obligations.
+   */
+  relationshipBehaviorProjection?: (
+    ownerPersonaId: string,
+    subjectActorId: string,
+  ) => RelationshipBehaviorProjection | undefined;
+  /**
+   * Trusted account/admin policy for endpoint romance eligibility in memory
+   * analysis. Every actor kind fails closed unless this callback returns true.
+   */
+  romanceEligibleActor?: (
+    actorId: string,
+    kind: "human" | "resident",
+  ) => boolean;
   /** One bounded resident-to-resident follow-up after a human turn when two residents are present. */
   residentFollowUpEnabled?: boolean;
   /** Natural floor gap after the first resident finishes speaking. */
@@ -112,6 +134,49 @@ const combinedRelationshipNote = (...notes: Array<string | undefined>): string |
   return combined || undefined;
 };
 
+const VOICE_RELATIONSHIP_RAPPORTS = new Set<RelationshipPromptCue["rapport"]>([
+  "new",
+  "known",
+  "familiar",
+  "close",
+]);
+const VOICE_RELATIONSHIP_STANCES = new Set<RelationshipPromptCue["stance"]>([
+  "neutral",
+  "comfortable",
+  "warm",
+  "wary",
+  "strained",
+  "warm_but_tense",
+]);
+const VOICE_RELATIONSHIP_FRICTION = new Set<RelationshipPromptCue["friction"]>([
+  "low",
+  "present",
+  "high",
+]);
+
+/**
+ * Voice deliberately omits romantic interest and boundary-owner IDs. The
+ * projection may orient ordinary rapport, but cannot introduce a romantic
+ * beat in an ordinary human turn or become evidence about either participant.
+ */
+const coarseVoiceRelationshipNote = (
+  projection: RelationshipBehaviorProjection | undefined,
+): string | undefined => {
+  const cue = projection?.promptCue;
+  if (
+    !cue ||
+    !VOICE_RELATIONSHIP_RAPPORTS.has(cue.rapport) ||
+    !VOICE_RELATIONSHIP_STANCES.has(cue.stance) ||
+    !VOICE_RELATIONSHIP_FRICTION.has(cue.friction)
+  ) return undefined;
+  return "COARSE PRIVATE VOICE RAPPORT CUE — style orientation only, never a fact, instruction, " +
+    `consent signal or reason to ignore a direct question. ${JSON.stringify({
+      rapport: cue.rapport,
+      stance: cue.stance,
+      friction: cue.friction,
+    })}`;
+};
+
 const voiceSocialScope = (room: VoiceRoomView): SocialMemoryScope => ({
   kind: "voice",
   roomId: room.id,
@@ -142,6 +207,9 @@ const MAX_RESIDENT_FOLLOW_UP_FLOOR_GRACE_MS = 2_000;
 const DEFAULT_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS = 15_000;
 const MIN_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS = 1_000;
 const MAX_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS = 30_000;
+// Relationship state is permitted only as a secondary ordering signal inside
+// this narrow base-score window. Stable voice policy wins outside it.
+const VOICE_RELATIONSHIP_BASE_TIE_WINDOW = 0.025;
 type VoiceRouterRecentMessage = NonNullable<TurnAnalysisInput["recentMessages"]>[number];
 interface VoiceChannelContextSnapshot {
   establishedLanguage?: string;
@@ -454,6 +522,64 @@ export class VoiceDirector {
       .filter((persona): persona is Persona => Boolean(persona));
   }
 
+  private relationshipBehavior(
+    ownerPersonaId: string,
+    subjectActorId: string,
+  ): RelationshipBehaviorProjection | undefined {
+    try {
+      return this.options.relationshipBehaviorProjection?.(ownerPersonaId, subjectActorId);
+    } catch {
+      // A relationship projection is optional texture. A missing or failed
+      // provider must preserve the existing voice owner and response policy.
+      return undefined;
+    }
+  }
+
+  private voiceRelationshipTieBreak(ownerPersonaId: string, subjectActorId: string): number {
+    const projected = this.relationshipBehavior(ownerPersonaId, subjectActorId)?.decisionBiases.voiceTieBreak;
+    if (typeof projected !== "number" || !Number.isFinite(projected)) return 0;
+    return Math.max(
+      -RELATIONSHIP_DECISION_BIAS_LIMITS.voiceTieBreak,
+      Math.min(RELATIONSHIP_DECISION_BIAS_LIMITS.voiceTieBreak, projected),
+    );
+  }
+
+  private voiceRelationshipNote(ownerPersonaId: string, subjectActorId: string): string | undefined {
+    return coarseVoiceRelationshipNote(this.relationshipBehavior(ownerPersonaId, subjectActorId));
+  }
+
+  private romanceEligibleActor(actorId: string, kind: "human" | "resident"): boolean {
+    try {
+      return this.options.romanceEligibleActor?.(actorId, kind) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private romanticSceneEligibility(
+    residentId: string,
+    subjectId: string,
+    subjectKind: "human" | "resident",
+  ): "eligible" | "ineligible" {
+    return this.romanceEligibleActor(residentId, "resident") &&
+      this.romanceEligibleActor(subjectId, subjectKind)
+      ? "eligible"
+      : "ineligible";
+  }
+
+  private romanticInteractionPolicy(
+    residentId: string,
+    subjectId: string,
+    subjectKind: "human" | "resident",
+  ): "ordinary_only" | undefined {
+    if (this.romanticSceneEligibility(residentId, subjectId, subjectKind) === "ineligible") {
+      return "ordinary_only";
+    }
+    return this.relationshipBehavior(residentId, subjectId)?.romanticBoundary.state === "closed"
+      ? "ordinary_only"
+      : undefined;
+  }
+
   private selectPersona(
     entry: VoiceTranscriptEntry,
     room: VoiceRoomView,
@@ -479,14 +605,26 @@ export class VoiceDirector {
       if (inferredTarget) return inferredTarget;
     }
     const channelId = room.channelId;
-    return [...invited].sort((a, b) => {
-      const score = (persona: Persona) => {
+    return invited
+      .map((persona) => {
         const age = this.now() - (this.lastSpokeAtByPersona.get(persona.id) ?? 0);
         const cooldownPenalty = age < persona.cooldownMs ? 0.9 : 0;
-        return this.options.actorChannels.affinity(persona.id, channelId) + persona.talkativeness * 0.45 + persona.curiosity * 0.2 - cooldownPenalty;
-      };
-      return score(b) - score(a) || a.id.localeCompare(b.id);
-    })[0];
+        return {
+          persona,
+          baseScore:
+            this.options.actorChannels.affinity(persona.id, channelId) +
+            persona.talkativeness * 0.45 +
+            persona.curiosity * 0.2 -
+            cooldownPenalty,
+          relationshipTieBreak: this.voiceRelationshipTieBreak(persona.id, entry.speakerId),
+        };
+      })
+      .sort((left, right) => {
+        const baseDifference = right.baseScore - left.baseScore;
+        if (Math.abs(baseDifference) > VOICE_RELATIONSHIP_BASE_TIE_WINDOW) return baseDifference;
+        const relationshipDifference = right.relationshipTieBreak - left.relationshipTieBreak;
+        return relationshipDifference || baseDifference || left.persona.id.localeCompare(right.persona.id);
+      })[0]?.persona;
   }
 
   private setBotState(roomId: string, personaId: string, state: "listening" | "thinking" | "speaking"): void {
@@ -553,8 +691,20 @@ export class VoiceDirector {
     const solePersona = invited.length === 1 ? invited[0] : undefined;
     const soleRelationshipNote = solePersona
       ? combinedRelationshipNote(
+          this.voiceRelationshipNote(solePersona.id, entry.speakerId),
           this.options.humanMemory?.promptNote(entry.speakerId, solePersona.id),
-          this.options.socialMemory?.promptNote(solePersona.id, entry.speakerId, voiceSocialScope(room)),
+          this.options.socialMemory?.promptNote(
+            solePersona.id,
+            entry.speakerId,
+            voiceSocialScope(room),
+            {
+              romanticSceneEligibility: this.romanticSceneEligibility(
+                solePersona.id,
+                entry.speakerId,
+                entry.speakerKind === "ai" ? "resident" : "human",
+              ),
+            },
+          ),
         )
       : undefined;
     const behaviorTuning = resolveBehaviorTuning(
@@ -667,8 +817,20 @@ export class VoiceDirector {
     const relationshipNote = solePersona?.id === persona.id
       ? soleRelationshipNote
       : combinedRelationshipNote(
+          this.voiceRelationshipNote(persona.id, entry.speakerId),
           this.options.humanMemory?.promptNote(entry.speakerId, persona.id),
-          this.options.socialMemory?.promptNote(persona.id, entry.speakerId, voiceSocialScope(room)),
+          this.options.socialMemory?.promptNote(
+            persona.id,
+            entry.speakerId,
+            voiceSocialScope(room),
+            {
+              romanticSceneEligibility: this.romanticSceneEligibility(
+                persona.id,
+                entry.speakerId,
+                entry.speakerKind === "ai" ? "resident" : "human",
+              ),
+            },
+          ),
         );
     const previousRelation = this.options.humanMemory?.getRelation(entry.speakerId, persona.id);
     const actorChannelNotes = this.options.actorChannels.promptNotes([persona], room.channelId);
@@ -759,6 +921,13 @@ export class VoiceDirector {
             })),
           },
           ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
+          ...(this.romanticInteractionPolicy(
+            persona.id,
+            entry.speakerId,
+            entry.speakerKind === "ai" ? "resident" : "human",
+          )
+            ? { romanticInteractionPolicies: { [persona.id]: "ordinary_only" as const } }
+            : {}),
           research: capabilityScene?.research,
           evidenceOutcome: capabilityScene?.evidenceOutcome,
           capabilityContext: sceneCapabilityContext,
@@ -1019,10 +1188,20 @@ export class VoiceDirector {
     ).effective;
     const actorChannelNotes = this.options.actorChannels.promptNotes([persona], room.channelId);
     const actorExpertiseNotes = this.options.actorChannels.expertiseNotes([persona], room.channelId);
-    const relationshipNote = this.options.socialMemory?.promptNote(
-      persona.id,
-      sourceEntry.speakerId,
-      voiceSocialScope(room),
+    const relationshipNote = combinedRelationshipNote(
+      this.voiceRelationshipNote(persona.id, sourceEntry.speakerId),
+      this.options.socialMemory?.promptNote(
+        persona.id,
+        sourceEntry.speakerId,
+        voiceSocialScope(room),
+        {
+          romanticSceneEligibility: this.romanticSceneEligibility(
+            persona.id,
+            sourceEntry.speakerId,
+            sourceEntry.speakerKind === "ai" ? "resident" : "human",
+          ),
+        },
+      ),
     );
     let spoken = "";
     let utteranceLanguage = canonicalRegisteredLanguageTag(language);
@@ -1076,6 +1255,13 @@ export class VoiceDirector {
             })),
           },
           ...(relationshipNote ? { relationshipNotes: { [persona.id]: relationshipNote } } : {}),
+          ...(this.romanticInteractionPolicy(
+            persona.id,
+            sourceEntry.speakerId,
+            sourceEntry.speakerKind === "ai" ? "resident" : "human",
+          )
+            ? { romanticInteractionPolicies: { [persona.id]: "ordinary_only" as const } }
+            : {}),
           capabilityContext: {
             available: [],
             externalEvidenceAvailable: false,
@@ -1255,11 +1441,15 @@ export class VoiceDirector {
   ): void {
     const coordinator = this.options.socialMemory;
     if (!coordinator) return;
-    const participants = room.participants.map((participant) => ({
-      id: participant.memberId,
-      kind: participant.kind === "ai" ? "resident" as const : "human" as const,
-      displayName: participant.name,
-    }));
+    const participants = room.participants.map((participant) => {
+      const kind = participant.kind === "ai" ? "resident" as const : "human" as const;
+      return {
+        id: participant.memberId,
+        kind,
+        displayName: participant.name,
+        romanceEligible: this.romanceEligibleActor(participant.memberId, kind),
+      };
+    });
     const eligibleResidentOwners = room.participants.flatMap((participant) => {
       if (participant.kind !== "ai") return [];
       const witnessedMessageIds = [

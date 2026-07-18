@@ -50,9 +50,12 @@ const setup = (options: {
     enqueueDeliveredEpisode: ReturnType<typeof vi.fn>;
     promptNote: ReturnType<typeof vi.fn>;
     publicThirdPartyPromptNote?: ReturnType<typeof vi.fn>;
+    behaviorProjection?: ReturnType<typeof vi.fn>;
   };
   model?: Record<string, unknown>;
   humanMemory?: Record<string, unknown>;
+  romanceEligibleHumanActor?: (actorId: string) => boolean;
+  romanceEligibleResidentActor?: (actorId: string) => boolean;
 } = {}) => {
   const store = new RoomStore(`/tmp/director-social-memory-${process.pid}-${Math.random()}.json`);
   const actorChannels = new ActorChannelRuntime();
@@ -64,6 +67,7 @@ const setup = (options: {
   }));
   const promptNote = options.coordinator?.promptNote ?? vi.fn(() => undefined);
   const publicThirdPartyPromptNote = options.coordinator?.publicThirdPartyPromptNote ?? vi.fn(() => undefined);
+  const behaviorProjection = options.coordinator?.behaviorProjection ?? vi.fn(() => undefined);
   const model = {
     health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
     rememberDeliveredLine: vi.fn(),
@@ -88,7 +92,15 @@ const setup = (options: {
     {
       now: options.now,
       rng: () => 0.5,
-      socialMemory: { enqueueDeliveredEpisode, promptNote, publicThirdPartyPromptNote } as never,
+      socialMemory: {
+        enqueueDeliveredEpisode,
+        promptNote,
+        publicThirdPartyPromptNote,
+        behaviorProjection,
+      } as never,
+      romanceEligibleHumanActor: options.romanceEligibleHumanActor ?? (() => false),
+      romanceEligibleResidentActor: options.romanceEligibleResidentActor ?? ((actorId) =>
+        PERSONAS.some((persona) => persona.id === actorId)),
       weatherForecastProvider: null,
     },
   );
@@ -275,6 +287,9 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
         latest.id,
         storedReply.id,
       ]);
+      expect(generateScene.mock.calls[0]![0]).toMatchObject({
+        romanticInteractionPolicies: { [mira.id]: "ordinary_only" },
+      });
       director.stop();
     } finally {
       vi.clearAllTimers();
@@ -390,6 +405,9 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     expect(promptNote).toHaveBeenCalledWith(mira!.id, human.id, {
       kind: "public",
       channelId: "lobby",
+    }, {
+      romanticSceneEligibility: "ineligible",
+      allowRomanticSurface: false,
     });
 
     promptNote.mockClear();
@@ -401,6 +419,128 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     expect(Object.keys(residentNotes)).toEqual([mira!.id]);
     expect(promptNote).toHaveBeenCalledTimes(2);
     expect(promptNote).not.toHaveBeenCalledWith(sana!.id, expect.anything(), expect.anything());
+    director.stop();
+  });
+
+  it("projects an opted-out human veto to every selected resident without manufacturing private notes", () => {
+    const promptNote = vi.fn(() => undefined);
+    const { director } = setup({
+      romanceEligibleHumanActor: () => false,
+      coordinator: {
+        enqueueDeliveredEpisode: vi.fn(async () => ({
+          status: "no_events",
+          episodeId: "test",
+          eventIds: [],
+          createdEventIds: [],
+        })),
+        promptNote,
+      },
+    });
+    const [mira, sana] = PERSONAS.slice(0, 2);
+    const internals = director as unknown as {
+      humanRomanticInteractionPolicies: (
+        personas: typeof PERSONAS,
+        member: typeof human,
+      ) => Record<string, "ordinary_only">;
+      relationshipNotes: (
+        personas: typeof PERSONAS,
+        member: typeof human,
+        scope: { kind: "public"; channelId: string },
+      ) => Record<string, string>;
+    };
+
+    expect(internals.humanRomanticInteractionPolicies([mira!, sana!], human)).toEqual({
+      [mira!.id]: "ordinary_only",
+      [sana!.id]: "ordinary_only",
+    });
+    expect(internals.relationshipNotes(
+      [mira!, sana!],
+      human,
+      { kind: "public", channelId: "lobby" },
+    )).toEqual({});
+    expect(promptNote).toHaveBeenCalledTimes(2);
+    director.stop();
+  });
+
+  it("projects a stored boundary only onto the affected resident's prompt-safe policy", () => {
+    const [mira, sana] = PERSONAS.slice(0, 2);
+    const behaviorProjection = vi.fn((ownerId: string) => ({
+      romanticBoundary: { state: ownerId === sana!.id ? "closed" : "unspecified", blockerActorIds: [] },
+    }));
+    const { director } = setup({
+      romanceEligibleHumanActor: () => true,
+      romanceEligibleResidentActor: () => true,
+      coordinator: {
+        enqueueDeliveredEpisode: vi.fn(async () => ({
+          status: "no_events",
+          episodeId: "test",
+          eventIds: [],
+          createdEventIds: [],
+        })),
+        promptNote: vi.fn(() => undefined),
+        behaviorProjection,
+      },
+    });
+    const policies = (director as unknown as {
+      humanRomanticInteractionPolicies: (
+        personas: typeof PERSONAS,
+        member: typeof human,
+      ) => Record<string, "ordinary_only">;
+    }).humanRomanticInteractionPolicies([mira!, sana!], human);
+
+    expect(policies).toEqual({ [sana!.id]: "ordinary_only" });
+    director.stop();
+  });
+
+  it("passes an explicit generation veto when either human or resident is not romance-eligible", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const promptNote = vi.fn((_ownerId, _subjectId, _scope, options) =>
+      options?.romanticSceneEligibility === "ineligible"
+        ? "SCENE POLICY: do not flirt; ordinary warmth and humor remain allowed."
+        : "unexpected eligible note"
+    );
+    const { director, enqueueDeliveredEpisode } = setup({
+      romanceEligibleHumanActor: () => true,
+      romanceEligibleResidentActor: (actorId) => actorId !== mira.id,
+      coordinator: {
+        enqueueDeliveredEpisode: vi.fn(async () => ({
+          status: "no_events",
+          episodeId: "test",
+          eventIds: [],
+          createdEventIds: [],
+        })),
+        promptNote,
+      },
+    });
+    const notes = (director as unknown as {
+      relationshipNotes: (
+        personas: typeof PERSONAS,
+        member: typeof human,
+        scope: { kind: "public"; channelId: string },
+      ) => Record<string, string>;
+    }).relationshipNotes([mira], human, { kind: "public", channelId: "lobby" });
+
+    expect(promptNote).toHaveBeenCalledWith(mira.id, human.id, expect.anything(), {
+      romanticSceneEligibility: "ineligible",
+      allowRomanticSurface: false,
+    });
+    expect(notes[mira.id]).toContain("do not flirt");
+    expect(notes[mira.id]).toContain("ordinary warmth and humor remain allowed");
+
+    const incoming = createMessage("lobby", human.id, "a source-grounded turn");
+    (director as unknown as {
+      capturePublicHumanSocialEpisode: (
+        burst: typeof incoming[],
+        posted: typeof incoming[],
+        member: typeof human,
+        selected: typeof PERSONAS,
+      ) => void;
+    }).capturePublicHumanSocialEpisode([incoming], [], human, [mira]);
+    const episode = enqueueDeliveredEpisode.mock.calls.at(-1)?.[0] as DeliveredSocialEpisode;
+    expect(episode.participants).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: human.id, romanceEligible: true }),
+      expect.objectContaining({ id: mira.id, romanceEligible: false }),
+    ]));
     director.stop();
   });
 
@@ -442,6 +582,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       mira.id,
       sana.id,
       { kind: "public", channelId: "the-pub" },
+      { romanticSceneEligibility: "eligible", allowRomanticSurface: false },
     );
     expect(notes[mira.id]).toContain("PRIVATE DIRECTED MEMORY FROM MIRA TOWARD SANA");
     expect(notes[mira.id]).toContain(sana.name);
@@ -482,10 +623,16 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     expect(promptNote).toHaveBeenNthCalledWith(1, owner!.id, first!.id, {
       kind: "public",
       channelId: "lobby",
+    }, {
+      romanticSceneEligibility: "eligible",
+      allowRomanticSurface: false,
     });
     expect(promptNote).toHaveBeenNthCalledWith(2, owner!.id, second!.id, {
       kind: "public",
       channelId: "lobby",
+    }, {
+      romanticSceneEligibility: "eligible",
+      allowRomanticSurface: false,
     });
     expect(promptNote).not.toHaveBeenCalledWith(owner!.id, omitted!.id, expect.anything());
     expect(notes[owner!.id]).toContain(first!.name);
@@ -647,6 +794,10 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       expect(scene.roomRecall).toBeUndefined();
       expect(scene.relationshipNotes[mira.id]).toContain("MIRA PUBLIC RECOLLECTION ABOUT ALEX");
       expect(scene.relationshipNotes[mira.id]).toContain("Álex");
+      expect(scene.romanticInteractionPolicies).toMatchObject({ [mira.id]: "ordinary_only" });
+      expect(Object.keys(scene.romanticInteractionPolicies).sort()).toEqual(
+        scene.selected.map((persona: { id: string }) => persona.id).sort(),
+      );
       expect(scene.requestOwnerIds).toEqual([mira.id]);
       expect(scene.premise).toContain("fallible, owner-subjective public recollection");
       expect(generateScene).toHaveBeenCalledTimes(1);

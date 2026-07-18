@@ -74,6 +74,7 @@ describe("admin behavior API", () => {
         disagreement: 35,
       },
       canResearch: true,
+      fictionalAdult: false,
       roomAffinities: { lobby: 0 },
       voices: {},
     });

@@ -178,8 +178,10 @@ body { background: var(--admin-bg); color: var(--admin-text); }
 .admin-memory-relation > header strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .admin-memory-relation > header strong span { color: var(--admin-purple); }
 .admin-memory-relation > header small { overflow: hidden; color: var(--admin-dim); font: 600 8px ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
-.admin-memory-relation-scores { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; margin: 10px 0 0; }
+.admin-memory-relation-scores { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 4px; margin: 10px 0 0; }
 .admin-memory-relation-scores > div { display: grid; min-width: 0; gap: 2px; padding: 5px; border-radius: 5px; background: rgba(255, 255, 255, .025); }
+.admin-memory-boundary { color: var(--admin-dim); }
+.admin-memory-boundary.closed { color: #e6a3b8; }
 .admin-memory-inline-empty { margin: 0; padding: 17px 10px; border: 1px dashed var(--admin-line); border-radius: 9px; color: var(--admin-dim); font-size: 9px; text-align: center; }
 
 .admin-memory-simple-list header strong { font-size: 11px; text-transform: capitalize; }

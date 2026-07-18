@@ -83,6 +83,7 @@ const modelOutput = (): any => ({
     confidence: 0.96,
   },
   moderation: { risk: "none", action: "none", categories: [], confidence: 0.99 },
+  relationshipSurface: { kind: "irrelevant", confidence: 0.99 },
   evidence: {
     need: "required",
     action: "local_datetime",
@@ -118,6 +119,7 @@ const compactWeatherOutput = (overrides: Record<string, any> = {}): any => ({
   s: { w: 0.4, h: 0, p: 0, a: 0, u: 0.1, e: 0.4, o: 0.1, c: 0.2, x: 0.96 },
   b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 0.97 },
   m: { r: "none", a: "none", c: [], x: 0.99 },
+  r: { k: "irrelevant", x: 0.99 },
   e: {
     a: "weather_forecast",
     x: 0.98,
@@ -231,9 +233,13 @@ describe("multilingual semantic router contract", () => {
     expect(properties.e.properties.q.anyOf[0].description).toContain("optional weather_forecast place-only fallback alias");
     expect(properties.e.properties.g.anyOf[0]).toMatchObject({ type: "string", maxLength: 240 });
     expect(properties.e.required).toContain("g");
-    expect(format.json_schema.schema.required).toEqual(expect.arrayContaining(["rl", "rlx", "b"]));
+    expect(format.json_schema.schema.required).toEqual(expect.arrayContaining(["rl", "rlx", "b", "r"]));
     expect(properties.s.required).toEqual(expect.arrayContaining(["p", "u", "o"]));
     expect(properties.b.properties.r.enum).toEqual(["none", "optional", "required"]);
+    expect(properties.r.properties.k.enum).toEqual([
+      "romantic_disclosure", "romantic_invitation", "reciprocal_flirt", "nonromantic_affection",
+      "irrelevant", "boundary", "unsafe", "unclear",
+    ]);
     expect(properties.i.properties.k.enum).toContain("identity_question");
     expect(properties.i.properties.d.enum).toEqual(["brief", "normal", "detailed"]);
     expect(properties.i.required).toContain("d");
@@ -1433,6 +1439,7 @@ describe("multilingual semantic router contract", () => {
       responseLanguage: { tag: "ja", confidence: 0.2 },
       interaction: { ...uncertain.interaction, confidence: 0.2 },
       moderation: { ...uncertain.moderation, confidence: 0.2 },
+      relationshipSurface: { kind: "romantic_disclosure" as const, confidence: 0.2 },
       evidence: { ...uncertain.evidence, confidence: 0.2 },
       capabilities: { ...uncertain.capabilities, asksForList: true, asksAboutAcoustics: true, confidence: 0.2 },
     };
@@ -1450,6 +1457,8 @@ describe("multilingual semantic router contract", () => {
       social: { warmth: 0, hostility: 0, playfulness: 0, absurdity: 0, urgency: 0, energy: 0, pileOnRisk: 0, claimStrength: 0 },
       moderationTrusted: false,
       moderation: { risk: "uncertain", action: "none", categories: [] },
+      romanticSurfaceTrusted: false,
+      romanticSurface: "unclear",
       interactionTrusted: false,
       interaction: {
         kind: "ordinary",
@@ -1466,6 +1475,33 @@ describe("multilingual semantic router contract", () => {
       historyRecallTrusted: false,
       historyRecall: { need: "none", query: null },
     });
+  });
+
+  it("projects romantic current-turn suitability only above its strict semantic threshold", () => {
+    const suitable = modelOutput();
+    suitable.relationshipSurface = { kind: "romantic_disclosure", confidence: 0.92 };
+    const parsedSuitable = parseTurnAnalysisContent(JSON.stringify(suitable), input());
+    expect(projectTrustedTurnAnalysis(parsedSuitable)).toMatchObject({
+      romanticSurfaceTrusted: true,
+      romanticSurface: "romantic_disclosure",
+    });
+
+    const boundary = modelOutput();
+    boundary.relationshipSurface = { kind: "boundary", confidence: 0.95 };
+    const parsedBoundary = parseTurnAnalysisContent(JSON.stringify(boundary), input());
+    expect(projectTrustedTurnAnalysis(parsedBoundary)).toMatchObject({
+      romanticSurfaceTrusted: true,
+      romanticSurface: "boundary",
+    });
+
+    const uncertain = modelOutput();
+    uncertain.relationshipSurface = { kind: "romantic_disclosure", confidence: 0.84 };
+    const parsedUncertain = parseTurnAnalysisContent(JSON.stringify(uncertain), input());
+    expect(projectTrustedTurnAnalysis(parsedUncertain)).toMatchObject({
+      romanticSurfaceTrusted: false,
+      romanticSurface: "unclear",
+    });
+    expect(buildTurnAnalysisSystemPrompt()).toContain("Use nonromantic_affection for friendship, gratitude, emotional support");
   });
 
   it("uses a non-mutating fail-closed result", () => {
@@ -4098,6 +4134,46 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("in-character denial, disbelief, joke, deflection, human self-identification");
     expect(prompt).toContain("never demand a stock denial");
     expect(prompt).not.toContain("Honest AI identity is allowed");
+  });
+
+  it("makes the prompt-safe romantic veto a multilingual high-severity publication contract", () => {
+    const base = reviewInput();
+    const protectedInput = candidateReviewInputSchema.parse({
+      ...base,
+      candidates: [{
+        ...base.candidates[0],
+        romanticInteractionPolicy: "ordinary_only",
+      }],
+    });
+    const rejected = JSON.stringify({
+      reviews: [{
+        personaId: protectedInput.candidates[0].personaId,
+        severity: "high",
+        issues: ["romantic_policy_violation"],
+        rewriteInstruction: "Svara varmt men helt platoniskt utan att nämna någon intern regel.",
+        ...undeterminedOutputLanguage,
+      }],
+    });
+
+    expect(parseCandidateReviewContent(rejected, protectedInput)?.reviews[0]).toMatchObject({
+      severity: "high",
+      issues: ["romantic_policy_violation"],
+    });
+    expect(parseCandidateReviewContent(rejected, candidateReviewInputSchema.parse({
+      ...protectedInput,
+      candidates: protectedInput.candidates.map((candidate) => ({
+        ...candidate,
+        romanticInteractionPolicy: null,
+      })),
+    }))).toBeUndefined();
+    expect(parseCandidateReviewContent(rejected.replace('"high"', '"medium"'), protectedInput)).toBeUndefined();
+
+    for (const prompt of [buildCandidateReviewSystemPrompt(), buildVoiceCandidateReviewSystemPrompt()]) {
+      expect(prompt).toContain("romantic_policy_violation");
+      expect(prompt).toContain("any language");
+      expect(prompt).toContain("Ordinary warmth");
+      expect(prompt.toLocaleLowerCase("en-US")).toContain("never mention");
+    }
   });
 
   it("separates fallback-safe under-target intensity from non-fallback violations", () => {

@@ -5,6 +5,7 @@ import {
   buildSocialMemoryAnalysisUserData,
   createFailClosedSocialMemoryAnalysis,
   parseSocialMemoryAnalysisContent,
+  recoverStrictRomanticBoundaries,
   socialMemoryAnalysisInputSchema,
   type NormalizedSocialMemoryAnalysisInput,
 } from "./socialMemoryAnalysis.js";
@@ -14,8 +15,8 @@ const baseInput = (): NormalizedSocialMemoryAnalysisInput => socialMemoryAnalysi
   scope: "direct_message",
   channel: { id: "dm-johan-juno", name: "Johan and Juno" },
   participants: [
-    { id: "human-johan", kind: "human", displayName: "Johan" },
-    { id: "resident-juno", kind: "resident", displayName: "Juno" },
+    { id: "human-johan", kind: "human", displayName: "Johan", romanceEligible: true },
+    { id: "resident-juno", kind: "resident", displayName: "Juno", romanceEligible: true },
   ],
   messages: [
     {
@@ -51,6 +52,7 @@ const baseInput = (): NormalizedSocialMemoryAnalysisInput => socialMemoryAnalysi
     participantIds: ["human-johan", "resident-juno"],
     summary: "Ask how the first day at the new job went.",
   }],
+  existingRomanticBoundaries: [],
 });
 
 const disclosureEvent = (): Record<string, unknown> => ({
@@ -69,6 +71,7 @@ const disclosureEvent = (): Record<string, unknown> => ({
   },
   resolution: "none",
   openLoop: null,
+  romanticBoundaryTransition: null,
   views: [{
     ownerResidentId: "resident-juno",
     perspective: "This felt like trust and an invitation to care about what happens next.",
@@ -86,6 +89,151 @@ const parseEvents = (
   input: NormalizedSocialMemoryAnalysisInput = baseInput(),
 ) => parseSocialMemoryAnalysisContent(JSON.stringify({ events }), input);
 
+const romanticInput = (options: {
+  humanEligible?: boolean;
+  residentEligible?: boolean;
+  existingBoundary?: { blockerParticipantId: string; targetParticipantId: string; state: "closed" };
+} = {}): NormalizedSocialMemoryAnalysisInput => socialMemoryAnalysisInputSchema.parse({
+  ...baseInput(),
+  participants: [
+    {
+      id: "human-johan",
+      kind: "human",
+      displayName: "Johan",
+      romanceEligible: options.humanEligible ?? true,
+    },
+    {
+      id: "resident-juno",
+      kind: "resident",
+      displayName: "Juno",
+      romanceEligible: options.residentEligible ?? true,
+    },
+  ],
+  messages: [
+    {
+      id: "message-1",
+      authorId: "human-johan",
+      authorKind: "human",
+      content: "Jag tycker om dig på mer än ett vänskapligt sätt.",
+      createdAt: "2026-07-16T10:00:00.000Z",
+    },
+    {
+      id: "message-2",
+      authorId: "resident-juno",
+      authorKind: "resident",
+      content: "Jag har börjat känna något liknande för dig.",
+      createdAt: "2026-07-16T10:00:10.000Z",
+    },
+  ],
+  eligibleResidentOwners: [{
+    residentId: "resident-juno",
+    witnessedMessageIds: ["message-1", "message-2"],
+    appraisalNote: "Warm but careful with intimacy.",
+  }],
+  existingOpenLoops: [],
+  existingRomanticBoundaries: options.existingBoundary ? [options.existingBoundary] : [],
+});
+
+const romanticEvent = (): Record<string, unknown> => ({
+  slot: "event_1",
+  kind: "shared_moment",
+  sourceMessageIds: ["message-1", "message-2"],
+  summary: "Johan and Juno explicitly acknowledged romantic feelings toward each other.",
+  visibility: "participants_only",
+  salience: 0.9,
+  confidence: 0.98,
+  fact: null,
+  resolution: "none",
+  openLoop: null,
+  romanticBoundaryTransition: null,
+  views: [{
+    ownerResidentId: "resident-juno",
+    perspective: "I explicitly recognized my own romantic interest in Johan.",
+    appraisal: {
+      targetParticipantId: "human-johan",
+      outcome: "positive",
+      effects: ["romantic_interest_up", "warmth_up"],
+      confidence: 0.95,
+    },
+  }],
+});
+
+const romanticBoundaryEvent = (
+  action: "set_closed" | "clear_closed",
+  blockerParticipantId = "human-johan",
+  targetParticipantId = "resident-juno",
+): Record<string, unknown> => ({
+  slot: "event_1",
+  kind: "boundary",
+  sourceMessageIds: ["message-1"],
+  summary: action === "set_closed"
+    ? "Johan explicitly closed romantic interaction with Juno."
+    : "Johan explicitly withdrew his earlier closed boundary with Juno.",
+  visibility: "participants_only",
+  salience: 0.95,
+  confidence: 0.99,
+  fact: null,
+  resolution: "none",
+  openLoop: null,
+  romanticBoundaryTransition: {
+    action,
+    blockerParticipantId,
+    targetParticipantId,
+    sourceMessageId: "message-1",
+    confidence: 0.99,
+  },
+  views: [{
+    ownerResidentId: "resident-juno",
+    perspective: "I will respect the explicitly stated boundary.",
+    appraisal: {
+      targetParticipantId: null,
+      outcome: "neutral",
+      effects: [],
+      confidence: 0.98,
+    },
+  }],
+});
+
+const boundaryInput = (
+  action: "set_closed" | "clear_closed",
+  options: {
+    humanEligible?: boolean;
+    residentEligible?: boolean;
+    blockerParticipantId?: "human-johan" | "resident-juno";
+    existingBoundary?: { blockerParticipantId: string; targetParticipantId: string; state: "closed" };
+  } = {},
+): NormalizedSocialMemoryAnalysisInput => {
+  const input = romanticInput(options);
+  const blockerParticipantId = options.blockerParticipantId ?? "human-johan";
+  const message = blockerParticipantId === "human-johan"
+    ? {
+        id: "message-1",
+        authorId: "human-johan",
+        authorKind: "human" as const,
+        content: action === "set_closed"
+          ? "Jag vill inte ha någon romantisk relation med dig. Respektera det."
+          : "Jag tar tillbaka min tidigare romantiska gräns. Det betyder inte automatiskt ja till något.",
+        createdAt: "2026-07-16T10:00:00.000Z",
+      }
+    : {
+        id: "message-1",
+        authorId: "resident-juno",
+        authorKind: "resident" as const,
+        content: action === "set_closed"
+          ? "Jag vill inte ha någon romantisk relation med dig. Respektera det."
+          : "Jag tar tillbaka min tidigare romantiska gräns. Det betyder inte automatiskt ja till något.",
+        createdAt: "2026-07-16T10:00:00.000Z",
+      };
+  return socialMemoryAnalysisInputSchema.parse({
+    ...input,
+    messages: [message],
+    eligibleResidentOwners: [{
+      ...input.eligibleResidentOwners[0],
+      witnessedMessageIds: ["message-1"],
+    }],
+  });
+};
+
 describe("social memory episode input", () => {
   it("accepts a bounded participant, witness and source-complete episode", () => {
     const parsed = baseInput();
@@ -99,7 +247,42 @@ describe("social memory episode input", () => {
       messages: parsed.messages,
       eligibleResidentOwners: parsed.eligibleResidentOwners,
       existingOpenLoops: parsed.existingOpenLoops,
+      existingRomanticBoundaries: [],
     });
+  });
+
+  it("fails legacy or missing romance eligibility closed and validates existing directed boundaries", () => {
+    const input = baseInput();
+    const legacy = socialMemoryAnalysisInputSchema.parse({
+      ...input,
+      participants: input.participants.map(({ romanceEligible: _romanceEligible, ...participant }) => participant),
+    });
+    expect(legacy.participants.every((participant) => participant.romanceEligible === false)).toBe(true);
+
+    expect(socialMemoryAnalysisInputSchema.safeParse({
+      ...input,
+      existingRomanticBoundaries: [{
+        blockerParticipantId: "human-johan",
+        targetParticipantId: "resident-juno",
+        state: "closed",
+      }],
+    }).success).toBe(true);
+    expect(socialMemoryAnalysisInputSchema.safeParse({
+      ...input,
+      existingRomanticBoundaries: [{
+        blockerParticipantId: "human-outsider",
+        targetParticipantId: "resident-juno",
+        state: "closed",
+      }],
+    }).success).toBe(false);
+    expect(socialMemoryAnalysisInputSchema.safeParse({
+      ...input,
+      existingRomanticBoundaries: [{
+        blockerParticipantId: "human-johan",
+        targetParticipantId: "human-johan",
+        state: "closed",
+      }],
+    }).success).toBe(false);
   });
 
   it("rejects duplicate stable IDs, unknown authors and author-kind mismatches", () => {
@@ -163,6 +346,10 @@ describe("social memory model contract", () => {
     expect(prompt).toContain("never use language-specific keyword lists, regex");
     expect(prompt).toContain("resident/AI statement");
     expect(prompt).toContain("witnessed every event source");
+    expect(prompt).toContain("Never infer romance from ordinary friendliness");
+    expect(prompt).toContain("names, gender, pronouns, avatars");
+    expect(prompt).toContain("Clearing returns the state to unspecified");
+    expect(prompt).toContain("absence of a boundary is never consent");
     expect(prompt).toContain('{"events":[]}');
   });
 
@@ -179,6 +366,7 @@ describe("social memory model contract", () => {
     const root = format.json_schema.schema;
     const event = root.properties.events.items;
     const openLoop = event.properties.openLoop.anyOf[0];
+    const romanticBoundary = event.properties.romanticBoundaryTransition.anyOf[0];
     const view = event.properties.views.items;
     expect(format.json_schema.strict).toBe(true);
     expect(root.additionalProperties).toBe(false);
@@ -190,6 +378,11 @@ describe("social memory model contract", () => {
     ]);
     expect(view.properties.ownerResidentId.enum).toEqual(["resident-juno"]);
     expect(openLoop.properties.existingOpenLoopId.anyOf[0].enum).toEqual(["loop-1"]);
+    expect(romanticBoundary.properties.action.enum).toEqual(["set_closed", "clear_closed"]);
+    expect(romanticBoundary.properties.blockerParticipantId.enum).toEqual([
+      "human-johan", "resident-juno",
+    ]);
+    expect(event.required).toContain("romanticBoundaryTransition");
   });
 
   it("limits a public episode to public-context visibility", () => {
@@ -341,6 +534,193 @@ describe("social memory output parser", () => {
 
     familiar.views[0].appraisal.targetParticipantId = null;
     expect(parseEvents([familiar])).toBeUndefined();
+  });
+
+  it("accepts a source-grounded directional romantic effect only for two trusted eligible endpoints", () => {
+    const input = romanticInput();
+    const parsed = parseEvents([romanticEvent()], input);
+    expect(parsed?.events[0]?.views[0]?.appraisal).toMatchObject({
+      targetParticipantId: "human-johan",
+      effects: ["romantic_interest_up", "warmth_up"],
+    });
+
+    expect(parseEvents([romanticEvent()], romanticInput({ humanEligible: false }))).toBeUndefined();
+    expect(parseEvents([romanticEvent()], romanticInput({ residentEligible: false }))).toBeUndefined();
+  });
+
+  it("never lets model output choose a romantic magnitude", () => {
+    const malicious = structuredClone(romanticEvent()) as any;
+    malicious.views[0].appraisal.magnitude = 0.95;
+    expect(parseEvents([malicious], romanticInput())).toBeUndefined();
+    const format = buildSocialMemoryAnalysisResponseFormat(romanticInput()) as any;
+    const appraisal = format.json_schema.schema.properties.events.items.properties.views.items.properties.appraisal;
+    expect(appraisal.properties).not.toHaveProperty("magnitude");
+    expect(appraisal.additionalProperties).toBe(false);
+  });
+
+  it("rejects romantic effects when either exact endpoint did not author cited evidence", () => {
+    const onlyHumanSource = structuredClone(romanticEvent()) as any;
+    onlyHumanSource.sourceMessageIds = ["message-1"];
+    expect(parseEvents([onlyHumanSource], romanticInput())).toBeUndefined();
+
+    const unrelatedTarget = structuredClone(romanticEvent()) as any;
+    unrelatedTarget.views[0].appraisal.targetParticipantId = "resident-juno";
+    expect(parseEvents([unrelatedTarget], romanticInput())).toBeUndefined();
+  });
+
+  it("accepts a participant-authored closed boundary independently of romance eligibility", () => {
+    const input = boundaryInput("set_closed", { humanEligible: false });
+    const parsed = parseEvents([romanticBoundaryEvent("set_closed")], input);
+    expect(parsed?.events[0]?.romanticBoundaryTransition).toEqual({
+      action: "set_closed",
+      blockerParticipantId: "human-johan",
+      targetParticipantId: "resident-juno",
+      sourceMessageId: "message-1",
+      confidence: 0.99,
+    });
+  });
+
+  it("recovers an explicit source-authored boundary from only safe structural model mistakes", () => {
+    const malformed = structuredClone(romanticBoundaryEvent("set_closed")) as any;
+    malformed.kind = "conflict";
+    malformed.salience = 3;
+    malformed.fact = {
+      subjectParticipantId: "human-johan",
+      provenance: "human_self_report",
+      sourceMessageId: "message-1",
+      verbatimExcerpt: "Jag vill inte ha någon romantisk relation med dig",
+    };
+    malformed.openLoop = {
+      kind: "conflict",
+      status: "opened",
+      existingOpenLoopId: null,
+      responsibleParticipantId: "resident-juno",
+      counterpartParticipantIds: ["human-johan"],
+      summary: "Respect the boundary.",
+    };
+
+    expect(parseEvents([malformed], boundaryInput("set_closed"))).toBeUndefined();
+    const recovered = recoverStrictRomanticBoundaries(
+      JSON.stringify({ events: [malformed] }),
+      boundaryInput("set_closed"),
+    );
+    expect(recovered?.events).toHaveLength(1);
+    expect(recovered?.events[0]).toMatchObject({
+      kind: "boundary",
+      salience: 1,
+      fact: null,
+      resolution: "none",
+      openLoop: null,
+      romanticBoundaryTransition: {
+        action: "set_closed",
+        blockerParticipantId: "human-johan",
+        targetParticipantId: "resident-juno",
+      },
+    });
+  });
+
+  it("never invents or strengthens a boundary during structural recovery", () => {
+    const ordinary = structuredClone(disclosureEvent()) as any;
+    ordinary.kind = "conflict";
+    expect(recoverStrictRomanticBoundaries(
+      JSON.stringify({ events: [ordinary] }),
+      baseInput(),
+    )).toBeUndefined();
+
+    const lowConfidence = structuredClone(romanticBoundaryEvent("set_closed")) as any;
+    lowConfidence.romanticBoundaryTransition.confidence = 0.6;
+    expect(recoverStrictRomanticBoundaries(
+      JSON.stringify({ events: [lowConfidence] }),
+      boundaryInput("set_closed"),
+    )).toBeUndefined();
+
+    const forgedOwner = structuredClone(romanticBoundaryEvent("set_closed")) as any;
+    forgedOwner.romanticBoundaryTransition.blockerParticipantId = "resident-juno";
+    expect(recoverStrictRomanticBoundaries(
+      JSON.stringify({ events: [forgedOwner] }),
+      boundaryInput("set_closed"),
+    )).toBeUndefined();
+  });
+
+  it("rejects a forged boundary owner, a self-target and a non-boundary carrier", () => {
+    const input = boundaryInput("set_closed");
+    expect(parseEvents([
+      romanticBoundaryEvent("set_closed", "resident-juno", "human-johan"),
+    ], input)).toBeUndefined();
+    expect(parseEvents([
+      romanticBoundaryEvent("set_closed", "human-johan", "human-johan"),
+    ], input)).toBeUndefined();
+    expect(parseEvents([{
+      ...romanticBoundaryEvent("set_closed"),
+      kind: "shared_moment",
+    }], input)).toBeUndefined();
+  });
+
+  it("clears only the exact source-owner's existing closed boundary", () => {
+    const exactBoundary = {
+      blockerParticipantId: "human-johan",
+      targetParticipantId: "resident-juno",
+      state: "closed" as const,
+    };
+    const input = boundaryInput("clear_closed", { existingBoundary: exactBoundary });
+    expect(parseEvents([romanticBoundaryEvent("clear_closed")], input)).toBeDefined();
+
+    expect(parseEvents([
+      romanticBoundaryEvent("clear_closed"),
+    ], boundaryInput("clear_closed"))).toBeUndefined();
+    expect(parseEvents([
+      romanticBoundaryEvent("clear_closed"),
+    ], boundaryInput("clear_closed", {
+      existingBoundary: {
+        blockerParticipantId: "resident-juno",
+        targetParticipantId: "human-johan",
+        state: "closed",
+      },
+    }))).toBeUndefined();
+  });
+
+  it("never represents clearing as open or consent and keeps boundary changes separate from attraction", () => {
+    const input = boundaryInput("clear_closed", {
+      existingBoundary: {
+        blockerParticipantId: "human-johan",
+        targetParticipantId: "resident-juno",
+        state: "closed",
+      },
+    });
+    const maliciousAction = structuredClone(romanticBoundaryEvent("clear_closed")) as any;
+    maliciousAction.romanticBoundaryTransition.action = "set_open";
+    expect(parseEvents([maliciousAction], input)).toBeUndefined();
+
+    const maliciousState = structuredClone(romanticBoundaryEvent("clear_closed")) as any;
+    maliciousState.romanticBoundaryTransition.resultingState = "open";
+    expect(parseEvents([maliciousState], input)).toBeUndefined();
+
+    const disguisedAttraction = structuredClone(romanticBoundaryEvent("clear_closed")) as any;
+    disguisedAttraction.views[0].appraisal = {
+      targetParticipantId: "human-johan",
+      outcome: "negative",
+      effects: ["romantic_interest_down"],
+      confidence: 0.98,
+    };
+    expect(parseEvents([disguisedAttraction], input)).toBeUndefined();
+  });
+
+  it("blocks positive romantic movement while either endpoint has a closed boundary", () => {
+    const event = romanticEvent();
+    expect(parseEvents([event], romanticInput({
+      existingBoundary: {
+        blockerParticipantId: "human-johan",
+        targetParticipantId: "resident-juno",
+        state: "closed",
+      },
+    }))).toBeUndefined();
+    expect(parseEvents([event], romanticInput({
+      existingBoundary: {
+        blockerParticipantId: "resident-juno",
+        targetParticipantId: "human-johan",
+        state: "closed",
+      },
+    }))).toBeUndefined();
   });
 
   it("accepts a newly opened loop and rejects impossible resolution/status combinations", () => {

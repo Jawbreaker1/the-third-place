@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdminChannelConfig, AdminPersonaConfig } from "../shared/adminTypes.js";
 import { CHANNEL_PROFILES, CHANNELS } from "./channels.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
-import { PERSONAS } from "./personas.js";
+import { PERSONAS, isActiveResidentActorId } from "./personas.js";
 import { participantIdentityKey } from "./participantIdentity.js";
 
 const pathFor = () => `/tmp/the-third-place-admin-${randomUUID()}.json`;
@@ -45,6 +45,7 @@ const customPersona = (channels: readonly string[]): AdminPersonaConfig => ({
     disagreement: 48,
   },
   canResearch: true,
+  fictionalAdult: false,
   roomAffinities: Object.fromEntries(channels.slice(0, 2).map((id, index) => [id, 70 - index * 10])),
   voices: { sv: "lisa-warm", en: "alloy" },
 });
@@ -81,6 +82,8 @@ describe("persistent admin overlay state", () => {
     expect(initial.automation.autonomousLinkChannelIds).toContain("football-talk");
     expect(initial.automation.autonomousLinkChannelIds).toContain("ai-hacking");
     expect(initial.channels.some((channel) => channel.id === "lobby")).toBe(true);
+    expect(initial.personas.every((persona) => persona.fictionalAdult)).toBe(true);
+    expect(store.isRomanceEligibleResident("ai-mira")).toBe(true);
     expect(initial.channels.find((channel) => channel.id === "ai-hacking")).toMatchObject({
       name: "ai-hacking",
       register: "technical",
@@ -96,6 +99,8 @@ describe("persistent admin overlay state", () => {
 
     await store.createChannel(customChannel());
     await store.createPersona(customPersona(CHANNELS.map((channel) => channel.id)));
+    expect(store.isRomanceEligibleResident("ai-test-resident")).toBe(false);
+    expect(isActiveResidentActorId("ai-test-resident")).toBe(true);
     expect(CHANNELS.some((channel) => channel.id === "test-room")).toBe(true);
     expect(PERSONAS.find((persona) => persona.id === "ai-test-resident")).toMatchObject({
       name: "Test Resident",
@@ -108,8 +113,14 @@ describe("persistent admin overlay state", () => {
       en: "alloy",
     });
 
+    const custom = store.snapshot().personas.find((persona) => persona.id === "ai-test-resident")!;
+    await store.updatePersona(custom.id, { ...custom, fictionalAdult: true });
+    expect(store.isRomanceEligibleResident("ai-test-resident")).toBe(true);
+
     await store.deletePersona("ai-test-resident");
     await store.deleteChannel("test-room");
+    expect(isActiveResidentActorId("ai-test-resident")).toBe(false);
+    expect(store.isRomanceEligibleResident("ai-test-resident")).toBe(false);
     expect(PERSONAS.some((persona) => persona.id === "ai-test-resident")).toBe(false);
     expect(CHANNELS.some((channel) => channel.id === "test-room")).toBe(false);
   });
@@ -390,6 +401,41 @@ describe("persistent admin overlay state", () => {
       expect(migrated.behaviorTuning("the-pub").autonomousLinkFrequency).toBe(0);
       await migrated.updateBehavior({ scope: "channel", channelId: "the-pub", tuning: null });
       expect(migrated.behaviorTuning("the-pub").autonomousLinkFrequency).toBe(75);
+    } finally {
+      await rm(path, { force: true });
+    }
+  });
+
+  it("migrates legacy resident adulthood fail-closed for custom actors and preserves built-ins", async () => {
+    const path = pathFor();
+    try {
+      const original = new AdminStateStore({ path });
+      await original.load();
+      const mira = original.snapshot().personas.find((persona) => persona.id === "ai-mira")!;
+      await original.updatePersona(mira.id, { ...mira, name: "Mira Migrated" });
+      await original.createPersona({
+        ...customPersona(["lobby"]),
+        fictionalAdult: true,
+        voices: {},
+      });
+
+      const legacy = JSON.parse(await readFile(path, "utf8")) as {
+        version: number;
+        personaOverrides: Record<string, Record<string, unknown>>;
+        customPersonas: Array<Record<string, unknown>>;
+      };
+      legacy.version = 2;
+      delete legacy.personaOverrides["ai-mira"]!.fictionalAdult;
+      delete legacy.customPersonas[0]!.fictionalAdult;
+      await writeFile(path, JSON.stringify(legacy), "utf8");
+
+      const migrated = new AdminStateStore({ path });
+      await migrated.load();
+      expect(migrated.isRomanceEligibleResident("ai-mira")).toBe(true);
+      expect(migrated.isRomanceEligibleResident("ai-test-resident")).toBe(false);
+      expect(migrated.snapshot().personas.find((persona) => persona.id === "ai-mira")?.fictionalAdult).toBe(true);
+      expect(migrated.snapshot().personas.find((persona) => persona.id === "ai-test-resident")?.fictionalAdult).toBe(false);
+      expect(migrated.isRomanceEligibleResident("ai-unknown")).toBe(false);
     } finally {
       await rm(path, { force: true });
     }

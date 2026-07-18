@@ -9,6 +9,7 @@ import {
   type RecordSocialEventInput,
   type SocialMemoryScope,
 } from "./socialMemory.js";
+import { projectRelationshipBehavior } from "./relationshipBehavior.js";
 
 const stores: SocialMemoryStore[] = [];
 const directories: string[] = [];
@@ -134,7 +135,7 @@ describe("persistent social memory store", () => {
 
     const store = new SocialMemoryStore({ filePath, now: () => 1_800_000_100_000 });
     stores.push(store);
-    expect(store.status().schemaVersion).toBe(5);
+    expect(store.status().schemaVersion).toBe(7);
     expect(store.listMemories({ ownerId: "resident-mira" })[0]).toMatchObject({
       id: "legacy-memory",
       tier: "episodic",
@@ -146,7 +147,7 @@ describe("persistent social memory store", () => {
 
   it("migrates a new database, enables WAL/foreign keys, and survives restart", async () => {
     const { store, filePath } = await createStore();
-    expect(store.status()).toEqual({ schemaVersion: 5, journalMode: "wal", foreignKeys: true });
+    expect(store.status()).toEqual({ schemaVersion: 7, journalMode: "wal", foreignKeys: true });
     expect((await stat(filePath)).mode & 0o777).toBe(0o600);
 
     const result = store.recordEvent(baseEvent("restart"));
@@ -196,13 +197,16 @@ describe("persistent social memory store", () => {
       UPDATE open_loops SET pinned = 1;
       DROP TABLE social_memory_lifecycle_state;
       DROP TABLE relationship_daily_budgets;
+      DROP TABLE relationship_romantic_boundaries;
+      ALTER TABLE relationship_edges DROP COLUMN romantic_interest;
+      ALTER TABLE relationship_changes DROP COLUMN romantic_interest;
       PRAGMA user_version = 3;
     `);
     legacy.close();
 
     const migrated = new SocialMemoryStore({ filePath, now: () => 1_800_000_100_000 });
     stores.push(migrated);
-    expect(migrated.status().schemaVersion).toBe(5);
+    expect(migrated.status().schemaVersion).toBe(7);
     expect(migrated.lifecycleStats().pinned)
       .toBe(SOCIAL_MEMORY_LIFECYCLE_DEFAULTS.maxPinnedPerOwner);
     expect(migrated.listOpenLoops({ ownerId: "resident-mira", limit: 50 }).filter((loop) => loop.pinned))
@@ -219,10 +223,11 @@ describe("persistent social memory store", () => {
     legacy.prepare(
       `INSERT INTO relationship_checkpoints
        (id, owner_id, subject_id, origin, day_key, participant_ids_json,
-        familiarity, warmth, trust, respect, friction,
+        familiarity, warmth, trust, respect, friction, romantic_interest,
         spent_familiarity, spent_warmth, spent_trust, spent_respect, spent_friction,
+        spent_romantic_interest,
         through_at, updated_at)
-       VALUES (?, ?, ?, 'human', ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?)`,
+       VALUES (?, ?, ?, 'human', ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?)`,
     ).run(
       "legacy-checkpoint-net-zero",
       "resident-mira",
@@ -235,6 +240,9 @@ describe("persistent social memory store", () => {
     legacy.exec(`
       DROP TABLE social_memory_lifecycle_state;
       DROP TABLE relationship_daily_budgets;
+      DROP TABLE relationship_romantic_boundaries;
+      ALTER TABLE relationship_edges DROP COLUMN romantic_interest;
+      ALTER TABLE relationship_changes DROP COLUMN romantic_interest;
       PRAGMA user_version = 3;
     `);
     legacy.close();
@@ -261,12 +269,20 @@ describe("persistent social memory store", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new DatabaseSync(filePath);
-    legacy.exec("DROP TABLE relationship_daily_budgets; PRAGMA user_version = 4;");
+    legacy.exec(`
+      DROP TABLE relationship_daily_budgets;
+      DROP TABLE relationship_romantic_boundaries;
+      ALTER TABLE relationship_edges DROP COLUMN romantic_interest;
+      ALTER TABLE relationship_changes DROP COLUMN romantic_interest;
+      ALTER TABLE relationship_checkpoints DROP COLUMN romantic_interest;
+      ALTER TABLE relationship_checkpoints DROP COLUMN spent_romantic_interest;
+      PRAGMA user_version = 4;
+    `);
     legacy.close();
 
     const migrated = new SocialMemoryStore({ filePath, now: () => baseNow + 1_000 });
     stores.push(migrated);
-    expect(migrated.status().schemaVersion).toBe(5);
+    expect(migrated.status().schemaVersion).toBe(7);
     expect(migrated.lifecycleStats().relationshipDailyBudgets).toBe(1);
     const next = migrated.recordEvent(baseEvent("v5-budget-continuation", {
       memoryViews: [],
@@ -1172,6 +1188,526 @@ describe("persistent social memory store", () => {
     );
     expect(store.getRelationship("resident-mira", "human-johan")?.warmth).toBeCloseTo(0.36);
     expect(store.getRelationship("human-johan", "resident-mira")?.warmth).toBeCloseTo(-0.1);
+  });
+
+  it("migrates a populated v5 relationship edge through the romance schemas without changing old values", async () => {
+    const { store, filePath } = await createStore();
+    store.recordEvent(baseEvent("v5-romance-migration-source"));
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new DatabaseSync(filePath);
+    legacy.exec(`
+      DROP TABLE relationship_romantic_boundaries;
+      ALTER TABLE relationship_edges DROP COLUMN romantic_interest;
+      ALTER TABLE relationship_changes DROP COLUMN romantic_interest;
+      ALTER TABLE relationship_checkpoints DROP COLUMN romantic_interest;
+      ALTER TABLE relationship_checkpoints DROP COLUMN spent_romantic_interest;
+      ALTER TABLE relationship_daily_budgets DROP COLUMN spent_romantic_interest;
+      PRAGMA user_version = 5;
+    `);
+    legacy.close();
+
+    const migrated = new SocialMemoryStore({ filePath, now: () => 1_800_000_100_000 });
+    stores.push(migrated);
+    expect(migrated.status().schemaVersion).toBe(7);
+    expect(migrated.getRelationship("resident-mira", "human-johan")).toMatchObject({
+      familiarity: 0.08,
+      warmth: 0.12,
+      trust: 0.06,
+      respect: 0.04,
+      friction: 0,
+      romanticInterest: 0,
+      romanticBoundaryClosed: false,
+      romanticBoundaryBlockerIds: [],
+    });
+  });
+
+  it("deduplicates mirrored v6 blockers, clears through one view, and preserves them through admin reset", async () => {
+    const { store, filePath } = await createStore();
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new DatabaseSync(filePath);
+    legacy.exec(`
+      DROP INDEX romantic_boundary_subject_lookup;
+      DROP TABLE relationship_romantic_boundaries;
+      CREATE TABLE relationship_romantic_boundaries (
+        owner_id TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        blocker_actor_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_id, subject_id, blocker_actor_id),
+        CHECK (owner_id <> subject_id),
+        CHECK (blocker_actor_id = owner_id OR blocker_actor_id = subject_id)
+      ) STRICT;
+      CREATE INDEX romantic_boundary_subject_lookup
+        ON relationship_romantic_boundaries(subject_id, owner_id);
+      INSERT INTO relationship_romantic_boundaries VALUES
+        ('resident-mira', 'resident-sana', 'resident-mira', 100, 300),
+        ('resident-sana', 'resident-mira', 'resident-mira', 200, 400);
+      INSERT INTO relationship_edges VALUES
+        ('resident-mira', 'resident-sana', 0, 0, 0, 0, 0, 0, 300),
+        ('resident-sana', 'resident-mira', 0, 0, 0, 0, 0, 0, 400);
+      PRAGMA user_version = 6;
+    `);
+    legacy.close();
+
+    const migrated = new SocialMemoryStore({
+      filePath,
+      now: () => 1_800_000_100_000,
+      resolveActorKind: () => "resident",
+    });
+    stores.push(migrated);
+    expect(migrated.status().schemaVersion).toBe(7);
+    expect(migrated.getRomanticBoundary("resident-sana", "resident-mira")).toEqual({
+      ownerId: "resident-sana",
+      subjectId: "resident-mira",
+      closed: true,
+      blockerActorIds: ["resident-mira"],
+      updatedAt: 400,
+    });
+    expect(migrated.listRelationships({ limit: 10 }).filter((edge) =>
+      new Set([edge.ownerId, edge.subjectId]).has("resident-mira") &&
+      new Set([edge.ownerId, edge.subjectId]).has("resident-sana")
+    )).toHaveLength(1);
+
+    migrated.recordEvent(baseEvent("one-view-clears-mirrored-v6-boundary", {
+      kind: "boundary",
+      actorIds: ["resident-mira"],
+      subjectIds: ["resident-sana"],
+      witnessIds: ["resident-sana"],
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-sana",
+        subjectId: "resident-mira",
+        blockerActorId: "resident-mira",
+        action: "clear_closed",
+      }],
+      openLoops: [],
+    }));
+    expect(migrated.getRomanticBoundary("resident-mira", "resident-sana").closed).toBe(false);
+    expect(migrated.getRelationship("resident-mira", "resident-sana")).toBeUndefined();
+    expect(migrated.getRelationship("resident-sana", "resident-mira")).toBeUndefined();
+
+    migrated.recordEvent(baseEvent("one-view-sets-canonical-boundary-again", {
+      kind: "boundary",
+      actorIds: ["resident-mira"],
+      subjectIds: ["resident-sana"],
+      witnessIds: ["resident-sana"],
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-sana",
+        subjectId: "resident-mira",
+        blockerActorId: "resident-mira",
+        action: "set_closed",
+      }],
+      openLoops: [],
+    }));
+    expect(migrated.resetRelationship(
+      "resident-sana",
+      "resident-mira",
+      "local-admin",
+    )).toBe(true);
+    expect(migrated.getRomanticBoundary("resident-mira", "resident-sana")).toMatchObject({
+      closed: true,
+      blockerActorIds: ["resident-mira"],
+    });
+    expect(migrated.getRelationship("resident-mira", "resident-sana")).toBeUndefined();
+    expect(migrated.getRelationship("resident-sana", "resident-mira")).toMatchObject({
+      romanticInterest: 0,
+      romanticBoundaryClosed: true,
+      romanticBoundaryBlockerIds: ["resident-mira"],
+    });
+  });
+
+  it("keeps endpoint-owned romantic blockers independent and treats clearing as unspecified, not consent", async () => {
+    const { store } = await createStore();
+    const boundaryEvent = (
+      id: string,
+      blockerActorId: string,
+      action: "set_closed" | "clear_closed",
+    ): RecordSocialEventInput => baseEvent(id, {
+      kind: "boundary",
+      actorIds: [blockerActorId],
+      subjectIds: blockerActorId === "human-johan" ? ["resident-mira"] : ["human-johan"],
+      witnessIds: blockerActorId === "human-johan" ? ["resident-mira"] : [],
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        blockerActorId,
+        action,
+      }],
+      openLoops: [],
+    });
+
+    const humanClosed = store.recordEvent(boundaryEvent("human-closes-romance", "human-johan", "set_closed"));
+    expect(humanClosed.appliedRomanticBoundaryTransitions).toEqual([
+      expect.objectContaining({ blockerActorId: "human-johan", action: "set_closed", changed: true }),
+    ]);
+    expect(store.getRelationship("resident-mira", "human-johan")).toMatchObject({
+      familiarity: 0,
+      romanticInterest: 0,
+      romanticBoundaryClosed: true,
+      romanticBoundaryBlockerIds: ["human-johan"],
+    });
+
+    store.recordEvent(boundaryEvent("resident-closes-romance", "resident-mira", "set_closed"));
+    expect(store.getRomanticBoundary("resident-mira", "human-johan")).toMatchObject({
+      closed: true,
+      blockerActorIds: ["human-johan", "resident-mira"],
+    });
+
+    store.recordEvent(boundaryEvent("human-clears-own-blocker", "human-johan", "clear_closed"));
+    expect(store.getRomanticBoundary("resident-mira", "human-johan")).toMatchObject({
+      closed: true,
+      blockerActorIds: ["resident-mira"],
+    });
+    store.recordEvent(boundaryEvent("resident-clears-own-blocker", "resident-mira", "clear_closed"));
+    expect(store.getRomanticBoundary("resident-mira", "human-johan")).toEqual({
+      ownerId: "resident-mira",
+      subjectId: "human-johan",
+      closed: false,
+      blockerActorIds: [],
+    });
+    expect(store.getRelationship("resident-mira", "human-johan")).toBeUndefined();
+
+    expect(() => store.recordEvent(boundaryEvent(
+      "cannot-clear-an-absent-blocker",
+      "human-johan",
+      "clear_closed",
+    ))).toThrow(/existing blocker/iu);
+    expect(store.getEvent("cannot-clear-an-absent-blocker")).toBeUndefined();
+
+    store.recordEvent(boundaryEvent("boundary-only-admin-reset", "human-johan", "set_closed"));
+    expect(store.resetRelationship("resident-mira", "human-johan", "local-admin")).toBe(true);
+    expect(store.getRomanticBoundary("resident-mira", "human-johan")).toMatchObject({
+      closed: true,
+      blockerActorIds: ["human-johan"],
+    });
+    expect(store.getRelationship("resident-mira", "human-johan")).toMatchObject({
+      romanticInterest: 0,
+      romanticBoundaryClosed: true,
+      romanticBoundaryBlockerIds: ["human-johan"],
+    });
+    store.recordEvent(boundaryEvent(
+      "admin-reset-boundary-requires-explicit-clear",
+      "human-johan",
+      "clear_closed",
+    ));
+    expect(store.getRomanticBoundary("resident-mira", "human-johan").closed).toBe(false);
+    expect(store.getRelationship("resident-mira", "human-johan")).toBeUndefined();
+
+    store.recordEvent(baseEvent("reverse-boundary-closes-pair", {
+      kind: "boundary",
+      occurredAt: 1_800_000_000_000 + 2 * DAY_MS,
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "human-johan",
+        subjectId: "resident-mira",
+        blockerActorId: "human-johan",
+        action: "set_closed",
+      }],
+      openLoops: [],
+    }));
+    const reverseClosed = store.recordEvent(baseEvent("reverse-boundary-blocks-later-rise", {
+      occurredAt: 1_800_000_000_000 + 2 * DAY_MS,
+      memoryViews: [],
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        romanticInterest: 1,
+      }],
+      openLoops: [],
+    }));
+    expect(reverseClosed.appliedRelationshipDeltas[0]?.romanticInterest).toBe(0);
+    expect(store.getRelationship("resident-mira", "human-johan")?.romanticInterest).toBe(0);
+  });
+
+  it("requires boundary transitions and romantic-interest movement to come from separate sourced events", async () => {
+    const { store } = await createStore();
+    const transitionEvent = (
+      id: string,
+      action: "set_closed" | "clear_closed",
+      romanticInterest: number,
+    ): RecordSocialEventInput => baseEvent(id, {
+      kind: "boundary",
+      actorIds: ["human-johan"],
+      subjectIds: ["resident-mira"],
+      witnessIds: ["resident-mira"],
+      memoryViews: [],
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        romanticInterest,
+      }],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        blockerActorId: "human-johan",
+        action,
+      }],
+      openLoops: [],
+    });
+
+    expect(() => store.recordEvent(transitionEvent(
+      "boundary-set-cannot-also-raise-romance",
+      "set_closed",
+      1,
+    ))).toThrow(/separate events/iu);
+    expect(store.getEvent("boundary-set-cannot-also-raise-romance")).toBeUndefined();
+
+    store.recordEvent(baseEvent("boundary-set-on-its-own", {
+      kind: "boundary",
+      actorIds: ["human-johan"],
+      subjectIds: ["resident-mira"],
+      witnessIds: ["resident-mira"],
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        blockerActorId: "human-johan",
+        action: "set_closed",
+      }],
+      openLoops: [],
+    }));
+    expect(() => store.recordEvent(transitionEvent(
+      "boundary-clear-is-not-romantic-evidence",
+      "clear_closed",
+      1,
+    ))).toThrow(/separate events/iu);
+    expect(store.getRomanticBoundary("human-johan", "resident-mira")).toMatchObject({
+      closed: true,
+      blockerActorIds: ["human-johan"],
+    });
+  });
+
+  it("rejects third-party romantic blockers and preserves a boundary across unrelated witness erasure", async () => {
+    const { store } = await createStore();
+    expect(() => store.recordEvent(baseEvent("third-party-romantic-blocker", {
+      kind: "boundary",
+      actorIds: ["human-observer"],
+      subjectIds: ["human-johan", "resident-mira"],
+      witnessIds: ["resident-mira"],
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        blockerActorId: "human-observer",
+        action: "set_closed",
+      }],
+      openLoops: [],
+    }))).toThrow(/relationship endpoints/iu);
+
+    store.recordEvent(baseEvent("boundary-with-unrelated-witness", {
+      kind: "boundary",
+      actorIds: ["human-johan"],
+      subjectIds: ["resident-mira"],
+      witnessIds: ["resident-mira", "human-observer"],
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        blockerActorId: "human-johan",
+        action: "set_closed",
+      }],
+      openLoops: [],
+    }));
+    expect(store.forgetActor("human-observer").events).toBe(1);
+    expect(store.getRelationship("resident-mira", "human-johan")).toMatchObject({
+      romanticBoundaryClosed: true,
+      romanticBoundaryBlockerIds: ["human-johan"],
+    });
+    expect(store.forgetActor("human-johan").relationships).toBe(1);
+    expect(store.getRelationship("resident-mira", "human-johan")).toBeUndefined();
+  });
+
+  it("persists a boundary-only pair across restart and lifecycle recomputation", async () => {
+    const { store, filePath } = await createStore();
+    store.recordEvent(baseEvent("persistent-boundary-only-pair", {
+      kind: "boundary",
+      actorIds: ["human-johan"],
+      subjectIds: ["resident-mira"],
+      witnessIds: ["resident-mira"],
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        blockerActorId: "human-johan",
+        action: "set_closed",
+      }],
+      openLoops: [],
+    }));
+    store.runLifecycleMaintenance({ now: 1_800_000_000_000 + 900 * DAY_MS });
+    expect(store.getRelationship("resident-mira", "human-johan")).toMatchObject({
+      romanticBoundaryClosed: true,
+      romanticBoundaryBlockerIds: ["human-johan"],
+    });
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const restarted = new SocialMemoryStore({ filePath, now: () => 1_800_000_000_000 + 900 * DAY_MS });
+    stores.push(restarted);
+    expect(restarted.getRelationship("resident-mira", "human-johan")).toMatchObject({
+      familiarity: 0,
+      romanticInterest: 0,
+      romanticBoundaryClosed: true,
+      romanticBoundaryBlockerIds: ["human-johan"],
+    });
+  });
+
+  it("blocks positive romantic movement while closed, allows decay, and resets a boundary-only pair", async () => {
+    const { store } = await createStore();
+    const first = store.recordEvent(baseEvent("romance-human-cap", {
+      memoryViews: [],
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        romanticInterest: 1,
+      }],
+      openLoops: [],
+    }));
+    expect(first.appliedRelationshipDeltas[0]?.romanticInterest).toBeCloseTo(0.05);
+
+    store.recordEvent(baseEvent("romance-close-before-rise", {
+      kind: "boundary",
+      actorIds: ["human-johan"],
+      subjectIds: ["resident-mira"],
+      witnessIds: ["resident-mira"],
+      memoryViews: [],
+      relationshipDeltas: [],
+      romanticBoundaryTransitions: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        blockerActorId: "human-johan",
+        action: "set_closed",
+      }],
+      openLoops: [],
+    }));
+    const closed = store.recordEvent(baseEvent("romance-rise-is-blocked-after-close", {
+      memoryViews: [],
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        romanticInterest: 1,
+      }],
+      openLoops: [],
+    }));
+    expect(closed.appliedRelationshipDeltas[0]?.romanticInterest).toBe(0);
+    expect(store.getRelationship("resident-mira", "human-johan")?.romanticInterest).toBeCloseTo(0.05);
+
+    const decayed = store.recordEvent(baseEvent("romance-decays-while-closed", {
+      occurredAt: 1_800_000_000_000 + DAY_MS,
+      memoryViews: [],
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        romanticInterest: -1,
+      }],
+      openLoops: [],
+    }));
+    expect(decayed.appliedRelationshipDeltas[0]?.romanticInterest).toBeCloseTo(-0.05);
+    expect(store.getRelationship("resident-mira", "human-johan")?.romanticInterest).toBe(0);
+    expect(store.resetRelationship("resident-mira", "human-johan", "local-admin")).toBe(true);
+    expect(store.getRomanticBoundary("resident-mira", "human-johan")).toMatchObject({
+      closed: true,
+      blockerActorIds: ["human-johan"],
+    });
+    expect(store.getRelationship("resident-mira", "human-johan")).toMatchObject({
+      romanticInterest: 0,
+      romanticBoundaryClosed: true,
+      romanticBoundaryBlockerIds: ["human-johan"],
+    });
+  });
+
+  it("uses autonomous caps and lifetime provenance for resident-to-resident edges even in a human-origin episode", () => {
+    const store = new SocialMemoryStore({
+      filePath: ":memory:",
+      resolveActorKind: (actorId) => actorId.startsWith("resident-") ? "resident" : "human",
+    });
+    stores.push(store);
+    const event = (id: string, occurredAt: number): RecordSocialEventInput => baseEvent(id, {
+      origin: "human",
+      occurredAt,
+      actorIds: ["human-johan"],
+      subjectIds: ["resident-sana"],
+      witnessIds: ["resident-mira"],
+      memoryViews: [],
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "resident-sana",
+        warmth: 1,
+        romanticInterest: 1,
+      }],
+      openLoops: [],
+    });
+
+    const first = store.recordEvent(event("human-triggered-ai-pair", 1_800_000_000_000));
+    expect(first.appliedRelationshipDeltas[0]).toMatchObject({
+      origin: "autonomous",
+      warmth: 0.008,
+      romanticInterest: 0.01,
+    });
+    const sameDay = store.recordEvent(event("human-triggered-ai-pair-repeat", 1_800_000_001_000));
+    expect(sameDay.appliedRelationshipDeltas[0]).toMatchObject({ warmth: 0, romanticInterest: 0 });
+
+    // One evidence-bearing event cannot rush the relationship, but sixty
+    // distinct days can eventually reach the established behavior threshold.
+    for (let day = 1; day < 60; day += 1) {
+      store.recordEvent(event(`human-triggered-ai-pair-day-${day}`, 1_800_000_000_000 + day * DAY_MS));
+    }
+    const establishedSlowBurn = store.getRelationship("resident-mira", "resident-sana");
+    expect(establishedSlowBurn?.romanticInterest).toBeCloseTo(0.6);
+    expect(projectRelationshipBehavior(establishedSlowBurn).bands.romanticInterest).toBe("established");
+
+    // Unlimited autonomous activity remains lifetime-bounded.
+    for (let day = 60; day < 100; day += 1) {
+      store.recordEvent(event(`human-triggered-ai-pair-day-${day}`, 1_800_000_000_000 + day * DAY_MS));
+    }
+    expect(store.getRelationship("resident-mira", "resident-sana")).toMatchObject({
+      warmth: expect.closeTo(0.3, 8),
+      romanticInterest: expect.closeTo(0.65, 8),
+    });
+  });
+
+  it("checkpoints and replays romantic interest without reopening its spent UTC-day budget", async () => {
+    const baseNow = 1_800_000_000_000;
+    const { store } = await createStore(baseNow);
+    store.recordEvent(baseEvent("romance-before-checkpoint", {
+      occurredAt: baseNow,
+      memoryViews: [],
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        romanticInterest: 1,
+      }],
+      openLoops: [],
+    }));
+    store.runLifecycleMaintenance({ now: baseNow + 100 * DAY_MS });
+    expect(store.getRelationship("resident-mira", "human-johan")?.romanticInterest).toBeCloseTo(0.05);
+
+    const late = store.recordEvent(baseEvent("romance-late-same-day", {
+      occurredAt: baseNow + 1_000,
+      memoryViews: [],
+      relationshipDeltas: [{
+        ownerId: "resident-mira",
+        subjectId: "human-johan",
+        romanticInterest: 1,
+      }],
+      openLoops: [],
+    }));
+    expect(late.appliedRelationshipDeltas[0]?.romanticInterest).toBe(0);
+    expect(store.getRelationship("resident-mira", "human-johan")?.romanticInterest).toBeCloseTo(0.05);
   });
 
   it("supports audited pin, delete, loop-state, and relationship-reset admin operations", async () => {

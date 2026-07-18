@@ -806,6 +806,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
         },
         resolution: "none",
         openLoop: null,
+        romanticBoundaryTransition: null,
         views: [{
           ownerResidentId: "ai-mira",
           perspective: "Johan is moving soon, which may matter when he returns.",
@@ -848,8 +849,94 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       events: [{ kind: "personal_disclosure", views: [{ ownerResidentId: "ai-mira" }] }],
     });
     expect(completionCalls).toBe(1);
-    expect(completionBody.response_format.json_schema.name).toBe("multilingual_social_memory_episode_v1");
+    expect(completionBody.response_format.json_schema.name).toBe("multilingual_social_memory_episode_v2");
     expect(completionBody.messages[0].content).toContain("strict multilingual episodic social-memory analyst");
+  });
+
+  it("gives a near-valid social-memory candidate one bounded, fully revalidated repair", async () => {
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      const common = {
+        slot: "event_1",
+        kind: "support",
+        sourceMessageIds: ["repair-message-1", "repair-message-2"],
+        summary: "Johan thanked Mira and Mira acknowledged it.",
+        visibility: "participants_only",
+        confidence: 0.95,
+        resolution: "none",
+        openLoop: null,
+        romanticBoundaryTransition: null,
+        views: [{
+          ownerResidentId: "ai-mira",
+          perspective: "Mira appreciated the friendly thanks.",
+          appraisal: {
+            targetParticipantId: "human-johan",
+            outcome: "positive",
+            effects: ["warmth_up"],
+            confidence: 0.9,
+          },
+        }],
+      };
+      const content = bodies.length === 1
+        ? { events: [{
+            ...common,
+            salience: 3,
+            fact: {
+              subjectParticipantId: "human-johan",
+              provenance: "human_self_report",
+              sourceMessageId: "repair-message-1",
+              verbatimExcerpt: "Tack för hjälpen",
+            },
+          }] }
+        : { events: [{ ...common, salience: 0.7, fact: null }] };
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify(content) } }] });
+    }));
+
+    const lm = new LmStudioClient();
+    const result = await lm.analyzeSocialEpisode({
+      episodeId: "episode-social-structured-repair",
+      scope: "direct_message",
+      channel: { id: "dm-johan-mira", name: "Mira" },
+      participants: [
+        { id: "human-johan", kind: "human", displayName: "Johan" },
+        { id: "ai-mira", kind: "resident", displayName: "Mira" },
+      ],
+      messages: [
+        {
+          id: "repair-message-1",
+          authorId: "human-johan",
+          authorKind: "human",
+          content: "Tack för hjälpen, du är en bra vän.",
+          createdAt: "2026-07-18T15:00:00.000Z",
+        },
+        {
+          id: "repair-message-2",
+          authorId: "ai-mira",
+          authorKind: "resident",
+          content: "Klart jag hjälper dig.",
+          createdAt: "2026-07-18T15:00:10.000Z",
+        },
+      ],
+      eligibleResidentOwners: [{
+        residentId: "ai-mira",
+        witnessedMessageIds: ["repair-message-1", "repair-message-2"],
+        appraisalNote: "Mira is friendly without overreading the exchange.",
+      }],
+    });
+
+    expect(result).toMatchObject({ source: "lm", failureReason: null });
+    expect(result.events[0]).toMatchObject({ kind: "support", salience: 0.7, fact: null });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1].messages[0].content).toContain("Repair the entire candidate exactly once");
+    const repairData = JSON.parse(bodies[1].messages[1].content);
+    expect(repairData.validationIssues).toEqual(expect.arrayContaining([
+      expect.stringContaining("salience"),
+      expect.stringContaining("fact"),
+    ]));
+    expect(repairData.rejectedCandidate).toContain("Tack för hjälpen");
+    expect(bodies[1].response_format.json_schema.name).toBe("multilingual_social_memory_episode_v2");
   });
 
   it("deduplicates in-flight social analysis but evicts transient failures so a later retry can succeed", async () => {
@@ -857,7 +944,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
       if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
       completionCalls += 1;
-      return completionCalls === 1
+      return completionCalls <= 2
         ? jsonResponse({ choices: [{ message: { content: "not valid json" } }] })
         : jsonResponse({ choices: [{ message: { content: JSON.stringify({ events: [] }) } }] });
     }));
@@ -893,7 +980,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(retry).not.toBe(failed);
     await expect(retry).resolves.toMatchObject({ source: "lm", failureReason: null, events: [] });
     expect(lm.analyzeSocialEpisode(request)).toBe(retry);
-    expect(completionCalls).toBe(2);
+    expect(completionCalls).toBe(3);
   });
 
   it("runs bounded social-memory consolidation in the preemptible lane and caches by candidate content", async () => {

@@ -70,6 +70,7 @@ export const adminPersonaSchema: z.ZodType<AdminPersonaConfig> = z.object({
     disagreement: percent,
   }).strict(),
   canResearch: z.boolean(),
+  fictionalAdult: z.boolean(),
   roomAffinities: affinitySchema,
   voices: voicesSchema,
 }).strict();
@@ -108,7 +109,7 @@ const banSchema: z.ZodType<AdminBanRecord> = z.object({
 }).strict();
 
 const persistedSchema = z.object({
-  version: z.literal(2),
+  version: z.literal(3),
   revision: z.number().int().min(0),
   behavior: z.object({
     global: tuningSchema,
@@ -138,8 +139,8 @@ type PersistedAdminState = z.infer<typeof persistedSchema>;
 
 const migratePersistedState = (raw: unknown): unknown => {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
-  const record = raw as Record<string, unknown>;
-  if (record.version !== 1) return raw;
+  let record = raw as Record<string, unknown>;
+  if (record.version === 1) {
   const behavior = record.behavior;
   if (!behavior || typeof behavior !== "object" || Array.isArray(behavior)) return raw;
   const behaviorRecord = behavior as Record<string, unknown>;
@@ -179,7 +180,7 @@ const migratePersistedState = (raw: unknown): unknown => {
         }];
       }))
     : channelOverrides;
-  return {
+  record = {
     ...record,
     version: 2,
     channelOverrides: migratedChannelOverrides,
@@ -188,6 +189,32 @@ const migratePersistedState = (raw: unknown): unknown => {
       global: migratedGlobal,
       channels: migratedChannels,
     },
+  };
+  }
+  if (record.version !== 2) return record;
+
+  const personaOverrides = record.personaOverrides;
+  const customPersonas = record.customPersonas;
+  return {
+    ...record,
+    version: 3,
+    // Version 2 could contain only built-in persona overrides in this map.
+    // Built-ins are authored fictional adults, so preserve that invariant.
+    personaOverrides: personaOverrides && typeof personaOverrides === "object" && !Array.isArray(personaOverrides)
+      ? Object.fromEntries(Object.entries(personaOverrides as Record<string, unknown>).map(([id, config]) => [
+          id,
+          config && typeof config === "object" && !Array.isArray(config)
+            ? { ...(config as Record<string, unknown>), fictionalAdult: true }
+            : config,
+        ]))
+      : personaOverrides,
+    // Legacy custom residents had no trusted adult assertion and therefore
+    // fail closed until an administrator explicitly opts each one in.
+    customPersonas: Array.isArray(customPersonas)
+      ? customPersonas.map((config) => config && typeof config === "object" && !Array.isArray(config)
+          ? { ...(config as Record<string, unknown>), fictionalAdult: false }
+          : config)
+      : customPersonas,
   };
 };
 
@@ -202,7 +229,7 @@ const BUILTIN_PERSONA_IDS = new Set(BUILTIN_PERSONAS.map((persona) => persona.id
 const BUILTIN_CHANNEL_IDS = new Set(BUILTIN_CHANNEL_PROFILES.map((profile) => profile.public.id));
 
 const emptyState = (): PersistedAdminState => ({
-  version: 2,
+  version: 3,
   revision: 0,
   behavior: { global: { ...DEFAULT_TUNING }, channels: {} },
   personaOverrides: {},
@@ -234,6 +261,7 @@ const personaConfigFromRuntime = (persona: Persona): AdminPersonaConfig => ({
     disagreement: percentFromUnit(persona.disagreement, 20),
   },
   canResearch: Boolean(persona.canResearch),
+  fictionalAdult: true,
   roomAffinities: Object.fromEntries(
     Object.entries(persona.channelAffinity ?? {}).map(([channelId, value]) => [channelId, percentFromUnit(value)]),
   ),
@@ -510,6 +538,21 @@ export class AdminStateStore {
 
   behaviorTuning(channelId?: string): AdminBehaviorTuning {
     return { ...(channelId ? this.state.behavior.channels[channelId] ?? this.state.behavior.global : this.state.behavior.global) };
+  }
+
+  /**
+   * Trusted live romance-eligibility lookup. Built-ins are authored fictional
+   * adults; custom residents fail closed unless an administrator explicitly
+   * asserted the same invariant. Disabled or unknown actors are ineligible.
+   */
+  isRomanceEligibleResident(actorId: string): boolean {
+    if (BUILTIN_PERSONA_IDS.has(actorId)) {
+      if (this.state.disabledPersonaIds.includes(actorId)) return false;
+      return this.state.personaOverrides[actorId]?.fictionalAdult ?? true;
+    }
+    return this.state.customPersonas.some(
+      (persona) => persona.id === actorId && persona.fictionalAdult === true,
+    );
   }
 
   isBanned(memberId: string | undefined, name: string): boolean {

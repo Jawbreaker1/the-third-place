@@ -10,7 +10,15 @@ afterEach(() => {
 });
 
 const createStore = (now = Date.UTC(2026, 6, 16, 12)): SocialMemoryStore => {
-  const store = new SocialMemoryStore({ filePath: ":memory:", now: () => now });
+  const store = new SocialMemoryStore({
+    filePath: ":memory:",
+    now: () => now,
+    resolveActorKind: (actorId) => actorId === "ai-mira"
+      ? "resident"
+      : actorId === "human-johan"
+        ? "human"
+        : undefined,
+  });
   stores.push(store);
   return store;
 };
@@ -87,6 +95,52 @@ const reciprocalEvent = (): RecordSocialEventInput => ({
       friction: 0.1,
     },
   ],
+});
+
+const romanticRelationshipEvent = (
+  id: string,
+  ownerId: "ai-mira" | "human-johan",
+  subjectId: "ai-mira" | "human-johan",
+  romanticInterest: number,
+): RecordSocialEventInput => ({
+  id,
+  kind: "shared_moment",
+  origin: "human",
+  scope: { kind: "public", channelId: "lobby" },
+  sourceMessageIds: [`message-${id}`],
+  actorIds: [subjectId],
+  subjectIds: [ownerId],
+  witnessIds: [ownerId],
+  occurredAt: Date.UTC(2026, 6, 16, 11),
+  summary: "A source-grounded interaction changed one directed romantic-interest edge.",
+  salience: 0.8,
+  confidence: 0.95,
+  relationshipDeltas: [{ ownerId, subjectId, romanticInterest }],
+});
+
+const romanticBoundaryEvent = (
+  id: string,
+  blockerActorId: "ai-mira" | "human-johan",
+): RecordSocialEventInput => ({
+  id,
+  kind: "boundary",
+  origin: "human",
+  scope: { kind: "public", channelId: "lobby" },
+  sourceMessageIds: [`message-${id}`],
+  // The blocker is the trusted source author; a third party cannot write this.
+  actorIds: [blockerActorId],
+  subjectIds: [blockerActorId === "ai-mira" ? "human-johan" : "ai-mira"],
+  witnessIds: ["ai-mira"],
+  occurredAt: Date.UTC(2026, 6, 16, 11, 30),
+  summary: "One endpoint explicitly set its own directed romantic boundary.",
+  salience: 0.95,
+  confidence: 0.99,
+  romanticBoundaryTransitions: [{
+    ownerId: "ai-mira",
+    subjectId: "human-johan",
+    blockerActorId,
+    action: "set_closed",
+  }],
 });
 
 const boundedMemoryEvent = (
@@ -194,6 +248,85 @@ describe("social-memory admin projection", () => {
       sourceEventIds: ["event-kindness"],
       sourceMessageIds: ["message-1", "message-2"],
     });
+  });
+
+  it("projects romantic interest and endpoint-owned boundaries, then resets only the selected direction", () => {
+    const store = createStore();
+    store.recordEvent(romanticRelationshipEvent(
+      "romance-mira-to-johan",
+      "ai-mira",
+      "human-johan",
+      1,
+    ));
+    store.recordEvent(romanticRelationshipEvent(
+      "romance-johan-to-mira",
+      "human-johan",
+      "ai-mira",
+      1,
+    ));
+    store.recordEvent(romanticBoundaryEvent("johan-closes-forward-pair", "human-johan"));
+    store.recordEvent(romanticBoundaryEvent("mira-closes-forward-pair", "ai-mira"));
+    const admin = new SocialMemoryAdmin({ store, getActors: () => actors });
+
+    const before = admin.getActorDetail("ai-mira");
+    const forward = before?.outgoingRelationships.find(
+      (relationship) => relationship.subjectId === "human-johan",
+    );
+    const reverse = before?.incomingRelationships.find(
+      (relationship) => relationship.ownerId === "human-johan",
+    );
+    expect(forward?.romanticInterest).toBeCloseTo(0.05);
+    expect(forward?.romanticBoundary).toEqual({
+      state: "closed",
+      blockers: expect.arrayContaining([
+        { actorId: "ai-mira", actorName: "Mira" },
+        { actorId: "human-johan", actorName: "Johan" },
+      ]),
+    });
+    expect(forward?.romanticBoundary.blockers).toHaveLength(2);
+    expect(reverse).toMatchObject({
+      ownerId: "human-johan",
+      subjectId: "ai-mira",
+      romanticInterest: 0.05,
+      romanticBoundary: {
+        state: "closed",
+        blockers: expect.arrayContaining([
+          { actorId: "ai-mira", actorName: "Mira" },
+          { actorId: "human-johan", actorName: "Johan" },
+        ]),
+      },
+    });
+    expect(reverse?.romanticBoundary.state).not.toBe("open");
+
+    expect(admin.resetRelationship("ai-mira", "human-johan")).toBe(true);
+    expect(store.getRelationship("ai-mira", "human-johan")).toBeUndefined();
+    expect(store.getRomanticBoundary("ai-mira", "human-johan")).toMatchObject({
+      closed: true,
+      blockerActorIds: ["ai-mira", "human-johan"],
+    });
+
+    const reverseAfterReset = store.getRelationship("human-johan", "ai-mira");
+    expect(reverseAfterReset).toMatchObject({
+      romanticInterest: 0.05,
+      romanticBoundaryClosed: true,
+      romanticBoundaryBlockerIds: ["ai-mira", "human-johan"],
+    });
+    const after = admin.getActorDetail("ai-mira");
+    expect(after?.outgoingRelationships).toEqual([]);
+    expect(after?.incomingRelationships).toEqual([
+      expect.objectContaining({
+        ownerId: "human-johan",
+        subjectId: "ai-mira",
+        romanticInterest: 0.05,
+        romanticBoundary: {
+          state: "closed",
+          blockers: expect.arrayContaining([
+            { actorId: "ai-mira", actorName: "Mira" },
+            { actorId: "human-johan", actorName: "Johan" },
+          ]),
+        },
+      }),
+    ]);
   });
 
   it("records mutations as local-admin audit without exposing store metadata", () => {

@@ -36,6 +36,7 @@ describe("admin model boundary", () => {
           behaviorPrompt: "Keep it concrete.",
           sliders: { talkativeness: 105, warmth: 88 },
           researchEnabled: true,
+          fictionalAdult: true,
           affinities: { lobby: 83 },
           voiceMappings: { sv: "sv-voice" },
         }],
@@ -90,6 +91,7 @@ describe("admin model boundary", () => {
       role: "regular",
       prompt: "Keep it concrete.",
       canResearch: true,
+      fictionalAdult: true,
       roomAffinities: { lobby: 83 },
       voices: { sv: "sv-voice" },
       core: { talkativeness: 100, warmth: 88 },
@@ -111,6 +113,13 @@ describe("admin model boundary", () => {
       status: "online",
       recoveryConfigured: true,
     });
+  });
+
+  it("fails closed when legacy persona snapshots omit the fictional-adult assertion", () => {
+    const snapshot = normalizeAdminState({
+      personas: [{ id: "ai-custom", name: "Custom" }],
+    });
+    expect(snapshot.personas[0]?.fictionalAdult).toBe(false);
   });
 
   it("selects only the admin pathname and descendants", () => {

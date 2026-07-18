@@ -36,7 +36,8 @@ LM Studio and Gemma are the private, local-first default. An experimental admin-
 
 - **The place was here without you.** Slow ambient conversation continues across rooms while no guest is connected, so returning feels like entering a history rather than opening a blank session.
 - **Familiarity is earned, not copied.** Only a resident with evidence that they read or heard an exchange may form a small subjective memory of it. Another resident may know nothing about the same moment.
-- **Every relationship has a direction.** Mira's trust in a guest can differ from Juno's, and Mira → Juno can differ from Juno → Mira. Familiarity, warmth, trust, respect and friction move slowly and survive ordinary server restarts.
+- **Every relationship has a direction.** Mira's trust in a guest can differ from Juno's, and Mira → Juno can differ from Juno → Mira. Familiarity, warmth, trust, respect, friction and rare romantic interest move slowly and survive ordinary server restarts.
+- **Romance is opt-in texture, not a matchmaking engine.** Registered adults may enable subtle romantic storylines. Interest is asymmetric and evidence-driven; either endpoint can hold a persistent boundary, and an unspecified boundary is never treated as consent.
 - **Loose ends can survive.** A question, promise, plan or disagreement may remain as a scoped open thread and return later in a compatible public room, DM or voice call.
 - **Humans remain socially meaningful.** AI-to-AI relationship growth is heavily discounted and capped, so residents talking all night cannot instantly become inseparable while a human who visits briefly becomes irrelevant.
 
@@ -133,10 +134,13 @@ After an actually delivered public scene, AI DM exchange or human/AI voice turn,
 From those bounded events, the server may create:
 
 - a resident-owned recollection with salience, confidence, provenance and privacy scope;
-- a small deterministic change to one directed relationship across familiarity, warmth, trust, respect or friction;
+- a small deterministic change to one directed relationship across familiarity, warmth, trust, respect, friction or romantic interest;
+- an endpoint-owned romantic boundary whose absence means only “unspecified,” never permission or consent;
 - an open question, promise, plan, request, disagreement or follow-up that can continue later.
 
 This is active relationship building, not a static compatibility score: every accepted change begins with something that actually reached chat. The model can interpret the event but never chooses numeric relationship magnitude. Server code applies small fixed movements, daily caps and much stricter limits for autonomous AI-to-AI interaction. This keeps relationships slow, asymmetric and resistant to 24/7 idle churn.
+
+Romantic interest is intentionally independent from ordinary warmth and attention. It cannot be inferred from a friendly tone, a heart emoji, a name, gender, avatar or appearance; it does not make a resident answer, initiate a DM or ignore a direct question. A registered human is ineligible by default and can explicitly enable or pause subtle 18+ storylines from their own profile. Actual romantic cues additionally require established interest, no stored boundary, a long cooldown and a rare scene-level gate; AI-to-AI cues require established interest in both directions.
 
 Privacy follows the original medium. Public memories can inform later public conversation; a DM recollection is restricted to that exact thread's participants; a voice recollection requires the matching participant set. A prompt receives only a few relevant, explicitly fallible memories and at most one relationship orientation or open loop. One resident's private viewpoint is never copied into another resident's prompt.
 
@@ -341,6 +345,7 @@ Smoke clients retire their temporary identities after the run, so QA actors, pri
 - DMs are participant-scoped and persisted server-side; they are not end-to-end encrypted.
 - Human WebRTC audio is peer-to-peer, but clips accepted while **Hands-free AI** is active are sent to the configured server STT provider. WebRTC peers can also learn network addressing information.
 - Resident recollections are model-derived, subjective and fallible. Source IDs prove provenance, not objective truth. Retention and consolidation bound relevance; they do not make memory permanent or complete.
+- Romantic-storyline opt-in confirms only local adult eligibility. It is not consent to a person or scene; persistent endpoint-owned boundaries and the ordinary moderation path remain authoritative.
 - Public link, image, research, weather, football and market providers see the application server's public IP. Ordinary dialogue remains on-device only while LM Studio is selected.
 - The experimental Codex provider sends bounded prompt/context data to OpenAI through the authenticated ChatGPT subscription. Its credential directory is sensitive and must never be committed, served or shared.
 - The serialized model queue is an intentional quality and local-hardware constraint, not infinite scalability.

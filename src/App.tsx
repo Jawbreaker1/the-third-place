@@ -391,6 +391,7 @@ export default function App() {
   const [showDirector, setShowDirector] = useState(false);
   const [profile, setProfile] = useState<Member | null>(null);
   const [forgettingMemory, setForgettingMemory] = useState(false);
+  const [updatingRomancePreference, setUpdatingRomancePreference] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<Panel>(null);
   const [toasts, setToasts] = useState<Array<ToastPayload & { id: number }>>([]);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -1966,6 +1967,46 @@ export default function App() {
     }
   };
 
+  const updateRomancePreference = async (enabled: boolean) => {
+    if (updatingRomancePreference || sessionIdentity?.kind !== "registered") return;
+    setUpdatingRomancePreference(true);
+    try {
+      const response = await fetch("/api/account/preferences", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          romanticInteractionsOptIn: enabled,
+          ...(enabled ? { adultConfirmed: true } : {}),
+        }),
+      });
+      const result = await response.json().catch(() => null) as {
+        ok?: boolean;
+        identity?: HumanSessionIdentity;
+        error?: string;
+      } | null;
+      if (!response.ok || result?.ok !== true || result.identity?.kind !== "registered") {
+        throw new Error(result?.error ?? "That story preference could not be updated.");
+      }
+      setSessionIdentity(result.identity);
+      pushToast({
+        tone: "success",
+        title: enabled ? "Romantic storylines allowed" : "Romantic storylines paused",
+        message: enabled
+          ? "This only makes subtle adult storylines eligible. It never overrides your boundaries."
+          : "Residents will no longer express romantic interest toward this account.",
+      });
+    } catch (error) {
+      pushToast({
+        tone: "warning",
+        title: "Preference not changed",
+        message: error instanceof Error ? error.message : "Try again in a moment.",
+      });
+    } finally {
+      setUpdatingRomancePreference(false);
+    }
+  };
+
   const upgradeCurrentIdentity = async (event: FormEvent) => {
     event.preventDefault();
     if (upgradingAccount || sessionIdentity?.kind === "registered") return;
@@ -3497,10 +3538,24 @@ export default function App() {
                       : "Human visitor"}</b></span>
               </div>
               {me && profile.id === me.id && sessionIdentity?.kind === "registered" && (
-                <div className="profile-account-status">
-                  <Icon name="lock" size={16} />
-                  <span><strong>Local account</strong><small>@{sessionIdentity.loginHandle} · Your identity and private chats remain after logout.</small></span>
-                </div>
+                <>
+                  <div className="profile-account-status">
+                    <Icon name="lock" size={16} />
+                    <span><strong>Local account</strong><small>@{sessionIdentity.loginHandle} · Your identity and private chats remain after logout.</small></span>
+                  </div>
+                  <label className="profile-romance-preference">
+                    <span className="profile-romance-copy">
+                      <span><Icon name="spark" size={15} /><strong>Allow subtle romantic storylines (18+)</strong></span>
+                      <small>Optional, slow-burn moments between adults. This is eligibility—not consent—and a boundary always wins.</small>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={sessionIdentity.romanticInteractionsOptIn === true}
+                      disabled={updatingRomancePreference}
+                      onChange={(event) => void updateRomancePreference(event.target.checked)}
+                    />
+                  </label>
+                </>
               )}
               {me && profile.id === me.id && sessionIdentity && sessionIdentity.kind !== "registered" && (
                 <form className="profile-upgrade" onSubmit={upgradeCurrentIdentity}>

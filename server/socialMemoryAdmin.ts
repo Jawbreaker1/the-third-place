@@ -400,6 +400,14 @@ export class SocialMemoryAdmin {
       trust: relationship.trust,
       respect: relationship.respect,
       friction: relationship.friction,
+      romanticInterest: relationship.romanticInterest,
+      romanticBoundary: {
+        state: relationship.romanticBoundaryClosed ? "closed" : "unspecified",
+        blockers: relationship.romanticBoundaryBlockerIds.map((actorId) => ({
+          actorId,
+          actorName: names.get(actorId) ?? actorId,
+        })),
+      },
       updatedAt: asIso(relationship.updatedAt),
     };
   }

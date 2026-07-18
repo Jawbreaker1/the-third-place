@@ -31,6 +31,12 @@ export interface AccountRecord {
   actorId: string;
   loginHandle: string;
   displayName: string;
+  /**
+   * Eligibility preference for a registered adult account to appear in subtle,
+   * non-sexual romantic storylines. This is never consent to an interaction;
+   * every interaction must still respect current boundaries and context.
+   */
+  romanticInteractionsOptIn: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -234,6 +240,7 @@ const publicAccount = (account: PersistedAccount): AccountRecord => ({
   actorId: account.actorId,
   loginHandle: account.loginHandle,
   displayName: account.displayName,
+  romanticInteractionsOptIn: account.romanticInteractionsOptIn,
   createdAt: account.createdAt,
   updatedAt: account.updatedAt,
 });
@@ -247,7 +254,7 @@ const publicSession = (session: PersistedSession): AccountSession => ({
 
 const ACCOUNT_KEYS = new Set([
   "id", "kind", "profileState", "actorId", "loginHandle", "normalizedHandle", "displayName",
-  "createdAt", "updatedAt", "password",
+  "romanticInteractionsOptIn", "createdAt", "updatedAt", "password",
 ]);
 const PASSWORD_KEYS = new Set(["algorithm", "salt", "digest", "keyLength", "N", "r", "p", "maxmem"]);
 const SESSION_KEYS = new Set(["id", "accountId", "tokenHash", "createdAt", "expiresAt"]);
@@ -284,7 +291,9 @@ const parseState = (value: unknown): PersistedAccountState => {
         !isSafeIdentifier(candidate.id) || !isSafeIdentifier(candidate.actorId) ||
         typeof candidate.loginHandle !== "string" || typeof candidate.normalizedHandle !== "string" ||
         typeof candidate.displayName !== "string" || !isCanonicalTimestamp(candidate.createdAt) ||
-        !isCanonicalTimestamp(candidate.updatedAt)) {
+        !isCanonicalTimestamp(candidate.updatedAt) ||
+        (candidate.romanticInteractionsOptIn !== undefined &&
+          typeof candidate.romanticInteractionsOptIn !== "boolean")) {
       throw new TypeError("Account store contains an invalid registered account.");
     }
     const normalized = normalizeLoginHandle(candidate.loginHandle);
@@ -303,6 +312,9 @@ const parseState = (value: unknown): PersistedAccountState => {
       loginHandle: candidate.loginHandle,
       normalizedHandle: candidate.normalizedHandle,
       displayName: candidate.displayName,
+      // Version 1 account files predate this preference. Missing is the safe,
+      // fail-closed value; no guest or legacy identity is promoted by parsing.
+      romanticInteractionsOptIn: candidate.romanticInteractionsOptIn ?? false,
       createdAt: candidate.createdAt,
       updatedAt: candidate.updatedAt,
       password: parsePasswordDigest(candidate.password),
@@ -514,6 +526,7 @@ export class AccountStore {
         loginHandle: normalized.handle,
         normalizedHandle: normalized.key,
         displayName,
+        romanticInteractionsOptIn: false,
         createdAt: timestamp,
         updatedAt: timestamp,
         password: {
@@ -654,6 +667,32 @@ export class AccountStore {
         ...this.state,
         accounts: this.state.accounts.map((candidate) => candidate.id === accountId
           ? { ...candidate, profileState: "ready", updatedAt }
+          : candidate),
+      });
+      await this.persist(next);
+      this.state = next;
+      return this.getAccount(accountId);
+    });
+  }
+
+  /**
+   * Stores registered-adult storyline eligibility only. A true value is not
+   * consent to any interaction and must never bypass live boundary checks.
+   */
+  async setRomanticInteractionsOptIn(
+    accountId: string,
+    enabled: boolean,
+  ): Promise<AccountRecord | undefined> {
+    if (typeof enabled !== "boolean") throw new TypeError("Romantic interaction preference must be boolean.");
+    return this.enqueue(async () => {
+      const account = this.state.accounts.find((candidate) => candidate.id === accountId);
+      if (!account) return undefined;
+      if (account.romanticInteractionsOptIn === enabled) return publicAccount(account);
+      const updatedAt = new Date(this.now()).toISOString();
+      const next = parseState({
+        ...this.state,
+        accounts: this.state.accounts.map((candidate) => candidate.id === accountId
+          ? { ...candidate, romanticInteractionsOptIn: enabled, updatedAt }
           : candidate),
       });
       await this.persist(next);

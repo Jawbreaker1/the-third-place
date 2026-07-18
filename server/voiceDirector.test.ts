@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
+import type { VoiceRoomView, VoiceTranscriptEntry } from "../shared/types.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
-import { PERSONAS } from "./personas.js";
+import { PERSONAS, type Persona } from "./personas.js";
 import { setAdminPersonaVoiceMappings } from "./personaVoices.js";
 import { createFailClosedTurnAnalysis, type TurnAnalysis, type TurnAnalysisInput } from "./semanticRouter.js";
 import { mentionsPersona, routedLanguage, VoiceDirector, sanitizeSpokenLine, ttsModelSupportsLanguage } from "./voiceDirector.js";
 import { VoiceRoomRuntime } from "./voiceRooms.js";
 import { CapabilityRegistry } from "./capabilities/registry.js";
+import type { RelationshipBehaviorProjection } from "./relationshipBehavior.js";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
 const voiceCapabilityRegistry = (now: () => number = Date.now): CapabilityRegistry => new CapabilityRegistry({
@@ -98,6 +100,14 @@ interface LanguageTurnOptions {
     promptNote: ReturnType<typeof vi.fn>;
     enqueueDeliveredEpisode: ReturnType<typeof vi.fn>;
   };
+  relationshipBehaviorProjection?: (
+    ownerPersonaId: string,
+    subjectActorId: string,
+  ) => RelationshipBehaviorProjection | undefined;
+  romanceEligibleActor?: (
+    actorId: string,
+    kind: "human" | "resident",
+  ) => boolean;
 }
 
 const runLanguageTurn = async (options: LanguageTurnOptions) => {
@@ -183,6 +193,10 @@ const runLanguageTurn = async (options: LanguageTurnOptions) => {
     },
     actorChannels: new ActorChannelRuntime(),
     ...(options.socialMemory ? { socialMemory: options.socialMemory as never } : {}),
+    ...(options.relationshipBehaviorProjection
+      ? { relationshipBehaviorProjection: options.relationshipBehaviorProjection }
+      : {}),
+    romanceEligibleActor: options.romanceEligibleActor ?? ((_actorId, kind) => kind === "resident"),
     ...(options.establishedChannelLanguage
       ? { establishedChannelLanguage: () => options.establishedChannelLanguage }
       : {}),
@@ -219,6 +233,126 @@ const installCustomPersona = (id: string, name: string): (() => void) => {
   return () => {
     const index = PERSONAS.findIndex((persona) => persona.id === id);
     if (index >= 0) PERSONAS.splice(index, 1);
+  };
+};
+
+const voiceRelationshipProjection = (input: {
+  voiceTieBreak?: number;
+  closed?: boolean;
+  blockerActorIds?: string[];
+  includeRomanticCue?: boolean;
+} = {}): RelationshipBehaviorProjection => ({
+  bands: {
+    familiarity: "close",
+    warmth: "positive",
+    trust: "positive",
+    respect: "positive",
+    friction: "low",
+    romanticInterest: "established",
+  },
+  romanticBoundary: {
+    state: input.closed ? "closed" : "unspecified",
+    blockerActorIds: input.blockerActorIds ?? [],
+  },
+  decisionBiases: {
+    ordinaryPublicReply: 0,
+    conflictChallengeReply: 0,
+    welcome: 0,
+    ambientContinuation: 0,
+    voiceTieBreak: input.voiceTieBreak ?? 0,
+  },
+  promptCue: {
+    rapport: "close",
+    stance: "warm",
+    friction: "low",
+    ...(input.includeRomanticCue ? { romanticInterest: "established" as const } : {}),
+  },
+});
+
+const selectionDirector = (
+  runtime: VoiceRoomRuntime,
+  actorChannels: ActorChannelRuntime,
+  relationshipBehaviorProjection?: (
+    ownerPersonaId: string,
+    subjectActorId: string,
+  ) => RelationshipBehaviorProjection | undefined,
+  now: () => number = () => 100_000,
+) => new VoiceDirector({
+  runtime,
+  capabilityRegistry: voiceCapabilityRegistry(now),
+  lm: {
+    analyzeTurn: analyzeSwedish,
+    generateScene: async () => [],
+  },
+  speech: {
+    capabilities: async () => ({
+      stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+      tts: { available: false, provider: "disabled", formats: [] },
+      normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+      browserFallbackAllowed: true,
+    }),
+    synthesize: async () => { throw new Error("selection tests never synthesize"); },
+  },
+  actorChannels,
+  ...(relationshipBehaviorProjection ? { relationshipBehaviorProjection } : {}),
+  now,
+  events: {
+    roomChanged: () => undefined,
+    transcriptFinal: () => undefined,
+    aiSpeech: () => undefined,
+    aiStop: () => undefined,
+  },
+});
+
+const invokeVoiceSelection = (
+  director: VoiceDirector,
+  entry: VoiceTranscriptEntry,
+  room: VoiceRoomView,
+  invited: Persona[],
+  analysis: TurnAnalysis | undefined,
+): Persona | undefined => (director as unknown as {
+  selectPersona: (
+    candidateEntry: VoiceTranscriptEntry,
+    candidateRoom: VoiceRoomView,
+    candidatePersonas: Persona[],
+    candidateAnalysis: TurnAnalysis | undefined,
+  ) => Persona | undefined;
+}).selectPersona(entry, room, invited, analysis);
+
+const createVoiceSelectionFixture = (
+  text: string,
+  personaSpecs: Array<{ id: string; name: string; install?: boolean }>,
+) => {
+  const cleanups = personaSpecs.map(({ id, name, install = true }) =>
+    install ? installCustomPersona(id, name) : () => undefined,
+  );
+  const runtime = new VoiceRoomRuntime(["lobby"]);
+  const created = runtime.createRoom("lobby", {
+    socketId: "socket-relationship-selection",
+    memberId: "human-relationship-selection",
+    name: "Alex",
+  });
+  if (!created.ok) throw new Error(created.error);
+  for (const spec of personaSpecs) {
+    const invited = runtime.inviteBot(created.room.id, "socket-relationship-selection", {
+      personaId: spec.id,
+      name: spec.name,
+    });
+    if (!invited.ok) throw new Error(invited.error);
+    runtime.setBotState(created.room.id, spec.id, "listening");
+  }
+  const appended = runtime.appendFinalTranscript(created.room.id, "human-relationship-selection", text);
+  if (!appended.ok) throw new Error(appended.error);
+  const room = runtime.getRoom(created.room.id);
+  if (!room) throw new Error("voice selection room disappeared");
+  const invited = personaSpecs.map(({ id }) => PERSONAS.find((persona) => persona.id === id)!);
+  return {
+    actorChannels: new ActorChannelRuntime(),
+    cleanup: () => cleanups.reverse().forEach((cleanup) => cleanup()),
+    entry: appended.entry,
+    invited,
+    room,
+    runtime,
   };
 };
 
@@ -261,6 +395,196 @@ describe("VoiceDirector", () => {
     });
   });
 
+  it("uses relationship state only as a small tie-break between otherwise optional speakers", () => {
+    const fixture = createVoiceSelectionFixture("Vad tänker ni om det här?", [
+      { id: "ai-voice-alpha", name: "Alpha" },
+      { id: "ai-voice-beta", name: "Beta" },
+    ]);
+    try {
+      const projection = vi.fn((ownerPersonaId: string) => voiceRelationshipProjection({
+        voiceTieBreak: ownerPersonaId === "ai-voice-beta" ? 0.08 : -0.08,
+      }));
+      const director = selectionDirector(fixture.runtime, fixture.actorChannels, projection);
+
+      expect(invokeVoiceSelection(
+        director,
+        fixture.entry,
+        fixture.room,
+        fixture.invited,
+        routedAnalysis(),
+      )?.id).toBe("ai-voice-beta");
+      expect(projection).toHaveBeenCalledWith("ai-voice-alpha", "human-relationship-selection");
+      expect(projection).toHaveBeenCalledWith("ai-voice-beta", "human-relationship-selection");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("is fail-neutral when the relationship projection is absent, empty or throws", () => {
+    const fixture = createVoiceSelectionFixture("Vad tänker ni om det här?", [
+      { id: "ai-voice-alpha-neutral", name: "Alpha" },
+      { id: "ai-voice-beta-neutral", name: "Beta" },
+    ]);
+    try {
+      const analyses = routedAnalysis();
+      const selectedIds = [
+        selectionDirector(fixture.runtime, fixture.actorChannels),
+        selectionDirector(fixture.runtime, fixture.actorChannels, () => undefined),
+        selectionDirector(fixture.runtime, fixture.actorChannels, () => {
+          throw new Error("projection unavailable");
+        }),
+      ].map((director) => invokeVoiceSelection(
+        director,
+        fixture.entry,
+        fixture.room,
+        fixture.invited,
+        analyses,
+      )?.id);
+
+      expect(selectedIds).toEqual([
+        "ai-voice-alpha-neutral",
+        "ai-voice-alpha-neutral",
+        "ai-voice-alpha-neutral",
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("keeps exact and semantic addressees ahead of relationship preference", () => {
+    const exactFixture = createVoiceSelectionFixture("@Alpha, vad tycker du?", [
+      { id: "ai-voice-alpha-exact", name: "Alpha" },
+      { id: "ai-voice-beta-exact", name: "Beta" },
+    ]);
+    try {
+      const exactProjection = vi.fn((ownerPersonaId: string) => voiceRelationshipProjection({
+        voiceTieBreak: ownerPersonaId.includes("beta") ? 0.08 : -0.08,
+      }));
+      const exactDirector = selectionDirector(
+        exactFixture.runtime,
+        exactFixture.actorChannels,
+        exactProjection,
+      );
+      expect(invokeVoiceSelection(
+        exactDirector,
+        exactFixture.entry,
+        exactFixture.room,
+        exactFixture.invited,
+        routedAnalysis(),
+      )?.id).toBe("ai-voice-alpha-exact");
+      expect(exactProjection).not.toHaveBeenCalled();
+    } finally {
+      exactFixture.cleanup();
+    }
+
+    const semanticFixture = createVoiceSelectionFixture("Vad tycker du om det här?", [
+      { id: "ai-voice-alpha-semantic", name: "Alpha" },
+      { id: "ai-voice-beta-semantic", name: "Beta" },
+    ]);
+    try {
+      const semanticProjection = vi.fn((ownerPersonaId: string) => voiceRelationshipProjection({
+        voiceTieBreak: ownerPersonaId.includes("beta") ? 0.08 : -0.08,
+      }));
+      const semanticDirector = selectionDirector(
+        semanticFixture.runtime,
+        semanticFixture.actorChannels,
+        semanticProjection,
+      );
+      expect(invokeVoiceSelection(
+        semanticDirector,
+        semanticFixture.entry,
+        semanticFixture.room,
+        semanticFixture.invited,
+        routedAnalysis("sv-SE", { addressedIds: ["ai-voice-alpha-semantic"] }),
+      )?.id).toBe("ai-voice-alpha-semantic");
+      expect(semanticProjection).not.toHaveBeenCalled();
+    } finally {
+      semanticFixture.cleanup();
+    }
+  });
+
+  it("keeps moderation and cooldown policy ahead of relationship preference", () => {
+    const moderationFixture = createVoiceSelectionFixture("Nu går det över styr.", [
+      { id: "ai-runa", name: "Runa", install: false },
+      { id: "ai-voice-beta-moderation", name: "Beta" },
+    ]);
+    try {
+      const projection = vi.fn((ownerPersonaId: string) => voiceRelationshipProjection({
+        voiceTieBreak: ownerPersonaId === "ai-voice-beta-moderation" ? 0.08 : -0.08,
+      }));
+      const director = selectionDirector(
+        moderationFixture.runtime,
+        moderationFixture.actorChannels,
+        projection,
+      );
+      const moderationAnalysis = {
+        ...routedAnalysis(),
+        moderation: {
+          risk: "medium",
+          action: "deescalate",
+          categories: ["harassment"],
+          confidence: 0.99,
+        },
+      } as TurnAnalysis;
+      expect(invokeVoiceSelection(
+        director,
+        moderationFixture.entry,
+        moderationFixture.room,
+        moderationFixture.invited,
+        moderationAnalysis,
+      )?.id).toBe("ai-runa");
+      expect(projection).not.toHaveBeenCalled();
+    } finally {
+      moderationFixture.cleanup();
+    }
+
+    const cooldownFixture = createVoiceSelectionFixture("Vad tänker ni?", [
+      { id: "ai-voice-alpha-cooldown", name: "Alpha" },
+      { id: "ai-voice-beta-cooldown", name: "Beta" },
+    ]);
+    try {
+      const now = () => 100_000;
+      const director = selectionDirector(
+        cooldownFixture.runtime,
+        cooldownFixture.actorChannels,
+        (ownerPersonaId) => voiceRelationshipProjection({
+          voiceTieBreak: ownerPersonaId.includes("beta") ? 0.08 : -0.08,
+        }),
+        now,
+      );
+      (director as unknown as { lastSpokeAtByPersona: Map<string, number> })
+        .lastSpokeAtByPersona.set("ai-voice-beta-cooldown", now());
+      expect(invokeVoiceSelection(
+        director,
+        cooldownFixture.entry,
+        cooldownFixture.room,
+        cooldownFixture.invited,
+        routedAnalysis(),
+      )?.id).toBe("ai-voice-alpha-cooldown");
+    } finally {
+      cooldownFixture.cleanup();
+    }
+  });
+
+  it("answers an ordinary direct question across a closed romantic boundary with only a coarse cue", async () => {
+    const result = await runLanguageTurn({
+      analysis: routedAnalysis("sv-SE", { addressedIds: ["ai-sana"] }),
+      utterance: "Sana, vad tycker du om filmen?",
+      reply: "Jag gillade tempot, men slutet var lite väl prydligt.",
+      relationshipBehaviorProjection: () => voiceRelationshipProjection({
+        closed: true,
+        blockerActorIds: ["human-language-anchor"],
+        includeRomanticCue: true,
+        voiceTieBreak: 0.08,
+      }),
+    });
+
+    expect(result.payloads).toHaveLength(1);
+    expect(result.sceneRelationshipNote).toContain('"rapport":"close"');
+    expect(result.sceneRelationshipNote).toContain('"stance":"warm"');
+    expect(result.sceneRelationshipNote).not.toMatch(/romanticInterest|blocker|human-language-anchor|0\.08/iu);
+  });
+
   it("persists only the voice exchange that reached transcript and reuses scoped resident memory", async () => {
     const promptNote = vi.fn(() => "remembered that Alex likes odd film trivia");
     const enqueueDeliveredEpisode = vi.fn(async () => ({
@@ -284,6 +608,7 @@ describe("VoiceDirector", () => {
         roomId: result.roomId,
         participantIds: ["ai-sana", "human-language-anchor"],
       }),
+      { romanticSceneEligibility: "ineligible" },
     );
     expect(enqueueDeliveredEpisode).toHaveBeenCalledOnce();
     expect(enqueueDeliveredEpisode).toHaveBeenCalledWith(expect.objectContaining({
@@ -293,6 +618,10 @@ describe("VoiceDirector", () => {
         expect.objectContaining({ authorId: "human-language-anchor", authorKind: "human" }),
         expect.objectContaining({ authorId: "ai-sana", authorKind: "resident" }),
       ],
+      participants: expect.arrayContaining([
+        expect.objectContaining({ id: "human-language-anchor", kind: "human", romanceEligible: false }),
+        expect.objectContaining({ id: "ai-sana", kind: "resident", romanceEligible: true }),
+      ]),
       eligibleResidentOwners: [{
         residentId: "ai-sana",
         witnessedMessageIds: expect.arrayContaining([
@@ -303,11 +632,102 @@ describe("VoiceDirector", () => {
     }));
     const episode = enqueueDeliveredEpisode.mock.calls[0]?.[0] as {
       messages: Array<{ id: string }>;
+      participants: Array<{ id: string; kind: "human" | "resident"; romanceEligible: boolean }>;
       eligibleResidentOwners: Array<{ witnessedMessageIds: string[] }>;
     };
     expect(episode.eligibleResidentOwners[0]?.witnessedMessageIds).toEqual(
       episode.messages.map((message) => message.id),
     );
+  });
+
+  it("carries the no-romantic-escalation veto into voice generation for an ineligible resident", async () => {
+    const promptNote = vi.fn((_ownerId, _subjectId, _scope, options) =>
+      options?.romanticSceneEligibility === "ineligible"
+        ? "SCENE POLICY: do not flirt, romantically reciprocate, suggest dating, or add sexual or romantic escalation. Ordinary warmth, humor and disagreement remain allowed."
+        : 'unexpected {"romanticInterest":"established"}'
+    );
+    const enqueueDeliveredEpisode = vi.fn(async () => ({
+      status: "no_events" as const,
+      episodeId: "voice-ineligible-resident",
+      eventIds: [],
+      createdEventIds: [],
+    }));
+    const result = await runLanguageTurn({
+      analysis: routedAnalysis("sv-SE", { addressedIds: ["ai-sana"] }),
+      utterance: "Jag tycker väldigt mycket om dig.",
+      romanceEligibleActor: (_actorId, kind) => kind === "human",
+      socialMemory: { promptNote, enqueueDeliveredEpisode },
+    });
+
+    expect(result.sceneRelationshipNote).toContain("do not flirt, romantically reciprocate");
+    expect(result.sceneRelationshipNote).toContain("Ordinary warmth, humor and disagreement remain allowed");
+    expect(result.sceneRelationshipNote).not.toContain("romanticInterest");
+    expect(promptNote).toHaveBeenCalledWith(
+      "ai-sana",
+      "human-language-anchor",
+      expect.anything(),
+      { romanticSceneEligibility: "ineligible" },
+    );
+    const episode = enqueueDeliveredEpisode.mock.calls[0]?.[0] as {
+      participants: Array<{ id: string; romanceEligible: boolean }>;
+    };
+    expect(episode.participants).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "human-language-anchor", romanceEligible: true }),
+      expect.objectContaining({ id: "ai-sana", romanceEligible: false }),
+    ]));
+  });
+
+  it("uses only trusted server policy to make a human romance-eligible for voice memory", async () => {
+    const enqueueDeliveredEpisode = vi.fn(async () => ({
+      status: "no_events" as const,
+      episodeId: "voice-romance-policy",
+      eventIds: [],
+      createdEventIds: [],
+    }));
+    await runLanguageTurn({
+      analysis: routedAnalysis("sv-SE", { addressedIds: ["ai-sana"] }),
+      utterance: "Vad tycker du?",
+      romanceEligibleActor: (actorId, kind) => kind === "resident" ||
+        (kind === "human" && actorId === "human-language-anchor"),
+      socialMemory: {
+        promptNote: vi.fn(() => undefined),
+        enqueueDeliveredEpisode,
+      },
+    });
+
+    const episode = enqueueDeliveredEpisode.mock.calls[0]?.[0] as {
+      participants: Array<{ id: string; kind: "human" | "resident"; romanceEligible: boolean }>;
+    };
+    expect(episode.participants).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "human-language-anchor", romanceEligible: true }),
+      expect.objectContaining({ id: "ai-sana", romanceEligible: true }),
+    ]));
+  });
+
+  it("fails every voice actor's romance eligibility closed when trusted policy throws", async () => {
+    const enqueueDeliveredEpisode = vi.fn(async () => ({
+      status: "no_events" as const,
+      episodeId: "voice-romance-policy-failure",
+      eventIds: [],
+      createdEventIds: [],
+    }));
+    await runLanguageTurn({
+      analysis: routedAnalysis("sv-SE", { addressedIds: ["ai-sana"] }),
+      utterance: "Vad tycker du?",
+      romanceEligibleActor: () => { throw new Error("account store unavailable"); },
+      socialMemory: {
+        promptNote: vi.fn(() => undefined),
+        enqueueDeliveredEpisode,
+      },
+    });
+
+    const episode = enqueueDeliveredEpisode.mock.calls[0]?.[0] as {
+      participants: Array<{ id: string; kind: "human" | "resident"; romanceEligible: boolean }>;
+    };
+    expect(episode.participants).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "human-language-anchor", romanceEligible: false }),
+      expect.objectContaining({ id: "ai-sana", romanceEligible: false }),
+    ]));
   });
 
   it.each([

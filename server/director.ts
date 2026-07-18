@@ -118,6 +118,11 @@ import type {
   SocialMemoryCoordinator,
 } from "./socialMemoryCoordinator.js";
 import type { SocialMemoryScope } from "./socialMemory.js";
+import type { RelationshipDecisionBiases } from "./relationshipBehavior.js";
+import {
+  shouldSurfaceRareRomanticPromptCue,
+  type HumanRomanticTurnGate,
+} from "./relationshipBeatPolicy.js";
 
 export interface SocialSignals {
   mentionedIds: string[];
@@ -165,6 +170,14 @@ const PENDING_PUBLIC_TURN_RETRY_DELAY_MS = 14_000;
 const PENDING_PUBLIC_TURN_RETRY_COOLDOWN_MS = 12_000;
 const AUTONOMOUS_SOCIAL_MEMORY_WINDOW_MS = 12 * 60_000;
 const AUTONOMOUS_SOCIAL_MEMORY_COOLDOWN_MS = 10 * 60_000;
+const HUMAN_ROMANTIC_CUE_COOLDOWN_MS = 8 * 60 * 60_000;
+const RESIDENT_ROMANTIC_CUE_COOLDOWN_MS = 12 * 60 * 60_000;
+const HUMAN_ROMANTIC_CUE_CHANCE = Object.freeze({
+  public: 0.012,
+  dm: 0.06,
+});
+const RESIDENT_ROMANTIC_CUE_CHANCE = 0.01;
+const MAX_ROMANTIC_CUE_COOLDOWNS = 4_096;
 const AUTONOMOUS_SOCIAL_MEMORY_MAX_MESSAGES = 8;
 const CROWD_REACTION_PALETTES = {
   hostile: ["😬", "👀", "🛑"],
@@ -274,6 +287,34 @@ export function socialSignalsFromTurnAnalysis(
   };
 }
 
+/**
+ * Projects only trusted structured current-turn semantics into the rare-cue
+ * policy. It never reads chat text, language, punctuation or room names.
+ */
+export function humanRomanticTurnGate(
+  analysis: TurnAnalysis,
+  personaId: string,
+  deterministicAddressedIds: readonly string[],
+): HumanRomanticTurnGate {
+  const trusted = projectTrustedTurnAnalysis(analysis);
+  const addressedToResident = deterministicAddressedIds.includes(personaId) ||
+    trusted.inferredAddressedIds.includes(personaId);
+  return {
+    semanticTrusted: analysis.source === "lm" && trusted.romanticSurfaceTrusted,
+    semanticKind: trusted.romanticSurface,
+    addressedToResident,
+    socialTrusted: trusted.socialTrusted,
+    hostility: trusted.social.hostility,
+    urgency: trusted.social.urgency,
+    interactionTrusted: trusted.interactionTrusted,
+    interactionKind: trusted.interaction.kind,
+    moderationTrusted: trusted.moderationTrusted,
+    moderationRisk: trusted.moderation.risk,
+    moderationAction: trusted.moderation.action,
+    moderationCategories: trusted.moderation.categories,
+  };
+}
+
 export function addressedPersonaIds(
   mentionedIds: readonly string[],
   replyTarget?: Pick<ChatMessage, "authorId" | "system">,
@@ -312,6 +353,7 @@ export function selectResponders(
   now = Date.now(),
   rng = Math.random,
   attention?: ReadonlyMap<string, number>,
+  relationshipBias?: ReadonlyMap<string, number>,
 ): Persona[] {
   const direct = personas.filter((persona) => signals.mentionedIds.includes(persona.id));
   const moderatorRequired = MODERATOR_ACTIONS.has(signals.moderationAction);
@@ -345,6 +387,13 @@ export function selectResponders(
       score += signals.claimStrength * (persona.disagreement ?? 0.2) * 0.44;
       if (strongPeerReaction) score += (persona.disagreement ?? 0.2) * 0.42 + persona.mischief * 0.08;
       score += (attention?.get(persona.id) ?? 0.5) * 0.12;
+      // A relationship may nudge an available optional candidate, but it is
+      // never allowed to reactivate somebody who is cooling down. The prior
+      // scoring policy can still make a cooling resident respond when the
+      // social act itself requires it; relationship state contributes zero.
+      if (!coolingDown) {
+        score += clamp(relationshipBias?.get(persona.id) ?? 0, -0.12, 0.12);
+      }
       score -= coolingDown ? 0.78 : 0;
       if (persona.id === "ai-runa") score -= 0.9;
       if (signals.aggression >= 0.65 && signals.playfulness < 0.35 && persona.id !== "ai-runa") {
@@ -635,11 +684,12 @@ export function selectAmbientLead(
   affinity: (personaId: string) => number,
   rng: () => number,
   mode: AmbientMode = "discussion",
+  continuationBias: (personaId: string) => number = () => 0,
 ): Persona | undefined {
   const scored = [...candidates]
     .map((persona) => ({
       persona,
-      score: mode === "banter"
+      score: (mode === "banter"
         ? affinity(persona.id) * 0.42 +
           persona.talkativeness * 0.22 +
           persona.mischief * 0.12 +
@@ -656,7 +706,8 @@ export function selectAmbientLead(
         : affinity(persona.id) * 0.5 +
           persona.style.complexityAppetite * 0.22 +
           persona.conscientiousness * 0.1 +
-          persona.talkativeness * 0.08,
+          persona.talkativeness * 0.08) +
+        clamp(continuationBias(persona.id), -0.12, 0.12),
     }))
     .sort((a, b) => b.score - a.score);
   const topScore = scored[0]?.score;
@@ -946,6 +997,10 @@ export interface SocialDirectorOptions {
   ambientEpisodeLedger?: AmbientEpisodeLedger;
   /** Persistent, source-bound resident memories. Omit to retain the legacy memory path. */
   socialMemory?: SocialMemoryCoordinator;
+  /** Trusted account-owned adult opt-in. Unknown, guest and legacy humans fail closed. */
+  romanceEligibleHumanActor?: (actorId: string) => boolean;
+  /** Trusted live admin assertion. Unknown, disabled and legacy custom residents fail closed. */
+  romanceEligibleResidentActor?: (actorId: string) => boolean;
 }
 
 export interface HumanReactionResponseGate {
@@ -1497,6 +1552,7 @@ export function selectConsideredConversation(
   now: number,
   affinity: (personaId: string) => number,
   rng: () => number,
+  relationshipBias: (ownerId: string, subjectId: string) => number = () => 0,
 ): ConsideredConversationPlan | undefined {
   const available = candidates
     .filter(
@@ -1518,7 +1574,13 @@ export function selectConsideredConversation(
   const lead = available.find(({ persona }) => persona.style.complexityAppetite >= 0.55)?.persona;
   if (!lead) return undefined;
 
-  const rest = available.filter(({ persona }) => persona.id !== lead.id);
+  const rest = available
+    .filter(({ persona }) => persona.id !== lead.id)
+    .map((entry) => ({
+      ...entry,
+      score: entry.score + clamp(relationshipBias(entry.persona.id, lead.id), -0.12, 0.12),
+    }))
+    .sort((left, right) => right.score - left.score);
   if (rest.length === 0) return undefined;
   const rolePredicates: Record<ConsideredResponseRole, (persona: Persona) => boolean> = {
     challenge: (persona) =>
@@ -2019,8 +2081,11 @@ export class SocialDirector {
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
   private readonly ambientEpisodeLedger?: AmbientEpisodeLedger;
   private readonly socialMemory?: SocialMemoryCoordinator;
+  private readonly romanceEligibleHumanActor?: (actorId: string) => boolean;
+  private readonly romanceEligibleResidentActor?: (actorId: string) => boolean;
   private readonly autonomousSocialMemoryByChannel = new Map<string, AutonomousSocialMemoryBuffer>();
   private readonly autonomousSocialMemoryCooldownByChannel = new Map<string, number>();
+  private readonly lastRomanticCueAtByPair = new Map<string, number>();
   private lastAutonomousResearchSuccessAt?: number;
   private autonomousResearchGlobalRetryAfterAt?: number;
   private autonomousResearchGlobalConsecutiveFailures = 0;
@@ -2059,6 +2124,8 @@ export class SocialDirector {
     this.behaviorTuningProvider = options.behaviorTuningProvider;
     this.ambientEpisodeLedger = options.ambientEpisodeLedger;
     this.socialMemory = options.socialMemory;
+    this.romanceEligibleHumanActor = options.romanceEligibleHumanActor;
+    this.romanceEligibleResidentActor = options.romanceEligibleResidentActor;
     this.dmTurns = new DmTurnCoordinator<CoordinatedDmInput, CoordinatedDmReply>({
       debounceMs: options.dmDebounceMs,
       generate: (turn) => this.generateDirectTurn(turn),
@@ -2508,7 +2575,16 @@ export class SocialDirector {
     this.lastHumanMessageAtByChannel.set("lobby", arrivalAt);
     this.invalidateAmbientChannel("lobby", "human_preempted");
     const candidates = PERSONAS.filter((persona) => persona.warmth > 0.7 && persona.id !== "ai-runa");
-    const persona = choose(candidates);
+    const persona = [...candidates]
+      .map((candidate) => ({
+        candidate,
+        score:
+          candidate.warmth * 0.72 +
+          candidate.talkativeness * 0.1 +
+          this.relationshipDecisionBias(candidate.id, human.id, "welcome") +
+          this.rng() * 0.18,
+      }))
+      .sort((left, right) => right.score - left.score)[0]!.candidate;
     const temporalWelcome = shouldSurfaceTemporalCue({
       now: arrivalAt,
       lastSurfacedAt: this.lastWelcomeTemporalCueAt,
@@ -2571,7 +2647,12 @@ export class SocialDirector {
                 },
               }
             : {}),
-          relationshipNotes: this.relationshipNotes([persona], human, { kind: "public", channelId: "lobby" }),
+          relationshipNotes: this.relationshipNotes(
+            [persona],
+            human,
+            { kind: "public", channelId: "lobby" },
+          ),
+          romanticInteractionPolicies: this.humanRomanticInteractionPolicies([persona], human),
           actorChannelNotes: this.actorChannels.promptNotes([persona], "lobby"),
           actorExpertiseNotes: this.actorChannels.expertiseNotes([persona], "lobby"),
           temporalPolicy: temporalWelcome ? "welcome_optional" : "reactive_only",
@@ -2789,6 +2870,10 @@ export class SocialDirector {
             [pending.persona],
             pending.human,
             { kind: "public", channelId: pending.channelId },
+          ),
+          romanticInteractionPolicies: this.humanRomanticInteractionPolicies(
+            [pending.persona],
+            pending.human,
           ),
           languageHint: this.lastTrustedLanguageByChannel.get(pending.channelId)
             ?? ambientLanguageHint(this.store.getRecent(pending.channelId, 18)),
@@ -3338,11 +3423,6 @@ export class SocialDirector {
     const combined = messages.map((message) => this.transcriptContent(message)).join("\n");
     const hasImage = messages.some((message) => (message.attachments?.length ?? 0) > 0);
     const catalogEpoch = this.catalogEpoch;
-    const relationshipNotes = this.relationshipNotes(
-      [persona],
-      human,
-      { kind: "dm", threadId: latest.channelId, participantIds: [human.id, persona.id] },
-    );
     const dmMessages = this.store.getDmMessages(latest.channelId);
     const visualEvidence = collectReadyVisualEvidence(dmMessages);
     const currentMessageIds = new Set(messages.map((message) => message.id));
@@ -3391,6 +3471,19 @@ export class SocialDirector {
       [],
       analyzeSocialSignals(combined, [persona]),
     );
+    const relationshipNotes = this.relationshipNotes(
+      [persona],
+      human,
+      { kind: "dm", threadId: latest.channelId, participantIds: [human.id, persona.id] },
+      {
+        context: "dm",
+        gateForPersona: (personaId) => humanRomanticTurnGate(
+          analysis,
+          personaId,
+          [persona.id],
+        ),
+      },
+    );
     const resolution = invocation
       ? await this.capabilityRegistry.execute(invocation, human.id)
       : undefined;
@@ -3420,6 +3513,7 @@ export class SocialDirector {
           mustReplyIds: [persona.id],
           requestOwnerIds: dmRequestOwnerIds,
           relationshipNotes,
+          romanticInteractionPolicies: this.humanRomanticInteractionPolicies([persona], human),
           languageHint: classifiedLanguage(analysis),
           semanticContext: semanticSceneContext(analysis),
           actorChannelNotes: this.actorChannels.promptNotes([persona]),
@@ -3697,7 +3791,25 @@ export class SocialDirector {
     const historyResponseRequired = trustedTurn.historyRecallTrusted && (
       trustedTurn.historyRecall.need === "required" || trustedTurn.isQuestion
     );
-    let selected = selectResponders(candidates, signals, this.lastSpoke, this.now(), this.rng, attention);
+    const relationshipBias = new Map(candidates.map((persona) => [
+      persona.id,
+      this.relationshipDecisionBias(
+        persona.id,
+        human.id,
+        signals.aggression >= 0.35 || signals.reactionNeed === "required"
+          ? "conflictChallengeReply"
+          : "ordinaryPublicReply",
+      ),
+    ]));
+    let selected = selectResponders(
+      candidates,
+      signals,
+      this.lastSpoke,
+      this.now(),
+      this.rng,
+      attention,
+      relationshipBias,
+    );
     if ((responseExpected || historyResponseRequired) && selected.length === 0) {
       const accountable = [...candidates]
         .filter((persona) => persona.id !== "ai-runa")
@@ -3956,7 +4068,18 @@ export class SocialDirector {
       : undefined;
     const relationshipNotes = referencedHumanMemoryOwnerId
       ? referencedHumanNotes
-      : this.relationshipNotes(selected, human, publicScope);
+      : this.relationshipNotes(selected, human, publicScope, {
+          context: "public",
+          gateForPersona: (personaId) => humanRomanticTurnGate(
+            analysis,
+            personaId,
+            deterministicAddressedIds,
+          ),
+        });
+    // This typed veto is deliberately separate from actor-private memory. It
+    // reaches every possible speaker (including the offline-recollection path)
+    // without serializing ordinary opt-out scenes into one model call per actor.
+    const romanticInteractionPolicies = this.humanRomanticInteractionPolicies(selected, human);
     for (const persona of selected) this.actorChannels.markRead(persona.id, trigger.channelId, trigger.id);
     selectedReadersMarked = selected.length > 0;
     const reactionCount = autoSharedLinkAttempt ? 0 : this.scheduleCrowdReactions(trigger, signals, selected);
@@ -4091,6 +4214,7 @@ export class SocialDirector {
           requestOwnerIds,
           wordLimits: responseWordLimits,
           relationshipNotes,
+          romanticInteractionPolicies,
           languageHint: classifiedLanguage(analysis),
           semanticContext: semanticSceneContext(analysis),
           actorChannelNotes: this.actorChannels.promptNotes(selected, trigger.channelId),
@@ -4166,6 +4290,9 @@ export class SocialDirector {
               : undefined,
             relationshipNotes: relationshipNotes[persona.id]
               ? { [persona.id]: relationshipNotes[persona.id] }
+              : {},
+            romanticInteractionPolicies: romanticInteractionPolicies[persona.id]
+              ? { [persona.id]: romanticInteractionPolicies[persona.id] }
               : {},
             languageHint: classifiedLanguage(analysis),
             semanticContext: semanticSceneContext(analysis),
@@ -5499,6 +5626,10 @@ export class SocialDirector {
           [responder],
           { kind: "public", channelId: channel.id },
         ),
+        romanticInteractionPolicies: this.residentRomanticInteractionPolicies(
+          [lead],
+          [responder],
+        ),
         research,
         autonomousResearchContext: {
           seedId: seed.id,
@@ -5726,6 +5857,11 @@ export class SocialDirector {
             now,
             (personaId) => this.actorChannels.affinity(personaId, channel.id),
             this.rng,
+            (ownerId, subjectId) => this.relationshipDecisionBias(
+              ownerId,
+              subjectId,
+              "ambientContinuation",
+            ),
           )
         : undefined;
       if (consideredPlan) {
@@ -5800,6 +5936,13 @@ export class SocialDirector {
           (personaId) => this.actorChannels.affinity(personaId, channel.id),
           this.rng,
           ambientMode,
+          (personaId) => previousPersona
+            ? this.relationshipDecisionBias(
+                personaId,
+                previousPersona.id,
+                "ambientContinuation",
+              )
+            : 0,
         );
       if (!first) return;
       const selected = [first];
@@ -5909,6 +6052,10 @@ export class SocialDirector {
               selected,
               socialCounterparts,
               { kind: "public", channelId: channel.id },
+            ),
+            romanticInteractionPolicies: this.residentRomanticInteractionPolicies(
+              selected,
+              socialCounterparts,
             ),
             research: thread.research,
             evidenceOutcome: thread.research ? "succeeded" : undefined,
@@ -6251,8 +6398,18 @@ export class SocialDirector {
       scope: { kind: "dm", threadId: reply.channelId, participantIds: [human.id, persona.id] },
       channel: { name: `private chat with ${human.name}` },
       participants: [
-        { id: human.id, kind: "human", displayName: human.name },
-        { id: persona.id, kind: "resident", displayName: persona.name },
+        {
+          id: human.id,
+          kind: "human",
+          displayName: human.name,
+          romanceEligible: this.isRomanceEligibleHuman(human.id),
+        },
+        {
+          id: persona.id,
+          kind: "resident",
+          displayName: persona.name,
+          romanceEligible: this.isRomanceEligibleResident(persona.id),
+        },
       ],
       messages,
       eligibleResidentOwners: [{
@@ -6286,8 +6443,18 @@ export class SocialDirector {
       scope: { kind: "public", channelId },
       channel: { name: channel?.name ?? channelId, ...(channel?.description ? { topic: channel.description } : {}) },
       participants: [
-        { id: human.id, kind: "human", displayName: human.name },
-        ...residents.map((persona) => ({ id: persona.id, kind: "resident" as const, displayName: persona.name })),
+        {
+          id: human.id,
+          kind: "human",
+          displayName: human.name,
+          romanceEligible: this.isRomanceEligibleHuman(human.id),
+        },
+        ...residents.map((persona) => ({
+          id: persona.id,
+          kind: "resident" as const,
+          displayName: persona.name,
+          romanceEligible: this.isRomanceEligibleResident(persona.id),
+        })),
       ],
       messages,
       eligibleResidentOwners: residents.map((persona) => ({
@@ -6353,6 +6520,7 @@ export class SocialDirector {
         id: persona.id,
         kind: "resident" as const,
         displayName: persona.name,
+        romanceEligible: this.isRomanceEligibleResident(persona.id),
       })),
       messages: delivered,
       eligibleResidentOwners: owners.map((persona) => ({
@@ -6600,10 +6768,142 @@ export class SocialDirector {
     );
   }
 
+  private relationshipDecisionBias(
+    ownerId: string,
+    subjectId: string,
+    key: keyof RelationshipDecisionBiases,
+  ): number {
+    try {
+      const value = this.socialMemory?.behaviorProjection(ownerId, subjectId).decisionBiases[key];
+      return typeof value === "number" && Number.isFinite(value) ? value : 0;
+    } catch {
+      // Relationship texture is optional; a damaged projection must preserve
+      // the established routing, expertise and moderation policy.
+      return 0;
+    }
+  }
+
+  private isRomanceEligibleHuman(actorId: string): boolean {
+    try {
+      return this.romanceEligibleHumanActor?.(actorId) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private isRomanceEligibleResident(actorId: string): boolean {
+    try {
+      return this.romanceEligibleResidentActor?.(actorId) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private relationshipProjection(ownerId: string, subjectId: string) {
+    try {
+      return this.socialMemory?.behaviorProjection(ownerId, subjectId);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * A prompt-safe per-actor generation veto. It carries no score, blocker ID,
+   * reason or memory text and therefore remains safe in a shared model batch.
+   */
+  private humanRomanticInteractionPolicies(
+    personas: readonly Persona[],
+    human: Member,
+  ): Record<string, "ordinary_only"> {
+    const policies: Record<string, "ordinary_only"> = {};
+    for (const persona of personas) {
+      const endpointsEligible = this.isRomanceEligibleHuman(human.id) &&
+        this.isRomanceEligibleResident(persona.id);
+      const boundaryClosed = this.relationshipProjection(persona.id, human.id)
+        ?.romanticBoundary.state === "closed";
+      if (!endpointsEligible || boundaryClosed) policies[persona.id] = "ordinary_only";
+    }
+    return policies;
+  }
+
+  private residentRomanticInteractionPolicies(
+    owners: readonly Persona[],
+    counterparts: readonly Persona[],
+  ): Record<string, "ordinary_only"> {
+    const policies: Record<string, "ordinary_only"> = {};
+    for (const owner of owners) {
+      const relevant = counterparts.filter((counterpart) => counterpart.id !== owner.id);
+      const mustStayOrdinary = !this.isRomanceEligibleResident(owner.id) || relevant.some(
+        (counterpart) => !this.isRomanceEligibleResident(counterpart.id) ||
+          this.relationshipProjection(owner.id, counterpart.id)?.romanticBoundary.state === "closed",
+      );
+      if (mustStayOrdinary) policies[owner.id] = "ordinary_only";
+    }
+    return policies;
+  }
+
+  private allowRareHumanRomanticCue(
+    personaId: string,
+    humanId: string,
+    context: keyof typeof HUMAN_ROMANTIC_CUE_CHANCE,
+    turn: HumanRomanticTurnGate,
+  ): boolean {
+    const now = this.now();
+    const key = `human\u0000${personaId}\u0000${humanId}`;
+    const allowed = shouldSurfaceRareRomanticPromptCue({
+      audience: "resident-human",
+      accountEligible: this.isRomanceEligibleHuman(humanId),
+      residentEligible: this.isRomanceEligibleResident(personaId),
+      turn,
+      forward: this.relationshipProjection(personaId, humanId),
+      now,
+      lastSurfaceAt: this.lastRomanticCueAtByPair.get(key),
+      cooldownMs: HUMAN_ROMANTIC_CUE_COOLDOWN_MS,
+      chance: HUMAN_ROMANTIC_CUE_CHANCE[context],
+      rng: this.rng,
+    });
+    if (allowed) this.recordRomanticCue(key, now);
+    return allowed;
+  }
+
+  private allowRareResidentRomanticCue(ownerId: string, subjectId: string): boolean {
+    const now = this.now();
+    const pair = [ownerId, subjectId].sort().join("\u0000");
+    const key = `resident\u0000${pair}`;
+    const allowed = shouldSurfaceRareRomanticPromptCue({
+      audience: "resident-resident",
+      ownerEligible: this.isRomanceEligibleResident(ownerId),
+      subjectEligible: this.isRomanceEligibleResident(subjectId),
+      forward: this.relationshipProjection(ownerId, subjectId),
+      reciprocal: this.relationshipProjection(subjectId, ownerId),
+      now,
+      lastSurfaceAt: this.lastRomanticCueAtByPair.get(key),
+      cooldownMs: RESIDENT_ROMANTIC_CUE_COOLDOWN_MS,
+      chance: RESIDENT_ROMANTIC_CUE_CHANCE,
+      rng: this.rng,
+    });
+    if (allowed) this.recordRomanticCue(key, now);
+    return allowed;
+  }
+
+  private recordRomanticCue(key: string, now: number): void {
+    this.lastRomanticCueAtByPair.delete(key);
+    this.lastRomanticCueAtByPair.set(key, now);
+    while (this.lastRomanticCueAtByPair.size > MAX_ROMANTIC_CUE_COOLDOWNS) {
+      const oldest = this.lastRomanticCueAtByPair.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.lastRomanticCueAtByPair.delete(oldest);
+    }
+  }
+
   private relationshipNotes(
     personas: Persona[],
     human: Member,
     scope?: SocialMemoryScope,
+    romanticTurn?: {
+      context: keyof typeof HUMAN_ROMANTIC_CUE_CHANCE;
+      gateForPersona: (personaId: string) => HumanRomanticTurnGate;
+    },
   ): Record<string, string> {
     // A multi-resident scene surfaces at most one private viewpoint. Besides
     // bounding Gemma latency to one isolated actor plus one redacted batch,
@@ -6625,7 +6925,25 @@ export class SocialDirector {
           })()
         : undefined);
       const persistent = this.socialMemory && scope
-        ? this.socialMemory.promptNote(persona.id, human.id, scope)
+        ? this.socialMemory.promptNote(
+            persona.id,
+            human.id,
+            scope,
+            {
+              romanticSceneEligibility:
+                this.isRomanceEligibleHuman(human.id) && this.isRomanceEligibleResident(persona.id)
+                  ? "eligible"
+                  : "ineligible",
+              allowRomanticSurface: Boolean(
+                romanticTurn && this.allowRareHumanRomanticCue(
+                  persona.id,
+                  human.id,
+                  romanticTurn.context,
+                  romanticTurn.gateForPersona(persona.id),
+                )
+              ),
+            },
+          )
         : undefined;
       const note = boundedUntrustedText([persistent, legacy].filter(Boolean).join(" "), 2_600);
       if (note) return { [persona.id]: note };
@@ -6684,7 +7002,19 @@ export class SocialDirector {
         .filter((counterpart) => counterpart.id !== owner.id)
         .slice(0, 2)
         .flatMap((counterpart) => {
-          const remembered = this.socialMemory?.promptNote(owner.id, counterpart.id, scope);
+          const allowRomanticSurface = this.allowRareResidentRomanticCue(owner.id, counterpart.id);
+          const remembered = this.socialMemory?.promptNote(
+            owner.id,
+            counterpart.id,
+            scope,
+            {
+              romanticSceneEligibility:
+                this.isRomanceEligibleResident(owner.id) && this.isRomanceEligibleResident(counterpart.id)
+                  ? "eligible"
+                  : "ineligible",
+              allowRomanticSurface,
+            },
+          );
           return remembered
             ? [`Counterpart ${JSON.stringify({ id: counterpart.id, name: counterpart.name })}: ${remembered}`]
             : [];

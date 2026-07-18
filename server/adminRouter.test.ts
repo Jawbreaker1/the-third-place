@@ -373,6 +373,7 @@ describe("admin HTTP API", () => {
         disagreement: 40,
       },
       canResearch: false,
+      fictionalAdult: false,
       roomAffinities: { "admin-test-room": 70 },
       voices: {},
     };

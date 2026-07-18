@@ -234,6 +234,7 @@ function RelationshipScores({ relationship }: { relationship: AdminMemoryRelatio
         ["Trust", relationship.trust],
         ["Respect", relationship.respect],
         ["Friction", relationship.friction],
+        ["Romantic interest", relationship.romanticInterest],
       ] as const).map(([label, value]) => (
         <div key={label}><dt>{label}</dt><dd>{formatMemoryScore(value)}</dd></div>
       ))}
@@ -1197,6 +1198,10 @@ export default function AdminApp() {
                 <input checked={personaDraft.canResearch} onChange={(event) => setPersonaDraft({ ...personaDraft, canResearch: event.target.checked })} type="checkbox" />
                 <span><strong>May answer with fresh research</strong><small>The director still owns every lookup and source boundary.</small></span>
               </label>
+              <label className="admin-checkbox">
+                <input checked={personaDraft.fictionalAdult} onChange={(event) => setPersonaDraft({ ...personaDraft, fictionalAdult: event.target.checked })} type="checkbox" />
+                <span><strong>Fictional adult (18+)</strong><small>Required for subtle romantic storylines. This grants eligibility only—not interest or consent; relationship boundaries still apply.</small></span>
+              </label>
             </fieldset>
 
             <fieldset className="admin-fieldset">
@@ -1735,7 +1740,15 @@ export default function AdminApp() {
                                   >Reset</button>
                                 </header>
                                 <RelationshipScores relationship={relationship} />
-                                <footer>Updated {formatDateTime(relationship.updatedAt)}</footer>
+                                <footer>
+                                  <span>Updated {formatDateTime(relationship.updatedAt)}</span>
+                                  <span className={`admin-memory-boundary ${relationship.romanticBoundary.state}`}>
+                                    Romance: {relationship.romanticBoundary.state}
+                                    {relationship.romanticBoundary.blockers.length > 0
+                                      ? ` · blocked by ${relationship.romanticBoundary.blockers.map((blocker) => blocker.actorName).join(", ")}`
+                                      : ""}
+                                  </span>
+                                </footer>
                               </article>
                             )) : <p className="admin-memory-inline-empty">No {title.toLocaleLowerCase()} relationships.</p>}
                           </div>

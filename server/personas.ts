@@ -701,6 +701,10 @@ export const PERSONAS: Persona[] = [
   },
 ];
 
+/** Live lookup against the trusted runtime catalog materialized by AdminStateStore. */
+export const isActiveResidentActorId = (actorId: string): boolean =>
+  PERSONAS.some((persona) => persona.id === actorId);
+
 export const memberView = (persona: Persona): Member => ({
   id: persona.id,
   name: persona.name,

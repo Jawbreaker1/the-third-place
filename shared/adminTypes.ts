@@ -42,6 +42,11 @@ export interface AdminPersonaConfig {
   avatarImageUrl?: string;
   core: AdminPersonaCore;
   canResearch: boolean;
+  /**
+   * Trusted administrator assertion that this fictional resident is an adult.
+   * This is romance eligibility only; it is never evidence of interest or consent.
+   */
+  fictionalAdult: boolean;
   roomAffinities: Record<string, number>;
   /** BCP-47 language tag to provider voice ID. */
   voices: Record<string, string>;
@@ -213,6 +218,12 @@ export interface AdminMemoryRelationship {
   trust: number;
   respect: number;
   friction: number;
+  romanticInterest: number;
+  romanticBoundary: {
+    /** Unspecified means no stored veto; it is never affirmative consent. */
+    state: "unspecified" | "closed";
+    blockers: Array<{ actorId: string; actorName: string }>;
+  };
   updatedAt: string;
 }
 

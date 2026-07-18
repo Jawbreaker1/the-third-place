@@ -149,6 +149,8 @@ const normalizePersona = (value: unknown, index: number): AdminPersonaConfig => 
       : {}),
     core: normalizePersonaCore(input.core ?? input.sliders),
     canResearch: asBoolean(input.canResearch ?? input.researchEnabled),
+    // Compatibility data without an explicit assertion always fails closed.
+    fictionalAdult: asBoolean(input.fictionalAdult),
     roomAffinities: percentRecord(input.roomAffinities ?? input.affinities),
     voices: stringRecord(input.voices ?? input.voiceMappings),
   };
@@ -291,6 +293,7 @@ export function createPersonaDraft(index: number): AdminPersonaConfig {
     prompt: "",
     core: { ...DEFAULT_PERSONA_CORE },
     canResearch: false,
+    fictionalAdult: false,
     roomAffinities: {},
     voices: {},
   };

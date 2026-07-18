@@ -1,9 +1,10 @@
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 7;
 
 const LIMITS = {
   id: 120,
@@ -14,6 +15,7 @@ const LIMITS = {
   participants: 32,
   views: 32,
   relationshipDeltas: 32,
+  romanticBoundaryTransitions: 32,
   openLoops: 24,
   openLoopUpdates: 24,
   episodeEvents: 3,
@@ -106,7 +108,8 @@ export type RelationshipDimension =
   | "warmth"
   | "trust"
   | "respect"
-  | "friction";
+  | "friction"
+  | "romanticInterest";
 
 export interface RelationshipVector {
   familiarity: number;
@@ -114,6 +117,7 @@ export interface RelationshipVector {
   trust: number;
   respect: number;
   friction: number;
+  romanticInterest: number;
 }
 
 export interface SocialMemoryViewInput {
@@ -129,6 +133,35 @@ export interface SocialMemoryViewInput {
 export interface RelationshipDeltaInput extends Partial<RelationshipVector> {
   ownerId: string;
   subjectId: string;
+}
+
+export type RomanticBoundaryTransitionAction = "set_closed" | "clear_closed";
+
+/**
+ * An endpoint-owned romantic boundary. A missing blocker means only that no
+ * boundary has been recorded; it is never affirmative consent. Each endpoint
+ * may clear only its own blocker, so one participant cannot reopen the other
+ * participant's boundary.
+ */
+export interface RomanticBoundaryTransitionInput {
+  ownerId: string;
+  subjectId: string;
+  blockerActorId: string;
+  action: RomanticBoundaryTransitionAction;
+}
+
+export interface AppliedRomanticBoundaryTransition extends RomanticBoundaryTransitionInput {
+  eventId: string;
+  changed: boolean;
+  updatedAt: number;
+}
+
+export interface RomanticBoundaryState {
+  ownerId: string;
+  subjectId: string;
+  closed: boolean;
+  blockerActorIds: string[];
+  updatedAt?: number;
 }
 
 export type OpenLoopKind = "promise" | "question" | "request" | "plan" | "conflict" | "follow_up";
@@ -169,6 +202,7 @@ export interface RecordSocialEventInput {
   confidence: number;
   memoryViews?: SocialMemoryViewInput[];
   relationshipDeltas?: RelationshipDeltaInput[];
+  romanticBoundaryTransitions?: RomanticBoundaryTransitionInput[];
   openLoops?: OpenLoopInput[];
   openLoopUpdates?: OpenLoopUpdateInput[];
 }
@@ -217,6 +251,8 @@ export interface SocialMemoryView {
 export interface RelationshipEdge extends RelationshipVector {
   ownerId: string;
   subjectId: string;
+  romanticBoundaryClosed: boolean;
+  romanticBoundaryBlockerIds: string[];
   updatedAt: number;
 }
 
@@ -224,6 +260,7 @@ export interface AppliedRelationshipDelta extends RelationshipVector {
   ownerId: string;
   subjectId: string;
   eventId: string;
+  /** Effective budget origin; resident-to-resident movement is autonomous. */
   origin: SocialEventOrigin;
   dayKey: string;
 }
@@ -266,6 +303,7 @@ export interface RecordSocialEventResult {
   created: boolean;
   event: SocialEvent;
   appliedRelationshipDeltas: AppliedRelationshipDelta[];
+  appliedRomanticBoundaryTransitions: AppliedRomanticBoundaryTransition[];
   updatedOpenLoops: OpenLoop[];
 }
 
@@ -338,6 +376,8 @@ export interface SocialMemoryStoreOptions {
   now?: () => number;
   humanDailyCaps?: Partial<RelationshipVector>;
   autonomousDailyCaps?: Partial<RelationshipVector>;
+  /** Trusted registry lookup; never infer actor kind from a display name/id. */
+  resolveActorKind?: (actorId: string) => "human" | "resident" | undefined;
 }
 
 export interface SocialMemoryDatabaseStatus {
@@ -453,6 +493,7 @@ const DEFAULT_HUMAN_CAPS: RelationshipVector = {
   trust: 0.15,
   respect: 0.15,
   friction: 0.2,
+  romanticInterest: 0.05,
 };
 
 const DEFAULT_AUTONOMOUS_CAPS: RelationshipVector = {
@@ -461,6 +502,10 @@ const DEFAULT_AUTONOMOUS_CAPS: RelationshipVector = {
   trust: 0.006,
   respect: 0.006,
   friction: 0.01,
+  // Slow enough to require many distinct evidence-bearing days, but unlike
+  // the original 0.0015 cap it can eventually reach the behavior projection's
+  // established band instead of making resident romance dead code.
+  romanticInterest: 0.01,
 };
 
 /**
@@ -474,6 +519,7 @@ const AUTONOMOUS_LIFETIME_ENVELOPES: RelationshipVector = {
   trust: 0.25,
   respect: 0.25,
   friction: 0.3,
+  romanticInterest: 0.65,
 };
 
 const DIMENSIONS: RelationshipDimension[] = [
@@ -482,7 +528,11 @@ const DIMENSIONS: RelationshipDimension[] = [
   "trust",
   "respect",
   "friction",
+  "romanticInterest",
 ];
+
+const relationshipColumn = (dimension: RelationshipDimension): string =>
+  dimension === "romanticInterest" ? "romantic_interest" : dimension;
 
 const EVENT_KINDS = new Set<SocialEventKind>([
   "shared_moment",
@@ -666,11 +716,17 @@ const appendPromptVisibilityClause = (
 
 interface NormalizedRecordInput extends Omit<
   RecordSocialEventInput,
-  "scope" | "memoryViews" | "relationshipDeltas" | "openLoops" | "openLoopUpdates"
+  | "scope"
+  | "memoryViews"
+  | "relationshipDeltas"
+  | "romanticBoundaryTransitions"
+  | "openLoops"
+  | "openLoopUpdates"
 > {
   scope: SocialMemoryScope;
   memoryViews: SocialMemoryViewInput[];
   relationshipDeltas: Array<RelationshipDeltaInput & RelationshipVector>;
+  romanticBoundaryTransitions: RomanticBoundaryTransitionInput[];
   openLoops: OpenLoopInput[];
   openLoopUpdates: OpenLoopUpdateInput[];
 }
@@ -756,6 +812,10 @@ const normalizeRecordInput = (input: RecordSocialEventInput): NormalizedRecordIn
         trust: cleanDelta(delta.trust, `relationshipDeltas[${index}].trust`),
         respect: cleanDelta(delta.respect, `relationshipDeltas[${index}].respect`),
         friction: cleanDelta(delta.friction, `relationshipDeltas[${index}].friction`),
+        romanticInterest: cleanDelta(
+          delta.romanticInterest,
+          `relationshipDeltas[${index}].romanticInterest`,
+        ),
       };
       if (DIMENSIONS.every((dimension) => normalized[dimension] === 0)) {
         throw new Error("relationship delta must change at least one dimension");
@@ -771,6 +831,74 @@ const normalizeRecordInput = (input: RecordSocialEventInput): NormalizedRecordIn
     relationshipDeltas.length
   ) {
     throw new Error("an event may change a directed relationship only once");
+  }
+
+  const romanticBoundaryTransitions = (input.romanticBoundaryTransitions ?? []).map(
+    (transition, index): RomanticBoundaryTransitionInput => {
+      if (!transition || typeof transition !== "object") {
+        throw new TypeError(`romanticBoundaryTransitions[${index}] must be an object`);
+      }
+      const ownerId = cleanId(
+        transition.ownerId,
+        `romanticBoundaryTransitions[${index}].ownerId`,
+      );
+      const subjectId = cleanId(
+        transition.subjectId,
+        `romanticBoundaryTransitions[${index}].subjectId`,
+      );
+      const blockerActorId = cleanId(
+        transition.blockerActorId,
+        `romanticBoundaryTransitions[${index}].blockerActorId`,
+      );
+      if (ownerId === subjectId) throw new Error("a romantic boundary cannot point to itself");
+      if (!observers.has(ownerId) || !involved.has(subjectId)) {
+        throw new Error(
+          "romantic boundaries require a source actor or explicit witness as owner and an involved subject",
+        );
+      }
+      if (blockerActorId !== ownerId && blockerActorId !== subjectId) {
+        throw new Error("a romantic boundary blocker must be one of the relationship endpoints");
+      }
+      // Boundary state is more durable than episodic memory. Only the endpoint
+      // that actually authored cited source material may set or clear its own
+      // blocker; a witness or third party can never manufacture consent state.
+      if (!actorIds.includes(blockerActorId)) {
+        throw new Error("a romantic boundary blocker must be a source author in this event");
+      }
+      if (transition.action !== "set_closed" && transition.action !== "clear_closed") {
+        throw new Error(`romanticBoundaryTransitions[${index}].action is not supported`);
+      }
+      return { ownerId, subjectId, blockerActorId, action: transition.action };
+    },
+  );
+  if (romanticBoundaryTransitions.length > LIMITS.romanticBoundaryTransitions) {
+    throw new Error(
+      `romanticBoundaryTransitions may contain at most ${LIMITS.romanticBoundaryTransitions} items`,
+    );
+  }
+  if (
+    new Set(romanticBoundaryTransitions.map((transition) =>
+      `${romanticBoundaryPairKey(transition.ownerId, transition.subjectId)}\u0000${transition.blockerActorId}`
+    )).size !== romanticBoundaryTransitions.length
+  ) {
+    throw new Error("an event may transition each endpoint-owned romantic boundary only once");
+  }
+  if (romanticBoundaryTransitions.length > 0 && input.kind !== "boundary") {
+    throw new Error("romantic boundary transitions require an explicit boundary event");
+  }
+  const transitionedRomanticPairs = new Set(romanticBoundaryTransitions.map((transition) =>
+    romanticBoundaryPairKey(transition.ownerId, transition.subjectId)
+  ));
+  if (relationshipDeltas.some((delta) =>
+    delta.romanticInterest !== 0 &&
+    transitionedRomanticPairs.has(romanticBoundaryPairKey(delta.ownerId, delta.subjectId))
+  )) {
+    // Clearing a veto is not evidence of attraction or consent. Requiring a
+    // separate sourced event prevents one semantic output from laundering a
+    // boundary clear into immediate romantic movement.
+    throw new Error(
+      "a romantic boundary transition and romantic-interest change for the same pair require separate events",
+    );
   }
 
   const openLoops = (input.openLoops ?? []).map((loop, index): OpenLoopInput => {
@@ -851,6 +979,11 @@ const normalizeRecordInput = (input: RecordSocialEventInput): NormalizedRecordIn
     relationshipDeltas: relationshipDeltas.sort((left, right) =>
       `${left.ownerId}\u0000${left.subjectId}`.localeCompare(`${right.ownerId}\u0000${right.subjectId}`),
     ),
+    romanticBoundaryTransitions: romanticBoundaryTransitions.sort((left, right) =>
+      `${left.ownerId}\u0000${left.subjectId}\u0000${left.blockerActorId}`.localeCompare(
+        `${right.ownerId}\u0000${right.subjectId}\u0000${right.blockerActorId}`,
+      ),
+    ),
     openLoops: openLoops.sort((left, right) => left.id.localeCompare(right.id)),
     openLoopUpdates: openLoopUpdates.sort((left, right) => left.id.localeCompare(right.id)),
   };
@@ -863,7 +996,9 @@ const clamp = (value: number, minimum: number, maximum: number): number =>
   Math.min(maximum, Math.max(minimum, value));
 
 const dimensionRange = (dimension: RelationshipDimension): [number, number] =>
-  dimension === "familiarity" || dimension === "friction" ? [0, 1] : [-1, 1];
+  dimension === "familiarity" || dimension === "friction" || dimension === "romanticInterest"
+    ? [0, 1]
+    : [-1, 1];
 
 const cleanCaps = (partial: Partial<RelationshipVector> | undefined, defaults: RelationshipVector): RelationshipVector => {
   const result = { ...defaults };
@@ -881,6 +1016,22 @@ const cleanCaps = (partial: Partial<RelationshipVector> | undefined, defaults: R
 
 const rowString = (row: Record<string, unknown>, key: string): string => String(row[key]);
 const rowNumber = (row: Record<string, unknown>, key: string): number => Number(row[key]);
+
+/**
+ * Romantic boundaries belong to an unordered pair and to the endpoint that
+ * authored the veto. SQLite's BINARY collation compares UTF-8 bytes, so using
+ * the same byte ordering here keeps the canonical orientation stable for every
+ * valid Unicode actor ID (and independent of process locale).
+ */
+const canonicalRomanticBoundaryPair = (left: string, right: string): readonly [string, string] =>
+  Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")) <= 0
+    ? [left, right]
+    : [right, left];
+
+const romanticBoundaryPairKey = (left: string, right: string): string => {
+  const [ownerId, subjectId] = canonicalRomanticBoundaryPair(left, right);
+  return `${ownerId}\u0000${subjectId}`;
+};
 
 const migrationOne = `
   CREATE TABLE social_events (
@@ -961,9 +1112,22 @@ const migrationOne = `
     trust REAL NOT NULL,
     respect REAL NOT NULL,
     friction REAL NOT NULL,
+    romantic_interest REAL NOT NULL CHECK (romantic_interest >= 0 AND romantic_interest <= 1),
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (owner_id, subject_id),
     CHECK (owner_id <> subject_id)
+  ) STRICT;
+  CREATE TABLE relationship_romantic_boundaries (
+    owner_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    blocker_actor_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, subject_id, blocker_actor_id),
+    -- owner/subject are the canonical, unordered pair endpoints. The blocker
+    -- remains the endpoint-owned part of the state.
+    CHECK (owner_id < subject_id COLLATE BINARY),
+    CHECK (blocker_actor_id = owner_id OR blocker_actor_id = subject_id)
   ) STRICT;
   CREATE TABLE relationship_changes (
     event_id TEXT NOT NULL REFERENCES social_events(id) ON DELETE CASCADE,
@@ -976,6 +1140,7 @@ const migrationOne = `
     trust REAL NOT NULL,
     respect REAL NOT NULL,
     friction REAL NOT NULL,
+    romantic_interest REAL NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (event_id, owner_id, subject_id)
   ) STRICT;
@@ -991,11 +1156,13 @@ const migrationOne = `
     trust REAL NOT NULL,
     respect REAL NOT NULL,
     friction REAL NOT NULL,
+    romantic_interest REAL NOT NULL,
     spent_familiarity REAL NOT NULL CHECK (spent_familiarity >= 0),
     spent_warmth REAL NOT NULL CHECK (spent_warmth >= 0),
     spent_trust REAL NOT NULL CHECK (spent_trust >= 0),
     spent_respect REAL NOT NULL CHECK (spent_respect >= 0),
     spent_friction REAL NOT NULL CHECK (spent_friction >= 0),
+    spent_romantic_interest REAL NOT NULL CHECK (spent_romantic_interest >= 0),
     through_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE (owner_id, subject_id, origin, day_key, participant_ids_json),
@@ -1011,6 +1178,7 @@ const migrationOne = `
     spent_trust REAL NOT NULL CHECK (spent_trust >= 0),
     spent_respect REAL NOT NULL CHECK (spent_respect >= 0),
     spent_friction REAL NOT NULL CHECK (spent_friction >= 0),
+    spent_romantic_interest REAL NOT NULL CHECK (spent_romantic_interest >= 0),
     through_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (owner_id, subject_id, origin, day_key),
@@ -1076,6 +1244,8 @@ const migrationOne = `
   CREATE INDEX memory_provenance_event_lookup ON memory_provenance(source_event_id, memory_id);
   CREATE INDEX event_scope_recency ON social_events(scope_kind, scope_id, occurred_at DESC);
   CREATE INDEX relation_subject_lookup ON relationship_edges(subject_id, owner_id);
+  CREATE INDEX romantic_boundary_subject_lookup
+    ON relationship_romantic_boundaries(subject_id, owner_id);
   CREATE INDEX relation_budget_lookup
     ON relationship_changes(owner_id, subject_id, origin, day_key);
   CREATE INDEX loop_owner_state ON open_loops(owner_id, state, pinned DESC, updated_at DESC);
@@ -1275,12 +1445,89 @@ const migrationFive = `
   GROUP BY owner_id, subject_id, origin, day_key;
 `;
 
+const migrationSix = `
+  CREATE TABLE IF NOT EXISTS relationship_edges (
+    owner_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    familiarity REAL NOT NULL,
+    warmth REAL NOT NULL,
+    trust REAL NOT NULL,
+    respect REAL NOT NULL,
+    friction REAL NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, subject_id),
+    CHECK (owner_id <> subject_id)
+  ) STRICT;
+  ALTER TABLE relationship_edges ADD COLUMN romantic_interest REAL NOT NULL DEFAULT 0
+    CHECK (romantic_interest >= 0 AND romantic_interest <= 1);
+  ALTER TABLE relationship_changes ADD COLUMN romantic_interest REAL NOT NULL DEFAULT 0;
+  ALTER TABLE relationship_checkpoints ADD COLUMN romantic_interest REAL NOT NULL DEFAULT 0;
+  ALTER TABLE relationship_checkpoints ADD COLUMN spent_romantic_interest REAL NOT NULL DEFAULT 0
+    CHECK (spent_romantic_interest >= 0);
+  ALTER TABLE relationship_daily_budgets ADD COLUMN spent_romantic_interest REAL NOT NULL DEFAULT 0
+    CHECK (spent_romantic_interest >= 0);
+  CREATE TABLE relationship_romantic_boundaries (
+    owner_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    blocker_actor_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, subject_id, blocker_actor_id),
+    CHECK (owner_id <> subject_id),
+    CHECK (blocker_actor_id = owner_id OR blocker_actor_id = subject_id)
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS relation_subject_lookup ON relationship_edges(subject_id, owner_id);
+  CREATE INDEX romantic_boundary_subject_lookup
+    ON relationship_romantic_boundaries(subject_id, owner_id);
+`;
+
+/**
+ * v6 materialized one endpoint-owned veto once per resident view. An AI-to-AI
+ * event could therefore leave the same blocker under both directed edge
+ * orientations, which made a clear/reset through one view leave the mirror
+ * closed. v7 stores one row per unordered pair + blocker and folds all such
+ * mirrored rows without losing the oldest creation or newest update time.
+ */
+const migrationSeven = `
+  DROP INDEX IF EXISTS romantic_boundary_subject_lookup;
+  ALTER TABLE relationship_romantic_boundaries RENAME TO relationship_romantic_boundaries_v6;
+  CREATE TABLE relationship_romantic_boundaries (
+    owner_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    blocker_actor_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, subject_id, blocker_actor_id),
+    CHECK (owner_id < subject_id COLLATE BINARY),
+    CHECK (blocker_actor_id = owner_id OR blocker_actor_id = subject_id)
+  ) STRICT;
+  WITH canonical AS (
+    SELECT
+      CASE WHEN owner_id < subject_id COLLATE BINARY THEN owner_id ELSE subject_id END AS pair_owner_id,
+      CASE WHEN owner_id < subject_id COLLATE BINARY THEN subject_id ELSE owner_id END AS pair_subject_id,
+      blocker_actor_id,
+      created_at,
+      updated_at
+    FROM relationship_romantic_boundaries_v6
+  )
+  INSERT INTO relationship_romantic_boundaries
+    (owner_id, subject_id, blocker_actor_id, created_at, updated_at)
+  SELECT pair_owner_id, pair_subject_id, blocker_actor_id, MIN(created_at), MAX(updated_at)
+  FROM canonical
+  WHERE blocker_actor_id = pair_owner_id OR blocker_actor_id = pair_subject_id
+  GROUP BY pair_owner_id, pair_subject_id, blocker_actor_id;
+  DROP TABLE relationship_romantic_boundaries_v6;
+  CREATE INDEX romantic_boundary_subject_lookup
+    ON relationship_romantic_boundaries(subject_id, owner_id);
+`;
+
 /** Synchronous SQLite domain store; callers should keep one instance per process. */
 export class SocialMemoryStore {
   readonly #database: DatabaseSync;
   readonly #now: () => number;
   readonly #humanCaps: RelationshipVector;
   readonly #autonomousCaps: RelationshipVector;
+  readonly #resolveActorKind: NonNullable<SocialMemoryStoreOptions["resolveActorKind"]>;
 
   constructor(options: SocialMemoryStoreOptions) {
     const filePath = options?.filePath;
@@ -1290,6 +1537,7 @@ export class SocialMemoryStore {
     this.#now = options.now ?? Date.now;
     this.#humanCaps = cleanCaps(options.humanDailyCaps, DEFAULT_HUMAN_CAPS);
     this.#autonomousCaps = cleanCaps(options.autonomousDailyCaps, DEFAULT_AUTONOMOUS_CAPS);
+    this.#resolveActorKind = options.resolveActorKind ?? (() => undefined);
     this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.#database.exec("PRAGMA journal_mode = WAL;");
     this.#migrate();
@@ -1579,6 +1827,13 @@ export class SocialMemoryStore {
       this.#database.prepare(
         "DELETE FROM relationship_edges WHERE owner_id = ? OR subject_id = ?",
       ).run(actor, actor);
+      // A romantic blocker is durable endpoint-owned consent state, not an
+      // episodic recollection. Erasing an unrelated witness may remove the
+      // source episode but must not silently reopen either endpoint's boundary.
+      this.#database.prepare(
+        `DELETE FROM relationship_romantic_boundaries
+         WHERE owner_id = ? OR subject_id = ? OR blocker_actor_id = ?`,
+      ).run(actor, actor, actor);
       this.#database.prepare(
         "DELETE FROM relationship_changes WHERE owner_id = ? OR subject_id = ?",
       ).run(actor, actor);
@@ -1667,11 +1922,26 @@ export class SocialMemoryStore {
         ...scopeParts(event.scope).participants,
         ...event.memoryViews.flatMap((view) => [view.ownerId, ...view.subjectIds]),
         ...event.relationshipDeltas.flatMap((delta) => [delta.ownerId, delta.subjectId]),
+        ...event.romanticBoundaryTransitions.flatMap((transition) => [
+          transition.ownerId,
+          transition.subjectId,
+          transition.blockerActorId,
+        ]),
         ...event.openLoops.flatMap((loop) => [loop.ownerId, ...loop.subjectIds]),
       ]);
       if ([...referenced].some((actorId) => !participantSet.has(actorId))) {
         throw new Error("episode participantIds must include every actor referenced by its events");
       }
+    }
+    const boundaryKeys = normalized.flatMap((event) => event.romanticBoundaryTransitions.map(
+      (transition) =>
+        `${romanticBoundaryPairKey(transition.ownerId, transition.subjectId)}\u0000${transition.blockerActorId}`,
+    ));
+    if (new Set(boundaryKeys).size !== boundaryKeys.length) {
+      // Event rows are canonicalized by stable ID, not semantic chronology.
+      // Reject an order-dependent set/clear pair instead of guessing which
+      // boundary state the model intended to win inside one delivered episode.
+      throw new Error("an episode may transition each endpoint-owned romantic boundary only once");
     }
     const canonicalEvents = [...normalized].sort((left, right) => left.id.localeCompare(right.id));
     const eventIds = canonicalEvents.map((event) => event.id);
@@ -1740,6 +2010,7 @@ export class SocialMemoryStore {
           created: false,
           event: this.#requireEvent(normalized.id),
           appliedRelationshipDeltas: this.#listAppliedDeltas(normalized.id),
+          appliedRomanticBoundaryTransitions: [],
           updatedOpenLoops: this.#listEventUpdatedLoops(normalized.id),
         };
       }
@@ -1799,6 +2070,13 @@ export class SocialMemoryStore {
         for (const subjectId of view.subjectIds) statement.run(view.id, subjectId);
       }
 
+      // Consent boundaries are applied first: a closure in this same event
+      // suppresses positive attraction immediately, while an explicit clear by
+      // the original blocker can permit later bounded movement. Clearing never
+      // creates consent; it only returns the pair to unspecified state.
+      const appliedRomanticBoundaryTransitions = normalized.romanticBoundaryTransitions.map(
+        (transition) => this.#applyRomanticBoundaryTransition(normalized, transition, createdAt),
+      );
       const appliedRelationshipDeltas = normalized.relationshipDeltas.map((delta) =>
         this.#applyRelationshipDelta(normalized, delta, createdAt),
       );
@@ -1835,6 +2113,7 @@ export class SocialMemoryStore {
         created: true,
         event: this.#requireEvent(normalized.id),
         appliedRelationshipDeltas,
+        appliedRomanticBoundaryTransitions,
         updatedOpenLoops,
       };
   }
@@ -2604,6 +2883,27 @@ export class SocialMemoryStore {
     return rows.map((row) => this.#relationshipFromRow(row));
   }
 
+  getRomanticBoundary(ownerId: string, subjectId: string): RomanticBoundaryState {
+    const owner = cleanId(ownerId, "ownerId");
+    const subject = cleanId(subjectId, "subjectId");
+    const [pairOwner, pairSubject] = canonicalRomanticBoundaryPair(owner, subject);
+    const rows = this.#database.prepare(
+      `SELECT blocker_actor_id, updated_at
+       FROM relationship_romantic_boundaries
+       WHERE owner_id = ? AND subject_id = ?
+       ORDER BY blocker_actor_id ASC`,
+    ).all(pairOwner, pairSubject) as Record<string, unknown>[];
+    return {
+      ownerId: owner,
+      subjectId: subject,
+      closed: rows.length > 0,
+      blockerActorIds: rows.map((row) => rowString(row, "blocker_actor_id")),
+      ...(rows.length > 0
+        ? { updatedAt: Math.max(...rows.map((row) => rowNumber(row, "updated_at"))) }
+        : {}),
+    };
+  }
+
   listOpenLoops(query: OpenLoopQuery): OpenLoop[] {
     const ownerId = cleanId(query.ownerId, "ownerId");
     if (query.scope !== undefined && query.visibleInScope !== undefined) {
@@ -2716,13 +3016,26 @@ export class SocialMemoryStore {
   resetRelationship(ownerId: string, subjectId: string, adminId: string, reason?: string): boolean {
     const owner = cleanId(ownerId, "ownerId");
     const subject = cleanId(subjectId, "subjectId");
+    const [boundaryOwner, boundarySubject] = canonicalRomanticBoundaryPair(owner, subject);
     const admin = cleanId(adminId, "adminId");
     const cleanReason = reason === undefined ? undefined : cleanText(reason, LIMITS.reason, "reason");
     return this.#transaction(() => {
-      const result = this.#database
+      const existing = this.#database.prepare(
+        `SELECT 1 AS present FROM relationship_edges WHERE owner_id = ? AND subject_id = ?
+         UNION ALL SELECT 1 FROM relationship_changes WHERE owner_id = ? AND subject_id = ?
+         UNION ALL SELECT 1 FROM relationship_checkpoints WHERE owner_id = ? AND subject_id = ?
+         UNION ALL SELECT 1 FROM relationship_daily_budgets WHERE owner_id = ? AND subject_id = ?
+         LIMIT 1`,
+      ).get(
+        owner, subject,
+        owner, subject,
+        owner, subject,
+        owner, subject,
+      ) as Record<string, unknown> | undefined;
+      if (!existing) return false;
+      this.#database
         .prepare("DELETE FROM relationship_edges WHERE owner_id = ? AND subject_id = ?")
         .run(owner, subject);
-      if (Number(result.changes) === 0) return false;
       this.#database
         .prepare("DELETE FROM relationship_changes WHERE owner_id = ? AND subject_id = ?")
         .run(owner, subject);
@@ -2732,6 +3045,32 @@ export class SocialMemoryStore {
       this.#database
         .prepare("DELETE FROM relationship_daily_budgets WHERE owner_id = ? AND subject_id = ?")
         .run(owner, subject);
+      const boundary = this.getRomanticBoundary(boundaryOwner, boundarySubject);
+      if (boundary.closed) {
+        const pairStillProjected = this.#database.prepare(
+          `SELECT 1 AS present FROM relationship_edges
+           WHERE (owner_id = ? AND subject_id = ?) OR (owner_id = ? AND subject_id = ?)
+           LIMIT 1`,
+        ).get(
+          boundaryOwner,
+          boundarySubject,
+          boundarySubject,
+          boundaryOwner,
+        ) as Record<string, unknown> | undefined;
+        if (!pairStillProjected) {
+          // Relationship reset is intentionally directed. Endpoint-owned
+          // safety boundaries are separate durable state and cannot be opened
+          // implicitly by an admin resetting numeric history. Keep one neutral
+          // shell so the surviving boundary remains visible in admin/prompt
+          // projections even when this was the pair's only relationship edge.
+          this.#database.prepare(
+            `INSERT INTO relationship_edges
+             (owner_id, subject_id, familiarity, warmth, trust, respect, friction,
+              romantic_interest, updated_at)
+             VALUES (?, ?, 0, 0, 0, 0, 0, 0, ?)`,
+          ).run(owner, subject, boundary.updatedAt ?? this.#nowTimestamp());
+        }
+      }
       this.#audit(admin, "relationship.reset", "relationship", `${owner}->${subject}`, cleanReason, {
         ownerId: owner,
         subjectId: subject,
@@ -2876,8 +3215,104 @@ export class SocialMemoryStore {
         this.#database.exec(migrationFive);
         this.#database.exec("PRAGMA user_version = 5");
       });
+      migratedVersion = 5;
     }
+    if (migratedVersion < 6) {
+      this.#transaction(() => {
+        this.#database.exec(migrationSix);
+        this.#database.exec("PRAGMA user_version = 6");
+      });
+      migratedVersion = 6;
+    }
+    if (migratedVersion < 7) {
+      this.#transaction(() => {
+        this.#database.exec(migrationSeven);
+        this.#database.exec("PRAGMA user_version = 7");
+      });
+    }
+    this.#reconcileRomanticBoundaryProjectionEdges();
     this.#reconcileLegacyOpenLoopUpdateBounds();
+  }
+
+  #reconcileRomanticBoundaryProjectionEdges(): void {
+    const pairs = this.#database.prepare(
+      `SELECT owner_id, subject_id, MAX(updated_at) AS updated_at
+       FROM relationship_romantic_boundaries
+       GROUP BY owner_id, subject_id`,
+    ).all() as Record<string, unknown>[];
+    if (pairs.length === 0) return;
+    this.#transaction(() => {
+      for (const pair of pairs) {
+        const pairOwnerId = rowString(pair, "owner_id");
+        const pairSubjectId = rowString(pair, "subject_id");
+        const candidates = this.#database.prepare(
+          `SELECT owner_id, subject_id, updated_at
+           FROM relationship_edges
+           WHERE (owner_id = ? AND subject_id = ?) OR (owner_id = ? AND subject_id = ?)
+           ORDER BY updated_at DESC, owner_id ASC`,
+        ).all(
+          pairOwnerId,
+          pairSubjectId,
+          pairSubjectId,
+          pairOwnerId,
+        ) as Record<string, unknown>[];
+        const withHistory: Record<string, unknown>[] = [];
+        const shells: Record<string, unknown>[] = [];
+        for (const candidate of candidates) {
+          const ownerId = rowString(candidate, "owner_id");
+          const subjectId = rowString(candidate, "subject_id");
+          const history = this.#database.prepare(
+            `SELECT 1 AS present FROM relationship_changes
+             WHERE owner_id = ? AND subject_id = ?
+             UNION ALL SELECT 1 FROM relationship_checkpoints
+             WHERE owner_id = ? AND subject_id = ?
+             UNION ALL SELECT 1 FROM relationship_daily_budgets
+             WHERE owner_id = ? AND subject_id = ?
+             LIMIT 1`,
+          ).get(
+            ownerId,
+            subjectId,
+            ownerId,
+            subjectId,
+            ownerId,
+            subjectId,
+          ) as Record<string, unknown> | undefined;
+          (history ? withHistory : shells).push(candidate);
+        }
+        if (withHistory.length > 0) {
+          for (const shell of shells) {
+            this.#deleteNeutralRelationshipEdgeWithoutHistory(
+              rowString(shell, "owner_id"),
+              rowString(shell, "subject_id"),
+            );
+          }
+          continue;
+        }
+        const [projectionOwnerId, projectionSubjectId] = this.#boundaryProjectionDirection(
+          pairOwnerId,
+          pairSubjectId,
+          shells[0] === undefined ? undefined : rowString(shells[0], "owner_id"),
+        );
+        for (const shell of shells) {
+          if (
+            rowString(shell, "owner_id") === projectionOwnerId &&
+            rowString(shell, "subject_id") === projectionSubjectId
+          ) continue;
+          this.#deleteNeutralRelationshipEdgeWithoutHistory(
+            rowString(shell, "owner_id"),
+            rowString(shell, "subject_id"),
+          );
+        }
+        this.#database.prepare(
+          `INSERT INTO relationship_edges
+           (owner_id, subject_id, familiarity, warmth, trust, respect, friction,
+            romantic_interest, updated_at)
+           VALUES (?, ?, 0, 0, 0, 0, 0, 0, ?)
+           ON CONFLICT(owner_id, subject_id) DO UPDATE SET
+             updated_at = MAX(relationship_edges.updated_at, excluded.updated_at)`,
+        ).run(projectionOwnerId, projectionSubjectId, rowNumber(pair, "updated_at"));
+      }
+    });
   }
 
   #reconcileLegacyOpenLoopUpdateBounds(): void {
@@ -3056,12 +3491,20 @@ export class SocialMemoryStore {
         trust: 0,
         respect: 0,
         friction: 0,
-        spent: { familiarity: 0, warmth: 0, trust: 0, respect: 0, friction: 0 },
+        romanticInterest: 0,
+        spent: {
+          familiarity: 0,
+          warmth: 0,
+          trust: 0,
+          respect: 0,
+          friction: 0,
+          romanticInterest: 0,
+        },
         throughAt: 0,
         rows: [],
       };
       for (const dimension of DIMENSIONS) {
-        const applied = rowNumber(row, dimension);
+        const applied = rowNumber(row, relationshipColumn(dimension));
         aggregate[dimension] += applied;
         aggregate.spent[dimension] += Math.abs(applied);
       }
@@ -3072,21 +3515,24 @@ export class SocialMemoryStore {
     const upsert = this.#database.prepare(
       `INSERT INTO relationship_checkpoints
        (id, owner_id, subject_id, origin, day_key, participant_ids_json,
-        familiarity, warmth, trust, respect, friction,
+        familiarity, warmth, trust, respect, friction, romantic_interest,
         spent_familiarity, spent_warmth, spent_trust, spent_respect, spent_friction,
+        spent_romantic_interest,
         through_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(owner_id, subject_id, origin, day_key, participant_ids_json) DO UPDATE SET
          familiarity = relationship_checkpoints.familiarity + excluded.familiarity,
          warmth = relationship_checkpoints.warmth + excluded.warmth,
          trust = relationship_checkpoints.trust + excluded.trust,
          respect = relationship_checkpoints.respect + excluded.respect,
          friction = relationship_checkpoints.friction + excluded.friction,
+         romantic_interest = relationship_checkpoints.romantic_interest + excluded.romantic_interest,
          spent_familiarity = relationship_checkpoints.spent_familiarity + excluded.spent_familiarity,
          spent_warmth = relationship_checkpoints.spent_warmth + excluded.spent_warmth,
          spent_trust = relationship_checkpoints.spent_trust + excluded.spent_trust,
          spent_respect = relationship_checkpoints.spent_respect + excluded.spent_respect,
          spent_friction = relationship_checkpoints.spent_friction + excluded.spent_friction,
+         spent_romantic_interest = relationship_checkpoints.spent_romantic_interest + excluded.spent_romantic_interest,
          through_at = MAX(relationship_checkpoints.through_at, excluded.through_at),
          updated_at = excluded.updated_at`,
     );
@@ -3114,11 +3560,13 @@ export class SocialMemoryStore {
         aggregate.trust,
         aggregate.respect,
         aggregate.friction,
+        aggregate.romanticInterest,
         aggregate.spent.familiarity,
         aggregate.spent.warmth,
         aggregate.spent.trust,
         aggregate.spent.respect,
         aggregate.spent.friction,
+        aggregate.spent.romanticInterest,
         aggregate.throughAt,
         checkpointedAt,
       );
@@ -3217,14 +3665,34 @@ export class SocialMemoryStore {
   }
 
   #recomputeAllRelationshipEdges(): void {
+    const priorBoundaryProjectionRows = this.#database.prepare(
+      `SELECT b.owner_id AS pair_owner_id, b.subject_id AS pair_subject_id,
+              e.owner_id AS projection_owner_id
+       FROM relationship_romantic_boundaries b
+       JOIN relationship_edges e ON (
+         (e.owner_id = b.owner_id AND e.subject_id = b.subject_id) OR
+         (e.owner_id = b.subject_id AND e.subject_id = b.owner_id)
+       )
+       ORDER BY b.owner_id ASC, b.subject_id ASC, e.updated_at DESC, e.owner_id ASC`,
+    ).all() as Record<string, unknown>[];
+    const priorBoundaryProjectionOwners = new Map<string, string>();
+    for (const row of priorBoundaryProjectionRows) {
+      const key = romanticBoundaryPairKey(
+        rowString(row, "pair_owner_id"),
+        rowString(row, "pair_subject_id"),
+      );
+      if (!priorBoundaryProjectionOwners.has(key)) {
+        priorBoundaryProjectionOwners.set(key, rowString(row, "projection_owner_id"));
+      }
+    }
     const rows = this.#database.prepare(
       `WITH history AS (
          SELECT c.owner_id, c.subject_id, c.origin, c.familiarity, c.warmth, c.trust,
-                c.respect, c.friction, e.occurred_at AS updated_at
+                c.respect, c.friction, c.romantic_interest, e.occurred_at AS updated_at
          FROM relationship_changes c JOIN social_events e ON e.id = c.event_id
          UNION ALL
          SELECT owner_id, subject_id, origin, familiarity, warmth, trust, respect,
-                friction, through_at AS updated_at
+                friction, romantic_interest, through_at AS updated_at
          FROM relationship_checkpoints
        )
        SELECT owner_id, subject_id,
@@ -3233,19 +3701,30 @@ export class SocialMemoryStore {
               SUM(CASE WHEN origin = 'human' THEN trust ELSE 0 END) AS human_trust,
               SUM(CASE WHEN origin = 'human' THEN respect ELSE 0 END) AS human_respect,
               SUM(CASE WHEN origin = 'human' THEN friction ELSE 0 END) AS human_friction,
+              SUM(CASE WHEN origin = 'human' THEN romantic_interest ELSE 0 END) AS human_romanticInterest,
               SUM(CASE WHEN origin = 'autonomous' THEN familiarity ELSE 0 END) AS autonomous_familiarity,
               SUM(CASE WHEN origin = 'autonomous' THEN warmth ELSE 0 END) AS autonomous_warmth,
               SUM(CASE WHEN origin = 'autonomous' THEN trust ELSE 0 END) AS autonomous_trust,
               SUM(CASE WHEN origin = 'autonomous' THEN respect ELSE 0 END) AS autonomous_respect,
               SUM(CASE WHEN origin = 'autonomous' THEN friction ELSE 0 END) AS autonomous_friction,
+              SUM(CASE WHEN origin = 'autonomous' THEN romantic_interest ELSE 0 END) AS autonomous_romanticInterest,
               MAX(updated_at) AS updated_at
        FROM history GROUP BY owner_id, subject_id`,
     ).all() as Record<string, unknown>[];
     this.#database.exec("DELETE FROM relationship_edges");
     const insert = this.#database.prepare(
       `INSERT INTO relationship_edges
-       (owner_id, subject_id, familiarity, warmth, trust, respect, friction, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (owner_id, subject_id, familiarity, warmth, trust, respect, friction,
+        romantic_interest, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(owner_id, subject_id) DO UPDATE SET
+         familiarity = excluded.familiarity,
+         warmth = excluded.warmth,
+         trust = excluded.trust,
+         respect = excluded.respect,
+         friction = excluded.friction,
+         romantic_interest = excluded.romantic_interest,
+         updated_at = MAX(relationship_edges.updated_at, excluded.updated_at)`,
     );
     for (const row of rows) {
       const recomputed = (dimension: RelationshipDimension): number => {
@@ -3265,6 +3744,35 @@ export class SocialMemoryStore {
         recomputed("trust"),
         recomputed("respect"),
         recomputed("friction"),
+        recomputed("romanticInterest"),
+        rowNumber(row, "updated_at"),
+      );
+    }
+    const boundaryPairs = this.#database.prepare(
+      `SELECT owner_id, subject_id, MAX(updated_at) AS updated_at
+       FROM relationship_romantic_boundaries
+       GROUP BY owner_id, subject_id`,
+    ).all() as Record<string, unknown>[];
+    const insertBoundaryPair = this.#database.prepare(
+      `INSERT INTO relationship_edges
+       (owner_id, subject_id, familiarity, warmth, trust, respect, friction,
+        romantic_interest, updated_at)
+       VALUES (?, ?, 0, 0, 0, 0, 0, 0, ?)
+       ON CONFLICT(owner_id, subject_id) DO UPDATE SET
+         updated_at = MAX(relationship_edges.updated_at, excluded.updated_at)`,
+    );
+    for (const row of boundaryPairs) {
+      const [projectionOwnerId, projectionSubjectId] = this.#boundaryProjectionDirection(
+        rowString(row, "owner_id"),
+        rowString(row, "subject_id"),
+        priorBoundaryProjectionOwners.get(romanticBoundaryPairKey(
+          rowString(row, "owner_id"),
+          rowString(row, "subject_id"),
+        )),
+      );
+      insertBoundaryPair.run(
+        projectionOwnerId,
+        projectionSubjectId,
         rowNumber(row, "updated_at"),
       );
     }
@@ -3554,15 +4062,21 @@ export class SocialMemoryStore {
   }
 
   #relationshipFromRow(row: Record<string, unknown>): RelationshipEdge {
+    const ownerId = rowString(row, "owner_id");
+    const subjectId = rowString(row, "subject_id");
+    const romanticBoundary = this.getRomanticBoundary(ownerId, subjectId);
     return {
-      ownerId: rowString(row, "owner_id"),
-      subjectId: rowString(row, "subject_id"),
+      ownerId,
+      subjectId,
       familiarity: rowNumber(row, "familiarity"),
       warmth: rowNumber(row, "warmth"),
       trust: rowNumber(row, "trust"),
       respect: rowNumber(row, "respect"),
       friction: rowNumber(row, "friction"),
-      updatedAt: rowNumber(row, "updated_at"),
+      romanticInterest: rowNumber(row, "romantic_interest"),
+      romanticBoundaryClosed: romanticBoundary.closed,
+      romanticBoundaryBlockerIds: romanticBoundary.blockerActorIds,
+      updatedAt: Math.max(rowNumber(row, "updated_at"), romanticBoundary.updatedAt ?? 0),
     };
   }
 
@@ -3586,12 +4100,155 @@ export class SocialMemoryStore {
     };
   }
 
+  #relationshipOrigin(
+    event: NormalizedRecordInput,
+    ownerId: string,
+    subjectId: string,
+  ): SocialEventOrigin {
+    if (event.origin === "autonomous") return "autonomous";
+    // A human may trigger or witness an AI-to-AI exchange, but that must not
+    // grant the pair a human-sized intimacy budget. Actor kind comes only from
+    // the trusted registry supplied by the host; IDs and labels are not parsed.
+    try {
+      if (
+        this.#resolveActorKind(ownerId) === "resident" &&
+        this.#resolveActorKind(subjectId) === "resident"
+      ) return "autonomous";
+    } catch {
+      // A registry outage cannot make an otherwise valid human-origin event
+      // fail. Unknown kinds preserve the source origin and never infer trust.
+    }
+    return "human";
+  }
+
+  #boundaryProjectionDirection(
+    pairOwnerId: string,
+    pairSubjectId: string,
+    preferredOwnerId?: string,
+  ): readonly [string, string] {
+    try {
+      const ownerKind = this.#resolveActorKind(pairOwnerId);
+      const subjectKind = this.#resolveActorKind(pairSubjectId);
+      if (ownerKind === "resident" && subjectKind !== "resident") {
+        return [pairOwnerId, pairSubjectId];
+      }
+      if (subjectKind === "resident" && ownerKind !== "resident") {
+        return [pairSubjectId, pairOwnerId];
+      }
+    } catch {
+      // Registry failure cannot make durable boundary state disappear. The
+      // canonical pair is a stable, fail-closed projection fallback.
+    }
+    if (preferredOwnerId === pairOwnerId) return [pairOwnerId, pairSubjectId];
+    if (preferredOwnerId === pairSubjectId) return [pairSubjectId, pairOwnerId];
+    return [pairOwnerId, pairSubjectId];
+  }
+
+  #deleteNeutralRelationshipEdgeWithoutHistory(ownerId: string, subjectId: string): void {
+    const numericHistory = this.#database.prepare(
+      `SELECT 1 AS present FROM relationship_changes
+       WHERE owner_id = ? AND subject_id = ?
+       UNION ALL
+       SELECT 1 AS present FROM relationship_checkpoints
+       WHERE owner_id = ? AND subject_id = ?
+       UNION ALL
+       SELECT 1 AS present FROM relationship_daily_budgets
+       WHERE owner_id = ? AND subject_id = ?
+       LIMIT 1`,
+    ).get(
+      ownerId,
+      subjectId,
+      ownerId,
+      subjectId,
+      ownerId,
+      subjectId,
+    ) as Record<string, unknown> | undefined;
+    if (!numericHistory) {
+      this.#database.prepare(
+        `DELETE FROM relationship_edges
+         WHERE owner_id = ? AND subject_id = ?
+           AND familiarity = 0 AND warmth = 0 AND trust = 0 AND respect = 0
+           AND friction = 0 AND romantic_interest = 0`,
+      ).run(ownerId, subjectId);
+    }
+  }
+
+  #applyRomanticBoundaryTransition(
+    event: NormalizedRecordInput,
+    transition: RomanticBoundaryTransitionInput,
+    createdAt: number,
+  ): AppliedRomanticBoundaryTransition {
+    const [pairOwnerId, pairSubjectId] = canonicalRomanticBoundaryPair(
+      transition.ownerId,
+      transition.subjectId,
+    );
+    let changed = false;
+    if (transition.action === "set_closed") {
+      const result = this.#database.prepare(
+        `INSERT OR IGNORE INTO relationship_romantic_boundaries
+         (owner_id, subject_id, blocker_actor_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        pairOwnerId,
+        pairSubjectId,
+        transition.blockerActorId,
+        event.occurredAt,
+        event.occurredAt,
+      );
+      changed = Number(result.changes) > 0;
+      // A boundary with otherwise neutral history is still a real directed
+      // relationship state and must remain visible to admin/reset callers.
+      const [projectionOwnerId, projectionSubjectId] = this.#boundaryProjectionDirection(
+        pairOwnerId,
+        pairSubjectId,
+        transition.ownerId,
+      );
+      this.#database.prepare(
+        `INSERT INTO relationship_edges
+         (owner_id, subject_id, familiarity, warmth, trust, respect, friction,
+          romantic_interest, updated_at)
+         VALUES (?, ?, 0, 0, 0, 0, 0, 0, ?)
+         ON CONFLICT(owner_id, subject_id) DO UPDATE SET
+           updated_at = MAX(relationship_edges.updated_at, excluded.updated_at)`,
+      ).run(projectionOwnerId, projectionSubjectId, event.occurredAt);
+    } else {
+      const existing = this.#database.prepare(
+        `SELECT 1 AS present FROM relationship_romantic_boundaries
+         WHERE owner_id = ? AND subject_id = ? AND blocker_actor_id = ?`,
+      ).get(
+        pairOwnerId,
+        pairSubjectId,
+        transition.blockerActorId,
+      ) as Record<string, unknown> | undefined;
+      if (!existing) {
+        throw new Error("a romantic boundary can be cleared only by its existing blocker");
+      }
+      changed = Number(this.#database.prepare(
+        `DELETE FROM relationship_romantic_boundaries
+         WHERE owner_id = ? AND subject_id = ? AND blocker_actor_id = ?`,
+      ).run(
+        pairOwnerId,
+        pairSubjectId,
+        transition.blockerActorId,
+      ).changes) > 0;
+      const remaining = this.getRomanticBoundary(pairOwnerId, pairSubjectId).closed;
+      if (!remaining) {
+        // Remove either v6 view projection when it is only a boundary shell;
+        // genuine directional relationship history is never erased here.
+        this.#deleteNeutralRelationshipEdgeWithoutHistory(pairOwnerId, pairSubjectId);
+        this.#deleteNeutralRelationshipEdgeWithoutHistory(pairSubjectId, pairOwnerId);
+      }
+    }
+    return { ...transition, eventId: event.id, changed, updatedAt: createdAt };
+  }
+
   #applyRelationshipDelta(
     event: NormalizedRecordInput,
     requested: RelationshipDeltaInput & RelationshipVector,
     createdAt: number,
   ): AppliedRelationshipDelta {
     const dayKey = new Date(event.occurredAt).toISOString().slice(0, 10);
+    const relationshipOrigin = this.#relationshipOrigin(event, requested.ownerId, requested.subjectId);
     const existing = this.getRelationship(requested.ownerId, requested.subjectId) ?? {
       ownerId: requested.ownerId,
       subjectId: requested.subjectId,
@@ -3600,37 +4257,45 @@ export class SocialMemoryStore {
       trust: 0,
       respect: 0,
       friction: 0,
+      romanticInterest: 0,
+      romanticBoundaryClosed: false,
+      romanticBoundaryBlockerIds: [],
       updatedAt: createdAt,
     };
-    const caps = event.origin === "human" ? this.#humanCaps : this.#autonomousCaps;
+    const reverseRomanticBoundaryClosed = this.getRomanticBoundary(
+      requested.subjectId,
+      requested.ownerId,
+    ).closed;
+    const caps = relationshipOrigin === "human" ? this.#humanCaps : this.#autonomousCaps;
     const spentRow = this.#database
       .prepare(
         `SELECT spent_familiarity AS familiarity, spent_warmth AS warmth,
                 spent_trust AS trust, spent_respect AS respect,
-                spent_friction AS friction
+                spent_friction AS friction,
+                spent_romantic_interest AS romanticInterest
          FROM relationship_daily_budgets
          WHERE owner_id = ? AND subject_id = ? AND origin = ? AND day_key = ?`,
       )
       .get(
         requested.ownerId,
         requested.subjectId,
-        event.origin,
+        relationshipOrigin,
         dayKey,
       ) as Record<string, unknown> | undefined;
     const legacyWatermarkRow = this.#database.prepare(
       `SELECT MAX(through_at) AS through_at FROM relationship_checkpoints
        WHERE owner_id = ? AND subject_id = ? AND origin = ? AND day_key = 'legacy'`,
-    ).get(requested.ownerId, requested.subjectId, event.origin) as Record<string, unknown>;
+    ).get(requested.ownerId, requested.subjectId, relationshipOrigin) as Record<string, unknown>;
     const legacyBackdatedQuarantine = legacyWatermarkRow.through_at !== null &&
       event.occurredAt <= rowNumber(legacyWatermarkRow, "through_at");
-    const autonomousLifetimeRow = event.origin === "autonomous"
+    const autonomousLifetimeRow = relationshipOrigin === "autonomous"
       ? this.#database.prepare(
         `WITH autonomous_history AS (
-           SELECT familiarity, warmth, trust, respect, friction
+           SELECT familiarity, warmth, trust, respect, friction, romantic_interest AS romanticInterest
            FROM relationship_changes
            WHERE owner_id = ? AND subject_id = ? AND origin = 'autonomous'
            UNION ALL
-           SELECT familiarity, warmth, trust, respect, friction
+           SELECT familiarity, warmth, trust, respect, friction, romantic_interest AS romanticInterest
            FROM relationship_checkpoints
            WHERE owner_id = ? AND subject_id = ? AND origin = 'autonomous'
          )
@@ -3638,7 +4303,8 @@ export class SocialMemoryStore {
                 COALESCE(SUM(warmth), 0) AS warmth,
                 COALESCE(SUM(trust), 0) AS trust,
                 COALESCE(SUM(respect), 0) AS respect,
-                COALESCE(SUM(friction), 0) AS friction
+                COALESCE(SUM(friction), 0) AS friction,
+                COALESCE(SUM(romanticInterest), 0) AS romanticInterest
          FROM autonomous_history`,
       ).get(
         requested.ownerId,
@@ -3651,10 +4317,14 @@ export class SocialMemoryStore {
     const applied = {} as RelationshipVector;
     const next = { ...existing };
     for (const dimension of DIMENSIONS) {
+      const requestedAmount = dimension === "romanticInterest" &&
+          (existing.romanticBoundaryClosed || reverseRomanticBoundaryClosed) && requested[dimension] > 0
+        ? 0
+        : requested[dimension];
       const remaining = legacyBackdatedQuarantine
         ? 0
         : Math.max(0, caps[dimension] - (spentRow ? rowNumber(spentRow, dimension) : 0));
-      const budgeted = Math.sign(requested[dimension]) * Math.min(Math.abs(requested[dimension]), remaining);
+      const budgeted = Math.sign(requestedAmount) * Math.min(Math.abs(requestedAmount), remaining);
       let lifetimeBounded = budgeted;
       if (autonomousLifetimeRow) {
         const history = rowNumber(autonomousLifetimeRow, dimension);
@@ -3681,14 +4351,16 @@ export class SocialMemoryStore {
     this.#database
       .prepare(
         `INSERT INTO relationship_edges
-         (owner_id, subject_id, familiarity, warmth, trust, respect, friction, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         (owner_id, subject_id, familiarity, warmth, trust, respect, friction,
+          romantic_interest, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(owner_id, subject_id) DO UPDATE SET
            familiarity = excluded.familiarity,
            warmth = excluded.warmth,
            trust = excluded.trust,
            respect = excluded.respect,
            friction = excluded.friction,
+           romantic_interest = excluded.romantic_interest,
            updated_at = excluded.updated_at`,
       )
       .run(
@@ -3699,26 +4371,28 @@ export class SocialMemoryStore {
         next.trust,
         next.respect,
         next.friction,
+        next.romanticInterest,
         event.occurredAt,
       );
     this.#database
       .prepare(
         `INSERT INTO relationship_changes
          (event_id, owner_id, subject_id, origin, day_key,
-          familiarity, warmth, trust, respect, friction, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          familiarity, warmth, trust, respect, friction, romantic_interest, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         event.id,
         requested.ownerId,
         requested.subjectId,
-        event.origin,
+        relationshipOrigin,
         dayKey,
         applied.familiarity,
         applied.warmth,
         applied.trust,
         applied.respect,
         applied.friction,
+        applied.romanticInterest,
         createdAt,
       );
     if (DIMENSIONS.some((dimension) => Math.abs(applied[dimension]) > 0)) {
@@ -3726,26 +4400,29 @@ export class SocialMemoryStore {
         `INSERT INTO relationship_daily_budgets
          (owner_id, subject_id, origin, day_key,
           spent_familiarity, spent_warmth, spent_trust, spent_respect, spent_friction,
+          spent_romantic_interest,
           through_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(owner_id, subject_id, origin, day_key) DO UPDATE SET
            spent_familiarity = relationship_daily_budgets.spent_familiarity + excluded.spent_familiarity,
            spent_warmth = relationship_daily_budgets.spent_warmth + excluded.spent_warmth,
            spent_trust = relationship_daily_budgets.spent_trust + excluded.spent_trust,
            spent_respect = relationship_daily_budgets.spent_respect + excluded.spent_respect,
            spent_friction = relationship_daily_budgets.spent_friction + excluded.spent_friction,
+           spent_romantic_interest = relationship_daily_budgets.spent_romantic_interest + excluded.spent_romantic_interest,
            through_at = MAX(relationship_daily_budgets.through_at, excluded.through_at),
            updated_at = MAX(relationship_daily_budgets.updated_at, excluded.updated_at)`,
       ).run(
         requested.ownerId,
         requested.subjectId,
-        event.origin,
+        relationshipOrigin,
         dayKey,
         Math.abs(applied.familiarity),
         Math.abs(applied.warmth),
         Math.abs(applied.trust),
         Math.abs(applied.respect),
         Math.abs(applied.friction),
+        Math.abs(applied.romanticInterest),
         event.occurredAt,
         createdAt,
       );
@@ -3754,7 +4431,7 @@ export class SocialMemoryStore {
       eventId: event.id,
       ownerId: requested.ownerId,
       subjectId: requested.subjectId,
-      origin: event.origin,
+      origin: relationshipOrigin,
       dayKey,
       ...applied,
     };
@@ -3775,6 +4452,7 @@ export class SocialMemoryStore {
       trust: rowNumber(row, "trust"),
       respect: rowNumber(row, "respect"),
       friction: rowNumber(row, "friction"),
+      romanticInterest: rowNumber(row, "romantic_interest"),
     }));
   }
 

@@ -36,7 +36,11 @@ import { displayNameGlyph, normalizeDisplayName, validDisplayName } from "../sha
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { HUMAN_IDLE_AFTER_MS } from "../shared/presence.js";
 import { AdminAuthManager } from "./adminAuth.js";
-import { AccountStore, type AuthenticatedAccountSession } from "./accountStore.js";
+import {
+  AccountStore,
+  type AccountRecord,
+  type AuthenticatedAccountSession,
+} from "./accountStore.js";
 import { AdminModerationGuard } from "./adminModeration.js";
 import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
@@ -66,7 +70,8 @@ import { CodexBackend } from "./codexBackend.js";
 import { ModelProviderManager } from "./modelProviderManager.js";
 import { SwitchableSocialModel } from "./switchableModel.js";
 import { CHANNELS } from "./channels.js";
-import { PERSONAS, memberView } from "./personas.js";
+import { PERSONAS, isActiveResidentActorId, memberView } from "./personas.js";
+import { createLiveActorKindResolver } from "./actorKindResolver.js";
 import { configuredProviderVoiceIds } from "./personaVoices.js";
 import { participantIdentityKey } from "./participantIdentity.js";
 import {
@@ -241,6 +246,10 @@ const accountUpgradeSchema = z.object({
 }).strict();
 const accountDeleteSchema = z.object({
   password: z.string().min(1).max(1_024),
+}).strict();
+const accountRomancePreferenceSchema = z.object({
+  romanticInteractionsOptIn: z.boolean(),
+  adultConfirmed: z.boolean().optional(),
 }).strict();
 const recoverSessionSchema = z.object({
   name: z.string().min(1).max(128),
@@ -488,6 +497,15 @@ const humanMemory = new HumanMemoryStore();
 const accountStore = new AccountStore();
 const socialMemoryStore = new SocialMemoryStore({
   filePath: resolve(process.env.SOCIAL_MEMORY_PATH ?? "./data/social-memory.sqlite"),
+  resolveActorKind: createLiveActorKindResolver({
+    // PERSONAS is the trusted, in-place runtime catalog. AdminStateStore can
+    // replace its contents after this store is constructed and while the
+    // server is live, so this must remain a lookup rather than a startup set.
+    isResident: isActiveResidentActorId,
+    isHuman: (actorId) => Boolean(
+      accountStore.getAccountByActorId(actorId) || humanMemory.findByHumanId(actorId),
+    ),
+  }),
 });
 const ambientEpisodeLedger = new AmbientEpisodeLedger();
 await ambientEpisodeLedger.load();
@@ -847,6 +865,9 @@ const director = new SocialDirector(
     marketPulseCoordinator,
     ambientEpisodeLedger,
     socialMemory,
+    romanceEligibleHumanActor: (actorId) =>
+      accountStore.getAccountByActorId(actorId)?.romanticInteractionsOptIn === true,
+    romanceEligibleResidentActor: (actorId) => adminState.isRomanceEligibleResident(actorId),
   },
 );
 
@@ -879,6 +900,11 @@ const voiceDirector = new VoiceDirector({
   actorChannels,
   humanMemory,
   socialMemory,
+  relationshipBehaviorProjection: (ownerPersonaId, subjectActorId) =>
+    socialMemory.behaviorProjection(ownerPersonaId, subjectActorId),
+  romanceEligibleActor: (actorId, kind) => kind === "resident"
+    ? adminState.isRomanceEligibleResident(actorId)
+    : accountStore.getAccountByActorId(actorId)?.romanticInteractionsOptIn === true,
   behaviorTuningProvider,
   establishedChannelLanguage: (channelId) => director.trustedLanguageForChannel(channelId),
   recentChannelMessages: (channelId) => store.getRecent(channelId, 6)
@@ -1062,6 +1088,14 @@ const hasAllowedOrigin = (request: Request): boolean => {
   }
 };
 
+const registeredIdentityFor = (
+  account: Pick<AccountRecord, "loginHandle" | "romanticInteractionsOptIn">,
+): HumanSessionIdentity => ({
+  kind: "registered",
+  loginHandle: account.loginHandle,
+  romanticInteractionsOptIn: account.romanticInteractionsOptIn,
+});
+
 const allowJoinAttempt = (ip: string): boolean => {
   const now = Date.now();
   const sourceKey = createHmac("sha256", joinAttemptHashKey)
@@ -1137,7 +1171,10 @@ const snapshotFor = (session: HumanSession): RoomSnapshot => {
     me: { ...session.member },
     identity: {
       kind: session.identityKind,
-      ...(account ? { loginHandle: account.loginHandle } : {}),
+      ...(account ? {
+        loginHandle: account.loginHandle,
+        romanticInteractionsOptIn: account.romanticInteractionsOptIn,
+      } : {}),
     },
     members: getMembers(),
     channels: CHANNELS,
@@ -1909,7 +1946,7 @@ app.post("/api/auth/login", async (request, response) => {
   response.status(201).json({
     ok: true,
     me: session.member,
-    identity: { kind: "registered", loginHandle: result.account.loginHandle } satisfies HumanSessionIdentity,
+    identity: registeredIdentityFor(result.account),
   });
 });
 
@@ -2036,7 +2073,7 @@ app.post("/api/auth/register", async (request, response) => {
   response.status(201).json({
     ok: true,
     me: result.session.member,
-    identity: { kind: "registered", loginHandle: result.issued.account.loginHandle } satisfies HumanSessionIdentity,
+    identity: registeredIdentityFor(result.issued.account),
   });
 });
 
@@ -2202,7 +2239,7 @@ app.post("/api/auth/upgrade", async (request, response) => {
   response.status(201).json({
     ok: true,
     me: result.session.member,
-    identity: { kind: "registered", loginHandle: result.issued.account.loginHandle } satisfies HumanSessionIdentity,
+    identity: registeredIdentityFor(result.issued.account),
   });
 });
 
@@ -2224,9 +2261,48 @@ app.get("/api/session", (request, response) => {
     me: authenticated.session.member,
     identity: {
       kind: authenticated.session.identityKind,
-      ...(account ? { loginHandle: account.loginHandle } : {}),
+      ...(account ? {
+        loginHandle: account.loginHandle,
+        romanticInteractionsOptIn: account.romanticInteractionsOptIn,
+      } : {}),
     } satisfies HumanSessionIdentity,
   });
+});
+
+app.patch("/api/account/preferences", async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (!hasAllowedOrigin(request)) {
+    response.status(403).json({ ok: false, error: "That account request did not come from the room." });
+    return;
+  }
+  const parsed = accountRomancePreferenceSchema.safeParse(request.body);
+  const authenticated = authenticatedSessionFromRequest(request);
+  if (!parsed.success || !authenticated || authenticated.session.identityKind !== "registered" ||
+      !authenticated.session.accountId) {
+    response.status(!parsed.success ? 400 : 401).json({
+      ok: false,
+      error: !parsed.success
+        ? "Choose whether subtle adult romantic storylines may appear."
+        : "A registered local account is required for this preference.",
+    });
+    return;
+  }
+  if (parsed.data.romanticInteractionsOptIn && parsed.data.adultConfirmed !== true) {
+    response.status(400).json({
+      ok: false,
+      error: "Confirm that this local account belongs to an adult before enabling this preference.",
+    });
+    return;
+  }
+  const account = await accountStore.setRomanticInteractionsOptIn(
+    authenticated.session.accountId,
+    parsed.data.romanticInteractionsOptIn,
+  );
+  if (!account || account.actorId !== authenticated.session.member.id) {
+    response.status(409).json({ ok: false, error: "That account preference could not be updated." });
+    return;
+  }
+  response.json({ ok: true, identity: registeredIdentityFor(account) });
 });
 
 app.delete("/api/account", async (request, response) => {

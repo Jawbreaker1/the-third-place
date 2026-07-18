@@ -3029,6 +3029,43 @@ textarea:focus-visible,
 .profile-account-status small,
 .profile-upgrade > div:first-child small { color: #6f7684; font-size: 10px; line-height: 1.35; }
 
+.profile-romance-preference {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 8px;
+  padding: 11px;
+  border: 1px solid rgba(202, 139, 190, 0.14);
+  border-radius: 10px;
+  background: rgba(202, 139, 190, 0.035);
+  cursor: pointer;
+}
+
+.profile-romance-copy {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.profile-romance-copy > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #cf91bc;
+}
+
+.profile-romance-copy strong { color: #b8afb9; font-size: 11px; }
+.profile-romance-copy small { color: #716b74; font-size: 10px; line-height: 1.35; }
+.profile-romance-preference input {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  accent-color: #c67faa;
+  cursor: pointer;
+}
+.profile-romance-preference input:disabled { cursor: wait; opacity: 0.55; }
+
 .profile-upgrade {
   display: grid;
   gap: 9px;
