@@ -1,6 +1,12 @@
 export type Presence = "online" | "idle" | "dnd" | "offline";
 export type MemberKind = "human" | "ai";
 
+/** Browser hint only; the server owns activity timestamps and aggregation. */
+export interface PresenceActivityPayload {
+  visible: boolean;
+  active: boolean;
+}
+
 export interface Member {
   id: string;
   name: string;
@@ -139,6 +145,7 @@ export interface ServerHealth {
     provider?: "lmstudio" | "codex";
   };
   onlineHumans: number;
+  idleHumans: number;
   aiPace: "calm" | "lively" | "party";
 }
 

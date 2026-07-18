@@ -35,6 +35,7 @@ import { normalizeDisplayName, validDisplayName } from "../shared/displayName";
 import { unicodeCaselessKey } from "../shared/unicodeSafety";
 import { VoicePeerMesh } from "./voicePeer";
 import { VoiceActivityDetector, type VoiceActivityEvent } from "./voiceActivity";
+import { attachBrowserHumanPresenceActivity, HumanPresenceActivityReporter } from "./humanPresenceActivity";
 import { conversationEntryTarget, type ConversationViewport, type PendingConversationEntry } from "./chatScroll";
 import { formatSourceDate, linkPreviewAriaLabel, linkPreviewDomainLabel } from "./linkPreview";
 import {
@@ -151,7 +152,7 @@ const Avatar = ({ member, size = "md", showStatus = true }: { member: Member; si
 
   return (
     <span
-      aria-label={`${member.name} avatar`}
+      aria-label={`${member.name} avatar${showStatus ? `, ${member.status}` : ""}`}
       className={`avatar avatar-${size}`}
       data-avatar-kind={showImage ? "image" : "glyph"}
       role="img"
@@ -389,6 +390,7 @@ export default function App() {
   const [voiceInviteExpanded, setVoiceInviteExpanded] = useState(false);
   const [, setRemoteStreamRevision] = useState(0);
   const socketRef = useRef<Socket | null>(null);
+  const presenceActivityCleanupRef = useRef<(() => void) | null>(null);
   const meRef = useRef<Member | null>(null);
   const activeChannelRef = useRef("lobby");
   const channelsRef = useRef<Channel[]>([]);
@@ -744,10 +746,27 @@ export default function App() {
   }, []);
 
   const connectSocket = useCallback(() => {
+    presenceActivityCleanupRef.current?.();
+    presenceActivityCleanupRef.current = null;
     socketRef.current?.disconnect();
     setConnection("connecting");
-    const socket = io({ transports: ["websocket", "polling"], withCredentials: true, reconnection: true });
+    let socket!: Socket;
+    const presenceReporter = new HumanPresenceActivityReporter(
+      (payload) => {
+        if (!socket?.connected) return false;
+        socket.emit("presence:activity", payload);
+        return true;
+      },
+      () => document.visibilityState === "visible",
+    );
+    socket = io({
+      transports: ["websocket", "polling"],
+      withCredentials: true,
+      reconnection: true,
+      auth: (authorize) => authorize({ presence: presenceReporter.snapshot() }),
+    });
     socketRef.current = socket;
+    presenceActivityCleanupRef.current = attachBrowserHumanPresenceActivity(socket, presenceReporter);
 
     socket.on("room:snapshot", applySnapshot);
     socket.on("message:new", (message: ChatMessage) => {
@@ -893,6 +912,18 @@ export default function App() {
     socket.on("presence:update", (payload: PresencePayload) => {
       membersRef.current = payload.members;
       setMembers(payload.members);
+      const currentMe = meRef.current;
+      const nextMe = currentMe && payload.members.find((member) => member.id === currentMe.id);
+      if (nextMe) {
+        meRef.current = nextMe;
+        setMe(nextMe);
+      }
+      setProfile((current) => {
+        if (!current) return current;
+        const next = payload.members.find((member) => member.id === current.id);
+        if (next) return next;
+        return current.kind === "human" ? { ...current, status: "offline" } : current;
+      });
     });
     socket.on("catalog:update", (payload: CatalogUpdatePayload) => {
       const activeId = activeChannelRef.current;
@@ -1112,6 +1143,8 @@ export default function App() {
       meRef.current = null;
       setMe(null);
       setConnection("preview");
+      presenceActivityCleanupRef.current?.();
+      presenceActivityCleanupRef.current = null;
       socket.disconnect();
     });
     socket.on("disconnect", (reason) => {
@@ -1121,6 +1154,12 @@ export default function App() {
       setVoiceInvitingBotId(null);
       if (reason !== "io client disconnect") setConnection("reconnecting");
       if (reason !== "io client disconnect" && joinedVoiceRoomRef.current) setVoiceJoinState("reconnecting");
+      if (reason !== "io client disconnect" && meRef.current) {
+        const disconnectedMe: Member = { ...meRef.current, status: "offline" };
+        meRef.current = disconnectedMe;
+        setMe(disconnectedMe);
+        setProfile((current) => current?.id === disconnectedMe.id ? disconnectedMe : current);
+      }
     });
     socket.on("connect", () => {
       setConnection((current) => (current === "live" ? current : "connecting"));
@@ -1149,6 +1188,8 @@ export default function App() {
         setJoinedVoiceRoomId(null);
         setVoiceJoinState("idle");
         setConnection("preview");
+        presenceActivityCleanupRef.current?.();
+        presenceActivityCleanupRef.current = null;
         socket.disconnect();
         if (error.message !== "AUTH_REQUIRED") {
           pushToast({
@@ -1189,6 +1230,8 @@ export default function App() {
       typingExpiryRef.current?.clear();
       if (joinedVoiceRoomRef.current) socketRef.current?.emit("voice:room:leave", { roomId: joinedVoiceRoomRef.current });
       clearVoiceMedia();
+      presenceActivityCleanupRef.current?.();
+      presenceActivityCleanupRef.current = null;
       socketRef.current?.disconnect();
     };
   }, [clearVoiceMedia, connectSocket]);
@@ -2309,6 +2352,8 @@ export default function App() {
   };
 
   const onlineHumans = members.filter((member) => member.kind === "human" && member.status === "online");
+  const idleHumans = members.filter((member) => member.kind === "human" && member.status === "idle");
+  const connectedHumans = [...onlineHumans, ...idleHumans];
   const activeResidents = members.filter((member) => member.kind === "ai" && member.status === "online");
   const quietResidents = members.filter((member) => member.kind === "ai" && member.status !== "online");
   const displayMembers = members.length ? members : preview?.members ?? [];
@@ -2405,7 +2450,7 @@ export default function App() {
         )}
         {me ? (
           <button className="sidebar-foot sidebar-foot-button" type="button" onClick={() => setProfile(me)} aria-label="Open your profile and return-key settings">
-            <Avatar member={me} size="sm" /><div><strong dir="auto">{me.name}</strong><span>Guest · connected</span></div><span className="signal-bars" aria-hidden="true"><i /><i /><i /></span>
+            <Avatar member={me} size="sm" /><div><strong dir="auto">{me.name}</strong><span>Guest · {me.status === "offline" ? "reconnecting" : me.status}</span></div><span className="signal-bars" aria-hidden="true"><i /><i /><i /></span>
           </button>
         ) : (
           <div className="sidebar-foot"><span className="preview-eye"><Icon name="users" size={16} /></span><div><strong>Live preview</strong><span>Join to take part</span></div></div>
@@ -2604,7 +2649,7 @@ export default function App() {
             )}
             <button className={`icon-button ${showDirector ? "active" : ""}`} onClick={() => setShowDirector((value) => !value)} title="Director view"><Icon name="pulse" /></button>
             <button className={`icon-button ${searchOpen ? "active" : ""}`} onClick={() => setSearchOpen((value) => !value)} title="Search"><Icon name="search" /></button>
-            <button className="people-button" onClick={() => setMobilePanel("people")}><Icon name="users" /><span>{onlineHumans.length + activeResidents.length}</span></button>
+            <button className="people-button" onClick={() => setMobilePanel("people")}><Icon name="users" /><span>{connectedHumans.length + activeResidents.length}</span></button>
           </div>
           {searchOpen && <div className="search-pop"><Icon name="search" size={15} /><input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder={`Search loaded messages in #${activeTitle}`} /><button onClick={() => { setSearch(""); setSearchOpen(false); }}><Icon name="close" size={14} /></button></div>}
         </header>
@@ -2940,14 +2985,14 @@ export default function App() {
       )}
 
       <aside className={`member-panel ${mobilePanel === "people" ? "mobile-open" : ""}`}>
-        <div className="member-panel-head"><div><strong>{voiceRoomInView ? "In voice" : "In the room"}</strong><span>{voiceRoomInView ? `${voiceRoomInView.participants.length} connected` : `${onlineHumans.length} guests · ${activeResidents.length} active residents`}</span></div><button className="icon-button mobile-only" onClick={() => setMobilePanel(null)}><Icon name="close" /></button></div>
+        <div className="member-panel-head"><div><strong>{voiceRoomInView ? "In voice" : "In the room"}</strong><span>{voiceRoomInView ? `${voiceRoomInView.participants.length} connected` : `${connectedHumans.length} guests · ${activeResidents.length} active residents`}</span></div><button className="icon-button mobile-only" onClick={() => setMobilePanel(null)}><Icon name="close" /></button></div>
         {!voiceRoomInView && <div className="room-pulse-card" onClick={() => setShowDirector(true)} role="button" tabIndex={0}>
           <div className="pulse-orb"><i /><i /><i /></div>
           <div><strong>Room pulse</strong><span>{typingMembers.length ? `${typingMembers.length} composing now` : directorEvents.at(-1)?.summary ?? "Quietly paying attention"}</span></div>
           <Icon name="chevron" size={15} />
         </div>}
         <div className="member-scroll">
-          {voiceRoomInView ? <><MemberGroup title="Connected" members={voicePanelMembers} onSelect={setProfile} /><MemberGroup title="Available AI residents" members={availableVoiceBots.slice(0, 10)} onSelect={setProfile} /></> : <><MemberGroup title="Here now" members={onlineHumans} onSelect={setProfile} /><MemberGroup title="Active residents" members={activeResidents} onSelect={setProfile} /><MemberGroup title="Around · quieter" members={quietResidents} onSelect={setProfile} /></>}
+          {voiceRoomInView ? <><MemberGroup title="Connected" members={voicePanelMembers} onSelect={setProfile} /><MemberGroup title="Available AI residents" members={availableVoiceBots.slice(0, 10)} onSelect={setProfile} /></> : <><MemberGroup title="Online guests" members={onlineHumans} onSelect={setProfile} /><MemberGroup title="Idle guests" members={idleHumans} onSelect={setProfile} /><MemberGroup title="Active residents" members={activeResidents} onSelect={setProfile} /><MemberGroup title="Around · quieter" members={quietResidents} onSelect={setProfile} /></>}
         </div>
         <div className="model-card">
           <div className="model-icon"><Icon name="spark" size={15} /></div>
@@ -2959,7 +3004,7 @@ export default function App() {
       {!me && (
         <div className="join-overlay">
           <form className="join-card" onSubmit={join}>
-            <div className="join-live"><i /> LIVE ROOM <span>{preview?.health.onlineHumans ?? 0} real guests here now</span></div>
+            <div className="join-live"><i /> LIVE ROOM <span>{(preview?.health.onlineHumans ?? 0) + (preview?.health.idleHumans ?? 0)} real guests connected</span></div>
             <div className="join-logo"><BrandMark large /></div>
             <p className="join-kicker">THE THIRD PLACE</p>
             <h2>{identityJoinMode === "returning" ? "Welcome back." : "Join the conversation."}</h2>

@@ -2972,9 +2972,9 @@ export class SocialDirector {
       labelCounts.set(key, (labelCounts.get(key) ?? 0) + 1);
     }
     const residentLabelKeys = new Set(PERSONAS.map((persona) => unicodeCaselessKey(persona.name)));
-    const onlineHumanIds = new Set(
+    const presentHumanIds = new Set(
       this.getMembers()
-        .filter((member) => member.kind === "human" && member.status === "online")
+        .filter((member) => member.kind === "human" && member.status !== "offline")
         .map((member) => member.id),
     );
     const seenIds = new Set<string>();
@@ -2983,7 +2983,7 @@ export class SocialDirector {
       const displayLabel = labels[index]!;
       const labelKey = displayLabel ? unicodeCaselessKey(displayLabel) : "";
       if (
-        !displayLabel || id === currentSpeakerId || onlineHumanIds.has(id) || seenIds.has(id) ||
+        !displayLabel || id === currentSpeakerId || presentHumanIds.has(id) || seenIds.has(id) ||
         labelCounts.get(labelKey) !== 1 || residentLabelKeys.has(labelKey)
       ) return [];
       seenIds.add(id);

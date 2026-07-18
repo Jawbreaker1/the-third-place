@@ -934,7 +934,7 @@ export default function AdminApp() {
       <section className="admin-stat-grid" aria-label="Community totals">
         <div className="admin-stat"><span>Residents</span><strong>{snapshot.personas.length}</strong><small>{snapshot.personas.filter((persona) => persona.canResearch).length} can research</small></div>
         <div className="admin-stat"><span>Rooms</span><strong>{snapshot.channels.length}</strong><small>{Object.keys(snapshot.behavior.channels).length} overrides</small></div>
-        <div className="admin-stat"><span>Humans</span><strong>{snapshot.humans.length}</strong><small>{snapshot.humans.filter((human) => human.status === "online").length} online</small></div>
+        <div className="admin-stat"><span>Humans</span><strong>{snapshot.humans.length}</strong><small>{snapshot.humans.filter((human) => human.status === "online").length} online · {snapshot.humans.filter((human) => human.status === "idle").length} idle</small></div>
         <div className="admin-stat"><span>Bans</span><strong>{snapshot.bans.length}</strong><small>{snapshot.revision ? `Revision ${snapshot.revision}` : "Live snapshot"}</small></div>
       </section>
       {behaviorPanel}

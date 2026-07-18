@@ -17,6 +17,7 @@ import type {
   ImageMessageResult,
   LinkPreviewPayload,
   Member,
+  PresenceActivityPayload,
   PublicPreview,
   RoomSnapshot,
   ServerHealth,
@@ -32,6 +33,7 @@ import { isPublicReactionEmoji } from "../shared/reactions.js";
 import type { AdminHumanMember } from "../shared/adminTypes.js";
 import { displayNameGlyph, normalizeDisplayName, validDisplayName } from "../shared/displayName.js";
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
+import { HUMAN_IDLE_AFTER_MS } from "../shared/presence.js";
 import { AdminAuthManager } from "./adminAuth.js";
 import { AdminModerationGuard } from "./adminModeration.js";
 import { createAdminRouter } from "./adminRouter.js";
@@ -55,6 +57,7 @@ import {
   normalizeHumanIdentityRecoveryKey,
 } from "./humanIdentityRecovery.js";
 import { HumanIdentityMutationCoordinator } from "./humanIdentityMutation.js";
+import { HumanPresenceRuntime } from "./humanPresence.js";
 import { LmStudioClient } from "./lmStudio.js";
 import { LmStudioBackend } from "./lmStudioBackend.js";
 import { CodexBackend } from "./codexBackend.js";
@@ -148,6 +151,7 @@ interface HumanSession {
   tokenHash: string;
   member: Member;
   socketIds: Set<string>;
+  presence: HumanPresenceRuntime;
   /** Blocks HTTP and socket actions while a credential transfer commits. */
   revoked: boolean;
   lastSeenAt: number;
@@ -187,6 +191,7 @@ const createHumanSession = (
   tokenHash,
   member: { ...member, avatar: { ...member.avatar }, status: "offline" },
   socketIds: new Set(),
+  presence: new HumanPresenceRuntime(HUMAN_IDLE_AFTER_MS),
   revoked: false,
   lastSeenAt,
   createdAt,
@@ -215,6 +220,11 @@ const reactionSchema = z.object({
   messageId: z.string().min(1).max(100),
   emoji: z.string().min(1).max(12),
 });
+const presenceActivitySchema = z.object({
+  visible: z.boolean(),
+  active: z.boolean(),
+}).strict();
+const presenceHandshakeSchema = presenceActivitySchema;
 const voiceRoomIdSchema = z.object({ roomId: z.string().uuid() }).strict();
 const voiceCreateSchema = z.object({ channelId: z.string().min(1).max(80) }).strict();
 const voiceStateSchema = z
@@ -598,6 +608,7 @@ const socketBuckets = new Map<
     messages: TokenBucket;
     reactions: TokenBucket;
     typing: TokenBucket;
+    presence: TokenBucket;
     voiceActions: TokenBucket;
     voiceSignals: TokenBucket;
   }
@@ -664,7 +675,7 @@ const historyPageFor = (channelId: string, before?: HistoryPosition, limit = 40)
 const getMembers = (): Member[] => [
   ...PERSONAS.map((persona) => ({ ...memberView(persona), activity: actorChannels.activityLabel(persona) })),
   ...[...sessions.values()]
-    .filter((session) => session.member.status === "online")
+    .filter((session) => session.member.status !== "offline")
     .map((session) => ({ ...session.member })),
 ];
 const replyPreviewFor = (message: ChatMessage) => ({
@@ -678,10 +689,24 @@ const replyPreviewFor = (message: ChatMessage) => ({
 const publicTurnTargetIds = (content: string, replyTarget?: ChatMessage): string[] =>
   addressedPersonaIds(analyzeSocialSignals(content).mentionedIds, replyTarget);
 const onlineHumanCount = () => [...sessions.values()].filter((session) => session.member.status === "online").length;
+const idleHumanCount = () => [...sessions.values()].filter((session) => session.member.status === "idle").length;
+const connectedHumanCount = () => [...sessions.values()].filter((session) => session.socketIds.size > 0).length;
+const refreshHumanPresence = (session: HumanSession, now = Date.now()): boolean => {
+  const next = session.presence.status(now);
+  if (session.member.status === next) return false;
+  session.member.status = next;
+  return true;
+};
+const publishHumanPresenceIfChanged = (session: HumanSession, now = Date.now()): void => {
+  if (refreshHumanPresence(session, now)) {
+    io.to("public").emit("presence:update", { members: getMembers() });
+  }
+};
 const getHealth = (): ServerHealth => ({
   ok: true,
   model: lm.health(),
   onlineHumans: onlineHumanCount(),
+  idleHumans: idleHumanCount(),
   aiPace: PACE,
 });
 const marketSnapshotProvider = process.env.MARKET_SNAPSHOT_ENABLED === "false"
@@ -712,7 +737,7 @@ const director = new SocialDirector(
   researchBroker,
   humanMemory,
   getMembers,
-  onlineHumanCount,
+  connectedHumanCount,
   {
     behaviorTuningProvider,
     marketSnapshotProvider,
@@ -1030,6 +1055,11 @@ const disconnectHumanSockets = (
       }
       socket?.disconnect(true);
     }
+    // A socket id may already be absent from Socket.IO, in which case no
+    // disconnect callback will clean the session set. Forced revocation owns
+    // both registries and must leave neither stale liveness nor stale presence.
+    session.socketIds.clear();
+    session.presence.clear();
     session.member.status = "offline";
   }
   io.to("public").emit("presence:update", { members: getMembers() });
@@ -1567,7 +1597,7 @@ app.post("/api/dms/:threadId/image-messages", async (request, response) => {
 
 app.get("/api/preview", (_request, response) => {
   const preview: PublicPreview = {
-    members: getMembers().filter((member) => member.kind === "ai" || member.status === "online"),
+    members: getMembers().filter((member) => member.kind === "ai" || member.status !== "offline"),
     channels: CHANNELS,
     messages: CHANNELS.flatMap((channel) => store.getRecent(channel.id, 15))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
@@ -2008,9 +2038,16 @@ io.on("connection", (socket) => {
     next();
   });
   const wasOffline = session.socketIds.size === 0;
+  const connectedAt = Date.now();
+  const initialPresence = presenceHandshakeSchema.safeParse(socket.handshake.auth?.presence);
   session.socketIds.add(socket.id);
-  session.member.status = "online";
-  session.lastSeenAt = Date.now();
+  session.presence.connect(
+    socket.id,
+    initialPresence.success ? initialPresence.data : { visible: true, active: true },
+    connectedAt,
+  );
+  refreshHumanPresence(session, connectedAt);
+  session.lastSeenAt = connectedAt;
   humanMemory.noteSeen(session.member.id, session.lastSeenAt);
   socket.join("public");
   socket.join(`user:${session.member.id}`);
@@ -2018,6 +2055,7 @@ io.on("connection", (socket) => {
     messages: new TokenBucket(5, 0.45),
     reactions: new TokenBucket(12, 1.6),
     typing: new TokenBucket(8, 2),
+    presence: new TokenBucket(8, 0.5),
     voiceActions: new TokenBucket(12, 1),
     voiceSignals: new TokenBucket(120, 40),
   });
@@ -2025,6 +2063,15 @@ io.on("connection", (socket) => {
   socket.emit("room:snapshot", snapshotFor(session));
   socket.emit("voice:rooms:update", voiceRooms.listRooms());
   io.to("public").emit("presence:update", { members: getMembers() });
+
+  socket.on("presence:activity", (raw: unknown) => {
+    if (!socketBuckets.get(socket.id)?.presence.take()) return;
+    const parsed = presenceActivitySchema.safeParse(raw);
+    if (!parsed.success) return;
+    const signal: PresenceActivityPayload = parsed.data;
+    if (!session.presence.update(socket.id, signal, Date.now())) return;
+    publishHumanPresenceIfChanged(session);
+  });
 
   if (wasOffline) {
     const visit = humanMemory.noteVisit(session.member.id, session.lastSeenAt);
@@ -2057,6 +2104,8 @@ io.on("connection", (socket) => {
     const existing = voiceRooms.getRoomForSocket(socket.id);
     const result = voiceRooms.leaveRoom(socket.id);
     if (!result.ok) return result;
+    session.presence.setVoiceConnected(socket.id, false);
+    publishHumanPresenceIfChanged(session);
     if (existing) void socket.leave(voiceSocketRoom(existing.id));
     if (result.closed) {
       voiceDirector.forgetRoom(result.roomId);
@@ -2086,6 +2135,8 @@ io.on("connection", (socket) => {
     }
     const result = voiceRooms.createRoom(parsed.data.channelId, joinedVoiceIdentity());
     if (result.ok) {
+      session.presence.setVoiceConnected(socket.id, true);
+      publishHumanPresenceIfChanged(session);
       void socket.join(voiceSocketRoom(result.room.id));
       publishVoiceRoom(result.room);
       socket.emit("voice:transcript:history", voiceRooms.getTranscript(result.room.id));
@@ -2121,6 +2172,8 @@ io.on("connection", (socket) => {
         : voiceRooms.joinRoom(parsed.data.roomId, joinedVoiceIdentity());
     }
     if (result.ok) {
+      session.presence.setVoiceConnected(socket.id, true);
+      publishHumanPresenceIfChanged(session);
       void socket.join(voiceSocketRoom(result.room.id));
       publishVoiceRoom(result.room);
       socket.emit("voice:transcript:history", voiceRooms.getTranscript(result.room.id));
@@ -2384,9 +2437,10 @@ io.on("connection", (socket) => {
     }
     socketBuckets.delete(socket.id);
     session.socketIds.delete(socket.id);
+    session.presence.disconnect(socket.id);
     session.lastSeenAt = Date.now();
     humanMemory.noteSeen(session.member.id, session.lastSeenAt);
-    if (session.socketIds.size === 0) session.member.status = "offline";
+    refreshHumanPresence(session);
     io.to("public").emit("presence:update", { members: getMembers() });
   });
 });
@@ -2494,6 +2548,7 @@ if (recoveredDirectTurns > 0) {
 
 const healthInterval = setInterval(async () => {
   const now = Date.now();
+  let presenceChanged = false;
   for (const session of sessions.values()) {
     if (session.socketIds.size > 0) {
       if (now - session.lastSeenAt >= SESSION_HEARTBEAT_MS) {
@@ -2501,7 +2556,9 @@ const healthInterval = setInterval(async () => {
         humanMemory.noteSeen(session.member.id, now);
       }
     }
+    if (refreshHumanPresence(session, now)) presenceChanged = true;
   }
+  if (presenceChanged) io.to("public").emit("presence:update", { members: getMembers() });
   adminAuth.prune(now);
   adminModeration.prune(now);
   try {

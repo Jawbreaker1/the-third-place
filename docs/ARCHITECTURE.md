@@ -95,6 +95,8 @@ DM context contains only that thread. Private messages are never copied into pub
 
 An initial or returning welcome receives the browser's validated `Accept-Language` preference as a language hint. If that is unavailable, the director uses the established lobby language. An invalid or unavailable model response stays silent; there is no canned English or Swedish welcome fallback.
 
+Human presence is session-scoped and server-authoritative. Each browser socket contributes a bounded visibility/activity state without supplying timestamps: any recently active visible socket makes the identity `online`, connected sockets with no active visible tab make it `idle`, and no sockets make it `offline`. A hidden tab becomes idle immediately, meaningful browser activity is throttled before transport, Socket.IO heartbeats never count as human activity, and trusted voice-room membership keeps that socket online. The shared browser/server contract expires activity after five minutes, aggregates all tabs/devices, publishes only online/idle guests, and continues to use actual socket liveness—not the display status—for recovery, takeover and authorization.
+
 The humanizer also keeps at most 18 recent **delivered** lines per resident and conversation scope in process memory for style comparison. Public channels, individual DMs and voice channels use separate keys; generated lines enter memory only after public/DM storage or a final voice transcript succeeds. This is not factual character memory, is never inserted as freeform biography and is lost on restart. Scene history contributes up to 18 same-actor and 24 peer lines to an assessment; the independent memory remains bounded to 128 scope keys.
 
 ## Persistent guest-memory boundary
