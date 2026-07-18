@@ -47,6 +47,7 @@ import {
 import { attachBrowserHumanPresenceActivity, HumanPresenceActivityReporter } from "./humanPresenceActivity";
 import { conversationEntryTarget, type ConversationViewport, type PendingConversationEntry } from "./chatScroll";
 import { formatSourceDate, linkPreviewAriaLabel, linkPreviewDomainLabel } from "./linkPreview";
+import { accountUpgradePrefill } from "./accountUpgradePrefill";
 import {
   createBrowserVoicePlaybackController,
   type VoiceAiSpeechPayload,
@@ -457,6 +458,7 @@ export default function App() {
   const lightboxCloseRef = useRef<HTMLButtonElement | null>(null);
   const lightboxTriggerRef = useRef<HTMLButtonElement | null>(null);
   const recoveryKeyInputRef = useRef<HTMLInputElement | null>(null);
+  const upgradePrefillIdentityRef = useRef<string | null>(null);
   const emojiPickerAnchorRef = useRef<HTMLButtonElement | null>(null);
   const imageObjectUrls = useRef(new Set<string>());
   const localVoiceStreamRef = useRef<MediaStream | null>(null);
@@ -1409,6 +1411,17 @@ export default function App() {
       socketRef.current?.disconnect();
     };
   }, [clearVoiceMedia, connectSocket]);
+
+  useEffect(() => {
+    const next = accountUpgradePrefill(
+      { identityId: upgradePrefillIdentityRef.current, handle: upgradeLoginHandle },
+      me && sessionIdentity && sessionIdentity.kind !== "registered"
+        ? { id: me.id, name: me.name }
+        : null,
+    );
+    upgradePrefillIdentityRef.current = next.identityId;
+    if (next.handle !== upgradeLoginHandle) setUpgradeLoginHandle(next.handle);
+  }, [me, sessionIdentity, upgradeLoginHandle]);
 
   useEffect(() => {
     if (!profile || !me || profile.id !== me.id) {
