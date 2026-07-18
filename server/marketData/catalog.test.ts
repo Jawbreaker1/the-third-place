@@ -32,7 +32,13 @@ describe("canonical market target catalog", () => {
   });
 
   it("keeps every overview basket fixed, unique and small enough for one bounded provider read", () => {
-    expect(MARKET_BASKET_IDS).toEqual(["GLOBAL_MAJOR", "US_MAJOR", "EUROPE_MAJOR", "ASIA_MAJOR"]);
+    expect(MARKET_BASKET_IDS).toEqual([
+      "GLOBAL_MAJOR",
+      "COMMUNITY_MAJOR",
+      "US_MAJOR",
+      "EUROPE_MAJOR",
+      "ASIA_MAJOR",
+    ]);
     for (const id of MARKET_BASKET_IDS) {
       const basket = MARKET_BASKET_CATALOG[id];
       expect(basket.indexIds.length).toBeGreaterThan(1);
@@ -48,6 +54,14 @@ describe("canonical market target catalog", () => {
       MARKET_BASKET_CATALOG.GLOBAL_MAJOR.indexIds.map((id) => MARKET_INDEX_CATALOG[id].region),
     );
     expect(globalRegions).toEqual(new Set(["americas", "europe", "asia_pacific"]));
+    expect(MARKET_BASKET_CATALOG.COMMUNITY_MAJOR.indexIds).toEqual([
+      "SE_OMXS30",
+      "EU_STOXX50",
+      "US_SP500",
+      "US_NASDAQ_COMPOSITE",
+      "JP_NIKKEI225",
+      "HK_HSI",
+    ]);
   });
 
   it("fails closed for unknown runtime identifiers and returns defensive basket arrays", () => {

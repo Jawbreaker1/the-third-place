@@ -70,7 +70,7 @@ describe("experimental Yahoo chart market provider", () => {
     const fetcher: YahooChartFetcher = vi.fn(async (url, policy) => {
       requested.push(url);
       expect(policy).toMatchObject({
-        timeoutMs: 4_000,
+        timeoutMs: 2_000,
         maxRedirects: 0,
         maxBodyBytes: 256 * 1024,
         acceptedMediaTypes: ["application/json"],
@@ -126,6 +126,27 @@ describe("experimental Yahoo chart market provider", () => {
     expect(requested.map((url) => url.hostname)).toEqual(YAHOO_CHART_HOSTS);
     expect(result.observations[0]).toMatchObject({ change: 0, changePercent: 0 });
     expect(result.failures).toEqual([]);
+  });
+
+  it("bounds basket reads to two concurrent requests so six symbols fit the service deadline", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    const fetcher: YahooChartFetcher = vi.fn(async () => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      active -= 1;
+      return undefined;
+    });
+    const result = await new YahooChartMarketDataProvider(fetcher).read({
+      indexIds: MARKET_INDEX_IDS.slice(0, 6),
+      now: NOW,
+    });
+
+    expect(maximumActive).toBe(2);
+    expect(fetcher).toHaveBeenCalledTimes(12);
+    expect(result.observations).toEqual([]);
+    expect(result.failures).toHaveLength(6);
   });
 
   it("accepts a not-yet-finalized trailing intraday candle but rejects conflicting previous-close metadata", async () => {

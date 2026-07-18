@@ -63,6 +63,84 @@ export interface LinkPreview {
   fetchedAt: string;
 }
 
+/**
+ * A server-owned utility publisher. Feed publishers are deliberately not
+ * members: they have no presence, profile, relationships, DMs or voice role.
+ */
+export interface ChannelFeedPublisher {
+  id: string;
+  name: string;
+  badge: "BOT";
+  avatar: {
+    color: string;
+    accent: string;
+    glyph: string;
+    /** Feed artwork is server-owned and served from the same origin. */
+    imageUrl?: string;
+  };
+}
+
+/** Attribution for structured feed data, not article publication metadata. */
+export interface ChannelFeedSource {
+  id: string;
+  label: string;
+  url: string;
+  retrievedAt: string;
+  experimental: boolean;
+}
+
+export type MarketTickerFreshness = "recent" | "previous_session" | "stale";
+
+export interface MarketTickerFeedObservation {
+  indexId: string;
+  displayName: string;
+  shortName: string;
+  currency: string;
+  level: number;
+  previousClose: number;
+  change: number;
+  changePercent: number;
+  changeBasis: "previous_close";
+  tradingDate: string;
+  observedAt: string;
+  freshness: MarketTickerFreshness;
+  source: ChannelFeedSource;
+}
+
+export interface MarketTickerFeedCoverage {
+  requested: number;
+  available: number;
+  ratio: number;
+  complete: boolean;
+}
+
+export interface MarketTickerFeedCard {
+  id: string;
+  kind: "market_ticker";
+  channelId: string;
+  publisher: ChannelFeedPublisher;
+  /** Store-owned, monotonically increasing revision used for idempotent UI updates. */
+  revision: number;
+  /** Outcome of the latest refresh; observations may retain the last good snapshot. */
+  state: "ready" | "partial" | "unavailable";
+  title: string;
+  targetId: string;
+  updatedAt: string;
+  /** Absent only when no successful or partial snapshot has ever been obtained. */
+  retrievedAt?: string;
+  requestedIndexIds: string[];
+  missingIndexIds: string[];
+  coverage: MarketTickerFeedCoverage;
+  observations: MarketTickerFeedObservation[];
+}
+
+/** Add future deterministic integrations as new discriminants, not as Members. */
+export type ChannelFeedCard = MarketTickerFeedCard;
+
+export interface ChannelFeedUpdatePayload {
+  card: ChannelFeedCard;
+}
+
 export interface ReplyPreview {
   authorId: string;
   authorName: string;
@@ -178,6 +256,7 @@ export interface RoomSnapshot {
   identity: HumanSessionIdentity;
   members: Member[];
   channels: Channel[];
+  channelFeeds: ChannelFeedCard[];
   messages: ChatMessage[];
   historyPageInfo: Record<string, { before?: string; hasMore: boolean }>;
   dmThreads: DmThread[];
@@ -189,6 +268,7 @@ export interface RoomSnapshot {
 export interface PublicPreview {
   members: Member[];
   channels: Channel[];
+  channelFeeds: ChannelFeedCard[];
   messages: ChatMessage[];
   inviteRequired: boolean;
   health: ServerHealth;

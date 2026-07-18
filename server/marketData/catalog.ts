@@ -188,6 +188,18 @@ const marketBasketDefinitions = {
       "BR_IBOVESPA",
     ],
   },
+  COMMUNITY_MAJOR: {
+    displayName: "The Third Place market wire",
+    semanticDescription: "a bounded cross-region overview used by the community market wire",
+    indexIds: [
+      "SE_OMXS30",
+      "EU_STOXX50",
+      "US_SP500",
+      "US_NASDAQ_COMPOSITE",
+      "JP_NIKKEI225",
+      "HK_HSI",
+    ],
+  },
   US_MAJOR: {
     displayName: "Major United States markets",
     semanticDescription: "a bounded overview of the major United States equity indexes",

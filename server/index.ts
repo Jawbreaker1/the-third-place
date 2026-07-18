@@ -10,6 +10,7 @@ import { Server } from "socket.io";
 import { z } from "zod";
 import type {
   ActionResult,
+  ChannelFeedCard,
   ChatMessage,
   HistoryPage,
   ImageAnalysis,
@@ -91,6 +92,10 @@ import {
   MarketPulseCoordinator,
 } from "./marketPulse.js";
 import { safeMarketPulseFeedFetcher } from "./marketPulseFetch.js";
+import { ChannelFeedStore } from "./channelFeedStore.js";
+import { ChannelFeedCoordinator } from "./channelFeeds.js";
+import { MarketWireAdapter } from "./marketWire.js";
+import { residentChannelFeedFact } from "./channelFeedFacts.js";
 import {
   ADMIN_JSON_BODY_LIMIT_BYTES,
   PUBLIC_JSON_BODY_LIMIT_BYTES,
@@ -259,6 +264,7 @@ const presenceActivitySchema = z.object({
   active: z.boolean(),
 }).strict();
 const presenceHandshakeSchema = presenceActivitySchema;
+const channelFocusSchema = z.object({ channelId: z.string().min(1).max(80) }).strict();
 const voiceRoomIdSchema = z.object({ roomId: z.string().uuid() }).strict();
 const voiceCreateSchema = z.object({ channelId: z.string().min(1).max(80) }).strict();
 const voiceStateSchema = z
@@ -823,6 +829,32 @@ const marketSnapshotProvider = process.env.MARKET_SNAPSHOT_ENABLED === "false"
   : new MarketSnapshotService({
       providers: [new YahooChartMarketDataProvider()],
     });
+const channelFeedStore = new ChannelFeedStore();
+const channelFeedAdapters = process.env.CHANNEL_FEEDS_ENABLED === "false" ||
+    process.env.MARKET_WIRE_ENABLED === "false" ||
+    !marketSnapshotProvider
+  ? []
+  : [new MarketWireAdapter(marketSnapshotProvider)];
+let channelFeedsStarted = false;
+const channelFeedCoordinator = channelFeedAdapters.length > 0
+  ? new ChannelFeedCoordinator<ChannelFeedCard>({
+      adapters: channelFeedAdapters,
+      store: channelFeedStore,
+      onCard: (card) => {
+        io.to("public").emit("channel-feed:update", { card });
+      },
+      onError: (feedId, error) => {
+        console.warn(
+          `Channel feed ${feedId} is backing off safely:`,
+          error instanceof Error ? error.message : error,
+        );
+      },
+    })
+  : null;
+const currentChannelFeeds = (): ChannelFeedCard[] =>
+  channelFeedsStarted && channelFeedCoordinator ? channelFeedCoordinator.cards() : [];
+const channelFeedFactFor = (channelId: string) =>
+  residentChannelFeedFact(currentChannelFeeds().find((card) => card.channelId === channelId));
 const footballCompetitionProvider = process.env.FOOTBALL_DATA_ENABLED === "false"
   ? null
   : new FootballCompetitionProvider({
@@ -850,6 +882,7 @@ const director = new SocialDirector(
   {
     behaviorTuningProvider,
     marketSnapshotProvider,
+    channelFeedFacts: channelFeedFactFor,
     footballCompetitionProvider,
     marketPulseCoordinator,
     ambientEpisodeLedger,
@@ -1177,6 +1210,7 @@ const snapshotFor = (session: HumanSession): RoomSnapshot => {
     identity: identityForSession(session),
     members: getMembers(),
     channels: CHANNELS,
+    channelFeeds: currentChannelFeeds(),
     messages: pages
       .flatMap((page) => page.messages)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)),
@@ -1613,7 +1647,10 @@ app.post("/api/voice/:roomId/turns", async (request, response) => {
     if (completedKey) completedVoiceTurns.set(completedKey, { expiresAt: now + VOICE_TURN_DEDUP_TTL_MS, entry: appended.entry });
     io.to(voiceSocketRoom(roomId)).emit("voice:transcript:final", appended.entry);
     const room = voiceRooms.getRoom(roomId);
-    if (room) director.noteHumanVoiceActivity(room.channelId, session.member.id);
+    if (room) {
+      director.noteHumanVoiceActivity(room.channelId, session.member.id);
+      channelFeedCoordinator?.noteHumanActivity(room.channelId);
+    }
     voiceDirector.onHumanFinal(appended.entry);
     response.status(201).json({ ok: true, text: appended.entry.text, entry: appended.entry });
   } catch (error) {
@@ -1725,6 +1762,7 @@ const handleImageMessageUpload = async (
       }
       attachmentId = undefined;
       io.to("public").emit("message:new", message);
+      channelFeedCoordinator?.noteHumanActivity(message.channelId);
       if (message.content) humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
       director.onHumanImagePosted(message);
       analyzeImageMessage(message, session.member, {
@@ -1841,6 +1879,7 @@ app.get("/api/preview", (_request, response) => {
   const preview: PublicPreview = {
     members: getMembers().filter((member) => member.kind === "ai" || member.status !== "offline"),
     channels: CHANNELS,
+    channelFeeds: currentChannelFeeds(),
     messages: CHANNELS.flatMap((channel) => store.getRecent(channel.id, 15))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
       .map((message) =>
@@ -2869,6 +2908,15 @@ io.on("connection", (socket) => {
     publishHumanPresenceIfChanged(session);
   });
 
+  socket.on("channel:focus", (raw: unknown) => {
+    if (!socketBuckets.get(socket.id)?.presence.take(0.25)) return;
+    const parsed = channelFocusSchema.safeParse(raw);
+    if (!parsed.success || !CHANNELS.some((channel) => channel.id === parsed.data.channelId)) return;
+    const now = Date.now();
+    if (session.presence.status(now) !== "online") return;
+    channelFeedCoordinator?.noteHumanActivity(parsed.data.channelId, now);
+  });
+
   if (wasOffline) {
     const visit = humanMemory.noteVisit(session.member.id, session.lastSeenAt);
     // A tab refresh or brief network reconnect is transport recovery, not a
@@ -3074,7 +3122,10 @@ io.on("connection", (socket) => {
     }
     io.to(voiceSocketRoom(parsed.data.roomId)).emit("voice:transcript:final", appended.entry);
     const room = voiceRooms.getRoom(parsed.data.roomId);
-    if (room) director.noteHumanVoiceActivity(room.channelId, session.member.id);
+    if (room) {
+      director.noteHumanVoiceActivity(room.channelId, session.member.id);
+      channelFeedCoordinator?.noteHumanActivity(room.channelId);
+    }
     voiceDirector.onHumanFinal(appended.entry);
     acknowledge?.({ ok: true });
   });
@@ -3126,6 +3177,7 @@ io.on("connection", (socket) => {
         store.addPublicMessage(message);
       }
       io.to("public").emit("message:new", message);
+      channelFeedCoordinator?.noteHumanActivity(message.channelId);
       attachLinkPreview(message, session.member.id);
       humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
       director.onHumanMessage(message, session.member);
@@ -3209,6 +3261,7 @@ io.on("connection", (socket) => {
       messageId: parsed.data.messageId,
       reaction,
     });
+    channelFeedCoordinator?.noteHumanActivity(parsed.data.channelId);
     if (reaction.memberIds.includes(session.member.id)) {
       director.onHumanReaction({
         channelId: parsed.data.channelId,
@@ -3440,6 +3493,19 @@ for (const message of store.getAllImageMessages()) {
 }
 actorChannels.restore(store.getAllMessages());
 await lm.probe();
+if (channelFeedCoordinator) {
+  try {
+    await channelFeedCoordinator.start();
+    channelFeedsStarted = true;
+  } catch (error) {
+    // Feed telemetry is useful but non-authoritative. A corrupt optional feed
+    // file must not take the social world or account continuity down with it.
+    console.warn(
+      "Channel feeds are disabled for this run because their local state could not be loaded safely:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
 socialMemoryLifecycle.start();
 director.start();
 const recoveredDirectTurns = director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true });
@@ -3557,6 +3623,7 @@ const shutdown = async (signal: string) => {
   console.log(`${signal}: closing the room gracefully…`);
   clearInterval(healthInterval);
   director.stop();
+  const channelFeedClose = channelFeedCoordinator?.close();
   io.close();
   await socialMemory.close();
   await socialMemoryLifecycle.close();
@@ -3567,6 +3634,7 @@ const shutdown = async (signal: string) => {
     ambientEpisodeLedger.flush(),
     adminState.flush(),
     modelProviders.close(),
+    ...(channelFeedClose ? [channelFeedClose] : []),
   ]);
   socialMemoryStore.close();
   httpServer.close(() => process.exit(0));

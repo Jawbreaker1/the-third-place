@@ -105,6 +105,30 @@ describe("provider-neutral market snapshot service", () => {
     ]);
   });
 
+  it("validates the fixed community market-wire basket through the normal provider boundary", async () => {
+    const communityIds = [
+      "SE_OMXS30",
+      "EU_STOXX50",
+      "US_SP500",
+      "US_NASDAQ_COMPOSITE",
+      "JP_NIKKEI225",
+      "HK_HSI",
+    ] as const;
+    const backing = provider("backing", MARKET_INDEX_IDS, async (request) =>
+      batch(
+        "backing",
+        request.now,
+        request.indexIds.map((id) => observation(id, "backing", request.now)),
+        request.indexIds,
+      ));
+    const result = await new MarketSnapshotService({ providers: [backing], now: () => START })
+      .snapshot({ targetId: "COMMUNITY_MAJOR" });
+
+    expect(backing.read).toHaveBeenCalledWith({ indexIds: communityIds, now: START });
+    expect(result.requestedIndexIds).toEqual(communityIds);
+    expect(result.coverage).toMatchObject({ requested: 6, available: 6, complete: true });
+  });
+
   it("coalesces in-flight work, caches completed snapshots and refreshes cached age labels", async () => {
     let now = START;
     const observedAt = START - 119 * 60_000;
