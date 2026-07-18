@@ -903,6 +903,10 @@ const voiceDirector = new VoiceDirector({
   residentFollowUpEnabled: true,
   residentFollowUpGapMs: 220,
   residentFollowUpFloorGraceMs: 450,
+  residentFollowUpMaxLatenessMs: Number.parseInt(
+    process.env.VOICE_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS ?? "15000",
+    10,
+  ),
   hasPendingHumanIngest: (roomId) => (pendingVoiceIngestsByRoom.get(roomId) ?? 0) > 0,
   events: {
     roomChanged: publishVoiceRoom,

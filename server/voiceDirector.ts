@@ -86,6 +86,8 @@ export interface VoiceDirectorOptions {
   residentFollowUpGapMs?: number;
   /** Defers optional publication briefly after a browser human-floor transition. */
   residentFollowUpFloorGraceMs?: number;
+  /** Absolute freshness budget after the intended peer handoff. Slow optional work is aborted. */
+  residentFollowUpMaxLatenessMs?: number;
 }
 
 export const mentionsPersona = containsExactMention;
@@ -137,7 +139,9 @@ const MIN_RESIDENT_FOLLOW_UP_GAP_MS = 80;
 const MAX_RESIDENT_FOLLOW_UP_GAP_MS = 1_500;
 const DEFAULT_RESIDENT_FOLLOW_UP_FLOOR_GRACE_MS = 450;
 const MAX_RESIDENT_FOLLOW_UP_FLOOR_GRACE_MS = 2_000;
-const RESIDENT_FOLLOW_UP_MAX_LATENESS_MS = 4_000;
+const DEFAULT_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS = 15_000;
+const MIN_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS = 1_000;
+const MAX_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS = 30_000;
 type VoiceRouterRecentMessage = NonNullable<TurnAnalysisInput["recentMessages"]>[number];
 interface VoiceChannelContextSnapshot {
   establishedLanguage?: string;
@@ -986,7 +990,14 @@ export class VoiceDirector {
     // Optional voice texture is useful only as an immediate floor handoff. A
     // slow local model must never surface it as an unrelated interruption a
     // minute later, even though ordinary LM calls have a much larger timeout.
-    const publicationDeadlineAt = publicationTargetAt + RESIDENT_FOLLOW_UP_MAX_LATENESS_MS;
+    const configuredMaxLateness = this.options.residentFollowUpMaxLatenessMs;
+    const maxLatenessMs = typeof configuredMaxLateness === "number" && Number.isFinite(configuredMaxLateness)
+      ? Math.max(
+          MIN_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS,
+          Math.min(MAX_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS, configuredMaxLateness),
+        )
+      : DEFAULT_RESIDENT_FOLLOW_UP_MAX_LATENESS_MS;
+    const publicationDeadlineAt = publicationTargetAt + maxLatenessMs;
     const deadlineExpired = (): boolean => this.now() >= publicationDeadlineAt;
     const armDeadlineAbort = (controller: AbortController): ReturnType<typeof setTimeout> | undefined => {
       const remainingMs = publicationDeadlineAt - this.now();

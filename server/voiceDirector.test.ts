@@ -1041,6 +1041,7 @@ describe("VoiceDirector", () => {
         capabilityRegistry: voiceCapabilityRegistry(),
         residentFollowUpEnabled: true,
         residentFollowUpGapMs: 80,
+        residentFollowUpMaxLatenessMs: 4_000,
         lm: {
           analyzeTurn: async () => routedAnalysis("sv-SE", {
             addressedIds: ["ai-sana", "ai-mira"],
@@ -1102,6 +1103,82 @@ describe("VoiceDirector", () => {
       ]);
       expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-mira")?.botState)
         .toBe("listening");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("allows a slow local-model peer reply while it remains inside the configured freshness budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = new VoiceRoomRuntime(["lobby"]);
+      const created = runtime.createRoom("lobby", { socketId: "socket-slow-peer", memberId: "human-slow-peer", name: "Alex" });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      expect(runtime.inviteBot(created.room.id, "socket-slow-peer", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
+      expect(runtime.inviteBot(created.room.id, "socket-slow-peer", { personaId: "ai-mira", name: "Mira" }).ok).toBe(true);
+      runtime.setBotState(created.room.id, "ai-sana", "listening");
+      runtime.setBotState(created.room.id, "ai-mira", "listening");
+      const human = runtime.appendFinalTranscript(created.room.id, "human-slow-peer", "@Sana @Mira, vad tycker ni?");
+      expect(human.ok).toBe(true);
+      if (!human.ok) return;
+
+      const speeches: string[] = [];
+      const director = new VoiceDirector({
+        runtime,
+        capabilityRegistry: voiceCapabilityRegistry(),
+        residentFollowUpEnabled: true,
+        residentFollowUpGapMs: 80,
+        residentFollowUpMaxLatenessMs: 15_000,
+        lm: {
+          analyzeTurn: async () => routedAnalysis("sv-SE", {
+            addressedIds: ["ai-sana", "ai-mira"],
+            addressConfidence: 0.99,
+          }),
+          generateScene: async (request) => {
+            if (request.selected[0]!.id === "ai-sana") {
+              return [{ personaId: "ai-sana", content: "Ja.", source: "lm", sourceIds: [] }];
+            }
+            return await new Promise((resolve) => setTimeout(() => resolve([{
+              personaId: "ai-mira",
+              content: "Jag lägger till en sak medan samtalet fortfarande är aktuellt.",
+              source: "lm",
+              sourceIds: [],
+            }]), 10_000));
+          },
+        },
+        speech: {
+          capabilities: async () => ({
+            stt: { available: false, provider: "disabled", inputMimeTypes: [] },
+            tts: { available: false, provider: "disabled", formats: [] },
+            normalizer: { available: false, maxInputBytes: 0, maxDurationMs: 0 },
+            browserFallbackAllowed: true,
+          }),
+          synthesize: async () => { throw new Error("must not synthesize when disabled"); },
+        },
+        actorChannels: new ActorChannelRuntime(),
+        events: {
+          roomChanged: () => undefined,
+          transcriptFinal: () => undefined,
+          aiSpeech: (payload) => speeches.push(payload.memberId),
+          aiStop: () => undefined,
+        },
+      });
+
+      director.onHumanFinal(human.entry);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speeches).toEqual(["ai-sana"]);
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(speeches).toEqual(["ai-sana"]);
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(speeches).toEqual(["ai-sana", "ai-mira"]);
+      expect(runtime.getTranscript(created.room.id).map((entry) => entry.speakerId)).toEqual([
+        "human-slow-peer",
+        "ai-sana",
+        "ai-mira",
+      ]);
     } finally {
       vi.useRealTimers();
     }
