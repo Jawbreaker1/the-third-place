@@ -16,6 +16,27 @@ describe("admin model boundary", () => {
         },
         automation: {
           autonomousLinkChannelIds: ["lobby"],
+          channelFeeds: [{
+            id: "market-wire",
+            channelId: "stock-market",
+            kind: "market_ticker",
+            label: "MarketWire",
+            description: "Bounded market snapshots.",
+            publisher: { id: "market-wire", name: "MarketWire", badge: "BOT" },
+            available: true,
+            enabled: true,
+            activeIntervalMinutes: 5,
+            idleIntervalMinutes: 30,
+            defaultEnabled: true,
+            defaultActiveIntervalMinutes: 5,
+            defaultIdleIntervalMinutes: 30,
+            minimumIntervalMinutes: 5,
+            maximumIntervalMinutes: 1_440,
+            status: "ready",
+            cardAvailable: true,
+            failures: 0,
+            nextPollAt: 1_752_492_300_000,
+          }],
           autonomousResearch: {
             attempts: 9.8,
             published: 3,
@@ -71,6 +92,14 @@ describe("admin model boundary", () => {
     });
     expect(snapshot.automation).toEqual({
       autonomousLinkChannelIds: ["lobby"],
+      channelFeeds: [expect.objectContaining({
+        id: "market-wire",
+        channelId: "stock-market",
+        activeIntervalMinutes: 5,
+        idleIntervalMinutes: 30,
+        minimumIntervalMinutes: 5,
+        status: "ready",
+      })],
       autonomousResearch: {
         attempts: 9,
         published: 3,
@@ -112,6 +141,54 @@ describe("admin model boundary", () => {
       name: "Johan",
       status: "online",
       recoveryConfigured: true,
+    });
+  });
+
+  it("normalizes room integration intervals into their server-declared bounds", () => {
+    const snapshot = normalizeAdminState({
+      automation: {
+        channelFeeds: [{
+          id: "fixture-wire",
+          channelId: "football-talk",
+          publisher: {},
+          minimumIntervalMinutes: 5,
+          maximumIntervalMinutes: 120,
+          defaultActiveIntervalMinutes: 10,
+          defaultIdleIntervalMinutes: 30,
+          activeIntervalMinutes: 1,
+          idleIntervalMinutes: 2,
+          enabled: false,
+          status: "ready",
+        }],
+      },
+    });
+
+    expect(snapshot.automation.channelFeeds[0]).toMatchObject({
+      activeIntervalMinutes: 5,
+      idleIntervalMinutes: 5,
+      status: "disabled",
+      failures: 0,
+    });
+  });
+
+  it("drops room integrations with missing or invalid operational identifiers", () => {
+    const snapshot = normalizeAdminState({
+      automation: {
+        channelFeeds: [
+          { id: "valid-wire", channelId: "stock-market", publisher: {} },
+          { channelId: "stock-market", publisher: {} },
+          { id: "missing-room", publisher: {} },
+          { id: "Invalid-Wire", channelId: "stock-market", publisher: {} },
+          { id: "padded-wire", channelId: " stock-market ", publisher: {} },
+          { id: 42, channelId: "stock-market", publisher: {} },
+        ],
+      },
+    });
+
+    expect(snapshot.automation.channelFeeds).toHaveLength(1);
+    expect(snapshot.automation.channelFeeds[0]).toMatchObject({
+      id: "valid-wire",
+      channelId: "stock-market",
     });
   });
 

@@ -6,6 +6,7 @@ import {
   formatMarketObservationTime,
   marketCardStatus,
   marketDirection,
+  syncChannelFeeds,
   upsertChannelFeed,
 } from "./channelFeeds";
 
@@ -57,6 +58,15 @@ describe("channel feed client reducer", () => {
     expect(upsertChannelFeed(first, card(1))).toBe(first);
     expect(upsertChannelFeed(first, card(2))).toBe(first);
     expect(upsertChannelFeed(first, card(3))[0]?.revision).toBe(3);
+  });
+
+  it("replaces and defensively copies the visible set from a full sync", () => {
+    const incoming = [card(4)];
+    const synced = syncChannelFeeds(incoming);
+
+    expect(synced).toEqual(incoming);
+    expect(synced).not.toBe(incoming);
+    expect(synced[0]).not.toBe(incoming[0]);
   });
 
   it("formats index points rather than currency and preserves direction", () => {

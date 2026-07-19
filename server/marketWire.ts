@@ -394,6 +394,17 @@ const unavailableCard = (
 export class MarketWireAdapter implements ChannelFeedAdapter<MarketTickerFeedCard> {
   readonly id = MARKET_WIRE_FEED_ID;
   readonly channelId = MARKET_WIRE_CHANNEL_ID;
+  readonly metadata = Object.freeze({
+    kind: "market_ticker",
+    label: "MarketWire",
+    description: "Validated major-market index snapshots for the stock-market room.",
+    publisher: Object.freeze({
+      id: MARKET_WIRE_ACTOR.id,
+      name: MARKET_WIRE_ACTOR.name,
+      badge: MARKET_WIRE_ACTOR.badge,
+    }),
+    defaultEnabled: true,
+  });
   activeIntervalMs = MARKET_WIRE_SCHEDULE.activeEveryMs;
   idleIntervalMs = MARKET_WIRE_SCHEDULE.idleEveryMs;
   activityWindowMs = MARKET_WIRE_SCHEDULE.activityWindowMs;

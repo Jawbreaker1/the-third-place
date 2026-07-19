@@ -2,6 +2,8 @@ import type {
   AdminAutonomousResearchDiagnostics,
   AdminBanRecord,
   AdminBehaviorTuning,
+  AdminChannelFeedControl,
+  AdminChannelFeedStatus,
   AdminChannelConfig,
   AdminHumanMember,
   AdminPersonaConfig,
@@ -83,6 +85,13 @@ const asBoolean = (value: unknown, fallback = false): boolean => typeof value ==
 const nonNegativeInteger = (value: unknown): number => {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+};
+
+const boundedInteger = (value: unknown, fallback: number, minimum: number, maximum: number): number => {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed)
+    ? Math.max(minimum, Math.min(maximum, Math.floor(parsed)))
+    : fallback;
 };
 
 export const clampAdminPercent = (value: unknown, fallback = 50): number => {
@@ -257,6 +266,81 @@ const normalizeAutonomousResearchDiagnostics = (
   };
 };
 
+const normalizeChannelFeedStatus = (value: unknown): AdminChannelFeedStatus =>
+  value === "disabled" || value === "waiting" || value === "polling" || value === "ready" || value === "unavailable"
+    ? value
+    : "waiting";
+
+const CHANNEL_FEED_CATALOG_ID = /^[a-z0-9][a-z0-9-]{1,63}$/u;
+
+const normalizeChannelFeed = (value: unknown, index: number): AdminChannelFeedControl | undefined => {
+  const input = asRecord(value);
+  const id = asString(input.id);
+  const channelId = asString(input.channelId);
+  if (!CHANNEL_FEED_CATALOG_ID.test(id) || !CHANNEL_FEED_CATALOG_ID.test(channelId)) return undefined;
+
+  const publisher = asRecord(input.publisher);
+  const minimumIntervalMinutes = boundedInteger(input.minimumIntervalMinutes, 1, 1, 1_440);
+  const maximumIntervalMinutes = boundedInteger(
+    input.maximumIntervalMinutes,
+    1_440,
+    minimumIntervalMinutes,
+    1_440,
+  );
+  const defaultActiveIntervalMinutes = boundedInteger(
+    input.defaultActiveIntervalMinutes,
+    minimumIntervalMinutes,
+    minimumIntervalMinutes,
+    maximumIntervalMinutes,
+  );
+  const defaultIdleIntervalMinutes = boundedInteger(
+    input.defaultIdleIntervalMinutes,
+    Math.max(defaultActiveIntervalMinutes, 30),
+    defaultActiveIntervalMinutes,
+    maximumIntervalMinutes,
+  );
+  const activeIntervalMinutes = boundedInteger(
+    input.activeIntervalMinutes,
+    defaultActiveIntervalMinutes,
+    minimumIntervalMinutes,
+    maximumIntervalMinutes,
+  );
+  const idleIntervalMinutes = boundedInteger(
+    input.idleIntervalMinutes,
+    Math.max(activeIntervalMinutes, defaultIdleIntervalMinutes),
+    activeIntervalMinutes,
+    maximumIntervalMinutes,
+  );
+  const enabled = asBoolean(input.enabled, asBoolean(input.defaultEnabled, true));
+  return {
+    id,
+    channelId,
+    kind: asString(input.kind, "integration"),
+    label: asString(input.label, `Room integration ${index + 1}`),
+    description: asString(input.description),
+    publisher: {
+      id: asString(publisher.id, `channel-feed-publisher-${index + 1}`),
+      name: asString(publisher.name, asString(input.label, `Integration ${index + 1}`)),
+      badge: "BOT",
+    },
+    available: asBoolean(input.available),
+    enabled,
+    activeIntervalMinutes,
+    idleIntervalMinutes,
+    defaultEnabled: asBoolean(input.defaultEnabled, true),
+    defaultActiveIntervalMinutes,
+    defaultIdleIntervalMinutes,
+    minimumIntervalMinutes,
+    maximumIntervalMinutes,
+    status: enabled ? normalizeChannelFeedStatus(input.status) : "disabled",
+    cardAvailable: asBoolean(input.cardAvailable),
+    failures: nonNegativeInteger(input.failures),
+    ...(nonNegativeInteger(input.lastAttemptAt) > 0 ? { lastAttemptAt: nonNegativeInteger(input.lastAttemptAt) } : {}),
+    ...(nonNegativeInteger(input.lastSuccessAt) > 0 ? { lastSuccessAt: nonNegativeInteger(input.lastSuccessAt) } : {}),
+    ...(nonNegativeInteger(input.nextPollAt) > 0 ? { nextPollAt: nonNegativeInteger(input.nextPollAt) } : {}),
+  };
+};
+
 export function normalizeAdminState(value: unknown): AdminStateSnapshot {
   const envelope = asRecord(value);
   const root = isRecord(envelope.state) ? envelope.state : envelope;
@@ -269,11 +353,15 @@ export function normalizeAdminState(value: unknown): AdminStateSnapshot {
   const personas = asArray(root.personas).map(normalizePersona);
   const automation = asRecord(root.automation);
   const autonomousResearch = normalizeAutonomousResearchDiagnostics(automation.autonomousResearch);
+  const channelFeeds = asArray(automation.channelFeeds)
+    .map(normalizeChannelFeed)
+    .filter((feed): feed is AdminChannelFeedControl => Boolean(feed));
   return {
     behavior: { global, channels: channelTunings },
     automation: {
       autonomousLinkChannelIds: stringArray(automation.autonomousLinkChannelIds),
       ...(autonomousResearch ? { autonomousResearch } : {}),
+      channelFeeds,
     },
     personas,
     channels: asArray(root.channels).map(normalizeChannel),

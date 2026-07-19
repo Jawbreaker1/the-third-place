@@ -6,6 +6,7 @@ import type {
   Channel,
   ChannelFeedCard,
   ChannelFeedPublisher,
+  ChannelFeedSyncPayload,
   ChannelFeedUpdatePayload,
   ChatMessage,
   DirectorEvent,
@@ -65,6 +66,7 @@ import {
   formatMarketObservationTime,
   marketCardStatus,
   marketDirection,
+  syncChannelFeeds,
   upsertChannelFeed,
 } from "./channelFeeds";
 import { EmojiPicker } from "./EmojiPicker";
@@ -254,53 +256,104 @@ const FeedAvatar = ({ publisher }: { publisher: ChannelFeedPublisher }) => {
   );
 };
 
-const ChannelFeedPost = ({ card }: { card: ChannelFeedCard }) => {
+export const ChannelFeedPanelCard = ({ card }: { card: ChannelFeedCard }) => {
   if (card.kind !== "market_ticker") return null;
   const experimental = card.observations.some((observation) => observation.source.experimental);
   const sourceCount = new Set(card.observations.map((observation) => observation.source.id)).size;
   return (
-    <article className={`channel-feed-post channel-feed-${card.state}`} data-channel-feed-id={card.id}>
-      <FeedAvatar publisher={card.publisher} />
-      <div className="channel-feed-body">
-        <div className="channel-feed-meta">
-          <strong>{card.publisher.name}</strong><BotBadge />
-          <time dateTime={card.updatedAt}>{formatRelative(card.updatedAt)}</time>
+    <article
+      aria-label={`${card.publisher.name}: ${card.title}`}
+      className={`channel-integration-card channel-feed-${card.state}`}
+      data-channel-feed-id={card.id}
+    >
+      <header className="channel-integration-card-header">
+        <FeedAvatar publisher={card.publisher} />
+        <div className="channel-integration-card-copy">
+          <div className="channel-feed-meta">
+            <strong>{card.publisher.name}</strong><BotBadge />
+            <time dateTime={card.updatedAt}>{formatRelative(card.updatedAt)}</time>
+          </div>
+          <div className="channel-integration-title">
+            <span>MARKET SNAPSHOT</span>
+            <strong>{card.title}</strong>
+            <small className="market-ticker-status">{marketCardStatus(card)}</small>
+          </div>
         </div>
-        <section className="market-ticker-card" aria-label={`${card.publisher.name}: ${card.title}`}>
-          <header>
-            <div><span>MARKET SNAPSHOT</span><strong>{card.title}</strong></div>
-            <span className={`feed-state feed-state-${card.state}`}>{card.state === "ready" ? "reported" : card.state}</span>
-          </header>
-          <p className="market-ticker-status">{marketCardStatus(card)}</p>
-          {card.observations.length > 0 && (
-            <div className="market-ticker-grid">
-              {card.observations.map((observation) => {
-                const direction = marketDirection(observation);
-                return (
-                  <a
-                    href={observation.source.url}
-                    key={observation.indexId}
-                    rel="noopener noreferrer nofollow"
-                    referrerPolicy="no-referrer"
-                    target="_blank"
-                    title={`Open ${observation.source.label} source for ${observation.displayName}`}
-                  >
-                    <span className="market-name">{observation.shortName}</span>
-                    <span className="market-value">{formatMarketLevel(observation)}</span>
-                    <span className={`market-change market-${direction}`}>{direction === "up" ? "▲" : direction === "down" ? "▼" : "•"} {formatMarketChangePercent(observation)}</span>
-                    <small>{formatMarketObservationTime(observation)}</small>
-                  </a>
-                );
-              })}
-            </div>
-          )}
-          <footer>
-            <span>Change from previous close · latest reported, not live</span>
-            <span>{sourceCount > 0 ? `${sourceCount} validated ${sourceCount === 1 ? "source" : "sources"}` : "Waiting for a validated source"}{experimental ? " · experimental data provider" : ""}</span>
-          </footer>
-        </section>
-      </div>
+        <span className={`feed-state feed-state-${card.state}`}>{card.state === "ready" ? "reported" : card.state}</span>
+      </header>
+      {card.observations.length > 0 && (
+        <div className="market-ticker-grid">
+          {card.observations.map((observation) => {
+            const direction = marketDirection(observation);
+            return (
+              <a
+                href={observation.source.url}
+                key={observation.indexId}
+                rel="noopener noreferrer nofollow"
+                referrerPolicy="no-referrer"
+                target="_blank"
+                title={`Open ${observation.source.label} source for ${observation.displayName}`}
+              >
+                <span className="market-name">{observation.shortName}</span>
+                <span className="market-value">{formatMarketLevel(observation)}</span>
+                <span className={`market-change market-${direction}`}>{direction === "up" ? "▲" : direction === "down" ? "▼" : "•"} {formatMarketChangePercent(observation)}</span>
+                <small>{formatMarketObservationTime(observation)}</small>
+              </a>
+            );
+          })}
+        </div>
+      )}
+      <footer>
+        <span>Change from previous close · latest reported, not live</span>
+        <span>{sourceCount > 0 ? `${sourceCount} validated ${sourceCount === 1 ? "source" : "sources"}` : "Waiting for a validated source"}{experimental ? " · experimental data provider" : ""}</span>
+      </footer>
     </article>
+  );
+};
+
+export const ChannelIntegrationsPanel = ({
+  cards,
+  collapsed,
+  onToggle,
+}: {
+  cards: ChannelFeedCard[];
+  collapsed: boolean;
+  onToggle: () => void;
+}) => {
+  if (cards.length === 0) return null;
+  const publisherCount = new Set(cards.map((card) => card.publisher.id)).size;
+  const summary = publisherCount === 1
+    ? `${cards[0].publisher.name} keeps this room current`
+    : `${publisherCount} services keep this room current`;
+
+  return (
+    <aside
+      aria-label="Room integrations"
+      className={`channel-integrations-panel${collapsed ? " collapsed" : ""}`}
+      data-channel-integrations
+    >
+      <div className="channel-integrations-toolbar">
+        <span className="channel-integrations-icon"><Icon name="radio" size={15} /></span>
+        <div>
+          <strong>Room integrations</strong>
+          <span>{summary}</span>
+        </div>
+        <button
+          aria-expanded={!collapsed}
+          aria-label={`${collapsed ? "Show" : "Hide"} room integrations`}
+          onClick={onToggle}
+          type="button"
+        >
+          <span>{collapsed ? "Show" : "Hide"}</span>
+          <Icon name="chevron" size={15} />
+        </button>
+      </div>
+      {!collapsed && (
+        <div className="channel-integrations-list">
+          {cards.map((card) => <ChannelFeedPanelCard card={card} key={card.id} />)}
+        </div>
+      )}
+    </aside>
   );
 };
 
@@ -492,6 +545,7 @@ export default function App() {
   const [emojiPickerTarget, setEmojiPickerTarget] = useState<EmojiPickerTarget | null>(null);
   const [channelNotices, setChannelNotices] = useState<ChannelNotices>({});
   const [unreadDividers, setUnreadDividers] = useState<Record<string, string | undefined>>({});
+  const [collapsedIntegrationChannels, setCollapsedIntegrationChannels] = useState<Record<string, boolean>>({});
   const [historyPageInfo, setHistoryPageInfo] = useState<Record<string, { before?: string; hasMore: boolean }>>({});
   const [historyLoading, setHistoryLoading] = useState<Record<string, boolean>>({});
   const [historyError, setHistoryError] = useState<Record<string, string | undefined>>({});
@@ -1007,9 +1061,9 @@ export default function App() {
     });
     socket.on("channel-feed:update", (payload: ChannelFeedUpdatePayload) => {
       setChannelFeeds((current) => upsertChannelFeed(current, payload.card));
-      if (payload.card.channelId === activeChannelRef.current && shouldStickToBottom.current) {
-        requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }));
-      }
+    });
+    socket.on("channel-feed:sync", (payload: ChannelFeedSyncPayload) => {
+      setChannelFeeds(syncChannelFeeds(payload.cards));
     });
     socket.on("reaction:update", (payload: ReactionPayload) => {
       setMessages((current) =>
@@ -1614,6 +1668,7 @@ export default function App() {
     () => activeThread || foldedSearch ? [] : channelFeedsFor(channelFeeds, activeChannelId),
     [activeChannelId, activeThread, channelFeeds, foldedSearch],
   );
+  const integrationsCollapsed = collapsedIntegrationChannels[activeChannelId] ?? false;
   const activeTitle = activeChannel?.name ?? activePeer?.name ?? "conversation";
   const activeDescription = activeChannel?.description ?? (activePeer?.kind === "ai" ? "Private chat with an AI resident" : "Private conversation");
   const typingMembers = (typing[activeChannelId] ?? []).map((id) => memberMap.get(id)).filter((member): member is Member => Boolean(member));
@@ -1905,7 +1960,7 @@ export default function App() {
     if (foldedSearch) return;
     if (!shouldStickToBottom.current) return;
     requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }));
-  }, [activeMessages.length, activeChannelFeeds, activeChannelId, foldedSearch]);
+  }, [activeMessages.length, activeChannelId, foldedSearch]);
 
   useEffect(() => {
     const scroller = scrollRef.current;
@@ -3221,6 +3276,15 @@ export default function App() {
           {searchOpen && <div className="search-pop"><Icon name="search" size={15} /><input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder={`Search loaded messages in #${activeTitle}`} /><button onClick={() => { setSearch(""); setSearchOpen(false); }}><Icon name="close" size={14} /></button></div>}
         </header>
 
+        <ChannelIntegrationsPanel
+          cards={activeChannelFeeds}
+          collapsed={integrationsCollapsed}
+          onToggle={() => setCollapsedIntegrationChannels((current) => ({
+            ...current,
+            [activeChannelId]: !(current[activeChannelId] ?? false),
+          }))}
+        />
+
         <div
           className="message-scroller"
           ref={scrollRef}
@@ -3257,7 +3321,7 @@ export default function App() {
             <p dir="auto">{activeDescription}</p>
             {activePeer?.kind === "ai" && <div className="transparency-note"><AiBadge label="AI RESIDENT" /><span>This character is generated by a local language model. Private history is stored locally by this server.</span></div>}
           </div>}
-          {activeMessages.length === 0 && activeChannelFeeds.length === 0 && <div className="empty-conversation"><Icon name="message" size={22} /><strong>Quiet, for once.</strong><span>Say something and see who notices.</span></div>}
+          {activeMessages.length === 0 && <div className="empty-conversation"><Icon name="message" size={22} /><strong>Quiet, for once.</strong><span>Say something and see who notices.</span></div>}
           {activeMessages.map((message, index) => {
             const author = memberMap.get(message.authorId) ?? message.authorSnapshot;
             const previous = activeMessages[index - 1];
@@ -3427,7 +3491,6 @@ export default function App() {
               </Fragment>
             );
           })}
-          {activeChannelFeeds.map((card) => <ChannelFeedPost card={card} key={card.id} />)}
           <div className="scroll-pad" />
         </div>
 

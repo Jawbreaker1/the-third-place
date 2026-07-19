@@ -576,6 +576,7 @@ textarea:focus-visible,
 }
 
 .chat-panel.voice-view > .chat-header,
+.chat-panel.voice-view > .channel-integrations-panel,
 .chat-panel.voice-view > .message-scroller,
 .chat-panel.voice-view > .composer-wrap { visibility: hidden; pointer-events: none; }
 
@@ -1091,24 +1092,131 @@ textarea:focus-visible,
   margin-top: 1px;
 }
 
-.channel-feed-post {
+.channel-integrations-panel {
+  position: relative;
+  z-index: 4;
+  flex: 0 0 auto;
+  min-width: 0;
+  border-bottom: 1px solid var(--line);
+  background:
+    linear-gradient(90deg, rgba(50, 116, 105, 0.08), rgba(24, 28, 37, 0.97) 42%),
+    #181c25;
+  box-shadow: 0 7px 20px rgba(0, 0, 0, 0.09);
+}
+
+.channel-integrations-toolbar {
+  display: flex;
+  min-height: 39px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 16px;
+}
+
+.channel-integrations-icon {
   display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
-  gap: 10px;
-  margin-top: 18px;
-  padding: 7px clamp(18px, 3.4vw, 40px) 3px;
-  animation: message-in 170ms ease-out both;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(86, 213, 173, 0.13);
+  border-radius: 8px;
+  color: #74cdb9;
+  background: rgba(86, 213, 173, 0.065);
+}
+
+.channel-integrations-toolbar > div {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.channel-integrations-toolbar strong {
+  color: #cbd3d1;
+  font-size: 11px;
+  font-weight: 720;
+  letter-spacing: 0.015em;
+  white-space: nowrap;
+}
+
+.channel-integrations-toolbar > div > span {
+  overflow: hidden;
+  color: #707a79;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-integrations-toolbar > button {
+  display: inline-flex;
+  min-width: 52px;
+  height: 28px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  border-radius: 8px;
+  color: #858d98;
+  background: rgba(255, 255, 255, 0.025);
+  cursor: pointer;
+  font-size: 9px;
+}
+
+.channel-integrations-toolbar > button:hover {
+  color: #c9ced4;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.channel-integrations-toolbar > button svg {
+  transform: rotate(-90deg);
+  transition: transform 140ms ease;
+}
+
+.channel-integrations-panel.collapsed .channel-integrations-toolbar > button svg { transform: rotate(90deg); }
+
+.channel-integrations-list {
+  display: grid;
+  max-height: min(34dvh, 270px);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 540px), 1fr));
+  gap: 8px;
+  padding: 0 14px 10px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.09) transparent;
+}
+
+.channel-integration-card {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(91, 216, 187, 0.13);
+  border-left: 3px solid #53bda8;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(51, 120, 108, 0.09), rgba(20, 24, 32, 0.84) 48%);
+  box-shadow: 0 7px 20px rgba(0, 0, 0, 0.08);
+}
+
+.channel-integration-card-header {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 33px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px 7px;
 }
 
 .feed-avatar {
   position: relative;
   display: grid;
-  width: 40px;
-  height: 40px;
+  width: 32px;
+  height: 32px;
   overflow: hidden;
   place-items: center;
   border: 1px solid color-mix(in srgb, var(--accent) 58%, rgba(255, 255, 255, 0.14));
-  border-radius: 12px;
+  border-radius: 10px;
   color: #effffb;
   background: linear-gradient(145deg, var(--accent), var(--avatar));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.17), 0 6px 18px rgba(0, 0, 0, 0.16);
@@ -1123,18 +1231,18 @@ textarea:focus-visible,
   object-fit: cover;
 }
 
-.channel-feed-body { min-width: 0; }
+.channel-integration-card-copy { min-width: 0; }
 
 .channel-feed-meta {
   display: flex;
-  height: 20px;
+  height: 16px;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
 }
 
 .channel-feed-meta > strong {
   color: #f2f3f5;
-  font-size: 14px;
+  font-size: 11px;
   font-weight: 700;
 }
 
@@ -1158,43 +1266,28 @@ textarea:focus-visible,
   letter-spacing: 0.06em;
 }
 
-.market-ticker-card {
-  max-width: 720px;
-  margin-top: 4px;
-  overflow: hidden;
-  border: 1px solid rgba(91, 216, 187, 0.14);
-  border-left: 3px solid #53bda8;
-  border-radius: 10px;
-  background: linear-gradient(135deg, rgba(51, 120, 108, 0.1), rgba(20, 24, 32, 0.78) 48%);
-  box-shadow: 0 9px 26px rgba(0, 0, 0, 0.1);
-}
-
-.market-ticker-card > header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 11px 13px 5px;
-}
-
-.market-ticker-card > header > div {
+.channel-integration-title {
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  gap: 2px;
+  align-items: baseline;
+  gap: 6px;
 }
 
-.market-ticker-card > header > div > span {
+.channel-integration-title > span {
+  flex: 0 0 auto;
   color: #62b9a9;
   font-size: 8px;
   font-weight: 780;
   letter-spacing: 0.13em;
 }
 
-.market-ticker-card > header strong {
+.channel-integration-title > strong {
+  overflow: hidden;
   color: #e8eeec;
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .feed-state {
@@ -1214,32 +1307,40 @@ textarea:focus-visible,
 .feed-state-unavailable { color: #d18e8a; border-color: rgba(209, 112, 105, 0.17); background: rgba(170, 70, 64, 0.08); }
 
 .market-ticker-status {
+  overflow: hidden;
   margin: 0;
-  padding: 0 13px 9px;
   color: #808b89;
-  font-size: 10px;
+  font-size: 9px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .market-ticker-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  display: flex;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
   border-top: 1px solid rgba(255, 255, 255, 0.045);
   border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
 }
 
 .market-ticker-grid > a {
   display: grid;
-  min-width: 0;
+  min-width: 110px;
+  flex: 1 0 110px;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 2px 7px;
-  padding: 9px 11px;
+  padding: 7px 9px;
   color: inherit;
+  scroll-snap-align: start;
   text-decoration: none;
   transition: background 120ms ease;
 }
 
-.market-ticker-grid > a:not(:nth-child(3n + 1)) { border-left: 1px solid rgba(255, 255, 255, 0.045); }
-.market-ticker-grid > a:nth-child(n + 4) { border-top: 1px solid rgba(255, 255, 255, 0.045); }
+.market-ticker-grid > a + a { border-left: 1px solid rgba(255, 255, 255, 0.045); }
 .market-ticker-grid > a:hover { background: rgba(255, 255, 255, 0.035); }
 .market-ticker-grid > a:focus-visible {
   outline: 2px solid rgba(111, 205, 185, 0.82);
@@ -1282,17 +1383,17 @@ textarea:focus-visible,
   white-space: nowrap;
 }
 
-.market-ticker-card > footer {
+.channel-integration-card > footer {
   display: flex;
   justify-content: space-between;
   gap: 14px;
-  padding: 8px 12px 9px;
+  padding: 6px 9px 7px;
   color: #84908d;
-  font-size: 10px;
+  font-size: 9px;
   line-height: 1.45;
 }
 
-.channel-feed-unavailable .market-ticker-card { border-left-color: #a96561; }
+.channel-feed-unavailable { border-left-color: #a96561; }
 
 .message-body {
   min-width: 0;
@@ -3583,14 +3684,19 @@ textarea:focus-visible,
   }
 
   .message .avatar-md { width: 33px; height: 33px; border-radius: 11px; font-size: 12px; }
-  .channel-feed-post { grid-template-columns: 36px minmax(0, 1fr); gap: 8px; padding-right: 13px; padding-left: 12px; }
-  .feed-avatar { width: 33px; height: 33px; border-radius: 10px; font-size: 9px; }
-  .market-ticker-card { width: 100%; }
-  .market-ticker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .market-ticker-grid > a:not(:nth-child(3n + 1)) { border-left: 0; }
-  .market-ticker-grid > a:not(:nth-child(2n + 1)) { border-left: 1px solid rgba(255, 255, 255, 0.045); }
-  .market-ticker-grid > a:nth-child(n + 3) { border-top: 1px solid rgba(255, 255, 255, 0.045); }
-  .market-ticker-card > footer { flex-direction: column; gap: 2px; }
+  .channel-integrations-toolbar { min-height: 40px; padding: 0 9px; }
+  .channel-integrations-toolbar > div > span { display: none; }
+  .channel-integrations-toolbar > button { min-width: 58px; height: 32px; }
+  .channel-integrations-list { max-height: min(32dvh, 205px); padding: 0 8px 8px; }
+  .channel-integration-card-header { grid-template-columns: 31px minmax(0, 1fr) auto; gap: 7px; padding: 7px 8px 6px; }
+  .feed-avatar { width: 30px; height: 30px; border-radius: 9px; font-size: 9px; }
+  .channel-integration-title > span { display: none; }
+  .channel-integration-title { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .market-ticker-grid { scroll-snap-type: x proximity; }
+  .market-ticker-grid > a { min-width: 118px; flex-basis: 118px; }
+  .channel-integration-card > footer { gap: 7px; }
+  .channel-integration-card > footer span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .channel-integration-card > footer span:last-child { display: none; }
   .message-content { font-size: 15px; }
   .message-image { width: 100%; }
   .message-image-button img { max-height: 52dvh; }

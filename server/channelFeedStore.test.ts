@@ -110,6 +110,69 @@ describe("ChannelFeedStore", () => {
     expect(store.schedules()).toEqual([]);
   });
 
+  it("loads a valid version-one payload with empty controls and migrates it on the next write", async () => {
+    let saved: ChannelFeedPersistedState | undefined;
+    const persistence: ChannelFeedPersistence = {
+      load: async () => ({
+        version: 1,
+        cards: [{ ...draft(), revision: 1 }],
+        schedules: [{
+          feedId: "market-wire",
+          lastAttemptAt: START,
+          lastSuccessAt: START,
+          nextPollAt: START + 30 * 60_000,
+          failures: 0,
+        }],
+      }),
+      save: async (state) => { saved = structuredClone(state); },
+    };
+    const store = new ChannelFeedStore({ persistence });
+    await store.load();
+    expect(store.getCard("market-wire")?.revision).toBe(1);
+    expect(store.configurations()).toEqual([]);
+
+    await store.reschedule("market-wire", START + 5 * 60_000);
+    expect(saved).toMatchObject({ version: 2, configurations: [] });
+  });
+
+  it("round-trips disabled cadence controls and atomically clears fresh-poll gating", async () => {
+    const persistence = new MemoryChannelFeedPersistence();
+    const first = new ChannelFeedStore({ persistence });
+    await first.load();
+    await first.publishSuccess("market-wire", draft(), timing());
+    await first.configure("market-wire", {
+      feedId: "market-wire",
+      enabled: false,
+      activeIntervalMs: 5 * 60_000,
+      idleIntervalMs: 45 * 60_000,
+      freshPollRequired: true,
+    }, START + 45 * 60_000);
+
+    const restored = new ChannelFeedStore({ persistence });
+    await restored.load();
+    expect(restored.configuration("market-wire")).toEqual({
+      feedId: "market-wire",
+      enabled: false,
+      activeIntervalMs: 5 * 60_000,
+      idleIntervalMs: 45 * 60_000,
+      freshPollRequired: true,
+    });
+    await restored.configure("market-wire", {
+      feedId: "market-wire",
+      enabled: true,
+      activeIntervalMs: 5 * 60_000,
+      idleIntervalMs: 45 * 60_000,
+      freshPollRequired: true,
+    }, START + 5 * 60_000);
+    expect(restored.configuration("market-wire")?.freshPollRequired).toBe(true);
+
+    await restored.publishUnchanged("market-wire", timing(START + 5 * 60_000, 5 * 60_000));
+    expect(restored.configuration("market-wire")?.freshPollRequired).toBe(false);
+    const final = new ChannelFeedStore({ persistence });
+    await final.load();
+    expect(final.configuration("market-wire")?.freshPollRequired).toBe(false);
+  });
+
   it("assigns monotonic revisions and restores cards plus scheduler metadata", async () => {
     const persistence = new MemoryChannelFeedPersistence();
     const first = new ChannelFeedStore({ persistence });
@@ -298,7 +361,10 @@ describe("ChannelFeedStore", () => {
 
     const metadata = await stat(filePath);
     expect(metadata.mode & 0o777).toBe(0o600);
-    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ version: 1 });
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
+      version: 2,
+      configurations: [],
+    });
     expect((await stat(join(directory, "nested"))).isDirectory()).toBe(true);
 
     const restored = new ChannelFeedStore({ filePath });

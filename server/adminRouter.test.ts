@@ -2,6 +2,7 @@ import { IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import express, { type Express } from "express";
 import { describe, expect, it } from "vitest";
+import type { AdminChannelFeedControl } from "../shared/adminTypes.js";
 import { AdminAuthManager } from "./adminAuth.js";
 import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateStore } from "./adminState.js";
@@ -608,5 +609,97 @@ describe("admin HTTP API", () => {
     // untrusted forwarding header to escape the socket source's own budget.
     expect((await login("correct horse battery staple", "203.0.113.20", "198.51.100.3")).status).toBe(429);
     expect((await login("correct horse battery staple", "203.0.113.21")).status).toBe(201);
+  });
+
+  it("exposes and live-updates only the feed registered to the addressed room", async () => {
+    const state = isolatedAdminState();
+    await state.load();
+    const auth = new AdminAuthManager({
+      password: "correct horse battery staple",
+      randomToken: () => "f".repeat(43),
+    });
+    let control: AdminChannelFeedControl = {
+      id: "market-wire",
+      channelId: "stock-market",
+      kind: "market_ticker",
+      label: "MarketWire",
+      description: "Bounded market snapshots.",
+      publisher: { id: "market-wire", name: "MarketWire", badge: "BOT" as const },
+      available: true,
+      enabled: true,
+      activeIntervalMinutes: 5,
+      idleIntervalMinutes: 30,
+      defaultEnabled: true,
+      defaultActiveIntervalMinutes: 5,
+      defaultIdleIntervalMinutes: 30,
+      minimumIntervalMinutes: 5,
+      maximumIntervalMinutes: 1_440,
+      status: "ready",
+      cardAvailable: true,
+      failures: 0,
+      nextPollAt: Date.UTC(2026, 6, 19, 17, 30),
+    };
+    const configured: unknown[] = [];
+    const app = express();
+    app.use("/api/admin", createAdminRouter({
+      auth,
+      state,
+      configuredOrigins: ["https://admin.example"],
+      getHumans: () => [],
+      kickHuman: () => undefined,
+      banHuman: () => undefined,
+      getChannelFeedControls: () => [control],
+      configureChannelFeed: async (_feedId, patch) => {
+        configured.push(patch);
+        control = { ...control, ...patch, status: patch.enabled ? "waiting" : "disabled" };
+        return control;
+      },
+    }));
+
+    const login = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/session",
+      origin: "https://admin.example",
+      body: { password: "correct horse battery staple" },
+    });
+    const cookie = String(login.headers["set-cookie"]).split(";", 1)[0]!;
+    const initial = await dispatch(app, { method: "GET", path: "/api/admin/state", cookie });
+    expect(initial.body).toMatchObject({ state: { automation: { channelFeeds: [{ id: "market-wire", enabled: true }] } } });
+
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/channels/stock-market/feeds/market-wire",
+      cookie,
+      origin: "https://evil.example",
+      body: { enabled: false, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
+    })).status).toBe(403);
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/channels/lobby/feeds/market-wire",
+      cookie,
+      origin: "https://admin.example",
+      body: { enabled: true, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
+    })).status).toBe(404);
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/channels/stock-market/feeds/market-wire",
+      cookie,
+      origin: "https://admin.example",
+      body: { enabled: true, activeIntervalMinutes: 4, idleIntervalMinutes: 45 },
+    })).status).toBe(400);
+    expect(configured).toEqual([]);
+
+    const updated = await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/channels/stock-market/feeds/market-wire",
+      cookie,
+      origin: "https://admin.example",
+      body: { enabled: false, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
+    });
+    expect(updated.status).toBe(200);
+    expect(configured).toEqual([{ enabled: false, activeIntervalMinutes: 5, idleIntervalMinutes: 45 }]);
+    expect(updated.body).toMatchObject({
+      state: { automation: { channelFeeds: [{ id: "market-wire", enabled: false, idleIntervalMinutes: 45 }] } },
+    });
   });
 });

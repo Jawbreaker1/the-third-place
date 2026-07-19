@@ -1,5 +1,6 @@
 import type {
   AdminBehaviorPatch,
+  AdminChannelFeedPatch,
   AdminChannelWrite,
   AdminMemoryActorDetail,
   AdminMemoryItemPatch,
@@ -137,6 +138,17 @@ export async function patchAdminChannel(id: string, channel: AdminChannelWrite):
 
 export async function deleteAdminChannel(id: string): Promise<void> {
   await request(`/api/admin/channels/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function patchAdminChannelFeed(
+  channelId: string,
+  feedId: string,
+  patch: AdminChannelFeedPatch,
+): Promise<void> {
+  await request(
+    `/api/admin/channels/${encodeURIComponent(channelId)}/feeds/${encodeURIComponent(feedId)}`,
+    { method: "PATCH", body: jsonBody(patch) },
+  );
 }
 
 export async function moderateAdminHuman(id: string, action: "kick" | "ban"): Promise<void> {

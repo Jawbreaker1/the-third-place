@@ -10,6 +10,7 @@ import {
   getAdminMemoryActor,
   issueAdminHumanRecoveryKey,
   patchAdminBehavior,
+  patchAdminChannelFeed,
   patchAdminLlmProvider,
   patchAdminMemoryItem,
   patchAdminPersona,
@@ -84,6 +85,26 @@ describe("admin behavior API", () => {
       body: expect.stringContaining('"roomAffinities":{"lobby":0}'),
     }));
     expect((fetchMock.mock.calls[0]?.[1] as RequestInit).body).not.toContain("the-pub");
+  });
+
+  it("updates one server-owned room integration through its room-scoped route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await patchAdminChannelFeed("stock/market", "market wire", {
+      enabled: true,
+      activeIntervalMinutes: 5,
+      idleIntervalMinutes: 45,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/channels/stock%2Fmarket/feeds/market%20wire",
+      expect.objectContaining({
+        method: "PATCH",
+        credentials: "same-origin",
+        body: JSON.stringify({ enabled: true, activeIntervalMinutes: 5, idleIntervalMinutes: 45 }),
+      }),
+    );
   });
 });
 

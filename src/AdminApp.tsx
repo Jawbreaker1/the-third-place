@@ -8,6 +8,7 @@ import {
 } from "react";
 import type {
   AdminBehaviorTuning,
+  AdminChannelFeedControl,
   AdminChannelConfig,
   AdminMemoryActorDetail,
   AdminMemoryOverview,
@@ -38,6 +39,7 @@ import {
   moderateAdminHuman,
   patchAdminBehavior,
   patchAdminChannel,
+  patchAdminChannelFeed,
   patchAdminLlmProvider,
   patchAdminMemoryItem,
   patchAdminPersona,
@@ -70,6 +72,10 @@ type ConfirmRequest = {
   action: () => Promise<boolean>;
 };
 type IssuedRecoveryKey = { name: string; recoveryKey: string; copied: boolean };
+type AdminChannelFeedDraft = Pick<
+  AdminChannelFeedControl,
+  "enabled" | "activeIntervalMinutes" | "idleIntervalMinutes"
+>;
 
 const sections: Array<{ id: AdminSection; label: string; hint: string }> = [
   { id: "overview", label: "Overview", hint: "Live controls" },
@@ -111,6 +117,36 @@ const formatDateTime = (value?: string): string => {
   return Number.isFinite(date.getTime())
     ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date)
     : value;
+};
+
+const channelFeedDraftKey = (channelId: string, feedId: string): string => `${channelId}:${feedId}`;
+
+const formatFeedInstant = (value: number | undefined, empty: string): string => {
+  if (!Number.isSafeInteger(value) || value === undefined || value <= 0) return empty;
+  return formatDateTime(new Date(value).toISOString());
+};
+
+const formatIntervalMinutes = (minutes: number): string => {
+  if (minutes < 60) return `${minutes} min`;
+  if (minutes % (24 * 60) === 0) {
+    const days = minutes / (24 * 60);
+    return `${days} day${days === 1 ? "" : "s"}`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `${minutes} min`;
+};
+
+const channelFeedStatusLabel = (status: AdminChannelFeedControl["status"]): string => {
+  switch (status) {
+    case "disabled": return "Disabled";
+    case "waiting": return "Waiting for first run";
+    case "polling": return "Polling now";
+    case "ready": return "Ready";
+    case "unavailable": return "Source unavailable";
+  }
 };
 
 const mutationErrorMessage = (error: unknown): string => {
@@ -401,6 +437,7 @@ export default function AdminApp() {
   const [channelDraft, setChannelDraft] = useState<AdminChannelConfig>();
   const [channelSeedText, setChannelSeedText] = useState("");
   const [newChannel, setNewChannel] = useState(false);
+  const [channelFeedDrafts, setChannelFeedDrafts] = useState<Record<string, AdminChannelFeedDraft>>({});
   const [memoryOverview, setMemoryOverview] = useState<AdminMemoryOverview>();
   const [memoryOverviewLoading, setMemoryOverviewLoading] = useState(false);
   const [memoryOverviewError, setMemoryOverviewError] = useState<string>();
@@ -415,6 +452,14 @@ export default function AdminApp() {
     setBehaviorChannelId((current) => next.channels.some((channel) => channel.id === current) ? current : next.channels[0]?.id ?? "");
     setSelectedPersonaId((current) => next.personas.some((persona) => persona.id === current) ? current : next.personas[0]?.id ?? "");
     setSelectedChannelId((current) => next.channels.some((channel) => channel.id === current) ? current : next.channels[0]?.id ?? "");
+    setChannelFeedDrafts(Object.fromEntries(next.automation.channelFeeds.map((feed) => [
+      channelFeedDraftKey(feed.channelId, feed.id),
+      {
+        enabled: feed.enabled,
+        activeIntervalMinutes: feed.activeIntervalMinutes,
+        idleIntervalMinutes: feed.idleIntervalMinutes,
+      },
+    ])));
   };
 
   const installLlmState = (next: AdminLlmState) => {
@@ -831,6 +876,62 @@ export default function AdminApp() {
         setNewChannel(false);
         setSelectedChannelId(payload.id);
       },
+    );
+  };
+
+  const updateChannelFeedDraft = (
+    feed: AdminChannelFeedControl,
+    patch: Partial<AdminChannelFeedDraft>,
+  ): void => {
+    const key = channelFeedDraftKey(feed.channelId, feed.id);
+    setChannelFeedDrafts((current) => {
+      const existing = current[key] ?? {
+        enabled: feed.enabled,
+        activeIntervalMinutes: feed.activeIntervalMinutes,
+        idleIntervalMinutes: feed.idleIntervalMinutes,
+      };
+      return {
+        ...current,
+        [key]: {
+          ...existing,
+          ...patch,
+        },
+      };
+    });
+  };
+
+  const saveChannelFeed = async (feed: AdminChannelFeedControl): Promise<void> => {
+    const key = channelFeedDraftKey(feed.channelId, feed.id);
+    const draft = channelFeedDrafts[key] ?? {
+      enabled: feed.enabled,
+      activeIntervalMinutes: feed.activeIntervalMinutes,
+      idleIntervalMinutes: feed.idleIntervalMinutes,
+    };
+    if (
+      !Number.isSafeInteger(draft.activeIntervalMinutes)
+      || !Number.isSafeInteger(draft.idleIntervalMinutes)
+      || draft.activeIntervalMinutes < feed.minimumIntervalMinutes
+      || draft.idleIntervalMinutes < draft.activeIntervalMinutes
+      || draft.activeIntervalMinutes > feed.maximumIntervalMinutes
+      || draft.idleIntervalMinutes > feed.maximumIntervalMinutes
+    ) {
+      setNotice({
+        tone: "error",
+        message: `${feed.label} intervals must be whole minutes between ${feed.minimumIntervalMinutes} and ${feed.maximumIntervalMinutes}; the quiet interval cannot be shorter than the active interval.`,
+      });
+      return;
+    }
+    if (!feed.available && draft.enabled) {
+      setNotice({
+        tone: "error",
+        message: `${feed.label} is unavailable in this server process. Disable it before saving, or restore the server integration first.`,
+      });
+      return;
+    }
+    await runMutation(
+      `save-channel-feed-${feed.id}`,
+      `${feed.label} was updated live for #${feed.channelId}.`,
+      () => patchAdminChannelFeed(feed.channelId, feed.id, draft),
     );
   };
 
@@ -1292,6 +1393,12 @@ export default function AdminApp() {
     </div>
   );
 
+  const selectedChannelFeeds = newChannel
+    ? []
+    : snapshot.automation.channelFeeds
+      .filter((feed) => feed.channelId === selectedChannelId)
+      .sort((left, right) => left.label.localeCompare(right.label) || left.id.localeCompare(right.id));
+
   const rooms = (
     <div className="admin-editor-layout">
       <aside className="admin-list-card" aria-label="Rooms">
@@ -1311,18 +1418,27 @@ export default function AdminApp() {
           >+</button>
         </div>
         <div className="admin-entity-list">
-          {snapshot.channels.map((channel) => (
-            <button
-              aria-current={!newChannel && selectedChannelId === channel.id ? "true" : undefined}
-              className={!newChannel && selectedChannelId === channel.id ? "active" : ""}
-              key={channel.id}
-              onClick={() => { setNewChannel(false); setSelectedChannelId(channel.id); }}
-              type="button"
-            >
-              <span className="admin-room-chip">{channel.icon || "#"}</span>
-              <span><strong>#{channel.name}</strong><small>{channel.seeds.length} topic seeds</small></span>
-            </button>
-          ))}
+          {snapshot.channels.map((channel) => {
+            const integrationCount = snapshot.automation.channelFeeds.filter(
+              (feed) => feed.channelId === channel.id,
+            ).length;
+            return (
+              <button
+                aria-current={!newChannel && selectedChannelId === channel.id ? "true" : undefined}
+                className={!newChannel && selectedChannelId === channel.id ? "active" : ""}
+                key={channel.id}
+                onClick={() => { setNewChannel(false); setSelectedChannelId(channel.id); }}
+                type="button"
+              >
+                <span className="admin-room-chip">{channel.icon || "#"}</span>
+                <span>
+                  <strong>#{channel.name}</strong>
+                  <small>{channel.seeds.length} topic seeds · {integrationCount} integration{integrationCount === 1 ? "" : "s"}</small>
+                </span>
+                {integrationCount > 0 && <i aria-label={`${integrationCount} server-owned integrations`}>{integrationCount}</i>}
+              </button>
+            );
+          })}
         </div>
       </aside>
       <section className="admin-card admin-editor-card">
@@ -1377,6 +1493,187 @@ export default function AdminApp() {
                   </select>
                 </Field>
               </div>
+            </fieldset>
+            <fieldset className="admin-fieldset admin-channel-feeds-fieldset">
+              <legend>Server-owned integrations</legend>
+              <p className="admin-fieldset-note">
+                Deterministic information bots publish bounded room facts without becoming residents, joining relationships or adding unread chat messages. Changes apply immediately after their own save.
+              </p>
+              {newChannel ? (
+                <div className="admin-channel-feed-empty">
+                  <strong>Save the room before assigning integrations</strong>
+                  <span>Server-owned adapters bind to a stable room ID and will appear here when registered.</span>
+                </div>
+              ) : selectedChannelFeeds.length ? (
+                <div className="admin-channel-feed-list">
+                  {selectedChannelFeeds.map((feed) => {
+                    const key = channelFeedDraftKey(feed.channelId, feed.id);
+                    const feedDraft = channelFeedDrafts[key] ?? {
+                      enabled: feed.enabled,
+                      activeIntervalMinutes: feed.activeIntervalMinutes,
+                      idleIntervalMinutes: feed.idleIntervalMinutes,
+                    };
+                    const intervalsValid = Number.isSafeInteger(feedDraft.activeIntervalMinutes)
+                      && Number.isSafeInteger(feedDraft.idleIntervalMinutes)
+                      && feedDraft.activeIntervalMinutes >= feed.minimumIntervalMinutes
+                      && feedDraft.activeIntervalMinutes <= feed.maximumIntervalMinutes
+                      && feedDraft.idleIntervalMinutes >= feedDraft.activeIntervalMinutes
+                      && feedDraft.idleIntervalMinutes <= feed.maximumIntervalMinutes;
+                    const unavailableSelection = !feed.available;
+                    const dirty = feedDraft.enabled !== feed.enabled
+                      || feedDraft.activeIntervalMinutes !== feed.activeIntervalMinutes
+                      || feedDraft.idleIntervalMinutes !== feed.idleIntervalMinutes;
+                    const saving = busy === `save-channel-feed-${feed.id}`;
+                    return (
+                      <article className={`admin-channel-feed ${feed.status}${feed.available ? "" : " adapter-unavailable"}`} key={feed.id}>
+                        <header className="admin-channel-feed-header">
+                          <div className="admin-channel-feed-identity">
+                            <span className="admin-channel-feed-mark" aria-hidden="true">↯</span>
+                            <div>
+                              <div className="admin-channel-feed-title">
+                                <strong>{feed.label}</strong>
+                                <span>{feed.publisher.badge}</span>
+                                <code>{feed.kind}</code>
+                              </div>
+                              <small>Published by {feed.publisher.name} · {feed.id}</small>
+                            </div>
+                          </div>
+                          <span className={`admin-channel-feed-status ${feed.status}`}>
+                            {channelFeedStatusLabel(feed.status)}
+                          </span>
+                        </header>
+
+                        <p className="admin-channel-feed-description">{feed.description || "No integration description was provided."}</p>
+
+                        {!feed.available && (
+                          <div className="admin-channel-feed-warning" role="status">
+                            This adapter is not available in the running server. Its saved settings remain visible for diagnostics, but cannot be changed until the server integration is restored.
+                          </div>
+                        )}
+
+                        <label className="admin-checkbox admin-channel-feed-toggle">
+                          <input
+                            checked={feedDraft.enabled}
+                            disabled={Boolean(busy) || !feed.available}
+                            onChange={(event) => updateChannelFeedDraft(feed, { enabled: event.target.checked })}
+                            type="checkbox"
+                          />
+                          <span>
+                            <strong>Enabled for #{feed.channelId}</strong>
+                            <small>Disabling stops future polls and hides its room card; it does not turn this into a resident or delete room history.</small>
+                          </span>
+                        </label>
+
+                        <div className="admin-channel-feed-cadence">
+                          <Field
+                            id={`feed-${feed.id}-active-interval`}
+                            label="People active"
+                            hint="Poll cadence while a human has recently been active in this room."
+                          >
+                            <div className="admin-channel-feed-number">
+                              <input
+                                aria-invalid={!intervalsValid}
+                                disabled={Boolean(busy) || !feed.available}
+                                id={`feed-${feed.id}-active-interval`}
+                                max={feed.maximumIntervalMinutes}
+                                min={feed.minimumIntervalMinutes}
+                                onChange={(event) => {
+                                  if (Number.isFinite(event.currentTarget.valueAsNumber)) {
+                                    updateChannelFeedDraft(feed, { activeIntervalMinutes: event.currentTarget.valueAsNumber });
+                                  }
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key !== "Enter") return;
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  if (!busy && dirty && intervalsValid && !unavailableSelection) {
+                                    void saveChannelFeed(feed);
+                                  }
+                                }}
+                                step="1"
+                                type="number"
+                                value={feedDraft.activeIntervalMinutes}
+                              />
+                              <span>minutes</span>
+                            </div>
+                          </Field>
+                          <Field
+                            id={`feed-${feed.id}-idle-interval`}
+                            label="Room quiet"
+                            hint="Slower background cadence when no human has recently been active here."
+                          >
+                            <div className="admin-channel-feed-number">
+                              <input
+                                aria-invalid={!intervalsValid}
+                                disabled={Boolean(busy) || !feed.available}
+                                id={`feed-${feed.id}-idle-interval`}
+                                max={feed.maximumIntervalMinutes}
+                                min={feed.minimumIntervalMinutes}
+                                onChange={(event) => {
+                                  if (Number.isFinite(event.currentTarget.valueAsNumber)) {
+                                    updateChannelFeedDraft(feed, { idleIntervalMinutes: event.currentTarget.valueAsNumber });
+                                  }
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key !== "Enter") return;
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  if (!busy && dirty && intervalsValid && !unavailableSelection) {
+                                    void saveChannelFeed(feed);
+                                  }
+                                }}
+                                step="1"
+                                type="number"
+                                value={feedDraft.idleIntervalMinutes}
+                              />
+                              <span>minutes</span>
+                            </div>
+                          </Field>
+                        </div>
+
+                        <div className="admin-channel-feed-policy" aria-label={`${feed.label} cadence policy`}>
+                          <span>Allowed <strong>{formatIntervalMinutes(feed.minimumIntervalMinutes)}–{formatIntervalMinutes(feed.maximumIntervalMinutes)}</strong></span>
+                          <span>Defaults <strong>{formatIntervalMinutes(feed.defaultActiveIntervalMinutes)} active / {formatIntervalMinutes(feed.defaultIdleIntervalMinutes)} quiet</strong></span>
+                          <span>Default state <strong>{feed.defaultEnabled ? "enabled" : "disabled"}</strong></span>
+                        </div>
+
+                        <dl className="admin-channel-feed-facts">
+                          <div><dt>Last success</dt><dd>{formatFeedInstant(feed.lastSuccessAt, "Never")}</dd></div>
+                          <div><dt>Next poll</dt><dd>{feed.enabled ? formatFeedInstant(feed.nextPollAt, "Not scheduled") : "Disabled"}</dd></div>
+                          <div><dt>Last attempt</dt><dd>{formatFeedInstant(feed.lastAttemptAt, "Never")}</dd></div>
+                          <div><dt>Failures</dt><dd>{feed.failures}</dd></div>
+                          <div><dt>Published card</dt><dd>{feed.cardAvailable ? "Available" : "None yet"}</dd></div>
+                        </dl>
+
+                        <footer className="admin-channel-feed-footer">
+                          <span className={!intervalsValid || unavailableSelection ? "invalid" : dirty ? "dirty" : "saved"}>
+                            {!intervalsValid
+                              ? `Use whole minutes within the allowed range; quiet must be ${feedDraft.activeIntervalMinutes} min or slower.`
+                              : unavailableSelection
+                                ? "This integration is unavailable until its server adapter is restored."
+                                : dirty
+                                  ? "Unsaved integration changes"
+                                  : "Configuration is saved"}
+                          </span>
+                          <button
+                            className="admin-button primary"
+                            disabled={Boolean(busy) || !dirty || !intervalsValid || unavailableSelection}
+                            onClick={() => { void saveChannelFeed(feed); }}
+                            type="button"
+                          >
+                            {saving ? "Saving…" : "Save integration"}
+                          </button>
+                        </footer>
+                      </article>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="admin-channel-feed-empty">
+                  <strong>No server-owned integrations in this room</strong>
+                  <span>When a trusted adapter is registered for #{channelDraft.id}, its live controls and health will appear here.</span>
+                </div>
+              )}
             </fieldset>
             <fieldset className="admin-fieldset">
               <legend>Knowledge and social direction</legend>

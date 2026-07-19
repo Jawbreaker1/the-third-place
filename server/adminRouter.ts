@@ -1,6 +1,11 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
-import type { AdminAutonomousResearchDiagnostics, AdminHumanMember } from "../shared/adminTypes.js";
+import type {
+  AdminAutonomousResearchDiagnostics,
+  AdminChannelFeedControl,
+  AdminChannelFeedPatch,
+  AdminHumanMember,
+} from "../shared/adminTypes.js";
 import {
   AdminAuthManager,
   adminCookie,
@@ -18,6 +23,14 @@ const idParam = z.string().min(1).max(100);
 const providerPatchSchema = z.object({ activeProvider: z.enum(["lmstudio", "codex"]) }).strict();
 const emptyBodySchema = z.object({}).strict();
 const memoryPatchSchema = z.object({ pinned: z.boolean() }).strict();
+const channelFeedPatchSchema = z.object({
+  enabled: z.boolean(),
+  activeIntervalMinutes: z.number().int().min(1).max(1_440),
+  idleIntervalMinutes: z.number().int().min(1).max(1_440),
+}).strict().refine(
+  (value) => value.idleIntervalMinutes >= value.activeIntervalMinutes,
+  { message: "The quiet-room interval cannot be shorter than the active-room interval." },
+);
 
 export interface AdminRouterDependencies {
   auth: AdminAuthManager;
@@ -25,6 +38,11 @@ export interface AdminRouterDependencies {
   configuredOrigins: readonly string[];
   getHumans: () => AdminHumanMember[];
   getAutonomousResearchDiagnostics?: () => AdminAutonomousResearchDiagnostics;
+  getChannelFeedControls?: () => AdminChannelFeedControl[];
+  configureChannelFeed?: (
+    feedId: string,
+    patch: AdminChannelFeedPatch,
+  ) => Promise<AdminChannelFeedControl | void>;
   kickHuman: (memberId: string, reason?: string) => AdminHumanMember | undefined;
   banHuman: (memberId: string, reason?: string) => AdminHumanMember | undefined;
   /** Issues a new one-time-disclosed portable return key for a retained human identity. */
@@ -139,9 +157,14 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
   const stateResponse = () => {
     const state = dependencies.state.snapshot(dependencies.getHumans());
     const autonomousResearch = dependencies.getAutonomousResearchDiagnostics?.();
-    return autonomousResearch
-      ? { ...state, automation: { ...state.automation, autonomousResearch } }
-      : state;
+    return {
+      ...state,
+      automation: {
+        ...state.automation,
+        ...(autonomousResearch ? { autonomousResearch } : {}),
+        channelFeeds: dependencies.getChannelFeedControls?.() ?? [],
+      },
+    };
   };
   router.get("/state", (_request, response) => response.json({ ok: true, state: stateResponse() }));
 
@@ -258,6 +281,44 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
   router.delete("/channels/:id", async (request, response, next) => {
     try {
       await dependencies.state.deleteChannel(idParam.parse(request.params.id));
+      response.json({ ok: true, state: stateResponse() });
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.patch("/channels/:channelId/feeds/:feedId", async (request, response, next) => {
+    if (!dependencies.configureChannelFeed || !dependencies.getChannelFeedControls) {
+      response.status(503).json({ ok: false, code: "CHANNEL_FEEDS_UNAVAILABLE", error: "Room integration controls are unavailable." });
+      return;
+    }
+    try {
+      const channelId = idParam.parse(request.params.channelId);
+      const feedId = idParam.parse(request.params.feedId);
+      const patch = channelFeedPatchSchema.parse(request.body);
+      const control = dependencies.getChannelFeedControls().find((candidate) => candidate.id === feedId);
+      if (!control || control.channelId !== channelId) {
+        response.status(404).json({ ok: false, code: "CHANNEL_FEED_NOT_FOUND", error: "That integration is not registered for this room." });
+        return;
+      }
+      if (!dependencies.state.snapshot().channels.some((channel) => channel.id === channelId)) {
+        response.status(404).json({ ok: false, code: "CHANNEL_NOT_FOUND", error: "That channel is not active." });
+        return;
+      }
+      if (!control.available && patch.enabled) {
+        response.status(409).json({ ok: false, code: "CHANNEL_FEED_UNAVAILABLE", error: "That integration is unavailable in this server process." });
+        return;
+      }
+      if (
+        patch.activeIntervalMinutes < control.minimumIntervalMinutes
+        || patch.idleIntervalMinutes < control.minimumIntervalMinutes
+        || patch.activeIntervalMinutes > control.maximumIntervalMinutes
+        || patch.idleIntervalMinutes > control.maximumIntervalMinutes
+      ) {
+        response.status(400).json({ ok: false, code: "CHANNEL_FEED_INTERVAL", error: `Intervals must be between ${control.minimumIntervalMinutes} and ${control.maximumIntervalMinutes} minutes.` });
+        return;
+      }
+      await dependencies.configureChannelFeed(feedId, patch);
       response.json({ ok: true, state: stateResponse() });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }

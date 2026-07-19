@@ -11,6 +11,7 @@ import { z } from "zod";
 import type {
   ActionResult,
   ChannelFeedCard,
+  ChannelFeedSyncPayload,
   ChatMessage,
   HistoryPage,
   ImageAnalysis,
@@ -93,7 +94,8 @@ import {
 } from "./marketPulse.js";
 import { safeMarketPulseFeedFetcher } from "./marketPulseFetch.js";
 import { ChannelFeedStore } from "./channelFeedStore.js";
-import { ChannelFeedCoordinator } from "./channelFeeds.js";
+import { ChannelFeedConfigurationError, ChannelFeedCoordinator } from "./channelFeeds.js";
+import { projectChannelFeedAdminControls } from "./channelFeedAdmin.js";
 import { MarketWireAdapter } from "./marketWire.js";
 import { residentChannelFeedFact } from "./channelFeedFacts.js";
 import {
@@ -836,12 +838,21 @@ const channelFeedAdapters = process.env.CHANNEL_FEEDS_ENABLED === "false" ||
   ? []
   : [new MarketWireAdapter(marketSnapshotProvider)];
 let channelFeedsStarted = false;
+const visibleChannelFeedCards = (cards: readonly ChannelFeedCard[]): ChannelFeedCard[] => {
+  const activeChannelIds = new Set(CHANNELS.map((channel) => channel.id));
+  return cards.filter((card) => activeChannelIds.has(card.channelId));
+};
 const channelFeedCoordinator = channelFeedAdapters.length > 0
   ? new ChannelFeedCoordinator<ChannelFeedCard>({
       adapters: channelFeedAdapters,
       store: channelFeedStore,
       onCard: (card) => {
+        if (!CHANNELS.some((channel) => channel.id === card.channelId)) return;
         io.to("public").emit("channel-feed:update", { card });
+      },
+      onCardsChanged: (cards) => {
+        const payload: ChannelFeedSyncPayload = { cards: visibleChannelFeedCards(cards) };
+        io.to("public").emit("channel-feed:sync", payload);
       },
       onError: (feedId, error) => {
         console.warn(
@@ -852,7 +863,28 @@ const channelFeedCoordinator = channelFeedAdapters.length > 0
     })
   : null;
 const currentChannelFeeds = (): ChannelFeedCard[] =>
-  channelFeedsStarted && channelFeedCoordinator ? channelFeedCoordinator.cards() : [];
+  channelFeedsStarted && channelFeedCoordinator
+    ? visibleChannelFeedCards(channelFeedCoordinator.cards())
+    : [];
+const reconcileChannelFeedRooms = async (): Promise<void> => {
+  if (!channelFeedsStarted || !channelFeedCoordinator) return;
+  const activeChannelIds = new Set(CHANNELS.map((channel) => channel.id));
+  const orphaned = channelFeedCoordinator.controls().filter(
+    (control) => control.enabled && !activeChannelIds.has(control.channelId),
+  );
+  const payload: ChannelFeedSyncPayload = { cards: currentChannelFeeds() };
+  io.to("public").emit("channel-feed:sync", payload);
+  const results = await Promise.allSettled(
+    orphaned.map((control) => channelFeedCoordinator.configure(control.id, { enabled: false })),
+  );
+  results.forEach((result, index) => {
+    if (result.status === "fulfilled") return;
+    console.warn(
+      `Could not disable channel feed ${orphaned[index]?.id ?? "unknown"} after its room was removed:`,
+      result.reason instanceof Error ? result.reason.message : result.reason,
+    );
+  });
+};
 const channelFeedFactFor = (channelId: string) =>
   residentChannelFeedFact(currentChannelFeeds().find((card) => card.channelId === channelId));
 const footballCompetitionProvider = process.env.FOOTBALL_DATA_ENABLED === "false"
@@ -1508,6 +1540,7 @@ adminState.setHooks({
       channels: CHANNELS.map((channel) => ({ ...channel })),
       members: getMembers(),
     });
+    void reconcileChannelFeedRooms();
   },
 });
 
@@ -1521,6 +1554,27 @@ app.use("/api/admin", createAdminRouter({
   configuredOrigins: adminOrigins,
   getHumans: adminHumans,
   getAutonomousResearchDiagnostics: () => director.getAutonomousResearchDiagnostics(),
+  getChannelFeedControls: () => projectChannelFeedAdminControls(
+    channelFeedCoordinator?.controls() ?? [],
+    channelFeedsStarted,
+  ),
+  configureChannelFeed: async (feedId, patch) => {
+    if (!channelFeedCoordinator || !channelFeedsStarted) {
+      throw new AdminStateError(503, "CHANNEL_FEEDS_UNAVAILABLE", "Room integration controls are unavailable in this server process.");
+    }
+    try {
+      return await channelFeedCoordinator.configure(feedId, patch);
+    } catch (error) {
+      if (!(error instanceof ChannelFeedConfigurationError)) throw error;
+      if (error.code === "unknown_feed") {
+        throw new AdminStateError(404, "CHANNEL_FEED_NOT_FOUND", error.message);
+      }
+      if (error.code === "invalid_configuration") {
+        throw new AdminStateError(400, "CHANNEL_FEED_CONFIGURATION", error.message);
+      }
+      throw new AdminStateError(503, "CHANNEL_FEEDS_UNAVAILABLE", error.message);
+    }
+  },
   issueHumanRecoveryKey,
   kickHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, true),
   banHuman: (memberId, reason) => disconnectModeratedHuman(memberId, reason, false),
@@ -3497,6 +3551,7 @@ if (channelFeedCoordinator) {
   try {
     await channelFeedCoordinator.start();
     channelFeedsStarted = true;
+    await reconcileChannelFeedRooms();
   } catch (error) {
     // Feed telemetry is useful but non-authoritative. A corrupt optional feed
     // file must not take the social world or account continuity down with it.

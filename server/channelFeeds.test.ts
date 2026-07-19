@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  ChannelFeedConfigurationError,
   ChannelFeedCoordinator,
   type ChannelFeedAdapter,
   type ChannelFeedCardDraftFor,
@@ -9,7 +10,11 @@ import {
   type ChannelFeedTimerRuntime,
   type SchedulableChannelFeedCard,
 } from "./channelFeeds.js";
-import type { ChannelFeedPollTiming, ChannelFeedScheduleState } from "./channelFeedStore.js";
+import type {
+  ChannelFeedPollTiming,
+  ChannelFeedRuntimeConfiguration,
+  ChannelFeedScheduleState,
+} from "./channelFeedStore.js";
 
 const MINUTE_MS = 60_000;
 
@@ -71,6 +76,7 @@ class ManualTimers implements ChannelFeedTimerRuntime {
 class TestStore<TCard extends SchedulableChannelFeedCard> implements ChannelFeedStorePort<TCard> {
   readonly cardById = new Map<string, TCard>();
   readonly scheduleById = new Map<string, ChannelFeedScheduleState>();
+  readonly configurationById = new Map<string, ChannelFeedRuntimeConfiguration>();
   loadCalls = 0;
   flushCalls = 0;
 
@@ -92,6 +98,11 @@ class TestStore<TCard extends SchedulableChannelFeedCard> implements ChannelFeed
     return schedule ? { ...schedule } : undefined;
   }
 
+  configuration(feedId: string): ChannelFeedRuntimeConfiguration | undefined {
+    const configuration = this.configurationById.get(feedId);
+    return configuration ? { ...configuration } : undefined;
+  }
+
   async publishSuccess(
     feedId: string,
     draft: ChannelFeedCardDraftFor<TCard>,
@@ -107,6 +118,10 @@ class TestStore<TCard extends SchedulableChannelFeedCard> implements ChannelFeed
       nextPollAt: timing.nextPollAt,
       failures: 0,
     });
+    const configuration = this.configurationById.get(feedId);
+    if (configuration?.enabled && configuration.freshPollRequired) {
+      this.configurationById.set(feedId, { ...configuration, freshPollRequired: false });
+    }
     return structuredClone(card);
   }
 
@@ -137,6 +152,10 @@ class TestStore<TCard extends SchedulableChannelFeedCard> implements ChannelFeed
       failures: (priorSchedule?.failures ?? 0) + 1,
     };
     this.scheduleById.set(feedId, schedule);
+    const configuration = this.configurationById.get(feedId);
+    if (unavailableDraft && configuration?.enabled && configuration.freshPollRequired) {
+      this.configurationById.set(feedId, { ...configuration, freshPollRequired: false });
+    }
     return {
       ...(card ? { card: structuredClone(card) } : {}),
       cardChanged,
@@ -157,6 +176,10 @@ class TestStore<TCard extends SchedulableChannelFeedCard> implements ChannelFeed
       failures: 0,
     };
     this.scheduleById.set(feedId, schedule);
+    const configuration = this.configurationById.get(feedId);
+    if (configuration?.enabled && configuration.freshPollRequired) {
+      this.configurationById.set(feedId, { ...configuration, freshPollRequired: false });
+    }
     return { ...schedule };
   }
 
@@ -169,8 +192,82 @@ class TestStore<TCard extends SchedulableChannelFeedCard> implements ChannelFeed
     return { ...schedule };
   }
 
+  async configure(
+    feedId: string,
+    configuration: ChannelFeedRuntimeConfiguration,
+    nextPollAt?: number,
+    interruptedAttemptAt?: number,
+  ): Promise<{ configuration: ChannelFeedRuntimeConfiguration; schedule?: ChannelFeedScheduleState }> {
+    this.configurationById.set(feedId, { ...configuration });
+    const previous = this.scheduleById.get(feedId);
+    const schedule = nextPollAt === undefined
+      ? previous
+      : previous
+        ? {
+            ...previous,
+            ...(interruptedAttemptAt !== undefined ? { lastAttemptAt: interruptedAttemptAt } : {}),
+            nextPollAt,
+          }
+        : {
+            feedId,
+            ...(interruptedAttemptAt !== undefined ? { lastAttemptAt: interruptedAttemptAt } : {}),
+            nextPollAt,
+            failures: 0,
+          };
+    if (schedule) this.scheduleById.set(feedId, schedule);
+    return {
+      configuration: { ...configuration },
+      ...(schedule ? { schedule: { ...schedule } } : {}),
+    };
+  }
+
   async flush(): Promise<void> {
     this.flushCalls += 1;
+  }
+}
+
+class QueuedPublishTestStore extends TestStore<TestCard> {
+  private queue: Promise<unknown> = Promise.resolve();
+  private releasePublish!: () => void;
+  readonly publishEntered: Promise<void>;
+  private readonly publishEnteredResolve: () => void;
+
+  constructor() {
+    super();
+    let entered!: () => void;
+    this.publishEntered = new Promise<void>((resolve) => { entered = resolve; });
+    this.publishEnteredResolve = entered;
+  }
+
+  release(): void {
+    this.releasePublish();
+  }
+
+  override publishSuccess(
+    feedId: string,
+    draft: ChannelFeedCardDraftFor<TestCard>,
+    timing: ChannelFeedPollTiming,
+  ): Promise<TestCard> {
+    const operation = this.queue.then(async () => {
+      this.publishEnteredResolve();
+      await new Promise<void>((resolve) => { this.releasePublish = resolve; });
+      return super.publishSuccess(feedId, draft, timing);
+    });
+    this.queue = operation.catch(() => undefined);
+    return operation;
+  }
+
+  override configure(
+    feedId: string,
+    configuration: ChannelFeedRuntimeConfiguration,
+    nextPollAt?: number,
+    interruptedAttemptAt?: number,
+  ): Promise<{ configuration: ChannelFeedRuntimeConfiguration; schedule?: ChannelFeedScheduleState }> {
+    const operation = this.queue.then(() =>
+      super.configure(feedId, configuration, nextPollAt, interruptedAttemptAt)
+    );
+    this.queue = operation.catch(() => undefined);
+    return operation;
   }
 }
 
@@ -203,6 +300,16 @@ const adapter = (input: {
 }): ChannelFeedAdapter<TestCard> => ({
   id: input.id,
   channelId: input.channelId,
+  metadata: {
+    kind: input.kind ?? "market",
+    label: input.kind === "football" ? "FixtureWire" : "MarketWire",
+    description: `Test integration for ${input.channelId}.`,
+    publisher: {
+      id: input.id,
+      name: input.kind === "football" ? "FixtureWire" : "MarketWire",
+      badge: "BOT",
+    },
+  },
   activeIntervalMs: input.activeIntervalMs ?? 5 * MINUTE_MS,
   idleIntervalMs: input.idleIntervalMs ?? 30 * MINUTE_MS,
   activityWindowMs: input.activityWindowMs ?? 15 * MINUTE_MS,
@@ -223,6 +330,7 @@ const coordinator = (
     retryBaseMs?: number;
     retryMaximumMs?: number;
     onCard?: (card: TestCard) => void;
+    onCardsChanged?: (cards: TestCard[]) => void;
     onError?: (id: string, error: unknown) => void;
   } = {},
 ) => ({
@@ -275,7 +383,7 @@ describe("ChannelFeedCoordinator", () => {
     await active.coordinator.close();
   });
 
-  it("accelerates an idle feed on arrival while respecting its minimum attempt gap", async () => {
+  it("accelerates an idle feed on arrival without bypassing its configured active cadence", async () => {
     const timers = new ManualTimers();
     const poll = vi.fn(async ({ now }: ChannelFeedPollContext<TestCard>) => ({
       kind: "updated" as const,
@@ -291,10 +399,72 @@ describe("ChannelFeedCoordinator", () => {
     await timers.runNext();
     timers.jumpTo(MINUTE_MS);
     runtime.coordinator.noteHumanActivity("stock-market", MINUTE_MS);
-    expect(timers.nextDueAt()).toBe(2 * MINUTE_MS);
-    await timers.advanceTo(2 * MINUTE_MS);
+    expect(timers.nextDueAt()).toBe(5 * MINUTE_MS);
+    await timers.advanceTo(5 * MINUTE_MS);
     expect(poll).toHaveBeenCalledTimes(2);
-    expect(runtime.store.scheduleById.get("market-wire")?.nextPollAt).toBe(7 * MINUTE_MS);
+    expect(runtime.store.scheduleById.get("market-wire")?.nextPollAt).toBe(10 * MINUTE_MS);
+    await runtime.coordinator.close();
+  });
+
+  it("does not let repeated human activity override an admin-selected active interval", async () => {
+    const timers = new ManualTimers();
+    const poll = vi.fn(async ({ now }: ChannelFeedPollContext<TestCard>) => ({
+      kind: "updated" as const,
+      card: card("market-wire", "stock-market", "market", now),
+    }));
+    const runtime = coordinator(timers, [adapter({
+      id: "market-wire",
+      channelId: "stock-market",
+      minAttemptGapMs: MINUTE_MS,
+      poll,
+    })]);
+    await runtime.coordinator.start();
+    await timers.runNext();
+    await runtime.coordinator.configure("market-wire", {
+      activeIntervalMinutes: 20,
+      idleIntervalMinutes: 60,
+    });
+    expect(timers.nextDueAt()).toBe(60 * MINUTE_MS);
+
+    for (const minute of [1, 5, 10, 15]) {
+      timers.jumpTo(minute * MINUTE_MS);
+      runtime.coordinator.noteHumanActivity("stock-market", timers.now);
+      expect(timers.nextDueAt()).toBe(20 * MINUTE_MS);
+    }
+    await timers.advanceTo(20 * MINUTE_MS);
+    expect(poll).toHaveBeenCalledTimes(2);
+    expect(runtime.store.scheduleById.get("market-wire")?.nextPollAt).toBe(40 * MINUTE_MS);
+    await runtime.coordinator.close();
+  });
+
+  it("does not let human activity shorten provider failure backoff", async () => {
+    const timers = new ManualTimers();
+    const poll = vi.fn(async () => {
+      throw new Error("provider down");
+    });
+    const runtime = coordinator(
+      timers,
+      [adapter({
+        id: "market-wire",
+        channelId: "stock-market",
+        activeIntervalMs: 5 * MINUTE_MS,
+        idleIntervalMs: 30 * MINUTE_MS,
+        minAttemptGapMs: MINUTE_MS,
+        poll,
+      })],
+      new TestStore<TestCard>(),
+      { retryBaseMs: 10 * MINUTE_MS, retryMaximumMs: 10 * MINUTE_MS, onError: vi.fn() },
+    );
+    await runtime.coordinator.start();
+    await timers.runNext();
+    expect(timers.nextDueAt()).toBe(10 * MINUTE_MS);
+
+    for (const minute of [1, 5, 9]) {
+      timers.jumpTo(minute * MINUTE_MS);
+      runtime.coordinator.noteHumanActivity("stock-market", timers.now);
+      expect(timers.nextDueAt()).toBe(10 * MINUTE_MS);
+    }
+    expect(poll).toHaveBeenCalledOnce();
     await runtime.coordinator.close();
   });
 
@@ -573,5 +743,234 @@ describe("ChannelFeedCoordinator", () => {
     await firstClose;
     await running;
     expect(await timers.runNext()).toBe(false);
+  });
+
+  it("persists controls per feed and exposes generic room-owned descriptors", async () => {
+    const timers = new ManualTimers();
+    const runtime = coordinator(timers, [
+      adapter({ id: "market-wire", channelId: "stock-market" }),
+      adapter({ id: "fixture-wire", channelId: "football-talk", kind: "football" }),
+    ]);
+    await runtime.coordinator.start();
+
+    expect(runtime.coordinator.controls()).toEqual([
+      expect.objectContaining({
+        id: "fixture-wire",
+        channelId: "football-talk",
+        kind: "football",
+        label: "FixtureWire",
+        publisher: { id: "fixture-wire", name: "FixtureWire", badge: "BOT" },
+        enabled: true,
+        activeIntervalMinutes: 5,
+        idleIntervalMinutes: 30,
+        status: "waiting",
+      }),
+      expect.objectContaining({
+        id: "market-wire",
+        channelId: "stock-market",
+        kind: "market",
+        minimumIntervalMinutes: 1,
+        maximumIntervalMinutes: 1_440,
+      }),
+    ]);
+
+    const configured = await runtime.coordinator.configure("market-wire", {
+      activeIntervalMinutes: 10,
+      idleIntervalMinutes: 60,
+    });
+    expect(configured).toMatchObject({
+      enabled: true,
+      activeIntervalMinutes: 10,
+      idleIntervalMinutes: 60,
+    });
+    expect(runtime.store.configurationById.get("market-wire")).toMatchObject({
+      activeIntervalMs: 10 * MINUTE_MS,
+      idleIntervalMs: 60 * MINUTE_MS,
+    });
+    await runtime.coordinator.close();
+  });
+
+  it("hides a disabled feed immediately and rejects a late result from its old generation", async () => {
+    const timers = new ManualTimers();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const poll = vi.fn(async ({ now }: ChannelFeedPollContext<TestCard>) => {
+      await blocked;
+      return { kind: "updated" as const, card: card("market-wire", "stock-market", "market", now) };
+    });
+    const fullSnapshots: TestCard[][] = [];
+    const runtime = coordinator(
+      timers,
+      [adapter({ id: "market-wire", channelId: "stock-market", poll })],
+      new TestStore<TestCard>(),
+      { onCardsChanged: (cards) => fullSnapshots.push(cards) },
+    );
+    await runtime.coordinator.start();
+    const running = timers.runNext();
+    await Promise.resolve();
+    expect(runtime.coordinator.controls()[0]?.status).toBe("polling");
+
+    const disabled = await runtime.coordinator.configure("market-wire", { enabled: false });
+    expect(disabled).toMatchObject({ enabled: false, status: "disabled", cardAvailable: false });
+    expect(runtime.coordinator.cards()).toEqual([]);
+    release();
+    await running;
+    expect(runtime.store.cardById.has("market-wire")).toBe(false);
+    expect(runtime.store.configurationById.get("market-wire")).toMatchObject({
+      enabled: false,
+      freshPollRequired: true,
+    });
+    expect(fullSnapshots.at(-1)).toEqual([]);
+    await runtime.coordinator.close();
+  });
+
+  it("keeps a re-enabled card hidden until a fresh unchanged poll validates it", async () => {
+    const timers = new ManualTimers();
+    let attempt = 0;
+    const poll = vi.fn(async ({ now }: ChannelFeedPollContext<TestCard>) => {
+      attempt += 1;
+      return attempt === 1
+        ? { kind: "updated" as const, card: card("market-wire", "stock-market", "market", now) }
+        : { kind: "unchanged" as const };
+    });
+    const store = new TestStore<TestCard>();
+    const runtime = coordinator(
+      timers,
+      [adapter({ id: "market-wire", channelId: "stock-market", poll })],
+      store,
+    );
+    await runtime.coordinator.start();
+    await timers.runNext();
+    expect(runtime.coordinator.cards()).toHaveLength(1);
+
+    await runtime.coordinator.configure("market-wire", { enabled: false });
+    expect(runtime.coordinator.cards()).toEqual([]);
+    await runtime.coordinator.configure("market-wire", { enabled: true });
+    expect(runtime.coordinator.controls()[0]).toMatchObject({ status: "waiting", cardAvailable: false });
+    expect(runtime.coordinator.cards()).toEqual([]);
+    expect(timers.nextDueAt()).toBe(MINUTE_MS);
+
+    await timers.advanceTo(MINUTE_MS);
+    expect(poll).toHaveBeenCalledTimes(2);
+    expect(runtime.coordinator.cards()).toHaveLength(1);
+    expect(runtime.coordinator.controls()[0]).toMatchObject({ status: "ready", cardAvailable: true });
+    expect(store.configurationById.get("market-wire")?.freshPollRequired).toBe(false);
+    await runtime.coordinator.close();
+  });
+
+  it("validates unknown feeds, bounds and idle-versus-active cadence without heuristics", async () => {
+    const timers = new ManualTimers();
+    const runtime = coordinator(timers, [adapter({ id: "market-wire", channelId: "stock-market" })]);
+    await runtime.coordinator.start();
+    await expect(runtime.coordinator.configure("missing-feed", { enabled: false }))
+      .rejects.toMatchObject<Partial<ChannelFeedConfigurationError>>({ code: "unknown_feed" });
+    await expect(runtime.coordinator.configure("market-wire", { activeIntervalMinutes: 0 }))
+      .rejects.toMatchObject<Partial<ChannelFeedConfigurationError>>({ code: "invalid_configuration" });
+    await expect(runtime.coordinator.configure("market-wire", {
+      activeIntervalMinutes: 20,
+      idleIntervalMinutes: 10,
+    })).rejects.toMatchObject<Partial<ChannelFeedConfigurationError>>({ code: "invalid_configuration" });
+    await runtime.coordinator.close();
+  });
+
+  it("persists an interrupted attempt so activity and restart cannot bypass the provider gap", async () => {
+    const timers = new ManualTimers();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const store = new TestStore<TestCard>();
+    const first = coordinator(timers, [adapter({
+      id: "market-wire",
+      channelId: "stock-market",
+      minAttemptGapMs: 5 * MINUTE_MS,
+      poll: async ({ now }) => {
+        await blocked;
+        return { kind: "updated", card: card("market-wire", "stock-market", "market", now) };
+      },
+    })], store);
+    await first.coordinator.start();
+    const running = timers.runNext();
+    await Promise.resolve();
+    await first.coordinator.configure("market-wire", { enabled: false });
+    release();
+    await running;
+    expect(store.scheduleById.get("market-wire")).toMatchObject({
+      lastAttemptAt: 0,
+      nextPollAt: 5 * MINUTE_MS,
+    });
+    await first.coordinator.close();
+
+    timers.jumpTo(MINUTE_MS);
+    const second = coordinator(timers, [adapter({
+      id: "market-wire",
+      channelId: "stock-market",
+      minAttemptGapMs: 5 * MINUTE_MS,
+    })], store);
+    await second.coordinator.start();
+    expect(timers.nextDueAt()).toBeUndefined();
+    await second.coordinator.configure("market-wire", { enabled: true });
+    second.coordinator.noteHumanActivity("stock-market", MINUTE_MS);
+    expect(timers.nextDueAt()).toBe(5 * MINUTE_MS);
+    await second.coordinator.close();
+  });
+
+  it("chooses changed cadence from current room activity, not the prior attempt time", async () => {
+    const timers = new ManualTimers();
+    const runtime = coordinator(timers, [adapter({
+      id: "market-wire",
+      channelId: "stock-market",
+      minAttemptGapMs: MINUTE_MS,
+    })]);
+    await runtime.coordinator.start();
+    await timers.runNext();
+    timers.jumpTo(MINUTE_MS);
+    runtime.coordinator.noteHumanActivity("stock-market", MINUTE_MS);
+    expect(timers.nextDueAt()).toBe(5 * MINUTE_MS);
+
+    await runtime.coordinator.configure("market-wire", {
+      activeIntervalMinutes: 10,
+      idleIntervalMinutes: 60,
+    });
+    expect(timers.nextDueAt()).toBe(10 * MINUTE_MS);
+    await runtime.coordinator.close();
+  });
+
+  it("adopts a card committed ahead of an interval-only configuration", async () => {
+    const timers = new ManualTimers();
+    const store = new QueuedPublishTestStore();
+    store.cardById.set("market-wire", {
+      ...card("market-wire", "stock-market", "market", 0, "old"),
+      revision: 1,
+    });
+    store.scheduleById.set("market-wire", {
+      feedId: "market-wire",
+      nextPollAt: 0,
+      failures: 0,
+    });
+    const snapshots: TestCard[][] = [];
+    const runtime = coordinator(timers, [adapter({
+      id: "market-wire",
+      channelId: "stock-market",
+      restorePersistedCard: (persisted) => persisted,
+      poll: async ({ now }) => ({
+        kind: "updated",
+        card: card("market-wire", "stock-market", "market", now, "new"),
+      }),
+    })], store, { onCardsChanged: (cards) => snapshots.push(cards) });
+    await runtime.coordinator.start();
+    const running = timers.runNext();
+    await store.publishEntered;
+    const configuring = runtime.coordinator.configure("market-wire", {
+      activeIntervalMinutes: 10,
+      idleIntervalMinutes: 60,
+    });
+    await Promise.resolve();
+    store.release();
+    await configuring;
+    await running;
+
+    expect(store.getCard("market-wire")).toMatchObject({ revision: 2, value: "new" });
+    expect(runtime.coordinator.cards()[0]).toMatchObject({ revision: 2, value: "new" });
+    expect(snapshots.at(-1)?.[0]).toMatchObject({ revision: 2, value: "new" });
+    await runtime.coordinator.close();
   });
 });

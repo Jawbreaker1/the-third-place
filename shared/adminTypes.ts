@@ -110,6 +110,47 @@ export interface AdminAutonomousResearchDiagnostics {
   };
 }
 
+export type AdminChannelFeedStatus = "disabled" | "waiting" | "polling" | "ready" | "unavailable";
+
+/**
+ * Read/write projection of one server-owned room integration. The server owns
+ * the adapter, room binding and safety limits; administrators only control its
+ * enabled state and cadence.
+ */
+export interface AdminChannelFeedControl {
+  id: string;
+  channelId: string;
+  kind: string;
+  label: string;
+  description: string;
+  publisher: {
+    id: string;
+    name: string;
+    badge: "BOT";
+  };
+  available: boolean;
+  enabled: boolean;
+  activeIntervalMinutes: number;
+  idleIntervalMinutes: number;
+  defaultEnabled: boolean;
+  defaultActiveIntervalMinutes: number;
+  defaultIdleIntervalMinutes: number;
+  minimumIntervalMinutes: number;
+  maximumIntervalMinutes: number;
+  status: AdminChannelFeedStatus;
+  cardAvailable: boolean;
+  failures: number;
+  lastAttemptAt?: number;
+  lastSuccessAt?: number;
+  nextPollAt?: number;
+}
+
+export interface AdminChannelFeedPatch {
+  enabled: boolean;
+  activeIntervalMinutes: number;
+  idleIntervalMinutes: number;
+}
+
 export interface AdminStateSnapshot {
   behavior: {
     global: AdminBehaviorTuning;
@@ -120,6 +161,8 @@ export interface AdminStateSnapshot {
     autonomousLinkChannelIds: string[];
     /** Ephemeral process diagnostics; absent when the director is unavailable. */
     autonomousResearch?: AdminAutonomousResearchDiagnostics;
+    /** Server-owned information bots, grouped in the UI by their bound room. */
+    channelFeeds: AdminChannelFeedControl[];
   };
   personas: AdminPersonaConfig[];
   channels: AdminChannelConfig[];

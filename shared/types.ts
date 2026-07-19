@@ -141,6 +141,11 @@ export interface ChannelFeedUpdatePayload {
   card: ChannelFeedCard;
 }
 
+/** Authoritative visible feed set; unlike an upsert it can remove a disabled integration. */
+export interface ChannelFeedSyncPayload {
+  cards: ChannelFeedCard[];
+}
+
 export interface ReplyPreview {
   authorId: string;
   authorName: string;

@@ -1,7 +1,12 @@
 import type {
   ChannelFeedPollTiming,
+  ChannelFeedRuntimeConfiguration,
   ChannelFeedScheduleState,
 } from "./channelFeedStore.js";
+import type {
+  AdminChannelFeedControl,
+  AdminChannelFeedStatus,
+} from "../shared/adminTypes.js";
 
 /**
  * A small, model-independent scheduler for typed channel feeds.
@@ -41,6 +46,14 @@ export interface ChannelFeedAdapter<TCard extends SchedulableChannelFeedCard> {
   minAttemptGapMs: number;
   /** A hung adapter is aborted without blocking every other feed indefinitely. */
   pollTimeoutMs?: number;
+  /** Server-owned presentation metadata used by the generic admin surface. */
+  metadata: {
+    kind: string;
+    label: string;
+    description: string;
+    publisher: ChannelFeedAdminPublisher;
+    defaultEnabled?: boolean;
+  };
   /**
    * Revalidate a structurally stored card against the current clock before it
    * can become public. Without this domain hook, persisted presentation data
@@ -63,6 +76,7 @@ export interface ChannelFeedStorePort<TCard extends SchedulableChannelFeedCard> 
   cards(): TCard[];
   getCard(feedId: string): TCard | undefined;
   schedule(feedId: string): ChannelFeedScheduleState | undefined;
+  configuration(feedId: string): ChannelFeedRuntimeConfiguration | undefined;
   publishSuccess(
     feedId: string,
     draft: ChannelFeedCardDraftFor<TCard>,
@@ -75,6 +89,12 @@ export interface ChannelFeedStorePort<TCard extends SchedulableChannelFeedCard> 
   ): Promise<{ card?: TCard; cardChanged: boolean; schedule: ChannelFeedScheduleState }>;
   publishUnchanged(feedId: string, timing: ChannelFeedPollTiming): Promise<ChannelFeedScheduleState>;
   reschedule(feedId: string, nextPollAt: number): Promise<ChannelFeedScheduleState>;
+  configure(
+    feedId: string,
+    configuration: ChannelFeedRuntimeConfiguration,
+    nextPollAt?: number,
+    interruptedAttemptAt?: number,
+  ): Promise<{ configuration: ChannelFeedRuntimeConfiguration; schedule?: ChannelFeedScheduleState }>;
   flush(): Promise<void>;
 }
 
@@ -96,7 +116,35 @@ export interface ChannelFeedCoordinatorOptions<TCard extends SchedulableChannelF
   retryBaseMs?: number;
   retryMaximumMs?: number;
   onCard?: (card: TCard) => void;
+  /** Full visible-card snapshot. Required for disable/remove transport events. */
+  onCardsChanged?: (cards: TCard[]) => void;
   onError?: (feedId: string, error: unknown) => void;
+}
+
+export type ChannelFeedAdminStatus = AdminChannelFeedStatus;
+export type ChannelFeedAdminPublisher = AdminChannelFeedControl["publisher"];
+export type ChannelFeedAdminControl = AdminChannelFeedControl;
+
+export interface ChannelFeedConfigureInput {
+  enabled?: boolean;
+  activeIntervalMinutes?: number;
+  idleIntervalMinutes?: number;
+}
+
+export type ChannelFeedConfigurationErrorCode =
+  | "unknown_feed"
+  | "invalid_configuration"
+  | "not_started"
+  | "closed";
+
+export class ChannelFeedConfigurationError extends Error {
+  constructor(
+    readonly code: ChannelFeedConfigurationErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ChannelFeedConfigurationError";
+  }
 }
 
 interface FeedRuntime<TCard extends SchedulableChannelFeedCard> {
@@ -108,6 +156,9 @@ interface FeedRuntime<TCard extends SchedulableChannelFeedCard> {
   card?: TCard;
   inFlight?: Promise<void>;
   abort?: AbortController;
+  configuration: ChannelFeedRuntimeConfiguration;
+  epoch: number;
+  configuring: boolean;
 }
 
 const MINUTE_MS = 60_000;
@@ -115,6 +166,7 @@ const DEFAULT_RETRY_BASE_MS = MINUTE_MS;
 const DEFAULT_RETRY_MAXIMUM_MS = 30 * MINUTE_MS;
 const MAX_INTERVAL_MS = 24 * 60 * MINUTE_MS;
 const MAX_CLOCK_SKEW_MS = 5 * MINUTE_MS;
+export const CHANNEL_FEED_MAX_INTERVAL_MINUTES = MAX_INTERVAL_MS / MINUTE_MS;
 
 const boundedMilliseconds = (
   value: number,
@@ -128,6 +180,10 @@ const boundedMilliseconds = (
 
 const validIdentifier = (value: string): boolean =>
   /^[a-z0-9][a-z0-9-]{1,63}$/u.test(value);
+
+const boundedDisplayText = (value: string, maximum: number): boolean =>
+  typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= maximum &&
+  !/[\u0000-\u001f\u007f]/u.test(value);
 
 const copyCard = <TCard extends SchedulableChannelFeedCard>(card: TCard): TCard =>
   structuredClone(card);
@@ -144,6 +200,7 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
   private readonly retryBaseMs: number;
   private readonly retryMaximumMs: number;
   private readonly onCard?: (card: TCard) => void;
+  private readonly onCardsChanged?: (cards: TCard[]) => void;
   private readonly onError?: (feedId: string, error: unknown) => void;
   private readonly feeds = new Map<string, FeedRuntime<TCard>>();
   private readonly lastHumanActivityAtByChannel = new Map<string, number>();
@@ -153,6 +210,7 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
   private startPromise?: Promise<void>;
   private closePromise?: Promise<void>;
   private schedulerPromise?: Promise<void>;
+  private configurationQueue: Promise<unknown> = Promise.resolve();
 
   constructor(options: ChannelFeedCoordinatorOptions<TCard>) {
     if (options.adapters.length === 0) {
@@ -174,6 +232,7 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
       "retryMaximumMs",
     );
     this.onCard = options.onCard;
+    this.onCardsChanged = options.onCardsChanged;
     this.onError = options.onError;
 
     for (const adapter of options.adapters) {
@@ -183,6 +242,9 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
         adapter,
         nextPollAt: 0,
         failures: 0,
+        configuration: this.defaultConfiguration(adapter),
+        epoch: 0,
+        configuring: false,
       });
     }
   }
@@ -200,8 +262,9 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
 
   /**
    * Marks trusted human activity in one exact room. Activity elsewhere never
-   * changes this room's cadence. A newly active room may poll immediately when
-   * the provider's minimum attempt gap has already elapsed.
+   * changes this room's cadence. A newly active room may move from its quiet
+   * schedule to the configured active schedule, but never beyond it or an
+   * existing provider retry backoff.
    */
   noteHumanActivity(channelId: string, at = this.now()): void {
     if (!Number.isFinite(at)) return;
@@ -215,11 +278,21 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     if (!this.started || this.closed) return;
 
     for (const runtime of this.feeds.values()) {
-      if (runtime.adapter.channelId !== channelId || runtime.inFlight) continue;
-      const earliestAllowed = runtime.lastAttemptAt === undefined
+      if (!runtime.configuration.enabled || runtime.configuring ||
+          runtime.adapter.channelId !== channelId || runtime.inFlight) continue;
+      // Activity may switch a room from its quiet cadence to its configured
+      // active cadence, but it is not a retry signal. Preserve an existing
+      // provider backoff and never let repeated focus/typing events turn the
+      // adapter's lower-level safety gap into the effective polling cadence.
+      if (runtime.failures > 0) continue;
+      const activeIntervalMs = Math.max(
+        runtime.configuration.activeIntervalMs,
+        runtime.adapter.minAttemptGapMs,
+      );
+      const activeDueAt = runtime.lastAttemptAt === undefined
         ? now
-        : runtime.lastAttemptAt + runtime.adapter.minAttemptGapMs;
-      const acceleratedAt = Math.max(now, earliestAllowed);
+        : runtime.lastAttemptAt + activeIntervalMs;
+      const acceleratedAt = Math.max(now, activeDueAt);
       if (acceleratedAt >= runtime.nextPollAt) continue;
       runtime.nextPollAt = acceleratedAt;
       void this.store.reschedule(runtime.adapter.id, acceleratedAt)
@@ -231,8 +304,34 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
   /** Latest successfully stored cards, in stable feed-id order. */
   cards(): TCard[] {
     return [...this.feeds.values()]
-      .flatMap((runtime) => runtime.card ? [copyCard(runtime.card)] : [])
+      .flatMap((runtime) => runtime.configuration.enabled &&
+          !runtime.configuration.freshPollRequired && runtime.card
+        ? [copyCard(runtime.card)]
+        : [])
       .sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  /** Stable server-owned integration catalog plus current durable controls. */
+  controls(): ChannelFeedAdminControl[] {
+    return [...this.feeds.values()]
+      .sort((left, right) =>
+        left.adapter.channelId.localeCompare(right.adapter.channelId) ||
+        left.adapter.id.localeCompare(right.adapter.id)
+      )
+      .map((runtime) => this.controlFor(runtime));
+  }
+
+  /**
+   * Applies a partial operator override without replacing the adapter. The
+   * call is serialized and persisted before its new settings become visible.
+   */
+  configure(
+    feedId: string,
+    input: ChannelFeedConfigureInput,
+  ): Promise<ChannelFeedAdminControl> {
+    const operation = this.configurationQueue.then(() => this.configureInternal(feedId, input));
+    this.configurationQueue = operation.catch(() => undefined);
+    return operation;
   }
 
   /** Stops timers, aborts current polls and waits for durable writes. */
@@ -249,6 +348,7 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     await Promise.allSettled([
       ...(this.startPromise ? [this.startPromise] : []),
       ...(this.schedulerPromise ? [this.schedulerPromise] : []),
+      this.configurationQueue,
       ...[...this.feeds.values()].flatMap((runtime) => runtime.inFlight ? [runtime.inFlight] : []),
     ]);
     await this.store.flush();
@@ -290,6 +390,252 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
         `${adapter.id}.pollTimeoutMs`,
       );
     }
+    const metadata = adapter.metadata;
+    if (!metadata ||
+        !/^[a-z][a-z0-9_]{1,63}$/u.test(metadata.kind) ||
+        !boundedDisplayText(metadata.label, 80) ||
+        !boundedDisplayText(metadata.description, 240) ||
+        !validIdentifier(metadata.publisher?.id ?? "") ||
+        !boundedDisplayText(metadata.publisher?.name ?? "", 80) ||
+        metadata.publisher?.badge !== "BOT" ||
+        (metadata.defaultEnabled !== undefined && typeof metadata.defaultEnabled !== "boolean")) {
+      throw new TypeError(`Invalid admin metadata for channel feed ${adapter.id}`);
+    }
+  }
+
+  private defaultConfiguration(
+    adapter: ChannelFeedAdapter<TCard>,
+  ): ChannelFeedRuntimeConfiguration {
+    const enabled = adapter.metadata.defaultEnabled ?? true;
+    return {
+      feedId: adapter.id,
+      enabled,
+      activeIntervalMs: adapter.activeIntervalMs,
+      idleIntervalMs: adapter.idleIntervalMs,
+      freshPollRequired: !enabled,
+    };
+  }
+
+  private normalizedPersistedConfiguration(
+    runtime: FeedRuntime<TCard>,
+    persisted: ChannelFeedRuntimeConfiguration | undefined,
+  ): ChannelFeedRuntimeConfiguration {
+    if (!persisted) return this.defaultConfiguration(runtime.adapter);
+    const minimum = this.minimumIntervalMs(runtime);
+    const activeIntervalMs = Math.max(minimum, Math.min(MAX_INTERVAL_MS, persisted.activeIntervalMs));
+    return {
+      feedId: runtime.adapter.id,
+      enabled: persisted.enabled,
+      activeIntervalMs,
+      idleIntervalMs: Math.max(activeIntervalMs, Math.min(MAX_INTERVAL_MS, persisted.idleIntervalMs)),
+      freshPollRequired: persisted.enabled ? persisted.freshPollRequired : true,
+    };
+  }
+
+  private minimumIntervalMs(runtime: FeedRuntime<TCard>): number {
+    return Math.max(MINUTE_MS, Math.ceil(runtime.adapter.minAttemptGapMs / MINUTE_MS) * MINUTE_MS);
+  }
+
+  private controlFor(runtime: FeedRuntime<TCard>): ChannelFeedAdminControl {
+    const cardAvailable = runtime.configuration.enabled &&
+      !runtime.configuration.freshPollRequired && Boolean(runtime.card);
+    const state = runtime.card && "state" in runtime.card
+      ? (runtime.card as TCard & { state?: unknown }).state
+      : undefined;
+    const status: ChannelFeedAdminStatus = !runtime.configuration.enabled
+      ? "disabled"
+      : runtime.inFlight
+        ? "polling"
+        : !cardAvailable
+          ? "waiting"
+          : state === "unavailable"
+            ? "unavailable"
+            : "ready";
+    const defaults = this.defaultConfiguration(runtime.adapter);
+    return {
+      id: runtime.adapter.id,
+      channelId: runtime.adapter.channelId,
+      kind: runtime.adapter.metadata.kind,
+      label: runtime.adapter.metadata.label,
+      description: runtime.adapter.metadata.description,
+      publisher: { ...runtime.adapter.metadata.publisher },
+      available: true,
+      enabled: runtime.configuration.enabled,
+      activeIntervalMinutes: runtime.configuration.activeIntervalMs / MINUTE_MS,
+      idleIntervalMinutes: runtime.configuration.idleIntervalMs / MINUTE_MS,
+      defaultEnabled: defaults.enabled,
+      defaultActiveIntervalMinutes: defaults.activeIntervalMs / MINUTE_MS,
+      defaultIdleIntervalMinutes: defaults.idleIntervalMs / MINUTE_MS,
+      minimumIntervalMinutes: this.minimumIntervalMs(runtime) / MINUTE_MS,
+      maximumIntervalMinutes: CHANNEL_FEED_MAX_INTERVAL_MINUTES,
+      status,
+      cardAvailable,
+      failures: runtime.failures,
+      ...(runtime.lastAttemptAt !== undefined ? { lastAttemptAt: runtime.lastAttemptAt } : {}),
+      ...(runtime.lastSuccessAt !== undefined ? { lastSuccessAt: runtime.lastSuccessAt } : {}),
+      ...(runtime.configuration.enabled && this.started
+        ? { nextPollAt: runtime.nextPollAt }
+        : {}),
+    };
+  }
+
+  private parseConfigurationInput(
+    runtime: FeedRuntime<TCard>,
+    input: ChannelFeedConfigureInput,
+  ): ChannelFeedRuntimeConfiguration {
+    if (!input || typeof input !== "object" || Array.isArray(input) ||
+        Object.keys(input).some((key) =>
+          !["enabled", "activeIntervalMinutes", "idleIntervalMinutes"].includes(key)
+        )) {
+      throw new ChannelFeedConfigurationError("invalid_configuration", "Invalid channel feed configuration payload.");
+    }
+    if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
+      throw new ChannelFeedConfigurationError("invalid_configuration", "enabled must be a boolean.");
+    }
+    const minimumMinutes = this.minimumIntervalMs(runtime) / MINUTE_MS;
+    const validateMinutes = (value: number | undefined, label: string): void => {
+      if (value !== undefined && (!Number.isSafeInteger(value) ||
+          value < minimumMinutes || value > CHANNEL_FEED_MAX_INTERVAL_MINUTES)) {
+        throw new ChannelFeedConfigurationError(
+          "invalid_configuration",
+          `${label} must be an integer from ${minimumMinutes} to ${CHANNEL_FEED_MAX_INTERVAL_MINUTES}.`,
+        );
+      }
+    };
+    validateMinutes(input.activeIntervalMinutes, "activeIntervalMinutes");
+    validateMinutes(input.idleIntervalMinutes, "idleIntervalMinutes");
+    const enabled = input.enabled ?? runtime.configuration.enabled;
+    const activeIntervalMs = (input.activeIntervalMinutes ??
+      runtime.configuration.activeIntervalMs / MINUTE_MS) * MINUTE_MS;
+    const idleIntervalMs = (input.idleIntervalMinutes ??
+      runtime.configuration.idleIntervalMs / MINUTE_MS) * MINUTE_MS;
+    if (idleIntervalMs < activeIntervalMs) {
+      throw new ChannelFeedConfigurationError(
+        "invalid_configuration",
+        "idleIntervalMinutes must be greater than or equal to activeIntervalMinutes.",
+      );
+    }
+    const newlyEnabled = enabled && !runtime.configuration.enabled;
+    return {
+      feedId: runtime.adapter.id,
+      enabled,
+      activeIntervalMs,
+      idleIntervalMs,
+      freshPollRequired: !enabled || newlyEnabled || runtime.configuration.freshPollRequired,
+    };
+  }
+
+  private async configureInternal(
+    feedId: string,
+    input: ChannelFeedConfigureInput,
+  ): Promise<ChannelFeedAdminControl> {
+    const runtime = this.feeds.get(feedId);
+    if (!runtime) {
+      throw new ChannelFeedConfigurationError("unknown_feed", `Unknown channel feed: ${feedId}`);
+    }
+    if (this.closed) {
+      throw new ChannelFeedConfigurationError("closed", "Channel feeds are shutting down.");
+    }
+    if (!this.started) {
+      throw new ChannelFeedConfigurationError("not_started", "Channel feeds have not started.");
+    }
+    const nextConfiguration = this.parseConfigurationInput(runtime, input);
+    if (
+      nextConfiguration.feedId === runtime.configuration.feedId
+      && nextConfiguration.enabled === runtime.configuration.enabled
+      && nextConfiguration.activeIntervalMs === runtime.configuration.activeIntervalMs
+      && nextConfiguration.idleIntervalMs === runtime.configuration.idleIntervalMs
+      && nextConfiguration.freshPollRequired === runtime.configuration.freshPollRequired
+    ) {
+      return this.controlFor(runtime);
+    }
+
+    const previousEpoch = runtime.epoch;
+    const previousNextPollAt = runtime.nextPollAt;
+    const interruptedAttemptAt = runtime.inFlight ? runtime.lastAttemptAt : undefined;
+    const runtimeCardRevisionBefore = runtime.card?.revision ?? 0;
+    const durableCardBefore = interruptedAttemptAt !== undefined
+      ? this.store.getCard(runtime.adapter.id)
+      : undefined;
+    runtime.configuring = true;
+    runtime.epoch += 1;
+    runtime.abort?.abort();
+    this.clearTimer();
+    const now = this.now();
+    const newlyEnabled = nextConfiguration.enabled && !runtime.configuration.enabled;
+    const cadenceChanged = nextConfiguration.activeIntervalMs !== runtime.configuration.activeIntervalMs ||
+      nextConfiguration.idleIntervalMs !== runtime.configuration.idleIntervalMs;
+    let nextPollAt: number | undefined;
+    if (nextConfiguration.enabled) {
+      if (newlyEnabled || nextConfiguration.freshPollRequired) {
+        nextPollAt = Math.max(
+          now,
+          runtime.lastAttemptAt === undefined
+            ? now
+            : runtime.lastAttemptAt + runtime.adapter.minAttemptGapMs,
+        );
+      } else if (cadenceChanged) {
+        nextPollAt = runtime.lastAttemptAt === undefined
+          ? now
+          : Math.max(
+              now,
+              runtime.lastAttemptAt + this.cadenceFor(runtime, now, nextConfiguration),
+            );
+      } else {
+        nextPollAt = runtime.nextPollAt;
+      }
+    } else if (interruptedAttemptAt !== undefined) {
+      nextPollAt = interruptedAttemptAt + runtime.adapter.minAttemptGapMs;
+    }
+
+    try {
+      const persisted = await this.store.configure(
+        runtime.adapter.id,
+        nextConfiguration,
+        nextPollAt,
+        interruptedAttemptAt,
+      );
+      runtime.configuration = { ...persisted.configuration };
+      if (persisted.schedule) {
+        runtime.nextPollAt = persisted.schedule.nextPollAt;
+        runtime.failures = Math.max(0, Math.min(32, persisted.schedule.failures));
+        runtime.lastAttemptAt = persisted.schedule.lastAttemptAt;
+        runtime.lastSuccessAt = persisted.schedule.lastSuccessAt;
+      }
+      if (interruptedAttemptAt !== undefined) {
+        const durableCardAfter = this.store.getCard(runtime.adapter.id);
+        const durableAdvancedDuringConfiguration = durableCardAfter &&
+          durableCardAfter.revision > (durableCardBefore?.revision ?? 0);
+        const runtimeWasBehindCommittedCard = durableCardBefore &&
+          durableCardBefore.revision > runtimeCardRevisionBefore;
+        if (durableCardAfter && (durableAdvancedDuringConfiguration || runtimeWasBehindCommittedCard)) {
+          this.assertAdapterCard(runtime, durableCardAfter);
+          runtime.card = copyCard(durableCardAfter);
+        }
+      }
+      runtime.configuring = false;
+      this.notifyCardsChanged(runtime.adapter.id);
+      this.scheduleNext();
+      return this.controlFor(runtime);
+    } catch (error) {
+      // The durable write is authoritative. A failed override gets a new
+      // generation so the aborted pre-change poll cannot publish afterwards.
+      runtime.epoch = Math.max(runtime.epoch + 1, previousEpoch + 2);
+      runtime.nextPollAt = interruptedAttemptAt === undefined
+        ? previousNextPollAt
+        : Math.max(previousNextPollAt, interruptedAttemptAt + runtime.adapter.minAttemptGapMs);
+      const durableCardAfter = interruptedAttemptAt === undefined
+        ? undefined
+        : this.store.getCard(runtime.adapter.id);
+      if (durableCardAfter && durableCardAfter.revision > runtimeCardRevisionBefore) {
+        this.assertAdapterCard(runtime, durableCardAfter);
+        runtime.card = copyCard(durableCardAfter);
+      }
+      runtime.configuring = false;
+      if (durableCardAfter) this.notifyCardsChanged(runtime.adapter.id);
+      this.scheduleNext();
+      throw error;
+    }
   }
 
   private async startInternal(): Promise<void> {
@@ -299,10 +645,14 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     for (const runtime of this.feeds.values()) {
       const persisted = this.store.schedule(runtime.adapter.id);
       const card = this.store.getCard(runtime.adapter.id);
+      runtime.configuration = this.normalizedPersistedConfiguration(
+        runtime,
+        this.store.configuration(runtime.adapter.id),
+      );
       runtime.nextPollAt = persisted
         ? Math.min(
             persisted.nextPollAt,
-            now + Math.max(runtime.adapter.idleIntervalMs, this.retryMaximumMs),
+            now + Math.max(runtime.configuration.idleIntervalMs, this.retryMaximumMs),
           )
         : now;
       runtime.failures = Math.max(0, Math.min(32, persisted?.failures ?? 0));
@@ -318,13 +668,15 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
         } catch (error) {
           this.reportError(runtime.adapter.id, error);
         }
-        // A persisted domain observation is never assumed current merely
-        // because its old schedule has not elapsed. Recheck it promptly while
-        // still respecting the provider's minimum gap across restarts.
-        const earliestAllowed = runtime.lastAttemptAt === undefined
-          ? now
-          : runtime.lastAttemptAt + runtime.adapter.minAttemptGapMs;
-        runtime.nextPollAt = Math.min(runtime.nextPollAt, Math.max(now, earliestAllowed));
+        if (runtime.configuration.enabled) {
+          // A persisted domain observation is never assumed current merely
+          // because its old schedule has not elapsed. Recheck it promptly while
+          // still respecting the provider's minimum gap across restarts.
+          const earliestAllowed = runtime.lastAttemptAt === undefined
+            ? now
+            : runtime.lastAttemptAt + runtime.adapter.minAttemptGapMs;
+          runtime.nextPollAt = Math.min(runtime.nextPollAt, Math.max(now, earliestAllowed));
+        }
       }
     }
     this.started = true;
@@ -347,7 +699,7 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     if (!this.started || this.closed || this.schedulerPromise) return;
     this.clearTimer();
     const next = [...this.feeds.values()]
-      .filter((runtime) => !runtime.inFlight)
+      .filter((runtime) => runtime.configuration.enabled && !runtime.configuring && !runtime.inFlight)
       .sort((left, right) =>
         left.nextPollAt - right.nextPollAt || left.adapter.id.localeCompare(right.adapter.id)
       )[0];
@@ -371,12 +723,15 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     while (this.started && !this.closed) {
       const now = this.now();
       const runtime = [...this.feeds.values()]
-        .filter((candidate) => !candidate.inFlight && candidate.nextPollAt <= now)
+        .filter((candidate) =>
+          candidate.configuration.enabled && !candidate.configuring &&
+          !candidate.inFlight && candidate.nextPollAt <= now
+        )
         .sort((left, right) =>
           left.nextPollAt - right.nextPollAt || left.adapter.id.localeCompare(right.adapter.id)
         )[0];
       if (!runtime) return;
-      const operation = this.pollOne(runtime);
+      const operation = this.pollOne(runtime, runtime.epoch);
       runtime.inFlight = operation;
       try {
         await operation;
@@ -386,7 +741,7 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     }
   }
 
-  private async pollOne(runtime: FeedRuntime<TCard>): Promise<void> {
+  private async pollOne(runtime: FeedRuntime<TCard>, epoch: number): Promise<void> {
     const attemptedAt = this.now();
     runtime.lastAttemptAt = attemptedAt;
     let failureAttempted = false;
@@ -417,11 +772,11 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
         }));
       }
       const result = await Promise.race(contenders);
-      if (this.closed) return;
+      if (!this.pollIsCurrent(runtime, epoch)) return;
       if (result.kind === "unavailable") {
         if (result.card) this.assertAdapterCard(runtime, result.card);
         failureAttempted = true;
-        await this.recordFailure(runtime, attemptedAt, result.card);
+        await this.recordFailure(runtime, epoch, attemptedAt, result.card);
         return;
       }
       const timing: ChannelFeedPollTiming = {
@@ -431,10 +786,17 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
       if (result.kind === "updated") {
         this.assertAdapterCard(runtime, result.card);
         const { revision: _storeOwnedRevision, ...draft } = copyCard(result.card);
-        runtime.card = await this.store.publishSuccess(runtime.adapter.id, draft, timing);
+        const published = await this.store.publishSuccess(runtime.adapter.id, draft, timing);
+        if (!this.pollIsCurrent(runtime, epoch)) return;
+        runtime.card = published;
+        runtime.configuration = { ...runtime.configuration, freshPollRequired: false };
         this.notifyCard(runtime.adapter.id, runtime.card);
       } else if (runtime.card) {
         await this.store.publishUnchanged(runtime.adapter.id, timing);
+        if (!this.pollIsCurrent(runtime, epoch)) return;
+        const wasHidden = runtime.configuration.freshPollRequired;
+        runtime.configuration = { ...runtime.configuration, freshPollRequired: false };
+        if (wasHidden) this.notifyCardsChanged(runtime.adapter.id);
       } else {
         throw new TypeError(`Adapter ${runtime.adapter.id} returned unchanged before its first card`);
       }
@@ -442,11 +804,11 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
       runtime.lastSuccessAt = attemptedAt;
       runtime.nextPollAt = timing.nextPollAt;
     } catch (error) {
-      if (!this.closed) {
+      if (this.pollIsCurrent(runtime, epoch)) {
         if (!failureAttempted) {
           failureAttempted = true;
           try {
-            await this.recordFailure(runtime, attemptedAt, undefined, this.now());
+            await this.recordFailure(runtime, epoch, attemptedAt, undefined, this.now());
           } catch (persistenceError) {
             this.reportError(runtime.adapter.id, persistenceError);
           }
@@ -466,17 +828,26 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     }
   }
 
-  private cadenceFor(runtime: FeedRuntime<TCard>, now: number): number {
+  private pollIsCurrent(runtime: FeedRuntime<TCard>, epoch: number): boolean {
+    return !this.closed && runtime.configuration.enabled && runtime.epoch === epoch;
+  }
+
+  private cadenceFor(
+    runtime: FeedRuntime<TCard>,
+    now: number,
+    configuration = runtime.configuration,
+  ): number {
     const lastActivityAt = this.lastHumanActivityAtByChannel.get(runtime.adapter.channelId);
     return lastActivityAt !== undefined &&
       lastActivityAt <= now &&
       now - lastActivityAt <= runtime.adapter.activityWindowMs
-      ? runtime.adapter.activeIntervalMs
-      : runtime.adapter.idleIntervalMs;
+      ? configuration.activeIntervalMs
+      : configuration.idleIntervalMs;
   }
 
   private async recordFailure(
     runtime: FeedRuntime<TCard>,
+    epoch: number,
     attemptedAt: number,
     unavailableCard?: TCard,
     detectedAt = this.now(),
@@ -497,18 +868,38 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
       ? (({ revision: _storeOwnedRevision, ...draft }) => draft)(copyCard(unavailableCard))
       : undefined;
     const failed = await this.store.publishFailure(runtime.adapter.id, timing, unavailableDraft);
+    if (!this.pollIsCurrent(runtime, epoch)) return;
+    const wasHidden = runtime.configuration.freshPollRequired;
     runtime.failures = Math.max(0, Math.min(32, failed.schedule.failures));
     runtime.lastAttemptAt = failed.schedule.lastAttemptAt;
     runtime.lastSuccessAt = failed.schedule.lastSuccessAt;
     runtime.nextPollAt = failed.schedule.nextPollAt;
-    if (failed.card) runtime.card = copyCard(failed.card);
-    if (failed.cardChanged && runtime.card) this.notifyCard(runtime.adapter.id, runtime.card);
+    if (failed.card && (!wasHidden || unavailableCard)) runtime.card = copyCard(failed.card);
+    if (unavailableCard) {
+      runtime.configuration = { ...runtime.configuration, freshPollRequired: false };
+    }
+    if (failed.cardChanged && runtime.card && (!wasHidden || unavailableCard)) {
+      this.notifyCard(runtime.adapter.id, runtime.card);
+    } else if (wasHidden && unavailableCard && runtime.card) {
+      this.notifyCardsChanged(runtime.adapter.id);
+    }
   }
 
   private notifyCard(feedId: string, card: TCard): void {
-    if (!this.onCard) return;
+    if (this.onCard) {
+      try {
+        this.onCard(copyCard(card));
+      } catch (error) {
+        this.reportError(feedId, error);
+      }
+    }
+    this.notifyCardsChanged(feedId);
+  }
+
+  private notifyCardsChanged(feedId: string): void {
+    if (!this.onCardsChanged) return;
     try {
-      this.onCard(copyCard(card));
+      this.onCardsChanged(this.cards());
     } catch (error) {
       this.reportError(feedId, error);
     }

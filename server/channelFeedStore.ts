@@ -21,6 +21,8 @@ const MAX_ROWS_PER_CARD = 8;
 const MAX_FAILURES = 1_000;
 const MAX_REVISION = Number.MAX_SAFE_INTEGER;
 const MAX_SCHEDULE_INSTANT = 8_640_000_000_000_000;
+const MIN_RUNTIME_INTERVAL_MS = 60_000;
+const MAX_RUNTIME_INTERVAL_MS = 24 * 60 * 60_000;
 const CATALOG_ID = /^[a-z0-9][a-z0-9-]{1,63}$/u;
 const MACHINE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$/u;
 const CURRENCY = /^[A-Z]{3}$/u;
@@ -46,10 +48,23 @@ export interface ChannelFeedPollTiming {
   nextPollAt: number;
 }
 
+export interface ChannelFeedRuntimeConfiguration {
+  feedId: string;
+  enabled: boolean;
+  activeIntervalMs: number;
+  idleIntervalMs: number;
+  /**
+   * Set when a disabled feed is enabled. A pre-disable card remains durable,
+   * but cannot become public again until a new provider poll has completed.
+   */
+  freshPollRequired: boolean;
+}
+
 export interface ChannelFeedPersistedState {
-  version: 1;
+  version: 2;
   cards: ChannelFeedCard[];
   schedules: ChannelFeedScheduleState[];
+  configurations: ChannelFeedRuntimeConfiguration[];
 }
 
 export interface ChannelFeedPersistence {
@@ -201,7 +216,15 @@ const SCHEDULE_KEYS = new Set([
   "nextPollAt",
   "failures",
 ]);
-const STATE_KEYS = new Set(["version", "cards", "schedules"]);
+const CONFIGURATION_KEYS = new Set([
+  "feedId",
+  "enabled",
+  "activeIntervalMs",
+  "idleIntervalMs",
+  "freshPollRequired",
+]);
+const STATE_V1_KEYS = new Set(["version", "cards", "schedules"]);
+const STATE_V2_KEYS = new Set(["version", "cards", "schedules", "configurations"]);
 
 const validAvatarImageUrl = (value: unknown): value is string =>
   typeof value === "string" &&
@@ -325,19 +348,39 @@ const isSchedule = (value: unknown): value is ChannelFeedScheduleState => {
   return value.lastAttemptAt === undefined || value.nextPollAt >= value.lastAttemptAt;
 };
 
+const isConfiguration = (value: unknown): value is ChannelFeedRuntimeConfiguration =>
+  isRecord(value) && hasOnlyKeys(value, CONFIGURATION_KEYS) &&
+  boundedText(value.feedId, 64, 2) && CATALOG_ID.test(value.feedId) &&
+  typeof value.enabled === "boolean" &&
+  safeInteger(value.activeIntervalMs, MIN_RUNTIME_INTERVAL_MS, MAX_RUNTIME_INTERVAL_MS) &&
+  safeInteger(value.idleIntervalMs, value.activeIntervalMs, MAX_RUNTIME_INTERVAL_MS) &&
+  typeof value.freshPollRequired === "boolean" &&
+  (value.enabled || value.freshPollRequired);
+
 const parseState = (value: unknown): ChannelFeedPersistedState => {
-  if (!isRecord(value) || !hasOnlyKeys(value, STATE_KEYS) || value.version !== 1 ||
+  if (!isRecord(value)) {
+    throw new TypeError("Invalid channel feed persistence payload.");
+  }
+  const versionOne = value.version === 1 && hasOnlyKeys(value, STATE_V1_KEYS);
+  const versionTwo = value.version === 2 && hasOnlyKeys(value, STATE_V2_KEYS);
+  if ((!versionOne && !versionTwo) ||
       !Array.isArray(value.cards) || value.cards.length > MAX_CARDS || !value.cards.every(isCard) ||
-      !Array.isArray(value.schedules) || value.schedules.length > MAX_CARDS || !value.schedules.every(isSchedule)) {
+      !Array.isArray(value.schedules) || value.schedules.length > MAX_CARDS || !value.schedules.every(isSchedule) ||
+      (versionTwo && (!Array.isArray(value.configurations) ||
+        value.configurations.length > MAX_CARDS || !value.configurations.every(isConfiguration)))) {
     throw new TypeError("Invalid channel feed persistence payload.");
   }
   const cards = value.cards as ChannelFeedCard[];
   const schedules = value.schedules as ChannelFeedScheduleState[];
+  const configurations = versionTwo
+    ? value.configurations as ChannelFeedRuntimeConfiguration[]
+    : [];
   if (new Set(cards.map((card) => card.id)).size !== cards.length ||
-      new Set(schedules.map((schedule) => schedule.feedId)).size !== schedules.length) {
+      new Set(schedules.map((schedule) => schedule.feedId)).size !== schedules.length ||
+      new Set(configurations.map((configuration) => configuration.feedId)).size !== configurations.length) {
     throw new TypeError("Channel feed persistence contains duplicate IDs.");
   }
-  return clone({ version: 1, cards, schedules });
+  return clone({ version: 2, cards, schedules, configurations });
 };
 
 const validateDraft = (draft: ChannelFeedCardDraft): ChannelFeedCardDraft => {
@@ -352,6 +395,15 @@ const validatePollTiming = (timing: ChannelFeedPollTiming): ChannelFeedPollTimin
     throw new TypeError("Invalid channel feed poll timing.");
   }
   return { ...timing };
+};
+
+const validateConfiguration = (
+  configuration: ChannelFeedRuntimeConfiguration,
+): ChannelFeedRuntimeConfiguration => {
+  if (!isConfiguration(configuration)) {
+    throw new TypeError("Invalid channel feed runtime configuration.");
+  }
+  return clone(configuration);
 };
 
 const stableJsonValue = (value: unknown): unknown => {
@@ -388,10 +440,14 @@ const assertNewerAttempt = (
 const stateFrom = (
   cards: ReadonlyMap<string, ChannelFeedCard>,
   schedules: ReadonlyMap<string, ChannelFeedScheduleState>,
+  configurations: ReadonlyMap<string, ChannelFeedRuntimeConfiguration>,
 ): ChannelFeedPersistedState => ({
-  version: 1,
+  version: 2,
   cards: [...cards.values()].map(clone).sort((left, right) => left.id.localeCompare(right.id)),
   schedules: [...schedules.values()].map(clone).sort((left, right) => left.feedId.localeCompare(right.feedId)),
+  configurations: [...configurations.values()]
+    .map(clone)
+    .sort((left, right) => left.feedId.localeCompare(right.feedId)),
 });
 
 /**
@@ -402,6 +458,7 @@ export class ChannelFeedStore {
   private readonly persistence: ChannelFeedPersistence;
   private cardById = new Map<string, ChannelFeedCard>();
   private scheduleByFeedId = new Map<string, ChannelFeedScheduleState>();
+  private configurationByFeedId = new Map<string, ChannelFeedRuntimeConfiguration>();
   private mutationQueue: Promise<unknown> = Promise.resolve();
 
   constructor(options: ChannelFeedStoreOptions = {}) {
@@ -416,14 +473,19 @@ export class ChannelFeedStore {
       if (raw === undefined) {
         this.cardById.clear();
         this.scheduleByFeedId.clear();
+        this.configurationByFeedId.clear();
         return;
       }
       const restored = parseState(raw);
       this.cardById = new Map(restored.cards.map((card) => [card.id, clone(card)]));
       this.scheduleByFeedId = new Map(restored.schedules.map((schedule) => [schedule.feedId, clone(schedule)]));
+      this.configurationByFeedId = new Map(
+        restored.configurations.map((configuration) => [configuration.feedId, clone(configuration)]),
+      );
     } catch (error) {
       this.cardById.clear();
       this.scheduleByFeedId.clear();
+      this.configurationByFeedId.clear();
       throw error instanceof ChannelFeedStateLoadError ? error : new ChannelFeedStateLoadError(error);
     }
   }
@@ -444,6 +506,17 @@ export class ChannelFeedStore {
 
   schedules(): ChannelFeedScheduleState[] {
     return [...this.scheduleByFeedId.values()].map(clone).sort((left, right) => left.feedId.localeCompare(right.feedId));
+  }
+
+  configuration(feedId: string): ChannelFeedRuntimeConfiguration | undefined {
+    const configuration = this.configurationByFeedId.get(feedId);
+    return configuration ? clone(configuration) : undefined;
+  }
+
+  configurations(): ChannelFeedRuntimeConfiguration[] {
+    return [...this.configurationByFeedId.values()]
+      .map(clone)
+      .sort((left, right) => left.feedId.localeCompare(right.feedId));
   }
 
   async publishSuccess(
@@ -477,11 +550,17 @@ export class ChannelFeedStore {
       };
       const cards = new Map(this.cardById);
       const schedules = new Map(this.scheduleByFeedId);
+      const configurations = new Map(this.configurationByFeedId);
       cards.set(feedId, clone(card));
       schedules.set(feedId, schedule);
-      await this.persistence.save(stateFrom(cards, schedules));
+      const configuration = configurations.get(feedId);
+      if (configuration?.enabled && configuration.freshPollRequired) {
+        configurations.set(feedId, { ...configuration, freshPollRequired: false });
+      }
+      await this.persistence.save(stateFrom(cards, schedules, configurations));
       this.cardById = cards;
       this.scheduleByFeedId = schedules;
+      this.configurationByFeedId = configurations;
       return clone(card);
     });
   }
@@ -553,11 +632,17 @@ export class ChannelFeedStore {
       }
       const cards = new Map(this.cardById);
       const schedules = new Map(this.scheduleByFeedId);
+      const configurations = new Map(this.configurationByFeedId);
       if (card) cards.set(feedId, clone(card));
       schedules.set(feedId, schedule);
-      await this.persistence.save(stateFrom(cards, schedules));
+      const configuration = configurations.get(feedId);
+      if (unavailableDraft && configuration?.enabled && configuration.freshPollRequired) {
+        configurations.set(feedId, { ...configuration, freshPollRequired: false });
+      }
+      await this.persistence.save(stateFrom(cards, schedules, configurations));
       this.cardById = cards;
       this.scheduleByFeedId = schedules;
+      this.configurationByFeedId = configurations;
       return { ...(card ? { card: clone(card) } : {}), cardChanged, schedule: clone(schedule) };
     });
   }
@@ -581,10 +666,85 @@ export class ChannelFeedStore {
         failures: 0,
       };
       const schedules = new Map(this.scheduleByFeedId);
+      const configurations = new Map(this.configurationByFeedId);
       schedules.set(feedId, schedule);
-      await this.persistence.save(stateFrom(this.cardById, schedules));
+      const configuration = configurations.get(feedId);
+      if (configuration?.enabled && configuration.freshPollRequired) {
+        configurations.set(feedId, { ...configuration, freshPollRequired: false });
+      }
+      await this.persistence.save(stateFrom(this.cardById, schedules, configurations));
       this.scheduleByFeedId = schedules;
+      this.configurationByFeedId = configurations;
       return clone(schedule);
+    });
+  }
+
+  /**
+   * Atomically persists operator configuration and, when supplied, an exact
+   * replacement due time. Unlike activity acceleration this path may move a
+   * poll later as well as earlier because the operator changed its cadence.
+   */
+  async configure(
+    feedId: string,
+    rawConfiguration: ChannelFeedRuntimeConfiguration,
+    nextPollAt?: number,
+    interruptedAttemptAt?: number,
+  ): Promise<{
+    configuration: ChannelFeedRuntimeConfiguration;
+    schedule?: ChannelFeedScheduleState;
+  }> {
+    return this.mutate(async () => {
+      const configuration = validateConfiguration(rawConfiguration);
+      if (feedId !== configuration.feedId || !CATALOG_ID.test(feedId)) {
+        throw new TypeError("A feed configuration must use its registered feed ID.");
+      }
+      if (nextPollAt !== undefined && !safeInstant(nextPollAt)) {
+        throw new TypeError("Invalid channel feed configuration due time.");
+      }
+      if (interruptedAttemptAt !== undefined && !safeInstant(interruptedAttemptAt)) {
+        throw new TypeError("Invalid interrupted channel feed attempt time.");
+      }
+      const previousSchedule = this.scheduleByFeedId.get(feedId);
+      const effectiveAttemptAt = interruptedAttemptAt === undefined
+        ? previousSchedule?.lastAttemptAt
+        : Math.max(previousSchedule?.lastAttemptAt ?? 0, interruptedAttemptAt);
+      if (nextPollAt !== undefined && effectiveAttemptAt !== undefined && nextPollAt < effectiveAttemptAt) {
+        throw new TypeError("A channel feed cannot be configured before its last attempt.");
+      }
+      if (!this.configurationByFeedId.has(feedId) && this.configurationByFeedId.size >= MAX_CARDS) {
+        throw new RangeError("Channel feed configuration retention is full.");
+      }
+      if (nextPollAt !== undefined && !previousSchedule && this.scheduleByFeedId.size >= MAX_CARDS) {
+        throw new RangeError("Channel feed schedule retention is full.");
+      }
+      const configurations = new Map(this.configurationByFeedId);
+      configurations.set(feedId, configuration);
+      const schedules = new Map(this.scheduleByFeedId);
+      const schedule = nextPollAt === undefined
+        ? previousSchedule
+        : previousSchedule
+          ? {
+              ...clone(previousSchedule),
+              ...(effectiveAttemptAt !== undefined ? { lastAttemptAt: effectiveAttemptAt } : {}),
+              nextPollAt,
+            }
+          : {
+              feedId,
+              ...(effectiveAttemptAt !== undefined ? { lastAttemptAt: effectiveAttemptAt } : {}),
+              nextPollAt,
+              failures: 0,
+            };
+      if (schedule && !isSchedule(schedule)) {
+        throw new TypeError("Invalid channel feed configuration schedule.");
+      }
+      if (schedule) schedules.set(feedId, schedule);
+      await this.persistence.save(stateFrom(this.cardById, schedules, configurations));
+      this.configurationByFeedId = configurations;
+      this.scheduleByFeedId = schedules;
+      return {
+        configuration: clone(configuration),
+        ...(schedule ? { schedule: clone(schedule) } : {}),
+      };
     });
   }
 
@@ -611,7 +771,7 @@ export class ChannelFeedStore {
       if (previous && schedule.nextPollAt === previous.nextPollAt) return clone(previous);
       const schedules = new Map(this.scheduleByFeedId);
       schedules.set(feedId, schedule);
-      await this.persistence.save(stateFrom(this.cardById, schedules));
+      await this.persistence.save(stateFrom(this.cardById, schedules, this.configurationByFeedId));
       this.scheduleByFeedId = schedules;
       return clone(schedule);
     });
@@ -619,14 +779,18 @@ export class ChannelFeedStore {
 
   async remove(feedId: string): Promise<boolean> {
     return this.mutate(async () => {
-      if (!this.cardById.has(feedId) && !this.scheduleByFeedId.has(feedId)) return false;
+      if (!this.cardById.has(feedId) && !this.scheduleByFeedId.has(feedId) &&
+          !this.configurationByFeedId.has(feedId)) return false;
       const cards = new Map(this.cardById);
       const schedules = new Map(this.scheduleByFeedId);
+      const configurations = new Map(this.configurationByFeedId);
       cards.delete(feedId);
       schedules.delete(feedId);
-      await this.persistence.save(stateFrom(cards, schedules));
+      configurations.delete(feedId);
+      await this.persistence.save(stateFrom(cards, schedules, configurations));
       this.cardById = cards;
       this.scheduleByFeedId = schedules;
+      this.configurationByFeedId = configurations;
       return true;
     });
   }

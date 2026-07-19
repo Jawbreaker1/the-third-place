@@ -24,6 +24,10 @@ export const channelFeedsFor = (
   channelId: string,
 ): ChannelFeedCard[] => cards.filter((card) => card.channelId === channelId);
 
+/** Authoritative full replacement used when a room integration is disabled. */
+export const syncChannelFeeds = (cards: readonly ChannelFeedCard[]): ChannelFeedCard[] =>
+  cards.map((card) => structuredClone(card));
+
 const compactNumber = new Intl.NumberFormat(undefined, {
   maximumFractionDigits: 2,
   minimumFractionDigits: 0,

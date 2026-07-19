@@ -519,6 +519,8 @@ export class AdminStateStore {
         autonomousLinkChannelIds: catalog.profiles
           .filter((profile) => (profile.autonomousResearchSeeds?.length ?? 0) > 0)
           .map((profile) => profile.public.id),
+        // Runtime feed controls are merged by the authenticated admin router.
+        channelFeeds: [],
       },
       personas: catalog.personaConfigs.map((persona) => structuredClone(persona)),
       channels: catalog.channelConfigs.map((channel) => structuredClone(channel)),
