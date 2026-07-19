@@ -424,11 +424,12 @@ const boundedTriggerImageAttachmentIds = (request: SceneRequest): string[] =>
 const boundedChannelFeedContext = (request: SceneRequest): SceneChannelFeedContext | null => {
   const feed = request.channelFeedContext;
   if (!feed || !feed.publisherName.trim() || !feed.content.trim()) return null;
-  if (!Number.isFinite(Date.parse(feed.updatedAt))) return null;
+  const updatedAt = Date.parse(feed.updatedAt);
+  if (!Number.isFinite(updatedAt)) return null;
   return {
     publisherName: feed.publisherName.trim().slice(0, 80),
     content: feed.content.trim().slice(0, 2_400),
-    updatedAt: feed.updatedAt,
+    updatedAt: new Date(updatedAt).toISOString(),
   };
 };
 
