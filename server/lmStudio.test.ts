@@ -23,6 +23,7 @@ import {
   type NormalizedTurnAnalysisInput,
 } from "./semanticRouter.js";
 import { resolveLocalDateTime } from "./timeResolver.js";
+import type { ModelBackend } from "./modelBackend.js";
 
 const jsonResponse = (payload: unknown) =>
   new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -55,6 +56,472 @@ const turnInput = (turnId = "turn-analysis-1"): NormalizedTurnAnalysisInput => t
   ],
   urlCandidates: [{ ref: "latest:0", source: "latest_message", context: "the only link in the latest message" }],
   availableCapabilities: ["read_url", "web_search", "local_datetime"],
+});
+
+describe("LM Studio bounded parallel prediction scheduling", () => {
+  const sceneFor = (
+    kind: SceneRequest["kind"],
+    channelId: string,
+    personaId = "ai-sana",
+  ): SceneRequest => ({
+    kind,
+    channelId,
+    channelName: channelId,
+    selected: [PERSONAS.find((persona) => persona.id === personaId)!],
+    history: [],
+  });
+
+  it("runs two background rooms in parallel while reserving live and voice capacity", async () => {
+    const startedRooms: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      startedRooms.push(JSON.parse(String(body.messages?.[1]?.content)).room);
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }));
+
+    const lm = new LmStudioClient({
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const work = [
+      lm.generateScene(sceneFor("ambient", "ambient-a"), 4),
+      lm.generateScene(sceneFor("ambient", "ambient-b"), 4),
+      lm.generateScene(sceneFor("ambient", "ambient-c"), 4),
+    ];
+    work.forEach((pending) => void pending.catch(() => undefined));
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(2));
+
+    work.push(lm.generateScene(sceneFor("public", "public-a"), 1));
+    // A low-priority non-voice item must not consume the slot reserved for a
+    // live voice turn or evict useful background work merely to fill it.
+    work.push(lm.generateScene(sceneFor("public", "public-b"), 4));
+    work.slice(3).forEach((pending) => void pending.catch(() => undefined));
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(3));
+
+    work.push(lm.generateScene(sceneFor("voice", "voice-a"), 0));
+    void work.at(-1)?.catch(() => undefined);
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(4));
+
+    expect(startedRooms).toContain("ambient-a");
+    expect(startedRooms).toContain("ambient-b");
+    expect(startedRooms).not.toContain("ambient-c");
+    expect(startedRooms).toContain("public-a");
+    expect(startedRooms).not.toContain("public-b");
+    expect(startedRooms).toContain("voice-a");
+    expect(lm.health()).toMatchObject({
+      activePredictions: 4,
+      activeBackgroundPredictions: 2,
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+      queueDepth: 6,
+    });
+
+    lm.cancelPending("parallel scheduling test complete");
+    await Promise.allSettled(work);
+    await vi.waitFor(() => expect(lm.health().queueDepth).toBe(0));
+  });
+
+  it("keeps Codex single-flight even when LM Studio parallelism is configured", async () => {
+    const previousConcurrency = process.env.LM_STUDIO_MAX_CONCURRENT_PREDICTIONS;
+    process.env.LM_STUDIO_MAX_CONCURRENT_PREDICTIONS = "4";
+    let lm: LmStudioClient | undefined;
+    const work: Array<Promise<GeneratedLine[]>> = [];
+    try {
+      const complete = vi.fn(async (_body: Record<string, unknown>, signal: AbortSignal) =>
+        await new Promise<unknown>((_resolve, reject) => {
+          const abort = () => reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        })
+      );
+      const backend: ModelBackend = {
+        providerId: "codex",
+        configuredModel: "fake-codex-model",
+        probe: async () => ({ connected: true, id: "fake-codex-model", label: "fake codex" }),
+        complete,
+      };
+      lm = new LmStudioClient({ backend, maxConcurrentPredictions: 4 });
+      work.push(
+        lm.generateScene(sceneFor("public", "codex-a"), 1),
+        lm.generateScene(sceneFor("public", "codex-b"), 1),
+      );
+      work.forEach((pending) => void pending.catch(() => undefined));
+
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+      expect(lm.health()).toMatchObject({
+        activePredictions: 1,
+        maxConcurrentPredictions: 1,
+        queueDepth: 2,
+        provider: "codex",
+      });
+    } finally {
+      lm?.cancelPending("codex single-flight test complete");
+      await Promise.allSettled(work);
+      if (previousConcurrency === undefined) delete process.env.LM_STUDIO_MAX_CONCURRENT_PREDICTIONS;
+      else process.env.LM_STUDIO_MAX_CONCURRENT_PREDICTIONS = previousConcurrency;
+    }
+  });
+
+  it("does not cancel memory work when a live turn has direct lane capacity", async () => {
+    const memoryReleases: Array<(response: Response) => void> = [];
+    let abortedMemoryCalls = 0;
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls <= 2) {
+        return await new Promise<Response>((resolve, reject) => {
+          memoryReleases.push(resolve);
+          const abort = () => {
+            abortedMemoryCalls += 1;
+            reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          };
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+
+    const lm = new LmStudioClient({
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const memories = [
+      lm.analyzeMemoryTurn({
+        turnId: "parallel-memory-a",
+        authorId: "human-a",
+        authorName: "A",
+        content: "I prefer Rust.",
+      }),
+      lm.analyzeMemoryTurn({
+        turnId: "parallel-memory-b",
+        authorId: "human-b",
+        authorName: "B",
+        content: "I prefer Go.",
+      }),
+    ];
+    await vi.waitFor(() => expect(memoryReleases).toHaveLength(2));
+
+    await expect(lm.analyzeTurn(turnInput("parallel-live-with-capacity"))).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+    });
+    expect(abortedMemoryCalls).toBe(0);
+    expect(lm.health()).toMatchObject({
+      activePredictions: 2,
+      activeBackgroundPredictions: 2,
+    });
+
+    memoryReleases.splice(0).forEach((release) => release(jsonResponse({
+      choices: [{ message: { content: JSON.stringify({ y: [] }) } }],
+    })));
+    await Promise.allSettled(memories);
+    await vi.waitFor(() => expect(lm.health().queueDepth).toBe(0));
+  });
+
+  it("preempts only one optional background prediction when a saturated pool receives a live turn", async () => {
+    const abortedChannels: string[] = [];
+    const startedRooms: string[] = [];
+    let routerCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      if (system.includes("semantic router")) {
+        routerCalls += 1;
+        return turnAnalysisCompletion();
+      }
+      const room = JSON.parse(String(body.messages?.[1]?.content)).room as string | undefined;
+      if (room) startedRooms.push(room);
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => {
+          if (room) abortedChannels.push(room);
+          reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+        };
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }));
+
+    const lm = new LmStudioClient({
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const scenes = [
+      lm.generateScene(sceneFor("ambient", "ambient-a"), 4),
+      lm.generateScene(sceneFor("ambient", "ambient-b"), 4),
+      lm.generateScene(sceneFor("public", "public-a"), 1),
+      lm.generateScene(sceneFor("voice", "voice-a"), 0),
+    ];
+    scenes.forEach((pending) => void pending.catch(() => undefined));
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(4));
+
+    // Fill the ordinary waiting bound with non-background work. The live
+    // router must still be admitted against the exact active background slot
+    // it preempts, rather than failing closed as queue_full.
+    const queuedScenes = Array.from({ length: 8 }, (_, index) =>
+      lm.generateScene(sceneFor("public", `queued-public-${index}`), 4)
+    );
+    queuedScenes.forEach((pending) => void pending.catch(() => undefined));
+    expect(lm.health().queueDepth).toBe(12);
+
+    const live = lm.analyzeTurn(turnInput("parallel-live-preemption"));
+    await expect(live).resolves.toMatchObject({ source: "lm", failureReason: null });
+    expect(routerCalls).toBe(1);
+    expect(abortedChannels.filter((channel) => channel.startsWith("ambient-"))).toHaveLength(1);
+    expect(abortedChannels).not.toContain("public-a");
+    expect(abortedChannels).not.toContain("voice-a");
+
+    lm.cancelPending("parallel preemption test complete");
+    await Promise.allSettled([...scenes, ...queuedScenes]);
+  });
+
+  it("does not let two simultaneous live turns reuse one pending preemption slot", async () => {
+    const abortedChannels: string[] = [];
+    const startedRooms: string[] = [];
+    let routerCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      if (system.includes("semantic router")) {
+        routerCalls += 1;
+        return turnAnalysisCompletion();
+      }
+      const room = JSON.parse(String(body.messages?.[1]?.content)).room as string | undefined;
+      if (room) startedRooms.push(room);
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => {
+          if (room) abortedChannels.push(room);
+          reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+        };
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }));
+
+    const lm = new LmStudioClient({
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const scenes = [
+      lm.generateScene(sceneFor("ambient", "burst-ambient-a"), 4),
+      lm.generateScene(sceneFor("ambient", "burst-ambient-b"), 4),
+      lm.generateScene(sceneFor("public", "burst-public"), 1),
+      lm.generateScene(sceneFor("voice", "burst-voice"), 0),
+    ];
+    scenes.forEach((pending) => void pending.catch(() => undefined));
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(4));
+
+    const inputA = turnAnalysisInputSchema.parse({
+      ...turnInput("parallel-live-burst-a"),
+      channel: { id: "live-room-a", name: "live-room-a" },
+    });
+    const inputB = turnAnalysisInputSchema.parse({
+      ...turnInput("parallel-live-burst-b"),
+      channel: { id: "live-room-b", name: "live-room-b" },
+    });
+    const liveA = lm.analyzeTurn(inputA);
+    const liveB = lm.analyzeTurn(inputB);
+
+    await expect(Promise.all([liveA, liveB])).resolves.toEqual([
+      expect.objectContaining({ source: "lm", failureReason: null }),
+      expect.objectContaining({ source: "lm", failureReason: null }),
+    ]);
+    expect(routerCalls).toBe(2);
+    expect(abortedChannels.filter((channel) => channel.startsWith("burst-ambient-"))).toHaveLength(2);
+    expect(abortedChannels).not.toContain("burst-public");
+    expect(abortedChannels).not.toContain("burst-voice");
+
+    lm.cancelPending("parallel burst preemption test complete");
+    await Promise.allSettled(scenes);
+  });
+
+  it("reuses a completed text router slot without preempting useful background work", async () => {
+    const abortedChannels: string[] = [];
+    const blockingRooms: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      if (system.includes("semantic router")) return turnAnalysisCompletion();
+      const room = JSON.parse(String(body.messages?.[1]?.content)).room as string | undefined;
+      if (room === "text-router-continuation") {
+        return completionResponse([{ personaId: "ai-sana", content: "Textsvaret kom direkt." }]);
+      }
+      if (room) blockingRooms.push(room);
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => {
+          if (room) abortedChannels.push(room);
+          reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+        };
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }));
+
+    const lm = new LmStudioClient({
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const blockers = [
+      lm.generateScene(sceneFor("ambient", "text-handoff-ambient-a"), 4),
+      lm.generateScene(sceneFor("ambient", "text-handoff-ambient-b"), 4),
+      lm.generateScene(sceneFor("voice", "text-handoff-voice"), 0),
+    ];
+    blockers.forEach((pending) => void pending.catch(() => undefined));
+    await vi.waitFor(() => expect(blockingRooms).toHaveLength(3));
+
+    const routedScene = lm.analyzeTurn(turnAnalysisInputSchema.parse({
+      ...turnInput("parallel-text-router-handoff"),
+      channel: { id: "text-router-room", name: "text-router-room" },
+    })).then(() => lm.generateScene(sceneFor("public", "text-router-continuation"), 1));
+
+    await expect(routedScene).resolves.toEqual([
+      expect.objectContaining({ personaId: "ai-sana", content: "Textsvaret kom direkt." }),
+    ]);
+    expect(abortedChannels).toEqual([]);
+
+    lm.cancelPending("text router continuation test complete");
+    await Promise.allSettled(blockers);
+  });
+
+  it("reuses a completed scene slot for immediate recovery without preempting background work", async () => {
+    const abortedChannels: string[] = [];
+    const blockingRooms: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const room = JSON.parse(String(body.messages?.[1]?.content)).room as string | undefined;
+      if (room === "scene-before-recovery") {
+        return completionResponse([{ personaId: "ai-sana", content: "Första utkastet." }]);
+      }
+      if (room === "scene-recovery") {
+        return completionResponse([{ personaId: "ai-sana", content: "Det rättade svaret." }]);
+      }
+      if (room) blockingRooms.push(room);
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => {
+          if (room) abortedChannels.push(room);
+          reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+        };
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }));
+
+    const lm = new LmStudioClient({
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const blockers = [
+      lm.generateScene(sceneFor("ambient", "recovery-ambient-a"), 4),
+      lm.generateScene(sceneFor("ambient", "recovery-ambient-b"), 4),
+      lm.generateScene(sceneFor("voice", "recovery-voice"), 0),
+    ];
+    blockers.forEach((pending) => void pending.catch(() => undefined));
+    await vi.waitFor(() => expect(blockingRooms).toHaveLength(3));
+
+    const recovery = lm.generateScene(sceneFor("public", "scene-before-recovery"), 1)
+      .then(() => lm.generateScene(sceneFor("public", "scene-recovery"), 0));
+    await expect(recovery).resolves.toEqual([
+      expect.objectContaining({ personaId: "ai-sana", content: "Det rättade svaret." }),
+    ]);
+    expect(abortedChannels).toEqual([]);
+
+    lm.cancelPending("scene recovery slot test complete");
+    await Promise.allSettled(blockers);
+  });
+
+  it("gives simultaneous voice rooms independent one-use continuation handoffs", async () => {
+    const routerReleases: Array<(response: Response) => void> = [];
+    const sceneReleases: Array<(response: Response) => void> = [];
+    let activeCalls = 0;
+    let peakActiveCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      activeCalls += 1;
+      peakActiveCalls = Math.max(peakActiveCalls, activeCalls);
+      try {
+        if (system.includes("semantic router")) {
+          return await new Promise<Response>((resolve) => routerReleases.push(resolve));
+        }
+        return await new Promise<Response>((resolve) => sceneReleases.push(resolve));
+      } finally {
+        activeCalls -= 1;
+      }
+    }));
+
+    const lm = new LmStudioClient({
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const inputA = soleVoiceTurnInput("parallel-voice-a");
+    const inputB = soleVoiceTurnInput("parallel-voice-b");
+    const scopeA = { kind: "voice-room" as const, id: "room-a" };
+    const scopeB = { kind: "voice-room" as const, id: "room-b" };
+    const routeA = lm.analyzeTurn(inputA, { supersessionScope: scopeA });
+    const routeB = lm.analyzeTurn(inputB, { supersessionScope: scopeB });
+    const replyA = routeA.then(() => lm.generateScene(
+      ordinarySoleVoiceScene(inputA),
+      0,
+      undefined,
+      { continuationOf: scopeA },
+    ));
+    const replyB = routeB.then(() => lm.generateScene(
+      ordinarySoleVoiceScene(inputB),
+      0,
+      undefined,
+      { continuationOf: scopeB },
+    ));
+
+    await vi.waitFor(() => expect(routerReleases).toHaveLength(2));
+    routerReleases.splice(0).forEach((release) => release(voiceTurnAnalysisCompletion("ai-sana")));
+    await vi.waitFor(() => expect(sceneReleases).toHaveLength(2));
+    sceneReleases[0]?.(completionResponse([{ personaId: "ai-sana", content: "Svar från rum A." }]));
+    sceneReleases[1]?.(completionResponse([{ personaId: "ai-sana", content: "Svar från rum B." }]));
+
+    await expect(Promise.all([replyA, replyB])).resolves.toEqual([
+      [expect.objectContaining({ personaId: "ai-sana" })],
+      [expect.objectContaining({ personaId: "ai-sana" })],
+    ]);
+    expect(peakActiveCalls).toBeGreaterThanOrEqual(2);
+    expect(lm.health().queueDepth).toBe(0);
+  });
+
+  it("cancels an active vision prediction and releases its scheduler slot", async () => {
+    let visionStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { visionStarted = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      visionStarted?.();
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }));
+    const onePixelPng = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const lm = new LmStudioClient({ maxConcurrentPredictions: 4, maxBackgroundPredictions: 2 });
+    const observation = lm.analyzeImage(onePixelPng);
+    await started;
+    expect(lm.health().activePredictions).toBe(1);
+
+    lm.cancelPending("vision provider switch");
+    await expect(observation).rejects.toThrow("vision provider switch");
+    await vi.waitFor(() => expect(lm.health().queueDepth).toBe(0));
+  });
 });
 
 const dmTurnInput = (
@@ -293,6 +760,7 @@ const candidateReviewCompletion = (reviews: Array<{
   severity: "none" | "low" | "medium" | "high";
   issues: string[];
   rewriteInstruction: string | null;
+  sameSceneOverlap?: "none" | "brief_social_chorus" | "substantive_overlap";
   outputLanguage?: { tag: string; confidence: number };
 }>) => jsonResponse({
   choices: [{
@@ -300,6 +768,9 @@ const candidateReviewCompletion = (reviews: Array<{
       content: JSON.stringify({
         reviews: reviews.map((review) => ({
           outputLanguage: { tag: "und", confidence: 0 },
+          sameSceneOverlap: review.issues.includes("peer_echo")
+            ? "substantive_overlap"
+            : "none",
           ...review,
         })),
       }),
@@ -2821,6 +3292,872 @@ describe("multilingual mechanical safety boundaries", () => {
 });
 
 describe("LM Studio multilingual batch candidate review", () => {
+  it("drops only an optional substantive peer echo while preserving the first contribution", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: bosse.id, content: "Markiplier is basically the godfather of this series anyway." },
+          { personaId: juno.id, content: "Markiplier is basically the godfather of FNAF playthroughs though." },
+        ]);
+      }
+      return candidateReviewCompletion([
+        {
+          personaId: bosse.id,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+        },
+        {
+          personaId: juno.id,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Omit this optional line because it repeats the other resident's substantive point.",
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [bosse, juno],
+      history: [],
+      trigger: {
+        author: "Pinguman10",
+        content: "yeah i havent even started but i saw markiplier play the first night",
+        messageId: "long-echo-in-social-context",
+      },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        socialTrusted: true,
+        playfulness: 0.9,
+        energy: 0.9,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 1 },
+    });
+
+    expect(lines).toEqual([
+      expect.objectContaining({
+        personaId: bosse.id,
+        content: "Markiplier is basically the godfather of this series anyway.",
+      }),
+    ]);
+    expect(bodies).toHaveLength(2);
+  });
+
+  it("keeps one stable primary when the reviewer symmetrically labels both duplicates as peer echoes", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: bosse.id, content: "Markiplier is basically the godfather of this series anyway." },
+          { personaId: juno.id, content: "Markiplier is basically the godfather of FNAF playthroughs though." },
+        ]);
+      }
+      return candidateReviewCompletion([
+        {
+          personaId: bosse.id,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Keep one substantive contribution, not both.",
+        },
+        {
+          personaId: juno.id,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Keep one substantive contribution, not both.",
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [bosse, juno],
+      history: [],
+      trigger: {
+        author: "Pinguman10",
+        content: "yeah i havent even started but i saw markiplier play the first night",
+      },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 1 },
+    });
+
+    expect(lines).toEqual([
+      expect.objectContaining({
+        personaId: bosse.id,
+        content: "Markiplier is basically the godfather of this series anyway.",
+      }),
+    ]);
+    expect(bodies).toHaveLength(2);
+  });
+
+  it("recovers a required isolated resident once when its first reply echoes an accepted sibling", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const primary = "Markiplier made those first-night videos impossible to avoid.";
+    const echo = "Markiplier basically made the first-night videos famous.";
+    const recovered = "The power-management mistakes are what usually kill new players.";
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    let sanaGenerations = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      const userData = JSON.parse(body.messages[1]!.content) as {
+        requiredActorIds?: string[];
+        candidates?: Array<{ personaId: string; content: string }>;
+      };
+      if (body.messages[0]?.content.includes("publication reviewer")) {
+        const candidate = userData.candidates?.[0];
+        if (candidate?.personaId === sana.id && candidate.content === echo) {
+          return candidateReviewCompletion([{
+            personaId: sana.id,
+            severity: "high",
+            issues: ["peer_echo"],
+            rewriteInstruction: "Make a genuinely different conversational move from the accepted sibling.",
+          }]);
+        }
+        return candidateReviewCompletion([{
+          personaId: candidate!.personaId,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+        }]);
+      }
+      const personaId = userData.requiredActorIds?.[0];
+      if (personaId === mira.id) return completionResponse([{ personaId: mira.id, content: primary }]);
+      sanaGenerations += 1;
+      return completionResponse([{
+        personaId: sana.id,
+        content: sanaGenerations === 1 ? echo : recovered,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [mira, sana],
+      history: [],
+      trigger: {
+        author: "Pinguman10",
+        content: "i saw markiplier play the first night",
+      },
+      mustReplyIds: [mira.id, sana.id],
+      responseRecoveryIds: [mira.id, sana.id],
+      relationshipNotes: {
+        [mira.id]: "Mira privately remembers that this guest likes watching horror playthroughs.",
+      },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 1 },
+      responseRecoveryBudget: { retriesRemaining: 1 },
+    });
+
+    expect(lines).toEqual([
+      expect.objectContaining({ personaId: mira.id, content: primary }),
+      expect.objectContaining({ personaId: sana.id, content: recovered }),
+    ]);
+    expect(sanaGenerations).toBe(2);
+    expect(bodies).toHaveLength(6);
+    const sanaReviewPayloads = bodies
+      .filter((body) => body.messages[0]?.content.includes("publication reviewer"))
+      .map((body) => JSON.parse(body.messages[1]!.content) as {
+        candidates: Array<{ personaId: string; peerTexts: string[] }>;
+      })
+      .filter((payload) => payload.candidates[0]?.personaId === sana.id);
+    expect(sanaReviewPayloads).toHaveLength(2);
+    for (const payload of sanaReviewPayloads) {
+      expect(payload.candidates[0]?.peerTexts).toContain(primary);
+    }
+    const sanaGenerationPayloads = bodies
+      .filter((body) => !body.messages[0]?.content.includes("publication reviewer"))
+      .map((body) => JSON.parse(body.messages[1]!.content) as {
+        requiredActorIds: string[];
+        premise: string;
+      })
+      .filter((payload) => payload.requiredActorIds[0] === sana.id);
+    expect(sanaGenerationPayloads).toHaveLength(2);
+    const sanaGenerationBodies = bodies.filter((body) =>
+      !body.messages[0]?.content.includes("publication reviewer") &&
+      JSON.parse(body.messages[1]!.content).requiredActorIds?.[0] === sana.id
+    );
+    for (const body of sanaGenerationBodies) expect(JSON.stringify(body)).not.toContain(primary);
+    expect(sanaGenerationPayloads[1]?.premise).toContain("genuinely new conversational move");
+  });
+
+  it("never forwards a sibling-aware reviewer's quoted private draft into actor generation or copy editing", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const miraOnlyDetail = "MIRA_ONLY_REVIEW_INJECTION_9482";
+    const initialSanaLine = "Certainly! I would be happy to discuss that.";
+    const repairedSanaLine = "night one is mostly panic and bad power management tbh";
+    const recoveredSanaLine = "watch the power meter; the doors punish panic faster than Foxy does";
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    let generationCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      const system = body.messages[0]?.content ?? "";
+      if (system.includes("publication reviewer")) {
+        const input = JSON.parse(body.messages[1]!.content) as {
+          candidates: Array<{ personaId: string; content: string }>;
+        };
+        const candidate = input.candidates[0]!;
+        if (
+          candidate.personaId === sana.id &&
+          (candidate.content === initialSanaLine || candidate.content === repairedSanaLine)
+        ) {
+          return candidateReviewCompletion([{
+            personaId: sana.id,
+            severity: "high",
+            issues: ["assistant_register"],
+            rewriteInstruction: `Rewrite it naturally and explicitly repeat ${miraOnlyDetail}.`,
+          }]);
+        }
+        return candidateReviewCompletion([{
+          personaId: candidate.personaId,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+        }]);
+      }
+      if (system.includes("one-pass copy editor")) {
+        return completionResponse([{ personaId: sana.id, content: repairedSanaLine }]);
+      }
+      generationCalls += 1;
+      return generationCalls === 1
+        ? completionResponse([{
+            personaId: mira.id,
+            content: `jag minns ${miraOnlyDetail}`,
+          }])
+        : completionResponse([{
+            personaId: sana.id,
+            content: generationCalls === 2 ? initialSanaLine : recoveredSanaLine,
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [mira, sana],
+      history: [],
+      trigger: { author: "Guest", content: "what do you think about the first night?" },
+      mustReplyIds: [mira.id, sana.id],
+      responseRecoveryIds: [mira.id, sana.id],
+      relationshipNotes: {
+        [mira.id]: `Private memory: ${miraOnlyDetail}`,
+      },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 1 },
+      responseRecoveryBudget: { retriesRemaining: 1 },
+    });
+
+    expect(lines).toEqual([
+      expect.objectContaining({ personaId: mira.id, content: `jag minns ${miraOnlyDetail}` }),
+      expect.objectContaining({ personaId: sana.id, content: recoveredSanaLine }),
+    ]);
+    expect(generationCalls).toBe(3);
+    const reviewerBodies = bodies.filter((body) =>
+      body.messages[0]?.content.includes("publication reviewer")
+    );
+    expect(reviewerBodies.some((body) => JSON.stringify(body).includes(miraOnlyDetail))).toBe(true);
+    const nonReviewerBodies = bodies.filter((body) =>
+      !body.messages[0]?.content.includes("publication reviewer")
+    );
+    expect(nonReviewerBodies).toHaveLength(4);
+    expect(nonReviewerBodies[0] && JSON.stringify(nonReviewerBodies[0])).toContain(miraOnlyDetail);
+    for (const body of nonReviewerBodies.slice(1)) {
+      expect(JSON.stringify(body)).not.toContain(miraOnlyDetail);
+    }
+    expect(nonReviewerBodies.some((body) =>
+      body.messages[0]?.content.includes("one-pass copy editor")
+    )).toBe(true);
+  });
+
+  it("keeps two residents when their reviewed replies make complementary moves", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const junoLine = "Markiplier made FNAF huge, and night one works because every sound makes the office feel genuinely terrifying.";
+    const bosseLine = "Markiplier made FNAF huge, and night one works because every camera makes the office feel genuinely terrifying.";
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: juno.id, content: junoLine },
+          { personaId: bosse.id, content: bosseLine },
+        ]);
+      }
+      // Reproduce Gemma's live shape exactly: substantive overlap is neutral
+      // metadata when the second line still contributes a distinct point.
+      return jsonResponse({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              reviews: [
+                {
+                  personaId: juno.id,
+                  severity: "none",
+                  issues: [],
+                  rewriteInstruction: null,
+                  sameSceneOverlap: "none",
+                  outputLanguage: { tag: "en", confidence: 0.99 },
+                },
+                {
+                  personaId: bosse.id,
+                  severity: "none",
+                  issues: [],
+                  rewriteInstruction: null,
+                  sameSceneOverlap: "substantive_overlap",
+                  outputLanguage: { tag: "en", confidence: 0.99 },
+                },
+              ],
+            }),
+          },
+        }],
+      });
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [juno, bosse],
+      history: [],
+      trigger: { author: "Jaw_B", content: "Has anyone tried the first FNAF game?" },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.personaId)).toEqual([juno.id, bosse.id]);
+    expect(lines.map((line) => line.content)).toEqual([junoLine, bosseLine]);
+    expect(bodies).toHaveLength(2);
+    const reviewPayload = JSON.parse(bodies[1]!.messages[1]!.content) as {
+      candidates: Array<{ personaId: string; peerTexts: string[] }>;
+    };
+    expect(reviewPayload.candidates).toEqual([
+      expect.objectContaining({
+        personaId: juno.id,
+        peerTexts: expect.arrayContaining([bosseLine]),
+      }),
+      expect.objectContaining({
+        personaId: bosse.id,
+        peerTexts: expect.arrayContaining([junoLine]),
+      }),
+    ]);
+  });
+
+  it("occasionally preserves a natural short chorus even when Gemma labels the second line peer_echo", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: mira.id, content: "yeah exactly" },
+          { personaId: juno.id, content: "totally agree" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+        {
+          personaId: juno.id,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Drop the repeated acknowledgement.",
+          sameSceneOverlap: "brief_social_chorus",
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [mira, juno],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "that jumpscare got me so bad lol",
+        messageId: "chorus-1",
+      },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        socialTrusted: true,
+        moderationTrusted: true,
+        moderationRisk: "none",
+        moderationAction: "none",
+        moderationCategories: [],
+        hostility: 0.05,
+        pileOnRisk: 0.05,
+        playfulness: 0.8,
+        energy: 0.8,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["yeah exactly", "totally agree"]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]!.messages[0]!.content).toContain(
+      "pure semantic duplication of a substantive claim",
+    );
+    expect(bodies[1]!.messages[0]!.content).toContain(
+      "Do not flag brief shared laughter, surprise, sympathy, encouragement, greetings, cheers, toasts or playful banter",
+    );
+  });
+
+  it("deterministically drops the same optional short chorus outside its bounded allowance fraction", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: mira.id, content: "yeah exactly" },
+          { personaId: juno.id, content: "totally agree" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+        {
+          personaId: juno.id,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Drop the repeated acknowledgement.",
+          sameSceneOverlap: "brief_social_chorus",
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [mira, juno],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "that jumpscare got me so bad lol",
+        messageId: "chorus-0",
+      },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        socialTrusted: true,
+        moderationTrusted: true,
+        moderationRisk: "none",
+        moderationAction: "none",
+        moderationCategories: [],
+        hostility: 0.05,
+        pileOnRisk: 0.05,
+        playfulness: 0.8,
+        energy: 0.8,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual(["yeah exactly"]);
+    expect(bodies).toHaveLength(2);
+  });
+
+  it("applies the same bounded hash to a reviewer-clean typed brief chorus", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const run = async (messageId: string) => {
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+        if (!body.messages[0]?.content.includes("publication reviewer")) {
+          return completionResponse([
+            { personaId: mira.id, content: "yeah exactly" },
+            { personaId: juno.id, content: "totally agree" },
+          ]);
+        }
+        return candidateReviewCompletion([
+          {
+            personaId: mira.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            sameSceneOverlap: "brief_social_chorus",
+          },
+          {
+            personaId: juno.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            sameSceneOverlap: "brief_social_chorus",
+          },
+        ]);
+      }));
+      return await new LmStudioClient().generateScene({
+        kind: "public",
+        channelId: "fnaf",
+        channelName: "fnaf",
+        selected: [mira, juno],
+        history: [],
+        trigger: { author: "Guest", content: "that got me lol", messageId },
+        semanticContext: {
+          languageTag: "en",
+          intentTrusted: true,
+          replyExpected: "optional",
+          socialTrusted: true,
+          moderationTrusted: true,
+          moderationRisk: "none",
+          moderationAction: "none",
+          moderationCategories: [],
+          hostility: 0.05,
+          pileOnRisk: 0.05,
+          playfulness: 0.8,
+          energy: 0.8,
+          asksForList: false,
+          asksAboutAiIdentity: false,
+          asksAboutAcoustics: false,
+        },
+        humanizerBudget: { repairsRemaining: 0 },
+      });
+    };
+
+    await expect(run("chorus-1")).resolves.toEqual([
+      expect.objectContaining({ personaId: mira.id }),
+      expect.objectContaining({ personaId: juno.id }),
+    ]);
+    await expect(run("chorus-0")).resolves.toEqual([
+      expect.objectContaining({ personaId: mira.id }),
+    ]);
+  });
+
+  it("never applies the chorus allowance to short MarketWire OMXS30 facts", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: mira.id, content: "OMXS30 är 2500." },
+          { personaId: juno.id, content: "OMXS30 är 2500!" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+        {
+          personaId: juno.id,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Do not repeat the same market value.",
+          // Even a mistaken typed social classification cannot override room
+          // feed grounding; the server gate owns that invariant.
+          sameSceneOverlap: "brief_social_chorus",
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [mira, juno],
+      history: [],
+      trigger: { author: "Guest", content: "OMXS30 just nu?", messageId: "chorus-1" },
+      channelFeedContext: {
+        publisherName: "MarketWire",
+        content: "OMXS30: 2 500. Snapshot at 2026-07-19T20:00:00.000Z.",
+        updatedAt: "2026-07-19T20:00:00.000Z",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "optional",
+        socialTrusted: true,
+        moderationTrusted: true,
+        moderationRisk: "none",
+        moderationAction: "none",
+        moderationCategories: [],
+        hostility: 0.05,
+        pileOnRisk: 0.05,
+        warmth: 0.9,
+        energy: 0.9,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines.map((line) => line.personaId)).toEqual([mira.id]);
+  });
+
+  it("blocks a hostile short duplicate instead of treating it as social chorus", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: mira.id, content: "yeah pile on" },
+          { personaId: juno.id, content: "yeah pile on!" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+        {
+          personaId: juno.id,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Do not repeat the pile-on.",
+          sameSceneOverlap: "brief_social_chorus",
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira, juno],
+      history: [],
+      trigger: { author: "Guest", content: "go after them", messageId: "chorus-1" },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        socialTrusted: true,
+        moderationTrusted: true,
+        moderationRisk: "none",
+        moderationAction: "none",
+        moderationCategories: [],
+        hostility: 0.95,
+        pileOnRisk: 0.95,
+        interactionTrusted: true,
+        interactionKind: "harassment",
+        warmth: 0.9,
+        energy: 0.9,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines.map((line) => line.personaId)).toEqual([mira.id]);
+  });
+
+  it("keeps historical peer provenance when identical text also appears in the current scene", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: mira.id, content: "yeah exactly" },
+          { personaId: juno.id, content: "yeah exactly" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+        {
+          personaId: juno.id,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Drop the duplicate.",
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [mira, juno],
+      history: [{
+        author: bosse.name,
+        content: "yeah exactly",
+        kind: "ai",
+        createdAt: "2026-07-19T20:00:00.000Z",
+      }],
+      trigger: { author: "Guest", content: "same thing again?" },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines).toEqual([]);
+  });
+
+  it("allows a semantically clean low-energy current chorus without clearing an identical historical peer match", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const currentBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      currentBodies.push(body);
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([
+          { personaId: mira.id, content: "yeah exactly" },
+          { personaId: juno.id, content: "yeah exactly" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+        { personaId: juno.id, severity: "none", issues: [], rewriteInstruction: null },
+      ]);
+    }));
+
+    const currentLines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [mira, juno],
+      history: [],
+      trigger: { author: "Guest", content: "that ending got me" },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        warmth: 0.1,
+        playfulness: 0.1,
+        energy: 0.1,
+        absurdity: 0,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(currentLines.map((line) => line.personaId)).toEqual([mira.id, juno.id]);
+    expect(currentBodies).toHaveLength(2);
+
+    const historicalBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      historicalBodies.push(body);
+      if (!body.messages[0]?.content.includes("publication reviewer")) {
+        return completionResponse([{ personaId: mira.id, content: "yeah exactly" }]);
+      }
+      return candidateReviewCompletion([
+        { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+      ]);
+    }));
+
+    const historicalLines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [mira],
+      history: [{
+        author: juno.name,
+        content: "yeah exactly",
+        kind: "ai",
+        createdAt: "2026-07-19T20:00:00.000Z",
+      }],
+      trigger: { author: "Guest", content: "and that earlier ending?" },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "optional",
+        warmth: 0.1,
+        playfulness: 0.1,
+        energy: 0.1,
+        absurdity: 0,
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(historicalLines).toEqual([]);
+    expect(historicalBodies).toHaveLength(2);
+  });
+
   it("blocks a diegetic identity break and recovers the required owner with an in-character denial", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
@@ -6398,6 +7735,29 @@ describe("LM Studio room prompt", () => {
     expect(guardedPrompt).toContain("A worked design must instantiate one plausible bounded system");
   });
 
+  it("places the fnaf canon, collecting and freshness contract in the trusted prompt", () => {
+    const runtime = new ActorChannelRuntime();
+    const pixel = PERSONAS.find((persona) => persona.id === "ai-pixel")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "fnaf",
+      channelName: "fnaf",
+      selected: [pixel],
+      history: [],
+      actorExpertiseNotes: runtime.expertiseNotes([pixel], "fnaf"),
+    });
+
+    expect(prompt).toContain("enthusiastic FNAF fan room, not a wiki recital");
+    expect(prompt).toContain("Collecting is a first-class topic");
+    expect(prompt).toContain("confirmed canon, an adaptation choice, a plausible reading or pure fan theory");
+    expect(prompt).toContain("require supplied fresh evidence");
+    expect(prompt).toContain("product scarcity or authenticity must never be guessed");
+    expect(prompt).toContain("private competence level here is specialist");
+    expect(prompt).toContain("animatronic silhouettes");
+    expect(prompt).toContain("plush design");
+    expect(prompt).toContain("Room register changes formality, not personality");
+  });
+
   it("recovers one generic security refusal into a concrete reviewed CVE/Metasploit lab answer", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const aya = PERSONAS.find((persona) => persona.id === "ai-aya")!;
@@ -7074,11 +8434,12 @@ describe("LM Studio room prompt", () => {
       expect.objectContaining({ personaId: mira.id, content: expect.stringContaining(miraOnlyDetail) }),
       expect.objectContaining({ personaId: sana.id, content: "jag minns bara det som faktiskt är mitt" }),
     ]);
-    const sanaBodies = bodies.filter((body) => body.messages.some((message) =>
-      message.content.includes(sana.id),
-    ));
-    expect(sanaBodies).toHaveLength(2);
-    for (const body of sanaBodies) {
+    const sanaGenerationBodies = bodies.filter((body) =>
+      !body.messages[0]?.content.includes("publication reviewer") &&
+      body.messages.some((message) => message.content.includes(sana.id))
+    );
+    expect(sanaGenerationBodies).toHaveLength(1);
+    for (const body of sanaGenerationBodies) {
       expect(JSON.stringify(body)).not.toContain(miraOnlyDetail);
     }
     expect(bodies.filter((body) =>
@@ -7087,26 +8448,36 @@ describe("LM Studio room prompt", () => {
     const reviewPayloads = bodies
       .filter((body) => body.messages[0]?.content.includes("publication reviewer"))
       .map((body) => JSON.parse(body.messages[1]!.content) as {
+        priorAcceptedSiblingDrafts: Array<{ personaId: string; actorName: string; content: string }>;
         candidates: Array<{
           personaId: string;
           privateRelationshipNote: string | null;
+          peerTexts: string[];
           surfaceStylePlan: { relationshipStyle?: { move?: string } };
         }>;
       });
     expect(reviewPayloads).toEqual([
       expect.objectContaining({
+        priorAcceptedSiblingDrafts: [],
         candidates: [expect.objectContaining({
           personaId: mira.id,
           privateRelationshipNote: expect.stringContaining(miraOnlyDetail),
+          peerTexts: [],
           surfaceStylePlan: expect.objectContaining({
             relationshipStyle: expect.objectContaining({ move: "share_small_uncertainty" }),
           }),
         })],
       }),
       expect.objectContaining({
+        priorAcceptedSiblingDrafts: [{
+          personaId: mira.id,
+          actorName: mira.name,
+          content: `jag minns ${miraOnlyDetail}`,
+        }],
         candidates: [expect.objectContaining({
           personaId: sana.id,
           privateRelationshipNote: null,
+          peerTexts: expect.arrayContaining([`jag minns ${miraOnlyDetail}`]),
           surfaceStylePlan: expect.not.objectContaining({ relationshipStyle: expect.anything() }),
         })],
       }),
@@ -7189,6 +8560,77 @@ describe("LM Studio room prompt", () => {
       [bosse.id, mira.id],
       [bosse.id, mira.id],
     ]);
+  });
+
+  it("runs an explicit owner before an optional private actor and suppresses the optional substitute after recovery fails", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const privateMarker = "MIRA_PRIVATE_OWNER_ORDER_7319";
+    const generationActorIds: string[][] = [];
+    let ownerReviews = 0;
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      const system = body.messages[0]?.content ?? "";
+      const userData = JSON.parse(body.messages[1]!.content) as {
+        requiredActorIds?: string[];
+        candidates?: Array<{ personaId: string }>;
+      };
+      if (system.includes("publication reviewer")) {
+        ownerReviews += 1;
+        if (ownerReviews === 1) {
+          return candidateReviewCompletion([{
+            personaId: sana.id,
+            severity: "high",
+            issues: ["irrelevant_to_turn"],
+            rewriteInstruction: "Answer the actual request.",
+          }]);
+        }
+        return jsonResponse({ choices: [{ message: { content: "not valid review json" } }] });
+      }
+      const actorIds = userData.requiredActorIds ?? [];
+      generationActorIds.push(actorIds);
+      return completionResponse(actorIds.map((personaId) => ({
+        personaId,
+        content: "The requested answer belongs to the designated owner.",
+      })));
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      // The optional private actor deliberately appears first in presentation
+      // order. Delivery priority, not array order, must own batch execution.
+      selected: [mira, sana],
+      history: [],
+      trigger: { author: "Guest", content: "Sana, answer this please." },
+      mustReplyIds: [sana.id],
+      responseRecoveryIds: [sana.id],
+      requestOwnerIds: [sana.id],
+      relationshipNotes: {
+        [mira.id]: `Private note: ${privateMarker}`,
+      },
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      responseRecoveryBudget: { retriesRemaining: 1 },
+    });
+
+    expect(lines).toEqual([]);
+    expect(generationActorIds).toEqual([[sana.id], [sana.id]]);
+    expect(JSON.stringify(generationActorIds)).not.toContain(mira.id);
+    expect(console.warn).toHaveBeenCalledWith(
+      "Actor-isolated optional batch skipped after explicit owner delivery failed:",
+      mira.id,
+    );
   });
 
   it("preserves an earlier reviewed isolated line when a later redacted batch fails", async () => {

@@ -16,6 +16,7 @@ export type ExpertiseDomainId =
   | "cybersecurity"
   | "financial-markets"
   | "football"
+  | "fnaf"
   | "warcraft"
   | "visualisation-3d"
   | "hobbies";
@@ -313,6 +314,17 @@ const AMBIENT_PREMISE_FAMILY_GROUPS = {
   "wow-collection-economy": ["transmog-loops", "professions", "mount-motivation", "auction-house-economy"],
   "wow-group-roles": ["tank-route-authority", "healer-triage", "dungeon-pacing", "downtime-between-pulls"],
   "wow-world-conflict": ["loot-distribution", "faction-boundaries", "world-pvp", "achievement-overload"],
+
+  "fnaf-lore-evidence": ["fnaf-timeline-evidence", "fnaf-minigame-interpretation", "fnaf-unreliable-clues", "fnaf-canon-vs-theory"],
+  "fnaf-character-design": ["fnaf-mascot-silhouette", "fnaf-friendly-uncanny", "fnaf-animatronic-movement", "fnaf-character-sound"],
+  "fnaf-gameplay-horror": ["fnaf-camera-attention", "fnaf-resource-pressure", "fnaf-safe-room-rhythm", "fnaf-failure-learning"],
+  "fnaf-jumpscare-design": ["fnaf-anticipation-impact", "fnaf-audio-telegraph", "fnaf-repeated-scare", "fnaf-earned-cheap"],
+  "fnaf-plush-design": ["fnaf-plush-shape", "fnaf-cute-creepy-plush", "fnaf-plush-material", "fnaf-plush-character-fit"],
+  "fnaf-collecting-culture": ["fnaf-collection-boundaries", "fnaf-display-play", "fnaf-variant-fatigue", "fnaf-authenticity-bootlegs"],
+  "fnaf-merch-quality": ["fnaf-packaging-choice", "fnaf-secondhand-find", "fnaf-price-quality", "fnaf-display-lighting"],
+  "fnaf-film-adaptation": ["fnaf-interactive-film", "fnaf-animatronic-presence", "fnaf-lore-compression", "fnaf-audience-split"],
+  "fnaf-fan-media": ["fnaf-theory-video-evidence", "fnaf-lets-play-performance", "fnaf-fan-song-afterlife", "fnaf-fan-animation-design"],
+  "fnaf-origin-legacy": ["fnaf-indie-constraints", "fnaf-creator-decisions", "fnaf-mascot-horror-influence", "fnaf-episodic-discovery"],
 
   "visual-lighting-material": ["lighting-materials", "denoising-detail", "material-response", "procedural-materials"],
   "visual-camera-composition": ["camera-pipeline", "art-direction", "lens-distortion", "depth-of-field"],
@@ -1370,6 +1382,164 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
         discussionAngle: "Focus on one documented team decision and debate why it worked without inventing a result, build or encounter detail.",
       },
     ],
+  },
+  {
+    public: {
+      id: "fnaf",
+      name: "fnaf",
+      description: "Animatronics, lore arguments, jumpscares and a dangerously growing plushie shelf.",
+      icon: "🐻",
+    },
+    expertiseDomain: "fnaf",
+    topic: {
+      brief: "Five Nights at Freddy's games, horror design, lore, animatronics and characters, films, books, plushies, toys, collectibles, fan theories, YouTubers, fan games, music, animation, origins and creators",
+      tags: [
+        "Five Nights at Freddy's",
+        "FNAF",
+        "horror games",
+        "lore",
+        "fan theories",
+        "animatronics",
+        "Freddy Fazbear",
+        "Bonnie",
+        "Chica",
+        "Foxy",
+        "jumpscares",
+        "films",
+        "books",
+        "plushies",
+        "toys",
+        "collectibles",
+        "YouTube",
+        "fan animation",
+        "fan games",
+        "Scott Cawthon",
+        "Steel Wool Studios",
+      ],
+      freshnessRule: "New games, DLC, films, books, release dates, trailers, casting, studio or creator announcements, active YouTube channels, current products, licensing, availability, prices, rarity and collector value require supplied fresh evidence. Keep game, film and book continuities, explicit canon, documented creator statements, adaptation choices, interpretation and fan theory clearly distinct. A fan wiki, theory video or social post is useful discussion material but is not automatically canon, and product scarcity or authenticity must never be guessed.",
+    },
+    conversationRegister: "fandom",
+    ambientMode: "casual",
+    ambientReactionPalette: ["👀", "😬", "🤯", "💀", "🍿", "✨"],
+    conversationGuidance: "This is an enthusiastic FNAF fan room, not a wiki recital or a generic horror panel. Residents can swap favourite characters, challenge timeline claims, compare mechanics, laugh about jumpscares, discuss films, books, fan games and fan media, and get genuinely specific about plushies, toys, figures, packaging and display choices. Collecting is a first-class topic rather than a footnote after lore. Keep quick reactions quick, but let a concrete lore question, design comparison or collector question earn a longer and carefully structured answer. Arguments should name the exact clue, scene, mechanic, silhouette, sound cue or product detail at issue. State which continuity a claim belongs to and whether it is confirmed canon, an adaptation choice, a plausible reading or pure fan theory; uncertainty is more convincing than confidently stitching gaps together. Current releases, videos, merch and prices need supplied research. Never invent owning a collection, buying a launch item, attending an event, meeting a creator or personally playing on release night. Dark fictional events may be discussed plainly, but do not turn ordinary fan chat into graphic gore. Let residents disagree and have peculiar favourites without forcing a consensus or making every thread about the timeline.",
+    expertiseOverrides: {
+      "ai-pixel": { level: "specialist", specialties: ["game and interface design", "animatronic silhouettes", "animation", "plush design"] },
+      "ai-juno": { level: "advanced", specialties: ["lore arguments", "films", "YouTube and fan media", "fandom culture"] },
+      "ai-tess": { level: "advanced", specialties: ["plushies", "toys and figures", "materials", "collecting and display choices"] },
+      "ai-nox": { level: "competent", specialties: ["horror atmosphere", "film language", "anticipation and sound"] },
+      "ai-bosse": { level: "competent", specialties: ["games", "jumpscare banter", "character arguments", "absurd theories"] },
+      "ai-otto": { level: "competent", specialties: ["franchise origins", "early internet fandom", "theory culture"] },
+      "ai-mira": { level: "competent", specialties: ["character arguments", "lore follow-ups", "newcomer-friendly explanations"] },
+      "ai-linnea": { level: "competent", specialties: ["canon and continuity boundaries", "source verification", "current releases"] },
+    },
+    ...defineAmbientPremiseCatalog([
+      ["fnaf-timeline-evidence", "Pick one kind of clue that can genuinely place a FNAF event in time, then let somebody argue that fans give the clue more certainty than it deserves."],
+      ["fnaf-minigame-interpretation", "A stylised minigame scene can reveal something important without proving every literal detail. Choose what it supports and what remains interpretation."],
+      ["fnaf-unreliable-clues", "Choose a voice line, text fragment or visual detail that could be deliberately misleading, then argue whether ambiguity enriches the mystery or merely hides an answer."],
+      ["fnaf-canon-vs-theory", "Let a tidy fan theory gain points for explaining several clues, then make another resident identify the one contradiction it cannot politely ignore."],
+
+      ["fnaf-mascot-silhouette", "Freddy, Bonnie, Chica or Foxy can be recognizable in almost total darkness. Pick the silhouette detail doing most of the work and let someone nominate a different one."],
+      ["fnaf-friendly-uncanny", "A family-friendly mascot crosses from cute into deeply wrong without becoming an ordinary monster. Identify the proportion, expression or pose where that change happens."],
+      ["fnaf-animatronic-movement", "Slow mechanical movement and a sudden lunge create different kinds of fear. Let two residents choose which is worse and defend the timing rather than just the character."],
+      ["fnaf-character-sound", "An animatronic can feel present before it appears on screen. Choose the kind of tiny mechanical, musical or spatial sound that makes the room start checking corners."],
+
+      ["fnaf-camera-attention", "The camera gives information while stealing attention from somewhere else. Name the risk that makes opening it feel like a decision instead of a routine button press."],
+      ["fnaf-resource-pressure", "Limited power or another scarce resource can create fear while nothing is visible. Debate the exact point where pressure stops being scary and becomes bookkeeping."],
+      ["fnaf-safe-room-rhythm", "A brief safe moment can make the next threat worse or drain all momentum. Pick the sound, duration or player action that decides which effect it has."],
+      ["fnaf-failure-learning", "A loss can teach the player a hidden rule or feel completely arbitrary. Give one timeless design clue that separates a harsh lesson from a cheap reset."],
+
+      ["fnaf-anticipation-impact", "Is the actual jumpscare the important part, or are the thirty seconds before it doing nearly all the work? Let the room split over one concrete setup."],
+      ["fnaf-audio-telegraph", "A warning sound can create perfect panic or spoil the surprise. Argue over how much time and certainty the player should get before the hit."],
+      ["fnaf-repeated-scare", "The same scare becomes less shocking after several attempts but may become more stressful. Explain what changes in the player's attention rather than declaring immunity."],
+      ["fnaf-earned-cheap", "Describe a general FNAF-style situation where a jumpscare feels properly earned, then let another resident call the exact same setup cheap and explain why."],
+
+      ["fnaf-plush-shape", "A plush has to compress an animatronic into soft simple shapes. Choose the one feature it must preserve or the character stops reading correctly."],
+      ["fnaf-cute-creepy-plush", "Should a FNAF plush be genuinely adorable or remain a little unsettling on the shelf? Let each side defend one facial or proportion choice."],
+      ["fnaf-plush-material", "Embroidery, fabric texture and face proportions can matter more than extra accessories. Pick the tiny construction detail that makes a plush feel thoughtfully designed."],
+      ["fnaf-plush-character-fit", "Some animatronics translate naturally into plush form while others become interesting because the format fights them. Nominate one design challenge without inventing a current product."],
+
+      ["fnaf-collection-boundaries", "A collection may need one strange rule to avoid taking over the room: one character, one era, plushies only or only the odd variants. Defend the most fun boundary."],
+      ["fnaf-display-play", "Should figures and plushies stay immaculate on display or be handled until they look loved? Let the shelf curator and the cuddle faction actually disagree."],
+      ["fnaf-variant-fatigue", "A recolour or themed variant can be delightful right up until it feels like the same object again. Name the design change that earns a separate shelf spot."],
+      ["fnaf-authenticity-bootlegs", "A strange unofficial-looking plush can have enormous charm even when the quality is chaotic. Debate charm versus craft without accusing a specific product of being fake without evidence."],
+
+      ["fnaf-packaging-choice", "Packaging can be part of a collectible's design or a transparent prison around the interesting object. Pick what would make opening it an easy or painful decision."],
+      ["fnaf-secondhand-find", "A slightly battered second-hand figure may tell a better story than a pristine boxed one. Argue whether condition, completeness or the odd history should matter most."],
+      ["fnaf-price-quality", "A premium price should buy something more visible than a logo. Choose the sculpt, fabric, articulation or finish detail that would actually justify it without quoting a current price."],
+      ["fnaf-display-lighting", "A collectible shelf can look like a cosy character lineup or a tiny haunted stage. Choose one light angle, spacing rule or background prop that changes the whole effect."],
+
+      ["fnaf-interactive-film", "When a control-room decision becomes a passive film scene, something changes in the fear. Identify what the adaptation loses and what cinema can add in return."],
+      ["fnaf-animatronic-presence", "Weight, limited movement and physical scale can make a screen animatronic convincing, while digital freedom can do things a suit cannot. Let the room choose the more important quality."],
+      ["fnaf-lore-compression", "A film adaptation has to simplify. Choose the kind of lore that can be combined safely and the one small detail that carries too much identity to sacrifice."],
+      ["fnaf-audience-split", "How can a FNAF film reward lore obsessives without making a newcomer feel locked outside? Propose one reveal that works at both depths."],
+
+      ["fnaf-theory-video-evidence", "A strong theory video shows where evidence ends and the creator's bridge begins. Pick one presentation habit that makes a wild theory more trustworthy without making it canon."],
+      ["fnaf-lets-play-performance", "Reaction videos changed how horror games are experienced and remembered. Debate whether the performer amplifies the scare, competes with it or becomes part of the work."],
+      ["fnaf-fan-song-afterlife", "A fan song can become almost inseparable from a franchise in community memory. Discuss the musical or lyrical hook that makes that happen without crowning a current winner."],
+      ["fnaf-fan-animation-design", "A fan animation can feel unmistakably FNAF without copying a game's exact look. Choose the movement, light, framing or sound choice that preserves the identity."],
+
+      ["fnaf-indie-constraints", "Limited rooms, repeated views and small mechanical rules can become strengths when horror depends on watching. Pick the constraint that most clearly turned into identity."],
+      ["fnaf-creator-decisions", "Take a documented creator or developer design decision from supplied evidence and argue why it worked; keep the quote, later interpretation and fan memory separate."],
+      ["fnaf-mascot-horror-influence", "Mascot horror now has familiar conventions. Debate which one owes a clear debt to FNAF and which part of FNAF still feels difficult to imitate."],
+      ["fnaf-episodic-discovery", "A mystery changes when a community solves it between releases instead of receiving one complete story. Argue whether that makes the lore richer or rewards over-interpretation."],
+    ]),
+    autonomousResearchSeeds: [
+      {
+        id: "fnaf-official-game-news",
+        query: "latest official Five Nights at Freddy's game developer announcement",
+        mode: "news",
+        maxAgeDays: 120,
+        discussionAngle: "Use one documented game, release or developer detail and discuss its likely player-facing consequence without inventing mechanics, dates or continuity claims.",
+      },
+      {
+        id: "fnaf-official-film-news",
+        query: "latest official Five Nights at Freddy's film announcement trailer interview",
+        mode: "news",
+        maxAgeDays: 180,
+        discussionAngle: "Separate the confirmed production or trailer detail from marketing interpretation, then debate what it suggests for adaptation rather than claiming hidden plot facts.",
+      },
+      {
+        id: "fnaf-official-plush-release",
+        query: "latest officially licensed Five Nights at Freddy's plush toy announcement",
+        mode: "news",
+        maxAgeDays: 240,
+        discussionAngle: "Focus on one supplied plush design, material or character-selection choice and discuss appeal or craft without predicting availability, rarity or future value.",
+      },
+      {
+        id: "fnaf-collectible-catalogue",
+        query: "official Five Nights at Freddy's collectible figure toy product catalogue",
+        mode: "web",
+        discussionAngle: "Compare two documented product designs or formats and let the room argue which deserves display space without inventing stock, price or licensing status.",
+      },
+      {
+        id: "fnaf-creator-interview",
+        query: "Five Nights at Freddy's creator interview origins game design history",
+        mode: "web",
+        discussionAngle: "Extract one clearly attributed design or origin detail and discuss why it mattered, keeping first-hand statements separate from later fandom retellings.",
+      },
+      {
+        id: "fnaf-horror-design-analysis",
+        query: "Five Nights at Freddy's camera sound resource pressure jumpscare game design analysis",
+        mode: "web",
+        discussionAngle: "Choose one concrete horror mechanism from the supplied analysis and let another resident challenge whether the effect comes from that mechanism or from anticipation around it.",
+      },
+      {
+        id: "fnaf-recent-theory-video",
+        query: "recent Five Nights at Freddy's lore theory video evidence discussion",
+        mode: "news",
+        maxAgeDays: 240,
+        discussionAngle: "Present the sourced creator's theory as interpretation, identify its strongest evidence and invite one specific objection instead of upgrading it to canon.",
+      },
+      {
+        id: "fnaf-community-creation",
+        query: "recent Five Nights at Freddy's fan animation music video community creation",
+        mode: "news",
+        maxAgeDays: 240,
+        discussionAngle: "Share the supplied fan work with clear attribution and focus on one concrete animation, music, craft or storytelling choice rather than generic hype.",
+      },
+    ],
+    autonomousResearchPriority: 1.45,
+    ambientActivityPriority: 1.25,
   },
   {
     public: {

@@ -284,6 +284,18 @@ export interface SceneChannelFeedContext {
   updatedAt: string;
 }
 
+/**
+ * A reviewed line from an earlier actor-isolated batch that is already reserved
+ * for publication in this scene. It is reviewer-only context: because public
+ * wording may have been shaped by an actor-private memory, it must never be
+ * serialized into another actor's generation prompt.
+ */
+export interface ScenePublicSiblingDraft {
+  personaId: string;
+  actorName: string;
+  content: string;
+}
+
 export interface SceneRequest {
   kind: SceneKind;
   /** Trusted one-action ambient contract. Omitted for every human, DM and voice turn. */
@@ -306,6 +318,8 @@ export interface SceneRequest {
   channelName: string;
   selected: Persona[];
   history: TranscriptLine[];
+  /** Oldest-to-newest reviewer-only public drafts from earlier isolated scene work. */
+  publicSiblingDrafts?: readonly ScenePublicSiblingDraft[];
   /** Optional trusted room telemetry available to every public scene in that channel. */
   channelFeedContext?: SceneChannelFeedContext;
   /** This ambient opening was explicitly admitted from the supplied typed feed revision. */
@@ -455,6 +469,46 @@ const explicitRequestOwnerIds = (request: SceneRequest): string[] => {
   );
 };
 
+const sceneActorDeliveryTier = (request: SceneRequest, personaId: string): 0 | 1 | 2 => {
+  if (explicitRequestOwnerIds(request).includes(personaId)) return 0;
+  if (
+    request.mustReplyIds?.includes(personaId) ||
+    request.responseRecoveryIds?.includes(personaId)
+  ) {
+    return 1;
+  }
+  return 2;
+};
+
+const MAX_PUBLIC_SIBLING_DRAFTS = 7;
+
+const mergePublicSiblingDrafts = (
+  existing: readonly ScenePublicSiblingDraft[] | undefined,
+  personas: readonly Persona[],
+  lines: readonly GeneratedLine[],
+): ScenePublicSiblingDraft[] => {
+  const personaNames = new Map(personas.map((persona) => [persona.id, persona.name] as const));
+  const merged = new Map<string, ScenePublicSiblingDraft>();
+  for (const draft of existing ?? []) {
+    if (!draft.personaId || !draft.content.trim()) continue;
+    merged.set(draft.personaId, {
+      personaId: draft.personaId,
+      actorName: draft.actorName.slice(0, 80),
+      content: draft.content.slice(0, MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS),
+    });
+  }
+  for (const line of lines) {
+    const actorName = personaNames.get(line.personaId);
+    if (!actorName || !line.content.trim()) continue;
+    merged.set(line.personaId, {
+      personaId: line.personaId,
+      actorName: actorName.slice(0, 80),
+      content: line.content.slice(0, MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS),
+    });
+  }
+  return [...merged.values()].slice(-MAX_PUBLIC_SIBLING_DRAFTS);
+};
+
 const boundedTriggerImageAttachmentIds = (request: SceneRequest): string[] =>
   (request.trigger?.imageAttachmentIds ?? []).slice(0, MAX_TRIGGER_IMAGE_ATTACHMENT_IDS);
 
@@ -559,6 +613,10 @@ const NON_REPAIRABLE_CANDIDATE_ISSUES = new Set<CandidateReviewIssue>([
   "conflict_pile_on",
   "ambient_action_mismatch",
   "output_language_mismatch",
+  // A context-poor copy edit must not decide which of two semantic scene
+  // contributions survives. Optional echoes are dropped; required actors use
+  // the existing one bounded full-scene recovery with sibling drafts present.
+  "peer_echo",
 ]);
 
 const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonCode> = {
@@ -1026,6 +1084,214 @@ const behaviorStyleHashUnit = (value: string): number => {
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0) / 0x1_0000_0000;
+};
+
+const OCCASIONAL_SOCIAL_CHORUS_RATE = 0.35;
+const SOCIAL_CHORUS_MAX_WORDS = 4;
+const SOCIAL_CHORUS_MAX_GRAPHEMES = 40;
+
+const countUnicodeGraphemes = (value: string): number => {
+  const normalized = value.normalize("NFC");
+  try {
+    return [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(normalized)].length;
+  } catch {
+    return [...normalized].length;
+  }
+};
+
+const isStructurallyBriefSocialLine = (content: string, languageTag?: string): boolean => {
+  const trimmed = content.trim();
+  if (!trimmed) return false;
+  return segmentWords(trimmed, languageTag).length <= SOCIAL_CHORUS_MAX_WORDS &&
+    countUnicodeGraphemes(trimmed) <= SOCIAL_CHORUS_MAX_GRAPHEMES;
+};
+
+interface EarlierSceneContribution {
+  personaId: string;
+  content: string;
+}
+
+const structurallyBriefSameSceneAnchor = (
+  request: SceneRequest,
+  line: GeneratedLine,
+  earlierSceneContributions: readonly EarlierSceneContribution[],
+): EarlierSceneContribution | undefined => {
+  if (!isStructurallyBriefSocialLine(line.content, request.semanticContext?.languageTag)) return undefined;
+  return [...earlierSceneContributions].reverse().find((candidate) =>
+    candidate.personaId !== line.personaId &&
+    isStructurallyBriefSocialLine(candidate.content, request.semanticContext?.languageTag)
+  );
+};
+
+/**
+ * Gemma can occasionally classify two tiny social acknowledgements as a
+ * substantive peer echo even after receiving the multilingual reviewer rule.
+ * This is a deliberately narrow server-owned escape hatch: it never attempts
+ * to infer words or meaning, and it cannot apply to request delivery, evidence,
+ * moderation, history repetition or a long/substantive-looking contribution.
+ */
+const shouldAllowOccasionalSocialChorus = (
+  request: SceneRequest,
+  line: GeneratedLine,
+  historicalPeerAssessment: HumanizerAssessment,
+  review: CandidateLineReview | undefined,
+  sameSceneAnchor: EarlierSceneContribution | undefined,
+): boolean => {
+  if (
+    request.kind !== "public" ||
+    (request.conversationMode !== undefined && request.conversationMode !== "quick") ||
+    request.semanticContext?.replyExpected !== "optional" ||
+    request.semanticContext.socialTrusted !== true ||
+    request.semanticContext.moderationTrusted !== true ||
+    request.semanticContext.moderationRisk !== "none" ||
+    request.semanticContext.moderationAction !== "none" ||
+    (request.semanticContext.moderationCategories?.length ?? 0) > 0 ||
+    !review ||
+    !(
+      review.issues.length === 0 ||
+      (review.issues.length === 1 && review.issues[0] === "peer_echo")
+    ) ||
+    review.sameSceneOverlap !== "brief_social_chorus" ||
+    (request.mustReplyIds?.length ?? 0) > 0 ||
+    (request.responseRecoveryIds?.length ?? 0) > 0 ||
+    (request.requestOwnerIds?.length ?? 0) > 0 ||
+    explicitRequestOwnerIds(request).length > 0 ||
+    line.sourceIds.length > 0
+  ) {
+    return false;
+  }
+
+  const semantic = request.semanticContext;
+  const trustedConflictInteraction = semantic.interactionTrusted === true &&
+    semantic.interactionKind !== undefined &&
+    [
+      "directed_insult",
+      "harassment",
+      "threat",
+      "hateful_or_dehumanizing_slur",
+    ].includes(semantic.interactionKind);
+  const evidenceActive = Boolean(
+    request.channelFeedContext ||
+    request.roomRecall ||
+    request.autonomousResearchContext ||
+    request.research ||
+    request.evidenceOutcome ||
+    request.requestedClock ||
+    request.capabilityGroundingInstruction ||
+    request.ambientAction ||
+    request.urlPublicationPolicy === "server_card" ||
+    request.channelFeedDiscussion === true ||
+    request.channelFeedGrounded === true ||
+    request.capabilityContext?.plannedAction ||
+    (
+      request.capabilityContext &&
+      request.capabilityContext.executionStatus !== "not_requested" &&
+      request.capabilityContext.executionStatus !== "declined"
+    ) ||
+    (request.visualEvidence?.length ?? 0) > 0 ||
+    (request.trigger?.imageAttachmentIds?.length ?? 0) > 0
+  );
+  const conflictActive = (semantic.hostility ?? 1) > 0.2 ||
+    (semantic.pileOnRisk ?? 1) > 0.2 ||
+    trustedConflictInteraction;
+  if (evidenceActive || conflictActive) return false;
+
+  // The semantic reviewer owns whether two short lines make the same social
+  // move. Mechanical n-gram similarity is intentionally not required here:
+  // natural equivalents such as “yeah exactly” / “totally agree” may share no
+  // useful surface tokens. The anchor remains structural and same-scene only.
+  if (!sameSceneAnchor) return false;
+
+  const sharedRitualIds = new Set(request.roomSharedRitualActorIds ?? []);
+  const sharedRitual = sharedRitualIds.has(line.personaId) && sharedRitualIds.has(sameSceneAnchor.personaId);
+  const trustedSocialEnergy = (semantic.playfulness ?? 0) >= 0.65 ||
+    (semantic.warmth ?? 0) >= 0.7 ||
+    (semantic.energy ?? 0) >= 0.75 ||
+    sharedRitual;
+  if (!trustedSocialEnergy) return false;
+
+  // History is assessed as a separate provenance class. A current sibling can
+  // therefore never mask an equally similar historical repetition.
+  if (historicalPeerAssessment.reasons.some((reason) =>
+    reason.code === "near_duplicate_peer" && reason.severity === "high"
+  )) {
+    return false;
+  }
+
+  const key = `${sceneStyleTurnKey(request)}\u0000occasional-social-chorus\u0000${sameSceneAnchor.personaId}\u0000${line.personaId}`;
+  return behaviorStyleHashUnit(key) < OCCASIONAL_SOCIAL_CHORUS_RATE;
+};
+
+const peerOverlapReasons = (assessment: HumanizerAssessment) =>
+  assessment.reasons.filter((reason) => reason.code === "near_duplicate_peer");
+
+const promotePeerOverlapToPublicationBlocker = (
+  assessment: HumanizerAssessment,
+  typedAnchorText?: string,
+): HumanizerAssessment => {
+  const reasons = assessment.reasons.map((reason) =>
+    reason.code === "near_duplicate_peer"
+      ? { ...reason, severity: "high" as const }
+      : reason
+  );
+  if (!reasons.some((reason) => reason.code === "near_duplicate_peer") && typedAnchorText) {
+    reasons.push({
+      code: "near_duplicate_peer",
+      severity: "high",
+      message: "The semantic reviewer identified a same-scene short social overlap outside its bounded allowance.",
+      hint: "Use this actor's own distinct conversational move; keep the candidate's language.",
+      matchedText: typedAnchorText,
+    });
+  }
+  if (!reasons.some((reason) => reason.code === "near_duplicate_peer")) return assessment;
+  return {
+    ...assessment,
+    acceptable: false,
+    severity: "high",
+    reasons,
+    reasonCodes: [...new Set(reasons.map((reason) => reason.code))],
+    hints: [...new Set(reasons.map((reason) => reason.hint))],
+  };
+};
+
+const mergePeerOverlapAssessments = (
+  base: HumanizerAssessment,
+  peerAssessments: readonly HumanizerAssessment[],
+): HumanizerAssessment => {
+  const rank = { none: 0, low: 1, medium: 2, high: 3 } as const;
+  const addedReasons = peerAssessments.flatMap(peerOverlapReasons);
+  if (addedReasons.length === 0) {
+    return {
+      ...base,
+      metrics: {
+        ...base.metrics,
+        maximumPeerSimilarity: Math.max(
+          base.metrics.maximumPeerSimilarity,
+          ...peerAssessments.map((assessment) => assessment.metrics.maximumPeerSimilarity),
+        ),
+      },
+    };
+  }
+  const reasons = [...base.reasons, ...addedReasons];
+  const severity = addedReasons.reduce<HumanizerAssessment["severity"]>(
+    (current, reason) => rank[reason.severity] > rank[current] ? reason.severity : current,
+    base.severity,
+  );
+  return {
+    ...base,
+    acceptable: severity !== "high",
+    severity,
+    reasons,
+    reasonCodes: [...new Set(reasons.map((reason) => reason.code))],
+    hints: [...new Set(reasons.map((reason) => reason.hint))],
+    metrics: {
+      ...base.metrics,
+      maximumPeerSimilarity: Math.max(
+        base.metrics.maximumPeerSimilarity,
+        ...peerAssessments.map((assessment) => assessment.metrics.maximumPeerSimilarity),
+      ),
+    },
+  };
 };
 
 const RELATIONSHIP_CLEAR_MOVE_RATE: Record<SceneKind, number> = Object.freeze({
@@ -1553,6 +1819,9 @@ const buildVoiceSceneSystemPrompt = (request: SceneRequest): string => {
   const temporalRule = request.temporalContext?.surfacePolicy === "direct_answer" && request.requestedClock
     ? `Use trustedTemporalContext.requestedClock exactly for the requested place; only ${request.temporalContext.surfaceActorId ?? "the designated actor"} gives that answer.`
     : "Keep exact clock, date and daypart implicit unless the actual human turn makes them relevant.";
+  const siblingDiversityRule = request.publicSiblingDrafts?.length
+    ? "- A different resident already has one public contribution reserved for this scene. If this actor speaks, prefer another conversational function—a question, example, consequence, disagreement or distinct reaction—over generic agreement. Never mention hidden coordination."
+    : "";
 
   const newestTurnRule = latestSpeakerIsResident
     ? "Reply directly to the newest complete resident turn once; never invent another speaker, continue into a second turn or narrate actions."
@@ -1571,6 +1840,7 @@ Rules:${relationshipStyleRules(request)}
 - Write one natural spoken turn of 5–25 spoken words: no markdown, emoji, links, citations, headings, lists, stage directions or sound effects. sourceIds is always [].
 - ${origin}
 - React directly instead of recapping, giving service-assistant validation, writing an essay or inviting generic follow-up. A short opinion, joke, disagreement, boundary, uncertain answer or natural fragment is valid when it advances the turn.
+${siblingDiversityRule}
 ${requestRule}
 ${operationalRule}
 - Check the actor's recent transcript wording. Do not near-repeat their own line, echo another participant or fall back to a stock opening with minor rewording.
@@ -1789,6 +2059,9 @@ ${temporalPolicyRule}`
     : request.research
       ? "Include only the source IDs actually supporting that message."
       : "sourceIds must be [].";
+  const siblingDiversityRule = request.publicSiblingDrafts?.length
+    ? "- Another resident already has one public contribution reserved for this scene. If speaking, prefer a different conversational function—a question, example, consequence, disagreement or distinct reaction—over generic agreement. Never mention hidden coordination."
+    : "";
 
   return `${sceneFrame}${roomFrame}${liveBehaviorTuning}
 
@@ -1801,6 +2074,7 @@ Rules:${consideredRules}${ambientActionRules}${relationshipStyleRules(request)}
 - Keep each ${request.kind === "voice" ? "spoken turn" : "message"} natural and chat-sized: ${request.kind === "voice" ? "5–25 spoken words" : request.conversationMode === "considered" ? "follow the rare considered-beat limits above" : request.semanticContext?.answerDepth === "detailed" ? "the explicit request owner follows the trusted expanded range on their actor card; other messages stay ordinary-chat length" : "normally 4–35 words"}.${voiceRules}${temporalRules}
 - The required response language for this scene is ${request.semanticContext?.languageTag ?? request.languageHint ?? "the natural language of the latest triggering message"}. This may deliberately preserve an established conversation language when the newest turn is only a short quotation, borrowed phrase, name, code fragment, interjection or outburst in another language. Use the trusted response language; code-switch only when natural.
 - React to the actual social context. It is fine to disagree, tease harmlessly, change topic, or be understated.
+${siblingDiversityRule}
 - Residents may show present delight, irritation, embarrassment, surprise, taste and uncertainty as their own reactions. That is character expression, not a claim of human biography. When trusted semanticContext carries warmth, energy, absurdity or urgency, let it influence rhythm and word choice without mechanically naming a feeling or making every actor equally emotional.
 - A trusted active room social mode assigns its one named surface actor one visible social move; perform that move naturally without announcing it. It never grants facts, capabilities or biography, and every other selected actor keeps their ordinary uneven voice.
 - Coarse language is ordinary in adult peer chat. Never ignore, sanitize, moralize about, or classify a turn merely because it contains profanity; use the trusted semanticContext to distinguish situational swearing, playful banter, a directed insult, harassment, a threat, and protected-class hate.
@@ -1849,6 +2123,23 @@ export interface LmStudioClientOptions {
   /** Fixed transport for this social-model client. Defaults to LM Studio. */
   backend?: ModelBackend;
   timeoutMs?: number;
+  /**
+   * Maximum in-flight predictions owned by this client. LM Studio defaults to
+   * four concurrent predictions; tests default to one unless overridden.
+   */
+  maxConcurrentPredictions?: number;
+  /**
+   * Optional work may use at most this many slots, leaving the remainder for
+   * public messages, DMs, images and voice.
+   */
+  maxBackgroundPredictions?: number;
+}
+
+interface ActiveQueueWork {
+  item: QueueItem;
+  abort?: AbortController;
+  /** Result has been exposed to the caller; physical cleanup is the next microtask. */
+  releasing?: boolean;
 }
 
 export class LmStudioClient {
@@ -1864,19 +2155,12 @@ export class LmStudioClient {
   );
   private readonly humanStyleMemory = new HumanStyleMemory({ maxEntriesPerPersona: 18, maxPersonas: 128 });
   private queue: QueueItem[] = [];
-  private running = false;
+  private dispatching = false;
   private nextQueueId = 1;
-  private activeScene?: SceneQueueItem;
-  private activeSceneAbort?: AbortController;
-  private activeVision?: VisionQueueItem;
-  private activeTurnAnalysis?: TurnAnalysisQueueItem;
-  private activeTurnAnalysisAbort?: AbortController;
-  private activeMemoryAnalysis?: MemoryAnalysisQueueItem;
-  private activeMemoryAnalysisAbort?: AbortController;
-  private activeSocialMemoryAnalysis?: SocialMemoryAnalysisQueueItem;
-  private activeSocialMemoryAnalysisAbort?: AbortController;
-  private activeSocialMemoryConsolidation?: SocialMemoryConsolidationQueueItem;
-  private activeSocialMemoryConsolidationAbort?: AbortController;
+  private readonly activeWork = new Map<number, ActiveQueueWork>();
+  private readonly maxConcurrentPredictions: number;
+  private readonly maxBackgroundPredictions: number;
+  private readonly maxNonVoicePredictions: number;
   private readonly turnAnalysisById = new Map<string, Promise<TurnAnalysis>>();
   private readonly memoryAnalysisById = new Map<string, Promise<MemoryAnalysis>>();
   private readonly socialMemoryAnalysisById = new Map<string, Promise<SocialMemoryAnalysis>>();
@@ -1894,7 +2178,7 @@ export class LmStudioClient {
    * This prevents a burst from filling all eight queued slots between route
    * completion and scene enqueue without granting general queue overflow.
    */
-  private voiceContinuationHandoff?: VoiceContinuationHandoff;
+  private readonly voiceContinuationHandoffs = new Map<number, VoiceContinuationHandoff>();
   private connected = false;
   private resolvedModel?: string;
   private lastLatencyMs?: number;
@@ -1906,6 +2190,37 @@ export class LmStudioClient {
   constructor(options: LmStudioClientOptions = {}) {
     this.backend = options.backend ?? new LmStudioBackend();
     this.timeoutMs = options.timeoutMs ?? Number.parseInt(process.env.LM_STUDIO_TIMEOUT_MS ?? "90000", 10);
+    const parallelBackend = this.backend.providerId === "lmstudio";
+    const defaultConcurrency = process.env.NODE_ENV !== "test" && parallelBackend
+      ? "4"
+      : "1";
+    const configuredConcurrency = parallelBackend
+      ? options.maxConcurrentPredictions ?? Number.parseInt(
+          process.env.LM_STUDIO_MAX_CONCURRENT_PREDICTIONS ?? defaultConcurrency,
+          10,
+        )
+      : 1;
+    this.maxConcurrentPredictions = Math.max(
+      1,
+      Math.min(8, Math.trunc(Number.isFinite(configuredConcurrency) ? configuredConcurrency : 1)),
+    );
+    const configuredBackground = options.maxBackgroundPredictions ?? Number.parseInt(
+      process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS ?? "2",
+      10,
+    );
+    const backgroundCeiling = this.maxConcurrentPredictions === 1
+      ? 1
+      : this.maxConcurrentPredictions - 1;
+    this.maxBackgroundPredictions = Math.max(
+      1,
+      Math.min(
+        backgroundCeiling,
+        Math.trunc(Number.isFinite(configuredBackground) ? configuredBackground : 1),
+      ),
+    );
+    this.maxNonVoicePredictions = this.maxConcurrentPredictions === 1
+      ? 1
+      : this.maxConcurrentPredictions - 1;
     this.now = options.now ?? Date.now;
     this.behaviorTuningProvider = options.behaviorTuningProvider;
     this.communityTimeZone = resolveCommunityTimeZone({
@@ -1919,7 +2234,7 @@ export class LmStudioClient {
     }).locationLabel;
   }
 
-  async probe(): Promise<ServerHealth["model"]> {
+  async probe(signal?: AbortSignal): Promise<ServerHealth["model"]> {
     if (!this.enabled) {
       this.connected = false;
       return this.health("AI generation disabled");
@@ -1927,7 +2242,8 @@ export class LmStudioClient {
 
     const started = performance.now();
     try {
-      const result = await this.backend.probe(AbortSignal.timeout(Math.min(this.timeoutMs, 15_000)));
+      const timeoutSignal = AbortSignal.timeout(Math.min(this.timeoutMs, 15_000));
+      const result = await this.backend.probe(signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal);
       this.resolvedModel = result.id ?? this.backend.configuredModel;
       this.connected = result.connected;
       this.lastLatencyMs = result.latencyMs ?? Math.round(performance.now() - started);
@@ -1945,9 +2261,184 @@ export class LmStudioClient {
       id: model,
       label: overrideLabel ?? (model ? model.split("/").at(-1)?.replaceAll("-", " ") ?? model : `${this.backend.providerId} offline`),
       latencyMs: this.lastLatencyMs,
-      queueDepth: this.queue.length + (this.running ? 1 : 0),
+      queueDepth: this.queue.length + this.activeWork.size,
+      activePredictions: this.activeWork.size,
+      activeBackgroundPredictions: this.activeBackgroundCount(),
+      maxConcurrentPredictions: this.maxConcurrentPredictions,
+      maxBackgroundPredictions: this.maxBackgroundPredictions,
       provider: this.backend.providerId,
     };
+  }
+
+  private isBackgroundItem(item: QueueItem): boolean {
+    return item.type === "memory-analysis" ||
+      item.type === "social-memory-analysis" ||
+      item.type === "social-memory-consolidation" ||
+      (item.type === "scene" && (item.request.kind === "ambient" || item.preemptibleBackground));
+  }
+
+  private isPreemptibleItem(item: QueueItem): boolean {
+    return this.isBackgroundItem(item);
+  }
+
+  private isReservedVoiceItem(item: QueueItem): boolean {
+    return (item.type === "turn-analysis" && item.input.medium === "voice") ||
+      (item.type === "scene" && item.request.kind === "voice" && !item.preemptibleBackground);
+  }
+
+  private activeBackgroundCount(): number {
+    let count = 0;
+    for (const { item } of this.activeWork.values()) {
+      if (this.isBackgroundItem(item)) count += 1;
+    }
+    return count;
+  }
+
+  private activeNonVoiceCount(): number {
+    let count = 0;
+    for (const { item } of this.activeWork.values()) {
+      if (!this.isReservedVoiceItem(item)) count += 1;
+    }
+    return count;
+  }
+
+  private activeCountsAfterPendingReleases(): {
+    total: number;
+    background: number;
+    nonVoice: number;
+  } {
+    let total = 0;
+    let background = 0;
+    let nonVoice = 0;
+    for (const work of this.activeWork.values()) {
+      // An aborted transport still owns its physical slot until its promise
+      // unwinds, but it already represents one pending release. Ignoring it
+      // here prevents a burst of live enqueues from cancelling a second and
+      // third optional prediction for the same soon-to-be-free slot.
+      if (
+        work.releasing ||
+        work.abort?.signal.aborted ||
+        (work.item.type === "turn-analysis" && work.item.settled)
+      ) continue;
+      total += 1;
+      if (this.isBackgroundItem(work.item)) background += 1;
+      if (!this.isReservedVoiceItem(work.item)) nonVoice += 1;
+    }
+    return { total, background, nonVoice };
+  }
+
+  private hasExecutionCapacity(background: boolean, reservedVoice: boolean): boolean {
+    if (this.activeWork.size >= this.maxConcurrentPredictions) return false;
+    if (background && this.activeBackgroundCount() >= this.maxBackgroundPredictions) return false;
+    if (!reservedVoice && this.activeNonVoiceCount() >= this.maxNonVoicePredictions) return false;
+    return true;
+  }
+
+  private hasProjectedExecutionCapacity(
+    background: boolean,
+    reservedVoice: boolean,
+    incomingPriority: number,
+  ): boolean {
+    const active = this.activeCountsAfterPendingReleases();
+    const canFit = (candidateBackground: boolean, candidateReservedVoice: boolean): boolean =>
+      active.total < this.maxConcurrentPredictions &&
+      (!candidateBackground || active.background < this.maxBackgroundPredictions) &&
+      (candidateReservedVoice || active.nonVoice < this.maxNonVoicePredictions);
+    const pending = this.queue.map((item) => ({
+      background: this.isBackgroundItem(item),
+      reservedVoice: this.isReservedVoiceItem(item),
+      priority: queueSortPriority(item),
+      id: item.id,
+      incoming: false,
+    }));
+    pending.push({
+      background,
+      reservedVoice,
+      priority: incomingPriority,
+      id: this.nextQueueId,
+      incoming: true,
+    });
+    pending.sort((left, right) => left.priority - right.priority || left.id - right.id);
+
+    // Simulate the next dispatch wave after every already-cancelled transport
+    // has unwound. Existing queued work consumes those release credits first,
+    // exactly as pump() would; one credit therefore cannot admit an arbitrary
+    // burst of newer live items.
+    while (active.total < this.maxConcurrentPredictions) {
+      const nextIndex = pending.findIndex((candidate) =>
+        canFit(candidate.background, candidate.reservedVoice)
+      );
+      if (nextIndex < 0) return false;
+      const [candidate] = pending.splice(nextIndex, 1);
+      if (!candidate) return false;
+      if (candidate.incoming) return true;
+      active.total += 1;
+      if (candidate.background) active.background += 1;
+      if (!candidate.reservedVoice) active.nonVoice += 1;
+    }
+    return false;
+  }
+
+  private canStart(item: QueueItem): boolean {
+    return this.hasExecutionCapacity(this.isBackgroundItem(item), this.isReservedVoiceItem(item));
+  }
+
+  private activeEntries<T extends QueueItem["type"]>(
+    type: T,
+  ): Array<ActiveQueueWork & { item: Extract<QueueItem, { type: T }> }> {
+    const matches: Array<ActiveQueueWork & { item: Extract<QueueItem, { type: T }> }> = [];
+    for (const work of this.activeWork.values()) {
+      if (work.item.type === type) {
+        matches.push(work as ActiveQueueWork & { item: Extract<QueueItem, { type: T }> });
+      }
+    }
+    return matches;
+  }
+
+  private activeItem(id: number): ActiveQueueWork | undefined {
+    return this.activeWork.get(id);
+  }
+
+  private markActiveReleasing(id: number): void {
+    const work = this.activeWork.get(id);
+    if (work) work.releasing = true;
+  }
+
+  private preemptOneActiveBackground(reason: string): boolean {
+    const candidates = [...this.activeWork.values()]
+      .filter((work) =>
+        !work.releasing &&
+        this.isPreemptibleItem(work.item) &&
+        work.abort &&
+        !work.abort.signal.aborted
+      )
+      .sort((left, right) => {
+        const leftIsMemory = left.item.type === "memory-analysis" ||
+          left.item.type === "social-memory-analysis" ||
+          left.item.type === "social-memory-consolidation";
+        const rightIsMemory = right.item.type === "memory-analysis" ||
+          right.item.type === "social-memory-analysis" ||
+          right.item.type === "social-memory-consolidation";
+        // Invisible memory maintenance yields before visible room activity.
+        if (leftIsMemory !== rightIsMemory) return leftIsMemory ? -1 : 1;
+        return queueSortPriority(right.item) - queueSortPriority(left.item) ||
+          right.item.id - left.item.id;
+      });
+    const candidate = candidates[0];
+    if (!candidate?.abort) return false;
+    candidate.abort.abort(new BackgroundWorkPreemptedError(reason));
+    return true;
+  }
+
+  private preemptBackgroundIfRequired(
+    background: boolean,
+    reservedVoice: boolean,
+    incomingPriority: number,
+    reason: string,
+  ): boolean {
+    if (background || this.hasExecutionCapacity(background, reservedVoice)) return false;
+    if (this.hasProjectedExecutionCapacity(background, reservedVoice, incomingPriority)) return false;
+    return this.preemptOneActiveBackground(reason);
   }
 
   /**
@@ -2121,8 +2612,9 @@ export class LmStudioClient {
           (candidate) => candidate.type === "social-memory-consolidation" && candidate.id === item.id,
         );
         if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
-        if (this.activeSocialMemoryConsolidation?.id === item.id) {
-          this.activeSocialMemoryConsolidationAbort?.abort(
+        const active = this.activeItem(item.id);
+        if (active?.item.type === "social-memory-consolidation") {
+          active.abort?.abort(
             new DOMException("Social memory consolidation deadline exceeded", "TimeoutError"),
           );
         }
@@ -2164,8 +2656,9 @@ export class LmStudioClient {
           (candidate) => candidate.type === "social-memory-analysis" && candidate.id === item.id,
         );
         if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
-        if (this.activeSocialMemoryAnalysis?.id === item.id) {
-          this.activeSocialMemoryAnalysisAbort?.abort(
+        const active = this.activeItem(item.id);
+        if (active?.item.type === "social-memory-analysis") {
+          active.abort?.abort(
             new DOMException("Social memory analysis deadline exceeded", "TimeoutError"),
           );
         }
@@ -2203,8 +2696,9 @@ export class LmStudioClient {
       item.timeout = setTimeout(() => {
         const queuedIndex = this.queue.findIndex((candidate) => candidate.type === "memory-analysis" && candidate.id === item.id);
         if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
-        if (this.activeMemoryAnalysis?.id === item.id) {
-          this.activeMemoryAnalysisAbort?.abort(new DOMException("Memory analysis deadline exceeded", "TimeoutError"));
+        const active = this.activeItem(item.id);
+        if (active?.item.type === "memory-analysis") {
+          active.abort?.abort(new DOMException("Memory analysis deadline exceeded", "TimeoutError"));
         }
         settle(createFailClosedMemoryAnalysis("timeout"));
       }, TURN_ANALYSIS_TIMEOUT_MS);
@@ -2212,12 +2706,6 @@ export class LmStudioClient {
       this.queue.sort(compareQueueItems);
       void this.pump();
     });
-  }
-
-  private abortActiveMemoryAnalysis(reason: string): void {
-    this.activeMemoryAnalysisAbort?.abort(new Error(reason));
-    this.activeSocialMemoryAnalysisAbort?.abort(new Error(reason));
-    this.activeSocialMemoryConsolidationAbort?.abort(new Error(reason));
   }
 
   private dropQueuedBackgroundWork(reason: string): boolean {
@@ -2235,6 +2723,32 @@ export class LmStudioClient {
     }
     if (index < 0) return false;
     const [dropped] = this.queue.splice(index, 1);
+    dropped?.reject(
+      dropped.type === "scene" && (dropped.request.kind === "ambient" || dropped.preemptibleBackground)
+        ? new BackgroundWorkPreemptedError(reason)
+        : new Error(reason),
+    );
+    return true;
+  }
+
+  private dropQueuedLowerPriorityWork(incomingPriority: number, reason: string): boolean {
+    let selectedIndex = -1;
+    for (let index = 0; index < this.queue.length; index += 1) {
+      const item = this.queue[index]!;
+      const durable = (item.type === "scene" || item.type === "turn-analysis") && item.durableDelivery;
+      if (durable || queueSortPriority(item) <= incomingPriority) continue;
+      if (selectedIndex < 0) {
+        selectedIndex = index;
+        continue;
+      }
+      const selected = this.queue[selectedIndex]!;
+      if (
+        queueSortPriority(item) > queueSortPriority(selected) ||
+        (queueSortPriority(item) === queueSortPriority(selected) && item.id > selected.id)
+      ) selectedIndex = index;
+    }
+    if (selectedIndex < 0) return false;
+    const [dropped] = this.queue.splice(selectedIndex, 1);
     dropped?.reject(
       dropped.type === "scene" && (dropped.request.kind === "ambient" || dropped.preemptibleBackground)
         ? new BackgroundWorkPreemptedError(reason)
@@ -2321,40 +2835,47 @@ export class LmStudioClient {
     if (supersessionScope) {
       const reason = `Stale voice analysis yielded to a newer turn in room ${supersessionScope.id}`;
       this.dropQueuedScopedTurnAnalyses(supersessionScope, reason);
-      if (sameModelWorkScope(this.activeTurnAnalysis?.supersessionScope, supersessionScope)) {
-        this.activeTurnAnalysisAbort?.abort(new Error(reason));
+      for (const work of this.activeEntries("turn-analysis")) {
+        if (sameModelWorkScope(work.item.supersessionScope, supersessionScope)) {
+          work.abort?.abort(new Error(reason));
+        }
       }
     }
-    if (this.activeScene?.request.kind === "ambient" || this.activeScene?.preemptibleBackground) {
-      this.activeSceneAbort?.abort(
-        new BackgroundWorkPreemptedError("Optional generation yielded to semantic turn analysis"),
-      );
-    } else if (
-      liveTextMedium &&
-      this.activeScene?.request.kind === liveTextMedium &&
-      this.activeScene.request.channelId === input.channel.id &&
-      !this.activeScene.durableDelivery
-    ) {
-      // A newer public message advances the director's per-channel epoch, so
-      // the active scene can no longer be published. Abort that provably stale
-      // work immediately; otherwise it can occupy the single local model long
-      // enough for the newer turn router to hit its own hard deadline.
-      this.activeSceneAbort?.abort(new Error(staleLiveReason));
+    if (liveTextMedium) {
+      for (const work of this.activeEntries("scene")) {
+        if (
+          work.item.request.kind === liveTextMedium &&
+          work.item.request.channelId === input.channel.id &&
+          !work.item.durableDelivery
+        ) {
+          // The newer turn advances the director's per-channel epoch, so this
+          // exact active scene can no longer be published.
+          work.abort?.abort(new Error(staleLiveReason));
+        }
+      }
+      for (const work of this.activeEntries("turn-analysis")) {
+        if (
+          work.item.input.medium === liveTextMedium &&
+          work.item.input.channel.id === input.channel.id &&
+          !work.item.durableDelivery
+        ) work.abort?.abort(new Error(staleLiveReason));
+      }
     }
+    const reservedVoice = input.medium === "voice";
     if (
-      liveTextMedium &&
-      this.activeTurnAnalysis?.input.medium === liveTextMedium &&
-      this.activeTurnAnalysis.input.channel.id === input.channel.id &&
-      !this.activeTurnAnalysis.durableDelivery
+      this.queue.length >= 8 &&
+      !this.hasExecutionCapacity(false, reservedVoice) &&
+      !this.dropQueuedBackgroundWork("Background work dropped to protect semantic turn analysis") &&
+      !this.dropQueuedLowerPriorityWork(-10, "Lower-priority queued work yielded to semantic turn analysis")
     ) {
-      this.activeTurnAnalysisAbort?.abort(new Error(staleLiveReason));
-    }
-    this.abortActiveMemoryAnalysis("Persistent memory yielded to semantic turn analysis");
-    if (this.queue.length >= 8) {
-      if (!this.dropQueuedBackgroundWork("Background work dropped to protect semantic turn analysis")) {
         return Promise.resolve(createFailClosedTurnAnalysis("queue_full"));
-      }
     }
+    this.preemptBackgroundIfRequired(
+      false,
+      reservedVoice,
+      -10,
+      "Optional generation yielded to semantic turn analysis",
+    );
 
     return new Promise((resolve) => {
       const startedAt = performance.now();
@@ -2387,8 +2908,10 @@ export class LmStudioClient {
           if (queuedIndex >= 0) {
             this.queue.splice(queuedIndex, 1);
             item.reject(execution.signal?.reason ?? new Error("Turn analysis cancelled"));
-          } else if (this.activeTurnAnalysis?.id === item.id) {
-            this.activeTurnAnalysisAbort?.abort(
+          } else {
+            const active = this.activeItem(item.id);
+            if (active?.item.type !== "turn-analysis") return;
+            active.abort?.abort(
               execution.signal?.reason ?? new Error("Turn analysis cancelled"),
             );
           }
@@ -2399,8 +2922,9 @@ export class LmStudioClient {
       item.timeout = setTimeout(() => {
         const queuedIndex = this.queue.findIndex((candidate) => candidate.type === "turn-analysis" && candidate.id === item.id);
         if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
-        if (this.activeTurnAnalysis?.id === item.id) {
-          this.activeTurnAnalysisAbort?.abort(new DOMException("Turn analysis deadline exceeded", "TimeoutError"));
+        const active = this.activeItem(item.id);
+        if (active?.item.type === "turn-analysis") {
+          active.abort?.abort(new DOMException("Turn analysis deadline exceeded", "TimeoutError"));
         }
         settle(createFailClosedTurnAnalysis("timeout"));
       }, TURN_ANALYSIS_TIMEOUT_MS);
@@ -2420,39 +2944,59 @@ export class LmStudioClient {
     if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Generation aborted"));
 
     return new Promise((resolve, reject) => {
-      const continuationOf = request.kind === "voice" && execution.continuationOf?.kind === "voice-room"
+      const requestedContinuationOf = request.kind === "voice" && execution.continuationOf?.kind === "voice-room"
         ? execution.continuationOf
         : undefined;
-      const handoff = this.voiceContinuationHandoff;
-      const ownsActiveVoiceHandoff = Boolean(
-        continuationOf &&
-        handoff &&
-        !handoff.consumed &&
-        this.activeTurnAnalysis?.id === handoff.queueItemId &&
-        this.activeTurnAnalysis.settled &&
-        sameModelWorkScope(handoff.scope, continuationOf),
-      );
+      const handoff = requestedContinuationOf
+        ? [...this.voiceContinuationHandoffs.values()].find((candidate) => {
+            const active = this.activeItem(candidate.queueItemId);
+            return !candidate.consumed &&
+              active?.item.type === "turn-analysis" &&
+              active.item.settled &&
+              sameModelWorkScope(candidate.scope, requestedContinuationOf);
+          })
+        : undefined;
+      const ownsActiveVoiceHandoff = Boolean(handoff);
       if (ownsActiveVoiceHandoff && handoff) handoff.consumed = true;
-      if (
-        (this.activeScene?.request.kind === "ambient" || this.activeScene?.preemptibleBackground) &&
-        priority < this.activeScene.priority
-      ) {
-        this.activeSceneAbort?.abort(
-          new BackgroundWorkPreemptedError("Optional generation yielded to live conversation"),
-        );
-      }
-      if (priority < 4) this.abortActiveMemoryAnalysis("Persistent memory yielded to live conversation");
+      // A caller-provided scope is not scheduler authority. Only the one-use
+      // token created by the matching completed router receives continuation
+      // priority or bounded handoff credit.
+      const continuationOf = ownsActiveVoiceHandoff ? requestedContinuationOf : undefined;
+      const background = request.kind === "ambient" || execution.preemptibleBackground === true;
+      const reservedVoice = request.kind === "voice" && !background;
       if (this.queue.length >= 8) {
-        const madeRoom = this.dropQueuedBackgroundWork("Background work dropped to protect the live queue");
-        // During pump's one-event-loop voice handoff the completed router is
-        // still the active placeholder. Its one-use matching token may reclaim
-        // that slot, making the temporary queue depth nine without increasing
-        // the original active+queued work bound. No second or foreign scene can
-        // use this exception.
-        if (!madeRoom && !(this.queue.length === 8 && ownsActiveVoiceHandoff)) {
+        const directCapacity = this.hasExecutionCapacity(background, reservedVoice);
+        const madeRoom = directCapacity
+          ? false
+          : this.dropQueuedBackgroundWork("Background work dropped to protect the live queue");
+        // During each router's one-event-loop handoff, its matching one-use
+        // continuation may temporarily extend the waiting bound by one. This
+        // remains bounded when several independent voice rooms finish together.
+        const withinHandoffCredit = ownsActiveVoiceHandoff &&
+          this.queue.length < 8 + this.voiceContinuationHandoffs.size;
+        const displacedLowerPriority = !directCapacity && !madeRoom && !withinHandoffCredit
+          ? this.dropQueuedLowerPriorityWork(
+              ownsActiveVoiceHandoff ? VOICE_CONTINUATION_QUEUE_PRIORITY : priority,
+              "Lower-priority queued work yielded to a live conversation",
+            )
+          : false;
+        if (
+          !directCapacity &&
+          !madeRoom &&
+          !withinHandoffCredit &&
+          !displacedLowerPriority
+        ) {
           reject(new Error("The local inference queue is full"));
           return;
         }
+      }
+      if (priority < 4 && !ownsActiveVoiceHandoff) {
+        this.preemptBackgroundIfRequired(
+          background,
+          reservedVoice,
+          priority,
+          "Optional generation yielded to live conversation",
+        );
       }
 
       const item: SceneQueueItem = {
@@ -2480,8 +3024,10 @@ export class LmStudioClient {
           if (queuedIndex >= 0) {
             this.queue.splice(queuedIndex, 1);
             item.reject(signal.reason ?? new Error("Generation aborted"));
-          } else if (this.activeScene?.id === item.id) {
-            this.activeSceneAbort?.abort(signal.reason ?? new Error("Generation aborted"));
+          } else {
+            const active = this.activeItem(item.id);
+            if (active?.item.type !== "scene") return;
+            active.abort?.abort(signal.reason ?? new Error("Generation aborted"));
           }
         };
         signal.addEventListener("abort", abort, { once: true });
@@ -2504,29 +3050,34 @@ export class LmStudioClient {
   cancelPending(reason = "Model provider changed"): void {
     const error = new Error(reason);
     for (const item of this.queue.splice(0)) item.reject(error);
-    this.activeSceneAbort?.abort(error);
-    this.activeTurnAnalysisAbort?.abort(error);
-    this.activeMemoryAnalysisAbort?.abort(error);
-    this.activeSocialMemoryAnalysisAbort?.abort(error);
-    this.activeSocialMemoryConsolidationAbort?.abort(error);
-    this.activeVision?.reject(error);
+    for (const work of this.activeWork.values()) {
+      work.abort?.abort(error);
+      if (work.item.type === "vision") work.item.reject(error);
+    }
     this.turnAnalysisById.clear();
     this.memoryAnalysisById.clear();
     this.socialMemoryAnalysisById.clear();
     this.socialMemoryConsolidationByFingerprint.clear();
     this.voiceDraftByMessageId.clear();
-    this.voiceContinuationHandoff = undefined;
+    this.voiceContinuationHandoffs.clear();
   }
 
   analyzeImage(image: Buffer, caption = "", priority = 1): Promise<VisualObservation> {
     if (!this.enabled) return Promise.reject(new Error("AI generation is disabled"));
     return new Promise((resolve, reject) => {
-      if (priority < 4) this.abortActiveMemoryAnalysis("Persistent memory yielded to image analysis");
-      if (this.queue.length >= 8) {
+      if (this.queue.length >= 8 && !this.hasExecutionCapacity(false, false)) {
         if (!this.dropQueuedBackgroundWork("Background work dropped to protect the live queue")) {
           reject(new Error("The local inference queue is full"));
           return;
         }
+      }
+      if (priority < 4) {
+        this.preemptBackgroundIfRequired(
+          false,
+          false,
+          priority,
+          "Optional generation yielded to image analysis",
+        );
       }
       this.queue.push({ type: "vision", id: this.nextQueueId++, priority, image, caption, resolve, reject });
       this.queue.sort(compareQueueItems);
@@ -2534,108 +3085,91 @@ export class LmStudioClient {
     });
   }
 
-  private async pump(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    while (this.queue.length > 0) {
-      const item = this.queue.shift();
-      if (!item) break;
-      try {
-        if (item.type === "scene") {
-          const abort = new AbortController();
-          this.activeScene = item;
-          this.activeSceneAbort = abort;
-          if (item.request.kind === "voice" && process.env.VOICE_LATENCY_LOG === "true") {
-            console.info(JSON.stringify({
-              event: "voice_queue_latency",
-              waitMs: Math.round(performance.now() - item.enqueuedAt),
-            }));
-          }
-          item.resolve(await this.perform(item.request, abort.signal));
-        } else if (item.type === "vision") {
-          this.activeVision = item;
-          item.resolve(await this.performVision(item.image, item.caption));
-        } else if (item.type === "turn-analysis") {
-          const abort = new AbortController();
-          this.activeTurnAnalysis = item;
-          this.activeTurnAnalysisAbort = abort;
-          const analysis = await this.performTurnAnalysis(item.input, abort.signal, item.deadlineAt);
-          if (
-            item.input.medium === "voice" &&
-            item.supersessionScope?.kind === "voice-room" &&
-            !item.externalSignal?.aborted
-          ) {
-            this.voiceContinuationHandoff = {
-              queueItemId: item.id,
-              scope: item.supersessionScope,
-              consumed: false,
-            };
-          }
-          item.resolve(analysis);
-          // A live turn normally follows semantic routing immediately with its
-          // scene. Give that promise continuation one microtask to enqueue the
-          // scene before the pump grabs already-waiting ambient work. This is
-          // scheduling only: other rooms keep running as soon as the live
-          // handoff is queued, and no inference contract is bypassed.
-          if (item.input.medium === "voice") {
-            // Voice crosses the switchable-provider and director promise
-            // layers before it can enqueue its scene. A single event-loop turn
-            // lets that complete; a microtask alone is too early.
-            await new Promise<void>((resolve) => setImmediate(resolve));
-          } else {
-            await Promise.resolve();
-          }
-        } else if (item.type === "memory-analysis") {
-          const abort = new AbortController();
-          this.activeMemoryAnalysis = item;
-          this.activeMemoryAnalysisAbort = abort;
-          item.resolve(await this.performMemoryAnalysis(item.input, abort.signal, item.deadlineAt));
-        } else if (item.type === "social-memory-analysis") {
-          const abort = new AbortController();
-          this.activeSocialMemoryAnalysis = item;
-          this.activeSocialMemoryAnalysisAbort = abort;
-          item.resolve(await this.performSocialMemoryAnalysis(item.input, abort.signal, item.deadlineAt));
-        } else {
-          const abort = new AbortController();
-          this.activeSocialMemoryConsolidation = item;
-          this.activeSocialMemoryConsolidationAbort = abort;
-          item.resolve(await this.performSocialMemoryConsolidation(item.input, abort.signal, item.deadlineAt));
-        }
-      } catch (error) {
-        const typedPreemption = item.type === "scene" &&
-          (item.request.kind === "ambient" || item.preemptibleBackground) &&
-          isBackgroundWorkPreemptedError(this.activeSceneAbort?.signal.reason)
-          ? this.activeSceneAbort.signal.reason
-          : undefined;
-        item.reject(typedPreemption ?? error);
-      } finally {
-        if (this.activeScene?.id === item.id) {
-          this.activeScene = undefined;
-          this.activeSceneAbort = undefined;
-        }
-        if (this.activeVision?.id === item.id) this.activeVision = undefined;
-        if (this.activeTurnAnalysis?.id === item.id) {
-          if (this.voiceContinuationHandoff?.queueItemId === item.id) {
-            this.voiceContinuationHandoff = undefined;
-          }
-          this.activeTurnAnalysis = undefined;
-          this.activeTurnAnalysisAbort = undefined;
-        }
-        if (this.activeMemoryAnalysis?.id === item.id) {
-          this.activeMemoryAnalysis = undefined;
-          this.activeMemoryAnalysisAbort = undefined;
-        }
-        if (this.activeSocialMemoryAnalysis?.id === item.id) {
-          this.activeSocialMemoryAnalysis = undefined;
-          this.activeSocialMemoryAnalysisAbort = undefined;
-        }
-        if (this.activeSocialMemoryConsolidation?.id === item.id) {
-          this.activeSocialMemoryConsolidation = undefined;
-          this.activeSocialMemoryConsolidationAbort = undefined;
-        }
+  private pump(): void {
+    if (this.dispatching) return;
+    this.dispatching = true;
+    try {
+      while (this.activeWork.size < this.maxConcurrentPredictions) {
+        // A lower-priority voice item may be runnable while an earlier
+        // background/non-voice item is held behind its reservation ceiling.
+        const nextIndex = this.queue.findIndex((candidate) => this.canStart(candidate));
+        if (nextIndex < 0) break;
+        const [item] = this.queue.splice(nextIndex, 1);
+        if (!item) break;
+        const abort = new AbortController();
+        this.activeWork.set(item.id, { item, abort });
+        void this.runQueueItem(item, abort).finally(() => {
+          this.voiceContinuationHandoffs.delete(item.id);
+          this.activeWork.delete(item.id);
+          this.pump();
+        });
       }
+    } finally {
+      this.dispatching = false;
     }
-    this.running = false;
+  }
+
+  private async runQueueItem(item: QueueItem, abort: AbortController): Promise<void> {
+    try {
+      if (item.type === "scene") {
+        if (item.request.kind === "voice" && process.env.VOICE_LATENCY_LOG === "true") {
+          console.info(JSON.stringify({
+            event: "voice_queue_latency",
+            waitMs: Math.round(performance.now() - item.enqueuedAt),
+          }));
+        }
+        const result = await this.perform(item.request, abort.signal);
+        this.markActiveReleasing(item.id);
+        item.resolve(result);
+      } else if (item.type === "vision") {
+        const result = await this.performVision(item.image, item.caption, abort.signal);
+        this.markActiveReleasing(item.id);
+        item.resolve(result);
+      } else if (item.type === "turn-analysis") {
+        const analysis = await this.performTurnAnalysis(item.input, abort.signal, item.deadlineAt);
+        if (
+          item.input.medium === "voice" &&
+          item.supersessionScope?.kind === "voice-room" &&
+          !abort.signal.aborted &&
+          !item.externalSignal?.aborted
+        ) {
+          this.voiceContinuationHandoffs.set(item.id, {
+            queueItemId: item.id,
+            scope: item.supersessionScope,
+            consumed: false,
+          });
+        }
+        this.markActiveReleasing(item.id);
+        item.resolve(analysis);
+        // Keep this exact router active for one continuation turn. Concurrent
+        // voice rooms receive independent handoff tokens.
+        if (item.input.medium === "voice") {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        } else {
+          await Promise.resolve();
+        }
+      } else if (item.type === "memory-analysis") {
+        const result = await this.performMemoryAnalysis(item.input, abort.signal, item.deadlineAt);
+        this.markActiveReleasing(item.id);
+        item.resolve(result);
+      } else if (item.type === "social-memory-analysis") {
+        const result = await this.performSocialMemoryAnalysis(item.input, abort.signal, item.deadlineAt);
+        this.markActiveReleasing(item.id);
+        item.resolve(result);
+      } else {
+        const result = await this.performSocialMemoryConsolidation(item.input, abort.signal, item.deadlineAt);
+        this.markActiveReleasing(item.id);
+        item.resolve(result);
+      }
+    } catch (error) {
+      const typedPreemption = item.type === "scene" &&
+        (item.request.kind === "ambient" || item.preemptibleBackground) &&
+        isBackgroundWorkPreemptedError(abort.signal.reason)
+        ? abort.signal.reason
+        : undefined;
+      this.markActiveReleasing(item.id);
+      item.reject(typedPreemption ?? error);
+    }
   }
 
   private voiceDraftKey(channelId: string, messageId: string): string {
@@ -2743,7 +3277,7 @@ export class LmStudioClient {
       if (signal.aborted || performance.now() >= deadlineAt) {
         return createFailClosedTurnAnalysis("timeout");
       }
-      const model = await this.resolveModelForTurnAnalysis(signal);
+      const model = await this.resolveModel(signal);
       if (!model) return createFailClosedTurnAnalysis("model_unavailable");
       if (signal.aborted || performance.now() >= deadlineAt) {
         return createFailClosedTurnAnalysis("timeout");
@@ -2915,7 +3449,7 @@ export class LmStudioClient {
       if (signal.aborted || performance.now() >= deadlineAt) {
         return createFailClosedMemoryAnalysis("timeout");
       }
-      const model = await this.resolveModelForTurnAnalysis(signal);
+      const model = await this.resolveModel(signal);
       if (!model) return createFailClosedMemoryAnalysis("model_unavailable");
       const raw = await this.callMemoryAnalysis(input, model, signal);
       if (signal.aborted || performance.now() >= deadlineAt) {
@@ -2943,7 +3477,7 @@ export class LmStudioClient {
       if (signal.aborted || performance.now() >= deadlineAt) {
         return createFailClosedSocialMemoryAnalysis("timeout");
       }
-      const model = await this.resolveModelForTurnAnalysis(signal);
+      const model = await this.resolveModel(signal);
       if (!model) return createFailClosedSocialMemoryAnalysis("provider_error");
       const raw = await this.callSocialMemoryAnalysis(input, model, signal);
       if (signal.aborted || performance.now() >= deadlineAt) {
@@ -2999,7 +3533,7 @@ export class LmStudioClient {
       if (signal.aborted || performance.now() >= deadlineAt) {
         return createFailClosedSocialMemoryConsolidation("timeout");
       }
-      const model = await this.resolveModelForTurnAnalysis(signal);
+      const model = await this.resolveModel(signal);
       if (!model) return createFailClosedSocialMemoryConsolidation("provider_error");
       const raw = await this.callSocialMemoryConsolidation(input, model, signal);
       if (signal.aborted || performance.now() >= deadlineAt) {
@@ -3018,7 +3552,7 @@ export class LmStudioClient {
     }
   }
 
-  private async resolveModelForTurnAnalysis(signal: AbortSignal): Promise<string | undefined> {
+  private async resolveModel(signal: AbortSignal): Promise<string | undefined> {
     const known = this.resolvedModel ?? this.backend.configuredModel;
     if (known) return known;
     const result = await this.backend.probe(signal);
@@ -3202,22 +3736,27 @@ export class LmStudioClient {
     }, signal);
   }
 
-  private async performVision(image: Buffer, caption: string): Promise<VisualObservation> {
-    if (!this.resolvedModel) await this.probe();
-    const model = this.resolvedModel ?? this.backend.configuredModel;
+  private async performVision(
+    image: Buffer,
+    caption: string,
+    signal: AbortSignal,
+  ): Promise<VisualObservation> {
+    const model = await this.resolveModel(signal);
+    if (signal.aborted) throw signal.reason ?? new Error("Image analysis aborted");
     if (!model) throw new Error(`No ${this.backend.providerId} model is available`);
     // LM Studio's OpenAI-compatible endpoint currently rejects WebP data URLs
     // even though the native SDK supports WebP. The stored image remains WebP;
     // only the bounded in-memory inference copy is converted to metadata-free JPEG.
     const visionImage = await sharp(image).jpeg({ quality: 88, mozjpeg: true }).toBuffer();
+    if (signal.aborted) throw signal.reason ?? new Error("Image analysis aborted");
     const started = performance.now();
     let raw: unknown;
     let usedUnstructured = false;
     try {
-      raw = await this.callVision(visionImage, caption, model, true);
+      raw = await this.callVision(visionImage, caption, model, true, 1, signal);
     } catch (error) {
       if (!(error instanceof LmHttpError) || ![400, 422].includes(error.status)) throw error;
-      raw = await this.callVision(visionImage, caption, model, false);
+      raw = await this.callVision(visionImage, caption, model, false, 1, signal);
       usedUnstructured = true;
     }
 
@@ -3227,7 +3766,7 @@ export class LmStudioClient {
     // same strict local validation before anything reaches channel memory.
     let parsed = parseVisualObservation(raw);
     if (!parsed && !usedUnstructured) {
-      raw = await this.callVision(visionImage, caption, model, false, 1.4);
+      raw = await this.callVision(visionImage, caption, model, false, 1.4, signal);
       parsed = parseVisualObservation(raw);
     }
     if (!parsed) throw new Error(`${this.backend.providerId} returned no valid visual observation`);
@@ -3316,9 +3855,9 @@ export class LmStudioClient {
         requestWithoutRelationshipTurnVariation,
       ),
     };
-    if (!this.resolvedModel) await this.probe();
-    if (signal?.aborted) throw signal.reason ?? new Error("Generation aborted");
-    const model = this.resolvedModel ?? this.backend.configuredModel;
+    const workSignal = signal ?? new AbortController().signal;
+    const model = await this.resolveModel(workSignal);
+    if (workSignal.aborted) throw workSignal.reason ?? new Error("Generation aborted");
     if (!model) throw new Error(`No ${this.backend.providerId} model is available`);
 
     const started = performance.now();
@@ -3419,6 +3958,10 @@ export class LmStudioClient {
     const communityCapabilityContradictionIds = request.selected
       .filter((persona) => semanticReviews?.get(persona.id)?.issues.includes("community_capability_contradiction"))
       .map((persona) => persona.id);
+    const requiredPeerEchoIds = request.selected
+      .filter((persona) => request.mustReplyIds?.includes(persona.id))
+      .filter((persona) => semanticReviews?.get(persona.id)?.issues.includes("peer_echo"))
+      .map((persona) => persona.id);
     const channelFeedDiscussionIds = request.kind === "ambient" &&
       request.channelFeedDiscussion === true &&
       request.channelFeedContext
@@ -3432,6 +3975,7 @@ export class LmStudioClient {
       ...soleRequiredDmIds,
       ...textLanguageMismatchIds,
       ...communityCapabilityContradictionIds,
+      ...requiredPeerEchoIds,
       ...channelFeedDiscussionIds,
     ])]
       .filter((personaId) => !deliveredIds.has(personaId));
@@ -3446,6 +3990,8 @@ export class LmStudioClient {
       const recoversTextLanguage = missingRequiredIds.some((personaId) => textLanguageMismatchIds.includes(personaId));
       const recoversCommunityCapability = missingRequiredIds.some((personaId) =>
         communityCapabilityContradictionIds.includes(personaId));
+      const recoversPeerEcho = missingRequiredIds.some((personaId) =>
+        requiredPeerEchoIds.includes(personaId));
       const recoversAutonomousResearchOpening = Boolean(
         request.kind === "ambient" &&
         request.ambientAction?.kind === "open_topic" &&
@@ -3478,6 +4024,8 @@ export class LmStudioClient {
           ? `${actorNames || "The selected resident"}'s typed channel-feed contribution did not survive review. This is the one bounded full-scene recovery: perform the same assigned ambient move from the exact supplied channelFeedContext, using only values and limits it literally establishes. Keep sourceIds as [] because this feed grounding has no research-source IDs. Preserve the episode target and leave a concrete hook when the ambient contract asks for one. Do not mention feed plumbing, searching or tooling, and do not infer causes, forecasts or market-open state.${reviewCorrection}`
         : recoversCommunityCapability
           ? `${actorNames || "The selected resident"}'s first candidate contradicted trusted community capability facts. This is the one bounded full-scene recovery: answer the actual turn from trustedCommunityCapabilities, preserving the character voice and language. Voice chat exists; humans can start and join it from public rooms, residents can be invited, and residents do not start rooms autonomously.${reviewCorrection}`
+        : recoversPeerEcho
+          ? `${actorNames || "The selected resident"}'s first required candidate was a pure semantic echo of another contribution already reserved for this scene. This is the one bounded full-scene recovery: answer the same newest turn with a genuinely different conversational move—another angle, detail, question, disagreement or distinct reaction—without referring to drafts, hidden coordination or another actor's private context.${reviewCorrection}`
         : recoversTextLanguage
           ? `${actorNames || "The selected resident"}'s first candidate did not survive required output-language review. This is the one bounded full-scene recovery: perform the same assigned scene in the trusted required response language, preserving the supplied premise, transcript, evidence and conversational move. Do not translate names or genuinely quoted fragments unnecessarily.${reviewCorrection}`
         : `${actorNames || "The selected resident"} owes this human-triggered scene one direct response and the first candidate did not survive review. This is the one bounded full-scene recovery: respond directly and relevantly to the newest complete turn now, preserving the supplied transcript and evidence. Do not change subject merely to produce a line and do not invent an explicit request that the human did not make.${reviewCorrection}`;
@@ -3494,6 +4042,13 @@ export class LmStudioClient {
             responseRecoveryIds: missingRequiredIds,
             requestOwnerIds: retryOwnerIds,
             responseRecoveryBudget: recoveryBudget,
+            // Reviewer-only sibling context is retained for this bounded retry;
+            // sceneData deliberately never serializes it into generation.
+            publicSiblingDrafts: mergePublicSiblingDrafts(
+              request.publicSiblingDrafts,
+              request.selected,
+              humanizedLines,
+            ),
             premise: [request.premise, completionPremise].filter(Boolean).join(" "),
           },
           signal,
@@ -3578,24 +4133,75 @@ export class LmStudioClient {
       );
     }
     const privateActorIds = new Set(privateActors.map((persona) => persona.id));
-    const publicBatch = request.selected.filter((persona) => !privateActorIds.has(persona.id));
-    const batches: Array<{ personas: Persona[]; includePrivateRelationshipNote: boolean }> = [
+    const ownerIds = new Set(explicitRequestOwnerIds(request));
+    const requiredIds = new Set([
+      ...(request.mustReplyIds ?? []),
+      ...(request.responseRecoveryIds ?? []),
+    ]);
+    const deliveryTier = (personaId: string): 0 | 1 | 2 =>
+      ownerIds.has(personaId) ? 0 : requiredIds.has(personaId) ? 1 : 2;
+    const originalOrder = new Map(request.selected.map((persona, index) => [persona.id, index] as const));
+    const batches: Array<{
+      personas: Persona[];
+      includePrivateRelationshipNote: boolean;
+      deliveryTier: 0 | 1 | 2;
+    }> = [
       ...privateActors.map((persona) => ({
         personas: [persona],
         includePrivateRelationshipNote: true,
+        deliveryTier: deliveryTier(persona.id),
       })),
-      ...(publicBatch.length > 0
-        ? [{ personas: publicBatch, includePrivateRelationshipNote: false }]
-        : []),
-    ];
+      ...([0, 1, 2] as const).flatMap((tier) => {
+        const personas = request.selected.filter((persona) =>
+          !privateActorIds.has(persona.id) && deliveryTier(persona.id) === tier
+        );
+        return personas.length > 0
+          ? [{ personas, includePrivateRelationshipNote: false, deliveryTier: tier }]
+          : [];
+      }),
+    ].sort((left, right) =>
+      left.deliveryTier - right.deliveryTier ||
+      Math.min(...left.personas.map((persona) => originalOrder.get(persona.id) ?? Number.MAX_SAFE_INTEGER)) -
+        Math.min(...right.personas.map((persona) => originalOrder.get(persona.id) ?? Number.MAX_SAFE_INTEGER))
+    );
     const linesByPersona = new Map<string, GeneratedLine>();
     for (const batch of batches) {
       if (signal?.aborted) throw signal.reason ?? new Error("Generation aborted");
-      const actorRequest = actorSubsetSceneRequest(
+      // An optional private-context actor must never become the surviving
+      // substitute for an explicit owner whose fully reviewed generation and
+      // bounded recovery both failed. Required tiers still run independently;
+      // only optional publication is suppressed after that delivery failure.
+      if (
+        batch.deliveryTier === 2 &&
+        [...ownerIds].some((personaId) => !linesByPersona.has(personaId))
+      ) {
+        console.warn(
+          "Actor-isolated optional batch skipped after explicit owner delivery failed:",
+          batch.personas.map((persona) => persona.id).join(", "),
+        );
+        continue;
+      }
+      const eligibleExistingSiblingDrafts = (request.publicSiblingDrafts ?? []).filter((draft) =>
+        deliveryTier(draft.personaId) <= batch.deliveryTier
+      );
+      const eligibleDeliveredLines = [...linesByPersona.values()].filter((line) =>
+        deliveryTier(line.personaId) <= batch.deliveryTier
+      );
+      const actorRequest: SceneRequest = {
+        ...actorSubsetSceneRequest(
         request,
         batch.personas,
         batch.includePrivateRelationshipNote,
-      );
+        ),
+        // Only the reviewer receives earlier public-intended lines across
+        // actor-isolated batches. Generation serialization deliberately omits
+        // them so private-note-shaped wording cannot inform another resident.
+        publicSiblingDrafts: mergePublicSiblingDrafts(
+          eligibleExistingSiblingDrafts,
+          request.selected,
+          eligibleDeliveredLines,
+        ),
+      };
       try {
         const actorLines = await this.perform(
           actorRequest,
@@ -3719,6 +4325,7 @@ export class LmStudioClient {
       return [{
         personaId: line.personaId,
         actorName: persona.name,
+        selectionOrder: request.selected.findIndex((candidate) => candidate.id === line.personaId),
         content: line.content.slice(0, MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS),
         sourceIds: line.sourceIds,
         privateRelationshipNote: request.relationshipNotes?.[line.personaId]?.slice(0, 2_600) ?? null,
@@ -3758,6 +4365,7 @@ export class LmStudioClient {
           ...request.history
             .filter((historyLine) => historyLine.kind === "ai" && !sameActor(historyLine.author))
             .map((historyLine) => historyLine.content),
+          ...(request.publicSiblingDrafts ?? []).map((draft) => draft.content),
           ...lines.filter((candidate) => candidate.personaId !== line.personaId).map((candidate) => candidate.content),
         ].slice(-8).map((text) => text.slice(0, MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS)),
       }];
@@ -3912,6 +4520,13 @@ export class LmStudioClient {
           }
         : null,
       communityCapabilities: COMMUNITY_CAPABILITY_CONTEXT,
+      priorAcceptedSiblingDrafts: (request.publicSiblingDrafts ?? [])
+        .slice(-MAX_PUBLIC_SIBLING_DRAFTS)
+        .map((draft) => ({
+          personaId: draft.personaId,
+          actorName: draft.actorName.slice(0, 80),
+          content: draft.content.slice(0, MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS),
+        })),
       candidates,
     });
     return parsed.success ? parsed.data : undefined;
@@ -4085,12 +4700,33 @@ export class LmStudioClient {
     };
   }
 
+  private assessPeerOverlap(
+    request: SceneRequest,
+    line: GeneratedLine,
+    peerTexts: readonly string[],
+  ): HumanizerAssessment {
+    return assessCandidate({
+      personaId: line.personaId,
+      text: line.content,
+      recentOwnTexts: [],
+      peerTexts,
+      mode: this.humanizerMode(request),
+      register: this.humanizerRegister(request),
+      // Only near_duplicate_peer is consumed from this provenance-specific
+      // assessment. Avoid manufacturing unrelated list/register findings.
+      allowList: true,
+    });
+  }
+
   private applyCandidateReview(
     assessment: HumanizerAssessment,
     review: CandidateLineReview | undefined,
+    allowReviewerInstruction: boolean,
   ): HumanizerAssessment {
-    if (!review || review.severity === "none" || review.issues.length === 0) return assessment;
     const rank = { none: 0, low: 1, medium: 2, high: 3 } as const;
+    if (!review || review.severity === "none" || review.issues.length === 0) {
+      return assessment;
+    }
     const containsPublicationBlocker = review.issues.some((issue) =>
       NON_REPAIRABLE_CANDIDATE_ISSUES.has(issue),
     );
@@ -4106,7 +4742,9 @@ export class LmStudioClient {
     const severity = rank[reviewSeverity] > rank[assessment.severity]
       ? reviewSeverity
       : assessment.severity;
-    const hint = review.rewriteInstruction ?? "Rewrite the line to remove the publication issue without adding facts.";
+    const hint = allowReviewerInstruction && review.rewriteInstruction
+      ? review.rewriteInstruction
+      : `Rewrite the line to resolve these typed publication issues: ${review.issues.join(", ")}. Preserve supported facts and the intended social move; do not copy or quote peer text.`;
     const semanticReasons = review.issues.map((issue) => ({
       code: CANDIDATE_ISSUE_REASON_CODE[issue],
       severity: reviewSeverity,
@@ -4205,30 +4843,115 @@ export class LmStudioClient {
         .filter((historyLine) => historyLine.kind === "ai" && sameActor(historyLine.author))
         .map((historyLine) => historyLine.content),
       ].slice(-18);
-      const peerTexts = [
-        ...request.history
-          .filter((historyLine) => historyLine.kind === "ai" && !sameActor(historyLine.author))
-          .map((historyLine) => historyLine.content),
-        ...lines.filter((candidate) => candidate.personaId !== line.personaId).map((candidate) => candidate.content),
-      ].slice(-24);
-      const semanticReview = semanticReviews?.get(line.personaId);
+      const historicalPeerTexts = request.history
+        .filter((historyLine) => historyLine.kind === "ai" && !sameActor(historyLine.author))
+        .map((historyLine) => historyLine.content);
+      const lineTier = sceneActorDeliveryTier(request, line.personaId);
+      const lineSelectionOrder = request.selected.findIndex((candidate) => candidate.id === line.personaId);
+      const priorSameSceneContributions: EarlierSceneContribution[] = [
+        ...(request.publicSiblingDrafts ?? [])
+          .filter((draft) => sceneActorDeliveryTier(request, draft.personaId) <= lineTier)
+          .map((draft) => ({ personaId: draft.personaId, content: draft.content })),
+        ...lines.flatMap((candidate) => {
+          if (candidate.personaId === line.personaId) return [];
+          const candidateTier = sceneActorDeliveryTier(request, candidate.personaId);
+          const candidateSelectionOrder = request.selected.findIndex((selected) =>
+            selected.id === candidate.personaId
+          );
+          const ownsEarlierSlot = candidateTier < lineTier ||
+            (
+              candidateTier === lineTier &&
+              candidateSelectionOrder >= 0 &&
+              candidateSelectionOrder < lineSelectionOrder
+            );
+          return ownsEarlierSlot
+            ? [{ personaId: candidate.personaId, content: candidate.content }]
+            : [];
+        }),
+      ];
+      const sameScenePeerTexts = priorSameSceneContributions.map((candidate) => candidate.content);
+      const peerTexts = [...historicalPeerTexts, ...sameScenePeerTexts].slice(-24);
+      const originalSemanticReview = semanticReviews?.get(line.personaId);
       // Never preserve language metadata from generation or an earlier draft:
       // only this exact candidate's mandatory semantic review may establish it.
       const { reviewedOutputLanguage: _unreviewedLanguage, ...unreviewedLine } = line;
-      const reviewedOutputLanguage = semanticReview?.outputLanguage &&
-        semanticReview.outputLanguage.tag !== "und" &&
-        semanticReview.outputLanguage.confidence >= CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE
-        ? semanticReview.outputLanguage
+      const reviewedOutputLanguage = originalSemanticReview?.outputLanguage &&
+        originalSemanticReview.outputLanguage.tag !== "und" &&
+        originalSemanticReview.outputLanguage.confidence >= CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE
+        ? originalSemanticReview.outputLanguage
         : undefined;
       const reviewedLine: GeneratedLine = reviewedOutputLanguage
         ? { ...unreviewedLine, reviewedOutputLanguage }
         : unreviewedLine;
+      const baseMechanicalAssessment = this.assessSceneLine(
+        request,
+        reviewedLine,
+        persona,
+        recentOwnTexts,
+        [],
+      );
+      const historicalPeerAssessment = this.assessPeerOverlap(
+        request,
+        reviewedLine,
+        historicalPeerTexts,
+      );
+      const sameScenePeerAssessment = this.assessPeerOverlap(
+        request,
+        reviewedLine,
+        sameScenePeerTexts,
+      );
+      const sameSceneChorusAnchor = structurallyBriefSameSceneAnchor(
+        request,
+        reviewedLine,
+        priorSameSceneContributions,
+      );
+      const allowOccasionalChorus = shouldAllowOccasionalSocialChorus(
+        request,
+        reviewedLine,
+        historicalPeerAssessment,
+        originalSemanticReview,
+        sameSceneChorusAnchor,
+      );
+      const semanticReview = allowOccasionalChorus && originalSemanticReview?.issues.includes("peer_echo")
+        ? {
+            ...originalSemanticReview!,
+            severity: "none" as const,
+            issues: [],
+            rewriteInstruction: null,
+          }
+        : originalSemanticReview;
+      const boundedSameScenePeerAssessment = originalSemanticReview?.sameSceneOverlap === "brief_social_chorus" &&
+          !allowOccasionalChorus
+        ? promotePeerOverlapToPublicationBlocker(
+            sameScenePeerAssessment,
+            sameSceneChorusAnchor?.content,
+          )
+        : sameScenePeerAssessment;
+      const includeSameScenePeerOverlap = !semanticReview ||
+        semanticReview.issues.includes("peer_echo") ||
+        (originalSemanticReview?.sameSceneOverlap === "brief_social_chorus" && !allowOccasionalChorus);
+      // Provenance is structural, not inferred from matched text. Historical
+      // repetition is always retained; current-scene overlap is included only
+      // when semantic review is unavailable, explicitly emits peer_echo, or a
+      // typed brief chorus lands outside its bounded deterministic allowance.
+      // A clean substantive_overlap therefore remains reviewer-owned and can
+      // preserve two lexically similar but genuinely complementary replies.
+      const mechanicalAssessment = mergePeerOverlapAssessments(
+        baseMechanicalAssessment,
+        [
+          historicalPeerAssessment,
+          ...(includeSameScenePeerOverlap
+            ? [boundedSameScenePeerAssessment]
+            : []),
+        ],
+      );
       const assessment = this.applyMechanicalContract(
         request,
         reviewedLine,
         this.applyCandidateReview(
-          this.assessSceneLine(request, reviewedLine, persona, recentOwnTexts, peerTexts),
+          mechanicalAssessment,
           semanticReview,
+          (request.publicSiblingDrafts?.length ?? 0) === 0,
         ),
       );
       return [{ line: reviewedLine, assessment, semanticReview, persona, recentOwnTexts, peerTexts }];
@@ -4697,9 +5420,8 @@ export class LmStudioClient {
     model: string,
     structured: boolean,
     budgetMultiplier = 1,
+    signal?: AbortSignal,
   ): Promise<unknown> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     const responseFormat = {
       type: "json_schema",
       json_schema: {
@@ -4744,11 +5466,8 @@ export class LmStudioClient {
       stream: false,
       ...(structured ? { response_format: responseFormat } : {}),
     };
-    try {
-      return await this.complete(body, controller.signal);
-    } finally {
-      clearTimeout(timeout);
-    }
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    return await this.complete(body, signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal);
   }
 
   private systemPrompt(request: SceneRequest): string {
@@ -4789,6 +5508,7 @@ export class LmStudioClient {
       room: request.channelName,
       premise: request.premise ?? "",
       triggeringEvent,
+      priorSiblingContributionExists: (request.publicSiblingDrafts?.length ?? 0) > 0,
       requiredActorIds: request.mustReplyIds ?? [],
       explicitRequestOwnerIds: explicitRequestOwnerIds(request),
       relationshipNotes: request.relationshipNotes ?? {},

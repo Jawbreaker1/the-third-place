@@ -5,10 +5,14 @@ import { PERSONAS } from "./personas.js";
 import { createMessage, RoomStore } from "./store.js";
 import {
   addressedPersonaIds,
+  AMBIENT_EXHAUSTED_FAMILY_REPEAT_FLOOR_MS,
+  AMBIENT_EXHAUSTED_SEED_REPEAT_FLOOR_MS,
   ambientChannelScore,
+  ambientGenerationAdmission,
   ambientHistoryWithAnchor,
   ambientConversationPremise,
   ambientLanguageHint,
+  ambientSeedRotationPool,
   ambientSceneWordLimits,
   analyzeSocialSignals,
   consideredConversationLeadPremise,
@@ -115,6 +119,64 @@ const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => 
 };
 
 describe("social director", () => {
+  it("admits ambient work only when the model has real background capacity", () => {
+    const baseHealth = {
+      queueDepth: 1,
+      activePredictions: 1,
+      activeBackgroundPredictions: 0,
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    };
+
+    expect(ambientGenerationAdmission(baseHealth)).toEqual({
+      allowed: true,
+      externalQueueDepth: 1,
+      reason: "available",
+    });
+    expect(ambientGenerationAdmission({
+      ...baseHealth,
+      queueDepth: 2,
+      activeBackgroundPredictions: 2,
+      activePredictions: 2,
+    })).toEqual({
+      allowed: false,
+      externalQueueDepth: 2,
+      reason: "background-full",
+    });
+    expect(ambientGenerationAdmission({
+      ...baseHealth,
+      queueDepth: 4,
+      activePredictions: 4,
+    })).toEqual({
+      allowed: false,
+      externalQueueDepth: 4,
+      reason: "prediction-full",
+    });
+    expect(ambientGenerationAdmission({
+      ...baseHealth,
+      queueDepth: 3,
+      activePredictions: 2,
+      activeBackgroundPredictions: 1,
+    })).toEqual({
+      allowed: false,
+      externalQueueDepth: 3,
+      reason: "queued",
+    });
+  });
+
+  it("retains conservative queue admission for incomplete model health snapshots", () => {
+    expect(ambientGenerationAdmission({ queueDepth: 1 })).toEqual({
+      allowed: false,
+      externalQueueDepth: 1,
+      reason: "legacy-busy",
+    });
+    expect(ambientGenerationAdmission({ queueDepth: 1 }, 1)).toEqual({
+      allowed: true,
+      externalQueueDepth: 0,
+      reason: "available",
+    });
+  });
+
   it("bounds retained visual evidence to the latest three entries in chronological order", () => {
     const messages = Array.from({ length: 5 }, (_, index) => createMessage(
       "dm:ai-mira:human-johan",
@@ -4796,6 +4858,225 @@ describe("social director", () => {
     expect(humanTriggeredTail.store.addPublicMessage).not.toHaveBeenCalled();
   });
 
+  it("runs two unattended ambient generations concurrently in distinct rooms with distinct leased residents", async () => {
+    const now = Date.parse("2026-07-19T12:00:00.000Z");
+    const pendingResolvers: Array<(lines: []) => void> = [];
+    const requests: Array<{ channelId: string; conversationMode?: string; personaId?: string }> = [];
+    const generateScene = vi.fn((request: {
+      channelId: string;
+      conversationMode?: string;
+      selected?: Array<{ id: string }>;
+    }) => {
+      requests.push({
+        channelId: request.channelId,
+        conversationMode: request.conversationMode,
+        personaId: request.selected?.[0]?.id,
+      });
+      return new Promise<[]>((resolve) => pendingResolvers.push(resolve));
+    });
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-ambient-concurrency-${process.pid}-${Math.random()}.json`),
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: pendingResolvers.length })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 0,
+      {
+        now: () => now,
+        rng: () => 0,
+        ambientConcurrency: 2,
+        consideredConversationChance: 1,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || ["ai-programming", "3d-visualisation"].includes(channelId)
+            ? 50
+            : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+    const runAmbient = (director as unknown as {
+      runAmbient: (workerId?: number) => Promise<void>;
+    }).runAmbient.bind(director);
+
+    const first = runAmbient(0);
+    const second = runAmbient(1);
+    await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(2));
+
+    expect(new Set(requests.map((request) => request.channelId)).size).toBe(2);
+    expect(new Set(requests.map((request) => request.personaId)).size).toBe(2);
+    expect(requests.filter((request) => request.conversationMode === "considered")).toHaveLength(1);
+
+    for (const resolve of pendingResolvers) resolve([]);
+    await Promise.all([first, second]);
+    director.stop();
+  });
+
+  it("never starts two concurrent ambient attempts in the same channel", async () => {
+    const now = Date.parse("2026-07-19T12:30:00.000Z");
+    let resolveScene: ((lines: []) => void) | undefined;
+    const generateScene = vi.fn(() => new Promise<[]>((resolve) => { resolveScene = resolve; }));
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-ambient-channel-lease-${process.pid}-${Math.random()}.json`),
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: generateScene.mock.calls.length })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 0,
+      {
+        now: () => now,
+        rng: () => 0,
+        ambientConcurrency: 2,
+        consideredConversationChance: 0,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "ai-programming" ? 50 : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+    const runAmbient = (director as unknown as {
+      runAmbient: (workerId?: number) => Promise<void>;
+    }).runAmbient.bind(director);
+
+    const first = runAmbient(0);
+    const second = runAmbient(1);
+    await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(1));
+    expect(generateScene).toHaveBeenCalledTimes(1);
+
+    resolveScene?.([]);
+    await Promise.all([first, second]);
+    director.stop();
+  });
+
+  it("stop clears every configured ambient worker timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const health = vi.fn(() => ({ connected: true, queueDepth: 0 }));
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        new RoomStore(`/tmp/director-ambient-worker-stop-${process.pid}-${Math.random()}.json`),
+        { health } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        { ambientConcurrency: 2 },
+      );
+      const internals = director as unknown as { ambientTimers: Map<number, NodeJS.Timeout> };
+
+      director.start();
+      expect(internals.ambientTimers.size).toBe(2);
+      director.stop();
+      expect(internals.ambientTimers.size).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(health).not.toHaveBeenCalled();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let a stale stopped worker release or reschedule a restarted worker's leases", async () => {
+    const now = Date.parse("2026-07-19T13:00:00.000Z");
+    let pendingCount = 0;
+    const releases: Array<() => void> = [];
+    const requests: Array<{ channelId: string; personaId?: string }> = [];
+    const generateScene = vi.fn((request: { channelId: string; selected?: Array<{ id: string }> }) => {
+      requests.push({ channelId: request.channelId, personaId: request.selected?.[0]?.id });
+      pendingCount += 1;
+      return new Promise<[]>((resolve) => releases.push(() => {
+        pendingCount -= 1;
+        resolve([]);
+      }));
+    });
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-ambient-lifecycle-${process.pid}-${Math.random()}.json`),
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: pendingCount })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        ambientConcurrency: 2,
+        consideredConversationChance: 0,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "ai-programming" ? 50 : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+    const internals = director as unknown as {
+      runAmbient: (workerId?: number) => Promise<void>;
+      ambientTimers: Map<number, NodeJS.Timeout>;
+      ambientChannelsInFlight: Map<string, symbol>;
+      ambientPersonasInFlight: Map<string, symbol>;
+    };
+
+    const stale = internals.runAmbient(0);
+    await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(1));
+    director.stop();
+    director.start();
+    const restartedTimers = new Map(internals.ambientTimers);
+
+    const current = internals.runAmbient(0);
+    await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(2));
+    expect(requests[1]).toEqual(requests[0]);
+    const channelId = requests[1]!.channelId;
+    const personaId = requests[1]!.personaId!;
+    const currentChannelLease = internals.ambientChannelsInFlight.get(channelId);
+    const currentPersonaLease = internals.ambientPersonasInFlight.get(personaId);
+
+    releases[0]?.();
+    await stale;
+
+    expect(internals.ambientChannelsInFlight.get(channelId)).toBe(currentChannelLease);
+    expect(internals.ambientPersonasInFlight.get(personaId)).toBe(currentPersonaLease);
+    expect([...internals.ambientTimers.entries()]).toEqual([...restartedTimers.entries()]);
+
+    await internals.runAmbient(1);
+    expect(generateScene).toHaveBeenCalledTimes(2);
+
+    releases[1]?.();
+    await current;
+    director.stop();
+  });
+
   it("retries a busy shared model queue after four seconds instead of the normal ambient interval", async () => {
     vi.useFakeTimers();
     try {
@@ -4846,6 +5127,51 @@ describe("social director", () => {
       vi.clearAllTimers();
       vi.useRealTimers();
     }
+  });
+
+  it("uses a spare background slot while one foreground prediction is active", async () => {
+    const now = Date.parse("2026-07-16T08:40:00.000Z");
+    const generateScene = vi.fn(async () => []);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-spare-background-${process.pid}-${Math.random()}.json`),
+      {
+        health: vi.fn(() => ({
+          connected: true,
+          queueDepth: 1,
+          activePredictions: 1,
+          activeBackgroundPredictions: 0,
+          maxConcurrentPredictions: 4,
+          maxBackgroundPredictions: 2,
+        })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        consideredConversationChance: 0,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "ai-programming" ? 50 : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+
+    await (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+
+    expect(generateScene).toHaveBeenCalledTimes(1);
+    director.stop();
   });
 
   it("preserves an ambient episode across live-work preemption and publishes it on the short retry", async () => {
@@ -6006,6 +6332,97 @@ describe("social director", () => {
     const seeds = ["trace one", "memory one", "trace two", "voice one", "memory two"];
     const families = ["observability", "memory", "observability", "voice", "memory"];
     expect(selectAmbientSeed(seeds, ["trace one", "memory one"], () => 0, families)).toBe("voice one");
+  });
+
+  it("keeps the full semantic cooldown authoritative while an ordinary family remains", () => {
+    const now = 10 * 60 * 60_000;
+    const pool = ambientSeedRotationPool([
+      {
+        premise: "an older but still cooling subject",
+        semanticKey: "older-key",
+        semanticFamily: "older-family",
+        sameAsPersistedCurrent: false,
+        coolingDown: true,
+        lastSeedUsedAt: now - AMBIENT_EXHAUSTED_SEED_REPEAT_FLOOR_MS - 1,
+        lastFamilyUsedAt: now - AMBIENT_EXHAUSTED_FAMILY_REPEAT_FLOOR_MS - 1,
+      },
+      {
+        premise: "a genuinely unused subject",
+        semanticKey: "unused-key",
+        semanticFamily: "unused-family",
+        sameAsPersistedCurrent: false,
+        coolingDown: false,
+      },
+    ], [], now);
+
+    expect(pool.map((candidate) => candidate.premise)).toEqual(["a genuinely unused subject"]);
+  });
+
+  it("recovers an exhausted catalogue through its least-recent family without repeating the last premise", () => {
+    const now = 10 * 60 * 60_000;
+    const pool = ambientSeedRotationPool([
+      {
+        premise: "the immediately previous premise",
+        semanticKey: "old-family-previous",
+        semanticFamily: "least-recent-family",
+        sameAsPersistedCurrent: false,
+        coolingDown: true,
+        lastSeedUsedAt: now - AMBIENT_EXHAUSTED_SEED_REPEAT_FLOOR_MS - 1,
+        lastFamilyUsedAt: now - AMBIENT_EXHAUSTED_FAMILY_REPEAT_FLOOR_MS - 15 * 60_000,
+      },
+      {
+        premise: "a different premise in the least-recent family",
+        semanticKey: "old-family-alternative",
+        semanticFamily: "least-recent-family",
+        sameAsPersistedCurrent: false,
+        coolingDown: true,
+        lastFamilyUsedAt: now - AMBIENT_EXHAUSTED_FAMILY_REPEAT_FLOOR_MS - 15 * 60_000,
+      },
+      {
+        premise: "a premise in a more recently used family",
+        semanticKey: "newer-family-key",
+        semanticFamily: "more-recent-family",
+        sameAsPersistedCurrent: false,
+        coolingDown: true,
+        lastSeedUsedAt: now - AMBIENT_EXHAUSTED_SEED_REPEAT_FLOOR_MS - 1,
+        lastFamilyUsedAt: now - AMBIENT_EXHAUSTED_FAMILY_REPEAT_FLOOR_MS - 5 * 60_000,
+      },
+    ], ["the immediately previous premise"], now);
+
+    expect(pool.map((candidate) => candidate.premise)).toEqual([
+      "a different premise in the least-recent family",
+    ]);
+    expect(selectAmbientSeed(
+      pool.map((candidate) => candidate.premise),
+      ["the immediately previous premise"],
+      () => 0,
+      pool.map((candidate) => candidate.semanticFamily),
+    )).toBe("a different premise in the least-recent family");
+  });
+
+  it("does not weaken exhausted-catalogue rotation before either repeat floor", () => {
+    const now = 10 * 60 * 60_000;
+    const pool = ambientSeedRotationPool([
+      {
+        premise: "family used too recently",
+        semanticKey: "fresh-family-key",
+        semanticFamily: "fresh-family",
+        sameAsPersistedCurrent: false,
+        coolingDown: true,
+        lastFamilyUsedAt: now - AMBIENT_EXHAUSTED_FAMILY_REPEAT_FLOOR_MS + 1,
+      },
+      {
+        premise: "exact seed used too recently",
+        semanticKey: "fresh-seed-key",
+        semanticFamily: "old-enough-family",
+        sameAsPersistedCurrent: false,
+        coolingDown: true,
+        lastSeedUsedAt: now - AMBIENT_EXHAUSTED_SEED_REPEAT_FLOOR_MS + 1,
+        lastFamilyUsedAt: now - AMBIENT_EXHAUSTED_FAMILY_REPEAT_FLOOR_MS - 1,
+      },
+    ], [], now);
+
+    expect(pool).toEqual([]);
   });
 
   it("prefers publication-derived least-recently-used families and exact seeds", () => {

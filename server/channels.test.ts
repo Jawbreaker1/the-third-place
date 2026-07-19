@@ -18,6 +18,7 @@ const NEW_ROOM_IDS = [
   "stock-market",
   "football-talk",
   "world-of-warcraft",
+  "fnaf",
   "3d-visualisation",
 ];
 const RESEARCH_ROOM_IDS = [
@@ -29,6 +30,7 @@ const RESEARCH_ROOM_IDS = [
   "stock-market",
   "football-talk",
   "world-of-warcraft",
+  "fnaf",
   "3d-visualisation",
   "side-quests",
 ];
@@ -41,6 +43,7 @@ const EXPECTED_AMBIENT_COUNTS: Record<string, number> = {
   "stock-market": 32,
   "football-talk": 40,
   "world-of-warcraft": 32,
+  fnaf: 40,
   "3d-visualisation": 32,
   "side-quests": 32,
 };
@@ -53,6 +56,7 @@ const EXPECTED_AMBIENT_FAMILY_COUNTS: Record<string, number> = {
   "stock-market": 8,
   "football-talk": 10,
   "world-of-warcraft": 8,
+  fnaf: 10,
   "3d-visualisation": 8,
   "side-quests": 9,
 };
@@ -110,7 +114,7 @@ describe("channel profiles", () => {
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
     }
     const allPremises = CHANNEL_PROFILES.flatMap((profile) => profile.ambientPremises.map(normalizedContentKey));
-    expect(allPremises).toHaveLength(344);
+    expect(allPremises).toHaveLength(384);
     expect(new Set(allPremises).size).toBe(allPremises.length);
   });
 
@@ -189,6 +193,7 @@ describe("channel profiles", () => {
     expect(profile("the-pub")).toMatchObject({ ambientMode: "banter", conversationRegister: "banter" });
     expect(profile("football-talk")).toMatchObject({ ambientMode: "banter", conversationRegister: "banter" });
     expect(profile("world-of-warcraft")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
+    expect(profile("fnaf")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
     expect(profile("side-quests")).toMatchObject({ ambientMode: "casual", conversationRegister: "everyday" });
     expect(profile("ai-programming").conversationRegister).toBe("technical");
     expect(profile("ai-hacking").conversationRegister).toBe("technical");
@@ -267,6 +272,9 @@ describe("channel profiles", () => {
     expect(matrix.get("football-talk")?.get("ai-vale")?.level).toBe("advanced");
     expect(matrix.get("football-talk")?.get("ai-ibrahim")?.level).toBe("advanced");
     expect(matrix.get("world-of-warcraft")?.get("ai-pixel")?.level).toBe("specialist");
+    expect(matrix.get("fnaf")?.get("ai-pixel")?.level).toBe("specialist");
+    expect(matrix.get("fnaf")?.get("ai-juno")?.level).toBe("advanced");
+    expect(matrix.get("fnaf")?.get("ai-tess")?.level).toBe("advanced");
     expect(matrix.get("3d-visualisation")?.get("ai-pixel")?.level).toBe("specialist");
     expect(matrix.get("the-pub")?.get("ai-juno")?.level).toBe("specialist");
   });
@@ -443,6 +451,65 @@ describe("channel profiles", () => {
     expect(football.autonomousResearchPriority).toBeLessThanOrEqual(4);
     expect(football.ambientActivityPriority).toBeGreaterThan(1);
     expect(football.ambientActivityPriority).toBeLessThanOrEqual(4);
+  });
+
+  it("gives fnaf deep fandom, collectible and source-backed current-topic coverage", () => {
+    const fnaf = CHANNEL_PROFILES.find((profile) => profile.public.id === "fnaf")!;
+
+    expect(fnaf).toMatchObject({
+      public: { name: "fnaf", icon: "🐻" },
+      expertiseDomain: "fnaf",
+      ambientMode: "casual",
+      conversationRegister: "fandom",
+      expertiseOverrides: {
+        "ai-pixel": { level: "specialist" },
+        "ai-juno": { level: "advanced" },
+        "ai-tess": { level: "advanced" },
+      },
+    });
+    expect(fnaf.topic.tags).toEqual(expect.arrayContaining([
+      "Five Nights at Freddy's",
+      "lore",
+      "animatronics",
+      "jumpscares",
+      "plushies",
+      "collectibles",
+      "YouTube",
+    ]));
+    expect(fnaf.topic.freshnessRule).toContain("require supplied fresh evidence");
+    expect(fnaf.topic.freshnessRule).toContain("fan theory");
+    expect(fnaf.topic.freshnessRule).toContain("must never be guessed");
+    expect(fnaf.conversationGuidance).toContain("not a wiki recital");
+    expect(fnaf.conversationGuidance).toContain("Collecting is a first-class topic");
+    expect(fnaf.conversationGuidance).toContain("Never invent owning a collection");
+
+    expect(fnaf.ambientPremises).toHaveLength(40);
+    expect(fnaf.ambientPremiseFamilies).toHaveLength(40);
+    expect(new Set(fnaf.ambientPremiseFamilies).size).toBe(10);
+    const collectingPremises = fnaf.ambientPremiseFamilies.filter((family) =>
+      ["fnaf-plush-design", "fnaf-collecting-culture", "fnaf-merch-quality"].includes(family),
+    );
+    expect(collectingPremises).toHaveLength(12);
+    expect(fnaf.ambientPremiseFamilies).toEqual(expect.arrayContaining([
+      "fnaf-lore-evidence",
+      "fnaf-gameplay-horror",
+      "fnaf-jumpscare-design",
+      "fnaf-film-adaptation",
+      "fnaf-fan-media",
+      "fnaf-origin-legacy",
+    ]));
+
+    expect(fnaf.autonomousResearchSeeds).toHaveLength(8);
+    expect(fnaf.autonomousResearchSeeds).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "fnaf-official-game-news", mode: "news" }),
+      expect.objectContaining({ id: "fnaf-official-plush-release", mode: "news" }),
+      expect.objectContaining({ id: "fnaf-creator-interview", mode: "web" }),
+      expect.objectContaining({ id: "fnaf-community-creation" }),
+    ]));
+    expect(fnaf.autonomousResearchPriority).toBeGreaterThan(1);
+    expect(fnaf.autonomousResearchPriority).toBeLessThanOrEqual(4);
+    expect(fnaf.ambientActivityPriority).toBeGreaterThan(1);
+    expect(fnaf.ambientActivityPriority).toBeLessThanOrEqual(4);
   });
 
   it("keeps stock-market discussion concrete and informal without weakening evidence boundaries", () => {

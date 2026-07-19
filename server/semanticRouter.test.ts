@@ -3155,6 +3155,10 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("never hearing verbs, keywords or translated phrase lists");
     expect(prompt).toContain("community_capability_contradiction");
     expect(prompt).toContain("output_language_mismatch");
+    expect(prompt).toContain(
+      "Bare assent, commiseration, shared encouragement and other brief social chorus in any language are clean",
+    );
+    expect(prompt).toContain("unless they also repeat substance");
     expect(prompt).not.toContain("ambient_action_mismatch");
     for (const issue of VOICE_CANDIDATE_REVIEW_ISSUES) {
       if (issue === "operational_scope_mismatch") expect(schema).not.toContain(issue);
@@ -4180,6 +4184,116 @@ describe("multilingual batch candidate-review contract", () => {
     expect(parseCandidateReviewContent(JSON.stringify(clean), fulfilled)).toEqual(clean);
   });
 
+  it("publishes a typed language-neutral same-scene overlap classification", () => {
+    const input = reviewInput();
+    const typedBriefWithConservativeIssue = {
+      reviews: [
+        {
+          personaId: input.candidates[0].personaId,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+          sameSceneOverlap: "none",
+          ...undeterminedOutputLanguage,
+        },
+        {
+          personaId: input.candidates[1].personaId,
+          severity: "high",
+          issues: ["peer_echo"],
+          rewriteInstruction: "Do not repeat the earlier contribution.",
+          sameSceneOverlap: "brief_social_chorus",
+          ...undeterminedOutputLanguage,
+        },
+      ],
+    };
+
+    expect(parseCandidateReviewContent(
+      JSON.stringify(typedBriefWithConservativeIssue),
+      input,
+    )).toEqual(typedBriefWithConservativeIssue);
+    const inconsistentPeerEcho = {
+      reviews: typedBriefWithConservativeIssue.reviews.map((review, index) => index === 1
+        ? { ...review, sameSceneOverlap: "none" }
+        : review),
+    };
+    expect(parseCandidateReviewContent(
+      JSON.stringify(inconsistentPeerEcho),
+      input,
+    )).toEqual({
+      reviews: inconsistentPeerEcho.reviews.map((review, index) => index === 1
+        ? { ...review, sameSceneOverlap: "substantive_overlap" }
+        : review),
+    });
+    const missingOverlap = {
+      reviews: typedBriefWithConservativeIssue.reviews.map((review, index) => index === 1
+        ? {
+            personaId: review.personaId,
+            severity: review.severity,
+            issues: review.issues,
+            rewriteInstruction: review.rewriteInstruction,
+            outputLanguage: review.outputLanguage,
+          }
+        : review),
+    };
+    expect(parseCandidateReviewContent(JSON.stringify(missingOverlap), input)).toEqual({
+      reviews: missingOverlap.reviews.map((review, index) => index === 1
+        ? { ...review, sameSceneOverlap: "substantive_overlap" }
+        : review),
+    });
+    const malformedBlockingPeerEcho = {
+      reviews: typedBriefWithConservativeIssue.reviews.map((review, index) => index === 1
+        ? {
+            personaId: review.personaId,
+            severity: "none",
+            issues: ["peer_echo"],
+            rewriteInstruction: null,
+            sameSceneOverlap: "none",
+            outputLanguage: review.outputLanguage,
+          }
+        : review),
+    };
+    expect(parseCandidateReviewContent(JSON.stringify(malformedBlockingPeerEcho), input)).toEqual({
+      reviews: malformedBlockingPeerEcho.reviews.map((review, index) => index === 1
+        ? {
+            ...review,
+            severity: "high",
+            sameSceneOverlap: "substantive_overlap",
+            rewriteInstruction: "Remove the pure semantic duplication and make a distinct conversational move.",
+          }
+        : review),
+    });
+    const cleanSubstantiveOverlap = {
+      reviews: typedBriefWithConservativeIssue.reviews.map((review, index) => index === 1
+        ? {
+            ...review,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            sameSceneOverlap: "substantive_overlap",
+          }
+        : review),
+    };
+    expect(parseCandidateReviewContent(
+      JSON.stringify(cleanSubstantiveOverlap),
+      input,
+    )).toEqual(cleanSubstantiveOverlap);
+
+    const format = buildCandidateReviewResponseFormat(input) as any;
+    const item = format.json_schema.schema.properties.reviews.items;
+    expect(item.required).toContain("sameSceneOverlap");
+    expect(item.properties.sameSceneOverlap.enum).toEqual([
+      "none",
+      "brief_social_chorus",
+      "substantive_overlap",
+    ]);
+    for (const prompt of [buildCandidateReviewSystemPrompt(), buildVoiceCandidateReviewSystemPrompt()]) {
+      expect(prompt).toContain("sameSceneOverlap");
+      expect(prompt).toContain("brief_social_chorus");
+      expect(prompt).toContain("substantive_overlap");
+      expect(prompt).toContain("in any language");
+    }
+  });
+
   it("explicitly reviews asserted meaning rather than multilingual keyword hits", () => {
     const prompt = buildCandidateReviewSystemPrompt();
     expect(prompt).toContain("directly in the language and cultural register of the turn");
@@ -4210,6 +4324,10 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("visibleAffect permits a brief genuine feeling");
     expect(prompt).toContain("Informal fragments, elongation, self-correction, rough orthography, harmless typos");
     expect(prompt).toContain("Never formalize them or alter names");
+    expect(prompt).toContain(
+      "This exemption is decisive for bare assent, commiseration, shared encouragement and any other terse social chorus in any language",
+    );
+    expect(prompt).toContain("flag only when the line also repeats substantive propositional content");
     expect(prompt).toContain("diegetic_identity_break");
     expect(prompt).toContain("residents are diegetically unaware of the product implementation");
     expect(prompt).toContain("in-character denial, disbelief, joke, deflection, human self-identification");

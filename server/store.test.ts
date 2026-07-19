@@ -95,6 +95,32 @@ describe("room history", () => {
     expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
   });
 
+  it("migrates existing history with a collectible-led fnaf opening exactly once", async () => {
+    const filePath = tempStorePath();
+    const existing = createMessage("lobby", "human-returning", "preserve this pre-fnaf history");
+    await writeFile(filePath, JSON.stringify({ version: 1, messages: [existing] }), "utf8");
+
+    const migrated = new RoomStore(filePath);
+    await migrated.load();
+    const fnafMessages = migrated.getRecent("fnaf", 50);
+    const firstFnafIds = fnafMessages.map((message) => message.id);
+
+    expect(fnafMessages).toHaveLength(3);
+    expect(new Set(fnafMessages.map((message) => message.authorId))).toEqual(
+      new Set(["ai-pixel", "ai-tess", "ai-bosse"]),
+    );
+    expect(fnafMessages.some((message) => message.content.includes("plush"))).toBe(true);
+    expect(fnafMessages.some((message) =>
+      message.reactions?.some((reaction) => reaction.emoji === "👀"),
+    )).toBe(true);
+    expect(migrated.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+
+    const reloaded = new RoomStore(filePath);
+    await reloaded.load();
+    expect(reloaded.getRecent("fnaf", 50).map((message) => message.id)).toEqual(firstFnafIds);
+    expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+  });
+
   it("returns stable chronological pages before a composite cursor", async () => {
     const store = tempStore();
     for (let index = 0; index < 95; index += 1) {

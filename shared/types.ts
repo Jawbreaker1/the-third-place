@@ -237,6 +237,14 @@ export interface ServerHealth {
     label: string;
     latencyMs?: number;
     queueDepth: number;
+    /** Predictions currently executing in the configured model backend. */
+    activePredictions?: number;
+    /** Active optional/background predictions that may yield to live turns. */
+    activeBackgroundPredictions?: number;
+    /** Local scheduler ceiling; the backend may enforce an additional shared limit. */
+    maxConcurrentPredictions?: number;
+    /** Background ceiling that deliberately reserves capacity for live turns. */
+    maxBackgroundPredictions?: number;
     provider?: "lmstudio" | "codex";
   };
   onlineHumans: number;

@@ -81,6 +81,7 @@ describe("persistent admin overlay state", () => {
     expect(initial.automation.autonomousLinkChannelIds).toContain("the-pub");
     expect(initial.automation.autonomousLinkChannelIds).toContain("football-talk");
     expect(initial.automation.autonomousLinkChannelIds).toContain("ai-hacking");
+    expect(initial.automation.autonomousLinkChannelIds).toContain("fnaf");
     expect(initial.channels.some((channel) => channel.id === "lobby")).toBe(true);
     expect(initial.personas.every((persona) => persona.fictionalAdult)).toBe(true);
     expect(store.isRomanceEligibleResident("ai-mira")).toBe(true);
@@ -95,6 +96,12 @@ describe("persistent admin overlay state", () => {
       register: "banter",
       mode: "banter",
       seeds: expect.arrayContaining([expect.stringContaining("pressing trigger")]),
+    });
+    expect(initial.channels.find((channel) => channel.id === "fnaf")).toMatchObject({
+      name: "fnaf",
+      register: "fandom",
+      mode: "casual",
+      seeds: expect.arrayContaining([expect.stringContaining("plush")]),
     });
 
     await store.createChannel(customChannel());
