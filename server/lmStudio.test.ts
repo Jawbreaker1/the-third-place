@@ -4516,6 +4516,75 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(bodies.some((body) => body.messages[0].content.includes("one-pass copy editor"))).toBe(false);
   });
 
+  it("carries trusted channel-feed facts separately through generation and candidate review", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{
+            personaId: vale.id,
+            content: "MarketWire har OMXS30 på 2 534,20, upp 1,25 procent mot föregående stängning.",
+          }])
+        : candidateReviewCompletion([{
+            personaId: vale.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            outputLanguage: { tag: "sv", confidence: 0.99 },
+          }]);
+    }));
+
+    const channelFeedContext = {
+      publisherName: "MarketWire",
+      updatedAt: "2026-07-18T21:30:00.000Z",
+      content:
+        "OMXS30: 2534.20 index points; +1.25% versus previous close; observed 2026-07-18T15:30:00.000Z; trading date 2026-07-18; freshness previous_session.",
+    };
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [vale],
+      history: [{
+        author: "Mira",
+        kind: "ai",
+        content: "Bruttomarginalen säger mer än kursgrafen här.",
+        createdAt: "2026-07-18T21:29:00.000Z",
+      }],
+      channelFeedContext,
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({ personaId: vale.id })]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].messages[0].content).toContain(
+      "trustedChannelFeedContext is server-validated, channel-local factual grounding",
+    );
+    const generationPayload = JSON.parse(bodies[0].messages[1].content);
+    expect(generationPayload.trustedChannelFeedContext).toEqual(channelFeedContext);
+    expect(generationPayload.freshResearch).toBeNull();
+    expect(generationPayload.recentTranscript).toEqual([
+      expect.objectContaining({ author: "Mira", content: "Bruttomarginalen säger mer än kursgrafen här." }),
+    ]);
+    expect(JSON.stringify(generationPayload.recentTranscript)).not.toContain("MarketWire");
+
+    expect(bodies[1].messages[0].content).toContain(
+      "channelFeedContext.content is separately server-validated bounded factual evidence",
+    );
+    const reviewPayload = JSON.parse(bodies[1].messages[1].content);
+    expect(reviewPayload.channelFeedContext).toEqual(channelFeedContext);
+    expect(reviewPayload.evidence).toEqual({ outcome: "none", kind: null, query: null, results: [] });
+  });
+
   it("recovers a multilingual false voice-chat denial from structured community capability truth", async () => {
     process.env.CANDIDATE_REVIEW_ENABLED = "true";
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;

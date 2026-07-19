@@ -9535,4 +9535,195 @@ describe("social director", () => {
       vi.useRealTimers();
     }
   });
+
+  it("passes the latest typed stock-market feed context to a human-triggered scene", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-19T14:10:00.000Z");
+      vi.setSystemTime(now);
+      const human = {
+        id: "guest-market-wire-human-context",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const store = new RoomStore(`/tmp/director-market-wire-human-${process.pid}-${Math.random()}.json`);
+      const incoming = createMessage(
+        "stock-market",
+        human.id,
+        "Hur tolkar ni börsläget?",
+        { createdAt: new Date(now).toISOString() },
+      );
+      store.addPublicMessage(incoming);
+      let feedFact = {
+        publisherName: "MarketWire",
+        content: "OLD_FEED_REVISION_7 OMXS30 3000.00 index points.",
+        updatedAt: "2026-07-19T13:30:00.000Z",
+      };
+      const channelFeedFacts = vi.fn((channelId: string) =>
+        channelId === "stock-market" ? feedFact : undefined,
+      );
+      const sceneRequests: Array<{
+        history: Array<{ author: string; kind: string; content: string }>;
+        channelFeedContext?: { publisherName: string; content: string; updatedAt: string };
+      }> = [];
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        history: Array<{ author: string; kind: string; content: string }>;
+        channelFeedContext?: { publisherName: string; content: string; updatedAt: string };
+      }) => {
+        sceneRequests.push({
+          history: request.history.map((line) => ({ ...line })),
+          channelFeedContext: request.channelFeedContext
+            ? { ...request.channelFeedContext }
+            : undefined,
+        });
+        return [{
+          personaId: request.selected[0]!.id,
+          content: "Det senaste rapporterade läget är värt att jämföra med föregående stängning.",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          analyzeTurn: vi.fn(async () => classifiedTurn({
+            intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.99 },
+          })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0.99,
+          channelFeedFacts,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({
+              requestedAt: new Date(now).toISOString(),
+              candidates: [],
+            })),
+          } as never,
+        },
+      );
+
+      feedFact = {
+        publisherName: "MarketWire",
+        content: "CURRENT_FEED_REVISION_8 OMXS30 3146.94 index points.",
+        updatedAt: "2026-07-19T14:05:00.000Z",
+      };
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      await pending;
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(channelFeedFacts).toHaveBeenCalledWith("stock-market");
+      expect(sceneRequests[0]?.channelFeedContext).toEqual(feedFact);
+      expect(sceneRequests[0]?.channelFeedContext?.content).toContain("CURRENT_FEED_REVISION_8");
+      expect(sceneRequests[0]?.channelFeedContext?.content).not.toContain("OLD_FEED_REVISION_7");
+      const history = sceneRequests[0]!.history;
+      expect(history.some((line) => /(?:CURRENT|OLD)_FEED_REVISION/.test(line.content))).toBe(false);
+      expect(history.at(-1)).toMatchObject({
+        author: human.name,
+        kind: "human",
+        content: incoming.content,
+      });
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("passes the latest typed stock-market feed context to an ambient scene", async () => {
+    const now = Date.parse("2026-07-19T14:20:00.000Z");
+    let feedFact = {
+      publisherName: "MarketWire",
+      content: "OLD_AMBIENT_FEED_REVISION_11 OMXS30 3000.00 index points.",
+      updatedAt: "2026-07-19T13:30:00.000Z",
+    };
+    const channelFeedFacts = vi.fn((channelId: string) =>
+      channelId === "stock-market" ? feedFact : undefined,
+    );
+    const sceneRequests: Array<{
+      channelId: string;
+      history: Array<{ author: string; kind: string; content: string }>;
+      channelFeedContext?: { publisherName: string; content: string; updatedAt: string };
+    }> = [];
+    const generateScene = vi.fn(async (request: {
+      channelId: string;
+      history: Array<{ author: string; kind: string; content: string }>;
+      channelFeedContext?: { publisherName: string; content: string; updatedAt: string };
+    }) => {
+      sceneRequests.push({
+        channelId: request.channelId,
+        history: request.history.map((line) => ({ ...line })),
+        channelFeedContext: request.channelFeedContext
+          ? { ...request.channelFeedContext }
+          : undefined,
+      });
+      return [];
+    });
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-market-wire-ambient-${process.pid}-${Math.random()}.json`),
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0.5,
+        channelFeedFacts,
+        consideredConversationChance: 0,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "stock-market" ? 50 : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+
+    feedFact = {
+      publisherName: "MarketWire",
+      content: "CURRENT_AMBIENT_FEED_REVISION_12 OMXS30 3146.94 index points.",
+      updatedAt: "2026-07-19T14:15:00.000Z",
+    };
+    await (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+
+    expect(generateScene).toHaveBeenCalledTimes(1);
+    expect(channelFeedFacts).toHaveBeenCalledWith("stock-market");
+    expect(sceneRequests[0]?.channelId).toBe("stock-market");
+    expect(sceneRequests[0]?.channelFeedContext).toEqual(feedFact);
+    expect(sceneRequests[0]?.channelFeedContext?.content).toContain("CURRENT_AMBIENT_FEED_REVISION_12");
+    expect(sceneRequests[0]?.channelFeedContext?.content).not.toContain("OLD_AMBIENT_FEED_REVISION_11");
+    const history = sceneRequests[0]!.history;
+    expect(history.some((line) => /(?:CURRENT|OLD)_AMBIENT_FEED_REVISION/.test(line.content))).toBe(false);
+    director.stop();
+  });
 });
