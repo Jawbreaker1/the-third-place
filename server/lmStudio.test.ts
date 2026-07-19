@@ -10,6 +10,7 @@ import {
   resolveSceneRelationshipStylePlans,
   LmStudioClient,
   sanitizeObservationText,
+  textActorModelWorkScope,
   type GeneratedLine,
   type SceneRequest,
 } from "./lmStudio.js";
@@ -71,7 +72,7 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
     history: [],
   });
 
-  it("runs two background rooms in parallel while reserving live and voice capacity", async () => {
+  it("uses all text lanes without voice demand and yields one background lane when voice arrives", async () => {
     const startedRooms: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
       if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
@@ -97,32 +98,86 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
     await vi.waitFor(() => expect(startedRooms).toHaveLength(2));
 
     work.push(lm.generateScene(sceneFor("public", "public-a"), 1));
-    // A low-priority non-voice item must not consume the slot reserved for a
-    // live voice turn or evict useful background work merely to fill it.
+    // With no actual voice demand, text is work-conserving and may use the
+    // fourth provider lane instead of leaving it permanently idle.
     work.push(lm.generateScene(sceneFor("public", "public-b"), 4));
     work.slice(3).forEach((pending) => void pending.catch(() => undefined));
-    await vi.waitFor(() => expect(startedRooms).toHaveLength(3));
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(4));
 
     work.push(lm.generateScene(sceneFor("voice", "voice-a"), 0));
     void work.at(-1)?.catch(() => undefined);
-    await vi.waitFor(() => expect(startedRooms).toHaveLength(4));
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(5));
 
     expect(startedRooms).toContain("ambient-a");
     expect(startedRooms).toContain("ambient-b");
     expect(startedRooms).not.toContain("ambient-c");
     expect(startedRooms).toContain("public-a");
-    expect(startedRooms).not.toContain("public-b");
+    expect(startedRooms).toContain("public-b");
     expect(startedRooms).toContain("voice-a");
     expect(lm.health()).toMatchObject({
       activePredictions: 4,
-      activeBackgroundPredictions: 2,
+      activeBackgroundPredictions: 1,
       maxConcurrentPredictions: 4,
       maxBackgroundPredictions: 2,
-      queueDepth: 6,
+      queueDepth: 5,
     });
 
     lm.cancelPending("parallel scheduling test complete");
     await Promise.allSettled(work);
+    await vi.waitFor(() => expect(lm.health().queueDepth).toBe(0));
+  });
+
+  it("reclaims one non-durable public lane for first voice demand while protecting a durable reply", async () => {
+    let nextCallId = 0;
+    const abortedCallIds: number[] = [];
+    let voiceCalls = 0;
+    const complete = vi.fn(async (body: Record<string, unknown>, signal: AbortSignal) => {
+      const callId = nextCallId++;
+      const messages = body.messages as Array<{ content?: string }> | undefined;
+      if (messages?.[0]?.content?.includes("semantic router")) voiceCalls += 1;
+      return await new Promise<unknown>((_resolve, reject) => {
+        const abort = () => {
+          abortedCallIds.push(callId);
+          reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+        };
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      });
+    });
+    const backend: ModelBackend = {
+      providerId: "lmstudio",
+      configuredModel: "test-model",
+      probe: async () => ({ connected: true, id: "test-model", label: "test model" }),
+      complete,
+    };
+    const lm = new LmStudioClient({
+      backend,
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const publicWork = Array.from({ length: 4 }, (_, index) => lm.generateScene({
+      ...sceneFor("public", `public-${index + 1}`),
+      trigger: {
+        authorId: `human-${index + 1}`,
+        author: `Human ${index + 1}`,
+        content: "answer me",
+      },
+    }, 1, undefined, { durableDelivery: index === 0 }));
+    publicWork.forEach((pending) => void pending.catch(() => undefined));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(4));
+
+    const voice = lm.analyzeTurn(voiceTurnInput("voice-needs-elastic-lane"), {
+      supersessionScope: { kind: "voice-room", id: "elastic-room" },
+    });
+    await vi.waitFor(() => expect(voiceCalls).toBe(1));
+
+    // Call 0 belongs to the durable public reply. The oldest eligible call is
+    // call 1, so voice gains a lane without discarding the direct obligation.
+    expect(abortedCallIds).toEqual([1]);
+    expect(lm.health()).toMatchObject({ activePredictions: 4, maxConcurrentPredictions: 4 });
+
+    lm.cancelPending("elastic voice reservation test complete");
+    await Promise.allSettled([...publicWork, voice]);
     await vi.waitFor(() => expect(lm.health().queueDepth).toBe(0));
   });
 
@@ -343,6 +398,55 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
     await Promise.allSettled(scenes);
   });
 
+  it("admits and dispatches a second participant fairly when one actor fills the bounded router queue", async () => {
+    const blockerController = new AbortController();
+    const startedActors: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      if (!system.includes("semantic router")) {
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      const payload = JSON.parse(String(body.messages?.[1]?.content));
+      startedActors.push(String(payload.latestMessage.authorId));
+      return turnAnalysisCompletion();
+    }));
+
+    const lm = new LmStudioClient({ maxConcurrentPredictions: 1 });
+    const blocker = lm.generateScene(sceneFor("public", "fairness-blocker"), 0, blockerController.signal);
+    void blocker.catch(() => undefined);
+    await vi.waitFor(() => expect(lm.health().activePredictions).toBe(1));
+
+    const actorATurns = Array.from({ length: 8 }, (_, index) => {
+      const base = turnInput(`fairness-a-${index}`);
+      return lm.analyzeTurn(turnAnalysisInputSchema.parse({
+        ...base,
+        channel: { id: `fairness-room-${index}`, name: `fairness-room-${index}` },
+        latestMessage: { ...base.latestMessage, authorId: "human-a", authorName: "A" },
+      }));
+    });
+    actorATurns.forEach((pending) => void pending.catch(() => undefined));
+    expect(lm.health().queueDepth).toBe(9);
+
+    const baseB = turnInput("fairness-b");
+    const actorB = lm.analyzeTurn(turnAnalysisInputSchema.parse({
+      ...baseB,
+      channel: { id: "fairness-room-b", name: "fairness-room-b" },
+      latestMessage: { ...baseB.latestMessage, authorId: "human-b", authorName: "B" },
+    }));
+    blockerController.abort(new Error("release fairness blocker"));
+    await expect(actorB).resolves.toMatchObject({ source: "lm", failureReason: null });
+    expect(startedActors.slice(0, 2)).toEqual(["human-a", "human-b"]);
+
+    lm.cancelPending("fairness admission test complete");
+    await Promise.allSettled([blocker, ...actorATurns]);
+  });
+
   it("reuses a completed text router slot without preempting useful background work", async () => {
     const abortedChannels: string[] = [];
     const blockingRooms: string[] = [];
@@ -390,6 +494,62 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
 
     lm.cancelPending("text router continuation test complete");
     await Promise.allSettled(blockers);
+  });
+
+  it("hands a routed public turn to its answer before a same-priority router flood", async () => {
+    const order: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      if (system.includes("semantic router")) {
+        const payload = JSON.parse(String(body.messages?.[1]?.content));
+        order.push(`route:${payload.latestMessage.authorId}`);
+        return turnAnalysisCompletion();
+      }
+      order.push("answer:human-a");
+      return completionResponse([{
+        personaId: "ai-sana",
+        content: "A gets the bounded next answer turn.",
+      }]);
+    }));
+    const lm = new LmStudioClient({ maxConcurrentPredictions: 1 });
+    const routeA = turnAnalysisInputSchema.parse({
+      ...turnInput("continuation-a"),
+      channel: { id: "continuation-room", name: "continuation-room" },
+      latestMessage: {
+        ...turnInput("continuation-a").latestMessage,
+        authorId: "human-a",
+        authorName: "A",
+      },
+    });
+    const routeB = turnAnalysisInputSchema.parse({
+      ...turnInput("continuation-b"),
+      channel: { id: "other-room", name: "other-room" },
+      latestMessage: {
+        ...turnInput("continuation-b").latestMessage,
+        authorId: "human-b",
+        authorName: "B",
+      },
+    });
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const answerA = lm.analyzeTurn(routeA).then(async () => await lm.generateScene({
+      kind: "public",
+      channelId: "continuation-room",
+      channelName: "continuation-room",
+      selected: [sana],
+      history: [],
+      trigger: { authorId: "human-a", author: "A", content: "answer me" },
+    }, 2, undefined, {
+      continuationOf: textActorModelWorkScope("public", "continuation-room", "human-a"),
+    }));
+    const routedB = lm.analyzeTurn(routeB);
+
+    await expect(answerA).resolves.toEqual([
+      expect.objectContaining({ personaId: sana.id, content: "A gets the bounded next answer turn." }),
+    ]);
+    await expect(routedB).resolves.toMatchObject({ source: "lm", failureReason: null });
+    expect(order).toEqual(["route:human-a", "answer:human-a", "route:human-b"]);
   });
 
   it("reuses a completed scene slot for immediate recovery without preempting background work", async () => {
@@ -2085,17 +2245,54 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       channelName: "lobby",
       selected: [sana],
       history: [],
+      trigger: { authorId: "human-jaw-b", author: "Jaw_B", content: "older turn" },
     }, 0);
     await sceneStarted;
 
     const newerTurn = lm.analyzeTurn(turnInput("same-channel-follow-up"));
 
-    await expect(staleScene).rejects.toThrow("newer same-channel turn");
+    await expect(staleScene).rejects.toThrow("newer turn from the same actor in this channel");
     await expect(newerTurn).resolves.toMatchObject({
       source: "lm",
       failureReason: null,
       evidence: { action: "read_url" },
     });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("keeps another human's active router alive in the same public channel", async () => {
+    let releaseFirst: ((response: Response) => void) | undefined;
+    const firstResponse = new Promise<Response>((resolve) => { releaseFirst = resolve; });
+    let firstAborted = false;
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        init?.signal?.addEventListener("abort", () => { firstAborted = true; }, { once: true });
+        return await firstResponse;
+      }
+      return turnAnalysisCompletion();
+    }));
+    const firstInput = turnInput("same-room-first-human");
+    const secondInput = turnAnalysisInputSchema.parse({
+      ...turnInput("same-room-second-human"),
+      latestMessage: {
+        ...turnInput("same-room-second-human").latestMessage,
+        authorId: "human-alex",
+        authorName: "Alex",
+      },
+    });
+    const lm = new LmStudioClient({ maxConcurrentPredictions: 2 });
+    const first = lm.analyzeTurn(firstInput);
+    await vi.waitFor(() => expect(completionCalls).toBe(1));
+
+    const second = lm.analyzeTurn(secondInput);
+    await expect(second).resolves.toMatchObject({ source: "lm", failureReason: null });
+    expect(firstAborted).toBe(false);
+    releaseFirst?.(turnAnalysisCompletion());
+    await expect(first).resolves.toMatchObject({ source: "lm", failureReason: null });
+    expect(firstAborted).toBe(false);
     expect(completionCalls).toBe(2);
   });
 
@@ -2174,12 +2371,13 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       selected: [mira],
       history: [],
       mustReplyIds: [mira.id],
+      trigger: { authorId: "human-jaw-b", author: "Jaw_B", content: "older DM turn" },
     }, 0);
     await sceneStarted;
 
     const newerTurn = lm.analyzeTurn(dmTurnInput("newer-dm-after-scene", channelId));
 
-    await expect(staleScene).rejects.toThrow("newer same-channel turn");
+    await expect(staleScene).rejects.toThrow("newer turn from the same actor in this channel");
     await expect(newerTurn).resolves.toMatchObject({
       source: "lm",
       failureReason: null,
@@ -2222,7 +2420,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       evidence: { action: "none" },
     });
     expect(firstAbortReason).toMatchObject({
-      message: expect.stringContaining("newer same-channel turn"),
+      message: expect.stringContaining("newer turn from the same actor in this channel"),
     });
     await expect(newerAnalysis).resolves.toMatchObject({
       source: "lm",
@@ -2385,11 +2583,12 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       channelName: "lobby",
       selected: [sana],
       history: [],
+      trigger: { authorId: "human-jaw-b", author: "Jaw_B", content: "older queued turn" },
     }, 2);
 
     const newerTurn = lm.analyzeTurn(turnInput("queued-same-channel-follow-up"));
 
-    await expect(staleQueuedScene).rejects.toThrow("newer same-channel turn");
+    await expect(staleQueuedScene).rejects.toThrow("newer turn from the same actor in this channel");
     expect(completionCalls).toBe(1);
     unrelatedController.abort(new Error("unrelated room complete"));
     await expect(unrelatedScene).rejects.toThrow("unrelated room complete");
@@ -8363,6 +8562,45 @@ describe("LM Studio room prompt", () => {
       actorChannelNotes: Record<string, string>;
     };
     expect(sceneData.actorChannelNotes).toEqual({});
+  });
+
+  it("never serializes the execution-only trigger actor ID to generation or review", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const executionOnlyActorId = "HUMAN_EXECUTION_SCOPE_SENTINEL_9173";
+    const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      bodies.push(body);
+      if (body.messages[0]?.content.includes("publication reviewer")) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+        }]);
+      }
+      return completionResponse([{ personaId: mira.id, content: "japp, jag hör dig" }]);
+    }));
+
+    await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: {
+        authorId: executionOnlyActorId,
+        author: "Alex",
+        content: "är du där?",
+        messageId: "trigger-with-private-execution-key",
+      },
+      mustReplyIds: [mira.id],
+    });
+
+    expect(bodies.length).toBeGreaterThanOrEqual(2);
+    for (const body of bodies) expect(JSON.stringify(body)).not.toContain(executionOnlyActorId);
   });
 
   it("isolates resident-private context through generation and review in a multi-actor scene", async () => {

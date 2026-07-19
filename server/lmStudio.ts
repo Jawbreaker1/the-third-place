@@ -328,6 +328,8 @@ export interface SceneRequest {
   channelFeedGrounded?: boolean;
   roomRecall?: RoomRecallEvidence;
   trigger?: {
+    /** Stable server actor ID used only for actor-local cancellation/fairness. */
+    authorId?: string;
     author: string;
     content: string;
     messageId?: string;
@@ -854,16 +856,26 @@ type QueueItem =
  * being allowed to cancel one another.
  */
 export interface ModelWorkScope {
-  kind: "voice-room";
+  kind: "voice-room" | "text-actor";
   id: string;
 }
+
+/** Stable, execution-only scope for one human's live text work in one room. */
+export const textActorModelWorkScope = (
+  medium: "public" | "dm",
+  channelId: string,
+  actorId: string,
+): ModelWorkScope => ({
+  kind: "text-actor",
+  id: `${medium}\u0000${channelId}\u0000${actorId}`,
+});
 
 export interface TurnAnalysisExecutionOptions {
   /** A newer analysis in the same scope supersedes queued and in-flight work. */
   supersessionScope?: ModelWorkScope;
   /** Cancels this caller's queued or in-flight analysis immediately. */
   signal?: AbortSignal;
-  /** Prevent same-channel text turns from discarding this durable obligation. */
+  /** Prevent newer text turns from the same actor and room from discarding this durable obligation. */
   durableDelivery?: boolean;
 }
 
@@ -874,16 +886,16 @@ export interface SceneGenerationExecutionOptions {
    * preempts an already running call.
    */
   continuationOf?: ModelWorkScope;
-  /** Prevent newer same-channel text routing from discarding this durable obligation. */
+  /** Prevent newer text routing from the same actor and room from discarding this durable obligation. */
   durableDelivery?: boolean;
   /** Marks optional generated texture that may be dropped to protect live human latency. */
   preemptibleBackground?: boolean;
 }
 
-// Turn analyses use -10. A ready voice continuation uses one higher scheduler
+// Turn analyses use -10. A ready live continuation uses one higher scheduler
 // band so routing and speaking alternate under burst load instead of routing
-// every newer room before anybody is allowed to answer.
-const VOICE_CONTINUATION_QUEUE_PRIORITY = -11;
+// every newer participant before anybody is allowed to answer.
+const LIVE_CONTINUATION_QUEUE_PRIORITY = -11;
 
 const sameModelWorkScope = (
   left: ModelWorkScope | undefined,
@@ -891,12 +903,29 @@ const sameModelWorkScope = (
 ): boolean => Boolean(left && right && left.kind === right.kind && left.id === right.id);
 
 const queueSortPriority = (item: QueueItem): number =>
-  item.type === "scene" && item.continuationOf?.kind === "voice-room"
-    ? Math.min(item.priority, VOICE_CONTINUATION_QUEUE_PRIORITY)
+  item.type === "scene" && item.continuationOf
+    ? Math.min(item.priority, LIVE_CONTINUATION_QUEUE_PRIORITY)
     : item.priority;
 
 const compareQueueItems = (left: QueueItem, right: QueueItem): number =>
   queueSortPriority(left) - queueSortPriority(right) || left.id - right.id;
+
+const liveQueueActorKey = (item: QueueItem): string | undefined => {
+  if (item.type === "turn-analysis") {
+    return item.input.medium === "public" || item.input.medium === "dm"
+      ? item.input.latestMessage.authorId
+      : item.supersessionScope?.kind === "voice-room"
+        ? `voice:${item.supersessionScope.id}`
+        : undefined;
+  }
+  if (item.type !== "scene") return undefined;
+  if (item.request.kind === "public" || item.request.kind === "dm") {
+    return item.request.trigger?.authorId;
+  }
+  return item.request.kind === "voice" && item.continuationOf?.kind === "voice-room"
+    ? `voice:${item.continuationOf.id}`
+    : undefined;
+};
 
 class LmHttpError extends Error {
   constructor(
@@ -2157,6 +2186,8 @@ export class LmStudioClient {
   private queue: QueueItem[] = [];
   private dispatching = false;
   private nextQueueId = 1;
+  private dispatchSequence = 0;
+  private readonly lastDispatchSequenceByLiveActor = new Map<string, number>();
   private readonly activeWork = new Map<number, ActiveQueueWork>();
   private readonly maxConcurrentPredictions: number;
   private readonly maxBackgroundPredictions: number;
@@ -2302,6 +2333,17 @@ export class LmStudioClient {
     return count;
   }
 
+  private hasReservedVoiceDemand(): boolean {
+    for (const work of this.activeWork.values()) {
+      if (
+        !work.releasing &&
+        !work.abort?.signal.aborted &&
+        this.isReservedVoiceItem(work.item)
+      ) return true;
+    }
+    return this.queue.some((item) => this.isReservedVoiceItem(item));
+  }
+
   private activeCountsAfterPendingReleases(): {
     total: number;
     background: number;
@@ -2330,7 +2372,11 @@ export class LmStudioClient {
   private hasExecutionCapacity(background: boolean, reservedVoice: boolean): boolean {
     if (this.activeWork.size >= this.maxConcurrentPredictions) return false;
     if (background && this.activeBackgroundCount() >= this.maxBackgroundPredictions) return false;
-    if (!reservedVoice && this.activeNonVoiceCount() >= this.maxNonVoicePredictions) return false;
+    if (
+      !reservedVoice &&
+      this.hasReservedVoiceDemand() &&
+      this.activeNonVoiceCount() >= this.maxNonVoicePredictions
+    ) return false;
     return true;
   }
 
@@ -2340,10 +2386,11 @@ export class LmStudioClient {
     incomingPriority: number,
   ): boolean {
     const active = this.activeCountsAfterPendingReleases();
+    const voiceDemand = reservedVoice || this.hasReservedVoiceDemand();
     const canFit = (candidateBackground: boolean, candidateReservedVoice: boolean): boolean =>
       active.total < this.maxConcurrentPredictions &&
       (!candidateBackground || active.background < this.maxBackgroundPredictions) &&
-      (candidateReservedVoice || active.nonVoice < this.maxNonVoicePredictions);
+      (!voiceDemand || candidateReservedVoice || active.nonVoice < this.maxNonVoicePredictions);
     const pending = this.queue.map((item) => ({
       background: this.isBackgroundItem(item),
       reservedVoice: this.isReservedVoiceItem(item),
@@ -2381,6 +2428,66 @@ export class LmStudioClient {
 
   private canStart(item: QueueItem): boolean {
     return this.hasExecutionCapacity(this.isBackgroundItem(item), this.isReservedVoiceItem(item));
+  }
+
+  /**
+   * Work-conserving actor round-robin inside the highest runnable priority
+   * band. New participants therefore enter before one prolific participant's
+   * next queued turn, while a single participant may still use every free lane.
+   */
+  private nextRunnableQueueIndex(): number {
+    const runnable = this.queue
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => this.canStart(item));
+    if (runnable.length === 0) return -1;
+    const bestPriority = Math.min(...runnable.map(({ item }) => queueSortPriority(item)));
+    const band = runnable.filter(({ item }) => queueSortPriority(item) === bestPriority);
+    const actorCandidates = band.filter(({ item }) => liveQueueActorKey(item) !== undefined);
+    if (actorCandidates.length === 0) return band[0]!.index;
+    actorCandidates.sort((left, right) => {
+      const leftKey = liveQueueActorKey(left.item)!;
+      const rightKey = liveQueueActorKey(right.item)!;
+      const leftSequence = this.lastDispatchSequenceByLiveActor.get(leftKey) ?? -1;
+      const rightSequence = this.lastDispatchSequenceByLiveActor.get(rightKey) ?? -1;
+      return leftSequence - rightSequence || left.item.id - right.item.id;
+    });
+    return actorCandidates[0]!.index;
+  }
+
+  /**
+   * A new participant may displace one excess, non-durable queued router from
+   * an actor that already owns several waiting turns. This protects admission
+   * at the bounded queue edge without cancelling an active reply or a routed
+   * continuation.
+   */
+  private dropQueuedRouterForFairAdmission(incomingActorId: string, reason: string): boolean {
+    const counts = new Map<string, number>();
+    for (const item of this.queue) {
+      if (item.type !== "turn-analysis" || item.durableDelivery) continue;
+      const actorId = liveQueueActorKey(item);
+      if (!actorId || actorId === incomingActorId) continue;
+      counts.set(actorId, (counts.get(actorId) ?? 0) + 1);
+    }
+    const dominant = [...counts.entries()]
+      .filter(([, count]) => count > 1)
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0];
+    if (!dominant) return false;
+    let selectedIndex = -1;
+    for (let index = this.queue.length - 1; index >= 0; index -= 1) {
+      const item = this.queue[index]!;
+      if (
+        item.type === "turn-analysis" &&
+        !item.durableDelivery &&
+        liveQueueActorKey(item) === dominant
+      ) {
+        selectedIndex = index;
+        break;
+      }
+    }
+    if (selectedIndex < 0) return false;
+    const [dropped] = this.queue.splice(selectedIndex, 1);
+    dropped?.reject(new Error(reason));
+    return true;
   }
 
   private activeEntries<T extends QueueItem["type"]>(
@@ -2427,6 +2534,38 @@ export class LmStudioClient {
     const candidate = candidates[0];
     if (!candidate?.abort) return false;
     candidate.abort.abort(new BackgroundWorkPreemptedError(reason));
+    return true;
+  }
+
+  /**
+   * Elastic voice reservation normally costs nothing while voice is idle. If
+   * its first live turn arrives while all provider lanes are occupied, reclaim
+   * one lane from the oldest non-durable public-text turn. Direct/durable work,
+   * DMs and every already-running voice turn remain protected.
+   */
+  private preemptOneActivePublicTextForVoice(reason: string): boolean {
+    const candidates = [...this.activeWork.values()]
+      .filter((work) => {
+        if (work.releasing || !work.abort || work.abort.signal.aborted) return false;
+        if (work.item.type === "turn-analysis") {
+          return work.item.input.medium === "public" && !work.item.durableDelivery;
+        }
+        return work.item.type === "scene" &&
+          work.item.request.kind === "public" &&
+          !work.item.durableDelivery;
+      })
+      .sort((left, right) => {
+        // Router work has a bounded director retry and yields before a scene
+        // that may already contain an expensive completed classification.
+        if (left.item.type !== right.item.type) {
+          if (left.item.type === "turn-analysis") return -1;
+          if (right.item.type === "turn-analysis") return 1;
+        }
+        return left.item.id - right.item.id;
+      });
+    const candidate = candidates[0];
+    if (!candidate?.abort) return false;
+    candidate.abort.abort(new Error(reason));
     return true;
   }
 
@@ -2760,6 +2899,7 @@ export class LmStudioClient {
   private dropQueuedStaleScenes(
     channelId: string,
     kind: "public" | "dm",
+    authorId: string,
     reason: string,
   ): void {
     const retained: QueueItem[] = [];
@@ -2768,6 +2908,7 @@ export class LmStudioClient {
         item.type === "scene" &&
         item.request.kind === kind &&
         item.request.channelId === channelId &&
+        item.request.trigger?.authorId === authorId &&
         !item.durableDelivery
       ) {
         item.reject(new Error(reason));
@@ -2781,6 +2922,7 @@ export class LmStudioClient {
   private dropQueuedStaleTurnAnalyses(
     channelId: string,
     medium: "public" | "dm",
+    authorId: string,
     reason: string,
   ): void {
     const retained: QueueItem[] = [];
@@ -2789,6 +2931,7 @@ export class LmStudioClient {
         item.type === "turn-analysis" &&
         item.input.medium === medium &&
         item.input.channel.id === channelId &&
+        item.input.latestMessage.authorId === authorId &&
         !item.durableDelivery
       ) item.reject(new Error(reason));
       else retained.push(item);
@@ -2816,7 +2959,9 @@ export class LmStudioClient {
 
     const supersessionScope = input.medium === "voice" && execution.supersessionScope?.kind === "voice-room"
       ? execution.supersessionScope
-      : undefined;
+      : input.medium === "public" || input.medium === "dm"
+        ? textActorModelWorkScope(input.medium, input.channel.id, input.latestMessage.authorId)
+        : undefined;
     const durableDelivery = Boolean(execution.durableDelivery && input.medium === "public");
     if (execution.signal?.aborted) {
       return Promise.resolve(createFailClosedTurnAnalysis("transport_error"));
@@ -2825,14 +2970,15 @@ export class LmStudioClient {
     const liveTextMedium = input.medium === "public" || input.medium === "dm"
       ? input.medium
       : undefined;
+    const liveTextAuthorId = liveTextMedium ? input.latestMessage.authorId : undefined;
     const staleLiveReason = liveTextMedium
-      ? `Stale ${liveTextMedium} generation yielded to a newer same-channel turn`
+      ? `Stale ${liveTextMedium} generation yielded to a newer turn from the same actor in this channel`
       : "";
     if (liveTextMedium) {
-      this.dropQueuedStaleScenes(input.channel.id, liveTextMedium, staleLiveReason);
-      this.dropQueuedStaleTurnAnalyses(input.channel.id, liveTextMedium, staleLiveReason);
+      this.dropQueuedStaleScenes(input.channel.id, liveTextMedium, liveTextAuthorId!, staleLiveReason);
+      this.dropQueuedStaleTurnAnalyses(input.channel.id, liveTextMedium, liveTextAuthorId!, staleLiveReason);
     }
-    if (supersessionScope) {
+    if (supersessionScope?.kind === "voice-room") {
       const reason = `Stale voice analysis yielded to a newer turn in room ${supersessionScope.id}`;
       this.dropQueuedScopedTurnAnalyses(supersessionScope, reason);
       for (const work of this.activeEntries("turn-analysis")) {
@@ -2846,6 +2992,7 @@ export class LmStudioClient {
         if (
           work.item.request.kind === liveTextMedium &&
           work.item.request.channelId === input.channel.id &&
+          work.item.request.trigger?.authorId === liveTextAuthorId &&
           !work.item.durableDelivery
         ) {
           // The newer turn advances the director's per-channel epoch, so this
@@ -2857,25 +3004,43 @@ export class LmStudioClient {
         if (
           work.item.input.medium === liveTextMedium &&
           work.item.input.channel.id === input.channel.id &&
+          work.item.input.latestMessage.authorId === liveTextAuthorId &&
           !work.item.durableDelivery
         ) work.abort?.abort(new Error(staleLiveReason));
       }
     }
     const reservedVoice = input.medium === "voice";
+    const firstVoiceDemand = reservedVoice && !this.hasReservedVoiceDemand();
     if (
       this.queue.length >= 8 &&
       !this.hasExecutionCapacity(false, reservedVoice) &&
       !this.dropQueuedBackgroundWork("Background work dropped to protect semantic turn analysis") &&
-      !this.dropQueuedLowerPriorityWork(-10, "Lower-priority queued work yielded to semantic turn analysis")
+      !this.dropQueuedLowerPriorityWork(-10, "Lower-priority queued work yielded to semantic turn analysis") &&
+      !(
+        liveTextAuthorId &&
+        this.dropQueuedRouterForFairAdmission(
+          liveTextAuthorId,
+          "Excess queued work yielded to a different live participant",
+        )
+      )
     ) {
         return Promise.resolve(createFailClosedTurnAnalysis("queue_full"));
     }
-    this.preemptBackgroundIfRequired(
+    const backgroundPreempted = this.preemptBackgroundIfRequired(
       false,
       reservedVoice,
       -10,
       "Optional generation yielded to semantic turn analysis",
     );
+    if (
+      firstVoiceDemand &&
+      !backgroundPreempted &&
+      !this.hasProjectedExecutionCapacity(false, true, -10)
+    ) {
+      this.preemptOneActivePublicTextForVoice(
+        "An ordinary public text turn yielded one lane to live voice",
+      );
+    }
 
     return new Promise((resolve) => {
       const startedAt = performance.now();
@@ -2944,26 +3109,38 @@ export class LmStudioClient {
     if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Generation aborted"));
 
     return new Promise((resolve, reject) => {
-      const requestedContinuationOf = request.kind === "voice" && execution.continuationOf?.kind === "voice-room"
+      const requestedVoiceContinuation = request.kind === "voice" && execution.continuationOf?.kind === "voice-room"
         ? execution.continuationOf
         : undefined;
-      const handoff = requestedContinuationOf
+      const requestedTextContinuation = (request.kind === "public" || request.kind === "dm") &&
+        execution.continuationOf?.kind === "text-actor" && request.trigger?.authorId
+        && sameModelWorkScope(
+          execution.continuationOf,
+          textActorModelWorkScope(request.kind, request.channelId ?? "", request.trigger.authorId),
+        )
+        ? execution.continuationOf
+        : undefined;
+      const handoff = requestedVoiceContinuation
         ? [...this.voiceContinuationHandoffs.values()].find((candidate) => {
             const active = this.activeItem(candidate.queueItemId);
             return !candidate.consumed &&
               active?.item.type === "turn-analysis" &&
               active.item.settled &&
-              sameModelWorkScope(candidate.scope, requestedContinuationOf);
+              sameModelWorkScope(candidate.scope, requestedVoiceContinuation);
           })
         : undefined;
       const ownsActiveVoiceHandoff = Boolean(handoff);
       if (ownsActiveVoiceHandoff && handoff) handoff.consumed = true;
-      // A caller-provided scope is not scheduler authority. Only the one-use
-      // token created by the matching completed router receives continuation
-      // priority or bounded handoff credit.
-      const continuationOf = ownsActiveVoiceHandoff ? requestedContinuationOf : undefined;
+      // Voice continuation authority is the router-created one-use token. Text
+      // continuation authority additionally requires the exact server actor ID
+      // in the trusted request; it receives priority but no queue-overflow credit.
+      const continuationOf = ownsActiveVoiceHandoff
+        ? requestedVoiceContinuation
+        : requestedTextContinuation;
+      const ownsLiveContinuation = continuationOf !== undefined;
       const background = request.kind === "ambient" || execution.preemptibleBackground === true;
       const reservedVoice = request.kind === "voice" && !background;
+      const firstVoiceDemand = reservedVoice && !this.hasReservedVoiceDemand();
       if (this.queue.length >= 8) {
         const directCapacity = this.hasExecutionCapacity(background, reservedVoice);
         const madeRoom = directCapacity
@@ -2976,7 +3153,7 @@ export class LmStudioClient {
           this.queue.length < 8 + this.voiceContinuationHandoffs.size;
         const displacedLowerPriority = !directCapacity && !madeRoom && !withinHandoffCredit
           ? this.dropQueuedLowerPriorityWork(
-              ownsActiveVoiceHandoff ? VOICE_CONTINUATION_QUEUE_PRIORITY : priority,
+              ownsLiveContinuation ? LIVE_CONTINUATION_QUEUE_PRIORITY : priority,
               "Lower-priority queued work yielded to a live conversation",
             )
           : false;
@@ -2991,12 +3168,21 @@ export class LmStudioClient {
         }
       }
       if (priority < 4 && !ownsActiveVoiceHandoff) {
-        this.preemptBackgroundIfRequired(
+        const backgroundPreempted = this.preemptBackgroundIfRequired(
           background,
           reservedVoice,
           priority,
           "Optional generation yielded to live conversation",
         );
+        if (
+          firstVoiceDemand &&
+          !backgroundPreempted &&
+          !this.hasProjectedExecutionCapacity(background, true, priority)
+        ) {
+          this.preemptOneActivePublicTextForVoice(
+            "An ordinary public text turn yielded one lane to live voice",
+          );
+        }
       }
 
       const item: SceneQueueItem = {
@@ -3092,10 +3278,20 @@ export class LmStudioClient {
       while (this.activeWork.size < this.maxConcurrentPredictions) {
         // A lower-priority voice item may be runnable while an earlier
         // background/non-voice item is held behind its reservation ceiling.
-        const nextIndex = this.queue.findIndex((candidate) => this.canStart(candidate));
+        const nextIndex = this.nextRunnableQueueIndex();
         if (nextIndex < 0) break;
         const [item] = this.queue.splice(nextIndex, 1);
         if (!item) break;
+        const liveActorKey = liveQueueActorKey(item);
+        if (liveActorKey) {
+          this.dispatchSequence += 1;
+          this.lastDispatchSequenceByLiveActor.set(liveActorKey, this.dispatchSequence);
+          if (this.lastDispatchSequenceByLiveActor.size > 2_000) {
+            const oldest = [...this.lastDispatchSequenceByLiveActor.entries()]
+              .sort((left, right) => left[1] - right[1])[0]?.[0];
+            if (oldest) this.lastDispatchSequenceByLiveActor.delete(oldest);
+          }
+        }
         const abort = new AbortController();
         this.activeWork.set(item.id, { item, abort });
         void this.runQueueItem(item, abort).finally(() => {
@@ -5492,8 +5688,16 @@ export class LmStudioClient {
           kind: promptTranscriptKind(line.kind),
         }))
       : null;
+    // `authorId` is an execution-only scheduler key. Build the prompt trigger
+    // explicitly so stable server actor IDs can never cross the model boundary.
     const boundedTrigger = request.trigger
-      ? { ...request.trigger, imageAttachmentIds: boundedTriggerImageAttachmentIds(request) }
+      ? {
+          author: request.trigger.author,
+          content: request.trigger.content,
+          messageId: request.trigger.messageId,
+          createdAt: request.trigger.createdAt,
+          imageAttachmentIds: boundedTriggerImageAttachmentIds(request),
+        }
       : undefined;
     const triggeringEvent = boundedTrigger?.createdAt && request.temporalContext
       ? annotateTranscriptTiming([boundedTrigger as typeof boundedTrigger & { createdAt: string }], request.temporalContext.instant)[0]

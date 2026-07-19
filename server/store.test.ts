@@ -1115,6 +1115,99 @@ describe("room history", () => {
     await store.flush();
   });
 
+  it("supersedes only expected work from the same human and room", async () => {
+    const now = Date.parse("2026-07-17T12:00:00.000Z");
+    const store = new RoomStore(tempStorePath(), { now: () => now });
+    const oldExpected = createMessage("lobby", "human-johan", "är någon här?", {
+      createdAt: new Date(now).toISOString(),
+    });
+    const direct = createMessage("lobby", "human-johan", "@Mira svara på detta", {
+      createdAt: "2026-07-17T12:00:01.000Z",
+    });
+    const currentExpected = createMessage("lobby", "human-johan", "ny fråga", {
+      createdAt: "2026-07-17T12:00:02.000Z",
+    });
+    const otherRoom = createMessage("the-pub", "human-johan", "pubfråga", {
+      createdAt: "2026-07-17T12:00:03.000Z",
+    });
+    const otherHuman = createMessage("lobby", "human-aya", "annan fråga", {
+      createdAt: "2026-07-17T12:00:04.000Z",
+    });
+
+    store.addPublicMessage(oldExpected, undefined, {
+      targetPersonaIds: ["ai-mira"],
+      deliveryKind: "expected",
+    });
+    store.addPublicMessage(direct, undefined, { targetPersonaIds: ["ai-mira"] });
+    store.addPublicMessage(currentExpected, undefined, {
+      targetPersonaIds: ["ai-vale"],
+      deliveryKind: "expected",
+    });
+    store.addPublicMessage(otherRoom, undefined, {
+      targetPersonaIds: ["ai-mira"],
+      deliveryKind: "expected",
+    });
+    store.addPublicMessage(otherHuman, undefined, {
+      targetPersonaIds: ["ai-mira"],
+      deliveryKind: "expected",
+    });
+    expect(store.claimPendingPublicTurnTarget(oldExpected.id, "ai-mira")).toBeDefined();
+
+    expect(store.cancelExpectedPendingPublicTurnsForActorScope(
+      "lobby",
+      "human-johan",
+      currentExpected.id,
+    )).toBe(1);
+    expect(store.releasePendingPublicTurnTarget(oldExpected.id, "ai-mira")).toBe(false);
+    expect(store.getPendingPublicTurns().map((turn) => [turn.messageId, turn.deliveryKind])).toEqual([
+      [direct.id, "direct"],
+      [currentExpected.id, "expected"],
+      [otherRoom.id, "expected"],
+      [otherHuman.id, "expected"],
+    ]);
+  });
+
+  it("migrates legacy pending work without a delivery kind as direct", async () => {
+    const now = Date.parse("2026-07-17T12:00:00.000Z");
+    const filePath = tempStorePath();
+    const first = new RoomStore(filePath, { now: () => now });
+    const trigger = createMessage("lobby", "human-johan", "@Mira?", {
+      createdAt: new Date(now).toISOString(),
+    });
+    first.addPublicMessage(trigger, undefined, { targetPersonaIds: ["ai-mira"] });
+    await first.flush();
+
+    const legacy = JSON.parse(await readFile(filePath, "utf8")) as {
+      pendingPublicTurns: Array<Record<string, unknown>>;
+    };
+    delete legacy.pendingPublicTurns[0]?.deliveryKind;
+    await writeFile(filePath, `${JSON.stringify(legacy, null, 2)}\n`, "utf8");
+
+    const restored = new RoomStore(filePath, { now: () => now });
+    await restored.load();
+    expect(restored.getPendingPublicTurns()[0]?.deliveryKind).toBe("direct");
+    await restored.flush();
+    const migrated = JSON.parse(await readFile(filePath, "utf8")) as {
+      pendingPublicTurns: Array<{ deliveryKind?: string }>;
+    };
+    expect(migrated.pendingPublicTurns[0]?.deliveryKind).toBe("direct");
+  });
+
+  it("does not manufacture new semantic reply work for an already expired transcript row", () => {
+    const createdAt = Date.parse("2026-07-17T12:00:00.000Z");
+    const store = new RoomStore(tempStorePath(), { now: () => createdAt + 21 * 60_000 });
+    const oldMessage = createMessage("lobby", "human-johan", "en gammal fråga", {
+      createdAt: new Date(createdAt).toISOString(),
+    });
+    store.addPublicMessage(oldMessage);
+
+    expect(store.registerPendingPublicTurn(oldMessage.id, {
+      targetPersonaIds: ["ai-mira"],
+      deliveryKind: "expected",
+    })).toBeUndefined();
+    expect(store.getPendingPublicTurns()).toEqual([]);
+  });
+
   it("drops process-local claims on restart while retaining durable attempt counts", async () => {
     const now = Date.parse("2026-07-17T12:00:00.000Z");
     const filePath = tempStorePath();

@@ -30,6 +30,7 @@ import {
   BackgroundWorkPreemptedError,
   diegeticIdentityTurnPremise,
   isBackgroundWorkPreemptedError,
+  textActorModelWorkScope,
   type GeneratedLine,
   type RoomRecallEvidence,
   type SceneCapabilityContext,
@@ -541,9 +542,17 @@ interface PendingBurst {
 interface ClaimedPublicTurnTarget {
   messageId: string;
   channelId: string;
+  authorId: string;
+  deliveryKind: "direct" | "expected";
   personaId: string;
   attempt: number;
 }
+
+const publicTurnActorScopeKey = (channelId: string, authorId: string): string =>
+  `${channelId}\u0000${authorId}`;
+
+const claimedPublicTurnActorScopeKey = (claim: ClaimedPublicTurnTarget): string =>
+  publicTurnActorScopeKey(claim.channelId, claim.authorId);
 
 const AMBIENT_THREAD_MAX_MESSAGES = 8;
 const AMBIENT_THREAD_COOLDOWN_MS = 8 * 60_000;
@@ -2243,8 +2252,11 @@ export class SocialDirector {
   private readonly lastSpoke = new Map<string, number>();
   private readonly pendingBursts = new Map<string, PendingBurst>();
   private pendingPublicTurnRecoveryTimer?: NodeJS.Timeout;
-  /** One durable direct-human delivery owns a room at a time across all recovery passes. */
-  private readonly pendingPublicTurnChannelsInFlight = new Set<string>();
+  /**
+   * One durable delivery per human and room; the message token prevents an
+   * older completion from releasing a newer lease after actor-local preemption.
+   */
+  private readonly pendingPublicTurnActorScopesInFlight = new Map<string, string>();
   private readonly deferredPublicMessageAppends = new Map<string, UncommittedPublicMessageAppend>();
   private readonly pendingHumanReactions = new Map<string, PendingHumanReaction>();
   private readonly pendingCrowdReactionTimersByHuman = new Map<string, Set<NodeJS.Timeout>>();
@@ -2260,6 +2272,8 @@ export class SocialDirector {
   private readonly ambientThreads = new Map<string, AmbientThreadState>();
   private readonly ambientBackoffUntilByChannel = new Map<string, number>();
   private readonly humanMessageEpochById = new Map<string, number>();
+  /** Newer turns supersede only the same human in the same room. */
+  private readonly humanTurnEpochByActorScope = new Map<string, number>();
   private readonly recentAmbientSeedsByChannel = new Map<string, string[]>();
   private readonly recentAutonomousResearchSeedsByChannel = new Map<string, string[]>();
   private readonly lastAutonomousResearchSuccessAtByChannel = new Map<string, number>();
@@ -2545,11 +2559,11 @@ export class SocialDirector {
       clearTimeout(burst.timer);
       for (const claim of burst.claimedDeliveries) {
         this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
-        this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+        this.releasePendingPublicTurnActorScope(claim);
       }
     }
     this.pendingBursts.clear();
-    this.pendingPublicTurnChannelsInFlight.clear();
+    this.pendingPublicTurnActorScopesInFlight.clear();
     for (const reaction of this.pendingHumanReactions.values()) clearTimeout(reaction.timer);
     this.pendingHumanReactions.clear();
     for (const timers of this.pendingCrowdReactionTimersByHuman.values()) {
@@ -2575,8 +2589,32 @@ export class SocialDirector {
     return [...this.directorEvents];
   }
 
+  private pendingPublicTurnActorScopeAvailable(actorScope: string, messageId: string): boolean {
+    const currentOwner = this.pendingPublicTurnActorScopesInFlight.get(actorScope);
+    if (!currentOwner) return true;
+    if (currentOwner === messageId) return false;
+    // A newer turn may have cancelled an ordinary expected outbox row while
+    // its model work is still unwinding. That stale token may be replaced;
+    // token-aware release below prevents the old finally block from deleting
+    // the new owner's lease.
+    return !this.store.getPendingPublicTurns().some((turn) => turn.messageId === currentOwner);
+  }
+
+  private acquirePendingPublicTurnActorScope(actorScope: string, messageId: string): boolean {
+    if (!this.pendingPublicTurnActorScopeAvailable(actorScope, messageId)) return false;
+    this.pendingPublicTurnActorScopesInFlight.set(actorScope, messageId);
+    return true;
+  }
+
+  private releasePendingPublicTurnActorScope(claim: ClaimedPublicTurnTarget): void {
+    const actorScope = claimedPublicTurnActorScopeKey(claim);
+    if (this.pendingPublicTurnActorScopesInFlight.get(actorScope) === claim.messageId) {
+      this.pendingPublicTurnActorScopesInFlight.delete(actorScope);
+    }
+  }
+
   /**
-   * Claims durable, still-unanswered direct turns and re-enters their normal
+   * Claims durable, still-unanswered direct or expected turns and re-enters their normal
    * reviewed public pipeline. The outbox, rather than a transcript heuristic,
    * is the authority: completion is per addressed resident, retries are
    * bounded, and an interrupted process loses only its process-local claim.
@@ -2595,7 +2633,7 @@ export class SocialDirector {
       return 0;
     }
     const humans = new Map(profiles.map((profile) => [profile.member.id, profile.member] as const));
-    const claimedChannels = new Set<string>();
+    const claimedActorScopes = new Set<string>();
     let recovered = 0;
 
     for (const turn of this.store.getPendingPublicTurns()) {
@@ -2615,12 +2653,12 @@ export class SocialDirector {
       // A restart converts abandoned pending analyses to unavailable before
       // this method runs; while the server is live, never race the vision pass.
       if (message.attachments?.some((attachment) => attachment.analysis.status === "pending")) continue;
-      // One single-model recovery per room at a time. Otherwise several
-      // durable turns in the same room can repeatedly supersede one another
-      // before any of them gets a chance to publish.
+      // One recovery per human and room at a time. Different humans in the
+      // same room are independent and must never block one another.
+      const actorScope = publicTurnActorScopeKey(turn.channelId, turn.authorId);
       if (
-        claimedChannels.has(turn.channelId) ||
-        this.pendingPublicTurnChannelsInFlight.has(turn.channelId)
+        claimedActorScopes.has(actorScope) ||
+        !this.pendingPublicTurnActorScopeAvailable(actorScope, turn.messageId)
       ) continue;
 
       const claims: ClaimedPublicTurnTarget[] = [];
@@ -2641,6 +2679,8 @@ export class SocialDirector {
           claims.push({
             messageId: turn.messageId,
             channelId: turn.channelId,
+            authorId: turn.authorId,
+            deliveryKind: turn.deliveryKind,
             personaId: target.personaId,
             attempt: claim.target.attempts,
           });
@@ -2649,8 +2689,8 @@ export class SocialDirector {
       }
       if (claims.length === 0) continue;
 
-      claimedChannels.add(turn.channelId);
-      this.pendingPublicTurnChannelsInFlight.add(turn.channelId);
+      claimedActorScopes.add(actorScope);
+      this.pendingPublicTurnActorScopesInFlight.set(actorScope, turn.messageId);
       recovered += 1;
       void this.handleHumanBurst([message], { ...human, status: "offline" }, undefined, claims)
         .catch((error) => {
@@ -2665,7 +2705,7 @@ export class SocialDirector {
           // restart can continue from the durable attempt count.
           for (const claim of claims) {
             this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
-            this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+            this.releasePendingPublicTurnActorScope(claim);
           }
           this.schedulePendingPublicTurnRecovery(1_000);
         });
@@ -2728,8 +2768,15 @@ export class SocialDirector {
       clearTimeout(burst.timer);
       for (const claim of burst.claimedDeliveries) {
         this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
+        this.releasePendingPublicTurnActorScope(claim);
       }
       this.pendingBursts.delete(key);
+    }
+    for (const scope of this.humanTurnEpochByActorScope.keys()) {
+      if (scope.endsWith(`\u0000${actorId}`)) this.humanTurnEpochByActorScope.delete(scope);
+    }
+    for (const scope of this.pendingPublicTurnActorScopesInFlight.keys()) {
+      if (scope.endsWith(`\u0000${actorId}`)) this.pendingPublicTurnActorScopesInFlight.delete(scope);
     }
     for (const [key, reaction] of this.pendingHumanReactions) {
       if (reaction.human.id !== actorId) continue;
@@ -2989,7 +3036,7 @@ export class SocialDirector {
       ? this.claimOnePendingPublicTurnTarget(pending.messageId)
       : [];
     if (pending && claimedDeliveries.length === 0) {
-      // Another durable delivery already owns this room. The outbox, not a
+      // Another durable delivery already owns this human+room scope. The outbox, not a
       // second coalesced scene, will resume this exact message afterwards.
       this.schedulePendingPublicTurnRecovery(1_000);
       return;
@@ -3003,15 +3050,18 @@ export class SocialDirector {
   private claimOnePendingPublicTurnTarget(messageId: string): ClaimedPublicTurnTarget[] {
     const turn = this.store.getPendingPublicTurns().find((candidate) => candidate.messageId === messageId);
     if (!turn) return [];
-    if (this.pendingPublicTurnChannelsInFlight.has(turn.channelId)) return [];
+    const actorScope = publicTurnActorScopeKey(turn.channelId, turn.authorId);
+    if (!this.pendingPublicTurnActorScopeAvailable(actorScope, messageId)) return [];
     for (const target of turn.targets) {
       if (!PERSONAS.some((persona) => persona.id === target.personaId)) continue;
       const claimed = this.store.claimPendingPublicTurnTarget(messageId, target.personaId);
       if (claimed) {
-        this.pendingPublicTurnChannelsInFlight.add(turn.channelId);
+        this.pendingPublicTurnActorScopesInFlight.set(actorScope, messageId);
         return [{
           messageId,
           channelId: turn.channelId,
+          authorId: turn.authorId,
+          deliveryKind: turn.deliveryKind,
           personaId: target.personaId,
           attempt: claimed.target.attempts,
         }];
@@ -3044,7 +3094,7 @@ export class SocialDirector {
         .finally(() => {
           for (const claim of claims) {
             this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
-            this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+            this.releasePendingPublicTurnActorScope(claim);
           }
           this.schedulePendingPublicTurnRecovery(1_000);
         });
@@ -3160,6 +3210,7 @@ export class SocialDirector {
           // left the ordinary window; it remains a resident-authored chat row.
           history: this.transcriptMessages([...recentWithoutTarget, target]),
           trigger: {
+            authorId: pending.human.id,
             author: pending.human.name,
             content: activeEmojis.join(" "),
             createdAt: new Date(now).toISOString(),
@@ -3293,7 +3344,7 @@ export class SocialDirector {
       .finally(() => {
         for (const claim of claims) {
           this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
-          this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+          this.releasePendingPublicTurnActorScope(claim);
         }
         this.schedulePendingPublicTurnRecovery(1_000);
       });
@@ -3301,11 +3352,28 @@ export class SocialDirector {
 
   private noteHumanChannelEvent(message: ChatMessage): void {
     const now = this.now();
+    // Coalescing crosses the 700 ms burst window only for the same actor and
+    // room. Older semantic room-answer obligations yield; exact direct
+    // mentions/replies remain in the durable outbox.
+    this.store.cancelExpectedPendingPublicTurnsForActorScope(
+      message.channelId,
+      message.authorId,
+      message.id,
+    );
     this.lastHumanMessageAtByChannel.set(message.channelId, now);
     this.lastHumanResearchActivityAtByChannel.set(message.channelId, now);
     this.rememberHumanResearchActivity(message.channelId, message.authorId, now);
-    const epoch = this.invalidateAmbientChannel(message.channelId, "human_preempted");
+    this.invalidateAmbientChannel(message.channelId, "human_preempted");
     this.actorChannels.noteChannelEvent(message);
+    const actorScope = publicTurnActorScopeKey(message.channelId, message.authorId);
+    const epoch = (this.humanTurnEpochByActorScope.get(actorScope) ?? 0) + 1;
+    this.humanTurnEpochByActorScope.delete(actorScope);
+    this.humanTurnEpochByActorScope.set(actorScope, epoch);
+    while (this.humanTurnEpochByActorScope.size > 4_000) {
+      const oldest = this.humanTurnEpochByActorScope.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.humanTurnEpochByActorScope.delete(oldest);
+    }
     this.humanMessageEpochById.set(message.id, epoch);
     while (this.humanMessageEpochById.size > 1_000) {
       const oldest = this.humanMessageEpochById.keys().next().value as string | undefined;
@@ -3414,7 +3482,7 @@ export class SocialDirector {
         : addressedPersonaIds(exactMentionIds, input.replyTarget, input.personas);
     try {
       if (typeof this.lm.analyzeTurn !== "function") return createFailClosedTurnAnalysis("disabled");
-      return await this.lm.analyzeTurn({
+      const request: TurnAnalysisInput = {
         turnId: input.turnId,
         medium: input.medium,
         channel: {
@@ -3437,7 +3505,35 @@ export class SocialDirector {
           ? this.channelFeedContext(input.channelId)
           : undefined,
         historyRecallAvailable: input.medium === "public",
-      }, { durableDelivery: input.durableDelivery });
+      };
+      const execution = { durableDelivery: input.durableDelivery };
+      const first = await this.lm.analyzeTurn(request, execution);
+      const transientFailure = first.source !== "lm" && [
+        "queue_full",
+        "timeout",
+        "transport_error",
+      ].includes(first.failureReason ?? "");
+      const actorScope = publicTurnActorScopeKey(input.channelId, input.latest.authorId);
+      const messageEpoch = this.humanMessageEpochById.get(input.latest.id);
+      const stillCurrent = messageEpoch === undefined ||
+        messageEpoch === (this.humanTurnEpochByActorScope.get(actorScope) ?? 0);
+      if (input.medium !== "public" || !transientFailure || !stillCurrent) return first;
+
+      // One bounded semantic retry is language- and topic-independent. It
+      // recovers transient shared-provider pressure without manufacturing an
+      // answer from punctuation or vocabulary heuristics. Yield only to the
+      // microtask queue: a fixed sleep both inflated live latency and made an
+      // already admitted participant wait behind unrelated work again.
+      await Promise.resolve();
+      if (
+        !this.humanActorWorkIsCurrent(input.latest.authorId) ||
+        messageEpoch !== undefined &&
+          messageEpoch !== (this.humanTurnEpochByActorScope.get(actorScope) ?? 0)
+      ) return first;
+      return await this.lm.analyzeTurn({
+        ...request,
+        turnId: `${request.turnId}:retry:1`,
+      }, execution);
     } catch (error) {
       console.warn("Turn analysis failed closed:", error instanceof Error ? error.message : error);
       return createFailClosedTurnAnalysis("transport_error");
@@ -3804,6 +3900,7 @@ export class SocialDirector {
           selected: [persona],
           history: this.dmTranscript(latest.channelId),
           trigger: {
+            authorId: human.id,
             author: human.name,
             content: combined,
             messageId: latest.id,
@@ -3846,6 +3943,9 @@ export class SocialDirector {
         },
         0,
         turn.signal,
+        {
+          continuationOf: textActorModelWorkScope("dm", latest.channelId, human.id),
+        },
       );
     } catch (error) {
       // A superseded turn must never manufacture or publish a late fallback.
@@ -3939,12 +4039,18 @@ export class SocialDirector {
   ): Promise<void> {
     const trigger = messages.at(-1);
     if (!trigger) return;
-    let durableDelivery = preclaimedDeliveries.length > 0;
+    let supersessionProtected = preclaimedDeliveries.some((claim) => claim.deliveryKind === "direct");
+    // A transport/recovery claim or a model-inferred addressee is routing
+    // authority for the accountable owner. A structural @ discovered only in
+    // this lower-level fallback remains mandatory, but may coexist with a more
+    // relevant recollection/evidence owner selected later in the same scene.
+    let claimedRequestOwnerAuthoritative = preclaimedDeliveries.length > 0;
+    const actorScope = publicTurnActorScopeKey(trigger.channelId, human.id);
     const burstEpoch = this.humanMessageEpochById.get(trigger.id)
-      ?? (this.channelEpoch.get(trigger.channelId) ?? 0);
+      ?? (this.humanTurnEpochByActorScope.get(actorScope) ?? 0);
     const burstIsCurrent = (): boolean =>
       this.humanActorWorkIsCurrent(human.id) &&
-      (durableDelivery || burstEpoch === (this.channelEpoch.get(trigger.channelId) ?? 0));
+      (supersessionProtected || burstEpoch === (this.humanTurnEpochByActorScope.get(actorScope) ?? 0));
     if (!burstIsCurrent()) {
       this.schedulePersistentMemory(messages, human);
       return;
@@ -3989,7 +4095,7 @@ export class SocialDirector {
       candidateSet,
       allowSearch: true,
       humanCandidates,
-      durableDelivery,
+      durableDelivery: supersessionProtected,
       ...(preclaimedPersonaIds.length > 0
         ? { mechanicalAddressedPersonaIdsOverride: preclaimedPersonaIds }
         : {}),
@@ -4202,8 +4308,10 @@ export class SocialDirector {
         );
       }
       const desiredIds = new Set(signals.mentionedIds);
-      const inferredDelivery = deterministicAddressedIds.length === 0;
-      if (pendingForBurst.length > 0 && this.pendingPublicTurnChannelsInFlight.has(trigger.channelId)) {
+      const modelInferredDelivery = deterministicAddressedIds.length === 0;
+      const actorScope = publicTurnActorScopeKey(trigger.channelId, human.id);
+      if (pendingForBurst.length > 0 &&
+          !this.pendingPublicTurnActorScopeAvailable(actorScope, trigger.id)) {
         return;
       }
       claimLoop: for (const turn of pendingForBurst) {
@@ -4214,13 +4322,23 @@ export class SocialDirector {
             claimedDeliveries.push({
               messageId: turn.messageId,
               channelId: turn.channelId,
+              authorId: turn.authorId,
+              deliveryKind: turn.deliveryKind,
               personaId: target.personaId,
               attempt: claim.target.attempts,
             });
-            if (inferredDelivery) {
-              this.pendingPublicTurnChannelsInFlight.add(turn.channelId);
-              durableDelivery = true;
-            }
+            // Structural transport normally claims exact targets before this
+            // pipeline starts. Model-inferred or legacy/test callers can first
+            // discover the target here, so every successful late claim must
+            // acquire the same actor-local lease. Only direct delivery is
+            // protected from a newer turn by this human; an ordinary expected
+            // answer remains durable across failure but is supersedable.
+            this.pendingPublicTurnActorScopesInFlight.set(
+              publicTurnActorScopeKey(turn.channelId, turn.authorId),
+              turn.messageId,
+            );
+            if (modelInferredDelivery) claimedRequestOwnerAuthoritative = true;
+            if (turn.deliveryKind === "direct") supersessionProtected = true;
             break claimLoop;
           }
         }
@@ -4334,7 +4452,7 @@ export class SocialDirector {
       ? recallResponder ?? referencedHumanMemoryOwner ?? selected[0]
       : recallResponder;
     const evidenceMustAnswer = evidenceRequested && (!autoSharedLinkAttempt || automaticReadResponseRequired);
-    const durableRequestOwner = durableDelivery && claimedDeliveries.length > 0
+    const durableRequestOwner = claimedRequestOwnerAuthoritative && claimedDeliveries.length > 0
       ? selected.find((persona) => claimedDeliveries.some((claim) => claim.personaId === persona.id))
       : undefined;
     const requestOwner = responseExpected || evidenceMustAnswer || Boolean(durableRequestOwner)
@@ -4350,6 +4468,32 @@ export class SocialDirector {
             ? detailedExpertPlan.preferredOwner
             : selected[0])
       : undefined;
+    if (responseExpected && requestOwner && claimedDeliveries.length === 0) {
+      // A successful multilingual semantic classification is the durability
+      // barrier for ordinary questions too. Persist the chosen accountable
+      // resident before generation so provider/reviewer failure or restart
+      // cannot turn an expected answer into unexplained silence.
+      const registeredExpectedTurn = this.store.registerPendingPublicTurn(trigger.id, {
+        targetPersonaIds: [requestOwner.id],
+        deliveryKind: "expected",
+      });
+      if (registeredExpectedTurn) {
+        await this.store.flush();
+        const expectedActorScope = publicTurnActorScopeKey(trigger.channelId, human.id);
+        if (!this.pendingPublicTurnActorScopeAvailable(expectedActorScope, trigger.id)) return;
+        const claim = this.store.claimPendingPublicTurnTarget(trigger.id, requestOwner.id);
+        if (!claim) return;
+        claimedDeliveries.push({
+          messageId: trigger.id,
+          channelId: trigger.channelId,
+          authorId: human.id,
+          deliveryKind: "expected",
+          personaId: requestOwner.id,
+          attempt: claim.target.attempts,
+        });
+        this.pendingPublicTurnActorScopesInFlight.set(expectedActorScope, trigger.id);
+      }
+    }
     const requestOwnerIds = requestOwner ? [requestOwner.id] : [];
     const directDetailedOwnerOnly = Boolean(
       requestOwner &&
@@ -4507,6 +4651,7 @@ export class SocialDirector {
           channelFeedGrounded: analysis.channelFeedGrounded === true,
           roomRecall: roomRecallFor(selected),
           trigger: {
+            authorId: human.id,
             author: human.name,
             content: combined,
             messageId: trigger.id,
@@ -4540,7 +4685,10 @@ export class SocialDirector {
         },
         signals.mentionedIds.length ? 0 : 2,
         undefined,
-        { durableDelivery },
+        {
+          durableDelivery: supersessionProtected,
+          continuationOf: textActorModelWorkScope("public", trigger.channelId, human.id),
+        },
       );
     } catch (error) {
       console.warn("Public scene failed:", error instanceof Error ? error.message : error);
@@ -4581,6 +4729,7 @@ export class SocialDirector {
             channelFeedGrounded: analysis.channelFeedGrounded === true,
             roomRecall: roomRecallFor([persona]),
             trigger: {
+              authorId: human.id,
               author: human.name,
               content: combined,
               messageId: trigger.id,
@@ -4646,7 +4795,7 @@ export class SocialDirector {
           },
           0,
           undefined,
-          { durableDelivery },
+          { durableDelivery: supersessionProtected },
         );
         if (focused[0]) lines.push(focused[0]);
       } catch (error) {
@@ -4721,7 +4870,7 @@ export class SocialDirector {
       if (!persona) continue;
       const publicationTypingLease = this.acquireTyping(trigger.channelId, persona.id);
       try {
-        await delay(index === 0 ? 350 : 1_200 + Math.random() * 1_600);
+        if (index > 0) await delay(450 + Math.random() * 550);
         const ordinarySlotAvailable = this.canSpeak();
         const directlyAddressedRequired = required.has(persona.id) &&
           signals.mentionedIds.includes(persona.id);
@@ -4753,10 +4902,10 @@ export class SocialDirector {
           linkCardSourceId && research ? linkPreviewFromResearch(research, linkCardSourceId) : undefined,
           undefined,
           required.has(persona.id),
-          durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id),
+          claimedDeliveries.some((claim) => claim.personaId === persona.id),
         );
         if (posted) {
-          if (durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id)) {
+          if (claimedDeliveries.some((claim) => claim.personaId === persona.id)) {
             await this.flushDurablePublicMessageBeforeBroadcast(posted);
           }
           publishedResponses.push(posted);
@@ -4780,10 +4929,10 @@ export class SocialDirector {
               undefined,
               undefined,
               true,
-              durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id),
+              claimedDeliveries.some((claim) => claim.personaId === persona.id),
             );
             if (fallbackMessage) {
-              if (durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id)) {
+              if (claimedDeliveries.some((claim) => claim.personaId === persona.id)) {
                 await this.flushDurablePublicMessageBeforeBroadcast(fallbackMessage);
               }
               publishedResponses.push(fallbackMessage);
@@ -4818,7 +4967,7 @@ export class SocialDirector {
         if (!settledDeliveryKeys.has(deliveryKey(claim))) {
           this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
         }
-        this.pendingPublicTurnChannelsInFlight.delete(claim.channelId);
+        this.releasePendingPublicTurnActorScope(claim);
       }
       this.schedulePendingPublicTurnRecovery();
       // Catalog edits advance the channel epoch; actor erasure closes only the

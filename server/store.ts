@@ -27,6 +27,8 @@ export interface PendingPublicTurn {
   messageId: string;
   channelId: string;
   authorId: string;
+  /** Direct address is non-supersedable; an expected room reply may yield to a newer turn by the same human. */
+  deliveryKind: "direct" | "expected";
   createdAt: string;
   expiresAt: string;
   targets: PendingPublicTurnTarget[];
@@ -34,6 +36,7 @@ export interface PendingPublicTurn {
 
 export interface PendingPublicTurnRegistration {
   targetPersonaIds: readonly string[];
+  deliveryKind?: "direct" | "expected";
   expiresAt?: string;
 }
 
@@ -300,6 +303,7 @@ const PENDING_PUBLIC_TURN_KEYS = new Set([
   "messageId",
   "channelId",
   "authorId",
+  "deliveryKind",
   "createdAt",
   "expiresAt",
   "targets",
@@ -463,6 +467,7 @@ const isPendingPublicTurn = (value: unknown): value is PendingPublicTurn => {
   const turn = value as Partial<PendingPublicTurn>;
   if (!isBoundedIdentifier(turn.messageId) || !isBoundedChannelId(turn.channelId) ||
       !isBoundedIdentifier(turn.authorId) || turn.authorId === SYSTEM_AUTHOR_ID ||
+      (turn.deliveryKind !== undefined && turn.deliveryKind !== "direct" && turn.deliveryKind !== "expected") ||
       !isCanonicalIsoTimestamp(turn.createdAt) || !isCanonicalIsoTimestamp(turn.expiresAt) ||
       Date.parse(turn.expiresAt) <= Date.parse(turn.createdAt) ||
       Date.parse(turn.expiresAt) - Date.parse(turn.createdAt) > MAX_PENDING_PUBLIC_TURN_TTL_MS ||
@@ -1215,6 +1220,9 @@ export class RoomStore {
   private copyPendingPublicTurn(turn: PendingPublicTurn): PendingPublicTurn {
     return {
       ...turn,
+      // Version-4/5 rows written before reply-expectation durability are all
+      // exact-address obligations and therefore migrate to the stronger kind.
+      deliveryKind: turn.deliveryKind ?? "direct",
       targets: turn.targets.map((target) => ({ ...target })),
     };
   }
@@ -1304,6 +1312,10 @@ export class RoomStore {
         ) || new Set(registration.targetPersonaIds).size !== registration.targetPersonaIds.length) {
       throw new TypeError("A pending public turn requires unique bounded resident targets.");
     }
+    if (registration.deliveryKind !== undefined &&
+        registration.deliveryKind !== "direct" && registration.deliveryKind !== "expected") {
+      throw new TypeError("A pending public turn requires a valid delivery kind.");
+    }
 
     const at = Number.isFinite(referenceAt) ? referenceAt : this.nowMs();
     const createdAt = new Date(message.createdAt).toISOString();
@@ -1322,6 +1334,7 @@ export class RoomStore {
       messageId: message.id,
       channelId: message.channelId,
       authorId: message.authorId,
+      deliveryKind: registration.deliveryKind ?? "direct",
       createdAt,
       expiresAt,
       targets: registration.targetPersonaIds.map((personaId) => ({ personaId, attempts: 0 })),
@@ -1348,6 +1361,10 @@ export class RoomStore {
     }
 
     let changed = false;
+    if (current.deliveryKind === "expected" && candidate.deliveryKind === "direct") {
+      current.deliveryKind = "direct";
+      changed = true;
+    }
     const targetsByPersonaId = new Map(current.targets.map((target) => [target.personaId, target]));
     for (const target of candidate.targets) {
       if (!targetsByPersonaId.has(target.personaId)) {
@@ -1377,6 +1394,14 @@ export class RoomStore {
     const message = this.messages.find((candidate) => candidate.id === messageId);
     if (!message) throw new TypeError("Pending public-turn trigger message does not exist.");
     const at = this.nowMs();
+    // Registering semantic reply expectation can happen while replaying an
+    // older transcript row. A valid but already expired trigger simply is not
+    // eligible for new delivery work; malformed or explicitly invalid expiry
+    // values still fail closed in createPendingPublicTurn below.
+    if (
+      registration.expiresAt === undefined &&
+      Date.parse(message.createdAt) + DEFAULT_PENDING_PUBLIC_TURN_TTL_MS <= at
+    ) return undefined;
     let changed = this.reconcilePendingPublicTurns(at, false);
     const upserted = this.upsertPendingPublicTurn(message, registration, at);
     changed = upserted.changed || changed;
@@ -1482,6 +1507,35 @@ export class RoomStore {
     return cancelledTargets;
   }
 
+  /**
+   * A newer conversational turn may supersede older semantically expected
+   * room replies from that same human. Exact mentions/replies remain durable.
+   */
+  cancelExpectedPendingPublicTurnsForActorScope(
+    channelId: string,
+    authorId: string,
+    exceptMessageId?: string,
+  ): number {
+    if (!isBoundedChannelId(channelId) || !isBoundedIdentifier(authorId) ||
+        (exceptMessageId !== undefined && !isBoundedIdentifier(exceptMessageId))) {
+      throw new TypeError("Pending public-turn actor scope is invalid.");
+    }
+    let cancelledTargets = 0;
+    for (const [messageId, turn] of this.pendingPublicTurns) {
+      if (
+        turn.channelId !== channelId ||
+        turn.authorId !== authorId ||
+        (turn.deliveryKind ?? "direct") !== "expected" ||
+        messageId === exceptMessageId
+      ) continue;
+      cancelledTargets += turn.targets.length;
+      this.pendingPublicTurns.delete(messageId);
+      this.releaseClaimsForPendingPublicTurn(messageId);
+    }
+    if (cancelledTargets > 0) this.schedulePersist();
+    return cancelledTargets;
+  }
+
   getRecent(channelId: string, limit = 30): ChatMessage[] {
     return this.messages.filter((message) => message.channelId === channelId).slice(-limit);
   }
@@ -1575,6 +1629,7 @@ export class RoomStore {
                 messageId: replyTurn.messageId,
                 channelId: replyTurn.channelId,
                 authorId: replyTurn.authorId,
+                deliveryKind: replyTurn.deliveryKind,
                 createdAt: replyTurn.createdAt,
                 expiresAt: replyTurn.expiresAt,
               },

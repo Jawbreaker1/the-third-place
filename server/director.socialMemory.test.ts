@@ -180,11 +180,9 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       }).handleHumanBurst([message], member);
       const forgottenPending = handle(forgottenMessage, human);
       const survivingPending = handle(survivingMessage, otherHuman);
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect([...pendingScenes.keys()]).toEqual(expect.arrayContaining([human.name, otherHuman.name]));
+      await vi.waitFor(() => expect([...pendingScenes.keys()]).toEqual(
+        expect.arrayContaining([human.name, otherHuman.name]),
+      ));
       director.invalidatePublicWorkForHumanActor(human.id);
       const forgottenScene = pendingScenes.get(human.name)!;
       const survivingScene = pendingScenes.get(otherHuman.name)!;
@@ -1032,6 +1030,9 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       const pending = (director as unknown as {
         handleHumanBurst: (messages: typeof incoming[], member: typeof human) => Promise<void>;
       }).handleHumanBurst([incoming], human);
+      await vi.waitFor(() => expect(
+        store.getRecent("lobby", 20).filter((message) => message.authorId.startsWith("ai-")),
+      ).not.toHaveLength(0));
       await vi.runAllTimersAsync();
       await pending;
 
