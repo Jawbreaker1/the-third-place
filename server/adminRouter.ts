@@ -25,6 +25,7 @@ const emptyBodySchema = z.object({}).strict();
 const memoryPatchSchema = z.object({ pinned: z.boolean() }).strict();
 const channelFeedPatchSchema = z.object({
   enabled: z.boolean(),
+  discussionFrequency: z.number().int().min(0).max(100),
   activeIntervalMinutes: z.number().int().min(1).max(1_440),
   idleIntervalMinutes: z.number().int().min(1).max(1_440),
 }).strict().refine(

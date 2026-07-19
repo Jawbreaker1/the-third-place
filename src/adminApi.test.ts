@@ -93,6 +93,7 @@ describe("admin behavior API", () => {
 
     await patchAdminChannelFeed("stock/market", "market wire", {
       enabled: true,
+      discussionFrequency: 70,
       activeIntervalMinutes: 5,
       idleIntervalMinutes: 45,
     });
@@ -102,7 +103,7 @@ describe("admin behavior API", () => {
       expect.objectContaining({
         method: "PATCH",
         credentials: "same-origin",
-        body: JSON.stringify({ enabled: true, activeIntervalMinutes: 5, idleIntervalMinutes: 45 }),
+        body: JSON.stringify({ enabled: true, discussionFrequency: 70, activeIntervalMinutes: 5, idleIntervalMinutes: 45 }),
       }),
     );
   });

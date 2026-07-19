@@ -267,6 +267,7 @@ describe("MarketWire typed adapter", () => {
     const first = marketSnapshot([observation("SE_OMXS30")]);
     const provider = { snapshot: vi.fn(async () => first) };
     const adapter = new MarketWireAdapter(provider);
+    expect(adapter.metadata.defaultDiscussionFrequency).toBe(50);
     const published = await adapter.poll({ now: NOW, signal: new AbortController().signal });
     expect(provider.snapshot).toHaveBeenCalledWith({
       targetId: "COMMUNITY_MAJOR",

@@ -66,6 +66,9 @@ import {
   buildCandidateReviewResponseFormat,
   buildCandidateReviewSystemPrompt,
   buildCandidateReviewUserData,
+  buildChannelFeedCoverageResponseFormat,
+  buildChannelFeedCoverageSystemPrompt,
+  buildChannelFeedCoverageUserData,
   buildVoiceCandidateReviewSystemPrompt,
   buildEvidencePlanVerifierResponseFormat,
   buildEvidencePlanVerifierSystemPrompt,
@@ -84,6 +87,7 @@ import {
   candidateReviewInputSchema,
   memoryAnalysisInputSchema,
   parseCandidateReviewContent,
+  parseChannelFeedCoverageContent,
   parseEvidencePlanVerifierContent,
   parseMemoryAnalysisContent,
   parseTurnAnalysisContent,
@@ -167,6 +171,35 @@ const mergeVerifiedEvidencePlan = (
     },
   };
 };
+
+const adoptTrustedChannelFeedCoverage = (
+  primary: TurnAnalysis,
+  confidence: number,
+): TurnAnalysis => ({
+  ...primary,
+  channelFeedGrounded: true,
+  evidence: {
+    need: "none",
+    action: "none",
+    confidence,
+    goal: null,
+    query: null,
+    urlRef: null,
+    searchMode: null,
+    timeZone: null,
+    timeKind: null,
+    locationLabel: null,
+    competitionTarget: null,
+    footballView: null,
+    footballFilter: null,
+  },
+  capabilities: {
+    ...primary.capabilities,
+    discussed: [],
+    requestKind: "none",
+    confidence: Math.max(primary.capabilities.confidence, confidence),
+  },
+});
 
 export type SceneKind = "welcome" | "public" | "dm" | "ambient" | "voice";
 
@@ -275,6 +308,10 @@ export interface SceneRequest {
   history: TranscriptLine[];
   /** Optional trusted room telemetry available to every public scene in that channel. */
   channelFeedContext?: SceneChannelFeedContext;
+  /** This ambient opening was explicitly admitted from the supplied typed feed revision. */
+  channelFeedDiscussion?: boolean;
+  /** The current human turn was explicitly proven answerable from the supplied feed. */
+  channelFeedGrounded?: boolean;
   roomRecall?: RoomRecallEvidence;
   trigger?: {
     author: string;
@@ -559,7 +596,7 @@ const CANDIDATE_ISSUE_REASON_CODE: Record<CandidateReviewIssue, HumanizerReasonC
 };
 
 const reviewedRecoveryPolicy = (
-  request: Pick<SceneRequest, "semanticContext">,
+  request: Pick<SceneRequest, "semanticContext" | "channelFeedDiscussion" | "channelFeedGrounded" | "channelFeedContext">,
   personaIds: readonly string[],
   reviews: ReadonlyMap<string, CandidateLineReview> | undefined,
 ): string => {
@@ -593,7 +630,14 @@ const reviewedRecoveryPolicy = (
       issue === "evidence_ungrounded" ||
       issue === "unsupported_external_evidence_claim"
     ) {
-      guidance.add("Use only supplied evidence and attach supporting source IDs as metadata; otherwise name only the concrete missing datum or failed attempt without a broad capability denial.");
+      if (
+        request.channelFeedContext &&
+        (request.channelFeedDiscussion === true || request.channelFeedGrounded === true)
+      ) {
+        guidance.add("Use only exact supplied channel-feed facts. Keep sourceIds as [] because channel-feed grounding has no research-source IDs; otherwise name only the concrete missing datum without a broad capability denial.");
+      } else {
+        guidance.add("Use only supplied evidence and attach supporting source IDs as metadata; otherwise name only the concrete missing datum or failed attempt without a broad capability denial.");
+      }
     } else if (issue === "community_capability_contradiction") {
       guidance.add("Answer from trusted community capability facts: voice chat exists, humans can start and join it from public rooms, residents can be invited, and residents do not start voice rooms autonomously.");
     } else if (issue === "unsupported_visual_claim") {
@@ -878,6 +922,7 @@ const forwardAbort = (controller: AbortController, signal?: AbortSignal): (() =>
 // local model is busy instead of letting the outer timer replace it with a
 // fail-closed empty analysis.
 const EVIDENCE_PLAN_VERIFIER_TIMEOUT_MS = 8_000;
+const CHANNEL_FEED_COVERAGE_TIMEOUT_MS = 4_000;
 const TURN_ANALYSIS_SETTLE_MARGIN_MS = 750;
 const VOICE_DRAFT_TTL_MS = 60_000;
 const MAX_VOICE_DRAFTS = 64;
@@ -2719,7 +2764,59 @@ export class LmStudioClient {
         ? summarizeInvalidPrimaryEvidenceContent(content) ?? primary
         : primary;
 
-      if (shouldVerifyEvidencePlan(input, verificationPrimary)) {
+      let channelFeedCovered = false;
+      const primarySummary = createEvidencePlanVerifierInput(input, verificationPrimary).primary;
+      const trustedNoAction = primarySummary.evidence.action === "none" &&
+        primarySummary.evidence.confidence >= TURN_TRUST_THRESHOLDS.evidence;
+      const trustedMarketSnapshotPlan = primarySummary.evidence.action === "market_snapshot" &&
+        primarySummary.evidence.confidence >= TURN_TRUST_THRESHOLDS.evidence &&
+        primarySummary.capabilities.confidence >= TURN_TRUST_THRESHOLDS.capability &&
+        primarySummary.capabilities.discussed.includes("market_snapshot") &&
+        ["execute", "retry", "correct_limitation"].includes(primarySummary.capabilities.requestKind);
+      const shouldJudgeFeedCoverage = input.channelFeedContext !== null &&
+        primarySummary.source === "lm" &&
+        (trustedNoAction || trustedMarketSnapshotPlan);
+      if (shouldJudgeFeedCoverage) {
+        const coverageBudgetMs = Math.min(
+          CHANNEL_FEED_COVERAGE_TIMEOUT_MS,
+          Math.max(0, deadlineAt - performance.now() - TURN_ANALYSIS_SETTLE_MARGIN_MS),
+        );
+        if (coverageBudgetMs > 0) {
+          const coverageController = new AbortController();
+          const stopForwardingAbort = forwardAbort(coverageController, signal);
+          const coverageTimeout = setTimeout(
+            () => coverageController.abort(new DOMException("Channel-feed coverage deadline exceeded", "TimeoutError")),
+            coverageBudgetMs,
+          );
+          try {
+            const coverageRaw = await this.callChannelFeedCoverage(input, model, coverageController.signal);
+            const coverageCompletion = completionSchema.safeParse(coverageRaw);
+            const coverageContent = coverageCompletion.success
+              ? coverageCompletion.data.choices[0]?.message.content
+              : undefined;
+            const coverage = coverageContent
+              ? parseChannelFeedCoverageContent(coverageContent)
+              : undefined;
+            channelFeedCovered = coverage?.verdict === "covered" &&
+              coverage.confidence >= TURN_TRUST_THRESHOLDS.evidence;
+            if (channelFeedCovered && coverage) {
+              analysis = adoptTrustedChannelFeedCoverage(primary, coverage.confidence);
+            }
+          } catch {
+            // An unavailable arbiter grants no authority. The ordinary
+            // provider verifier below remains responsible for the request.
+          } finally {
+            stopForwardingAbort();
+            clearTimeout(coverageTimeout);
+          }
+        }
+      }
+
+      if (signal.aborted || performance.now() >= deadlineAt) {
+        return createFailClosedTurnAnalysis("timeout");
+      }
+
+      if (!channelFeedCovered && shouldVerifyEvidencePlan(input, verificationPrimary)) {
         const verifierInput = createEvidencePlanVerifierInput(input, verificationPrimary);
         const verifierBudgetMs = Math.min(
           EVIDENCE_PLAN_VERIFIER_TIMEOUT_MS,
@@ -2990,6 +3087,26 @@ export class LmStudioClient {
       max_tokens: 320,
       stream: false,
       response_format: buildEvidencePlanVerifierResponseFormat(input),
+    }, signal);
+  }
+
+  private async callChannelFeedCoverage(
+    input: NormalizedTurnAnalysisInput,
+    model: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    return await this.complete({
+      model,
+      messages: [
+        { role: "system", content: buildChannelFeedCoverageSystemPrompt() },
+        { role: "user", content: JSON.stringify(buildChannelFeedCoverageUserData(input)) },
+      ],
+      temperature: 0,
+      top_p: 1,
+      reasoning_effort: "none",
+      max_tokens: 180,
+      stream: false,
+      response_format: buildChannelFeedCoverageResponseFormat(),
     }, signal);
   }
 
@@ -3302,12 +3419,20 @@ export class LmStudioClient {
     const communityCapabilityContradictionIds = request.selected
       .filter((persona) => semanticReviews?.get(persona.id)?.issues.includes("community_capability_contradiction"))
       .map((persona) => persona.id);
+    const channelFeedDiscussionIds = request.kind === "ambient" &&
+      request.channelFeedDiscussion === true &&
+      request.channelFeedContext
+      ? request.selected
+          .filter((persona) => request.mustReplyIds?.includes(persona.id))
+          .map((persona) => persona.id)
+      : [];
     const missingRequiredIds = [...new Set([
       ...explicitOwnerIds,
       ...responseRecoveryIds,
       ...soleRequiredDmIds,
       ...textLanguageMismatchIds,
       ...communityCapabilityContradictionIds,
+      ...channelFeedDiscussionIds,
     ])]
       .filter((personaId) => !deliveredIds.has(personaId));
     let result = humanizedLines;
@@ -3327,6 +3452,11 @@ export class LmStudioClient {
         request.autonomousResearchContext &&
         request.urlPublicationPolicy === "server_card"
       );
+      const recoversChannelFeedDiscussion = Boolean(
+        request.kind === "ambient" &&
+        request.channelFeedDiscussion === true &&
+        request.channelFeedContext
+      );
       const actorNames = missingActors.map((persona) => persona.name).join(", ");
       const reviewCorrection = reviewedRecoveryPolicy(request, missingRequiredIds, semanticReviews);
       const operationalMode = request.semanticContext?.operationalMode;
@@ -3344,6 +3474,8 @@ export class LmStudioClient {
         ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: ${boundedOperationalCompletion}. ${completionFailureRule} Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
         : recoversAutonomousResearchOpening
           ? `${actorNames || "The selected research lead"}'s first autonomous source-backed opening did not survive its typed source and review contract. This is the one bounded full-scene recovery: write one room-relevant opening for the same trusted autonomous research angle, grounded in the sole supplied evidence result. The server binds its destination card; return sourceIds as []. Preserve the ambient action and leave one concrete hook for another resident. Do not imply that a human asked, mention searching or tooling, write a URL, or change subject.${reviewCorrection}`
+        : recoversChannelFeedDiscussion
+          ? `${actorNames || "The selected resident"}'s typed channel-feed contribution did not survive review. This is the one bounded full-scene recovery: perform the same assigned ambient move from the exact supplied channelFeedContext, using only values and limits it literally establishes. Keep sourceIds as [] because this feed grounding has no research-source IDs. Preserve the episode target and leave a concrete hook when the ambient contract asks for one. Do not mention feed plumbing, searching or tooling, and do not infer causes, forecasts or market-open state.${reviewCorrection}`
         : recoversCommunityCapability
           ? `${actorNames || "The selected resident"}'s first candidate contradicted trusted community capability facts. This is the one bounded full-scene recovery: answer the actual turn from trustedCommunityCapabilities, preserving the character voice and language. Voice chat exists; humans can start and join it from public rooms, residents can be invited, and residents do not start rooms autonomously.${reviewCorrection}`
         : recoversTextLanguage
@@ -4154,7 +4286,14 @@ export class LmStudioClient {
       // under a stale or missing citation. A designated failed-capability
       // reporter has no evidence packet to lose and may receive one style-only
       // repair; the repaired output is still semantically reviewed below.
-      const evidenceScene = Boolean(request.research || request.evidenceOutcome || request.requestedClock);
+      const evidenceScene = Boolean(
+        request.research ||
+        request.evidenceOutcome ||
+        request.requestedClock ||
+        (boundedChannelFeedContext(request) && (
+          request.channelFeedDiscussion === true || request.channelFeedGrounded === true
+        ))
+      );
       const repairable = rejected.filter((entry) =>
         (!evidenceScene || (
           request.evidenceOutcome === "failed" && failureReporterIds.has(entry.line.personaId)

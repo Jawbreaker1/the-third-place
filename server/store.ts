@@ -84,7 +84,26 @@ export interface AutonomousPublicationRecord {
   createdAt: string;
   kind: "ambient" | "research";
   attendance: "attended" | "unattended";
+  /** Server-only idempotency proof for one durable feed-led opening. */
+  channelFeedReceipt?: ChannelFeedPublicationReceiptMarker;
 }
+
+export interface ChannelFeedPublicationReceiptMarker {
+  feedId: string;
+  revisionKey: string;
+  revision: number;
+}
+
+export interface DurableChannelFeedPublicationReceipt extends ChannelFeedPublicationReceiptMarker {
+  channelId: string;
+  messageId: string;
+  publishedAt: number;
+}
+
+type AutonomousPublicationInput = Pick<
+  AutonomousPublicationRecord,
+  "kind" | "attendance" | "channelFeedReceipt"
+>;
 
 interface PrivateThread {
   id: string;
@@ -159,6 +178,7 @@ const DEFAULT_DM_HISTORY_TRIM_TO = boundedRetention(
   DEFAULT_DM_HISTORY_HARD_LIMIT - 1,
 );
 const AUTONOMOUS_ACCOUNTING_RETENTION_MS = 48 * 60 * 60_000;
+const MAX_DURABLE_CHANNEL_FEED_RECEIPTS = 64;
 const MAX_PERSISTED_PUBLIC_MESSAGES = 100_000;
 const MAX_PERSISTED_PRIVATE_THREADS = 10_000;
 const MAX_PERSISTED_PRIVATE_MESSAGES_PER_THREAD = 20_000;
@@ -400,11 +420,23 @@ const compareMessages = (a: Pick<ChatMessage, "createdAt" | "id">, b: Pick<ChatM
 const isAutonomousPublicationRecord = (value: unknown): value is AutonomousPublicationRecord => {
   if (!isRecord(value)) return false;
   const record = value as Partial<AutonomousPublicationRecord>;
+  const receipt = record.channelFeedReceipt;
+  const validReceipt = receipt === undefined || (
+    isRecord(receipt) &&
+    Object.keys(receipt).every((key) => ["feedId", "revisionKey", "revision"].includes(key)) &&
+    Object.keys(receipt).length === 3 &&
+    isBoundedIdentifier(receipt.feedId) &&
+    isBoundedString(receipt.revisionKey, 192, 3) &&
+    /^[a-z0-9][a-z0-9:._-]{2,191}$/u.test(receipt.revisionKey) &&
+    isFiniteInteger(receipt.revision, 1, Number.MAX_SAFE_INTEGER) &&
+    receipt.revisionKey.endsWith(`:${receipt.feedId}:${receipt.revision}`)
+  );
   return isBoundedIdentifier(record.messageId) &&
     isBoundedChannelId(record.channelId) &&
     isTimestamp(record.createdAt) &&
     (record.kind === "ambient" || record.kind === "research") &&
-    (record.attendance === "attended" || record.attendance === "unattended");
+    (record.attendance === "attended" || record.attendance === "unattended") &&
+    validReceipt;
 };
 
 const isTrustedChannelLanguage = (value: unknown): value is TrustedChannelLanguage => {
@@ -1049,7 +1081,24 @@ export class RoomStore {
   }
 
   getAutonomousPublicationHistory(): AutonomousPublicationRecord[] {
-    return this.autonomousPublications.map((record) => ({ ...record }));
+    return this.autonomousPublications.map((record) => ({
+      ...record,
+      ...(record.channelFeedReceipt
+        ? { channelFeedReceipt: { ...record.channelFeedReceipt } }
+        : {}),
+    }));
+  }
+
+  getDurableChannelFeedPublicationReceipts(): DurableChannelFeedPublicationReceipt[] {
+    return this.autonomousPublications.flatMap((record) => record.channelFeedReceipt
+      ? [{
+          ...record.channelFeedReceipt,
+          channelId: record.channelId,
+          messageId: record.messageId,
+          publishedAt: Date.parse(record.createdAt),
+        }]
+      : []
+    ).filter((receipt) => Number.isFinite(receipt.publishedAt));
   }
 
   getTrustedChannelLanguage(channelId: string): TrustedChannelLanguage | undefined {
@@ -1105,14 +1154,29 @@ export class RoomStore {
 
   private pruneAutonomousPublications(referenceAt = Date.now()): void {
     const at = Number.isFinite(referenceAt) ? referenceAt : Date.now();
-    const recent = this.autonomousPublications
+    const ordered = this.autonomousPublications
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.messageId.localeCompare(right.messageId));
+    // A room-first receipt is transaction recovery state, not activity
+    // accounting. Keep exactly the latest one per bounded feed even after the
+    // ordinary 48-hour accounting window, otherwise a long-offline restart
+    // could lose the only proof needed to repair an admitted ledger revision.
+    const durableFeedReceipts = [...new Map(ordered.flatMap((record) => record.channelFeedReceipt
+      ? [[record.channelFeedReceipt.feedId, record] as const]
+      : []
+    )).values()].slice(-MAX_DURABLE_CHANNEL_FEED_RECEIPTS);
+    const recent = ordered
+      .filter((record) => record.channelFeedReceipt === undefined)
       .filter((record) => at - Date.parse(record.createdAt) <= AUTONOMOUS_ACCOUNTING_RETENTION_MS)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.messageId.localeCompare(right.messageId));
     const latest = recent.at(-1);
     const retained = recent.filter(
       (record) => record.attendance === "unattended" || record.kind === "research" || record === latest,
     );
-    this.autonomousPublications = [...new Map(retained.map((record) => [record.messageId, record])).values()];
+    this.autonomousPublications = [...new Map(
+      [...retained, ...durableFeedReceipts].map((record) => [record.messageId, record]),
+    ).values()].sort((left, right) =>
+      left.createdAt.localeCompare(right.createdAt) || left.messageId.localeCompare(right.messageId)
+    );
   }
 
   private nowMs(): number {
@@ -1420,7 +1484,7 @@ export class RoomStore {
 
   addPublicMessage(
     message: ChatMessage,
-    autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+    autonomousPublication?: AutonomousPublicationInput,
     pendingTurn?: PendingPublicTurnRegistration,
   ): ChatMessage[] {
     return this.appendPublicMessage(message, autonomousPublication, pendingTurn, false);
@@ -1434,7 +1498,7 @@ export class RoomStore {
    */
   addUncommittedPublicMessage(
     message: ChatMessage,
-    autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+    autonomousPublication?: AutonomousPublicationInput,
     pendingTurn?: PendingPublicTurnRegistration,
   ): UncommittedPublicMessageAppend {
     if (this.messages.some((candidate) => candidate.id === message.id) ||
@@ -1445,7 +1509,12 @@ export class RoomStore {
     const at = this.nowMs();
     this.reconcilePendingPublicTurns(at, false);
     const messageIndexes = new Map(this.messages.map((candidate, index) => [candidate.id, index]));
-    const autonomousBefore = this.autonomousPublications.map((record) => ({ ...record }));
+    const autonomousBefore = this.autonomousPublications.map((record) => ({
+      ...record,
+      ...(record.channelFeedReceipt
+        ? { channelFeedReceipt: { ...record.channelFeedReceipt } }
+        : {}),
+    }));
     const replyTurn = message.replyToId ? this.pendingPublicTurns.get(message.replyToId) : undefined;
     const replyTargetIndex = replyTurn?.targets.findIndex((target) => target.personaId === message.authorId) ?? -1;
     const replyTarget = replyTurn && replyTargetIndex >= 0 ? replyTurn.targets[replyTargetIndex] : undefined;
@@ -1504,7 +1573,7 @@ export class RoomStore {
    */
   async addPublicMessageDurably(
     message: ChatMessage,
-    autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+    autonomousPublication?: AutonomousPublicationInput,
     pendingTurn?: PendingPublicTurnRegistration,
   ): Promise<ChatMessage[]> {
     const handle = this.addUncommittedPublicMessage(message, autonomousPublication, pendingTurn);
@@ -1585,7 +1654,7 @@ export class RoomStore {
 
   private appendPublicMessage(
     message: ChatMessage,
-    autonomousPublication?: Pick<AutonomousPublicationRecord, "kind" | "attendance">,
+    autonomousPublication?: AutonomousPublicationInput,
     pendingTurn?: PendingPublicTurnRegistration,
     deferRemovalHandler = false,
   ): ChatMessage[] {
@@ -1598,12 +1667,16 @@ export class RoomStore {
       }
       let changed = false;
       if (autonomousPublication && !this.autonomousPublications.some((record) => record.messageId === message.id)) {
-        this.autonomousPublications.push({
+        const record: AutonomousPublicationRecord = {
           messageId: message.id,
           channelId: message.channelId,
           createdAt: message.createdAt,
           ...autonomousPublication,
-        });
+        };
+        if (!isAutonomousPublicationRecord(record)) {
+          throw new TypeError("Invalid autonomous publication metadata.");
+        }
+        this.autonomousPublications.push(record);
         this.pruneAutonomousPublications(Date.parse(message.createdAt));
         changed = true;
       }
@@ -1627,12 +1700,16 @@ export class RoomStore {
     this.messages.push(message);
     if (pendingCandidate) this.pendingPublicTurns.set(message.id, pendingCandidate);
     if (autonomousPublication) {
-      this.autonomousPublications.push({
+      const record: AutonomousPublicationRecord = {
         messageId: message.id,
         channelId: message.channelId,
         createdAt: message.createdAt,
         ...autonomousPublication,
-      });
+      };
+      if (!isAutonomousPublicationRecord(record)) {
+        throw new TypeError("Invalid autonomous publication metadata.");
+      }
+      this.autonomousPublications.push(record);
       this.pruneAutonomousPublications(Date.parse(message.createdAt));
     }
     this.reconcilePendingPublicTurns(at, false);

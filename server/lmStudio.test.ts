@@ -367,6 +367,314 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionBody.messages[0].content).toBe(buildTurnAnalysisSystemPrompt());
   });
 
+  it("lets the semantic router keep external capability work off when trusted room-feed facts answer the turn", async () => {
+    const completionBodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      completionBodies.push(body);
+      if (completionBodies.length === 1) return turnAnalysisCompletion({
+        language: { tag: "sv", confidence: 0.99 },
+        responseLanguage: { tag: "sv", confidence: 0.99 },
+        evidence: {
+          need: "none",
+          action: "none",
+          confidence: 0.99,
+          goal: null,
+          query: null,
+          urlRef: null,
+          searchMode: null,
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+        capabilities: {
+          discussed: [],
+          requestKind: "none",
+          asksAboutAcoustics: false,
+          asksAboutAiIdentity: false,
+          asksForList: false,
+          confidence: 0.99,
+        },
+      });
+      return jsonResponse({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              verdict: "covered",
+              confidence: 0.99,
+              missingDimension: null,
+            }),
+          },
+        }],
+      });
+    }));
+
+    const channelFeedContext = {
+      publisherName: "IndexWire",
+      content: "North Composite: 4123.50 points; -0.75% versus previous close; freshness recent.",
+      updatedAt: "2026-07-19T12:00:00.000Z",
+    };
+    const request = turnAnalysisInputSchema.parse({
+      ...turnInput("feed-covered-current-question"),
+      channel: { id: "markets", name: "markets" },
+      latestMessage: {
+        id: "feed-covered-current-question-message",
+        authorId: "human-jaw-b",
+        authorName: "Jaw_B",
+        content: "Mira, hur går de index som visas här just nu?",
+      },
+      recentMessages: [],
+      mechanicalAddressedPersonaIds: ["ai-mira"],
+      urlCandidates: [],
+      availableCapabilities: ["market_snapshot", "web_search"],
+      channelFeedContext,
+    });
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      evidence: { action: "none" },
+      capabilities: { discussed: [], requestKind: "none" },
+    });
+    expect(completionBodies).toHaveLength(2);
+    expect(JSON.parse(completionBodies[0].messages[1].content)).toMatchObject({ channelFeedContext });
+    expect(completionBodies[0].messages[0].content).toContain("the guest need not name its publisher");
+    expect(JSON.parse(completionBodies[1].messages[1].content)).toMatchObject({ channelFeedContext });
+    expect(completionBodies[1].messages[0].content).toContain(
+      "strict multilingual channel-feed coverage judge",
+    );
+  });
+
+  it("lets trusted feed coverage supersede an unnecessary high-confidence market snapshot plan", async () => {
+    const completionBodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      completionBodies.push(body);
+      if (completionBodies.length === 1) return turnAnalysisCompletion({
+        language: { tag: "sv", confidence: 0.99 },
+        responseLanguage: { tag: "sv", confidence: 0.99 },
+        evidence: {
+          need: "required",
+          action: "market_snapshot",
+          confidence: 0.99,
+          goal: "Rapportera hur OMXS30 går",
+          query: null,
+          urlRef: null,
+          searchMode: null,
+          timeZone: null,
+          timeKind: null,
+          locationLabel: "SE_OMXS30",
+        },
+        capabilities: {
+          discussed: ["market_snapshot"],
+          requestKind: "execute",
+          asksAboutAcoustics: false,
+          asksAboutAiIdentity: false,
+          asksForList: false,
+          confidence: 0.99,
+        },
+      });
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({
+        verdict: "covered",
+        confidence: 0.99,
+        missingDimension: null,
+      }) } }] });
+    }));
+
+    const request = turnAnalysisInputSchema.parse({
+      ...turnInput("feed-overrides-market-snapshot"),
+      channel: { id: "stock-market", name: "stock-market" },
+      latestMessage: {
+        id: "feed-overrides-market-snapshot-message",
+        authorId: "human-jaw-b",
+        authorName: "Jaw_B",
+        content: "Hur går OMXS30 idag?",
+      },
+      recentMessages: [],
+      urlCandidates: [],
+      availableCapabilities: ["market_snapshot", "web_search"],
+      channelFeedContext: {
+        publisherName: "MarketWire",
+        content: "OMXS30: 2534.20 index points; +1.25% versus previous close; freshness recent.",
+        updatedAt: "2026-07-19T12:00:00.000Z",
+      },
+    });
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      channelFeedGrounded: true,
+      evidence: {
+        need: "none",
+        action: "none",
+        goal: null,
+        locationLabel: null,
+      },
+      capabilities: { discussed: [], requestKind: "none" },
+    });
+    expect(completionBodies).toHaveLength(2);
+    expect(completionBodies[1].messages[0].content).toContain("channel-feed coverage judge");
+  });
+
+  it("does not supersede a market snapshot plan from an untrusted feed coverage verdict", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) return turnAnalysisCompletion({
+        evidence: {
+          need: "required", action: "market_snapshot", confidence: 0.99,
+          goal: "Report OMXS30", query: null, urlRef: null, searchMode: null,
+          timeZone: null, timeKind: null, locationLabel: "SE_OMXS30",
+        },
+        capabilities: {
+          discussed: ["market_snapshot"], requestKind: "execute",
+          asksAboutAcoustics: false, asksAboutAiIdentity: false,
+          asksForList: false, confidence: 0.99,
+        },
+      });
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({
+        verdict: "covered",
+        confidence: 0.74,
+        missingDimension: null,
+      }) } }] });
+    }));
+
+    const request = turnAnalysisInputSchema.parse({
+      ...turnInput("feed-low-confidence-does-not-override"),
+      channel: { id: "stock-market", name: "stock-market" },
+      recentMessages: [],
+      urlCandidates: [],
+      availableCapabilities: ["market_snapshot", "web_search"],
+      channelFeedContext: {
+        publisherName: "MarketWire",
+        content: "OMXS30: 2534.20 index points; +1.25% versus previous close.",
+        updatedAt: "2026-07-19T12:00:00.000Z",
+      },
+    });
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      evidence: { action: "market_snapshot", locationLabel: "SE_OMXS30" },
+      capabilities: { discussed: ["market_snapshot"], requestKind: "execute" },
+    });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("fails closed when the turn is aborted while the feed coverage judge is completing", async () => {
+    const controller = new AbortController();
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) return turnAnalysisCompletion({
+        language: { tag: "sv", confidence: 0.99 },
+        responseLanguage: { tag: "sv", confidence: 0.99 },
+        evidence: {
+          need: "none", action: "none", confidence: 0.99, goal: null, query: null,
+          urlRef: null, searchMode: null, timeZone: null, timeKind: null, locationLabel: null,
+        },
+        capabilities: {
+          discussed: [], requestKind: "none", asksAboutAcoustics: false,
+          asksAboutAiIdentity: false, asksForList: false, confidence: 0.99,
+        },
+      });
+      controller.abort(new Error("coverage no longer belongs to a live turn"));
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({
+        verdict: "covered",
+        confidence: 0.99,
+        missingDimension: null,
+      }) } }] });
+    }));
+
+    const request = turnAnalysisInputSchema.parse({
+      ...turnInput("feed-coverage-abort"),
+      channel: { id: "stock-market", name: "stock-market" },
+      latestMessage: {
+        id: "feed-coverage-abort-message",
+        authorId: "human-jaw-b",
+        authorName: "Jaw_B",
+        content: "Hur går indexen här?",
+      },
+      recentMessages: [],
+      urlCandidates: [],
+      availableCapabilities: ["market_snapshot", "web_search"],
+      channelFeedContext: {
+        publisherName: "MarketWire",
+        content: "OMXS30: 2534.20 index points; +1.25% versus previous close.",
+        updatedAt: "2026-07-19T12:00:00.000Z",
+      },
+    });
+
+    await expect(new LmStudioClient().analyzeTurn(request, { signal: controller.signal }))
+      .resolves.toMatchObject({
+        source: "fallback",
+        failureReason: "timeout",
+        evidence: { action: "none" },
+      });
+    expect(completionCalls).toBe(2);
+  });
+
+  it("continues to the provider verifier when the focused feed judge finds a missing dimension", async () => {
+    const completionBodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      completionBodies.push(body);
+      if (completionBodies.length === 1) return turnAnalysisCompletion({
+        language: { tag: "sv", confidence: 0.99 },
+        responseLanguage: { tag: "sv", confidence: 0.99 },
+        evidence: {
+          need: "none", action: "none", confidence: 0.99, goal: null, query: null,
+          urlRef: null, searchMode: null, timeZone: null, timeKind: null, locationLabel: null,
+        },
+        capabilities: {
+          discussed: [], requestKind: "none", asksAboutAcoustics: false,
+          asksAboutAiIdentity: false, asksForList: false, confidence: 0.99,
+        },
+      });
+      if (completionBodies.length === 2) return jsonResponse({ choices: [{ message: { content: JSON.stringify({
+        verdict: "missing",
+        confidence: 0.99,
+        missingDimension: "Investor B",
+      }) } }] });
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify({
+        t: "sv", tx: 0.99, v: "use_action", a: "web_search", r: "execute",
+        d: ["web_search"], x: 0.99, g: "Hur går Investor B idag?",
+        q: "Investor B aktiekurs idag", u: null, m: "web", z: null, k: null,
+        l: null, c: null, w: null, f: null,
+      }) } }] });
+    }));
+
+    const request = turnAnalysisInputSchema.parse({
+      ...turnInput("feed-missing-instrument"),
+      channel: { id: "markets", name: "markets" },
+      latestMessage: {
+        id: "feed-missing-instrument-message",
+        authorId: "human-jaw-b",
+        authorName: "Jaw_B",
+        content: "Hur går Investor B idag?",
+      },
+      recentMessages: [],
+      urlCandidates: [],
+      availableCapabilities: ["market_snapshot", "web_search"],
+      channelFeedContext: {
+        publisherName: "IndexWire",
+        content: "North Composite: 4123.50 points; -0.75% versus previous close.",
+        updatedAt: "2026-07-19T12:00:00.000Z",
+      },
+    });
+
+    await expect(new LmStudioClient().analyzeTurn(request)).resolves.toMatchObject({
+      source: "lm",
+      evidence: { action: "web_search", query: "Investor B aktiekurs idag" },
+      capabilities: { discussed: ["web_search"], requestKind: "execute" },
+    });
+    expect(completionBodies).toHaveLength(3);
+    expect(completionBodies[1].messages[0].content).toContain("channel-feed coverage judge");
+    expect(completionBodies[2].messages[0].content).toContain("evidence-plan verifier");
+  });
+
   it("uses the compact voice prompt with the same strict schema and complete router payload", async () => {
     let completionCalls = 0;
     let completionBody: any;
@@ -4583,6 +4891,149 @@ describe("LM Studio multilingual batch candidate review", () => {
     const reviewPayload = JSON.parse(bodies[1].messages[1].content);
     expect(reviewPayload.channelFeedContext).toEqual(channelFeedContext);
     expect(reviewPayload.evidence).toEqual({ outcome: "none", kind: null, query: null, results: [] });
+  });
+
+  it("keeps optional feed telemetry out of evidence mode for an unrelated ordinary scene", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{
+          personaId: vale.id,
+          content: "Certainly. Here is a balanced response about the film question.",
+        }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: vale.id,
+          severity: "high",
+          issues: ["assistant_register"],
+          rewriteInstruction: "Answer as Vale, not as a service assistant.",
+          outputLanguage: { tag: "en", confidence: 0.99 },
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{
+          personaId: vale.id,
+          content: "Nah, the second film loses me halfway through.",
+        }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: vale.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+        outputLanguage: { tag: "en", confidence: 0.99 },
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [vale],
+      history: [],
+      trigger: { author: "Guest", content: "Which of those two films did you prefer?" },
+      channelFeedContext: {
+        publisherName: "MarketWire",
+        content: "OMXS30: 2534.20 index points; +1.25% versus previous close.",
+        updatedAt: "2026-07-19T12:00:00.000Z",
+      },
+      semanticContext: {
+        languageTag: "en",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([
+      "Nah, the second film loses me halfway through.",
+    ]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[2].messages[0].content).toContain("one-pass copy editor");
+  });
+
+  it("recovers a rejected feed-grounded opening with full context instead of context-free style repair", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{
+          personaId: vale.id,
+          content: "IndexWire reports North Composite at 4,123.50, down 0.75 percent versus the previous close.",
+        }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: vale.id,
+          severity: "high",
+          issues: ["assistant_register", "evidence_ungrounded"],
+          rewriteInstruction: "Keep only the exact supplied figures in Vale's terse peer voice.",
+          outputLanguage: { tag: "en", confidence: 0.99 },
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{
+          personaId: vale.id,
+          content: "North Composite is down 0.75 percent versus the previous close. Broadly sour — what do you read into that?",
+        }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: vale.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "stock-market",
+      channelName: "stock-market",
+      selected: [vale],
+      history: [],
+      ambientAction: {
+        episodeId: "feed-episode-1",
+        causalRootId: "market_ticker:market-wire:7",
+        semanticFamily: "channel-feed:stock-market:market-wire",
+        kind: "open_topic",
+        turnIndex: 0,
+        openHook: true,
+        previousActions: [],
+      },
+      channelFeedContext: {
+        publisherName: "IndexWire",
+        content: "North Composite: 4123.50 points; -0.75% versus previous close; freshness recent.",
+        updatedAt: "2026-07-19T12:00:00.000Z",
+      },
+      channelFeedDiscussion: true,
+      mustReplyIds: [vale.id],
+      semanticContext: {
+        languageTag: "en",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: vale.id,
+      content: "North Composite is down 0.75 percent versus the previous close. Broadly sour — what do you read into that?",
+    })]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies.some((body) => body.messages[0].content.includes("one-pass copy editor"))).toBe(false);
+    expect(bodies[2].messages[1].content).toContain("typed channel-feed contribution did not survive review");
+    expect(bodies[2].messages[1].content).toContain("sourceIds as []");
+    expect(bodies[2].messages[1].content).not.toContain("attach supporting source IDs");
   });
 
   it("recovers a multilingual false voice-chat denial from structured community capability truth", async () => {

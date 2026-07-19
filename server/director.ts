@@ -39,6 +39,7 @@ import type { SocialModelClient } from "./switchableModel.js";
 import {
   createMessage,
   RoomStore,
+  type ChannelFeedPublicationReceiptMarker,
   type UncommittedPublicMessageAppend,
 } from "./store.js";
 import { ResearchBroker } from "./researchBroker.js";
@@ -114,6 +115,12 @@ import {
   type AmbientEpisodeShape,
 } from "./ambientActionPlanner.js";
 import type { AmbientEpisodeLedger } from "./ambientEpisodeLedger.js";
+import {
+  channelFeedConversationPolicy,
+  type ChannelFeedConversationCue,
+  type ChannelFeedConversationLedger,
+  type ChannelFeedConversationPolicy,
+} from "./channelFeedConversation.js";
 import type {
   DeliveredSocialEpisode,
   SocialMemoryCoordinator,
@@ -585,7 +592,10 @@ export interface AmbientThreadState {
     roomTopic: string;
     discussionAngle: string;
   };
-  origin?: "room_seed" | "human_topic" | "autonomous_research";
+  /** Exact admitted feed revision retained until its first successful publication. */
+  channelFeedConversationCue?: ChannelFeedConversationCue;
+  channelFeedConversationPolicy?: ChannelFeedConversationPolicy;
+  origin?: "room_seed" | "human_topic" | "autonomous_research" | "channel_feed";
   openedAt: number;
   updatedAt: number;
 }
@@ -1005,12 +1015,10 @@ export interface SocialDirectorOptions {
   weatherForecastProvider?: WeatherForecastCapabilityProvider | null;
   /** Provider-neutral typed market snapshots shared by direct turns and MarketPulse. */
   marketSnapshotProvider?: Pick<MarketSnapshotService, "snapshot"> | null;
-  /**
-   * Latest server-validated integration facts for a public room. These facts
-   * are optional scene context only: polling them never schedules a resident
-   * turn and they are never written into chat history or social memory.
-   */
-  channelFeedFacts?: (channelId: string) => ChannelFeedFactContext | undefined;
+  /** Latest server-validated integration facts and an optional typed discussion cue. */
+  channelFeedFacts?: (channelId: string) => readonly ChannelFeedFactContext[];
+  /** Persistent, poll-independent admission ledger for feed-led resident episodes. */
+  channelFeedConversationLedger?: ChannelFeedConversationLedger;
   /** Provider-neutral typed football snapshots shared with the server capability inventory. */
   footballCompetitionProvider?: FootballCompetitionCapabilityProvider | null;
   /** Fixed-source market event coordinator. `null` disables autonomous market events. */
@@ -1030,7 +1038,69 @@ export interface SocialDirectorOptions {
   romanceEligibleResidentActor?: (actorId: string) => boolean;
 }
 
-export type ChannelFeedFactContext = SceneChannelFeedContext;
+export interface ChannelFeedFactContext extends SceneChannelFeedContext {
+  conversationCue?: ChannelFeedConversationCue;
+  discussionFrequency?: number;
+}
+
+const MAX_AGGREGATED_CHANNEL_FEED_CONTENT = 2_400;
+const channelFeedPublisherBoundary = (publisherName: string): string =>
+  `=== ${publisherName.trim().replace(/\s+/gu, " ").slice(0, 80)} ===`;
+
+/**
+ * Deterministic water-filling keeps a large first integration from consuming
+ * the scene budget. Boundaries are reserved first, then content capacity is
+ * shared equally among still-unsatisfied feeds in callback order.
+ */
+const aggregateChannelFeedContexts = (
+  facts: readonly ChannelFeedFactContext[],
+): SceneChannelFeedContext | undefined => {
+  if (facts.length === 0) return undefined;
+  if (facts.length === 1) {
+    const fact = facts[0]!;
+    return {
+      publisherName: fact.publisherName,
+      content: fact.content.slice(0, MAX_AGGREGATED_CHANNEL_FEED_CONTENT),
+      updatedAt: fact.updatedAt,
+    };
+  }
+  const boundaries = facts.map((fact) => channelFeedPublisherBoundary(fact.publisherName));
+  const separatorLength = 2 * Math.max(0, facts.length - 1);
+  const boundaryLength = boundaries.reduce((total, boundary) => total + boundary.length + 1, 0);
+  let remainingBudget = Math.max(
+    0,
+    MAX_AGGREGATED_CHANNEL_FEED_CONTENT - boundaryLength - separatorLength,
+  );
+  const allocations = facts.map(() => 0);
+  let active = facts.map((_fact, index) => index);
+  while (remainingBudget > 0 && active.length > 0) {
+    const share = Math.max(1, Math.floor(remainingBudget / active.length));
+    const nextActive: number[] = [];
+    for (const index of active) {
+      if (remainingBudget === 0) {
+        nextActive.push(index);
+        continue;
+      }
+      const content = facts[index]!.content;
+      const needed = content.length - allocations[index]!;
+      const granted = Math.min(needed, share, remainingBudget);
+      allocations[index] = allocations[index]! + granted;
+      remainingBudget -= granted;
+      if (allocations[index]! < content.length) nextActive.push(index);
+    }
+    active = nextActive;
+  }
+  const updatedAt = facts.reduce((latest, fact) =>
+    Date.parse(fact.updatedAt) > Date.parse(latest) ? fact.updatedAt : latest,
+  facts[0]!.updatedAt);
+  return {
+    publisherName: facts.map((fact) => fact.publisherName).join(" + ").slice(0, 80),
+    content: facts.map((fact, index) =>
+      `${boundaries[index]}\n${fact.content.slice(0, allocations[index])}`
+    ).join("\n\n").slice(0, MAX_AGGREGATED_CHANNEL_FEED_CONTENT),
+    updatedAt,
+  };
+};
 
 interface DirectedRelationshipSceneContext {
   relationshipNotes: Record<string, string>;
@@ -2134,7 +2204,10 @@ export class SocialDirector {
   private readonly pageReader: PageReader;
   private readonly capabilityRegistry: CapabilityRegistry;
   private readonly marketSnapshotProvider?: Pick<MarketSnapshotService, "snapshot">;
-  private readonly channelFeedFacts?: (channelId: string) => ChannelFeedFactContext | undefined;
+  private readonly channelFeedFacts?: (channelId: string) => readonly ChannelFeedFactContext[];
+  private readonly channelFeedConversationLedger?: ChannelFeedConversationLedger;
+  private channelFeedReceiptRecovery?: Promise<boolean>;
+  private channelFeedReceiptRecoveryFailed = false;
   private readonly marketPulseCoordinator?: Pick<
     MarketPulseCoordinator,
     "pollOfficialFeeds" | "evaluateMarketObservations" | "acknowledgeFeedPublication"
@@ -2189,6 +2262,7 @@ export class SocialDirector {
     });
     this.marketSnapshotProvider = options.marketSnapshotProvider ?? undefined;
     this.channelFeedFacts = options.channelFeedFacts;
+    this.channelFeedConversationLedger = options.channelFeedConversationLedger;
     this.marketPulseCoordinator = options.marketPulseCoordinator ?? undefined;
     this.behaviorTuningProvider = options.behaviorTuningProvider;
     this.ambientEpisodeLedger = options.ambientEpisodeLedger;
@@ -3208,6 +3282,9 @@ export class SocialDirector {
         mechanicalAddressedPersonaIds,
         urlCandidates: semanticUrlCandidates(input.candidateSet),
         availableCapabilities,
+        channelFeedContext: input.medium === "public"
+          ? this.channelFeedContext(input.channelId)
+          : undefined,
         historyRecallAvailable: input.medium === "public",
       }, { durableDelivery: input.durableDelivery });
     } catch (error) {
@@ -4276,6 +4353,7 @@ export class SocialDirector {
           selected,
           history: this.transcript(trigger.channelId, 26),
           channelFeedContext: this.channelFeedContext(trigger.channelId),
+          channelFeedGrounded: analysis.channelFeedGrounded === true,
           roomRecall: roomRecallFor(selected),
           trigger: {
             author: human.name,
@@ -4349,6 +4427,7 @@ export class SocialDirector {
             selected: [persona],
             history: this.transcript(trigger.channelId, 22),
             channelFeedContext: this.channelFeedContext(trigger.channelId),
+            channelFeedGrounded: analysis.channelFeedGrounded === true,
             roomRecall: roomRecallFor([persona]),
             trigger: {
               author: human.name,
@@ -4527,7 +4606,7 @@ export class SocialDirector {
         );
         if (posted) {
           if (durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id)) {
-            await this.flushDurablePublicReplyBeforeBroadcast(posted);
+            await this.flushDurablePublicMessageBeforeBroadcast(posted);
           }
           publishedResponses.push(posted);
           settleClaimedDeliveries(persona.id);
@@ -4554,7 +4633,7 @@ export class SocialDirector {
             );
             if (fallbackMessage) {
               if (durableDelivery && claimedDeliveries.some((claim) => claim.personaId === persona.id)) {
-                await this.flushDurablePublicReplyBeforeBroadcast(fallbackMessage);
+                await this.flushDurablePublicMessageBeforeBroadcast(fallbackMessage);
               }
               publishedResponses.push(fallbackMessage);
               settleClaimedDeliveries(persona.id);
@@ -5062,6 +5141,141 @@ export class SocialDirector {
     const latestNonSystem = [...recent].reverse().find((message) => !message.system);
     const latestAt = latestNonSystem ? Date.parse(latestNonSystem.createdAt) : Number.NaN;
     return !Number.isFinite(latestAt) || now - latestAt >= AMBIENT_THREAD_COOLDOWN_MS;
+  }
+
+  /**
+   * Repairs the only intentional room-first transaction window before any
+   * feed revision may be reserved. A failed repair disables this optional
+   * autonomous lane for the run instead of risking a duplicate publication.
+   */
+  private async ensureChannelFeedPublicationReceiptsReconciled(): Promise<boolean> {
+    const ledger = this.channelFeedConversationLedger;
+    if (!ledger || this.channelFeedReceiptRecoveryFailed) return false;
+    this.channelFeedReceiptRecovery ??= (async () => {
+      try {
+        const receipts = this.store.getDurableChannelFeedPublicationReceipts().map((receipt) => ({
+          feedId: receipt.feedId,
+          channelId: receipt.channelId,
+          revisionKey: receipt.revisionKey,
+          revision: receipt.revision,
+          publishedAt: receipt.publishedAt,
+        }));
+        const reconciled = await ledger.reconcilePublished(receipts);
+        if (reconciled > 0) {
+          console.info(`Reconciled ${reconciled} durable channel-feed publication receipt(s).`);
+        }
+        return true;
+      } catch (error) {
+        this.channelFeedReceiptRecoveryFailed = true;
+        console.warn(
+          "Autonomous channel-feed discussions are disabled for this run because publication receipts could not be reconciled safely:",
+          error instanceof Error ? error.message : error,
+        );
+        return false;
+      }
+    })();
+    return await this.channelFeedReceiptRecovery;
+  }
+
+  /**
+   * Gives a newly admitted typed feed revision one ordinary ambient episode.
+   * The feed ledger samples each revision exactly once and persists the
+   * decision, so repeated scheduler ticks cannot turn a low frequency into
+   * eventual certainty. Poll cadence is deliberately absent from this path.
+   */
+  private async reserveChannelFeedAmbientThread(
+    now: number,
+    channelTunings: ReadonlyMap<string, AdminBehaviorTuning>,
+  ): Promise<{ channel: (typeof CHANNELS)[number]; thread: AmbientThreadState } | undefined> {
+    const ledger = this.channelFeedConversationLedger;
+    if (!ledger || !(await this.ensureChannelFeedPublicationReceiptsReconciled())) return undefined;
+    const relevanceWeight = { high: 3, normal: 2, low: 1 } as const;
+    const candidates = CHANNELS.flatMap((channel) => {
+      const tuning = channelTunings.get(channel.id);
+      if (
+        !tuning || tuning.activity === 0 || this.ambientThreads.has(channel.id) ||
+        now - (this.lastHumanMessageAtByChannel.get(channel.id) ?? 0) <= this.ambientHumanQuietMs ||
+        !this.ambientChannelIsAvailable(channel.id, now)
+      ) return [];
+      return this.channelFeedFactContexts(channel.id).flatMap((context) => {
+        const cue = context.conversationCue;
+        const discussionFrequency = context.discussionFrequency ?? 0;
+        if (!cue || cue.channelId !== channel.id || discussionFrequency <= 0) return [];
+        return [{
+          channel,
+          cue,
+          policy: channelFeedConversationPolicy(discussionFrequency),
+          tuning,
+          score: relevanceWeight[cue.relevance] * 100 + tuning.activity + this.rng(),
+        }];
+      });
+    }).sort((left, right) => right.score - left.score);
+
+    for (const candidate of candidates) {
+      let eligible = false;
+      try {
+        eligible = (await ledger.reserve(candidate.cue, candidate.policy, now, this.rng)).eligible;
+      } catch (error) {
+        console.warn(
+          `Channel feed discussion ${candidate.cue.feedId} could not be reserved safely:`,
+          error instanceof Error ? error.message : error,
+        );
+        continue;
+      }
+      if (!eligible) continue;
+
+      const profile = getChannelProfile(candidate.channel.id) ?? getChannelProfile("lobby");
+      const channelHistory = this.store.getAllMessages()
+        .filter((message) => message.channelId === candidate.channel.id);
+      const recent = ambientHistoryWithAnchor(channelHistory, 80);
+      const languageTag = this.lastTrustedLanguageByChannel.get(candidate.channel.id);
+      const debateBeat = this.rng() < ambientDebateChance(
+        profile?.ambientMode === "banter" ? 0.18 : 0.36,
+        candidate.tuning.aggression,
+      );
+      const episodeId = randomUUID();
+      const shape = sampleAmbientEpisodeShape({
+        origin: "channel_feed",
+        mode: profile?.ambientMode ?? "discussion",
+        debateBeat,
+        rng: this.rng,
+      });
+      const thread: AmbientThreadState = {
+        seed: candidate.cue.discussionPremise,
+        seedKey: candidate.cue.revisionKey,
+        semanticFamily: candidate.cue.semanticKey,
+        episodeId,
+        causalRootId: candidate.cue.revisionKey,
+        messageCount: 0,
+        participantIds: [],
+        actionHistory: [],
+        shape,
+        hasOpenHook: true,
+        nextEligibleAt: now,
+        debateBeat,
+        languageHint: languageTag ?? ambientLanguageHint(recent),
+        ...(languageTag ? { languageTag } : {}),
+        channelFeedConversationCue: candidate.cue,
+        channelFeedConversationPolicy: candidate.policy,
+        origin: "channel_feed",
+        openedAt: now,
+        updatedAt: now,
+      };
+      this.ambientThreads.set(candidate.channel.id, thread);
+      return { channel: candidate.channel, thread };
+    }
+    return undefined;
+  }
+
+  private channelFeedOpeningIsCurrent(
+    channelId: string,
+    cue: ChannelFeedConversationCue,
+  ): boolean {
+    return this.channelFeedFactContexts(channelId).some((context) =>
+      (context.discussionFrequency ?? 0) > 0 &&
+      context.conversationCue?.feedId === cue.feedId &&
+      context.conversationCue.revisionKey === cue.revisionKey
+    );
   }
 
   private getOrStartAmbientThread(channelId: string, now: number): AmbientThreadState | undefined {
@@ -5929,7 +6143,10 @@ export class SocialDirector {
           this.channelBehaviorTuning(candidate.id, globalTuning),
         ]),
       );
-      const channel = CHANNELS.filter(
+      const feedSelection = this.channelFeedConversationLedger
+        ? await this.reserveChannelFeedAmbientThread(now, channelTunings)
+        : undefined;
+      const channel = feedSelection?.channel ?? CHANNELS.filter(
         (candidate) => {
           const channelTuning = channelTunings.get(candidate.id)!;
           return channelTuning.activity > 0 &&
@@ -5964,7 +6181,7 @@ export class SocialDirector {
         .sort((a, b) => b.score - a.score)[0]?.candidate;
       if (!channel) return;
       this.lastAmbientChannelId = channel.id;
-      const thread = this.getOrStartAmbientThread(channel.id, now);
+      const thread = feedSelection?.thread ?? this.getOrStartAmbientThread(channel.id, now);
       if (!thread) return;
       const epoch = this.channelEpoch.get(channel.id) ?? 0;
       const autonomousSlots = this.availableAutonomousMessageSlots(now, globalTuning.activity);
@@ -6190,7 +6407,8 @@ export class SocialDirector {
             channelName: channel.name,
             selected,
             history: this.ambientTranscript(channel.id, 18),
-            channelFeedContext: this.channelFeedContext(channel.id),
+            channelFeedContext: thread.channelFeedConversationCue?.fact ?? this.channelFeedContext(channel.id),
+            channelFeedDiscussion: Boolean(thread.channelFeedConversationCue),
             premise,
             wordLimits,
             mustReplyIds: [first.id],
@@ -6257,6 +6475,21 @@ export class SocialDirector {
           epoch !== (this.channelEpoch.get(channel.id) ?? 0) ||
           !this.ambientThreadIsCurrent(channel.id, thread)
         ) return;
+        const firstPublication = thread.messageCount === 0;
+        if (
+          firstPublication &&
+          thread.channelFeedConversationCue &&
+          !this.channelFeedOpeningIsCurrent(channel.id, thread.channelFeedConversationCue)
+        ) {
+          // Admin disabled discussion, disabled the integration, or a newer
+          // typed revision superseded this one while generation was running.
+          // No publication has occurred, so discard without consuming room
+          // cooldown or manufacturing a failure message.
+          if (this.ambientThreads.get(channel.id) === thread) {
+            this.ambientThreads.delete(channel.id);
+          }
+          return;
+        }
         posted = this.postPublic(
           channel.id,
           first,
@@ -6266,14 +6499,54 @@ export class SocialDirector {
           this.messageSources(thread.research, leadLine.sourceIds),
           undefined,
           "ambient",
+          false,
+          Boolean(firstPublication && thread.channelFeedConversationCue),
+          firstPublication && thread.channelFeedConversationCue ? {
+            feedId: thread.channelFeedConversationCue.feedId,
+            revisionKey: thread.channelFeedConversationCue.revisionKey,
+            revision: thread.channelFeedConversationCue.revision,
+          } : undefined,
         );
         if (!posted) {
           if (thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
           else this.closeAmbientThread(thread, "model_rejected");
           return;
         }
+        if (firstPublication && thread.channelFeedConversationCue) {
+          try {
+            await this.flushDurablePublicMessageBeforeBroadcast(posted);
+          } catch {
+            this.abandonAmbientThread(
+              channel.id,
+              thread,
+              thread.channelFeedConversationPolicy?.failedAttemptCooldownMs,
+            );
+            return;
+          }
+        }
         this.lockAmbientThreadLanguage(channel.id, thread, leadLine, posted.createdAt);
         this.recordAmbientPost(thread, posted, action);
+        if (
+          firstPublication && thread.channelFeedConversationCue &&
+          this.channelFeedConversationLedger
+        ) {
+          try {
+            await this.channelFeedConversationLedger.acknowledgePublished(
+              thread.channelFeedConversationCue,
+              Date.parse(posted.createdAt),
+            );
+          } catch (error) {
+            // The room-first receipt is durable and will repair this exact
+            // acknowledgement on restart. Stop admitting newer feed work in
+            // this process so no high-water mark can pass the unacknowledged
+            // revision.
+            this.channelFeedReceiptRecoveryFailed = true;
+            console.warn(
+              `Published channel feed discussion ${thread.channelFeedConversationCue.feedId} could not be acknowledged safely:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
         if (pendingBeat && thread.pendingBeat === pendingBeat) thread.pendingBeat = undefined;
         if (consideredPlan) {
           thread.pendingBeat = {
@@ -6355,6 +6628,7 @@ export class SocialDirector {
     autonomousKind?: "ambient" | "research",
     requiredReply = false,
     deferBroadcast = false,
+    channelFeedReceipt?: ChannelFeedPublicationReceiptMarker,
   ): ChatMessage | undefined {
     if (this.stopped) return undefined;
     if (!PERSONAS.some((candidate) => candidate.id === persona.id)) return undefined;
@@ -6404,6 +6678,7 @@ export class SocialDirector {
     const autonomousPublication = autonomousKind ? {
       kind: autonomousKind,
       attendance: this.getOnlineHumanCount() > 0 ? "attended" : "unattended",
+      ...(channelFeedReceipt ? { channelFeedReceipt } : {}),
     } as const : undefined;
     if (deferBroadcast) {
       const append = this.store.addUncommittedPublicMessage(message, autonomousPublication);
@@ -6459,11 +6734,11 @@ export class SocialDirector {
    * unavailable, roll the speculative row back and leave its exact outbox
    * target pending; never show a reply that a restart cannot remember.
    */
-  private async flushDurablePublicReplyBeforeBroadcast(message: ChatMessage): Promise<void> {
+  private async flushDurablePublicMessageBeforeBroadcast(message: ChatMessage): Promise<void> {
     const append = this.deferredPublicMessageAppends.get(message.id);
     const persona = PERSONAS.find((candidate) => candidate.id === message.authorId);
     if (!append || !persona) {
-      throw new TypeError("A deferred public reply is missing its publication transaction");
+      throw new TypeError("A deferred public message is missing its publication transaction");
     }
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -6483,12 +6758,12 @@ export class SocialDirector {
       return;
     }
     console.error(
-      "Could not durably persist a direct resident reply before broadcast:",
+      "Could not durably persist a resident message before broadcast:",
       lastError instanceof Error ? lastError.message : lastError,
     );
     throw lastError instanceof Error
       ? lastError
-      : new Error("Could not durably persist a direct resident reply before broadcast");
+      : new Error("Could not durably persist a resident message before broadcast");
   }
 
   private messageSources(research: ResearchPacket | undefined, sourceIds: string[]): MessageSource[] {
@@ -6785,14 +7060,27 @@ export class SocialDirector {
     return this.transcriptMessages(ambientHistoryWithAnchor(channelHistory, limit));
   }
 
+  private channelFeedFactContexts(channelId: string): ChannelFeedFactContext[] {
+    const feedIds = new Set<string>();
+    return (this.channelFeedFacts?.(channelId) ?? []).flatMap((fact) => {
+      if (!fact || !fact.content.trim() || !Number.isFinite(Date.parse(fact.updatedAt))) return [];
+      const cue = fact.conversationCue;
+      if (cue && (cue.channelId !== channelId || feedIds.has(cue.feedId))) return [];
+      if (cue) feedIds.add(cue.feedId);
+      return [{
+        publisherName: fact.publisherName.trim().slice(0, 80),
+        content: fact.content.trim().slice(0, 2_400),
+        updatedAt: new Date(Date.parse(fact.updatedAt)).toISOString(),
+        ...(cue ? { conversationCue: cue } : {}),
+        ...(typeof fact.discussionFrequency === "number" && Number.isFinite(fact.discussionFrequency)
+          ? { discussionFrequency: clamp(fact.discussionFrequency, 0, 100) }
+          : {}),
+      }];
+    }).slice(0, 8);
+  }
+
   private channelFeedContext(channelId: string): SceneChannelFeedContext | undefined {
-    const fact = this.channelFeedFacts?.(channelId);
-    if (!fact || !fact.content.trim() || !Number.isFinite(Date.parse(fact.updatedAt))) return undefined;
-    return {
-      publisherName: fact.publisherName.trim().slice(0, 80),
-      content: fact.content.trim().slice(0, 2_400),
-      updatedAt: fact.updatedAt,
-    };
+    return aggregateChannelFeedContexts(this.channelFeedFactContexts(channelId));
   }
 
   private transcriptMessages(messages: readonly ChatMessage[]): TranscriptLine[] {

@@ -627,9 +627,11 @@ describe("admin HTTP API", () => {
       publisher: { id: "market-wire", name: "MarketWire", badge: "BOT" as const },
       available: true,
       enabled: true,
+      discussionFrequency: 50,
       activeIntervalMinutes: 5,
       idleIntervalMinutes: 30,
       defaultEnabled: true,
+      defaultDiscussionFrequency: 50,
       defaultActiveIntervalMinutes: 5,
       defaultIdleIntervalMinutes: 30,
       minimumIntervalMinutes: 5,
@@ -671,21 +673,28 @@ describe("admin HTTP API", () => {
       path: "/api/admin/channels/stock-market/feeds/market-wire",
       cookie,
       origin: "https://evil.example",
-      body: { enabled: false, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
+      body: { enabled: false, discussionFrequency: 35, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
     })).status).toBe(403);
     expect((await dispatch(app, {
       method: "PATCH",
       path: "/api/admin/channels/lobby/feeds/market-wire",
       cookie,
       origin: "https://admin.example",
-      body: { enabled: true, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
+      body: { enabled: true, discussionFrequency: 35, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
     })).status).toBe(404);
     expect((await dispatch(app, {
       method: "PATCH",
       path: "/api/admin/channels/stock-market/feeds/market-wire",
       cookie,
       origin: "https://admin.example",
-      body: { enabled: true, activeIntervalMinutes: 4, idleIntervalMinutes: 45 },
+      body: { enabled: true, discussionFrequency: 35, activeIntervalMinutes: 4, idleIntervalMinutes: 45 },
+    })).status).toBe(400);
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/channels/stock-market/feeds/market-wire",
+      cookie,
+      origin: "https://admin.example",
+      body: { enabled: true, discussionFrequency: 101, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
     })).status).toBe(400);
     expect(configured).toEqual([]);
 
@@ -694,10 +703,15 @@ describe("admin HTTP API", () => {
       path: "/api/admin/channels/stock-market/feeds/market-wire",
       cookie,
       origin: "https://admin.example",
-      body: { enabled: false, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
+      body: { enabled: false, discussionFrequency: 35, activeIntervalMinutes: 5, idleIntervalMinutes: 45 },
     });
     expect(updated.status).toBe(200);
-    expect(configured).toEqual([{ enabled: false, activeIntervalMinutes: 5, idleIntervalMinutes: 45 }]);
+    expect(configured).toEqual([{
+      enabled: false,
+      discussionFrequency: 35,
+      activeIntervalMinutes: 5,
+      idleIntervalMinutes: 45,
+    }]);
     expect(updated.body).toMatchObject({
       state: { automation: { channelFeeds: [{ id: "market-wire", enabled: false, idleIntervalMinutes: 45 }] } },
     });

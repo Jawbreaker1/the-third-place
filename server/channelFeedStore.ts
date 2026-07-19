@@ -48,9 +48,11 @@ export interface ChannelFeedPollTiming {
   nextPollAt: number;
 }
 
-export interface ChannelFeedRuntimeConfiguration {
+export interface ChannelFeedStoredConfiguration {
   feedId: string;
   enabled: boolean;
+  /** Missing only while a strict version-two payload awaits adapter-aware migration. */
+  discussionFrequency?: number;
   activeIntervalMs: number;
   idleIntervalMs: number;
   /**
@@ -60,12 +62,31 @@ export interface ChannelFeedRuntimeConfiguration {
   freshPollRequired: boolean;
 }
 
-export interface ChannelFeedPersistedState {
+export interface ChannelFeedRuntimeConfiguration extends ChannelFeedStoredConfiguration {
+  /** Independent from provider polling: 0 never opens autonomous discussion, 100 is the bounded ceiling. */
+  discussionFrequency: number;
+}
+
+interface ChannelFeedPersistedStateV2 {
   version: 2;
   cards: ChannelFeedCard[];
   schedules: ChannelFeedScheduleState[];
-  configurations: ChannelFeedRuntimeConfiguration[];
+  configurations: Omit<ChannelFeedRuntimeConfiguration, "discussionFrequency">[];
 }
+
+interface ChannelFeedPersistedStateV3 {
+  version: 3;
+  cards: ChannelFeedCard[];
+  schedules: ChannelFeedScheduleState[];
+  /**
+   * Mixed rows are intentional during adapter-aware migration: registered
+   * feeds gain a discussion frequency immediately, while an unavailable
+   * adapter's legacy row remains lossless until that adapter returns.
+   */
+  configurations: ChannelFeedStoredConfiguration[];
+}
+
+export type ChannelFeedPersistedState = ChannelFeedPersistedStateV2 | ChannelFeedPersistedStateV3;
 
 export interface ChannelFeedPersistence {
   load(): Promise<unknown | undefined>;
@@ -219,12 +240,21 @@ const SCHEDULE_KEYS = new Set([
 const CONFIGURATION_KEYS = new Set([
   "feedId",
   "enabled",
+  "discussionFrequency",
+  "activeIntervalMs",
+  "idleIntervalMs",
+  "freshPollRequired",
+]);
+const CONFIGURATION_V2_KEYS = new Set([
+  "feedId",
+  "enabled",
   "activeIntervalMs",
   "idleIntervalMs",
   "freshPollRequired",
 ]);
 const STATE_V1_KEYS = new Set(["version", "cards", "schedules"]);
 const STATE_V2_KEYS = new Set(["version", "cards", "schedules", "configurations"]);
+const STATE_V3_KEYS = new Set(["version", "cards", "schedules", "configurations"]);
 
 const validAvatarImageUrl = (value: unknown): value is string =>
   typeof value === "string" &&
@@ -352,35 +382,64 @@ const isConfiguration = (value: unknown): value is ChannelFeedRuntimeConfigurati
   isRecord(value) && hasOnlyKeys(value, CONFIGURATION_KEYS) &&
   boundedText(value.feedId, 64, 2) && CATALOG_ID.test(value.feedId) &&
   typeof value.enabled === "boolean" &&
+  safeInteger(value.discussionFrequency, 0, 100) &&
   safeInteger(value.activeIntervalMs, MIN_RUNTIME_INTERVAL_MS, MAX_RUNTIME_INTERVAL_MS) &&
   safeInteger(value.idleIntervalMs, value.activeIntervalMs, MAX_RUNTIME_INTERVAL_MS) &&
   typeof value.freshPollRequired === "boolean" &&
   (value.enabled || value.freshPollRequired);
 
-const parseState = (value: unknown): ChannelFeedPersistedState => {
+type LegacyChannelFeedRuntimeConfiguration = Omit<
+  ChannelFeedRuntimeConfiguration,
+  "discussionFrequency"
+>;
+
+const isLegacyConfiguration = (value: unknown): value is LegacyChannelFeedRuntimeConfiguration =>
+  isRecord(value) && hasOnlyKeys(value, CONFIGURATION_V2_KEYS) &&
+  boundedText(value.feedId, 64, 2) && CATALOG_ID.test(value.feedId) &&
+  typeof value.enabled === "boolean" &&
+  safeInteger(value.activeIntervalMs, MIN_RUNTIME_INTERVAL_MS, MAX_RUNTIME_INTERVAL_MS) &&
+  safeInteger(value.idleIntervalMs, value.activeIntervalMs, MAX_RUNTIME_INTERVAL_MS) &&
+  typeof value.freshPollRequired === "boolean" &&
+  (value.enabled || value.freshPollRequired);
+
+const isStoredConfiguration = (value: unknown): value is ChannelFeedStoredConfiguration =>
+  isConfiguration(value) || isLegacyConfiguration(value);
+
+interface ParsedChannelFeedState {
+  cards: ChannelFeedCard[];
+  schedules: ChannelFeedScheduleState[];
+  configurations: ChannelFeedStoredConfiguration[];
+}
+
+const parseState = (value: unknown): ParsedChannelFeedState => {
   if (!isRecord(value)) {
     throw new TypeError("Invalid channel feed persistence payload.");
   }
   const versionOne = value.version === 1 && hasOnlyKeys(value, STATE_V1_KEYS);
   const versionTwo = value.version === 2 && hasOnlyKeys(value, STATE_V2_KEYS);
-  if ((!versionOne && !versionTwo) ||
+  const versionThree = value.version === 3 && hasOnlyKeys(value, STATE_V3_KEYS);
+  if ((!versionOne && !versionTwo && !versionThree) ||
       !Array.isArray(value.cards) || value.cards.length > MAX_CARDS || !value.cards.every(isCard) ||
       !Array.isArray(value.schedules) || value.schedules.length > MAX_CARDS || !value.schedules.every(isSchedule) ||
       (versionTwo && (!Array.isArray(value.configurations) ||
-        value.configurations.length > MAX_CARDS || !value.configurations.every(isConfiguration)))) {
+        value.configurations.length > MAX_CARDS || !value.configurations.every(isLegacyConfiguration))) ||
+      (versionThree && (!Array.isArray(value.configurations) ||
+        value.configurations.length > MAX_CARDS || !value.configurations.every(isStoredConfiguration)))) {
     throw new TypeError("Invalid channel feed persistence payload.");
   }
   const cards = value.cards as ChannelFeedCard[];
   const schedules = value.schedules as ChannelFeedScheduleState[];
-  const configurations = versionTwo
-    ? value.configurations as ChannelFeedRuntimeConfiguration[]
-    : [];
+  const configurations: ChannelFeedStoredConfiguration[] = versionThree
+    ? value.configurations as ChannelFeedStoredConfiguration[]
+    : versionTwo
+      ? value.configurations as LegacyChannelFeedRuntimeConfiguration[]
+      : [];
   if (new Set(cards.map((card) => card.id)).size !== cards.length ||
       new Set(schedules.map((schedule) => schedule.feedId)).size !== schedules.length ||
       new Set(configurations.map((configuration) => configuration.feedId)).size !== configurations.length) {
     throw new TypeError("Channel feed persistence contains duplicate IDs.");
   }
-  return clone({ version: 2, cards, schedules, configurations });
+  return clone({ cards, schedules, configurations });
 };
 
 const validateDraft = (draft: ChannelFeedCardDraft): ChannelFeedCardDraft => {
@@ -440,15 +499,15 @@ const assertNewerAttempt = (
 const stateFrom = (
   cards: ReadonlyMap<string, ChannelFeedCard>,
   schedules: ReadonlyMap<string, ChannelFeedScheduleState>,
-  configurations: ReadonlyMap<string, ChannelFeedRuntimeConfiguration>,
-): ChannelFeedPersistedState => ({
-  version: 2,
-  cards: [...cards.values()].map(clone).sort((left, right) => left.id.localeCompare(right.id)),
-  schedules: [...schedules.values()].map(clone).sort((left, right) => left.feedId.localeCompare(right.feedId)),
-  configurations: [...configurations.values()]
+  configurations: ReadonlyMap<string, ChannelFeedStoredConfiguration>,
+): ChannelFeedPersistedState => {
+  const cardRows = [...cards.values()].map(clone).sort((left, right) => left.id.localeCompare(right.id));
+  const scheduleRows = [...schedules.values()].map(clone).sort((left, right) => left.feedId.localeCompare(right.feedId));
+  const configurationRows = [...configurations.values()]
     .map(clone)
-    .sort((left, right) => left.feedId.localeCompare(right.feedId)),
-});
+    .sort((left, right) => left.feedId.localeCompare(right.feedId));
+  return { version: 3, cards: cardRows, schedules: scheduleRows, configurations: configurationRows };
+};
 
 /**
  * Durable mutable feed cards, intentionally isolated from RoomStore history.
@@ -458,7 +517,7 @@ export class ChannelFeedStore {
   private readonly persistence: ChannelFeedPersistence;
   private cardById = new Map<string, ChannelFeedCard>();
   private scheduleByFeedId = new Map<string, ChannelFeedScheduleState>();
-  private configurationByFeedId = new Map<string, ChannelFeedRuntimeConfiguration>();
+  private configurationByFeedId = new Map<string, ChannelFeedStoredConfiguration>();
   private mutationQueue: Promise<unknown> = Promise.resolve();
 
   constructor(options: ChannelFeedStoreOptions = {}) {
@@ -508,12 +567,12 @@ export class ChannelFeedStore {
     return [...this.scheduleByFeedId.values()].map(clone).sort((left, right) => left.feedId.localeCompare(right.feedId));
   }
 
-  configuration(feedId: string): ChannelFeedRuntimeConfiguration | undefined {
+  configuration(feedId: string): ChannelFeedStoredConfiguration | undefined {
     const configuration = this.configurationByFeedId.get(feedId);
     return configuration ? clone(configuration) : undefined;
   }
 
-  configurations(): ChannelFeedRuntimeConfiguration[] {
+  configurations(): ChannelFeedStoredConfiguration[] {
     return [...this.configurationByFeedId.values()]
       .map(clone)
       .sort((left, right) => left.feedId.localeCompare(right.feedId));

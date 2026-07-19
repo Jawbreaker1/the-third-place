@@ -423,6 +423,7 @@ const semanticRecencyIdentity = (
 const AUTHORED_NOVELTY_SOURCE_KINDS = new Set([
   "room_seed",
   "autonomous_research",
+  "channel_feed",
   // Backward compatibility for ledgers written before room_seed was named.
   "idle_seed",
 ]);

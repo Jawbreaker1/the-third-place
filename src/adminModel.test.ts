@@ -25,9 +25,11 @@ describe("admin model boundary", () => {
             publisher: { id: "market-wire", name: "MarketWire", badge: "BOT" },
             available: true,
             enabled: true,
+            discussionFrequency: 140,
             activeIntervalMinutes: 5,
             idleIntervalMinutes: 30,
             defaultEnabled: true,
+            defaultDiscussionFrequency: 50,
             defaultActiveIntervalMinutes: 5,
             defaultIdleIntervalMinutes: 30,
             minimumIntervalMinutes: 5,
@@ -95,6 +97,7 @@ describe("admin model boundary", () => {
       channelFeeds: [expect.objectContaining({
         id: "market-wire",
         channelId: "stock-market",
+        discussionFrequency: 100,
         activeIntervalMinutes: 5,
         idleIntervalMinutes: 30,
         minimumIntervalMinutes: 5,
@@ -158,6 +161,8 @@ describe("admin model boundary", () => {
           activeIntervalMinutes: 1,
           idleIntervalMinutes: 2,
           enabled: false,
+          discussionFrequency: -10,
+          defaultDiscussionFrequency: 35,
           status: "ready",
         }],
       },
@@ -166,6 +171,8 @@ describe("admin model boundary", () => {
     expect(snapshot.automation.channelFeeds[0]).toMatchObject({
       activeIntervalMinutes: 5,
       idleIntervalMinutes: 5,
+      discussionFrequency: 0,
+      defaultDiscussionFrequency: 35,
       status: "disabled",
       failures: 0,
     });

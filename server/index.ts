@@ -97,7 +97,8 @@ import { ChannelFeedStore } from "./channelFeedStore.js";
 import { ChannelFeedConfigurationError, ChannelFeedCoordinator } from "./channelFeeds.js";
 import { projectChannelFeedAdminControls } from "./channelFeedAdmin.js";
 import { MarketWireAdapter } from "./marketWire.js";
-import { residentChannelFeedFact } from "./channelFeedFacts.js";
+import { projectChannelFeedFactsForRoom } from "./channelFeedProjection.js";
+import { ChannelFeedConversationLedger } from "./channelFeedConversation.js";
 import {
   ADMIN_JSON_BODY_LIMIT_BYTES,
   PUBLIC_JSON_BODY_LIMIT_BYTES,
@@ -504,6 +505,19 @@ const socialMemoryStore = new SocialMemoryStore({
 });
 const ambientEpisodeLedger = new AmbientEpisodeLedger();
 await ambientEpisodeLedger.load();
+let channelFeedConversationLedger: ChannelFeedConversationLedger | undefined;
+try {
+  const candidate = new ChannelFeedConversationLedger();
+  await candidate.start();
+  channelFeedConversationLedger = candidate;
+} catch (error) {
+  // Feed-led chat is optional. Corrupt admission metadata must not prevent the
+  // social world, direct market answers or the visible feed from starting.
+  console.warn(
+    "Autonomous channel-feed discussions are disabled for this run because their local state could not be loaded safely:",
+    error instanceof Error ? error.message : error,
+  );
+}
 let adminState!: AdminStateStore;
 const behaviorTuningProvider = (channelId?: string) => adminState?.behaviorTuning(channelId);
 const lmStudioBackend = new LmStudioBackend();
@@ -885,8 +899,11 @@ const reconcileChannelFeedRooms = async (): Promise<void> => {
     );
   });
 };
-const channelFeedFactFor = (channelId: string) =>
-  residentChannelFeedFact(currentChannelFeeds().find((card) => card.channelId === channelId));
+const channelFeedFactsFor = (channelId: string) => projectChannelFeedFactsForRoom(
+  currentChannelFeeds(),
+  channelFeedCoordinator?.controls() ?? [],
+  channelId,
+);
 const footballCompetitionProvider = process.env.FOOTBALL_DATA_ENABLED === "false"
   ? null
   : new FootballCompetitionProvider({
@@ -914,7 +931,8 @@ const director = new SocialDirector(
   {
     behaviorTuningProvider,
     marketSnapshotProvider,
-    channelFeedFacts: channelFeedFactFor,
+    channelFeedFacts: channelFeedFactsFor,
+    channelFeedConversationLedger,
     footballCompetitionProvider,
     marketPulseCoordinator,
     ambientEpisodeLedger,

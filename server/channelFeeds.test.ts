@@ -14,6 +14,7 @@ import type {
   ChannelFeedPollTiming,
   ChannelFeedRuntimeConfiguration,
   ChannelFeedScheduleState,
+  ChannelFeedStoredConfiguration,
 } from "./channelFeedStore.js";
 
 const MINUTE_MS = 60_000;
@@ -76,7 +77,7 @@ class ManualTimers implements ChannelFeedTimerRuntime {
 class TestStore<TCard extends SchedulableChannelFeedCard> implements ChannelFeedStorePort<TCard> {
   readonly cardById = new Map<string, TCard>();
   readonly scheduleById = new Map<string, ChannelFeedScheduleState>();
-  readonly configurationById = new Map<string, ChannelFeedRuntimeConfiguration>();
+  readonly configurationById = new Map<string, ChannelFeedStoredConfiguration>();
   loadCalls = 0;
   flushCalls = 0;
 
@@ -98,7 +99,7 @@ class TestStore<TCard extends SchedulableChannelFeedCard> implements ChannelFeed
     return schedule ? { ...schedule } : undefined;
   }
 
-  configuration(feedId: string): ChannelFeedRuntimeConfiguration | undefined {
+  configuration(feedId: string): ChannelFeedStoredConfiguration | undefined {
     const configuration = this.configurationById.get(feedId);
     return configuration ? { ...configuration } : undefined;
   }
@@ -295,6 +296,7 @@ const adapter = (input: {
   idleIntervalMs?: number;
   activityWindowMs?: number;
   minAttemptGapMs?: number;
+  defaultDiscussionFrequency?: number;
   restorePersistedCard?: (card: TestCard, now: number) => TestCard | undefined;
   poll?: (context: ChannelFeedPollContext<TestCard>) => Promise<ChannelFeedPollResult<TestCard>>;
 }): ChannelFeedAdapter<TestCard> => ({
@@ -309,6 +311,9 @@ const adapter = (input: {
       name: input.kind === "football" ? "FixtureWire" : "MarketWire",
       badge: "BOT",
     },
+    ...(input.defaultDiscussionFrequency !== undefined
+      ? { defaultDiscussionFrequency: input.defaultDiscussionFrequency }
+      : {}),
   },
   activeIntervalMs: input.activeIntervalMs ?? 5 * MINUTE_MS,
   idleIntervalMs: input.idleIntervalMs ?? 30 * MINUTE_MS,
@@ -866,10 +871,117 @@ describe("ChannelFeedCoordinator", () => {
       .rejects.toMatchObject<Partial<ChannelFeedConfigurationError>>({ code: "unknown_feed" });
     await expect(runtime.coordinator.configure("market-wire", { activeIntervalMinutes: 0 }))
       .rejects.toMatchObject<Partial<ChannelFeedConfigurationError>>({ code: "invalid_configuration" });
+    await expect(runtime.coordinator.configure("market-wire", { discussionFrequency: 101 }))
+      .rejects.toMatchObject<Partial<ChannelFeedConfigurationError>>({ code: "invalid_configuration" });
     await expect(runtime.coordinator.configure("market-wire", {
       activeIntervalMinutes: 20,
       idleIntervalMinutes: 10,
     })).rejects.toMatchObject<Partial<ChannelFeedConfigurationError>>({ code: "invalid_configuration" });
+    await runtime.coordinator.close();
+  });
+
+  it("persists discussion frequency without rescheduling provider polling", async () => {
+    const timers = new ManualTimers();
+    const runtime = coordinator(timers, [adapter({
+      id: "market-wire",
+      channelId: "stock-market",
+      defaultDiscussionFrequency: 40,
+    })]);
+    await runtime.coordinator.start();
+    await timers.runNext();
+    const before = runtime.coordinator.controls()[0]!;
+    expect(before).toMatchObject({ discussionFrequency: 40, defaultDiscussionFrequency: 40 });
+
+    const updated = await runtime.coordinator.configure("market-wire", { discussionFrequency: 85 });
+    expect(updated).toMatchObject({ discussionFrequency: 85, nextPollAt: before.nextPollAt });
+    expect(runtime.store.configurationById.get("market-wire")).toMatchObject({ discussionFrequency: 85 });
+    await runtime.coordinator.close();
+  });
+
+  it("saves discussion frequency during an in-flight poll without aborting or moving its cadence", async () => {
+    const timers = new ManualTimers();
+    let releasePoll!: () => void;
+    let observedSignal: AbortSignal | undefined;
+    let markPollEntered!: () => void;
+    const pollEntered = new Promise<void>((resolve) => { markPollEntered = resolve; });
+    const blocked = new Promise<void>((resolve) => { releasePoll = resolve; });
+    const poll = vi.fn(async ({ now, signal }: ChannelFeedPollContext<TestCard>) => {
+      observedSignal = signal;
+      markPollEntered();
+      await blocked;
+      return { kind: "updated" as const, card: card("market-wire", "stock-market", "market", now) };
+    });
+    const runtime = coordinator(timers, [adapter({
+      id: "market-wire",
+      channelId: "stock-market",
+      defaultDiscussionFrequency: 40,
+      idleIntervalMs: 30 * MINUTE_MS,
+      poll,
+    })]);
+    await runtime.coordinator.start();
+    const polling = timers.runNext();
+    await pollEntered;
+
+    let saveSettled = false;
+    const saving = runtime.coordinator.configure("market-wire", { discussionFrequency: 85 })
+      .finally(() => { saveSettled = true; });
+    await Promise.resolve();
+    expect(saveSettled).toBe(false);
+    expect(observedSignal?.aborted).toBe(false);
+    expect(runtime.coordinator.controls()[0]).toMatchObject({
+      status: "polling",
+      discussionFrequency: 40,
+      nextPollAt: 0,
+    });
+
+    releasePoll();
+    const [, configured] = await Promise.all([polling, saving]);
+
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(observedSignal?.aborted).toBe(false);
+    expect(configured).toMatchObject({
+      status: "ready",
+      discussionFrequency: 85,
+      nextPollAt: 30 * MINUTE_MS,
+    });
+    expect(runtime.store.scheduleById.get("market-wire")).toMatchObject({
+      lastAttemptAt: 0,
+      nextPollAt: 30 * MINUTE_MS,
+    });
+    expect(runtime.store.configurationById.get("market-wire")).toMatchObject({
+      discussionFrequency: 85,
+      freshPollRequired: false,
+    });
+    await runtime.coordinator.close();
+  });
+
+  it("migrates legacy cadence controls through the adapter discussion default", async () => {
+    const timers = new ManualTimers();
+    const store = new TestStore<TestCard>();
+    store.configurationById.set("market-wire", {
+      feedId: "market-wire",
+      enabled: true,
+      activeIntervalMs: 5 * MINUTE_MS,
+      idleIntervalMs: 45 * MINUTE_MS,
+      freshPollRequired: false,
+    });
+    const runtime = coordinator(timers, [adapter({
+      id: "market-wire",
+      channelId: "stock-market",
+      defaultDiscussionFrequency: 40,
+    })], store);
+
+    await runtime.coordinator.start();
+
+    expect(runtime.coordinator.controls()[0]).toMatchObject({
+      discussionFrequency: 40,
+      defaultDiscussionFrequency: 40,
+    });
+    expect(store.configurationById.get("market-wire")).toMatchObject({
+      discussionFrequency: 40,
+      activeIntervalMs: 5 * MINUTE_MS,
+      idleIntervalMs: 45 * MINUTE_MS,
+    });
     await runtime.coordinator.close();
   });
 

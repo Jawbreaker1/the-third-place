@@ -11,7 +11,11 @@ export const AMBIENT_ACTION_KINDS = [
 ] as const;
 
 export type AmbientActionKind = (typeof AMBIENT_ACTION_KINDS)[number];
-export type AmbientEpisodeOrigin = "room_seed" | "human_topic" | "autonomous_research";
+export type AmbientEpisodeOrigin =
+  | "room_seed"
+  | "human_topic"
+  | "autonomous_research"
+  | "channel_feed";
 export type AmbientConversationMode = "discussion" | "casual" | "banter";
 
 export interface AmbientEpisodeShape {
@@ -99,6 +103,8 @@ export function sampleAmbientEpisodeShape(input: {
   const sampled = weightedChoice(ordinary, input.rng);
   const originMinimum = input.origin === "autonomous_research"
     ? 3
+    : input.origin === "channel_feed"
+      ? 2
     : input.origin === "human_topic"
       ? alreadyPublished + 1
       : input.debateBeat
@@ -107,9 +113,10 @@ export function sampleAmbientEpisodeShape(input: {
   const minimumMessages = Math.min(7, Math.max(1, alreadyPublished, originMinimum));
   const debateExtension = input.debateBeat && sampled < 3 ? 1 : 0;
   const researchExtension = input.origin === "autonomous_research" && sampled < 4 ? 1 : 0;
+  const feedExtension = input.origin === "channel_feed" && sampled < 3 ? 1 : 0;
   const softTargetMessages = Math.min(
     7,
-    Math.max(minimumMessages, sampled + debateExtension + researchExtension),
+    Math.max(minimumMessages, sampled + debateExtension + researchExtension + feedExtension),
   );
   return {
     minimumMessages,
@@ -132,6 +139,8 @@ const continuationChance = (input: {
     ? 0.48
     : input.origin === "autonomous_research"
       ? 0.36
+      : input.origin === "channel_feed"
+        ? 0.3
       : input.debateBeat
         ? 0.3
         : 0.14;

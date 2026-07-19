@@ -132,7 +132,95 @@ describe("ChannelFeedStore", () => {
     expect(store.configurations()).toEqual([]);
 
     await store.reschedule("market-wire", START + 5 * 60_000);
-    expect(saved).toMatchObject({ version: 2, configurations: [] });
+    expect(saved).toMatchObject({ version: 3, configurations: [] });
+  });
+
+  it("preserves a version-two discussion field as missing for adapter-aware migration", async () => {
+    let saved: ChannelFeedPersistedState | undefined;
+    const persistence: ChannelFeedPersistence = {
+      load: async () => ({
+        version: 2,
+        cards: [],
+        schedules: [],
+        configurations: [{
+          feedId: "market-wire",
+          enabled: true,
+          activeIntervalMs: 5 * 60_000,
+          idleIntervalMs: 45 * 60_000,
+          freshPollRequired: false,
+        }],
+      }),
+      save: async (state) => { saved = structuredClone(state); },
+    };
+    const store = new ChannelFeedStore({ persistence });
+    await store.load();
+    expect(store.configuration("market-wire")).toEqual({
+      feedId: "market-wire",
+      enabled: true,
+      activeIntervalMs: 5 * 60_000,
+      idleIntervalMs: 45 * 60_000,
+      freshPollRequired: false,
+    });
+
+    await store.configure("market-wire", {
+      ...store.configuration("market-wire")!,
+      discussionFrequency: 65,
+    });
+    expect(saved).toMatchObject({
+      version: 3,
+      configurations: [{ feedId: "market-wire", discussionFrequency: 65 }],
+    });
+  });
+
+  it("never strips a configured discussion override because an orphaned legacy feed remains", async () => {
+    const persistence = new TogglePersistence();
+    persistence.state = {
+      version: 2,
+      cards: [],
+      schedules: [],
+      configurations: [
+        {
+          feedId: "market-wire",
+          enabled: true,
+          activeIntervalMs: 5 * 60_000,
+          idleIntervalMs: 45 * 60_000,
+          freshPollRequired: false,
+        },
+        {
+          feedId: "orphan-wire",
+          enabled: true,
+          activeIntervalMs: 10 * 60_000,
+          idleIntervalMs: 60 * 60_000,
+          freshPollRequired: false,
+        },
+      ],
+    };
+    const first = new ChannelFeedStore({ persistence });
+    await first.load();
+    await first.configure("market-wire", {
+      feedId: "market-wire",
+      enabled: true,
+      discussionFrequency: 85,
+      activeIntervalMs: 5 * 60_000,
+      idleIntervalMs: 45 * 60_000,
+      freshPollRequired: false,
+    });
+
+    expect(persistence.state).toMatchObject({
+      version: 3,
+      configurations: [
+        { feedId: "market-wire", discussionFrequency: 85 },
+        { feedId: "orphan-wire" },
+      ],
+    });
+    expect(
+      persistence.state?.configurations.find((configuration) => configuration.feedId === "orphan-wire"),
+    ).not.toHaveProperty("discussionFrequency");
+
+    const restarted = new ChannelFeedStore({ persistence });
+    await restarted.load();
+    expect(restarted.configuration("market-wire")?.discussionFrequency).toBe(85);
+    expect(restarted.configuration("orphan-wire")?.discussionFrequency).toBeUndefined();
   });
 
   it("round-trips disabled cadence controls and atomically clears fresh-poll gating", async () => {
@@ -143,6 +231,7 @@ describe("ChannelFeedStore", () => {
     await first.configure("market-wire", {
       feedId: "market-wire",
       enabled: false,
+      discussionFrequency: 67,
       activeIntervalMs: 5 * 60_000,
       idleIntervalMs: 45 * 60_000,
       freshPollRequired: true,
@@ -153,6 +242,7 @@ describe("ChannelFeedStore", () => {
     expect(restored.configuration("market-wire")).toEqual({
       feedId: "market-wire",
       enabled: false,
+      discussionFrequency: 67,
       activeIntervalMs: 5 * 60_000,
       idleIntervalMs: 45 * 60_000,
       freshPollRequired: true,
@@ -160,6 +250,7 @@ describe("ChannelFeedStore", () => {
     await restored.configure("market-wire", {
       feedId: "market-wire",
       enabled: true,
+      discussionFrequency: 67,
       activeIntervalMs: 5 * 60_000,
       idleIntervalMs: 45 * 60_000,
       freshPollRequired: true,
@@ -362,7 +453,7 @@ describe("ChannelFeedStore", () => {
     const metadata = await stat(filePath);
     expect(metadata.mode & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
-      version: 2,
+      version: 3,
       configurations: [],
     });
     expect((await stat(join(directory, "nested"))).isDirectory()).toBe(true);

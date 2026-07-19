@@ -2,6 +2,7 @@ import type {
   ChannelFeedPollTiming,
   ChannelFeedRuntimeConfiguration,
   ChannelFeedScheduleState,
+  ChannelFeedStoredConfiguration,
 } from "./channelFeedStore.js";
 import type {
   AdminChannelFeedControl,
@@ -53,6 +54,8 @@ export interface ChannelFeedAdapter<TCard extends SchedulableChannelFeedCard> {
     description: string;
     publisher: ChannelFeedAdminPublisher;
     defaultEnabled?: boolean;
+    /** Default autonomous discussion intensity, independent of provider polling. */
+    defaultDiscussionFrequency?: number;
   };
   /**
    * Revalidate a structurally stored card against the current clock before it
@@ -76,7 +79,7 @@ export interface ChannelFeedStorePort<TCard extends SchedulableChannelFeedCard> 
   cards(): TCard[];
   getCard(feedId: string): TCard | undefined;
   schedule(feedId: string): ChannelFeedScheduleState | undefined;
-  configuration(feedId: string): ChannelFeedRuntimeConfiguration | undefined;
+  configuration(feedId: string): ChannelFeedStoredConfiguration | undefined;
   publishSuccess(
     feedId: string,
     draft: ChannelFeedCardDraftFor<TCard>,
@@ -127,6 +130,7 @@ export type ChannelFeedAdminControl = AdminChannelFeedControl;
 
 export interface ChannelFeedConfigureInput {
   enabled?: boolean;
+  discussionFrequency?: number;
   activeIntervalMinutes?: number;
   idleIntervalMinutes?: number;
 }
@@ -398,7 +402,10 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
         !validIdentifier(metadata.publisher?.id ?? "") ||
         !boundedDisplayText(metadata.publisher?.name ?? "", 80) ||
         metadata.publisher?.badge !== "BOT" ||
-        (metadata.defaultEnabled !== undefined && typeof metadata.defaultEnabled !== "boolean")) {
+        (metadata.defaultEnabled !== undefined && typeof metadata.defaultEnabled !== "boolean") ||
+        (metadata.defaultDiscussionFrequency !== undefined &&
+          (!Number.isSafeInteger(metadata.defaultDiscussionFrequency) ||
+            metadata.defaultDiscussionFrequency < 0 || metadata.defaultDiscussionFrequency > 100))) {
       throw new TypeError(`Invalid admin metadata for channel feed ${adapter.id}`);
     }
   }
@@ -410,6 +417,7 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     return {
       feedId: adapter.id,
       enabled,
+      discussionFrequency: adapter.metadata.defaultDiscussionFrequency ?? 0,
       activeIntervalMs: adapter.activeIntervalMs,
       idleIntervalMs: adapter.idleIntervalMs,
       freshPollRequired: !enabled,
@@ -418,14 +426,19 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
 
   private normalizedPersistedConfiguration(
     runtime: FeedRuntime<TCard>,
-    persisted: ChannelFeedRuntimeConfiguration | undefined,
+    persisted: ChannelFeedStoredConfiguration | undefined,
   ): ChannelFeedRuntimeConfiguration {
     if (!persisted) return this.defaultConfiguration(runtime.adapter);
+    const defaults = this.defaultConfiguration(runtime.adapter);
     const minimum = this.minimumIntervalMs(runtime);
     const activeIntervalMs = Math.max(minimum, Math.min(MAX_INTERVAL_MS, persisted.activeIntervalMs));
     return {
       feedId: runtime.adapter.id,
       enabled: persisted.enabled,
+      discussionFrequency: Math.max(
+        0,
+        Math.min(100, persisted.discussionFrequency ?? defaults.discussionFrequency),
+      ),
       activeIntervalMs,
       idleIntervalMs: Math.max(activeIntervalMs, Math.min(MAX_INTERVAL_MS, persisted.idleIntervalMs)),
       freshPollRequired: persisted.enabled ? persisted.freshPollRequired : true,
@@ -461,9 +474,11 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
       publisher: { ...runtime.adapter.metadata.publisher },
       available: true,
       enabled: runtime.configuration.enabled,
+      discussionFrequency: runtime.configuration.discussionFrequency,
       activeIntervalMinutes: runtime.configuration.activeIntervalMs / MINUTE_MS,
       idleIntervalMinutes: runtime.configuration.idleIntervalMs / MINUTE_MS,
       defaultEnabled: defaults.enabled,
+      defaultDiscussionFrequency: defaults.discussionFrequency,
       defaultActiveIntervalMinutes: defaults.activeIntervalMs / MINUTE_MS,
       defaultIdleIntervalMinutes: defaults.idleIntervalMs / MINUTE_MS,
       minimumIntervalMinutes: this.minimumIntervalMs(runtime) / MINUTE_MS,
@@ -485,12 +500,20 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
   ): ChannelFeedRuntimeConfiguration {
     if (!input || typeof input !== "object" || Array.isArray(input) ||
         Object.keys(input).some((key) =>
-          !["enabled", "activeIntervalMinutes", "idleIntervalMinutes"].includes(key)
+          !["enabled", "discussionFrequency", "activeIntervalMinutes", "idleIntervalMinutes"].includes(key)
         )) {
       throw new ChannelFeedConfigurationError("invalid_configuration", "Invalid channel feed configuration payload.");
     }
     if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
       throw new ChannelFeedConfigurationError("invalid_configuration", "enabled must be a boolean.");
+    }
+    if (input.discussionFrequency !== undefined &&
+        (!Number.isSafeInteger(input.discussionFrequency) ||
+          input.discussionFrequency < 0 || input.discussionFrequency > 100)) {
+      throw new ChannelFeedConfigurationError(
+        "invalid_configuration",
+        "discussionFrequency must be an integer from 0 to 100.",
+      );
     }
     const minimumMinutes = this.minimumIntervalMs(runtime) / MINUTE_MS;
     const validateMinutes = (value: number | undefined, label: string): void => {
@@ -519,6 +542,7 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     return {
       feedId: runtime.adapter.id,
       enabled,
+      discussionFrequency: input.discussionFrequency ?? runtime.configuration.discussionFrequency,
       activeIntervalMs,
       idleIntervalMs,
       freshPollRequired: !enabled || newlyEnabled || runtime.configuration.freshPollRequired,
@@ -543,10 +567,41 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     if (
       nextConfiguration.feedId === runtime.configuration.feedId
       && nextConfiguration.enabled === runtime.configuration.enabled
+      && nextConfiguration.discussionFrequency === runtime.configuration.discussionFrequency
       && nextConfiguration.activeIntervalMs === runtime.configuration.activeIntervalMs
       && nextConfiguration.idleIntervalMs === runtime.configuration.idleIntervalMs
       && nextConfiguration.freshPollRequired === runtime.configuration.freshPollRequired
     ) {
+      return this.controlFor(runtime);
+    }
+
+    const discussionOnly =
+      nextConfiguration.enabled === runtime.configuration.enabled
+      && nextConfiguration.discussionFrequency !== runtime.configuration.discussionFrequency
+      && nextConfiguration.activeIntervalMs === runtime.configuration.activeIntervalMs
+      && nextConfiguration.idleIntervalMs === runtime.configuration.idleIntervalMs
+      && nextConfiguration.freshPollRequired === runtime.configuration.freshPollRequired;
+    if (discussionOnly) {
+      // Discussion admission is independent from provider scheduling. Let an
+      // already-started poll finish so its durable schedule and fresh-poll
+      // transition stay authoritative, then patch only the newly requested
+      // discussion value without supplying or rewriting a due time.
+      const activePoll = runtime.inFlight;
+      if (activePoll) await activePoll;
+      if (this.closed) {
+        throw new ChannelFeedConfigurationError("closed", "Channel feeds are shutting down.");
+      }
+      const refreshedConfiguration = this.parseConfigurationInput(runtime, {
+        discussionFrequency: input.discussionFrequency,
+      });
+      const persisted = await this.store.configure(runtime.adapter.id, refreshedConfiguration);
+      runtime.configuration = { ...persisted.configuration };
+      if (persisted.schedule) {
+        runtime.nextPollAt = persisted.schedule.nextPollAt;
+        runtime.failures = Math.max(0, Math.min(32, persisted.schedule.failures));
+        runtime.lastAttemptAt = persisted.schedule.lastAttemptAt;
+        runtime.lastSuccessAt = persisted.schedule.lastSuccessAt;
+      }
       return this.controlFor(runtime);
     }
 
@@ -645,10 +700,18 @@ export class ChannelFeedCoordinator<TCard extends SchedulableChannelFeedCard> {
     for (const runtime of this.feeds.values()) {
       const persisted = this.store.schedule(runtime.adapter.id);
       const card = this.store.getCard(runtime.adapter.id);
+      const persistedConfiguration = this.store.configuration(runtime.adapter.id);
       runtime.configuration = this.normalizedPersistedConfiguration(
         runtime,
-        this.store.configuration(runtime.adapter.id),
+        persistedConfiguration,
       );
+      // Version-two state predates autonomous discussion controls. Its
+      // missing value is deliberately resolved through the adapter default,
+      // then durably upgraded before any provider work can begin.
+      if (persistedConfiguration && persistedConfiguration.discussionFrequency === undefined) {
+        const migrated = await this.store.configure(runtime.adapter.id, runtime.configuration);
+        runtime.configuration = { ...migrated.configuration };
+      }
       runtime.nextPollAt = persisted
         ? Math.min(
             persisted.nextPollAt,

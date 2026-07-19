@@ -74,7 +74,7 @@ type ConfirmRequest = {
 type IssuedRecoveryKey = { name: string; recoveryKey: string; copied: boolean };
 type AdminChannelFeedDraft = Pick<
   AdminChannelFeedControl,
-  "enabled" | "activeIntervalMinutes" | "idleIntervalMinutes"
+  "enabled" | "discussionFrequency" | "activeIntervalMinutes" | "idleIntervalMinutes"
 >;
 
 const sections: Array<{ id: AdminSection; label: string; hint: string }> = [
@@ -456,6 +456,7 @@ export default function AdminApp() {
       channelFeedDraftKey(feed.channelId, feed.id),
       {
         enabled: feed.enabled,
+        discussionFrequency: feed.discussionFrequency,
         activeIntervalMinutes: feed.activeIntervalMinutes,
         idleIntervalMinutes: feed.idleIntervalMinutes,
       },
@@ -887,6 +888,7 @@ export default function AdminApp() {
     setChannelFeedDrafts((current) => {
       const existing = current[key] ?? {
         enabled: feed.enabled,
+        discussionFrequency: feed.discussionFrequency,
         activeIntervalMinutes: feed.activeIntervalMinutes,
         idleIntervalMinutes: feed.idleIntervalMinutes,
       };
@@ -904,12 +906,16 @@ export default function AdminApp() {
     const key = channelFeedDraftKey(feed.channelId, feed.id);
     const draft = channelFeedDrafts[key] ?? {
       enabled: feed.enabled,
+      discussionFrequency: feed.discussionFrequency,
       activeIntervalMinutes: feed.activeIntervalMinutes,
       idleIntervalMinutes: feed.idleIntervalMinutes,
     };
     if (
       !Number.isSafeInteger(draft.activeIntervalMinutes)
       || !Number.isSafeInteger(draft.idleIntervalMinutes)
+      || !Number.isSafeInteger(draft.discussionFrequency)
+      || draft.discussionFrequency < 0
+      || draft.discussionFrequency > 100
       || draft.activeIntervalMinutes < feed.minimumIntervalMinutes
       || draft.idleIntervalMinutes < draft.activeIntervalMinutes
       || draft.activeIntervalMinutes > feed.maximumIntervalMinutes
@@ -1510,6 +1516,7 @@ export default function AdminApp() {
                     const key = channelFeedDraftKey(feed.channelId, feed.id);
                     const feedDraft = channelFeedDrafts[key] ?? {
                       enabled: feed.enabled,
+                      discussionFrequency: feed.discussionFrequency,
                       activeIntervalMinutes: feed.activeIntervalMinutes,
                       idleIntervalMinutes: feed.idleIntervalMinutes,
                     };
@@ -1521,6 +1528,7 @@ export default function AdminApp() {
                       && feedDraft.idleIntervalMinutes <= feed.maximumIntervalMinutes;
                     const unavailableSelection = !feed.available;
                     const dirty = feedDraft.enabled !== feed.enabled
+                      || feedDraft.discussionFrequency !== feed.discussionFrequency
                       || feedDraft.activeIntervalMinutes !== feed.activeIntervalMinutes
                       || feedDraft.idleIntervalMinutes !== feed.idleIntervalMinutes;
                     const saving = busy === `save-channel-feed-${feed.id}`;
@@ -1563,6 +1571,35 @@ export default function AdminApp() {
                             <small>Disabling stops future polls and hides its room card; it does not turn this into a resident or delete room history.</small>
                           </span>
                         </label>
+
+                        <div className="admin-channel-feed-discussion">
+                          <div className="admin-channel-feed-discussion-heading">
+                            <div>
+                              <strong>Resident discussion frequency</strong>
+                              <small>Independent of how often this integration fetches new data.</small>
+                            </div>
+                            <output htmlFor={`feed-${feed.id}-discussion-frequency`}>
+                              {feedDraft.discussionFrequency}
+                            </output>
+                          </div>
+                          <input
+                            aria-label={`${feed.label} resident discussion frequency`}
+                            disabled={Boolean(busy) || !feed.available}
+                            id={`feed-${feed.id}-discussion-frequency`}
+                            max="100"
+                            min="0"
+                            onChange={(event) => updateChannelFeedDraft(feed, {
+                              discussionFrequency: event.currentTarget.valueAsNumber,
+                            })}
+                            step="1"
+                            type="range"
+                            value={feedDraft.discussionFrequency}
+                          />
+                          <p>
+                            <strong>0 = never.</strong> <strong>100 = highest allowed frequency</strong>,
+                            but room relevance, cooldowns, shared model capacity and anti-spam limits still apply.
+                          </p>
+                        </div>
 
                         <div className="admin-channel-feed-cadence">
                           <Field
@@ -1635,6 +1672,7 @@ export default function AdminApp() {
                           <span>Allowed <strong>{formatIntervalMinutes(feed.minimumIntervalMinutes)}–{formatIntervalMinutes(feed.maximumIntervalMinutes)}</strong></span>
                           <span>Defaults <strong>{formatIntervalMinutes(feed.defaultActiveIntervalMinutes)} active / {formatIntervalMinutes(feed.defaultIdleIntervalMinutes)} quiet</strong></span>
                           <span>Default state <strong>{feed.defaultEnabled ? "enabled" : "disabled"}</strong></span>
+                          <span>Default discussion <strong>{feed.defaultDiscussionFrequency}/100</strong></span>
                         </div>
 
                         <dl className="admin-channel-feed-facts">

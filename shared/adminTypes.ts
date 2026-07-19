@@ -115,7 +115,7 @@ export type AdminChannelFeedStatus = "disabled" | "waiting" | "polling" | "ready
 /**
  * Read/write projection of one server-owned room integration. The server owns
  * the adapter, room binding and safety limits; administrators only control its
- * enabled state and cadence.
+ * enabled state, fetch cadence and autonomous discussion frequency.
  */
 export interface AdminChannelFeedControl {
   id: string;
@@ -130,9 +130,12 @@ export interface AdminChannelFeedControl {
   };
   available: boolean;
   enabled: boolean;
+  /** 0 disables autonomous resident discussion of this feed; 100 is the bounded ceiling. */
+  discussionFrequency: number;
   activeIntervalMinutes: number;
   idleIntervalMinutes: number;
   defaultEnabled: boolean;
+  defaultDiscussionFrequency: number;
   defaultActiveIntervalMinutes: number;
   defaultIdleIntervalMinutes: number;
   minimumIntervalMinutes: number;
@@ -147,6 +150,7 @@ export interface AdminChannelFeedControl {
 
 export interface AdminChannelFeedPatch {
   enabled: boolean;
+  discussionFrequency: number;
   activeIntervalMinutes: number;
   idleIntervalMinutes: number;
 }

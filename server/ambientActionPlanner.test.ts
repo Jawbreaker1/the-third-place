@@ -40,6 +40,19 @@ describe("ambient action planner", () => {
     expect(human.minimumMessages).toBeGreaterThan(2);
   });
 
+  it("gives a typed channel-feed episode room for a grounded follow-up", () => {
+    const feed = sampleAmbientEpisodeShape({
+      origin: "channel_feed",
+      mode: "discussion",
+      debateBeat: false,
+      rng: () => 0,
+    });
+
+    expect(feed.minimumMessages).toBe(2);
+    expect(feed.softTargetMessages).toBeGreaterThanOrEqual(2);
+    expect(feed.hardMaximumMessages).toBeGreaterThan(feed.softTargetMessages);
+  });
+
   it("opens without a reply target and then uses one non-repeating action per tick", () => {
     const shape = { minimumMessages: 3, softTargetMessages: 4, hardMaximumMessages: 6 };
     const opening = decideAmbientAction({

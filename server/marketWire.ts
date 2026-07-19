@@ -404,6 +404,7 @@ export class MarketWireAdapter implements ChannelFeedAdapter<MarketTickerFeedCar
       badge: MARKET_WIRE_ACTOR.badge,
     }),
     defaultEnabled: true,
+    defaultDiscussionFrequency: 50,
   });
   activeIntervalMs = MARKET_WIRE_SCHEDULE.activeEveryMs;
   idleIntervalMs = MARKET_WIRE_SCHEDULE.idleEveryMs;

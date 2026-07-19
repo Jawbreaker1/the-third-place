@@ -63,6 +63,11 @@ import {
 import { CapabilityRegistry } from "./capabilities/registry.js";
 import type { MarketObservation, MarketSnapshot } from "./marketData/types.js";
 import type { MarketPulseFeedCandidate, MarketPulseMovementCandidate } from "./marketPulse.js";
+import {
+  ChannelFeedConversationLedger,
+  MemoryChannelFeedConversationPersistence,
+  type ChannelFeedConversationCue,
+} from "./channelFeedConversation.js";
 
 const classifiedTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => {
   const evidence = overrides.evidence ?? {
@@ -9552,7 +9557,7 @@ describe("social director", () => {
       const incoming = createMessage(
         "stock-market",
         human.id,
-        "Hur tolkar ni börsläget?",
+        "Vad visar RiskWire om riskläget?",
         { createdAt: new Date(now).toISOString() },
       );
       store.addPublicMessage(incoming);
@@ -9561,8 +9566,13 @@ describe("social director", () => {
         content: "OLD_FEED_REVISION_7 OMXS30 3000.00 index points.",
         updatedAt: "2026-07-19T13:30:00.000Z",
       };
+      const secondaryFeedFact = {
+        publisherName: "RiskWire",
+        content: "SECOND_FEED_FACT volatility breadth is elevated.",
+        updatedAt: "2026-07-19T14:06:00.000Z",
+      };
       const channelFeedFacts = vi.fn((channelId: string) =>
-        channelId === "stock-market" ? feedFact : undefined,
+        channelId === "stock-market" ? [feedFact, secondaryFeedFact] : [],
       );
       const sceneRequests: Array<{
         history: Array<{ author: string; kind: string; content: string }>;
@@ -9586,14 +9596,15 @@ describe("social director", () => {
           sourceIds: [],
         }];
       });
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.99 },
+      }));
       const director = new SocialDirector(
         { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
         store,
         {
           health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
-          analyzeTurn: vi.fn(async () => classifiedTurn({
-            intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.99 },
-          })),
+          analyzeTurn,
           generateScene,
           rememberDeliveredLine: vi.fn(),
         } as never,
@@ -9622,7 +9633,7 @@ describe("social director", () => {
 
       feedFact = {
         publisherName: "MarketWire",
-        content: "CURRENT_FEED_REVISION_8 OMXS30 3146.94 index points.",
+        content: `CURRENT_FEED_REVISION_8 OMXS30 3146.94 index points. ${"A".repeat(2_300)}`,
         updatedAt: "2026-07-19T14:05:00.000Z",
       };
       const pending = (director as unknown as {
@@ -9633,9 +9644,22 @@ describe("social director", () => {
 
       expect(generateScene).toHaveBeenCalledTimes(1);
       expect(channelFeedFacts).toHaveBeenCalledWith("stock-market");
-      expect(sceneRequests[0]?.channelFeedContext).toEqual(feedFact);
+      expect(analyzeTurn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channelFeedContext: expect.objectContaining({
+            publisherName: "MarketWire + RiskWire",
+            content: expect.stringContaining("SECOND_FEED_FACT"),
+          }),
+        }),
+        expect.any(Object),
+      );
+      expect(sceneRequests[0]?.channelFeedContext?.publisherName).toBe("MarketWire + RiskWire");
+      expect(sceneRequests[0]?.channelFeedContext?.content).toContain("=== MarketWire ===");
       expect(sceneRequests[0]?.channelFeedContext?.content).toContain("CURRENT_FEED_REVISION_8");
+      expect(sceneRequests[0]?.channelFeedContext?.content).toContain("=== RiskWire ===");
+      expect(sceneRequests[0]?.channelFeedContext?.content).toContain("SECOND_FEED_FACT");
       expect(sceneRequests[0]?.channelFeedContext?.content).not.toContain("OLD_FEED_REVISION_7");
+      expect(sceneRequests[0]?.channelFeedContext?.content.length).toBeLessThanOrEqual(2_400);
       const history = sceneRequests[0]!.history;
       expect(history.some((line) => /(?:CURRENT|OLD)_FEED_REVISION/.test(line.content))).toBe(false);
       expect(history.at(-1)).toMatchObject({
@@ -9658,7 +9682,7 @@ describe("social director", () => {
       updatedAt: "2026-07-19T13:30:00.000Z",
     };
     const channelFeedFacts = vi.fn((channelId: string) =>
-      channelId === "stock-market" ? feedFact : undefined,
+      channelId === "stock-market" ? [feedFact] : [],
     );
     const sceneRequests: Array<{
       channelId: string;
@@ -9725,5 +9749,325 @@ describe("social director", () => {
     const history = sceneRequests[0]!.history;
     expect(history.some((line) => /(?:CURRENT|OLD)_AMBIENT_FEED_REVISION/.test(line.content))).toBe(false);
     director.stop();
+  });
+
+  it("opens and durably acknowledges one autonomous episode from an admitted typed feed revision", async () => {
+    const now = Date.parse("2026-07-19T14:30:00.000Z");
+    const fact = {
+      publisherName: "IndexWire",
+      content: "North Composite: 4123.50 points; -0.75% versus previous close; freshness recent.",
+      updatedAt: "2026-07-19T14:25:00.000Z",
+    };
+    const cue: ChannelFeedConversationCue = {
+      feedId: "index-wire",
+      channelId: "stock-market",
+      feedKind: "market_ticker",
+      revision: 12,
+      revisionKey: "market_ticker:index-wire:12",
+      semanticKey: "channel-feed:stock-market:index-wire",
+      publisherName: "IndexWire",
+      relevance: "high",
+      fact,
+      discussionPremise: "Open a grounded discussion from one or two exact reported index moves.",
+    };
+    const feedLedger = new ChannelFeedConversationLedger(
+      new MemoryChannelFeedConversationPersistence(),
+    );
+    await feedLedger.start();
+    const store = new RoomStore(`/tmp/director-channel-feed-episode-${process.pid}-${Math.random()}.json`);
+    const sceneRequests: Array<Record<string, unknown>> = [];
+    const generateScene = vi.fn(async (request: {
+      selected: Array<(typeof PERSONAS)[number]>;
+    } & Record<string, unknown>) => {
+      sceneRequests.push(request);
+      return [{
+        personaId: request.selected[0]!.id,
+        content: "North Composite är ned 0,75 procent mot förra stängningen. Är det någon som läser det annorlunda?",
+        source: "lm" as const,
+        sourceIds: [],
+      }];
+    });
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        channelFeedFacts: (channelId) => channelId === "stock-market"
+          ? [{ ...fact, conversationCue: cue, discussionFrequency: 100 }]
+          : [],
+        channelFeedConversationLedger: feedLedger,
+        consideredConversationChance: 0,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "stock-market" ? 50 : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+
+    await (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+
+    expect(generateScene).toHaveBeenCalledTimes(1);
+    expect(sceneRequests[0]).toMatchObject({
+      channelId: "stock-market",
+      channelFeedContext: fact,
+      channelFeedDiscussion: true,
+      premise: expect.stringContaining(cue.discussionPremise),
+      ambientAction: {
+        causalRootId: cue.revisionKey,
+        semanticFamily: cue.semanticKey,
+        kind: "open_topic",
+      },
+    });
+    expect(store.getRecent("stock-market", 1)[0]?.content).toContain("0,75 procent");
+    expect(store.getDurableChannelFeedPublicationReceipts()).toEqual([
+      expect.objectContaining({
+        feedId: cue.feedId,
+        revisionKey: cue.revisionKey,
+        revision: cue.revision,
+      }),
+    ]);
+    expect(feedLedger.snapshot().feeds).toEqual([
+      expect.objectContaining({
+        feedId: cue.feedId,
+        lastPublishedRevisionKey: cue.revisionKey,
+        lastPublishedAt: now,
+      }),
+    ]);
+    director.stop();
+  });
+
+  it("revalidates a reserved feed opening after generation and honors current admin controls", async () => {
+    const now = Date.parse("2026-07-19T14:45:00.000Z");
+    const fact = {
+      publisherName: "IndexWire",
+      content: "North Composite: 4123.50 points; -0.75% versus previous close; freshness recent.",
+      updatedAt: "2026-07-19T14:40:00.000Z",
+    };
+    const cue: ChannelFeedConversationCue = {
+      feedId: "index-wire",
+      channelId: "stock-market",
+      feedKind: "market_ticker",
+      revision: 14,
+      revisionKey: "market_ticker:index-wire:14",
+      semanticKey: "channel-feed:stock-market:index-wire",
+      publisherName: "IndexWire",
+      relevance: "high",
+      fact,
+      discussionPremise: "Open one grounded discussion from the exact reported move.",
+    };
+
+    for (const change of ["frequency_zero", "integration_disabled"] as const) {
+      const ledger = new ChannelFeedConversationLedger(new MemoryChannelFeedConversationPersistence());
+      await ledger.start();
+      const store = new RoomStore(
+        `/tmp/director-feed-control-revalidation-${change}-${process.pid}-${Math.random()}.json`,
+      );
+      let contexts = [{ ...fact, conversationCue: cue, discussionFrequency: 100 }];
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+      }) => {
+        contexts = change === "frequency_zero"
+          ? [{ ...fact, conversationCue: cue, discussionFrequency: 0 }]
+          : [];
+        return [{
+          personaId: request.selected[0]!.id,
+          content: "North Composite är ned 0,75 procent mot förra stängningen.",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 1,
+        {
+          now: () => now,
+          rng: () => 0,
+          channelFeedFacts: (channelId) => channelId === "stock-market" ? contexts : [],
+          channelFeedConversationLedger: ledger,
+          consideredConversationChance: 0,
+          autonomousResearchEnabled: false,
+          ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "stock-market" ? 50 : 0,
+            autonomousLinkFrequency: 0,
+            competence: 50,
+            aggression: 25,
+            explicitness: 50,
+          }),
+        },
+      );
+
+      await (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+
+      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(store.getAllMessages().some((message) =>
+        message.content.includes("0,75 procent")
+      )).toBe(false);
+      expect(store.getDurableChannelFeedPublicationReceipts()).toEqual([]);
+      expect(ledger.snapshot().feeds[0]).not.toHaveProperty("lastPublishedRevisionKey");
+      director.stop();
+    }
+  });
+
+  it("recovers both partial persistence orders without losing or duplicating a feed opening", async () => {
+    let now = Date.parse("2026-07-19T15:00:00.000Z");
+    const fact = {
+      publisherName: "IndexWire",
+      content: "North Composite: 4123.50 points; -0.75% versus previous close; freshness recent.",
+      updatedAt: "2026-07-19T14:55:00.000Z",
+    };
+    const cue: ChannelFeedConversationCue = {
+      feedId: "index-wire",
+      channelId: "stock-market",
+      feedKind: "market_ticker",
+      revision: 13,
+      revisionKey: "market_ticker:index-wire:13",
+      semanticKey: "channel-feed:stock-market:index-wire",
+      publisherName: "IndexWire",
+      relevance: "high",
+      fact,
+      discussionPremise: "Open one grounded discussion from the exact reported move.",
+    };
+    const makeDirector = (
+      store: RoomStore,
+      ledger: ChannelFeedConversationLedger,
+      generateScene: ReturnType<typeof vi.fn>,
+    ) => new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      store,
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      {
+        now: () => now,
+        rng: () => 0,
+        channelFeedFacts: (channelId) => channelId === "stock-market"
+          ? [{ ...fact, conversationCue: cue, discussionFrequency: 100 }]
+          : [],
+        channelFeedConversationLedger: ledger,
+        consideredConversationChance: 0,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "stock-market" ? 50 : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+    const generatedLine = async (request: { selected: Array<(typeof PERSONAS)[number]> }) => [{
+      personaId: request.selected[0]!.id,
+      content: "North Composite är ned 0,75 procent mot förra stängningen.",
+      source: "lm" as const,
+      sourceIds: [],
+    }];
+
+    // Room persistence failing first must roll the speculative row back and
+    // must never advance the feed ledger acknowledgement.
+    const roomFailureLedger = new ChannelFeedConversationLedger(
+      new MemoryChannelFeedConversationPersistence(),
+    );
+    await roomFailureLedger.start();
+    const roomFailureStore = new RoomStore(
+      `/tmp/director-feed-room-failure-${process.pid}-${Math.random()}.json`,
+    );
+    const failedFlush = vi.spyOn(roomFailureStore, "flush").mockRejectedValue(new Error("room disk unavailable"));
+    const roomFailureDirector = makeDirector(roomFailureStore, roomFailureLedger, vi.fn(generatedLine));
+    await (roomFailureDirector as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+    expect(roomFailureStore.getDurableChannelFeedPublicationReceipts()).toEqual([]);
+    expect(roomFailureStore.getAllMessages().some((message) =>
+      message.content.includes("0,75 procent")
+    )).toBe(false);
+    expect(roomFailureLedger.snapshot().feeds[0]).not.toHaveProperty("lastPublishedRevisionKey");
+    failedFlush.mockRestore();
+    roomFailureDirector.stop();
+
+    // If the room commits but the second ledger write fails, the durable room
+    // receipt repairs that exact admitted revision after process restart.
+    let durableLedgerState: unknown;
+    let ledgerSaveCount = 0;
+    let failAcknowledgement = true;
+    const ledgerPersistence = {
+      load: async () => structuredClone(durableLedgerState),
+      save: async (state: unknown) => {
+        ledgerSaveCount += 1;
+        if (failAcknowledgement && ledgerSaveCount === 2) {
+          throw new Error("ledger disk unavailable");
+        }
+        durableLedgerState = structuredClone(state);
+      },
+    };
+    const roomPath = `/tmp/director-feed-ledger-failure-${process.pid}-${Math.random()}.json`;
+    const firstLedger = new ChannelFeedConversationLedger(ledgerPersistence);
+    await firstLedger.start();
+    const firstStore = new RoomStore(roomPath);
+    const firstDirector = makeDirector(firstStore, firstLedger, vi.fn(generatedLine));
+    await (firstDirector as unknown as { runAmbient: () => Promise<void> }).runAmbient();
+    expect(firstStore.getDurableChannelFeedPublicationReceipts()).toEqual([
+      expect.objectContaining({ revisionKey: cue.revisionKey }),
+    ]);
+    expect(firstLedger.snapshot().feeds[0]).not.toHaveProperty("lastPublishedRevisionKey");
+    firstDirector.stop();
+
+    failAcknowledgement = false;
+    const restartedStore = new RoomStore(roomPath);
+    await restartedStore.load();
+    const restartedLedger = new ChannelFeedConversationLedger(ledgerPersistence);
+    await restartedLedger.start();
+    now += 40 * 60_000;
+    const restartedGenerate = vi.fn(generatedLine);
+    const restartedDirector = makeDirector(restartedStore, restartedLedger, restartedGenerate);
+    await expect((restartedDirector as unknown as {
+      ensureChannelFeedPublicationReceiptsReconciled: () => Promise<boolean>;
+    }).ensureChannelFeedPublicationReceiptsReconciled()).resolves.toBe(true);
+    expect(restartedLedger.snapshot().feeds[0]).toMatchObject({
+      lastPublishedRevisionKey: cue.revisionKey,
+      lastPublishedRevision: cue.revision,
+    });
+    await expect(restartedLedger.reserve(cue, {
+      frequency: 100,
+      hardCooldownMs: 30 * 60_000,
+      failedAttemptCooldownMs: 3 * 60_000,
+    }, now, () => 0)).resolves.toMatchObject({
+      eligible: false,
+      reason: "already_published",
+    });
+    expect(restartedGenerate).not.toHaveBeenCalled();
+    restartedDirector.stop();
   });
 });

@@ -312,6 +312,13 @@ const normalizeChannelFeed = (value: unknown, index: number): AdminChannelFeedCo
     maximumIntervalMinutes,
   );
   const enabled = asBoolean(input.enabled, asBoolean(input.defaultEnabled, true));
+  const defaultDiscussionFrequency = boundedInteger(input.defaultDiscussionFrequency, 0, 0, 100);
+  const discussionFrequency = boundedInteger(
+    input.discussionFrequency,
+    defaultDiscussionFrequency,
+    0,
+    100,
+  );
   return {
     id,
     channelId,
@@ -325,9 +332,11 @@ const normalizeChannelFeed = (value: unknown, index: number): AdminChannelFeedCo
     },
     available: asBoolean(input.available),
     enabled,
+    discussionFrequency,
     activeIntervalMinutes,
     idleIntervalMinutes,
     defaultEnabled: asBoolean(input.defaultEnabled, true),
+    defaultDiscussionFrequency,
     defaultActiveIntervalMinutes,
     defaultIdleIntervalMinutes,
     minimumIntervalMinutes,

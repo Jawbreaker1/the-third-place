@@ -3,6 +3,9 @@ import {
   buildCandidateReviewResponseFormat,
   buildCandidateReviewSystemPrompt,
   buildCandidateReviewUserData,
+  buildChannelFeedCoverageResponseFormat,
+  buildChannelFeedCoverageSystemPrompt,
+  buildChannelFeedCoverageUserData,
   boundVisualEvidence,
   buildEvidencePlanVerifierResponseFormat,
   buildEvidencePlanVerifierSystemPrompt,
@@ -24,6 +27,7 @@ import {
   createFailClosedTurnAnalysis,
   memoryAnalysisInputSchema,
   parseCandidateReviewContent,
+  parseChannelFeedCoverageContent,
   parseEvidencePlanVerifierContent,
   parseMemoryAnalysisContent,
   parseTurnAnalysisContent,
@@ -185,6 +189,54 @@ describe("multilingual semantic router contract", () => {
       ...parsed,
       mechanicalAddressedPersonaIds: ["ai-unknown"],
     }).success).toBe(false);
+  });
+
+  it("carries trusted channel-feed grounding into semantic routing without making it an instruction", () => {
+    const channelFeedContext = {
+      publisherName: "IndexWire",
+      content: "North Composite: 4123.50 points; -0.75% versus previous close; freshness recent.",
+      updatedAt: "2026-07-19T12:00:00.000Z",
+    };
+    const parsed = input({ channelFeedContext });
+
+    expect(buildTurnAnalysisUserData(parsed)).toMatchObject({ channelFeedContext });
+    expect(buildTurnAnalysisSystemPrompt()).toContain(
+      "When channelFeedContext literally supplies every value needed to answer",
+    );
+    expect(buildTurnAnalysisSystemPrompt()).toContain("the guest need not name its publisher");
+    expect(turnAnalysisInputSchema.safeParse({
+      ...parsed,
+      channelFeedContext: { ...channelFeedContext, updatedAt: "not-a-date" },
+    }).success).toBe(false);
+  });
+
+  it("defines a focused feed-coverage arbiter without exposing the capability catalog", () => {
+    const turn = input({
+      channelFeedContext: {
+        publisherName: "IndexWire",
+        content: "North Composite: 4123.50 points; -0.75% versus previous close.",
+        updatedAt: "2026-07-19T12:00:00.000Z",
+      },
+    });
+
+    expect(buildChannelFeedCoverageUserData(turn)).toMatchObject({
+      latestMessage: turn.latestMessage,
+      channelFeedContext: turn.channelFeedContext,
+    });
+    expect(buildChannelFeedCoverageSystemPrompt()).toContain(
+      "Do not answer the human, select a tool/provider",
+    );
+    expect(JSON.stringify(buildChannelFeedCoverageResponseFormat())).not.toContain("web_search");
+    expect(parseChannelFeedCoverageContent(JSON.stringify({
+      verdict: "covered",
+      confidence: 0.99,
+      missingDimension: null,
+    }))).toMatchObject({ verdict: "covered", confidence: 0.99 });
+    expect(parseChannelFeedCoverageContent(JSON.stringify({
+      verdict: "missing",
+      confidence: 0.99,
+      missingDimension: null,
+    }))).toBeUndefined();
   });
 
   it("supplies a trusted community zone for unqualified clock requests without claiming the guest's zone", () => {
@@ -3659,6 +3711,35 @@ describe("multilingual batch candidate-review contract", () => {
     expect(parseCandidateReviewContent(JSON.stringify(valid), reviewInput())).toEqual(valid);
     valid.reviews[0] = { ...valid.reviews[0], issues: ["made_up_issue"] };
     expect(parseCandidateReviewContent(JSON.stringify(valid), reviewInput())).toBeUndefined();
+  });
+
+  it("allows a semantic false-denial blocker when trusted channel-feed grounding is present", () => {
+    const base = explicitRequestReviewInput({
+      trigger: "Can you see the current room figures?",
+      candidate: "No figures are available in this room.",
+    });
+    const feedGrounded = candidateReviewInputSchema.parse({
+      ...base,
+      channelFeedContext: {
+        publisherName: "IndexWire",
+        content: "North Composite: 4123.50 points; -0.75% versus previous close; freshness recent.",
+        updatedAt: "2026-07-19T12:00:00.000Z",
+      },
+      evidence: { outcome: "none", kind: null, query: null, results: [] },
+    });
+    const denial = {
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "high",
+        issues: ["false_evidence_denial"],
+        rewriteInstruction: "Answer from the trusted room figures instead of denying that they exist.",
+        ...undeterminedOutputLanguage,
+      }],
+    };
+
+    expect(JSON.stringify(buildCandidateReviewResponseFormat(feedGrounded))).toContain("false_evidence_denial");
+    expect(parseCandidateReviewContent(JSON.stringify(denial), feedGrounded)).toEqual(denial);
+    expect(buildCandidateReviewSystemPrompt()).toContain("trusted room feed could not be accessed");
   });
 
   it("gates packet inadequacy to successful evidence and a high-severity semantic verdict", () => {

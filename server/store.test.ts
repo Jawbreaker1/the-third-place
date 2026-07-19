@@ -799,6 +799,100 @@ describe("room history", () => {
     })]);
   });
 
+  it("round-trips only the latest durable feed receipt per feed for restart reconciliation", async () => {
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath);
+    const addReceipt = (feedId: string, revision: number, minute: number) => {
+      const message = createMessage("stock-market", "ai-mira", `${feedId} ${revision}`, {
+        createdAt: new Date(Date.UTC(2026, 6, 19, 14, minute)).toISOString(),
+      });
+      store.addPublicMessage(message, {
+        kind: "ambient",
+        attendance: "unattended",
+        channelFeedReceipt: {
+          feedId,
+          revision,
+          revisionKey: `market_ticker:${feedId}:${revision}`,
+        },
+      });
+      return message;
+    };
+    const oldMarket = addReceipt("market-wire", 7, 0);
+    const latestMarket = addReceipt("market-wire", 8, 30);
+    const macro = addReceipt("macro-wire", 3, 45);
+
+    expect(store.getDurableChannelFeedPublicationReceipts()).toEqual([
+      expect.objectContaining({
+        feedId: "market-wire",
+        revision: 8,
+        messageId: latestMarket.id,
+      }),
+      expect.objectContaining({
+        feedId: "macro-wire",
+        revision: 3,
+        messageId: macro.id,
+      }),
+    ]);
+    expect(store.getAutonomousPublicationHistory().some((record) =>
+      record.messageId === oldMarket.id
+    )).toBe(false);
+    await store.flush();
+
+    const restored = new RoomStore(filePath);
+    await restored.load();
+    expect(restored.getDurableChannelFeedPublicationReceipts().map((receipt) =>
+      [receipt.feedId, receipt.revision]
+    )).toEqual([["market-wire", 8], ["macro-wire", 3]]);
+  });
+
+  it("keeps the latest feed receipt across a restart after ordinary accounting retention expires", async () => {
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath);
+    const now = Date.now();
+    const oldAt = new Date(now - 72 * 60 * 60_000).toISOString();
+    const oldReceipt = createMessage("stock-market", "ai-mira", "durable old feed opening", {
+      createdAt: oldAt,
+    });
+    const oldOrdinary = createMessage("stock-market", "ai-vale", "expired accounting row", {
+      createdAt: oldAt,
+    });
+    store.addPublicMessage(oldReceipt, {
+      kind: "ambient",
+      attendance: "unattended",
+      channelFeedReceipt: {
+        feedId: "market-wire",
+        revision: 9,
+        revisionKey: "market_ticker:market-wire:9",
+      },
+    });
+    store.addPublicMessage(oldOrdinary, { kind: "ambient", attendance: "unattended" });
+    store.addPublicMessage(createMessage("lobby", "ai-sana", "current accounting row", {
+      createdAt: new Date(now).toISOString(),
+    }), { kind: "ambient", attendance: "attended" });
+
+    expect(store.getAutonomousPublicationHistory().some((record) =>
+      record.messageId === oldOrdinary.id
+    )).toBe(false);
+    expect(store.getDurableChannelFeedPublicationReceipts()).toEqual([
+      expect.objectContaining({
+        feedId: "market-wire",
+        revision: 9,
+        messageId: oldReceipt.id,
+      }),
+    ]);
+    await store.flush();
+
+    const restarted = new RoomStore(filePath);
+    await restarted.load();
+    expect(restarted.getDurableChannelFeedPublicationReceipts()).toEqual([
+      expect.objectContaining({
+        feedId: "market-wire",
+        revision: 9,
+        messageId: oldReceipt.id,
+      }),
+    ]);
+  });
+
   it("serializes overlapping flushes and atomically leaves the latest state on disk", async () => {
     const filePath = tempStorePath();
     const store = new RoomStore(filePath);

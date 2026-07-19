@@ -381,6 +381,16 @@ body { background: var(--admin-bg); color: var(--admin-text); }
 .admin-channel-feed-description { margin: -2px 0 0; color: var(--admin-muted); font-size: 11px; line-height: 1.55; }
 .admin-channel-feed-warning { padding: 10px 11px; border: 1px solid rgba(239, 173, 93, .2); border-radius: 8px; color: #ffd495; background: rgba(239, 173, 93, .055); font-size: 10px; line-height: 1.5; }
 .admin-channel-feed-toggle { margin: 0; }
+.admin-channel-feed-discussion { display: grid; gap: 8px; padding: 12px; border: 1px solid rgba(98, 216, 179, .14); border-radius: 9px; background: rgba(45, 113, 96, .055); }
+.admin-channel-feed-discussion-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.admin-channel-feed-discussion-heading > div { display: grid; gap: 3px; }
+.admin-channel-feed-discussion-heading strong { color: var(--admin-text); font-size: 11px; }
+.admin-channel-feed-discussion-heading small,
+.admin-channel-feed-discussion p { color: var(--admin-dim); font-size: 9px; line-height: 1.45; }
+.admin-channel-feed-discussion output { min-width: 38px; padding: 6px 7px; border: 1px solid rgba(98, 216, 179, .22); border-radius: 7px; color: #bdf8e5; background: rgba(0, 0, 0, .16); font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
+.admin-root .admin-channel-feed-discussion input[type="range"] { width: 100%; padding: 0; accent-color: var(--admin-mint); }
+.admin-channel-feed-discussion p { margin: 0; }
+.admin-channel-feed-discussion p strong { color: var(--admin-muted); }
 .admin-channel-feed-cadence { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .admin-channel-feed-cadence .admin-field { padding: 12px; border: 1px solid var(--admin-line); border-radius: 9px; background: rgba(255, 255, 255, .018); }
 .admin-channel-feed-number { position: relative; min-width: 0; }
