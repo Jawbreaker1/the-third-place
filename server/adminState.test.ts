@@ -66,6 +66,61 @@ const customChannel = (): AdminChannelConfig => ({
 });
 
 describe("persistent admin overlay state", () => {
+  it("migrates removed room settings and persona affinities into the surviving room", async () => {
+    const baseline = makeStore();
+    await baseline.load();
+    const mira = baseline.snapshot().personas.find((persona) => persona.id === "ai-mira")!;
+    const programming = baseline.snapshot().channels.find((channel) => channel.id === "ai-programming")!;
+    const path = pathFor();
+    const labTuning = { activity: 80, autonomousLinkFrequency: 70, competence: 75, aggression: 30, explicitness: 40 };
+    const programmingTuning = { activity: 45, autonomousLinkFrequency: 55, competence: 90, aggression: 20, explicitness: 35 };
+    await writeFile(path, JSON.stringify({
+      version: 3,
+      revision: 7,
+      behavior: {
+        global: { activity: 50, autonomousLinkFrequency: 60, competence: 50, aggression: 25, explicitness: 50 },
+        channels: {
+          "ai-lab": labTuning,
+          "ai-programming": programmingTuning,
+          "side-quests": labTuning,
+        },
+      },
+      personaOverrides: {
+        [mira.id]: {
+          ...mira,
+          roomAffinities: { "ai-lab": 88, "ai-programming": 40, "side-quests": 99, lobby: 60 },
+        },
+      },
+      customPersonas: [],
+      disabledPersonaIds: [],
+      channelOverrides: {
+        "ai-lab": { ...programming, id: "ai-lab", name: "ai-lab", description: "legacy lab override" },
+      },
+      customChannels: [],
+      disabledChannelIds: ["ai-lab", "side-quests"],
+      bans: [],
+    }), "utf8");
+
+    const migrated = new AdminStateStore({ path, voiceOptions: { languages: [], voices: [] } });
+    await migrated.load();
+    expect(migrated.snapshot().behavior.channels).toEqual({ "ai-programming": programmingTuning });
+    expect(migrated.snapshot().personas.find((persona) => persona.id === mira.id)?.roomAffinities)
+      .toEqual(expect.objectContaining({ lobby: 60, "ai-programming": 88 }));
+    expect(migrated.snapshot().personas.find((persona) => persona.id === mira.id)?.roomAffinities)
+      .not.toHaveProperty("ai-lab");
+    expect(migrated.snapshot().personas.find((persona) => persona.id === mira.id)?.roomAffinities)
+      .not.toHaveProperty("side-quests");
+    expect(migrated.snapshot().channels.map((channel) => channel.id)).not.toEqual(
+      expect.arrayContaining(["ai-lab", "side-quests"]),
+    );
+    expect(migrated.snapshot().channels.find((channel) => channel.id === "ai-programming")?.description)
+      .toBe(programming.description);
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+      version: 4,
+      channelOverrides: {},
+    });
+  });
+
   it("starts neutral relative to runtime defaults and materializes safe live catalog CRUD", async () => {
     const store = makeStore();
     await store.load();
@@ -146,13 +201,13 @@ describe("persistent admin overlay state", () => {
   it("clears stale index-aligned premise families when an admin replaces seeds", async () => {
     const store = makeStore();
     await store.load();
-    const current = store.snapshot().channels.find((channel) => channel.id === "ai-lab")!;
-    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-lab")?.ambientPremiseFamilies?.length).toBeGreaterThan(0);
-    await store.updateChannel("ai-lab", {
+    const current = store.snapshot().channels.find((channel) => channel.id === "ai-programming")!;
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")?.ambientPremiseFamilies?.length).toBeGreaterThan(0);
+    await store.updateChannel("ai-programming", {
       ...current,
       seeds: ["A replacement seed must not inherit a semantic family from the old list."],
     });
-    const runtime = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-lab")!;
+    const runtime = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")!;
     expect(runtime.ambientPremises).toEqual(["A replacement seed must not inherit a semantic family from the old list."]);
     expect(runtime.ambientPremiseFamilies).toBeUndefined();
   });
@@ -160,14 +215,14 @@ describe("persistent admin overlay state", () => {
   it("marks a room's link-frequency control unavailable when its trusted research topic is replaced", async () => {
     const store = makeStore();
     await store.load();
-    const current = store.snapshot().channels.find((channel) => channel.id === "ai-lab")!;
-    await store.updateChannel("ai-lab", {
+    const current = store.snapshot().channels.find((channel) => channel.id === "ai-programming")!;
+    await store.updateChannel("ai-programming", {
       ...current,
       topic: "a completely replaced administrator-authored room topic",
     });
-    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-lab")?.autonomousResearchSeeds)
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")?.autonomousResearchSeeds)
       .toBeUndefined();
-    expect(store.snapshot().automation.autonomousLinkChannelIds).not.toContain("ai-lab");
+    expect(store.snapshot().automation.autonomousLinkChannelIds).not.toContain("ai-programming");
   });
 
   it("drops a built-in research priority when an admin replaces that room's trusted topic", async () => {
@@ -536,11 +591,11 @@ describe("persistent admin overlay state", () => {
     await store.load();
     store.setHooks({
       validateChannelIds: (ids) => {
-        if (!ids.includes("side-quests")) throw new AdminStateError(409, "CHANNEL_IN_USE", "voice active");
+        if (!ids.includes("world-of-warcraft")) throw new AdminStateError(409, "CHANNEL_IN_USE", "voice active");
       },
     });
-    await expect(store.deleteChannel("side-quests")).rejects.toMatchObject({ status: 409, code: "CHANNEL_IN_USE" });
-    expect(CHANNELS.some((channel) => channel.id === "side-quests")).toBe(true);
+    await expect(store.deleteChannel("world-of-warcraft")).rejects.toMatchObject({ status: 409, code: "CHANNEL_IN_USE" });
+    expect(CHANNELS.some((channel) => channel.id === "world-of-warcraft")).toBe(true);
   });
 
   it("refuses to re-enable a resident whose name was reserved by a human while disabled", async () => {

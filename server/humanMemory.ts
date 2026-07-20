@@ -14,6 +14,10 @@ import {
 } from "./humanIdentityRecovery.js";
 import { participantIdentityKey } from "./participantIdentity.js";
 import { preservePreMigrationState } from "./persistenceMigrationBackup.js";
+import {
+  replacementPublicChannelId,
+  RETIRED_PUBLIC_CHANNEL_IDS,
+} from "../shared/channelLifecycle.js";
 
 export const HUMAN_MEMORY_DEFAULTS = {
   retentionMs: 90 * 24 * 60 * 60_000,
@@ -282,8 +286,8 @@ interface InternalProfile extends Omit<HumanMemoryProfile, "tokenHash" | "relati
   credential?: HumanMemoryCredential;
 }
 
-interface PersistedHumanMemoryV2 {
-  version: 2;
+interface PersistedHumanMemoryV3 {
+  version: 3;
   continuityVerified: boolean;
   pendingActorForgetIds: string[];
   profiles: Array<{
@@ -324,7 +328,7 @@ interface ValidatedPersistedRoot {
 const validatePersistedRoot = (value: unknown): ValidatedPersistedRoot => {
   const root = asRecord(value);
   if (!root) throw new TypeError("Human-memory root must be an object.");
-  if (root.version !== undefined && root.version !== 1 && root.version !== 2) {
+  if (root.version !== undefined && root.version !== 1 && root.version !== 2 && root.version !== 3) {
     throw new TypeError("Human-memory version is unsupported.");
   }
   if (!Array.isArray(root.profiles)) {
@@ -499,7 +503,7 @@ const safeFact = (raw: unknown, now: number): HumanMemoryFact | undefined => {
   if (typeof raw === "string") return undefined;
   const value = asRecord(raw);
   const kind = value?.kind;
-  const channelId = boundedString(value?.channelId, 80) ?? "lobby";
+  const channelId = replacementPublicChannelId(boundedString(value?.channelId, 80) ?? "lobby");
   const factValue = cleanClassifiedFactValue(value?.value);
   if (
     !value ||
@@ -633,14 +637,16 @@ export class HumanMemoryStore implements HumanMemory {
       const raw = await readFile(this.filePath, "utf8");
       const parsed = JSON.parse(raw) as unknown;
       const { root, rawProfiles, pendingActorForgetIds } = validatePersistedRoot(parsed);
-      if (root.version !== 2) migrationSource = { raw, version: root.version === 1 ? 1 : "legacy" };
-      const currentSchema = root.version === 1 || root.version === 2;
+      if (root.version !== 3) {
+        migrationSource = { raw, version: root.version === 1 || root.version === 2 ? root.version : "legacy" };
+      }
+      const currentSchema = root.version === 1 || root.version === 2 || root.version === 3;
       // Additive marker: a structurally valid legacy file predating the marker
       // is trusted because it is itself the durable companion being migrated.
       this.continuityVerified = root.continuityVerified === undefined
         ? true
         : root.continuityVerified === true;
-      shouldRewrite = root.version !== 2 ||
+      shouldRewrite = root.version !== 3 ||
         root.continuityVerified === undefined ||
         root.pendingActorForgetIds === undefined;
       for (const actorId of pendingActorForgetIds) this.pendingActorForgetIds.add(actorId);
@@ -718,7 +724,7 @@ export class HumanMemoryStore implements HumanMemory {
     }
     if (shouldRewrite) {
       if (migrationSource) {
-        await preservePreMigrationState(this.filePath, migrationSource.raw, migrationSource.version, 2);
+        await preservePreMigrationState(this.filePath, migrationSource.raw, migrationSource.version, 3);
       }
       await this.flush();
     }
@@ -1221,8 +1227,8 @@ export class HumanMemoryStore implements HumanMemory {
     const value = asRecord(raw);
     if (!value) return undefined;
     let credential: HumanMemoryCredential | undefined;
-    if (schemaVersion === 2) {
-      // v2 owns credentials in one explicit optional record. Accepting old
+    if (schemaVersion === 2 || schemaVersion === 3) {
+      // v2+ owns credentials in one explicit optional record. Accepting old
       // top-level fields here would silently reintroduce dual authentication.
       if (value.tokenHash !== undefined || value.recoveryKeyHash !== undefined) return undefined;
       if (value.credential !== undefined) {
@@ -1275,21 +1281,46 @@ export class HumanMemoryStore implements HumanMemory {
       .sort((left, right) => right.lastConfirmedAt - left.lastConfirmedAt)
       .slice(0, this.maxFactsPerProfile);
 
-    const channelScores: HumanChannelScore[] = [];
+    const channelScoresById = new Map<string, HumanChannelScore>();
+    const mergeChannelScore = (score: HumanChannelScore): void => {
+      if (RETIRED_PUBLIC_CHANNEL_IDS.has(score.channelId)) return;
+      const channelId = replacementPublicChannelId(score.channelId);
+      const candidate = { ...score, channelId };
+      const current = channelScoresById.get(channelId);
+      if (!current) {
+        channelScoresById.set(channelId, candidate);
+        return;
+      }
+      const activityTimes = [
+        current.lastActiveAt,
+        current.previousActiveAt,
+        candidate.lastActiveAt,
+        candidate.previousActiveAt,
+      ].filter((timestamp): timestamp is number => timestamp !== undefined)
+        .sort((left, right) => right - left);
+      const distinctActivityTimes = [...new Set(activityTimes)];
+      channelScoresById.set(channelId, {
+        channelId,
+        messageCount: boundedInteger(current.messageCount + candidate.messageCount),
+        lastActiveAt: distinctActivityTimes[0] ?? Math.max(current.lastActiveAt, candidate.lastActiveAt),
+        ...(distinctActivityTimes[1] !== undefined ? { previousActiveAt: distinctActivityTimes[1] } : {}),
+      });
+    };
     if (Array.isArray(value.channelScores)) {
       for (const rawScore of value.channelScores) {
         const scoreRecord = asRecord(rawScore);
         const channelId = boundedString(scoreRecord?.channelId, 80);
         const score = channelId ? safeChannelScore(channelId, rawScore, now) : undefined;
-        if (score) channelScores.push(score);
+        if (score) mergeChannelScore(score);
       }
     } else {
       const legacyScores = asRecord(value.channelScores);
       for (const [channelId, rawScore] of Object.entries(legacyScores ?? {})) {
         const score = safeChannelScore(channelId, rawScore, now);
-        if (score) channelScores.push(score);
+        if (score) mergeChannelScore(score);
       }
     }
+    const channelScores = [...channelScoresById.values()];
     channelScores.sort((left, right) => right.lastActiveAt - left.lastActiveAt);
 
     const relations = new Map<string, HumanPersonaRelation>();
@@ -1388,9 +1419,9 @@ export class HumanMemoryStore implements HumanMemory {
     };
   }
 
-  private serialize(): PersistedHumanMemoryV2 {
+  private serialize(): PersistedHumanMemoryV3 {
     return {
-      version: 2,
+      version: 3,
       continuityVerified: this.continuityVerified,
       pendingActorForgetIds: [...this.pendingActorForgetIds].sort(),
       profiles: [...this.profilesByHumanId.values()]

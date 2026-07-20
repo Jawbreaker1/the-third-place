@@ -13,6 +13,10 @@ import type {
 } from "../shared/adminTypes.js";
 import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
 import {
+  replacementPublicChannelId,
+  RETIRED_PUBLIC_CHANNEL_IDS,
+} from "../shared/channelLifecycle.js";
+import {
   CHANNEL_PROFILES,
   CHANNELS,
   type AmbientMode,
@@ -24,6 +28,7 @@ import { PERSONA_VOICE_PROFILES, setAdminPersonaVoiceMappings } from "./personaV
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 import { DEFAULT_RUNTIME_BEHAVIOR_TUNING } from "./behaviorTuning.js";
 import { participantIdentityKey } from "./participantIdentity.js";
+import { preservePreMigrationState } from "./persistenceMigrationBackup.js";
 
 const percent = z.number().int().min(0).max(100);
 const tuningSchema = z.object({
@@ -109,7 +114,7 @@ const banSchema: z.ZodType<AdminBanRecord> = z.object({
 }).strict();
 
 const persistedSchema = z.object({
-  version: z.literal(3),
+  version: z.literal(4),
   revision: z.number().int().min(0),
   behavior: z.object({
     global: tuningSchema,
@@ -136,6 +141,48 @@ const persistedSchema = z.object({
 });
 
 type PersistedAdminState = z.infer<typeof persistedSchema>;
+
+const migrateChannelKeyedRecord = (
+  raw: unknown,
+  mergeNumericValues = false,
+): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const source = raw as Record<string, unknown>;
+  const migrated: Record<string, unknown> = {};
+  // Canonical keys win ordinary configuration conflicts. Numeric affinity
+  // maps instead keep the strongest of the two precursor-room preferences.
+  for (const [channelId, value] of Object.entries(source)) {
+    if (RETIRED_PUBLIC_CHANNEL_IDS.has(channelId) || replacementPublicChannelId(channelId) !== channelId) continue;
+    migrated[channelId] = value;
+  }
+  for (const [channelId, value] of Object.entries(source)) {
+    if (RETIRED_PUBLIC_CHANNEL_IDS.has(channelId)) continue;
+    const replacement = replacementPublicChannelId(channelId);
+    if (replacement === channelId) continue;
+    const current = migrated[replacement];
+    if (current === undefined) migrated[replacement] = value;
+    else if (mergeNumericValues && typeof current === "number" && typeof value === "number") {
+      migrated[replacement] = Math.max(current, value);
+    }
+  }
+  return migrated;
+};
+
+const migratePersonaRoomAffinities = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const persona = raw as Record<string, unknown>;
+  return {
+    ...persona,
+    roomAffinities: migrateChannelKeyedRecord(persona.roomAffinities, true),
+  };
+};
+
+const keepCanonicalChannelConfigs = (raw: unknown): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  return Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([channelId]) =>
+    !RETIRED_PUBLIC_CHANNEL_IDS.has(channelId) && replacementPublicChannelId(channelId) === channelId
+  ));
+};
 
 const migratePersistedState = (raw: unknown): unknown => {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
@@ -191,30 +238,74 @@ const migratePersistedState = (raw: unknown): unknown => {
     },
   };
   }
-  if (record.version !== 2) return record;
+  if (record.version === 2) {
+    const personaOverrides = record.personaOverrides;
+    const customPersonas = record.customPersonas;
+    record = {
+      ...record,
+      version: 3,
+      // Version 2 could contain only built-in persona overrides in this map.
+      // Built-ins are authored fictional adults, so preserve that invariant.
+      personaOverrides: personaOverrides && typeof personaOverrides === "object" && !Array.isArray(personaOverrides)
+        ? Object.fromEntries(Object.entries(personaOverrides as Record<string, unknown>).map(([id, config]) => [
+            id,
+            config && typeof config === "object" && !Array.isArray(config)
+              ? { ...(config as Record<string, unknown>), fictionalAdult: true }
+              : config,
+          ]))
+        : personaOverrides,
+      // Legacy custom residents had no trusted adult assertion and therefore
+      // fail closed until an administrator explicitly opts each one in.
+      customPersonas: Array.isArray(customPersonas)
+        ? customPersonas.map((config) => config && typeof config === "object" && !Array.isArray(config)
+            ? { ...(config as Record<string, unknown>), fictionalAdult: false }
+            : config)
+        : customPersonas,
+    };
+  }
+  if (record.version !== 3) return record;
 
-  const personaOverrides = record.personaOverrides;
-  const customPersonas = record.customPersonas;
+  const behavior = record.behavior && typeof record.behavior === "object" && !Array.isArray(record.behavior)
+    ? record.behavior as Record<string, unknown>
+    : undefined;
+  const personaOverrides = record.personaOverrides && typeof record.personaOverrides === "object" &&
+      !Array.isArray(record.personaOverrides)
+    ? Object.fromEntries(Object.entries(record.personaOverrides as Record<string, unknown>)
+        .map(([id, persona]) => [id, migratePersonaRoomAffinities(persona)]))
+    : record.personaOverrides;
+  const customPersonas = Array.isArray(record.customPersonas)
+    ? record.customPersonas.map(migratePersonaRoomAffinities)
+    : record.customPersonas;
+  // A full channel override carries its ID and an entire topic/personality
+  // definition. It cannot be safely overlaid onto a successor with different
+  // semantics, so old-room overrides are retired instead of being relabelled.
+  const channelOverrides = keepCanonicalChannelConfigs(record.channelOverrides);
+  const customChannels = Array.isArray(record.customChannels)
+    ? record.customChannels.filter((channel) => {
+        const id = channel && typeof channel === "object" && !Array.isArray(channel)
+          ? (channel as Record<string, unknown>).id
+          : undefined;
+        return typeof id !== "string" ||
+          (!RETIRED_PUBLIC_CHANNEL_IDS.has(id) && replacementPublicChannelId(id) === id);
+      })
+    : record.customChannels;
+  const disabledChannelIds = Array.isArray(record.disabledChannelIds)
+    ? record.disabledChannelIds.filter((id) => typeof id !== "string" ||
+        (!RETIRED_PUBLIC_CHANNEL_IDS.has(id) && replacementPublicChannelId(id) === id))
+    : record.disabledChannelIds;
+
   return {
     ...record,
-    version: 3,
-    // Version 2 could contain only built-in persona overrides in this map.
-    // Built-ins are authored fictional adults, so preserve that invariant.
-    personaOverrides: personaOverrides && typeof personaOverrides === "object" && !Array.isArray(personaOverrides)
-      ? Object.fromEntries(Object.entries(personaOverrides as Record<string, unknown>).map(([id, config]) => [
-          id,
-          config && typeof config === "object" && !Array.isArray(config)
-            ? { ...(config as Record<string, unknown>), fictionalAdult: true }
-            : config,
-        ]))
-      : personaOverrides,
-    // Legacy custom residents had no trusted adult assertion and therefore
-    // fail closed until an administrator explicitly opts each one in.
-    customPersonas: Array.isArray(customPersonas)
-      ? customPersonas.map((config) => config && typeof config === "object" && !Array.isArray(config)
-          ? { ...(config as Record<string, unknown>), fictionalAdult: false }
-          : config)
-      : customPersonas,
+    version: 4,
+    behavior: behavior ? {
+      ...behavior,
+      channels: migrateChannelKeyedRecord(behavior.channels),
+    } : record.behavior,
+    personaOverrides,
+    customPersonas,
+    channelOverrides,
+    customChannels,
+    disabledChannelIds,
   };
 };
 
@@ -229,7 +320,7 @@ const BUILTIN_PERSONA_IDS = new Set(BUILTIN_PERSONAS.map((persona) => persona.id
 const BUILTIN_CHANNEL_IDS = new Set(BUILTIN_CHANNEL_PROFILES.map((profile) => profile.public.id));
 
 const emptyState = (): PersistedAdminState => ({
-  version: 3,
+  version: 4,
   revision: 0,
   behavior: { global: { ...DEFAULT_TUNING }, channels: {} },
   personaOverrides: {},
@@ -492,8 +583,18 @@ export class AdminStateStore {
 
   async load(): Promise<void> {
     let loaded = emptyState();
+    let migrationSource: { raw: string; version: string | number } | undefined;
     try {
-      loaded = persistedSchema.parse(migratePersistedState(JSON.parse(await readFile(this.path, "utf8"))));
+      const raw = await readFile(this.path, "utf8");
+      const parsed = JSON.parse(raw) as unknown;
+      const version = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>).version
+        : undefined;
+      loaded = persistedSchema.parse(migratePersistedState(parsed));
+      if (version !== 4) migrationSource = {
+        raw,
+        version: typeof version === "string" || typeof version === "number" ? version : "legacy",
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -502,6 +603,10 @@ export class AdminStateStore {
     this.validateCatalog(materialized);
     this.applyRuntime(materialized);
     this.state = loaded;
+    if (migrationSource) {
+      await preservePreMigrationState(this.path, migrationSource.raw, migrationSource.version, 4);
+      await this.persist(loaded);
+    }
   }
 
   snapshot(humans: AdminHumanMember[] = []): AdminStateSnapshot {

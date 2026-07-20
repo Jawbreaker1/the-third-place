@@ -66,7 +66,6 @@ describe("actor channel runtime", () => {
   it("keeps specialist-room rosters selective without leaving a room empty", () => {
     const runtime = new ActorChannelRuntime();
     const specialistChannels = [
-      "ai-lab",
       "ai-programming",
       "ai-hacking",
       "stock-market",
@@ -107,7 +106,7 @@ describe("actor channel runtime", () => {
   it("keeps KimchiKungen in social rooms while direct mentions still reach specialist rooms", () => {
     const runtime = new ActorChannelRuntime();
 
-    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "the-pub", "side-quests"]);
+    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "the-pub"]);
     expect(runtime.candidatesFor("ai-programming").map((persona) => persona.id)).not.toContain("ai-kim");
     expect(runtime.candidatesFor("ai-programming", ["ai-kim"]).map((persona) => persona.id)).toContain("ai-kim");
   });
@@ -116,21 +115,21 @@ describe("actor channel runtime", () => {
     const runtime = new ActorChannelRuntime();
     runtime.restore([createMessage("world-of-warcraft", "ai-kim", "an old out-of-roster post")]);
 
-    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "the-pub", "side-quests"]);
-    expect(runtime.snapshot("ai-kim")?.focusChannelId).toBe("side-quests");
+    expect(runtime.snapshot("ai-kim")?.subscribedChannels).toEqual(["lobby", "the-pub"]);
+    expect(runtime.snapshot("ai-kim")?.focusChannelId).toBe("lobby");
     expect(runtime.snapshot("ai-kim")?.lastSpokeAtByChannel["world-of-warcraft"]).toBeDefined();
   });
 
   it("moves live focus when an admin affinity edit removes the focused subscription", () => {
     const pixel = structuredClone(PERSONAS.find((persona) => persona.id === "ai-pixel")!);
-    pixel.channelAffinity = { ...(pixel.channelAffinity ?? {}), lobby: 0.9, "side-quests": 0.8, fnaf: 0.1 };
+    pixel.channelAffinity = { ...(pixel.channelAffinity ?? {}), lobby: 0.9, fnaf: 0.8 };
     const runtime = new ActorChannelRuntime([pixel]);
-    runtime.markSpoke(pixel.id, "side-quests");
-    expect(runtime.snapshot(pixel.id)?.focusChannelId).toBe("side-quests");
+    runtime.markSpoke(pixel.id, "fnaf");
+    expect(runtime.snapshot(pixel.id)?.focusChannelId).toBe("fnaf");
 
-    pixel.channelAffinity["side-quests"] = 0.1;
+    pixel.channelAffinity.fnaf = 0.1;
     runtime.reconcileCatalog();
-    expect(runtime.snapshot(pixel.id)?.subscribedChannels).not.toContain("side-quests");
+    expect(runtime.snapshot(pixel.id)?.subscribedChannels).not.toContain("fnaf");
     expect(runtime.snapshot(pixel.id)?.focusChannelId).toBe("lobby");
   });
 
@@ -245,14 +244,14 @@ describe("actor channel runtime", () => {
 
   it("restores an actor's last channel focus from persisted history", () => {
     const runtime = new ActorChannelRuntime();
-    runtime.restore([createMessage("side-quests", "ai-pixel", "tiny art quest")]);
-    expect(runtime.snapshot("ai-pixel")?.focusChannelId).toBe("side-quests");
+    runtime.restore([createMessage("fnaf", "ai-pixel", "tiny animatronic sketch")]);
+    expect(runtime.snapshot("ai-pixel")?.focusChannelId).toBe("fnaf");
     expect(runtime.promptNotes([], "lobby")).toEqual({});
   });
 
   it("restores quiet-channel state even after another channel has over 300 newer messages", () => {
     const runtime = new ActorChannelRuntime();
-    const quietMessage = createMessage("ai-lab", "ai-pixel", "remember this lab visit");
+    const quietMessage = createMessage("ai-programming", "ai-pixel", "remember this lab visit");
     quietMessage.createdAt = new Date(Date.UTC(2026, 0, 1)).toISOString();
     const busyMessages = Array.from({ length: 320 }, (_, index) => {
       const message = createMessage("lobby", "ai-mira", `busy lobby ${index}`);
@@ -262,6 +261,6 @@ describe("actor channel runtime", () => {
 
     runtime.restore([quietMessage, ...busyMessages]);
 
-    expect(runtime.snapshot("ai-pixel")?.lastSpokeAtByChannel["ai-lab"]).toBeDefined();
+    expect(runtime.snapshot("ai-pixel")?.lastSpokeAtByChannel["ai-programming"]).toBeDefined();
   });
 });

@@ -38,6 +38,7 @@ import type {
 import { findExactMentionRanges, findUrlTextCandidates } from "../shared/unicodeBoundaries";
 import { normalizeDisplayName, validDisplayName } from "../shared/displayName";
 import { unicodeCaselessKey } from "../shared/unicodeSafety";
+import { resolveSnapshotConversationId } from "./channelNavigation";
 import { VoicePeerMesh } from "./voicePeer";
 import { VoiceActivityDetector, type VoiceActivityEvent } from "./voiceActivity";
 import {
@@ -990,6 +991,37 @@ export default function App() {
   }, []);
 
   const applySnapshot = useCallback((snapshot: RoomSnapshot) => {
+    const previousActiveId = activeChannelRef.current;
+    const nextActiveId = resolveSnapshotConversationId(
+      previousActiveId,
+      snapshot.channels.map((channel) => channel.id),
+      snapshot.dmThreads.map((thread) => thread.id),
+    );
+    if (nextActiveId && nextActiveId !== previousActiveId) {
+      activeChannelRef.current = nextActiveId;
+      setActiveChannelId(nextActiveId);
+      setReplyTo(null);
+      setComposer("");
+      setUnreadDividers((current) => {
+        if (!(previousActiveId in current)) return current;
+        const next = { ...current };
+        delete next[previousActiveId];
+        return next;
+      });
+      setChannelNotices((current) => {
+        const next = { ...current };
+        delete next[previousActiveId];
+        return clearChannelNotice(next, nextActiveId);
+      });
+      setImageDrafts((current) => {
+        const draft = current[previousActiveId];
+        if (!draft) return current;
+        revokeDraftPreview(draft);
+        const next = { ...current };
+        delete next[previousActiveId];
+        return next;
+      });
+    }
     typingExpiryRef.current?.clear();
     setTyping({});
     shouldStickToBottom.current = true;
@@ -1008,7 +1040,7 @@ export default function App() {
     setHealth(snapshot.health);
     setDirectorEvents(snapshot.directorEvents);
     setConnection("live");
-  }, []);
+  }, [revokeDraftPreview]);
 
   const connectSocket = useCallback(() => {
     presenceActivityCleanupRef.current?.();
@@ -1225,21 +1257,36 @@ export default function App() {
         : null);
 
       if (activePublicRoomWasRemoved || activeDmResidentWasRemoved) {
-        const fallbackId = payload.channels.find((channel) => channel.id === "lobby")?.id
-          ?? payload.channels[0]?.id;
+        const fallbackId = resolveSnapshotConversationId(
+          activeId,
+          payload.channels.map((channel) => channel.id),
+          survivingThreads.map((thread) => thread.id),
+        );
         if (fallbackId) {
           shouldStickToBottom.current = true;
           activeChannelRef.current = fallbackId;
           setActiveChannelId(fallbackId);
           setReplyTo(null);
+          setComposer("");
           setMobilePanel(null);
           setChannelNotices((current) => clearChannelNotice(current, fallbackId));
+          setImageDrafts((current) => {
+            const draft = current[activeId];
+            if (!draft) return current;
+            revokeDraftPreview(draft);
+            const next = { ...current };
+            delete next[activeId];
+            return next;
+          });
+          const fallbackChannel = payload.channels.find((channel) => channel.id === fallbackId);
           pushToast({
             tone: "info",
             title: activeDmResidentWasRemoved ? "Conversation closed" : "Room changed",
             message: activeDmResidentWasRemoved
               ? "That AI resident was removed by an administrator. Existing history remains on the server."
-              : "That room was removed by an administrator. You were moved to the lobby.",
+              : fallbackChannel
+                ? `That room changed. You were moved to #${fallbackChannel.name}.`
+                : "That room changed. You were moved to another conversation.",
           });
         }
       }

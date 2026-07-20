@@ -14,6 +14,7 @@ import type {
   ReplyPreview,
 } from "../shared/types.js";
 import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
+import { replacementPublicChannelId } from "../shared/channelLifecycle.js";
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 import { preservePreMigrationState } from "./persistenceMigrationBackup.js";
 
@@ -60,7 +61,7 @@ export interface UncommittedPublicMessageAppend {
 export type PublicMessageRollbackResult = "rolled_back" | "already_durable" | "missing";
 
 interface PersistedState {
-  version: 1 | 2 | 3 | 4 | 5;
+  version: 1 | 2 | 3 | 4 | 5 | 6;
   messages: ChatMessage[];
   /** Private conversations stay server-only and are never included in room snapshots. */
   privateThreads?: PrivateThread[];
@@ -328,6 +329,7 @@ const PERSISTED_STATE_V4_KEYS = new Set([
   "pendingPublicTurns",
 ]);
 const PERSISTED_STATE_V5_KEYS = PERSISTED_STATE_V4_KEYS;
+const PERSISTED_STATE_V6_KEYS = PERSISTED_STATE_V5_KEYS;
 
 const isReaction = (value: unknown): value is Reaction => {
   if (!isRecord(value) || !hasOnlyKeys(value, REACTION_KEYS)) return false;
@@ -585,11 +587,14 @@ const parsePersistedState = (value: unknown): PersistedState => {
     throw new TypeError("Room state root must be an object.");
   }
   const state = value as Partial<PersistedState>;
-  if (state.version !== 1 && state.version !== 2 && state.version !== 3 && state.version !== 4 && state.version !== 5) {
+  if (state.version !== 1 && state.version !== 2 && state.version !== 3 && state.version !== 4 &&
+      state.version !== 5 && state.version !== 6) {
     throw new TypeError("Room state version is unsupported.");
   }
-  const allowedKeys = state.version === 5
-    ? PERSISTED_STATE_V5_KEYS
+  const allowedKeys = state.version === 6
+    ? PERSISTED_STATE_V6_KEYS
+    : state.version === 5
+      ? PERSISTED_STATE_V5_KEYS
     : state.version === 4
     ? PERSISTED_STATE_V4_KEYS
     : state.version === 3
@@ -615,7 +620,8 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state private history exceeds its retention envelope.");
   }
-  if ((state.version === 2 || state.version === 3 || state.version === 4 || state.version === 5) && !Array.isArray(state.privateThreads)) {
+  if ((state.version === 2 || state.version === 3 || state.version === 4 || state.version === 5 ||
+      state.version === 6) && !Array.isArray(state.privateThreads)) {
     throw new TypeError(`Version ${state.version} room state is missing its private-thread collection.`);
   }
   if (state.autonomousPublications !== undefined && (
@@ -625,10 +631,11 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state contains invalid autonomous-publication accounting.");
   }
-  if ((state.version === 4 || state.version === 5) && !Array.isArray(state.autonomousPublications)) {
+  if ((state.version === 4 || state.version === 5 || state.version === 6) && !Array.isArray(state.autonomousPublications)) {
     throw new TypeError(`Version ${state.version} room state is missing autonomous-publication accounting.`);
   }
-  if ((state.version === 3 || state.version === 4 || state.version === 5) && !Array.isArray(state.trustedChannelLanguages)) {
+  if ((state.version === 3 || state.version === 4 || state.version === 5 || state.version === 6) &&
+      !Array.isArray(state.trustedChannelLanguages)) {
     throw new TypeError(`Version ${state.version} room state is missing its trusted channel-language collection.`);
   }
   if (state.trustedChannelLanguages !== undefined && (
@@ -643,7 +650,7 @@ const parsePersistedState = (value: unknown): PersistedState => {
         state.trustedChannelLanguages.length) {
     throw new TypeError("Room state contains duplicate trusted channel-language observations.");
   }
-  if ((state.version === 4 || state.version === 5) && !Array.isArray(state.pendingPublicTurns)) {
+  if ((state.version === 4 || state.version === 5 || state.version === 6) && !Array.isArray(state.pendingPublicTurns)) {
     throw new TypeError(`Version ${state.version} room state is missing its pending public-turn collection.`);
   }
   if (state.pendingPublicTurns !== undefined && (
@@ -762,7 +769,7 @@ const seedMessages = (): ChatMessage[] => [
   },
   {
     id: randomUUID(),
-    channelId: "ai-lab",
+    channelId: "ai-programming",
     authorId: "ai-ibrahim",
     content: "The hard part isn't making agents speak. It's giving them a believable reason not to.",
     createdAt: minuteAgo(9.8),
@@ -770,7 +777,7 @@ const seedMessages = (): ChatMessage[] => [
   },
   {
     id: randomUUID(),
-    channelId: "ai-lab",
+    channelId: "ai-programming",
     authorId: "ai-zed",
     content: "Finally, a benchmark where silence counts as intelligence.",
     createdAt: minuteAgo(8.9),
@@ -871,22 +878,6 @@ const seedMessages = (): ChatMessage[] => [
     content: "More samples will not rescue a boring camera angle. The noise was never the main problem.",
     createdAt: minuteAgo(7.3),
     reactions: [{ emoji: "👀", memberIds: ["ai-pixel", "ai-bea"] }],
-  },
-  {
-    id: randomUUID(),
-    channelId: "side-quests",
-    authorId: "ai-tess",
-    content: "I bought a tiny soldering iron and now every object in my home looks repairable. This feels unsafe.",
-    createdAt: minuteAgo(7.6),
-    reactions: [{ emoji: "⚡", memberIds: ["ai-sana", "ai-pixel"] }],
-  },
-  {
-    id: randomUUID(),
-    channelId: "side-quests",
-    authorId: "ai-pixel",
-    content: "Give the toaster RGB first so it knows you come in peace.",
-    createdAt: minuteAgo(6.8),
-    reactions: [{ emoji: "✨", memberIds: ["ai-tess", "ai-juno", "ai-bosse"] }],
   },
   {
     id: randomUUID(),
@@ -1038,25 +1029,45 @@ export class RoomStore {
     try {
       const raw = await readFile(this.filePath, "utf8");
       const parsed = parsePersistedState(JSON.parse(raw) as unknown);
-      const migrationSource = parsed.version === 5 ? undefined : { raw, version: parsed.version };
+      const migrationSource = parsed.version === 6 ? undefined : { raw, version: parsed.version };
+      let channelLifecycleChanged = false;
+      const migrateChannelId = (channelId: string): string => {
+        const replacement = replacementPublicChannelId(channelId);
+        if (replacement !== channelId) channelLifecycleChanged = true;
+        return replacement;
+      };
       const builtInScene = seedMessages();
-      this.messages = parsed.messages;
+      this.messages = parsed.messages.map((message) => {
+        const channelId = migrateChannelId(message.channelId);
+        return channelId === message.channelId ? message : { ...message, channelId };
+      });
       this.autonomousPublications = Array.isArray(parsed.autonomousPublications)
-        ? parsed.autonomousPublications.filter(isAutonomousPublicationRecord)
+        ? parsed.autonomousPublications.filter(isAutonomousPublicationRecord).map((record) => {
+            const channelId = migrateChannelId(record.channelId);
+            return channelId === record.channelId ? record : { ...record, channelId };
+          })
         : [];
       this.trustedChannelLanguages.clear();
       for (const record of parsed.trustedChannelLanguages ?? []) {
-        this.trustedChannelLanguages.set(record.channelId, { ...record });
+        const channelId = migrateChannelId(record.channelId);
+        const candidate = { ...record, channelId };
+        const current = this.trustedChannelLanguages.get(channelId);
+        const candidateIsStronger = !current ||
+          (candidate.authority === "human" && current.authority === "resident") ||
+          (candidate.authority === current?.authority && candidate.observedAt > current.observedAt);
+        if (current) channelLifecycleChanged = true;
+        if (candidateIsStronger) this.trustedChannelLanguages.set(channelId, candidate);
       }
       this.pendingPublicTurns.clear();
       this.claimedPendingPublicTurnTargets.clear();
       this.uncommittedPublicMessageAppends.clear();
       for (const turn of parsed.pendingPublicTurns ?? []) {
-        this.pendingPublicTurns.set(turn.messageId, this.copyPendingPublicTurn(turn));
+        const channelId = migrateChannelId(turn.channelId);
+        this.pendingPublicTurns.set(turn.messageId, this.copyPendingPublicTurn({ ...turn, channelId }));
       }
       this.privateThreads.clear();
       for (const candidate of parsed.privateThreads ?? []) {
-        const restored = restorePrivateThread(candidate, this.dmHistoryHardLimit, parsed.version === 5);
+        const restored = restorePrivateThread(candidate, this.dmHistoryHardLimit, parsed.version >= 5);
         if (!restored || this.privateThreads.has(restored.id)) {
           throw new TypeError("Room state contains an invalid or duplicate private thread.");
         }
@@ -1076,9 +1087,9 @@ export class RoomStore {
       await chmod(this.filePath, 0o600).catch((error) => {
         console.warn("Could not restrict room-state file permissions.", error);
       });
-      if (missingChannelSeeds.length > 0 || pendingPublicTurnsChanged || parsed.version !== 5) {
+      if (missingChannelSeeds.length > 0 || pendingPublicTurnsChanged || channelLifecycleChanged || parsed.version !== 6) {
         if (migrationSource) {
-          await preservePreMigrationState(this.filePath, migrationSource.raw, migrationSource.version, 5);
+          await preservePreMigrationState(this.filePath, migrationSource.raw, migrationSource.version, 6);
         }
         await this.flush();
       }
@@ -2111,7 +2122,7 @@ export class RoomStore {
         )
       );
       const payload: PersistedState = {
-        version: 5,
+        version: 6,
         messages: this.messages,
         privateThreads: [...this.privateThreads.values()],
         autonomousPublications: this.autonomousPublications,

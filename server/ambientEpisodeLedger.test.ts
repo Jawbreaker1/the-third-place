@@ -27,6 +27,58 @@ const episodeInput = (
 });
 
 describe("AmbientEpisodeLedger", () => {
+  it("merges renamed room continuity and retires derived episode state for removed rooms", async () => {
+    let now = NOW;
+    const persistence = new MemoryAmbientEpisodePersistence();
+    const options = { persistence, now: () => now, persistDelayMs: 60_000 };
+    const legacy = new AmbientEpisodeLedger(options);
+    legacy.openEpisode(episodeInput("programming-current", {
+      channelId: "ai-programming",
+      semanticFamily: "software-testing",
+      semanticKey: "programming:test-contract",
+      sourceKind: "room_seed",
+    }));
+    now += 1_000;
+    legacy.openEpisode(episodeInput("lab-current", {
+      channelId: "ai-lab",
+      semanticFamily: "agent-evaluation",
+      semanticKey: "lab:recovery-benchmark",
+      sourceKind: "room_seed",
+    }));
+    now += 1_000;
+    legacy.openEpisode(episodeInput("retired-current", {
+      channelId: "side-quests",
+      semanticFamily: "small-project",
+      semanticKey: "side:repair",
+      sourceKind: "room_seed",
+    }));
+    await legacy.flush();
+
+    const migrated = new AmbientEpisodeLedger(options);
+    await migrated.load();
+    expect(migrated.current("ai-programming")).toMatchObject({
+      id: "lab-current",
+      channelId: "ai-programming",
+    });
+    expect(migrated.recent("ai-programming")).toEqual([
+      expect.objectContaining({
+        id: "programming-current",
+        channelId: "ai-programming",
+        status: "closed",
+        closeReason: "room_merged",
+      }),
+    ]);
+    expect(migrated.current("ai-lab")).toBeUndefined();
+    expect(migrated.recent("ai-lab")).toEqual([]);
+    expect(migrated.current("side-quests")).toBeUndefined();
+    expect(migrated.semanticLastUsedAt("ai-programming", { semanticKey: "lab:recovery-benchmark" }))
+      .toBe(NOW + 1_000);
+
+    await migrated.flush();
+    const persisted = await persistence.load() as AmbientEpisodePersistedState;
+    expect(persisted.channels.map((channel) => channel.channelId)).toEqual(["ai-programming"]);
+  });
+
   it("stores compact language-agnostic episode metadata and applies idempotent updates", () => {
     let now = NOW;
     const ledger = new AmbientEpisodeLedger({

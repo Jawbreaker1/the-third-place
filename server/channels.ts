@@ -363,7 +363,7 @@ export const defineAmbientPremiseCatalog = (
   ambientPremises: entries.map(([, premise]) => premise),
 });
 
-export const CHANNEL_PROFILES: ChannelProfile[] = [
+const AUTHORED_CHANNEL_PROFILES: ChannelProfile[] = [
   {
     public: {
       id: "lobby",
@@ -1760,6 +1760,66 @@ export const CHANNEL_PROFILES: ChannelProfile[] = [
     ],
   },
 ];
+
+const authoredProfile = (channelId: string): ChannelProfile => {
+  const profile = AUTHORED_CHANNEL_PROFILES.find((candidate) => candidate.public.id === channelId);
+  if (!profile) throw new Error(`Missing authored channel profile: ${channelId}`);
+  return profile;
+};
+
+/**
+ * ai-programming is the surviving identity for the former ai-lab/programming
+ * split. Keep all practical engineering material, add a deliberately varied
+ * subset of the model/evaluation catalogue (40 total Admin-editable premises),
+ * and retain both research catalogues. The old authored profiles remain below
+ * as reversible migration source, but are never exposed as active rooms.
+ */
+const mergedAiProgrammingProfile = (): ChannelProfile => {
+  const programming = authoredProfile("ai-programming");
+  const lab = authoredProfile("ai-lab");
+  const labPremiseIndexes = [1, 2, 5, 6, 12, 17, 18, 28] as const;
+  const labPremises = labPremiseIndexes.map((index) => lab.ambientPremises[index]!);
+  const labFamilies = labPremiseIndexes.map((index) => lab.ambientPremiseFamilies?.[index] ?? `ai-lab-${index}`);
+  const uniqueResearchSeeds = new Map(
+    [...(programming.autonomousResearchSeeds ?? []), ...(lab.autonomousResearchSeeds ?? [])]
+      .map((seed) => [seed.id, seed] as const),
+  );
+  return {
+    ...programming,
+    public: {
+      ...programming.public,
+      description: "Models, prompts and the practical work of building AI software.",
+    },
+    topic: {
+      brief: "AI models, prompting, local inference, agents and evaluations, plus practical software development: architecture, code, APIs, tools, testing and deployment",
+      tags: [...new Set([...lab.topic.tags, ...programming.topic.tags])],
+      freshnessRule: "Current model releases and benchmark results need supplied fresh research. Current SDK APIs, library versions and product capabilities do too; never invent a current signature, version or measured result.",
+    },
+    expertiseOverrides: {
+      ...lab.expertiseOverrides,
+      ...programming.expertiseOverrides,
+      "ai-ibrahim": {
+        level: "specialist",
+        specialties: ["agent systems", "second-order effects", "agent architecture", "feedback loops"],
+      },
+      "ai-zed": {
+        level: "advanced",
+        specialties: ["benchmarks", "claim evaluation", "testing", "failure analysis"],
+      },
+      "ai-aya": {
+        level: "advanced",
+        specialties: ["privacy", "security", "local inference", "local-first architecture"],
+      },
+    },
+    ambientPremises: [...programming.ambientPremises, ...labPremises],
+    ambientPremiseFamilies: [...(programming.ambientPremiseFamilies ?? []), ...labFamilies],
+    autonomousResearchSeeds: [...uniqueResearchSeeds.values()],
+  };
+};
+
+export const CHANNEL_PROFILES: ChannelProfile[] = AUTHORED_CHANNEL_PROFILES
+  .filter((profile) => profile.public.id !== "ai-lab" && profile.public.id !== "side-quests")
+  .map((profile) => profile.public.id === "ai-programming" ? mergedAiProgrammingProfile() : profile);
 
 export const CHANNELS: Channel[] = CHANNEL_PROFILES.map((profile) => ({ ...profile.public }));
 

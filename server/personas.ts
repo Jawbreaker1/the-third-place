@@ -226,7 +226,7 @@ export const PERSONAS: Persona[] = [
     cooldownMs: 90_000,
     latency: [1_500, 4_000],
     connections: "Protective of quieter residents; gives Bosse.exe room to joke until a clear boundary is crossed.",
-    channelAffinity: { lobby: 0.86, "ai-lab": 0.82, "side-quests": 0.82 },
+    channelAffinity: { lobby: 0.86, "ai-programming": 0.82 },
     disagreement: 0.2,
   },
   {
@@ -261,9 +261,7 @@ export const PERSONAS: Persona[] = [
     connections: "Trades loud cultural takes with Tess and enjoys Nox's deadpan resistance.",
     channelAffinity: {
       lobby: 0.74,
-      "side-quests": 0.88,
-      "ai-lab": 0.18,
-      "ai-programming": 0.16,
+      "ai-programming": 0.18,
       "stock-market": 0.18,
       "world-of-warcraft": 0.26,
       "3d-visualisation": 0.22,
@@ -564,7 +562,7 @@ export const PERSONAS: Persona[] = [
     latency: [1_800, 5_400],
     disagreement: 0.72,
     connections: "Respects Sana's ability to ship; regularly trims Mira's wildest scope; debates Vale about whether critique is actionable.",
-    channelAffinity: { lobby: 0.65, "ai-lab": 0.88, "side-quests": 0.38 },
+    channelAffinity: { lobby: 0.65, "ai-programming": 0.88 },
   },
   {
     id: "ai-elio",
@@ -597,7 +595,7 @@ export const PERSONAS: Persona[] = [
     latency: [2_200, 6_200],
     disagreement: 0.67,
     connections: "Often counters Zed's reflexive skepticism; gets along with Sana and moss.",
-    channelAffinity: { lobby: 0.78, "ai-lab": 0.58, "side-quests": 0.62 },
+    channelAffinity: { lobby: 0.78, "ai-programming": 0.58 },
   },
   {
     id: "ai-farah",
@@ -632,7 +630,7 @@ export const PERSONAS: Persona[] = [
     disagreement: 0.78,
     canResearch: true,
     connections: "Enjoys Ibrahim's systems view; appreciates Linnea's receipts but dislikes rule worship.",
-    channelAffinity: { lobby: 0.66, "ai-lab": 0.62, "side-quests": 0.32 },
+    channelAffinity: { lobby: 0.66, "ai-programming": 0.62 },
   },
   {
     id: "ai-aya",
@@ -666,7 +664,7 @@ export const PERSONAS: Persona[] = [
     disagreement: 0.86,
     canResearch: true,
     connections: "Trades security notes with Nox; pushes back on Pixel's most data-hungry interface ideas.",
-    channelAffinity: { lobby: 0.42, "ai-lab": 0.94, "ai-hacking": 0.98, "side-quests": 0.3 },
+    channelAffinity: { lobby: 0.42, "ai-programming": 0.94, "ai-hacking": 0.98 },
   },
   {
     id: "ai-robin",
@@ -699,7 +697,7 @@ export const PERSONAS: Persona[] = [
     latency: [4_000, 9_000],
     disagreement: 0.97,
     connections: "Respects Vale's questions but intervenes when Vale becomes predictably negative; occasionally backs Elio.",
-    channelAffinity: { lobby: 0.54, "ai-lab": 0.58, "side-quests": 0.46 },
+    channelAffinity: { lobby: 0.54, "ai-programming": 0.58 },
   },
 ];
 

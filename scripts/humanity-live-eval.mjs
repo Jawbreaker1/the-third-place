@@ -243,8 +243,8 @@ if (!health.connected) {
   }
   const kimFood = await lm.generateScene({
     kind: "public",
-    channelId: "side-quests",
-    channelName: "side-quests",
+    channelId: "the-pub",
+    channelName: "the-pub",
     selected: [kim],
     history: [],
     trigger: {
@@ -255,8 +255,8 @@ if (!health.connected) {
     mustReplyIds: [kim.id],
     languageHint: "Swedish",
     premise: "Detta är en direkt matfråga, så Kims genuina intresse får märkas. Ge ett specifikt men kort svar.",
-    actorChannelNotes: actorChannels.promptNotes([kim], "side-quests"),
-    actorExpertiseNotes: actorChannels.expertiseNotes([kim], "side-quests"),
+    actorChannelNotes: actorChannels.promptNotes([kim], "the-pub"),
+    actorExpertiseNotes: actorChannels.expertiseNotes([kim], "the-pub"),
   });
 
   const ambientSelected = [byId("ai-pixel"), byId("ai-tess")];

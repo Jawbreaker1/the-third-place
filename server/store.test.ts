@@ -26,6 +26,93 @@ describe("room history", () => {
     for (const channel of CHANNELS) {
       expect(store.getRecent(channel.id, 10).length).toBeGreaterThanOrEqual(2);
     }
+    expect(new Set(store.getAllMessages().map((message) => message.channelId))).toEqual(
+      new Set(CHANNELS.map((channel) => channel.id)),
+    );
+  });
+
+  it("migrates ai-lab into ai-programming while keeping retired side-quests history archived", async () => {
+    const now = Date.parse("2026-07-20T10:00:00.000Z");
+    const filePath = tempStorePath();
+    const programming = createMessage("ai-programming", "ai-sana", "surviving code history", {
+      createdAt: "2026-07-20T09:54:00.000Z",
+      generation: "lm",
+    });
+    const lab = createMessage("ai-lab", "human-johan", "merged model history", {
+      createdAt: "2026-07-20T09:56:00.000Z",
+    });
+    const sideQuest = createMessage("side-quests", "ai-pixel", "archived hobby history", {
+      createdAt: "2026-07-20T09:58:00.000Z",
+      generation: "lm",
+    });
+    const originalBytes = JSON.stringify({
+      version: 5,
+      messages: [programming, lab, sideQuest],
+      privateThreads: [],
+      autonomousPublications: [{
+        messageId: lab.id,
+        channelId: "ai-lab",
+        createdAt: lab.createdAt,
+        kind: "research",
+        attendance: "attended",
+      }],
+      trustedChannelLanguages: [
+        {
+          channelId: "ai-lab",
+          languageTag: "sv",
+          observedAt: "2026-07-20T09:55:00.000Z",
+          authority: "human",
+        },
+        {
+          channelId: "ai-programming",
+          languageTag: "en",
+          observedAt: "2026-07-20T09:57:00.000Z",
+          authority: "resident",
+        },
+      ],
+      pendingPublicTurns: [{
+        messageId: lab.id,
+        channelId: "ai-lab",
+        authorId: lab.authorId,
+        deliveryKind: "direct",
+        createdAt: lab.createdAt,
+        expiresAt: "2026-07-20T10:20:00.000Z",
+        targets: [{ personaId: "ai-mira", attempts: 0 }],
+      }],
+    });
+    await writeFile(filePath, originalBytes, "utf8");
+
+    const migrated = new RoomStore(filePath, { now: () => now });
+    await migrated.load();
+    expect(migrated.getHistoryPage("ai-programming", undefined, 20).messages.map((message) => message.id))
+      .toEqual([programming.id, lab.id]);
+    expect(migrated.getRecent("ai-lab", 20)).toEqual([]);
+    expect(migrated.getRecent("side-quests", 20).map((message) => message.id)).toEqual([sideQuest.id]);
+    expect(migrated.getAutonomousPublicationHistory()).toEqual([
+      expect.objectContaining({ messageId: lab.id, channelId: "ai-programming" }),
+    ]);
+    expect(migrated.getTrustedChannelLanguages()).toEqual([{
+      channelId: "ai-programming",
+      languageTag: "sv",
+      observedAt: "2026-07-20T09:55:00.000Z",
+      authority: "human",
+    }]);
+    expect(migrated.getPendingPublicTurns()).toEqual([
+      expect.objectContaining({ messageId: lab.id, channelId: "ai-programming" }),
+    ]);
+
+    const firstMigratedBytes = await readFile(filePath, "utf8");
+    expect(JSON.parse(firstMigratedBytes)).toMatchObject({ version: 6 });
+    expect(firstMigratedBytes).not.toContain('"channelId": "ai-lab"');
+    const backupName = (await readdir(dirname(filePath))).find((name) =>
+      name.startsWith(`${basename(filePath)}.pre-v6-from-5-`)
+    );
+    expect(backupName).toBeDefined();
+    expect(await readFile(`${dirname(filePath)}/${backupName}`, "utf8")).toBe(originalBytes);
+
+    const reloaded = new RoomStore(filePath, { now: () => now });
+    await reloaded.load();
+    expect(await readFile(filePath, "utf8")).toBe(firstMigratedBytes);
   });
 
   it("migrates an existing seven-room history by adding the pub exactly once", async () => {
@@ -185,7 +272,7 @@ describe("room history", () => {
     ]);
     expect(restored.getAllMessages().some((message) => message.channelId === thread.id)).toBe(false);
     expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
-      version: 5,
+      version: 6,
       trustedChannelLanguages: [],
       pendingPublicTurns: [],
     });
@@ -238,10 +325,10 @@ describe("room history", () => {
       version: number;
       privateThreads: Array<{ readReceipts?: unknown[] }>;
     };
-    expect(persisted.version).toBe(5);
+    expect(persisted.version).toBe(6);
     expect(persisted.privateThreads[0]?.readReceipts).toHaveLength(2);
     const backupName = (await readdir(dirname(filePath))).find((name) =>
-      name.startsWith(`${basename(filePath)}.pre-v5-from-4-`)
+      name.startsWith(`${basename(filePath)}.pre-v6-from-4-`)
     );
     expect(backupName).toBeDefined();
     expect(await readFile(`${dirname(filePath)}/${backupName}`, "utf8")).toBe(legacyBytes);
@@ -254,7 +341,7 @@ describe("room history", () => {
       createdAt: "2026-07-18T12:00:00.000Z",
     });
     const bytes = JSON.stringify({
-      version: 5,
+      version: 6,
       messages: [],
       privateThreads: [{
         id: threadId,
@@ -453,7 +540,7 @@ describe("room history", () => {
       trustedChannelLanguages: unknown[];
     };
     expect(persisted).toMatchObject({
-      version: 5,
+      version: 6,
       trustedChannelLanguages: [{
         channelId: "lobby",
         languageTag: "sv",
@@ -937,7 +1024,7 @@ describe("room history", () => {
       version: number;
       messages: Array<{ id: string }>;
     };
-    expect(persisted.version).toBe(5);
+    expect(persisted.version).toBe(6);
     expect(persisted.messages.map((message) => message.id)).toEqual(expectedIds);
 
     const temporaryPrefix = `${basename(filePath)}.`;
@@ -965,7 +1052,7 @@ describe("room history", () => {
       messages: Array<{ id: string }>;
       pendingPublicTurns: Array<{ messageId: string; targets: Array<{ personaId: string }> }>;
     };
-    expect(persisted.version).toBe(5);
+    expect(persisted.version).toBe(6);
     expect(persisted.messages.some((message) => message.id === trigger.id)).toBe(true);
     expect(persisted.pendingPublicTurns).toEqual([expect.objectContaining({
       messageId: trigger.id,

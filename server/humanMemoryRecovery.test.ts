@@ -207,7 +207,7 @@ describe("persistent human recovery identity", () => {
       version: number;
       profiles: Array<Record<string, unknown>>;
     };
-    expect(v2.version).toBe(2);
+    expect(v2.version).toBe(3);
     expect(v2.profiles[0]).toMatchObject({
       credential: { tokenHash: sessionDigest, recoveryKeyHash: recoveryDigest },
       visitCount: 3,

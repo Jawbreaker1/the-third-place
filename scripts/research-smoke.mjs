@@ -43,7 +43,7 @@ try {
       (message) => message.authorId === snapshot.me.id && message.content === text,
       10_000,
     );
-    await emitAck(socket, "message:send", { channelId: "ai-lab", content: text });
+    await emitAck(socket, "message:send", { channelId: "ai-programming", content: text });
     const humanMessage = await humanMessagePromise;
     return await waitForEvent(
       socket,

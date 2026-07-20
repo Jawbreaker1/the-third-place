@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { activePublicChannelId } from "../shared/channelLifecycle.js";
 import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
 import { validatePublicHttpsUrl } from "./safeHttpsFetch.js";
 
@@ -583,11 +584,13 @@ export class AmbientEpisodeLedger {
         }
       }
     }
+    const channelLifecycleNeedsPersist = this.applyChannelLifecycle();
     const result = this.pruneInternal(now);
     const channelsTrimmed = this.trimChannels();
     if (
       result.episodesClosed > 0 || result.episodesRemoved > 0 ||
-      result.channelsRemoved > 0 || channelsTrimmed > 0 || semanticRecencyNeedsPersist
+      result.channelsRemoved > 0 || channelsTrimmed > 0 || semanticRecencyNeedsPersist ||
+      channelLifecycleNeedsPersist
     ) {
       this.schedulePersist();
     }
@@ -1258,6 +1261,62 @@ export class AmbientEpisodeLedger {
     }
     this.includeProvenanceMessageIds(episode);
     return episode;
+  }
+
+  private applyChannelLifecycle(): boolean {
+    let changed = false;
+    for (const [sourceId, source] of [...this.channels.entries()]) {
+      const targetId = activePublicChannelId(sourceId);
+      if (targetId === sourceId) continue;
+      changed = true;
+      this.channels.delete(sourceId);
+      // Retired-room entries are compact derived metadata, not chat history.
+      // Their authoritative messages remain in RoomStore's archived history.
+      if (!targetId) continue;
+
+      const target = this.channels.get(targetId) ?? {
+        channelId: targetId,
+        recent: [],
+        semanticRecency: [],
+      };
+      const remapEpisode = (episode: StoredAmbientEpisode): StoredAmbientEpisode => ({
+        ...episode,
+        channelId: targetId,
+      });
+      const currentCandidates = [
+        ...(target.current ? [target.current] : []),
+        ...(source.current ? [remapEpisode(source.current)] : []),
+      ].sort((left, right) => right.lastActivityAt - left.lastActivityAt || left.id.localeCompare(right.id));
+      target.current = currentCandidates.shift();
+      const displacedCurrents = currentCandidates.map((episode) => ({
+        ...episode,
+        status: "closed" as const,
+        closedAt: episode.lastActivityAt,
+        closeReason: "room_merged",
+        cooldownUntil: episode.lastActivityAt + this.semanticCooldownMs,
+      }));
+      const recentById = new Map<string, StoredAmbientEpisode>();
+      for (const episode of [
+        ...target.recent,
+        ...source.recent.map(remapEpisode),
+        ...displacedCurrents,
+      ]) {
+        if (episode.id !== target.current?.id) recentById.set(episode.id, episode);
+      }
+      target.recent = [...recentById.values()]
+        .sort(compareRecent)
+        .slice(0, this.maxRecentEpisodesPerChannel);
+      for (const entry of source.semanticRecency) {
+        this.rememberSemanticPublication(
+          target,
+          entry.semanticFamily,
+          entry.semanticKey,
+          entry.lastPublishedAt,
+        );
+      }
+      this.channels.set(targetId, target);
+    }
+    return changed;
   }
 
   private serialize(): AmbientEpisodePersistedState {

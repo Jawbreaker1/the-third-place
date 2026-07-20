@@ -24,7 +24,6 @@ const NEW_ROOM_IDS = [
 const RESEARCH_ROOM_IDS = [
   "lobby",
   "the-pub",
-  "ai-lab",
   "ai-programming",
   "ai-hacking",
   "stock-market",
@@ -32,33 +31,28 @@ const RESEARCH_ROOM_IDS = [
   "world-of-warcraft",
   "fnaf",
   "3d-visualisation",
-  "side-quests",
 ];
 const EXPECTED_AMBIENT_COUNTS: Record<string, number> = {
   lobby: 32,
   "the-pub": 40,
-  "ai-lab": 32,
-  "ai-programming": 32,
+  "ai-programming": 40,
   "ai-hacking": 40,
   "stock-market": 32,
   "football-talk": 40,
   "world-of-warcraft": 32,
   fnaf: 40,
   "3d-visualisation": 32,
-  "side-quests": 32,
 };
 const EXPECTED_AMBIENT_FAMILY_COUNTS: Record<string, number> = {
   lobby: 9,
   "the-pub": 12,
-  "ai-lab": 9,
-  "ai-programming": 9,
+  "ai-programming": 15,
   "ai-hacking": 10,
   "stock-market": 8,
   "football-talk": 10,
   "world-of-warcraft": 8,
   fnaf: 10,
   "3d-visualisation": 8,
-  "side-quests": 9,
 };
 
 const normalizedContentKey = (value: string): string => value.normalize("NFKC").trim().toLocaleLowerCase("und");
@@ -67,6 +61,8 @@ describe("channel profiles", () => {
   it("defines a single scalable profile for every public room", () => {
     const ids = CHANNEL_PROFILES.map((profile) => profile.public.id);
     const personaIds = new Set(PERSONAS.map((persona) => persona.id));
+    expect(ids).toHaveLength(9);
+    expect(ids).not.toEqual(expect.arrayContaining(["ai-lab", "side-quests"]));
     expect(new Set(ids).size).toBe(ids.length);
     expect(ids).toEqual(expect.arrayContaining(NEW_ROOM_IDS));
     expect(CHANNELS.map((channel) => channel.id)).toEqual(ids);
@@ -114,7 +110,7 @@ describe("channel profiles", () => {
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
     }
     const allPremises = CHANNEL_PROFILES.flatMap((profile) => profile.ambientPremises.map(normalizedContentKey));
-    expect(allPremises).toHaveLength(384);
+    expect(allPremises).toHaveLength(328);
     expect(new Set(allPremises).size).toBe(allPremises.length);
   });
 
@@ -136,7 +132,7 @@ describe("channel profiles", () => {
     for (const profile of CHANNEL_PROFILES) {
       const seeds = profile.autonomousResearchSeeds ?? [];
       if (RESEARCH_ROOM_IDS.includes(profile.public.id)) {
-        expect(seeds, profile.public.id).toHaveLength(8);
+        expect(seeds, profile.public.id).toHaveLength(profile.public.id === "ai-programming" ? 16 : 8);
       }
       for (const seed of seeds) {
         expect(seed.id, profile.public.id).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u);
@@ -194,7 +190,6 @@ describe("channel profiles", () => {
     expect(profile("football-talk")).toMatchObject({ ambientMode: "banter", conversationRegister: "banter" });
     expect(profile("world-of-warcraft")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
     expect(profile("fnaf")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
-    expect(profile("side-quests")).toMatchObject({ ambientMode: "casual", conversationRegister: "everyday" });
     expect(profile("ai-programming").conversationRegister).toBe("technical");
     expect(profile("ai-hacking").conversationRegister).toBe("technical");
     expect(profile("stock-market").conversationRegister).toBe("analytical");
@@ -210,7 +205,7 @@ describe("channel profiles", () => {
       const deepExperts = expertise.filter((entry) => EXPERTISE_RANK[entry.level] >= EXPERTISE_RANK.advanced);
       const everydayResidents = expertise.filter((entry) => EXPERTISE_RANK[entry.level] <= EXPERTISE_RANK.casual);
       expect(deepExperts.length).toBeGreaterThanOrEqual(1);
-      expect(deepExperts.length).toBeLessThanOrEqual(3);
+      expect(deepExperts.length).toBeLessThanOrEqual(channelId === "ai-programming" ? 4 : 3);
       expect(everydayResidents.length).toBeGreaterThan(deepExperts.length * 2);
     }
   });
@@ -280,14 +275,13 @@ describe("channel profiles", () => {
   });
 
   it("gives the technical AI rooms explicit broad seed families", () => {
-    const aiLab = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-lab")!;
     const programming = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")!;
     const security = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-hacking")!;
-    expect(aiLab.ambientPremiseFamilies).toEqual(expect.arrayContaining([
+    expect(programming.ambientPremiseFamilies).toEqual(expect.arrayContaining([
       "ai-lab-agent-systems",
       "ai-lab-interfaces",
       "ai-lab-data-governance",
-      "ai-lab-alignment",
+      "ai-lab-evaluation",
     ]));
     expect(programming.ambientPremiseFamilies).toEqual(expect.arrayContaining([
       "ai-code-contracts",

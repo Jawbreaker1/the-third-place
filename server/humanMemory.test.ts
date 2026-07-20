@@ -63,6 +63,58 @@ const tempStore = async (
 };
 
 describe("persistent human memory", () => {
+  it("merges renamed room activity and hides retired room scores without losing facts or relationships", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-room-migration-"));
+    const filePath = join(directory, "human-memory.json");
+    const originalBytes = JSON.stringify({
+      version: 2,
+      continuityVerified: true,
+      pendingActorForgetIds: [],
+      profiles: [{
+        member: member(),
+        createdAt: 10,
+        lastSeenAt: 200,
+        visitCount: 2,
+        facts: [
+          { kind: "likes", value: "local models", channelId: "ai-lab", learnedAt: 50, lastConfirmedAt: 50 },
+          { kind: "likes", value: "tiny repairs", channelId: "side-quests", learnedAt: 60, lastConfirmedAt: 60 },
+        ],
+        channelScores: [
+          { channelId: "ai-lab", messageCount: 3, lastActiveAt: 100, previousActiveAt: 90 },
+          { channelId: "ai-programming", messageCount: 5, lastActiveAt: 120, previousActiveAt: 110 },
+          { channelId: "side-quests", messageCount: 10, lastActiveAt: 130 },
+        ],
+        relations: [{ personaId: "ai-sana", familiarity: 0.6, affinity: 0.4, irritation: 0, updatedAt: 150 }],
+      }],
+    });
+    await writeFile(filePath, originalBytes, "utf8");
+
+    const store = new HumanMemoryStore({ filePath, now: () => 200, persistDelayMs: 60_000 });
+    await store.load();
+    const profile = store.findByHumanId("human-one")!;
+    expect(profile.channelScores).toEqual([{
+      channelId: "ai-programming",
+      messageCount: 8,
+      lastActiveAt: 120,
+      previousActiveAt: 110,
+    }]);
+    expect(profile.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ value: "local models", channelId: "ai-programming" }),
+      expect.objectContaining({ value: "tiny repairs", channelId: "side-quests" }),
+    ]));
+    expect(profile.relations["ai-sana"]).toMatchObject({ familiarity: 0.6, affinity: 0.4 });
+    expect(store.clientSummary("human-one")?.activeChannels).toEqual([
+      { channelId: "ai-programming", messageCount: 8 },
+    ]);
+    const persisted = JSON.parse(await readFile(filePath, "utf8")) as { version: number };
+    expect(persisted.version).toBe(3);
+    const backupName = (await readdir(directory)).find((name) =>
+      name.startsWith("human-memory.json.pre-v3-from-2-")
+    );
+    expect(backupName).toBeDefined();
+    expect(await readFile(join(directory, backupName!), "utf8")).toBe(originalBytes);
+  });
+
   it("restores a stable identity after restart and serializes only the token hash", async () => {
     const rawToken = "server-only-cookie-value-that-must-never-touch-disk";
     const tokenHash = hash(rawToken);
@@ -122,7 +174,7 @@ describe("persistent human memory", () => {
       version: number;
       profiles: Array<Record<string, unknown>>;
     };
-    expect(serialized.version).toBe(2);
+    expect(serialized.version).toBe(3);
     expect(serialized.profiles[0]).not.toHaveProperty("credential");
     expect(serialized.profiles[0]).not.toHaveProperty("tokenHash");
 
@@ -509,11 +561,11 @@ describe("persistent human memory", () => {
       pendingActorForgetIds: string[];
       profiles: Array<{ facts: unknown[] }>;
     };
-    expect(migrated).toMatchObject({ version: 2 });
+    expect(migrated).toMatchObject({ version: 3 });
     expect(migrated.pendingActorForgetIds).toEqual(["human-bad"]);
     expect(migrated.profiles[0]?.facts).toHaveLength(1);
     const backupName = (await readdir(directory)).find((name) =>
-      name.startsWith("human-memory.json.pre-v2-from-legacy-")
+      name.startsWith("human-memory.json.pre-v3-from-legacy-")
     );
     expect(backupName).toBeDefined();
     expect(await readFile(join(directory, backupName!), "utf8")).toBe(legacyBytes);
@@ -754,7 +806,7 @@ describe("persistent human memory", () => {
     await unlink(blocker);
     await mkdir(blocker);
     await expect(store.flush()).resolves.toBeUndefined();
-    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ version: 2 });
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({ version: 3 });
   });
 
   it("fails closed on corrupt JSON without destroying or permitting replacement of the companion", async () => {
@@ -779,7 +831,7 @@ describe("persistent human memory", () => {
     const directory = await mkdtemp(join(tmpdir(), "third-place-human-memory-schema-"));
     const cases = [
       ["root", []],
-      ["version", { version: 3, continuityVerified: true, pendingActorForgetIds: [], profiles: [] }],
+      ["version", { version: 4, continuityVerified: true, pendingActorForgetIds: [], profiles: [] }],
       ["profile", { version: 1, continuityVerified: true, pendingActorForgetIds: [], profiles: [{}] }],
       ["tombstones", { version: 1, continuityVerified: true, pendingActorForgetIds: [" unsafe "], profiles: [] }],
     ] as const;
