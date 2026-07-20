@@ -20,6 +20,7 @@ import {
   consideredConversationResponsePremise,
   consideredConversationWordLimits,
   detailedHumanResponseWordLimits,
+  deriveAmbientAudienceMode,
   classifiedLanguage,
   collectReadyVisualEvidence,
   compareAutonomousResearchOpportunities,
@@ -145,6 +146,17 @@ describe("social director", () => {
     });
     expect(ambientGenerationAdmission({
       ...baseHealth,
+      effectiveMaxBackgroundPredictions: 1,
+      activeBackgroundPredictions: 1,
+      activePredictions: 2,
+      queueDepth: 2,
+    })).toEqual({
+      allowed: false,
+      externalQueueDepth: 2,
+      reason: "background-full",
+    });
+    expect(ambientGenerationAdmission({
+      ...baseHealth,
       queueDepth: 4,
       activePredictions: 4,
     })).toEqual({
@@ -162,6 +174,23 @@ describe("social director", () => {
       externalQueueDepth: 3,
       reason: "queued",
     });
+  });
+
+  it("derives ambient cadence from meaningful participation rather than socket count", () => {
+    const now = Date.parse("2026-07-20T12:00:00.000Z");
+    expect(deriveAmbientAudienceMode({ connectedHumans: 0, now })).toBe("unattended");
+    expect(deriveAmbientAudienceMode({ connectedHumans: 1, now })).toBe("connected_idle");
+    expect(deriveAmbientAudienceMode({ connectedHumans: 8, now })).toBe("connected_idle");
+    expect(deriveAmbientAudienceMode({
+      connectedHumans: 1,
+      lastMeaningfulHumanActivityAt: now - 10 * 60_000,
+      now,
+    })).toBe("engaged");
+    expect(deriveAmbientAudienceMode({
+      connectedHumans: 2,
+      lastMeaningfulHumanActivityAt: now - 10 * 60_000 - 1,
+      now,
+    })).toBe("connected_idle");
   });
 
   it("retains conservative queue admission for incomplete model health snapshots", () => {
@@ -4860,7 +4889,7 @@ describe("social director", () => {
     expect(humanTriggeredTail.store.addPublicMessage).not.toHaveBeenCalled();
   });
 
-  it("runs two unattended ambient generations concurrently in distinct rooms with distinct leased residents", async () => {
+  it("runs two engaged ambient generations concurrently in distinct rooms with distinct leased residents", async () => {
     const now = Date.parse("2026-07-19T12:00:00.000Z");
     const pendingResolvers: Array<(lines: []) => void> = [];
     const requests: Array<{ channelId: string; conversationMode?: string; personaId?: string }> = [];
@@ -4888,7 +4917,7 @@ describe("social director", () => {
       {} as never,
       {} as never,
       () => PERSONAS,
-      () => 0,
+      () => 1,
       {
         now: () => now,
         rng: () => 0,
@@ -4910,6 +4939,7 @@ describe("social director", () => {
     const runAmbient = (director as unknown as {
       runAmbient: (workerId?: number) => Promise<void>;
     }).runAmbient.bind(director);
+    director.noteHumanVoiceActivity("lobby", "human-engaged");
 
     const first = runAmbient(0);
     const second = runAmbient(1);
@@ -4921,6 +4951,50 @@ describe("social director", () => {
 
     for (const resolve of pendingResolvers) resolve([]);
     await Promise.all([first, second]);
+    director.stop();
+  });
+
+  it("keeps the second ambient worker asleep for a connected but inactive audience", async () => {
+    const now = Date.parse("2026-07-19T12:15:00.000Z");
+    const generateScene = vi.fn(async () => []);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-connected-idle-${process.pid}-${Math.random()}.json`),
+      {
+        health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+        generateScene,
+        rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {} as never,
+      () => PERSONAS,
+      () => 3,
+      {
+        now: () => now,
+        rng: () => 0,
+        ambientConcurrency: 2,
+        consideredConversationChance: 0,
+        autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || ["ai-programming", "3d-visualisation"].includes(channelId)
+            ? 50
+            : 0,
+          autonomousLinkFrequency: 0,
+          competence: 50,
+          aggression: 25,
+          explicitness: 50,
+        }),
+      },
+    );
+    const runAmbient = (director as unknown as {
+      runAmbient: (workerId?: number) => Promise<void>;
+    }).runAmbient.bind(director);
+
+    await Promise.all([runAmbient(0), runAmbient(1)]);
+
+    expect(generateScene).toHaveBeenCalledTimes(1);
     director.stop();
   });
 
@@ -5301,8 +5375,12 @@ describe("social director", () => {
       );
       director.setActiveVoicePersonaIds([voicePersona.id]);
       director.noteHumanVoiceActivity("football-talk");
-      const runAmbient = (director as unknown as { runAmbient: () => Promise<void> }).runAmbient.bind(director);
+      const runAmbient = (director as unknown as {
+        runAmbient: (workerId?: number) => Promise<void>;
+      }).runAmbient.bind(director);
 
+      await runAmbient(1);
+      expect(generateScene).not.toHaveBeenCalled();
       await runAmbient();
       expect(generateScene).toHaveBeenCalledTimes(1);
       const posted = store.getAllMessages().at(-1)!;
@@ -8246,6 +8324,286 @@ describe("social director", () => {
     expect(store.getPendingPublicTurns()).toEqual([]);
   });
 
+  it("keeps one accountable resident composing through a generation longer than the old TTL", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-15T16:55:00.000Z");
+      vi.setSystemTime(now);
+      const human = {
+        id: "guest-typing-heartbeat",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore("/tmp/director-typing-heartbeat-unused.json");
+      const incoming = createMessage("lobby", human.id, "@Mira vad tycker du?");
+      store.addPublicMessage(incoming);
+      const emitted: Array<{ event: string; payload: unknown }> = [];
+      const emit = vi.fn((event: string, payload: unknown) => emitted.push({ event, payload }));
+      let finishGeneration!: (lines: Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>) => void;
+      const generateScene = vi.fn(() => new Promise<Array<{
+        personaId: string;
+        content: string;
+        source: "lm";
+        sourceIds: string[];
+      }>>((resolve) => { finishGeneration = resolve; }));
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit })) } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          analyzeTurn: vi.fn(async () => classifiedTurn({
+            personas: {
+              addressedIds: [mira.id],
+              requestedReplyIds: [mira.id],
+              relevantIds: [mira.id],
+              addressConfidence: 0.99,
+              relevanceConfidence: 0.99,
+            },
+          })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime([mira]),
+        {} as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, mira],
+        () => 1,
+        { now: () => now, rng: () => 0.99 },
+      );
+
+      const pending = (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+      await vi.waitFor(() => expect(generateScene).toHaveBeenCalledOnce());
+      await vi.advanceTimersByTimeAsync(35_000);
+
+      const stateEventsBeforeCompletion = emitted.filter((entry) => entry.event === "typing:member") as Array<{
+        event: string;
+        payload: { memberId: string; active: boolean };
+      }>;
+      expect(stateEventsBeforeCompletion).toEqual([
+        expect.objectContaining({ payload: expect.objectContaining({ memberId: mira.id, active: true }) }),
+      ]);
+      expect(emitted.filter((entry) => entry.event === "typing:heartbeat").length).toBeGreaterThanOrEqual(6);
+
+      finishGeneration([{
+        personaId: mira.id,
+        content: "Jag gillar riktningen, men den behöver testas ordentligt.",
+        source: "lm",
+        sourceIds: [],
+      }]);
+      await pending;
+      const stateEvents = emitted.filter((entry) => entry.event === "typing:member") as Array<{
+        event: string;
+        payload: { memberId: string; active: boolean };
+      }>;
+      expect(stateEvents.map((entry) => entry.payload)).toEqual([
+        expect.objectContaining({ memberId: mira.id, active: true }),
+        expect.objectContaining({ memberId: mira.id, active: false }),
+      ]);
+      const publicEvents = emitted.filter((entry) =>
+        entry.event === "typing:member" || entry.event === "message:new",
+      );
+      expect(publicEvents.map((entry) => entry.event)).toEqual([
+        "typing:member",
+        "message:new",
+        "typing:member",
+      ]);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("replays composing only to its private audience and closes it after resident removal", async () => {
+    vi.useFakeTimers();
+    const personaIndex = PERSONAS.findIndex((candidate) => candidate.id === "ai-juno");
+    const persona = PERSONAS[personaIndex]!;
+    try {
+      const human = {
+        id: "guest-dm-typing-reconcile",
+        name: "Private Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "P" },
+      };
+      const otherHuman = { ...human, id: "guest-dm-typing-other", name: "Other Guest" };
+      const store = new RoomStore("/tmp/director-dm-typing-reconcile-unused.json");
+      const thread = store.openDm(human.id, persona.id);
+      const incoming = store.addDmMessage(thread.id, human.id, "svara när du kan")!;
+      const emitted: Array<{ room: string; event: string; payload: unknown }> = [];
+      const director = new SocialDirector(
+        {
+          to: vi.fn((room: string) => ({
+            emit: (event: string, payload: unknown) => emitted.push({ room, event, payload }),
+          })),
+        } as never,
+        store,
+        {
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+          generateScene: vi.fn(async () => []),
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime([persona]),
+        {} as never,
+        {} as never,
+        () => [human, otherHuman, ...PERSONAS],
+        () => 2,
+        { dmDebounceMs: 1_000 },
+      );
+
+      const pending = director.onDirectMessage(incoming, human, persona);
+      await Promise.resolve();
+      expect(director.typingSnapshotForHuman(human.id)).toEqual([
+        expect.objectContaining({ channelId: thread.id, memberId: persona.id, active: true }),
+      ]);
+      expect(director.typingSnapshotForHuman(otherHuman.id)).toEqual([]);
+      expect(emitted).toContainEqual(expect.objectContaining({
+        room: `user:${human.id}`,
+        event: "typing:member",
+        payload: expect.objectContaining({ memberId: persona.id, active: true }),
+      }));
+
+      PERSONAS.splice(personaIndex, 1);
+      director.reconcileCatalog();
+      await pending;
+      expect(emitted).toContainEqual(expect.objectContaining({
+        room: `user:${human.id}`,
+        event: "typing:member",
+        payload: expect.objectContaining({ memberId: persona.id, active: false }),
+      }));
+      expect(director.typingSnapshotForHuman(human.id)).toEqual([]);
+
+      const heartbeatsAtCancellation = emitted.filter((entry) => entry.event === "typing:heartbeat").length;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(emitted.filter((entry) => entry.event === "typing:heartbeat")).toHaveLength(
+        heartbeatsAtCancellation,
+      );
+      expect((director as unknown as {
+        typingHeartbeatTimers: Map<string, NodeJS.Timeout>;
+        typingLeaseExpiryTimers: Set<NodeJS.Timeout>;
+      }).typingHeartbeatTimers.size).toBe(0);
+      director.stop();
+    } finally {
+      if (!PERSONAS.some((candidate) => candidate.id === persona.id)) {
+        PERSONAS.splice(personaIndex, 0, persona);
+      }
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives a welcome turn foreground priority only after its social arrival delay", async () => {
+    vi.useFakeTimers();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    try {
+      const human = {
+        id: "guest-welcome-foreground",
+        name: "New Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "N" },
+      };
+      const release = vi.fn();
+      const acquireForegroundDemand = vi.fn(() => ({ released: false, release }));
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        new RoomStore("/tmp/director-welcome-foreground-unused.json"),
+        {
+          acquireForegroundDemand,
+          generateScene: vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => [{
+            personaId: request.selected[0]!.id,
+            content: "Hej, kul att du hittade hit.",
+            source: "lm" as const,
+            sourceIds: [],
+          }]),
+          rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        { rng: () => 0.5 },
+      );
+
+      const pending = director.welcome(human);
+      expect(acquireForegroundDemand).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(899);
+      expect(acquireForegroundDemand).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.runAllTimersAsync();
+      await pending;
+
+      expect(acquireForegroundDemand).toHaveBeenCalledOnce();
+      expect(release).toHaveBeenCalledOnce();
+      director.stop();
+    } finally {
+      random.mockRestore();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears composing watchdogs during catalog reconciliation", async () => {
+    vi.useFakeTimers();
+    try {
+      const emitted: Array<{ event: string; payload: { active?: boolean } }> = [];
+      const director = new SocialDirector(
+        {
+          to: vi.fn(() => ({
+            emit: (event: string, payload: { active?: boolean }) => emitted.push({ event, payload }),
+          })),
+        } as never,
+        new RoomStore("/tmp/director-typing-watchdog-unused.json"),
+        { rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(),
+        {} as never,
+        {} as never,
+        () => PERSONAS,
+        () => 0,
+      );
+      const internals = director as unknown as {
+        acquireTyping: (channelId: string, memberId: string) => { release: () => void };
+        typingLeaseExpiryTimers: Set<NodeJS.Timeout>;
+      };
+
+      internals.acquireTyping("lobby", "ai-mira");
+      expect(internals.typingLeaseExpiryTimers.size).toBe(1);
+      director.reconcileCatalog();
+      expect(internals.typingLeaseExpiryTimers.size).toBe(0);
+      expect(emitted.filter((entry) => entry.event === "typing:member").map((entry) => entry.payload.active))
+        .toEqual([true, false]);
+
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(emitted.filter((entry) => entry.event === "typing:member").map((entry) => entry.payload.active))
+        .toEqual([true, false]);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("never exposes an optional public-scene candidate as composing when only the accountable reviewed line survives", async () => {
     vi.useFakeTimers();
     try {
@@ -8401,7 +8759,7 @@ describe("social director", () => {
       }).handleHumanBurst([incoming], human);
       await vi.waitFor(() => expect(
         store.getRecent("lobby", 10).filter((message) => message.authorId.startsWith("ai-")),
-      ).toHaveLength(2));
+      ).toHaveLength(2), { timeout: 2_000 });
       await pending;
 
       expect(selectedIds).toHaveLength(2);

@@ -72,6 +72,75 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
     history: [],
   });
 
+  it("temporarily trims two background lanes to one across overlapping foreground leases", async () => {
+    const startedRooms: string[] = [];
+    const abortedRooms: string[] = [];
+    const complete = vi.fn(async (body: Record<string, unknown>, signal: AbortSignal) => {
+      const messages = body.messages as Array<{ content?: string }> | undefined;
+      const room = JSON.parse(String(messages?.[1]?.content ?? "{}")).room as string;
+      startedRooms.push(room);
+      return await new Promise<unknown>((_resolve, reject) => {
+        const abort = () => {
+          abortedRooms.push(room);
+          reject(signal.reason ?? new DOMException("aborted", "AbortError"));
+        };
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      });
+    });
+    const backend: ModelBackend = {
+      providerId: "lmstudio",
+      configuredModel: "test-model",
+      probe: async () => ({ connected: true, id: "test-model", label: "test model" }),
+      complete,
+    };
+    const lm = new LmStudioClient({
+      backend,
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: 2,
+    });
+    const background = [
+      lm.generateScene(sceneFor("ambient", "lease-ambient-a"), 4),
+      lm.generateScene(sceneFor("ambient", "lease-ambient-b"), 4),
+      lm.generateScene(sceneFor("ambient", "lease-ambient-c"), 4),
+    ];
+    background.forEach((pending) => void pending.catch(() => undefined));
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(2));
+
+    const first = lm.acquireForegroundDemand();
+    const second = lm.acquireForegroundDemand();
+    await vi.waitFor(() => expect(abortedRooms).toHaveLength(1));
+    await expect(background[2]).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
+    expect(startedRooms).not.toContain("lease-ambient-c");
+    expect(lm.health()).toMatchObject({
+      foregroundDemandCount: 2,
+      effectiveMaxBackgroundPredictions: 1,
+    });
+
+    const replacement = lm.generateScene(sceneFor("ambient", "lease-ambient-d"), 4);
+    void replacement.catch(() => undefined);
+    first.release();
+    first.release();
+    expect(lm.health()).toMatchObject({
+      foregroundDemandCount: 1,
+      effectiveMaxBackgroundPredictions: 1,
+    });
+    expect(abortedRooms).toHaveLength(1);
+    expect(startedRooms).not.toContain("lease-ambient-d");
+
+    second.release();
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(3));
+    expect(startedRooms).toContain("lease-ambient-d");
+    expect(lm.health()).toMatchObject({
+      foregroundDemandCount: 0,
+      effectiveMaxBackgroundPredictions: 2,
+    });
+
+    lm.cancelPending("foreground lease test complete");
+    await Promise.allSettled([...background, replacement]);
+    await vi.waitFor(() => expect(lm.health().queueDepth).toBe(0));
+  });
+
   it("uses all text lanes without voice demand and yields one background lane when voice arrives", async () => {
     const startedRooms: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {

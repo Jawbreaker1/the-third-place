@@ -2164,6 +2164,11 @@ export interface LmStudioClientOptions {
   maxBackgroundPredictions?: number;
 }
 
+export interface ForegroundDemandLease {
+  readonly released: boolean;
+  release(): void;
+}
+
 interface ActiveQueueWork {
   item: QueueItem;
   abort?: AbortController;
@@ -2192,6 +2197,7 @@ export class LmStudioClient {
   private readonly maxConcurrentPredictions: number;
   private readonly maxBackgroundPredictions: number;
   private readonly maxNonVoicePredictions: number;
+  private foregroundDemandCount = 0;
   private readonly turnAnalysisById = new Map<string, Promise<TurnAnalysis>>();
   private readonly memoryAnalysisById = new Map<string, Promise<MemoryAnalysis>>();
   private readonly socialMemoryAnalysisById = new Map<string, Promise<SocialMemoryAnalysis>>();
@@ -2297,8 +2303,38 @@ export class LmStudioClient {
       activeBackgroundPredictions: this.activeBackgroundCount(),
       maxConcurrentPredictions: this.maxConcurrentPredictions,
       maxBackgroundPredictions: this.maxBackgroundPredictions,
+      effectiveMaxBackgroundPredictions: this.effectiveMaxBackgroundPredictions(),
+      foregroundDemandCount: this.foregroundDemandCount,
       provider: this.backend.providerId,
     };
+  }
+
+  /**
+   * Holds foreground-aware scheduling across routing, capabilities, generation
+   * and publication. Overlapping leases are reference-counted so one completed
+   * participant cannot restore background pressure while another still waits.
+   */
+  acquireForegroundDemand(): ForegroundDemandLease {
+    this.foregroundDemandCount += 1;
+    if (this.foregroundDemandCount === 1) this.trimBackgroundForForegroundDemand();
+    let released = false;
+    return {
+      get released() {
+        return released;
+      },
+      release: () => {
+        if (released) return;
+        released = true;
+        this.foregroundDemandCount = Math.max(0, this.foregroundDemandCount - 1);
+        if (this.foregroundDemandCount === 0) this.pump();
+      },
+    };
+  }
+
+  private effectiveMaxBackgroundPredictions(): number {
+    return this.foregroundDemandCount > 0
+      ? Math.min(1, this.maxBackgroundPredictions)
+      : this.maxBackgroundPredictions;
   }
 
   private isBackgroundItem(item: QueueItem): boolean {
@@ -2331,6 +2367,41 @@ export class LmStudioClient {
       if (!this.isReservedVoiceItem(item)) count += 1;
     }
     return count;
+  }
+
+  private trimBackgroundForForegroundDemand(): void {
+    const limit = this.effectiveMaxBackgroundPredictions();
+    while (this.activeCountsAfterPendingReleases().background > limit) {
+      if (!this.preemptOneActiveBackground(
+        "Optional generation yielded one lane to live human demand",
+      )) break;
+    }
+
+    // An active abort frees a projected background credit immediately, but
+    // one continuing background prediction may still consume the foreground
+    // limit. Keep only the queued work that could use any genuinely remaining
+    // credit; stale ambient scenes must settle now so their typing leases and
+    // room obligations do not linger behind the live turn.
+    let remainingQueuedCredits = Math.max(
+      0,
+      limit - this.activeCountsAfterPendingReleases().background,
+    );
+    const retained: QueueItem[] = [];
+    const preempted: QueueItem[] = [];
+    for (const item of this.queue) {
+      if (!this.isBackgroundItem(item) || remainingQueuedCredits > 0) {
+        retained.push(item);
+        if (this.isBackgroundItem(item)) remainingQueuedCredits -= 1;
+      } else {
+        preempted.push(item);
+      }
+    }
+    this.queue = retained;
+    for (const item of preempted) {
+      item.reject(new BackgroundWorkPreemptedError(
+        "Queued optional generation yielded to live human demand",
+      ));
+    }
   }
 
   private hasReservedVoiceDemand(): boolean {
@@ -2371,7 +2442,10 @@ export class LmStudioClient {
 
   private hasExecutionCapacity(background: boolean, reservedVoice: boolean): boolean {
     if (this.activeWork.size >= this.maxConcurrentPredictions) return false;
-    if (background && this.activeBackgroundCount() >= this.maxBackgroundPredictions) return false;
+    if (
+      background &&
+      this.activeBackgroundCount() >= this.effectiveMaxBackgroundPredictions()
+    ) return false;
     if (
       !reservedVoice &&
       this.hasReservedVoiceDemand() &&
@@ -2387,9 +2461,10 @@ export class LmStudioClient {
   ): boolean {
     const active = this.activeCountsAfterPendingReleases();
     const voiceDemand = reservedVoice || this.hasReservedVoiceDemand();
+    const backgroundLimit = this.effectiveMaxBackgroundPredictions();
     const canFit = (candidateBackground: boolean, candidateReservedVoice: boolean): boolean =>
       active.total < this.maxConcurrentPredictions &&
-      (!candidateBackground || active.background < this.maxBackgroundPredictions) &&
+      (!candidateBackground || active.background < backgroundLimit) &&
       (!voiceDemand || candidateReservedVoice || active.nonVoice < this.maxNonVoicePredictions);
     const pending = this.queue.map((item) => ({
       background: this.isBackgroundItem(item),
@@ -3250,7 +3325,8 @@ export class LmStudioClient {
 
   analyzeImage(image: Buffer, caption = "", priority = 1): Promise<VisualObservation> {
     if (!this.enabled) return Promise.reject(new Error("AI generation is disabled"));
-    return new Promise((resolve, reject) => {
+    const foreground = this.acquireForegroundDemand();
+    return new Promise<VisualObservation>((resolve, reject) => {
       if (this.queue.length >= 8 && !this.hasExecutionCapacity(false, false)) {
         if (!this.dropQueuedBackgroundWork("Background work dropped to protect the live queue")) {
           reject(new Error("The local inference queue is full"));
@@ -3268,7 +3344,7 @@ export class LmStudioClient {
       this.queue.push({ type: "vision", id: this.nextQueueId++, priority, image, caption, resolve, reject });
       this.queue.sort(compareQueueItems);
       void this.pump();
-    });
+    }).finally(() => foreground.release());
   }
 
   private pump(): void {

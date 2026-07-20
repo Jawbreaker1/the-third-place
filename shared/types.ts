@@ -245,6 +245,10 @@ export interface ServerHealth {
     maxConcurrentPredictions?: number;
     /** Background ceiling that deliberately reserves capacity for live turns. */
     maxBackgroundPredictions?: number;
+    /** Runtime ceiling after foreground demand has temporarily claimed capacity. */
+    effectiveMaxBackgroundPredictions?: number;
+    /** Reference-counted live public, DM, image or voice work spanning model gaps. */
+    foregroundDemandCount?: number;
     provider?: "lmstudio" | "codex";
   };
   onlineHumans: number;
@@ -331,6 +335,12 @@ export interface TypingMemberPayload {
   channelId: string;
   memberId: string;
   active: boolean;
+}
+
+/** Refreshes one already-owned composing state without creating a new speaker. */
+export interface TypingHeartbeatPayload {
+  channelId: string;
+  memberId: string;
 }
 
 export interface PresencePayload {

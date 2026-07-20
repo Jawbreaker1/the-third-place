@@ -1,5 +1,6 @@
 import type { ServerHealth, VisualObservation } from "../shared/types.js";
 import type {
+  ForegroundDemandLease,
   GeneratedLine,
   LmStudioClient,
   SceneGenerationExecutionOptions,
@@ -34,11 +35,17 @@ export interface SocialModelClient {
     context: Pick<SceneRequest, "kind" | "channelId" | "channelName">,
   ): void;
   cancelPending?(reason?: string): void;
+  /** Optional on lightweight test doubles; production clients bind it to one provider. */
+  acquireForegroundDemand?(): ForegroundDemandLease;
 }
 
 export class SwitchableSocialModel implements SocialModelClient {
   private active: ModelProviderId;
   private epoch = 0;
+  /** Number of foreground leases held by callers of this switchable facade. */
+  private foregroundDemandCount = 0;
+  /** The single provider-local lease that represents all external demand. */
+  private foregroundDemandLease?: ForegroundDemandLease;
 
   constructor(
     private readonly clients: Record<ModelProviderId, LmStudioClient>,
@@ -58,9 +65,22 @@ export class SwitchableSocialModel implements SocialModelClient {
   select(provider: ModelProviderId, reason = "AI provider changed"): void {
     if (provider === this.active) return;
     const previous = this.active;
+    const previousForegroundLease = this.foregroundDemandLease;
+    const nextForegroundLease = this.foregroundDemandCount > 0
+      ? this.clients[provider].acquireForegroundDemand()
+      : undefined;
+
     this.active = provider;
     this.epoch += 1;
-    this.clients[previous].cancelPending(reason);
+    this.foregroundDemandLease = nextForegroundLease;
+
+    try {
+      this.clients[previous].cancelPending(reason);
+    } finally {
+      // Acquire on the new provider first so a provider switch never opens a
+      // scheduling window in which outstanding live demand is unthrottled.
+      previousForegroundLease?.release();
+    }
   }
 
   private async guarded<T>(operation: (client: LmStudioClient) => Promise<T>): Promise<T> {
@@ -78,6 +98,30 @@ export class SwitchableSocialModel implements SocialModelClient {
 
   health(overrideLabel?: string): ServerHealth["model"] {
     return { ...this.clients[this.active].health(overrideLabel), provider: this.active };
+  }
+
+  acquireForegroundDemand(): ForegroundDemandLease {
+    if (this.foregroundDemandCount === 0) {
+      this.foregroundDemandLease = this.clients[this.active].acquireForegroundDemand();
+    }
+    this.foregroundDemandCount += 1;
+
+    let released = false;
+    return {
+      get released() {
+        return released;
+      },
+      release: () => {
+        if (released) return;
+        released = true;
+        this.foregroundDemandCount = Math.max(0, this.foregroundDemandCount - 1);
+        if (this.foregroundDemandCount > 0) return;
+
+        const providerLease = this.foregroundDemandLease;
+        this.foregroundDemandLease = undefined;
+        providerLease?.release();
+      },
+    };
   }
 
   async analyzeTurn(

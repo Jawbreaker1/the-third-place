@@ -23,6 +23,15 @@ const fakeClient = (name: string) => ({
   analyzeImage: vi.fn(async () => ({ summary: name, details: [], safety: "safe" })),
   rememberDeliveredLine: vi.fn(),
   cancelPending: vi.fn(),
+  acquireForegroundDemand: vi.fn(() => {
+    let released = false;
+    return {
+      get released() {
+        return released;
+      },
+      release: vi.fn(() => { released = true; }),
+    };
+  }),
 }) as unknown as LmStudioClient;
 
 describe("SwitchableSocialModel", () => {
@@ -106,6 +115,52 @@ describe("SwitchableSocialModel", () => {
     pending.resolve({ source: "valid" });
     await expect(result).resolves.toEqual({ source: "valid" });
     expect(lmstudio.cancelPending).not.toHaveBeenCalled();
+  });
+
+  it("coalesces overlapping foreground leases into one provider-local lease", () => {
+    const lmstudio = fakeClient("local-gemma");
+    const codex = fakeClient("gpt-5.6-luna");
+    const model = new SwitchableSocialModel({ lmstudio, codex });
+
+    const first = model.acquireForegroundDemand();
+    const second = model.acquireForegroundDemand();
+    const providerLease = vi.mocked(lmstudio.acquireForegroundDemand).mock.results[0]?.value;
+
+    expect(lmstudio.acquireForegroundDemand).toHaveBeenCalledOnce();
+    expect(codex.acquireForegroundDemand).not.toHaveBeenCalled();
+    first.release();
+    first.release();
+    expect(first.released).toBe(true);
+    expect(providerLease?.release).not.toHaveBeenCalled();
+
+    second.release();
+    second.release();
+    expect(second.released).toBe(true);
+    expect(providerLease?.release).toHaveBeenCalledOnce();
+  });
+
+  it("transfers active foreground demand across provider switches until the final release", () => {
+    const lmstudio = fakeClient("local-gemma");
+    const codex = fakeClient("gpt-5.6-luna");
+    const model = new SwitchableSocialModel({ lmstudio, codex });
+
+    const first = model.acquireForegroundDemand();
+    const second = model.acquireForegroundDemand();
+    const localLease = vi.mocked(lmstudio.acquireForegroundDemand).mock.results[0]?.value;
+
+    model.select("codex");
+    const codexLease = vi.mocked(codex.acquireForegroundDemand).mock.results[0]?.value;
+
+    expect(lmstudio.acquireForegroundDemand).toHaveBeenCalledOnce();
+    expect(codex.acquireForegroundDemand).toHaveBeenCalledOnce();
+    expect(localLease?.release).toHaveBeenCalledOnce();
+    expect(codexLease?.release).not.toHaveBeenCalled();
+
+    first.release();
+    expect(codexLease?.release).not.toHaveBeenCalled();
+
+    second.release();
+    expect(codexLease?.release).toHaveBeenCalledOnce();
   });
 
   it("broadcasts delivered memory and global cancellation to both provider clients", () => {

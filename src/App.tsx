@@ -25,6 +25,7 @@ import type {
   RoomSnapshot,
   ServerHealth,
   ToastPayload,
+  TypingHeartbeatPayload,
   TypingMemberPayload,
   VoiceCapabilities,
   VoiceCreateResult,
@@ -1294,6 +1295,13 @@ export default function App() {
     socket.on("typing:member", (payload: TypingMemberPayload) => {
       typingExpiryRef.current?.observe(payload);
       setTyping((current) => reduceTypingPresence(current, payload));
+    });
+    socket.on("typing:heartbeat", (payload: TypingHeartbeatPayload) => {
+      const activePayload: TypingMemberPayload = { ...payload, active: true };
+      typingExpiryRef.current?.observe(activePayload);
+      // Also restores transient state after a reconnect; audience filtering is
+      // still owned by the server room that delivered this heartbeat.
+      setTyping((current) => reduceTypingPresence(current, activePayload));
     });
     socket.on("director:event", (event: DirectorEvent) => setDirectorEvents((current) => [...current.slice(-23), event]));
     socket.on("health:update", (nextHealth: ServerHealth) => setHealth(nextHealth));

@@ -8,6 +8,7 @@ import type {
   MessageSource,
   ReactionPayload,
   ServerHealth,
+  TypingHeartbeatPayload,
   TypingMemberPayload,
   VisualObservation,
 } from "../shared/types.js";
@@ -177,8 +178,9 @@ const AUTONOMOUS_RESEARCH_ATTENDANCE_CREDIT_MS = 45 * 60_000;
 const AUTONOMOUS_RESEARCH_PRIORITY_CREDIT_MS = 5 * 60_000;
 const AMBIENT_BUSY_RETRY_MIN_MS = 4_000;
 const AMBIENT_BUSY_RETRY_MAX_MS = 8_000;
-/** Lets sibling workers join one unattended admission wave without bypassing its cooldown indefinitely. */
-const UNATTENDED_AMBIENT_ADMISSION_WAVE_MS = 1_000;
+export const AMBIENT_ENGAGEMENT_WINDOW_MS = 10 * 60_000;
+const TYPING_HEARTBEAT_INTERVAL_MS = 5_000;
+const TYPING_LEASE_HARD_CAP_MS = 5 * 60_000;
 const HUMAN_REACTION_STATE_LIMIT = 1_000;
 const HUMAN_REACTION_DEBOUNCE_MS = 700;
 const HUMAN_REACTION_HUMAN_COOLDOWN_MS = 24_000;
@@ -196,6 +198,30 @@ const HUMAN_ROMANTIC_CUE_CHANCE = Object.freeze({
 const RESIDENT_ROMANTIC_CUE_CHANCE = 0.01;
 const MAX_ROMANTIC_CUE_COOLDOWNS = 4_096;
 const AUTONOMOUS_SOCIAL_MEMORY_MAX_MESSAGES = 8;
+
+export type AmbientAudienceMode = "engaged" | "connected_idle" | "unattended";
+
+/**
+ * Presence alone never multiplies autonomous work. A real recent community
+ * action unlocks the second ambient worker; an idle observer still sees a
+ * living room through one worker, and a fully unattended server uses its
+ * separately persisted slow budget.
+ */
+export function deriveAmbientAudienceMode(input: {
+  connectedHumans: number;
+  lastMeaningfulHumanActivityAt?: number;
+  now: number;
+  engagementWindowMs?: number;
+}): AmbientAudienceMode {
+  if (Math.max(0, Math.trunc(input.connectedHumans)) === 0) return "unattended";
+  const windowMs = Math.max(1, input.engagementWindowMs ?? AMBIENT_ENGAGEMENT_WINDOW_MS);
+  return input.lastMeaningfulHumanActivityAt !== undefined &&
+      input.now >= input.lastMeaningfulHumanActivityAt &&
+      input.now - input.lastMeaningfulHumanActivityAt <= windowMs
+    ? "engaged"
+    : "connected_idle";
+}
+
 const CROWD_REACTION_PALETTES = {
   hostile: ["😬", "👀", "🛑"],
   debate: ["🤔", "👀", "🫡"],
@@ -760,6 +786,7 @@ export function ambientGenerationAdmission(
     | "activeBackgroundPredictions"
     | "maxConcurrentPredictions"
     | "maxBackgroundPredictions"
+    | "effectiveMaxBackgroundPredictions"
   >,
   ownedAmbientGenerations = 0,
 ): AmbientGenerationAdmission {
@@ -782,7 +809,9 @@ export function ambientGenerationAdmission(
   const activePredictions = Math.max(0, Math.trunc(health.activePredictions!));
   const activeBackgroundPredictions = Math.max(0, Math.trunc(health.activeBackgroundPredictions!));
   const maxConcurrentPredictions = Math.max(0, Math.trunc(health.maxConcurrentPredictions!));
-  const maxBackgroundPredictions = Math.max(0, Math.trunc(health.maxBackgroundPredictions!));
+  const maxBackgroundPredictions = Math.max(0, Math.trunc(
+    health.effectiveMaxBackgroundPredictions ?? health.maxBackgroundPredictions!,
+  ));
   const queuedPredictions = Math.max(0, queueDepth - activePredictions);
 
   // Queued work has already lost a scheduling race for current capacity. Do
@@ -2313,6 +2342,7 @@ export class SocialDirector {
   private readonly lastHumanResearchActivityAtByChannel = new Map<string, number>();
   /** Presence-aware owners prevent an unrelated online human from boosting this room. */
   private readonly lastHumanResearchActivityAtByChannelActor = new Map<string, Map<string, number>>();
+  private lastMeaningfulHumanActivityAt?: number;
   private readonly lastTrustedLanguageByChannel = new Map<string, string>();
   private lastAmbientChannelId?: string;
   private started = false;
@@ -2364,6 +2394,14 @@ export class SocialDirector {
     memberId: string;
     rooms: readonly string[];
   }>();
+  private readonly dmTypingTargetByThread = new Map<string, {
+    key: string;
+    channelId: string;
+    memberId: string;
+    rooms: readonly string[];
+  }>();
+  private readonly typingHeartbeatTimers = new Map<string, NodeJS.Timeout>();
+  private readonly typingLeaseExpiryTimers = new Set<NodeJS.Timeout>();
   private readonly behaviorTuningProvider?: BehaviorTuningProvider;
   private readonly ambientEpisodeLedger?: AmbientEpisodeLedger;
   private readonly socialMemory?: SocialMemoryCoordinator;
@@ -2385,7 +2423,7 @@ export class SocialDirector {
     private readonly researchBroker: ResearchBroker,
     private readonly humanMemory: HumanMemory,
     private readonly getMembers: () => Member[],
-    private readonly getOnlineHumanCount: () => number,
+    private readonly getConnectedHumanCount: () => number,
     options: SocialDirectorOptions = {},
   ) {
     this.rng = options.rng ?? Math.random;
@@ -2402,7 +2440,11 @@ export class SocialDirector {
       const target = this.typingTargets.get(key);
       if (!target) return;
       this.emitTypingState(target.channelId, target.memberId, active, target.rooms);
-      if (!active) this.typingTargets.delete(key);
+      if (active) this.startTypingHeartbeat(key, target.channelId, target.memberId, target.rooms);
+      else {
+        this.stopTypingHeartbeat(key);
+        this.typingTargets.delete(key);
+      }
     });
     this.pageReader = options.pageReader ?? new PageReader();
     this.capabilityRegistry = new CapabilityRegistry({
@@ -2427,10 +2469,35 @@ export class SocialDirector {
       generate: (turn) => this.generateDirectTurn(turn),
       publish: (result, turn) => this.publishDirectTurn(result, turn),
       onTypingChange: (threadId, active) => {
+        if (!active) {
+          // The resident may already have disappeared from the live catalog.
+          // Keep the original private audience as process-local lifecycle
+          // state so cancellation can never leak a ghost heartbeat to this
+          // human (or accidentally resolve a different participant later).
+          const target = this.dmTypingTargetByThread.get(threadId);
+          if (!target) return;
+          this.emitTypingState(target.channelId, target.memberId, false, target.rooms);
+          this.stopTypingHeartbeat(target.key);
+          this.typingTargets.delete(target.key);
+          this.dmTypingTargetByThread.delete(threadId);
+          return;
+        }
         const participants: readonly string[] = this.store.getDmParticipants(threadId) ?? [];
         const persona = PERSONAS.find((candidate) => participants.includes(candidate.id));
         const humanId = participants.find((id) => id !== persona?.id);
-        if (persona && humanId) this.emitTypingState(threadId, persona.id, active, [`user:${humanId}`]);
+        if (persona && humanId) {
+          const rooms = [`user:${humanId}`];
+          const key = this.typingTargetKey(threadId, persona.id, rooms);
+          this.typingTargets.set(key, { channelId: threadId, memberId: persona.id, rooms });
+          this.dmTypingTargetByThread.set(threadId, {
+            key,
+            channelId: threadId,
+            memberId: persona.id,
+            rooms,
+          });
+          this.emitTypingState(threadId, persona.id, true, rooms);
+          this.startTypingHeartbeat(key, threadId, persona.id, rooms);
+        }
       },
       onError: (error, turn) => {
         for (const input of turn.messages) input.settle();
@@ -2514,6 +2581,10 @@ export class SocialDirector {
       if (!Number.isFinite(timestamp) || timestamp > now) continue;
       const authorKind = knownMemberKinds.get(message.authorId) ?? message.authorSnapshot?.kind;
       if (!message.system && authorKind === "human") {
+        this.lastMeaningfulHumanActivityAt = Math.max(
+          this.lastMeaningfulHumanActivityAt ?? 0,
+          timestamp,
+        );
         this.lastHumanMessageAtByChannel.set(
           message.channelId,
           Math.max(this.lastHumanMessageAtByChannel.get(message.channelId) ?? 0, timestamp),
@@ -2578,7 +2649,7 @@ export class SocialDirector {
     this.consideredConversationLease = undefined;
     this.unattendedAmbientAttemptsInFlight = 0;
     this.dmTurns.dispose();
-    this.typingLeases.clearAll();
+    this.clearTypingState();
     for (const thread of this.ambientThreads.values()) this.closeAmbientThread(thread, "stopped");
     this.ambientThreads.clear();
     this.autonomousSocialMemoryByChannel.clear();
@@ -2815,7 +2886,7 @@ export class SocialDirector {
   reconcileCatalog(): void {
     this.catalogEpoch += 1;
     this.dmTurns.cancelAll();
-    this.typingLeases.clearAll();
+    this.clearTypingState();
     for (const reaction of this.pendingHumanReactions.values()) clearTimeout(reaction.timer);
     this.pendingHumanReactions.clear();
     const channelIds = new Set([
@@ -2904,6 +2975,7 @@ export class SocialDirector {
 
   noteHumanVoiceActivity(channelId: string, humanActorId?: string): void {
     const now = this.now();
+    this.lastMeaningfulHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(channelId, now);
     this.lastHumanResearchActivityAtByChannel.set(channelId, now);
     if (humanActorId) this.rememberHumanResearchActivity(channelId, humanActorId, now);
@@ -2951,6 +3023,7 @@ export class SocialDirector {
       !this.humanActorWorkIsCurrent(human.id) ||
       !this.canSpeak()
     ) return;
+    const foreground = this.lm.acquireForegroundDemand?.();
     const typingLease = this.acquireTyping("lobby", persona.id);
     let line: GeneratedLine | undefined;
     try {
@@ -3025,6 +3098,7 @@ export class SocialDirector {
       if (posted) this.updateRelationship(persona.id, human.id, { warmth: 0.2, aggression: 0 }, 0.025);
     } finally {
       typingLease.release();
+      foreground?.release();
     }
   }
 
@@ -3126,6 +3200,7 @@ export class SocialDirector {
     )) return;
 
     const now = this.now();
+    this.lastMeaningfulHumanActivityAt = now;
     this.lastHumanMessageAtByChannel.set(event.channelId, now);
     this.lastHumanResearchActivityAtByChannel.set(event.channelId, now);
     this.rememberHumanResearchActivity(event.channelId, human.id, now);
@@ -3189,6 +3264,7 @@ export class SocialDirector {
       rng: this.rng,
     })) return;
 
+    const foreground = this.lm.acquireForegroundDemand?.();
     this.lastHumanReactionTurnAtByHumanChannel.set(humanChannelKey, now);
     this.lastHumanReactionTurnAtByMessage.set(messageKey, now);
     this.pruneHumanReactionState(now);
@@ -3295,6 +3371,7 @@ export class SocialDirector {
       });
     } finally {
       this.humanReactionResponsesInFlight.delete(inFlightKey);
+      foreground?.release();
     }
   }
 
@@ -3352,6 +3429,7 @@ export class SocialDirector {
 
   private noteHumanChannelEvent(message: ChatMessage): void {
     const now = this.now();
+    this.lastMeaningfulHumanActivityAt = now;
     // Coalescing crosses the 700 ms burst window only for the same actor and
     // room. Older semantic room-answer obligations yield; exact direct
     // mentions/replies remain in the durable outbox.
@@ -3785,6 +3863,7 @@ export class SocialDirector {
     persona: Persona,
     visualAnalysisReady?: Promise<void>,
   ): Promise<void> {
+    this.lastMeaningfulHumanActivityAt = this.now();
     return new Promise<void>((resolve) => {
       try {
         this.dmTurns.enqueue(message.channelId, {
@@ -3802,6 +3881,17 @@ export class SocialDirector {
   }
 
   private async generateDirectTurn(
+    turn: DmTurn<CoordinatedDmInput>,
+  ): Promise<CoordinatedDmReply | undefined> {
+    const foreground = this.lm.acquireForegroundDemand?.();
+    try {
+      return await this.generateDirectTurnWithForeground(turn);
+    } finally {
+      foreground?.release();
+    }
+  }
+
+  private async generateDirectTurnWithForeground(
     turn: DmTurn<CoordinatedDmInput>,
   ): Promise<CoordinatedDmReply | undefined> {
     const latestInput = turn.messages.at(-1);
@@ -4032,6 +4122,25 @@ export class SocialDirector {
   }
 
   private async handleHumanBurst(
+    messages: ChatMessage[],
+    human: Member,
+    visualObservation?: VisualObservation,
+    preclaimedDeliveries: readonly ClaimedPublicTurnTarget[] = [],
+  ): Promise<void> {
+    const foreground = this.lm.acquireForegroundDemand?.();
+    try {
+      await this.handleHumanBurstWithForeground(
+        messages,
+        human,
+        visualObservation,
+        preclaimedDeliveries,
+      );
+    } finally {
+      foreground?.release();
+    }
+  }
+
+  private async handleHumanBurstWithForeground(
     messages: ChatMessage[],
     human: Member,
     visualObservation?: VisualObservation,
@@ -4359,6 +4468,7 @@ export class SocialDirector {
     };
     const publishedResponses: ChatMessage[] = [];
     let selectedReadersMarked = false;
+    let primaryTypingLease: TypingLease | undefined;
     try {
     const automaticReadResponseRequired = Boolean(
       autoSharedLinkAttempt && (deterministicAddressedIds.length > 0 || responseExpected),
@@ -4564,7 +4674,7 @@ export class SocialDirector {
     // actually staged for publication.
     const accountablePrimary = requestOwner
       ?? selected.find((persona) => requiredIds.includes(persona.id));
-    let primaryTypingLease: TypingLease | undefined = autoSharedLinkAttempt || !accountablePrimary
+    primaryTypingLease = autoSharedLinkAttempt || !accountablePrimary
       ? undefined
       : this.acquireTyping(trigger.channelId, accountablePrimary.id);
     let lines: GeneratedLine[] = [];
@@ -4692,8 +4802,6 @@ export class SocialDirector {
       );
     } catch (error) {
       console.warn("Public scene failed:", error instanceof Error ? error.message : error);
-    } finally {
-      primaryTypingLease?.release();
     }
 
     if (!burstIsCurrent()) {
@@ -4843,7 +4951,10 @@ export class SocialDirector {
         sourceIds: safeEvidenceFallback.sourceIds,
       });
     }
-    lines.sort((a, b) => Number(required.has(b.personaId)) - Number(required.has(a.personaId)));
+    lines.sort((a, b) =>
+      Number(b.personaId === accountablePrimary?.id) - Number(a.personaId === accountablePrimary?.id) ||
+      Number(required.has(b.personaId)) - Number(required.has(a.personaId)),
+    );
     if (this.now() - generatedAt > 45_000 && required.size === 0) {
       this.schedulePersistentMemory(messages, human);
       return;
@@ -4870,7 +4981,14 @@ export class SocialDirector {
       if (!persona) continue;
       const publicationTypingLease = this.acquireTyping(trigger.channelId, persona.id);
       try {
-        if (index > 0) await delay(450 + Math.random() * 550);
+        if (index === 0 && accountablePrimary?.id !== persona.id) {
+          // Optional candidates remain hidden until review. Once one actually
+          // survives, give that real speaker a short renderable composing beat
+          // instead of emitting true -> message -> false in one event-loop turn.
+          await delay(250 + this.rng() * 100);
+        } else if (index > 0) {
+          await delay(450 + this.rng() * 550);
+        }
         const ordinarySlotAvailable = this.canSpeak();
         const directlyAddressedRequired = required.has(persona.id) &&
           signals.mentionedIds.includes(persona.id);
@@ -4946,6 +5064,10 @@ export class SocialDirector {
           }
         }
       } finally {
+        if (persona.id === accountablePrimary?.id) {
+          primaryTypingLease?.release();
+          primaryTypingLease = undefined;
+        }
         publicationTypingLease.release();
       }
     }
@@ -4963,6 +5085,10 @@ export class SocialDirector {
     }
     this.schedulePersistentMemory(messages, human);
     } finally {
+      // The accountable owner remains continuously composing from routing
+      // through reviewed publication. Publication may hold an overlapping
+      // lease, so this final release cannot create a true/false/true flicker.
+      primaryTypingLease?.release();
       for (const claim of claimedDeliveries) {
         if (!settledDeliveryKeys.has(deliveryKey(claim))) {
           this.store.releasePendingPublicTurnTarget(claim.messageId, claim.personaId);
@@ -5146,7 +5272,7 @@ export class SocialDirector {
   }
 
   private hasRecentHumanResearchActivity(channelId: string, now = this.now()): boolean {
-    if (this.getOnlineHumanCount() < 1) return false;
+    if (this.getConnectedHumanCount() < 1) return false;
     const onlineHumanIds = new Set(this.getMembers()
       .filter((member) => member.kind === "human" && member.status === "online")
       .map((member) => member.id));
@@ -6598,6 +6724,15 @@ export class SocialDirector {
     let nextScheduleDelayMs: number | undefined;
     try {
       if (!this.ambientLifecycleIsCurrent(lifecycleGeneration)) return;
+      const now = this.now();
+      const audienceMode = deriveAmbientAudienceMode({
+        connectedHumans: this.getConnectedHumanCount(),
+        lastMeaningfulHumanActivityAt: this.lastMeaningfulHumanActivityAt,
+        now,
+      });
+      // A passive observer still gets a continuously living room, but a second
+      // expensive worker is unlocked only by real recent participation.
+      if (workerId > 0 && audienceMode !== "engaged") return;
       const lmHealth = this.lm.health();
       if (!lmHealth.connected) return;
       const generationAdmission = ambientGenerationAdmission(
@@ -6609,21 +6744,17 @@ export class SocialDirector {
         nextScheduleDelayMs = this.ambientBusyRetryDelayMs();
         return;
       }
-      const now = this.now();
       const globalTuning = this.globalBehaviorTuning();
       if (globalTuning.activity === 0) return;
-      if (this.getOnlineHumanCount() < 1) {
+      if (audienceMode === "unattended") {
         const policy = unattendedAmbientPolicy(globalTuning.activity);
         const sinceLastAttempt = this.lastUnattendedAmbientAttemptAt === undefined
           ? Number.POSITIVE_INFINITY
           : now - this.lastUnattendedAmbientAttemptAt;
-        const joinsCurrentWave = this.unattendedAmbientAttemptsInFlight > 0 &&
-          sinceLastAttempt >= 0 &&
-          sinceLastAttempt <= UNATTENDED_AMBIENT_ADMISSION_WAVE_MS;
         if (
           !this.hasUnattendedAmbientCapacity(now, globalTuning.activity) ||
-          (sinceLastAttempt < policy.attemptCooldownMs && !joinsCurrentWave) ||
-          this.unattendedAmbientAttemptsInFlight >= this.ambientConcurrency
+          sinceLastAttempt < policy.attemptCooldownMs ||
+          this.unattendedAmbientAttemptsInFlight >= 1
         ) return;
         // Failed/rejected work does not consume the persisted publication
         // quota, but it still receives a bounded retry cadence for model and
@@ -7247,7 +7378,7 @@ export class SocialDirector {
     });
     const autonomousPublication = autonomousKind ? {
       kind: autonomousKind,
-      attendance: this.getOnlineHumanCount() > 0 ? "attended" : "unattended",
+      attendance: this.getConnectedHumanCount() > 0 ? "attended" : "unattended",
       ...(channelFeedReceipt ? { channelFeedReceipt } : {}),
     } as const : undefined;
     if (deferBroadcast) {
@@ -7615,7 +7746,7 @@ export class SocialDirector {
     if (globalTuning.activity === 0) return false;
     if (this.channelBehaviorTuning(channelId, globalTuning).activity === 0) return false;
     if (
-      this.getOnlineHumanCount() < 1 &&
+      this.getConnectedHumanCount() < 1 &&
       !this.hasUnattendedAmbientCapacity(this.now(), globalTuning.activity)
     ) return false;
     return this.availableAutonomousMessageSlots(this.now(), globalTuning.activity) >= 1;
@@ -7720,6 +7851,72 @@ export class SocialDirector {
     for (const room of rooms) this.io.to(room).emit("typing:member", payload);
   }
 
+  private typingTargetKey(
+    channelId: string,
+    memberId: string,
+    rooms: readonly string[],
+  ): string {
+    return JSON.stringify([channelId, memberId, [...new Set(rooms)].sort()]);
+  }
+
+  private startTypingHeartbeat(
+    key: string,
+    channelId: string,
+    memberId: string,
+    rooms: readonly string[],
+  ): void {
+    this.stopTypingHeartbeat(key);
+    const payload: TypingHeartbeatPayload = { channelId, memberId };
+    const timer = setInterval(() => {
+      for (const room of rooms) this.io.to(room).emit("typing:heartbeat", payload);
+    }, TYPING_HEARTBEAT_INTERVAL_MS);
+    timer.unref();
+    this.typingHeartbeatTimers.set(key, timer);
+  }
+
+  private stopTypingHeartbeat(key: string): void {
+    const timer = this.typingHeartbeatTimers.get(key);
+    if (!timer) return;
+    clearInterval(timer);
+    this.typingHeartbeatTimers.delete(key);
+  }
+
+  private clearTypingState(): void {
+    // Counter-owned public targets emit their final inactive transition here.
+    this.typingLeases.clearAll();
+    // DM targets are coordinated separately. Normally cancelAll/dispose has
+    // already closed them; this fallback makes catalog reconciliation and
+    // shutdown total even if a coordinator lifecycle changes later.
+    for (const target of this.dmTypingTargetByThread.values()) {
+      this.emitTypingState(target.channelId, target.memberId, false, target.rooms);
+    }
+    for (const timer of this.typingHeartbeatTimers.values()) clearInterval(timer);
+    for (const timer of this.typingLeaseExpiryTimers) clearTimeout(timer);
+    this.typingHeartbeatTimers.clear();
+    this.typingLeaseExpiryTimers.clear();
+    this.typingTargets.clear();
+    this.dmTypingTargetByThread.clear();
+  }
+
+  /**
+   * Replays only composing state visible to one authenticated human. This is
+   * sent immediately after room:snapshot so a reconnect does not wait for the
+   * next heartbeat and can never observe another human's private DM.
+   */
+  typingSnapshotForHuman(humanId: string): TypingMemberPayload[] {
+    const privateRoom = `user:${humanId}`;
+    const visible = new Map<string, TypingMemberPayload>();
+    for (const [key, target] of this.typingTargets) {
+      if (!target.rooms.includes("public") && !target.rooms.includes(privateRoom)) continue;
+      visible.set(key, {
+        channelId: target.channelId,
+        memberId: target.memberId,
+        active: true,
+      });
+    }
+    return [...visible.values()];
+  }
+
   /**
    * Operation-scoped composing state. Multiple overlapping operations owned by
    * the same resident share one outward state transition, and an old timeout
@@ -7729,23 +7926,31 @@ export class SocialDirector {
     channelId: string,
     memberId: string,
     rooms: readonly string[] = ["public"],
-    expireAfterMs = 14_000,
+    expireAfterMs = TYPING_LEASE_HARD_CAP_MS,
   ): TypingLease {
     const normalizedRooms = [...new Set(rooms)].sort();
-    const key = JSON.stringify([channelId, memberId, normalizedRooms]);
+    const key = this.typingTargetKey(channelId, memberId, normalizedRooms);
     this.typingTargets.set(key, { channelId, memberId, rooms: normalizedRooms });
     const lease = this.typingLeases.acquire(key);
-    const expiry = expireAfterMs > 0
-      ? setTimeout(() => lease.release(), expireAfterMs)
-      : undefined;
+    let expiry: NodeJS.Timeout | undefined;
+    const release = (): void => {
+      if (expiry) {
+        clearTimeout(expiry);
+        this.typingLeaseExpiryTimers.delete(expiry);
+        expiry = undefined;
+      }
+      lease.release();
+    };
+    if (expireAfterMs > 0) {
+      expiry = setTimeout(release, expireAfterMs);
+      expiry.unref();
+      this.typingLeaseExpiryTimers.add(expiry);
+    }
     return {
       get released() {
         return lease.released;
       },
-      release: () => {
-        if (expiry) clearTimeout(expiry);
-        lease.release();
-      },
+      release,
     };
   }
 

@@ -2968,6 +2968,9 @@ io.on("connection", (socket) => {
   });
 
   socket.emit("room:snapshot", snapshotFor(session));
+  for (const typing of director.typingSnapshotForHuman(session.member.id)) {
+    socket.emit("typing:member", typing);
+  }
   socket.emit("voice:rooms:update", voiceRooms.listRooms());
   io.to("public").emit("presence:update", { members: getMembers() });
 

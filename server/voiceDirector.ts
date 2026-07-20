@@ -68,7 +68,8 @@ export interface VoiceChannelRecentMessage {
 export interface VoiceDirectorOptions {
   runtime: VoiceRoomRuntime;
   capabilityRegistry: CapabilityRegistry;
-  lm: Pick<SocialModelClient, "analyzeTurn" | "generateScene"> & Partial<Pick<SocialModelClient, "rememberDeliveredLine">>;
+  lm: Pick<SocialModelClient, "analyzeTurn" | "generateScene"> &
+    Partial<Pick<SocialModelClient, "rememberDeliveredLine" | "acquireForegroundDemand">>;
   speech: Pick<VoiceSpeechService, "capabilities" | "synthesize">;
   actorChannels: ActorChannelRuntime;
   events: VoiceDirectorEvents;
@@ -676,6 +677,19 @@ export class VoiceDirector {
   }
 
   private async respond(
+    entry: VoiceTranscriptEntry,
+    epoch: number,
+    channelContext: VoiceChannelContextSnapshot,
+  ): Promise<void> {
+    const foreground = this.options.lm.acquireForegroundDemand?.();
+    try {
+      await this.respondWithForeground(entry, epoch, channelContext);
+    } finally {
+      foreground?.release();
+    }
+  }
+
+  private async respondWithForeground(
     entry: VoiceTranscriptEntry,
     epoch: number,
     channelContext: VoiceChannelContextSnapshot,
