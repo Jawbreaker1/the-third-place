@@ -2296,7 +2296,7 @@ textarea:focus-visible,
   flex: 1;
   padding: 6px 0 3px;
   resize: none;
-  overflow-y: auto;
+  overflow-y: hidden;
   border: 0;
   outline: 0;
   color: #e2e4e9;

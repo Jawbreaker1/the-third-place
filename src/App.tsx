@@ -73,6 +73,7 @@ import {
 } from "./channelFeeds";
 import { EmojiPicker } from "./EmojiPicker";
 import { insertEmojiAtSelection } from "./emoji";
+import { autosizeComposerTextarea } from "./composerAutosize";
 import {
   identityJoinError,
   needsIdentityTakeover,
@@ -2016,6 +2017,35 @@ export default function App() {
     if (!shouldStickToBottom.current) return;
     requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }));
   }, [activeMessages.length, activeChannelId, foldedSearch]);
+
+  useLayoutEffect(() => {
+    autosizeComposerTextarea(composerInputRef.current);
+  }, [activeChannelId, composer]);
+
+  useEffect(() => {
+    const input = composerInputRef.current;
+    if (!input) return;
+
+    const view = input.ownerDocument.defaultView;
+    if (typeof ResizeObserver === "undefined") {
+      const resize = () => autosizeComposerTextarea(input);
+      view?.addEventListener("resize", resize);
+      return () => view?.removeEventListener("resize", resize);
+    }
+
+    // Re-wrapping changes scrollHeight even when the draft itself is unchanged.
+    // Only react to width changes so our own height adjustment cannot create an
+    // observer loop.
+    let measuredWidth = input.getBoundingClientRect().width;
+    const observer = new ResizeObserver(([entry]) => {
+      const nextWidth = entry?.contentRect.width ?? input.getBoundingClientRect().width;
+      if (Math.abs(nextWidth - measuredWidth) < 0.5) return;
+      measuredWidth = nextWidth;
+      autosizeComposerTextarea(input);
+    });
+    observer.observe(input);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const scroller = scrollRef.current;
