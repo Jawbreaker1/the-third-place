@@ -15,15 +15,20 @@ const human = {
   avatar: { color: "#123", accent: "#456", glyph: "G" },
 };
 
-const restorableProfile = (id: string, name: string, lastSeenAt: number) => ({
-  tokenHash: id.padEnd(64, "0").slice(0, 64),
+const knownHumanProfile = (id: string, name: string, lastSeenAt: number) => ({
   member: {
     ...human,
     id,
     name,
     status: "offline" as const,
   },
+  createdAt: lastSeenAt,
   lastSeenAt,
+  visitCount: 1,
+  facts: [],
+  channelScores: [],
+  relations: {},
+  recoveryConfigured: false,
 });
 
 const analyzedTurn = () => ({
@@ -79,6 +84,7 @@ const setup = (options: {
     getRelation: vi.fn(() => undefined),
     updateRelation: vi.fn(),
     promptNote: vi.fn(() => undefined),
+    listProfiles: vi.fn(() => []),
     listRestorableProfiles: vi.fn(() => []),
     ...options.humanMemory,
   };
@@ -813,17 +819,17 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     director.stop();
   });
 
-  it("builds an offline-human catalog with global caseless ambiguity removal and a hard bound", () => {
-    const duplicateUpper = restorableProfile("human-duplicate-upper", "Per", 9_000);
-    const duplicateLower = restorableProfile("human-duplicate-lower", "ｐｅｒ", 8_000);
-    const residentCollision = restorableProfile("human-resident-collision", "MIRA", 7_000);
-    const unique = restorableProfile("human-unique", "Κατερίνα", 6_000);
+  it("builds an offline-human catalog from credentialless registered profiles with ambiguity removal and a hard bound", () => {
+    const duplicateUpper = knownHumanProfile("human-duplicate-upper", "Per", 9_000);
+    const duplicateLower = knownHumanProfile("human-duplicate-lower", "ｐｅｒ", 8_000);
+    const residentCollision = knownHumanProfile("human-resident-collision", "MIRA", 7_000);
+    const unique = knownHumanProfile("human-unique", "Κατερίνα", 6_000);
     const overflow = Array.from({ length: 40 }, (_, index) =>
-      restorableProfile(`human-bounded-${index}`, `Distinct ${index}`, 5_000 - index));
+      knownHumanProfile(`human-bounded-${index}`, `Distinct ${index}`, 5_000 - index));
     const { director } = setup({
       humanMemory: {
-        listRestorableProfiles: vi.fn(() => [
-          restorableProfile(human.id, human.name, 10_000),
+        listProfiles: vi.fn(() => [
+          knownHumanProfile(human.id, human.name, 10_000),
           duplicateUpper,
           duplicateLower,
           residentCollision,
@@ -929,9 +935,9 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       const { director, store } = setup({
         model: { analyzeTurn, generateScene },
         humanMemory: {
-          listRestorableProfiles: vi.fn(() => [
-            restorableProfile(human.id, human.name, 2_000),
-            restorableProfile("human-alex", "Álex", 1_000),
+          listProfiles: vi.fn(() => [
+            knownHumanProfile(human.id, human.name, 2_000),
+            knownHumanProfile("human-alex", "Álex", 1_000),
           ]),
         },
         coordinator: {
@@ -1012,7 +1018,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
           generateScene,
         },
         humanMemory: {
-          listRestorableProfiles: vi.fn(() => [restorableProfile("human-dario", "Dario", 1_000)]),
+          listProfiles: vi.fn(() => [knownHumanProfile("human-dario", "Dario", 1_000)]),
         },
         coordinator: {
           enqueueDeliveredEpisode: vi.fn(async () => ({
@@ -1079,7 +1085,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
           generateScene,
         },
         humanMemory: {
-          listRestorableProfiles: vi.fn(() => [restorableProfile("human-alex", "Álex", 1_000)]),
+          listProfiles: vi.fn(() => [knownHumanProfile("human-alex", "Álex", 1_000)]),
         },
         coordinator: {
           enqueueDeliveredEpisode: vi.fn(async () => ({
@@ -1093,7 +1099,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
         },
       });
       store.addPublicMessage(createMessage("lobby", "human-alex", "Álex byggde ett teleskop", {
-        authorSnapshot: restorableProfile("human-alex", "Álex", 1_000).member,
+        authorSnapshot: knownHumanProfile("human-alex", "Álex", 1_000).member,
         createdAt: new Date(now - 2 * 60 * 60_000).toISOString(),
       }));
       store.addPublicMessage(createMessage("lobby", mira.id, "det där teleskopet lät faktiskt rätt coolt", {
@@ -1201,7 +1207,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
           generateScene,
         },
         humanMemory: {
-          listRestorableProfiles: vi.fn(() => [restorableProfile("human-noor", "Noor", 1_000)]),
+          listProfiles: vi.fn(() => [knownHumanProfile("human-noor", "Noor", 1_000)]),
         },
         coordinator: {
           enqueueDeliveredEpisode: vi.fn(async () => ({

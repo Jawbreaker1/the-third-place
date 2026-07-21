@@ -3485,9 +3485,12 @@ export class SocialDirector {
   private offlineHumanCandidates(
     currentSpeakerId: string,
   ): NonNullable<TurnAnalysisInput["humanCandidates"]> {
-    let profiles: ReturnType<HumanMemory["listRestorableProfiles"]>;
+    let profiles: ReturnType<HumanMemory["listProfiles"]>;
     try {
-      profiles = this.humanMemory.listRestorableProfiles?.() ?? [];
+      // Social identity continuity must not depend on how somebody authenticates.
+      // Registered accounts intentionally have no legacy guest credential, but
+      // residents must still be able to resolve their retained offline profile.
+      profiles = this.humanMemory.listProfiles?.() ?? [];
     } catch {
       return [];
     }
