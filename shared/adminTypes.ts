@@ -193,16 +193,12 @@ export type AdminExternalAgentScope =
   | "messages:write"
   | "reactions:write";
 
-/**
- * Private administrator projection of an external agent. The personality
- * prompt is owner-authored configuration and must never be exposed through
- * public member/chat responses.
- */
+/** Administrator projection of an enrolled owner-operated agent. */
 export interface AdminExternalAgent {
   id: string;
+  /** Owner-submitted public identity. Read-only in administration. */
   displayName: string;
   publicBio: string;
-  personalityPrompt: string;
   channelIds: string[];
   scopes: AdminExternalAgentScope[];
   state: "enabled" | "revoked";
@@ -213,25 +209,56 @@ export interface AdminExternalAgent {
   revokedAt?: string;
 }
 
-export interface AdminExternalAgentWrite {
-  displayName: string;
-  publicBio: string;
-  personalityPrompt: string;
+/** Access policy controlled by the server administrator, never owner identity. */
+export interface AdminExternalAgentPolicyWrite {
   /** Explicit allowlist. Empty never means every room. */
   channelIds: string[];
   scopes: AdminExternalAgentScope[];
 }
 
-export interface AdminExternalAgentList {
-  agents: AdminExternalAgent[];
+export type AdminExternalAgentInvitationState = "pending" | "redeemed" | "expired" | "revoked";
+
+/** Token-free administrator projection of an enrollment invitation. */
+export interface AdminExternalAgentInvitation {
+  id: string;
+  /** Private administrative label; it does not choose the future agent's name. */
+  label: string;
+  channelIds: string[];
+  scopes: AdminExternalAgentScope[];
+  state: AdminExternalAgentInvitationState;
+  createdAt: string;
+  expiresAt: string;
+  redeemedAt?: string;
+  revokedAt?: string;
+  /** Stable actor created or reconnected by a redeemed invitation. */
+  agentId?: string;
 }
 
-/** Returned only when a credential is created or rotated. */
-export interface AdminExternalAgentCredential {
-  agent: AdminExternalAgent;
+export interface AdminExternalAgentInvitationWrite {
+  label: string;
+  expiresInSeconds: number;
+  /** Explicit allowlist. Empty never means every room. */
+  channelIds: string[];
+  scopes: AdminExternalAgentScope[];
+}
+
+export interface AdminExternalAgentReconnectInvitationWrite {
+  label: string;
+  expiresInSeconds: number;
+}
+
+export interface AdminExternalAgentList {
+  agents: AdminExternalAgent[];
+  invitations: AdminExternalAgentInvitation[];
+}
+
+/** Returned only when an enrollment invitation is created. */
+export interface AdminIssuedExternalAgentInvitation {
+  invitation: AdminExternalAgentInvitation;
+  /** One-time enrollment secret, not the agent's durable bearer credential. */
   token: string;
   /** May be same-origin relative when the server has no configured public origin. */
-  bootstrapUrl: string;
+  enrollmentUrl: string;
   /** Optional server-authored appendix; the client adds the credential handoff envelope. */
   handoffPrompt?: string;
 }

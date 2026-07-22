@@ -2,12 +2,17 @@ import { IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import express, { type Express } from "express";
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import type {
   AdminChannelFeedControl,
   AdminExternalAgent,
-  AdminExternalAgentCredential,
-  AdminExternalAgentWrite,
+  AdminExternalAgentInvitation,
+  AdminExternalAgentInvitationWrite,
+  AdminExternalAgentPolicyWrite,
+  AdminExternalAgentReconnectInvitationWrite,
+  AdminIssuedExternalAgentInvitation,
 } from "../shared/adminTypes.js";
+import { externalAgentAccessPolicyInputSchema } from "../shared/agentTypes.js";
 import { AdminAuthManager } from "./adminAuth.js";
 import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateStore } from "./adminState.js";
@@ -94,6 +99,7 @@ describe("admin HTTP API", () => {
     const forgotten: string[] = [];
     const recoveryKeysIssued: string[] = [];
     const memoryMutations: string[] = [];
+    const catalogMutationPhases: string[] = [];
     const memoryOverview = {
       stats: { actors: 1, memories: 1, relationships: 1, openLoops: 0, auditEntries: 0 },
       actors: [{
@@ -177,6 +183,14 @@ describe("admin HTTP API", () => {
         if (actorId !== human.id) return false;
         forgotten.push(actorId);
         return true;
+      },
+      runCatalogMutation: async (operation) => {
+        catalogMutationPhases.push("enter");
+        try {
+          return await operation();
+        } finally {
+          catalogMutationPhases.push("leave");
+        }
       },
       now: () => Date.UTC(2026, 6, 14, 12),
     }));
@@ -409,6 +423,10 @@ describe("admin HTTP API", () => {
       cookie,
       origin: "https://admin.example",
     })).status).toBe(200);
+    expect(catalogMutationPhases).toEqual(Array.from(
+      { length: 6 },
+      () => ["enter", "leave"],
+    ).flat());
 
     const kickedResponse = await dispatch(app, {
       method: "POST",
@@ -722,7 +740,7 @@ describe("admin HTTP API", () => {
     });
   });
 
-  it("protects the complete external-agent credential lifecycle behind authenticated same-origin administration", async () => {
+  it("keeps owner enrollment and host access policy behind authenticated same-origin administration", async () => {
     const state = isolatedAdminState();
     await state.load();
     const auth = new AdminAuthManager({
@@ -730,52 +748,106 @@ describe("admin HTTP API", () => {
       randomToken: () => "a".repeat(43),
     });
     const createdAt = new Date(Date.UTC(2026, 6, 22, 10)).toISOString();
+    const expiresAt = new Date(Date.UTC(2026, 6, 23, 10)).toISOString();
     const revokedAt = new Date(Date.UTC(2026, 6, 22, 11)).toISOString();
-    const createToken = `ttp_agent_${"c".repeat(43)}`;
-    const rotatedToken = `ttp_agent_${"d".repeat(43)}`;
-    const calls = { create: 0, update: 0, revoke: 0, rotate: 0 };
-    let agents: AdminExternalAgent[] = [];
+    const invitationToken = `ttp_invite_${"c".repeat(43)}`;
+    const reconnectToken = `ttp_invite_${"d".repeat(43)}`;
+    const calls = {
+      createInvitation: [] as AdminExternalAgentInvitationWrite[],
+      revokeInvitation: [] as string[],
+      updatePolicy: [] as AdminExternalAgentPolicyWrite[],
+      revoke: [] as string[],
+      reconnect: [] as AdminExternalAgentReconnectInvitationWrite[],
+    };
+    let agents: AdminExternalAgent[] = [{
+      id: "agent-owner-friend",
+      displayName: "Owner's Scout",
+      publicBio: "A public identity submitted by its owner.",
+      channelIds: ["lobby", "ai-programming"],
+      scopes: ["rooms:read", "messages:write", "reactions:write"],
+      state: "enabled",
+      presence: "offline",
+      createdAt,
+    }];
+    let invitations: AdminExternalAgentInvitation[] = [{
+      id: "agent-invite-original",
+      label: "Original owner handoff",
+      channelIds: ["lobby", "ai-programming"],
+      scopes: ["rooms:read", "messages:write", "reactions:write"],
+      state: "redeemed",
+      createdAt,
+      expiresAt,
+      redeemedAt: createdAt,
+      agentId: "agent-owner-friend",
+    }];
 
+    const invitationWriteSchema = z.object({
+      label: z.string().min(1).max(120),
+      expiresInSeconds: z.number().int().min(300).max(86_400),
+      channelIds: z.array(z.string()).min(1),
+      scopes: z.array(z.enum(["rooms:read", "messages:write", "reactions:write"])).min(1),
+    }).strict();
+    const reconnectWriteSchema = z.object({
+      label: z.string().min(1).max(120),
+      expiresInSeconds: z.number().int().min(300).max(86_400),
+    }).strict();
     const issue = (
-      agent: AdminExternalAgent,
+      invitation: AdminExternalAgentInvitation,
       token: string,
-    ): AdminExternalAgentCredential => ({
-      agent,
+    ): AdminIssuedExternalAgentInvitation => ({
+      invitation,
       token,
-      bootstrapUrl: "https://admin.example/api/agents/v1/bootstrap",
-      handoffPrompt: "Keep the owner's personality, then follow The Third Place community contract.",
+      enrollmentUrl: "https://admin.example/api/agents/v1/enroll",
+      handoffPrompt: "Keep private identity in the owner runtime; submit only a public profile during enrollment.",
     });
     const externalAgents = {
-      list: () => agents.map((agent) => ({ ...agent, channelIds: [...agent.channelIds], scopes: [...agent.scopes] })),
-      create: async (input: AdminExternalAgentWrite) => {
-        calls.create += 1;
-        const agent: AdminExternalAgent = {
-          id: "agent-owner-friend",
-          ...input,
-          channelIds: [...input.channelIds],
-          scopes: [...input.scopes],
-          state: "enabled",
-          presence: "offline",
+      list: () => ({
+        agents: agents.map((agent) => ({ ...agent, channelIds: [...agent.channelIds], scopes: [...agent.scopes] })),
+        invitations: invitations.map((invitation) => ({
+          ...invitation,
+          channelIds: [...invitation.channelIds],
+          scopes: [...invitation.scopes],
+        })),
+      }),
+      createInvitation: async (input: AdminExternalAgentInvitationWrite) => {
+        const parsed = invitationWriteSchema.parse(input) as AdminExternalAgentInvitationWrite;
+        calls.createInvitation.push(parsed);
+        const invitation: AdminExternalAgentInvitation = {
+          id: "agent-invite-pending",
+          label: parsed.label,
+          channelIds: [...parsed.channelIds],
+          scopes: [...parsed.scopes],
+          state: "pending",
           createdAt,
+          expiresAt,
+          agentId: "agent-pending-owner",
         };
-        agents = [agent];
-        return issue(agent, createToken);
+        invitations = [...invitations, invitation];
+        return issue(invitation, invitationToken);
       },
-      update: async (agentId: string, input: AdminExternalAgentWrite) => {
-        calls.update += 1;
+      revokeInvitation: async (invitationId: string) => {
+        calls.revokeInvitation.push(invitationId);
+        const current = invitations.find((invitation) => invitation.id === invitationId);
+        if (!current) return undefined;
+        const revoked: AdminExternalAgentInvitation = { ...current, state: "revoked", revokedAt };
+        invitations = invitations.map((invitation) => invitation.id === invitationId ? revoked : invitation);
+        return revoked;
+      },
+      updatePolicy: async (agentId: string, input: AdminExternalAgentPolicyWrite) => {
+        const parsed = externalAgentAccessPolicyInputSchema.parse(input) as AdminExternalAgentPolicyWrite;
+        calls.updatePolicy.push(parsed);
         const current = agents.find((agent) => agent.id === agentId);
         if (!current) return undefined;
         const updated: AdminExternalAgent = {
           ...current,
-          ...input,
-          channelIds: [...input.channelIds],
-          scopes: [...input.scopes],
+          channelIds: [...parsed.channelIds],
+          scopes: [...parsed.scopes],
         };
         agents = agents.map((agent) => agent.id === agentId ? updated : agent);
         return updated;
       },
       revoke: async (agentId: string) => {
-        calls.revoke += 1;
+        calls.revoke.push(agentId);
         const current = agents.find((agent) => agent.id === agentId);
         if (!current) return undefined;
         const revoked: AdminExternalAgent = {
@@ -787,14 +859,26 @@ describe("admin HTTP API", () => {
         agents = agents.map((agent) => agent.id === agentId ? revoked : agent);
         return revoked;
       },
-      rotate: async (agentId: string) => {
-        calls.rotate += 1;
+      createReconnectInvitation: async (
+        agentId: string,
+        input: AdminExternalAgentReconnectInvitationWrite,
+      ) => {
+        const parsed = reconnectWriteSchema.parse(input) as AdminExternalAgentReconnectInvitationWrite;
+        calls.reconnect.push(parsed);
         const current = agents.find((agent) => agent.id === agentId);
         if (!current) return undefined;
-        const { revokedAt: _removed, ...retained } = current;
-        const enabled: AdminExternalAgent = { ...retained, state: "enabled" };
-        agents = agents.map((agent) => agent.id === agentId ? enabled : agent);
-        return issue(enabled, rotatedToken);
+        const invitation: AdminExternalAgentInvitation = {
+          id: "agent-invite-reconnect",
+          label: parsed.label,
+          channelIds: [...current.channelIds],
+          scopes: [...current.scopes],
+          state: "pending",
+          createdAt,
+          expiresAt,
+          agentId,
+        };
+        invitations = [...invitations, invitation];
+        return issue(invitation, reconnectToken);
       },
     };
     const app = express();
@@ -807,11 +891,14 @@ describe("admin HTTP API", () => {
       banHuman: () => undefined,
       externalAgents,
     }));
+    app.use((_request, response) => {
+      response.status(404).json({ ok: false, error: "Admin endpoint not found." });
+    });
 
     expect((await dispatch(app, { method: "GET", path: "/api/admin/agents" })).status).toBe(401);
     expect((await dispatch(app, {
       method: "POST",
-      path: "/api/admin/agents",
+      path: "/api/admin/agent-invitations",
       origin: "https://admin.example",
       body: {},
     })).status).toBe(401);
@@ -826,28 +913,46 @@ describe("admin HTTP API", () => {
     const initial = await dispatch(app, { method: "GET", path: "/api/admin/agents", cookie });
     expect(initial.status).toBe(200);
     expect(initial.headers["cache-control"]).toContain("no-store");
-    expect(initial.body).toEqual({ agents: [] });
+    expect(initial.body).toMatchObject({
+      agents: [{ id: "agent-owner-friend", displayName: "Owner's Scout" }],
+      invitations: [{ id: "agent-invite-original", state: "redeemed", agentId: "agent-owner-friend" }],
+    });
+    expect(JSON.stringify(initial.body)).not.toContain("personalityPrompt");
+    expect(JSON.stringify(initial.body)).not.toContain("ttp_agent_");
 
-    const write: AdminExternalAgentWrite = {
-      displayName: "Owner's Scout",
-      publicBio: "A curious visitor operated by a community member.",
-      personalityPrompt: "Be candid, curious, a little dry, and preserve the owner's defined voice.",
+    const write: AdminExternalAgentInvitationWrite = {
+      label: "Invite a new owner-operated agent",
+      expiresInSeconds: 3_600,
       channelIds: ["lobby", "ai-programming"],
       scopes: ["rooms:read", "messages:write", "reactions:write"],
     };
     const rejectedCreate = await dispatch(app, {
       method: "POST",
-      path: "/api/admin/agents",
+      path: "/api/admin/agent-invitations",
       cookie,
       origin: "https://evil.example",
       body: write,
     });
     expect(rejectedCreate.status).toBe(403);
-    expect(calls.create).toBe(0);
+    expect(calls.createInvitation).toEqual([]);
+
+    const rejectedPrivateProfile = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agent-invitations",
+      cookie,
+      origin: "https://admin.example",
+      body: {
+        ...write,
+        displayName: "Admin must not choose this",
+        personalityPrompt: "Private owner material must never cross this boundary.",
+      },
+    });
+    expect(rejectedPrivateProfile.status).toBe(400);
+    expect(calls.createInvitation).toEqual([]);
 
     const created = await dispatch(app, {
       method: "POST",
-      path: "/api/admin/agents",
+      path: "/api/admin/agent-invitations",
       cookie,
       origin: "https://admin.example",
       body: write,
@@ -855,23 +960,31 @@ describe("admin HTTP API", () => {
     expect(created.status).toBe(201);
     expect(created.headers["cache-control"]).toContain("no-store");
     expect(created.body).toMatchObject({
-      agent: { id: "agent-owner-friend", personalityPrompt: write.personalityPrompt, state: "enabled" },
-      token: createToken,
-      bootstrapUrl: "https://admin.example/api/agents/v1/bootstrap",
+      invitation: { id: "agent-invite-pending", state: "pending", label: write.label },
+      token: invitationToken,
+      enrollmentUrl: "https://admin.example/api/agents/v1/enroll",
     });
-    expect(calls.create).toBe(1);
+    expect(JSON.stringify(created.body)).not.toContain("personalityPrompt");
+    expect(JSON.stringify(created.body)).not.toContain("ttp_agent_");
+    expect(calls.createInvitation).toEqual([write]);
 
     const listed = await dispatch(app, { method: "GET", path: "/api/admin/agents", cookie });
     expect(listed.status).toBe(200);
-    expect(listed.body).toMatchObject({ agents: [{ id: "agent-owner-friend", personalityPrompt: write.personalityPrompt }] });
-    expect(JSON.stringify(listed.body)).not.toContain(createToken);
+    expect(listed.body).toMatchObject({
+      agents: [{ id: "agent-owner-friend", displayName: "Owner's Scout" }],
+      invitations: [
+        { id: "agent-invite-original", state: "redeemed" },
+        { id: "agent-invite-pending", state: "pending" },
+      ],
+    });
+    expect(JSON.stringify(listed.body)).not.toContain(invitationToken);
+    expect(JSON.stringify(listed.body)).not.toContain("ttp_agent_");
+    expect(JSON.stringify(listed.body)).not.toContain("personalityPrompt");
     expect(JSON.stringify(listed.body)).not.toContain("handoffPrompt");
 
-    const updateWrite: AdminExternalAgentWrite = {
-      ...write,
-      publicBio: "A candid and curious visitor.",
-      personalityPrompt: "Keep the owner's dry humor and answer concretely.",
+    const updateWrite: AdminExternalAgentPolicyWrite = {
       channelIds: ["lobby"],
+      scopes: ["rooms:read", "messages:write"],
     };
     expect((await dispatch(app, {
       method: "PATCH",
@@ -880,7 +993,21 @@ describe("admin HTTP API", () => {
       origin: "https://evil.example",
       body: updateWrite,
     })).status).toBe(403);
-    expect(calls.update).toBe(0);
+    expect(calls.updatePolicy).toEqual([]);
+    const rejectedProfileMutation = await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/agents/agent-owner-friend",
+      cookie,
+      origin: "https://admin.example",
+      body: {
+        ...updateWrite,
+        displayName: "Admin Rewrite",
+        publicBio: "The host cannot rewrite owner identity.",
+        personalityPrompt: "Nor can it persist this.",
+      },
+    });
+    expect(rejectedProfileMutation.status).toBe(400);
+    expect(calls.updatePolicy).toEqual([]);
     const updated = await dispatch(app, {
       method: "PATCH",
       path: "/api/admin/agents/agent-owner-friend",
@@ -889,8 +1016,16 @@ describe("admin HTTP API", () => {
       body: updateWrite,
     });
     expect(updated.status).toBe(200);
-    expect(updated.body).toMatchObject({ agent: { publicBio: updateWrite.publicBio, channelIds: ["lobby"] } });
-    expect(JSON.stringify(updated.body)).not.toContain(createToken);
+    expect(updated.body).toMatchObject({
+      agent: {
+        displayName: "Owner's Scout",
+        publicBio: "A public identity submitted by its owner.",
+        channelIds: ["lobby"],
+        scopes: ["rooms:read", "messages:write"],
+      },
+    });
+    expect(calls.updatePolicy).toEqual([updateWrite]);
+    expect(JSON.stringify(updated.body)).not.toContain(invitationToken);
     expect((await dispatch(app, {
       method: "PATCH",
       path: "/api/admin/agents/missing",
@@ -901,12 +1036,40 @@ describe("admin HTTP API", () => {
 
     expect((await dispatch(app, {
       method: "POST",
+      path: "/api/admin/agent-invitations/agent-invite-pending/revoke",
+      cookie,
+      origin: "https://evil.example",
+      body: {},
+    })).status).toBe(403);
+    expect(calls.revokeInvitation).toEqual([]);
+    const revokedInvitation = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agent-invitations/agent-invite-pending/revoke",
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    });
+    expect(revokedInvitation.status).toBe(200);
+    expect(revokedInvitation.headers["cache-control"]).toContain("no-store");
+    expect(revokedInvitation.body).toMatchObject({ invitation: { state: "revoked", revokedAt } });
+    expect(JSON.stringify(revokedInvitation.body)).not.toContain(invitationToken);
+    expect(calls.revokeInvitation).toEqual(["agent-invite-pending"]);
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agent-invitations/missing/revoke",
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    })).status).toBe(404);
+
+    expect((await dispatch(app, {
+      method: "POST",
       path: "/api/admin/agents/agent-owner-friend/revoke",
       cookie,
       origin: "https://evil.example",
       body: {},
     })).status).toBe(403);
-    expect(calls.revoke).toBe(0);
+    expect(calls.revoke).toEqual([]);
     const revoked = await dispatch(app, {
       method: "POST",
       path: "/api/admin/agents/agent-owner-friend/revoke",
@@ -916,7 +1079,8 @@ describe("admin HTTP API", () => {
     });
     expect(revoked.status).toBe(200);
     expect(revoked.body).toMatchObject({ agent: { state: "revoked", revokedAt } });
-    expect(JSON.stringify(revoked.body)).not.toContain(createToken);
+    expect(JSON.stringify(revoked.body)).not.toContain(invitationToken);
+    expect(calls.revoke).toEqual(["agent-owner-friend"]);
     expect((await dispatch(app, {
       method: "POST",
       path: "/api/admin/agents/missing/revoke",
@@ -925,32 +1089,76 @@ describe("admin HTTP API", () => {
       body: {},
     })).status).toBe(404);
 
+    const reconnectWrite: AdminExternalAgentReconnectInvitationWrite = {
+      label: "Reconnect the same retained actor",
+      expiresInSeconds: 1_800,
+    };
     expect((await dispatch(app, {
       method: "POST",
-      path: "/api/admin/agents/agent-owner-friend/rotate-token",
+      path: "/api/admin/agents/agent-owner-friend/reconnect-invitations",
       cookie,
       origin: "https://evil.example",
-      body: {},
+      body: reconnectWrite,
     })).status).toBe(403);
-    expect(calls.rotate).toBe(0);
-    const rotated = await dispatch(app, {
+    expect(calls.reconnect).toEqual([]);
+    const reconnect = await dispatch(app, {
       method: "POST",
-      path: "/api/admin/agents/agent-owner-friend/rotate-token",
+      path: "/api/admin/agents/agent-owner-friend/reconnect-invitations",
       cookie,
       origin: "https://admin.example",
-      body: {},
+      body: reconnectWrite,
     });
-    expect(rotated.status).toBe(201);
-    expect(rotated.headers["cache-control"]).toContain("no-store");
-    expect(rotated.body).toMatchObject({ agent: { state: "enabled" }, token: rotatedToken });
-    expect(JSON.stringify(rotated.body)).not.toContain(createToken);
-    const listedAfterRotation = await dispatch(app, { method: "GET", path: "/api/admin/agents", cookie });
-    expect(JSON.stringify(listedAfterRotation.body)).not.toContain(createToken);
-    expect(JSON.stringify(listedAfterRotation.body)).not.toContain(rotatedToken);
-    expect(JSON.stringify(listedAfterRotation.body)).not.toContain("handoffPrompt");
+    expect(reconnect.status).toBe(201);
+    expect(reconnect.headers["cache-control"]).toContain("no-store");
+    expect(reconnect.body).toMatchObject({
+      invitation: {
+        id: "agent-invite-reconnect",
+        agentId: "agent-owner-friend",
+        state: "pending",
+      },
+      token: reconnectToken,
+      enrollmentUrl: "https://admin.example/api/agents/v1/enroll",
+    });
+    expect(calls.reconnect).toEqual([reconnectWrite]);
+    expect(JSON.stringify(reconnect.body)).not.toContain("ttp_agent_");
+
+    const listedAfterReconnect = await dispatch(app, { method: "GET", path: "/api/admin/agents", cookie });
+    expect(listedAfterReconnect.body).toMatchObject({
+      invitations: expect.arrayContaining([
+        expect.objectContaining({ id: "agent-invite-pending", state: "revoked" }),
+        expect.objectContaining({ id: "agent-invite-reconnect", state: "pending" }),
+      ]),
+    });
+    expect(JSON.stringify(listedAfterReconnect.body)).not.toContain(invitationToken);
+    expect(JSON.stringify(listedAfterReconnect.body)).not.toContain(reconnectToken);
+    expect(JSON.stringify(listedAfterReconnect.body)).not.toContain("ttp_agent_");
+    expect(JSON.stringify(listedAfterReconnect.body)).not.toContain("personalityPrompt");
+    expect(JSON.stringify(listedAfterReconnect.body)).not.toContain("handoffPrompt");
     expect((await dispatch(app, {
       method: "POST",
-      path: "/api/admin/agents/missing/rotate-token",
+      path: "/api/admin/agents/missing/reconnect-invitations",
+      cookie,
+      origin: "https://admin.example",
+      body: reconnectWrite,
+    })).status).toBe(404);
+
+    // Legacy control-plane routes cannot create a personality-bearing agent
+    // or directly disclose a durable runtime bearer anymore.
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents",
+      cookie,
+      origin: "https://admin.example",
+      body: {
+        displayName: "Legacy creation",
+        publicBio: "Should not be accepted.",
+        personalityPrompt: "Should never be stored.",
+        ...updateWrite,
+      },
+    })).status).toBe(404);
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents/agent-owner-friend/rotate-token",
       cookie,
       origin: "https://admin.example",
       body: {},
@@ -984,7 +1192,14 @@ describe("admin HTTP API", () => {
       dispatch(app, { method: "GET", path: "/api/admin/agents", cookie }),
       dispatch(app, {
         method: "POST",
-        path: "/api/admin/agents",
+        path: "/api/admin/agent-invitations",
+        cookie,
+        origin: "https://admin.example",
+        body: {},
+      }),
+      dispatch(app, {
+        method: "POST",
+        path: "/api/admin/agent-invitations/missing/revoke",
         cookie,
         origin: "https://admin.example",
         body: {},
@@ -1005,13 +1220,13 @@ describe("admin HTTP API", () => {
       }),
       dispatch(app, {
         method: "POST",
-        path: "/api/admin/agents/missing/rotate-token",
+        path: "/api/admin/agents/missing/reconnect-invitations",
         cookie,
         origin: "https://admin.example",
         body: {},
       }),
     ]);
-    expect(unavailable.map((response) => response.status)).toEqual([503, 503, 503, 503, 503]);
+    expect(unavailable.map((response) => response.status)).toEqual([503, 503, 503, 503, 503, 503]);
     unavailable.forEach((response) => {
       expect(response.headers["cache-control"]).toContain("no-store");
       expect(response.body).toMatchObject({ ok: false });

@@ -11,9 +11,12 @@ import type {
   AdminChannelFeedControl,
   AdminChannelConfig,
   AdminExternalAgent,
-  AdminExternalAgentCredential,
+  AdminExternalAgentInvitation,
+  AdminExternalAgentInvitationWrite,
+  AdminExternalAgentList,
+  AdminExternalAgentPolicyWrite,
   AdminExternalAgentScope,
-  AdminExternalAgentWrite,
+  AdminIssuedExternalAgentInvitation,
   AdminMemoryActorDetail,
   AdminMemoryOverview,
   AdminMemoryRelationship,
@@ -23,7 +26,8 @@ import type {
 } from "../shared/adminTypes";
 import {
   AdminApiError,
-  createAdminAgent,
+  createAdminAgentInvitation,
+  createAdminAgentReconnectInvitation,
   createAdminChannel,
   createAdminPersona,
   createAdminSession,
@@ -44,17 +48,17 @@ import {
   issueAdminHumanRecoveryKey,
   moderateAdminHuman,
   patchAdminBehavior,
-  patchAdminAgent,
+  patchAdminAgentPolicy,
   patchAdminChannel,
   patchAdminChannelFeed,
   patchAdminLlmProvider,
   patchAdminMemoryItem,
   patchAdminPersona,
   revokeAdminAgent,
-  rotateAdminAgentToken,
+  revokeAdminAgentInvitation,
   startAdminCodexLogin,
 } from "./adminApi";
-import { externalAgentBriefText } from "./agentBrief";
+import { externalAgentEnrollmentBriefText } from "./agentBrief";
 import {
   adminLlmProviderReady,
   codexStatusLabel,
@@ -82,9 +86,12 @@ type ConfirmRequest = {
   action: () => Promise<boolean>;
 };
 type IssuedRecoveryKey = { name: string; recoveryKey: string; copied: boolean };
-type IssuedAgentCredential = AdminExternalAgentCredential & {
-  copied: "token" | "bootstrap" | "brief" | null;
+type IssuedAgentInvitation = AdminIssuedExternalAgentInvitation & {
+  copied: "token" | "enrollment" | "brief" | null;
 };
+type AdminAgentSelection =
+  | { kind: "agent"; id: string }
+  | { kind: "invitation"; id: string };
 type AdminChannelFeedDraft = Pick<
   AdminChannelFeedControl,
   "enabled" | "discussionFrequency" | "activeIntervalMinutes" | "idleIntervalMinutes"
@@ -110,10 +117,15 @@ const agentScopes: Array<{
   { id: "reactions:write", label: "Add reactions", description: "Set or remove reactions without toggling accidentally on retry." },
 ];
 
-const newAgentDraft = (channels: AdminChannelConfig[]): AdminExternalAgentWrite => ({
-  displayName: "",
-  publicBio: "",
-  personalityPrompt: "",
+const invitationExpiryOptions = [
+  { seconds: 3_600, label: "1 hour" },
+  { seconds: 21_600, label: "6 hours" },
+  { seconds: 86_400, label: "24 hours" },
+] as const;
+
+const newAgentInvitationDraft = (channels: AdminChannelConfig[]): AdminExternalAgentInvitationWrite => ({
+  label: "",
+  expiresInSeconds: 86_400,
   channelIds: channels.some((channel) => channel.id === "lobby")
     ? ["lobby"]
     : channels[0]?.id ? [channels[0].id] : [],
@@ -394,7 +406,7 @@ function RecoveryKeyDialog({
   );
 }
 
-const resolvedBootstrapUrl = (value: string): string => {
+const resolvedEnrollmentUrl = (value: string): string => {
   try {
     return new URL(value, window.location.origin).href;
   } catch {
@@ -402,20 +414,19 @@ const resolvedBootstrapUrl = (value: string): string => {
   }
 };
 
-function AgentCredentialDialog({
+function AgentInvitationDialog({
   issued,
   onClose,
   onCopied,
 }: {
-  issued: IssuedAgentCredential;
+  issued: IssuedAgentInvitation;
   onClose: () => void;
-  onCopied: (kind: IssuedAgentCredential["copied"]) => void;
+  onCopied: (kind: IssuedAgentInvitation["copied"]) => void;
 }) {
   const closeRef = useRef<HTMLButtonElement | null>(null);
-  const bootstrapUrl = resolvedBootstrapUrl(issued.bootstrapUrl);
-  const agentBrief = externalAgentBriefText({
-    displayName: issued.agent.displayName,
-    bootstrapUrl,
+  const enrollmentUrl = resolvedEnrollmentUrl(issued.enrollmentUrl);
+  const agentBrief = externalAgentEnrollmentBriefText({
+    enrollmentUrl,
     ...(issued.handoffPrompt ? { communityAppendix: issued.handoffPrompt } : {}),
   });
   useEffect(() => {
@@ -426,7 +437,7 @@ function AgentCredentialDialog({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
-  const copy = async (kind: Exclude<IssuedAgentCredential["copied"], null>, value: string) => {
+  const copy = async (kind: Exclude<IssuedAgentInvitation["copied"], null>, value: string) => {
     try {
       await navigator.clipboard.writeText(value);
       onCopied(kind);
@@ -436,38 +447,38 @@ function AgentCredentialDialog({
   };
   return (
     <div className="admin-dialog-backdrop">
-      <section aria-labelledby="admin-agent-credential-title" aria-modal="true" className="admin-dialog admin-agent-credential-dialog" role="dialog">
+      <section aria-labelledby="admin-agent-invitation-title" aria-modal="true" className="admin-dialog admin-agent-credential-dialog" role="dialog">
         <p className="admin-kicker">Shown once</p>
-        <h2 id="admin-agent-credential-title">API access for {issued.agent.displayName}</h2>
+        <h2 id="admin-agent-invitation-title">Enrollment invitation</h2>
         <p>
-          Copy this now. The server stores only a one-way digest and cannot reveal the token again.
-          Rotating it immediately invalidates the previous credential.
+          Send this invitation privately to the owner. It does not choose the agent's identity and it is not the
+          durable API credential. When redeemed, the owner submits the public profile and receives that credential directly.
         </p>
         <div className="admin-agent-secret-block">
-          <div><strong>Bearer token</strong><small>Secret · Authorization header only</small></div>
+          <div><strong>Invitation secret</strong><small>One use · Authorization header only</small></div>
           <code>{issued.token}</code>
           <button className="admin-button subtle compact" onClick={() => { void copy("token", issued.token); }} type="button">
-            {issued.copied === "token" ? "Copied" : "Copy token"}
+            {issued.copied === "token" ? "Copied" : "Copy invitation secret"}
           </button>
         </div>
         <div className="admin-agent-secret-block">
-          <div><strong>Bootstrap endpoint</strong><small>The token is deliberately not included in this URL</small></div>
-          <code>{bootstrapUrl}</code>
-          <button className="admin-button subtle compact" onClick={() => { void copy("bootstrap", bootstrapUrl); }} type="button">
-            {issued.copied === "bootstrap" ? "Copied" : "Copy URL"}
+          <div><strong>Enrollment endpoint</strong><small>The invitation secret is deliberately not included in this URL</small></div>
+          <code>{enrollmentUrl}</code>
+          <button className="admin-button subtle compact" onClick={() => { void copy("enrollment", enrollmentUrl); }} type="button">
+            {issued.copied === "enrollment" ? "Copied" : "Copy URL"}
           </button>
         </div>
         <div className="admin-agent-handoff">
-          <strong>Agent brief (no credential)</strong>
+          <strong>Enrollment brief (no credential)</strong>
           <p>
-            Safe to add to the agent's trusted instructions. Install the token separately in its wrapper or secret store;
-            this text intentionally cannot reveal it.
+            Safe to add to trusted owner instructions. Install the invitation secret separately in the wrapper;
+            neither this text nor Admin receives the durable agent bearer.
           </p>
-          <textarea aria-label="External agent instructions without credential" readOnly rows={9} value={agentBrief} />
+          <textarea aria-label="External agent enrollment instructions without credential" readOnly rows={10} value={agentBrief} />
         </div>
         <div className="admin-dialog-actions">
           <button className="admin-button subtle" onClick={() => { void copy("brief", agentBrief); }} type="button">
-            {issued.copied === "brief" ? "Brief copied" : "Copy agent brief (no token)"}
+            {issued.copied === "brief" ? "Brief copied" : "Copy enrollment brief (no secret)"}
           </button>
           <button className="admin-button primary" onClick={onClose} ref={closeRef} type="button">I saved it</button>
         </div>
@@ -562,12 +573,15 @@ export default function AdminApp() {
   const [memoryDetailLoading, setMemoryDetailLoading] = useState(false);
   const [memoryDetailError, setMemoryDetailError] = useState<string>();
   const [agents, setAgents] = useState<AdminExternalAgent[]>();
+  const [agentInvitations, setAgentInvitations] = useState<AdminExternalAgentInvitation[]>();
   const [agentsLoading, setAgentsLoading] = useState(false);
   const [agentsError, setAgentsError] = useState<string>();
   const [selectedAgentId, setSelectedAgentId] = useState("");
-  const [agentDraft, setAgentDraft] = useState<AdminExternalAgentWrite>();
-  const [newAgent, setNewAgent] = useState(false);
-  const [issuedAgentCredential, setIssuedAgentCredential] = useState<IssuedAgentCredential>();
+  const [selectedAgentInvitationId, setSelectedAgentInvitationId] = useState("");
+  const [agentPolicyDraft, setAgentPolicyDraft] = useState<AdminExternalAgentPolicyWrite>();
+  const [agentInvitationDraft, setAgentInvitationDraft] = useState<AdminExternalAgentInvitationWrite>();
+  const [newAgentInvitation, setNewAgentInvitation] = useState(false);
+  const [issuedAgentInvitation, setIssuedAgentInvitation] = useState<IssuedAgentInvitation>();
 
   const installSnapshot = (next: AdminStateSnapshot) => {
     setSnapshot(next);
@@ -605,21 +619,43 @@ export default function AdminApp() {
     return next;
   };
 
-  const installAgents = (next: AdminExternalAgent[]): void => {
-    setAgents(next);
-    setSelectedAgentId((current) => next.some((agent) => agent.id === current)
-      ? current
-      : next.find((agent) => agent.state === "enabled")?.id ?? next[0]?.id ?? "");
+  const installAgents = (next: AdminExternalAgentList, preferred?: AdminAgentSelection): void => {
+    setAgents(next.agents);
+    setAgentInvitations(next.invitations);
+    if (preferred?.kind === "agent" && next.agents.some((agent) => agent.id === preferred.id)) {
+      setSelectedAgentId(preferred.id);
+      setSelectedAgentInvitationId("");
+      setAgentsError(undefined);
+      return;
+    }
+    if (preferred?.kind === "invitation" && next.invitations.some((invitation) => invitation.id === preferred.id)) {
+      setSelectedAgentId("");
+      setSelectedAgentInvitationId(preferred.id);
+      setAgentsError(undefined);
+      return;
+    }
+    const retainedAgent = next.agents.some((agent) => agent.id === selectedAgentId);
+    const retainedInvitation = next.invitations.some((invitation) => invitation.id === selectedAgentInvitationId);
+    if (retainedAgent) {
+      setSelectedAgentInvitationId("");
+    } else if (retainedInvitation) {
+      setSelectedAgentId("");
+    } else {
+      const fallbackAgent = next.agents.find((agent) => agent.state === "enabled") ?? next.agents[0];
+      const fallbackInvitation = next.invitations.find((invitation) => invitation.state === "pending") ?? next.invitations[0];
+      setSelectedAgentId(fallbackAgent?.id ?? "");
+      setSelectedAgentInvitationId(fallbackAgent ? "" : fallbackInvitation?.id ?? "");
+    }
     setAgentsError(undefined);
   };
 
-  const refreshAgents = async (): Promise<AdminExternalAgent[]> => {
+  const refreshAgents = async (preferred?: AdminAgentSelection): Promise<AdminExternalAgentList> => {
     setAgentsLoading(true);
     setAgentsError(undefined);
     try {
       const next = await getAdminAgents();
-      installAgents(next.agents);
-      return next.agents;
+      installAgents(next, preferred);
+      return next;
     } catch (error) {
       if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
         setSnapshot(null);
@@ -699,23 +735,20 @@ export default function AdminApp() {
   }, [newChannel, selectedChannelId, snapshot]);
 
   useEffect(() => {
-    if (section !== "agents" || agents !== undefined || agentsLoading) return;
+    if (section !== "agents" || (agents !== undefined && agentInvitations !== undefined) || agentsLoading || agentsError) return;
     void refreshAgents().catch(() => undefined);
-    // Agent credentials are private and loaded only when the admin opens this section.
+    // Enrollment and access state are private and loaded only when the admin opens this section.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agents, agentsLoading, section]);
+  }, [agentInvitations, agents, agentsError, agentsLoading, section]);
 
   useEffect(() => {
-    if (!snapshot || newAgent) return;
+    if (!snapshot || newAgentInvitation) return;
     const selected = agents?.find((agent) => agent.id === selectedAgentId);
-    setAgentDraft(selected ? {
-      displayName: selected.displayName,
-      publicBio: selected.publicBio,
-      personalityPrompt: selected.personalityPrompt,
+    setAgentPolicyDraft(selected ? {
       channelIds: [...selected.channelIds],
       scopes: [...selected.scopes],
     } : undefined);
-  }, [agents, newAgent, selectedAgentId, snapshot]);
+  }, [agents, newAgentInvitation, selectedAgentId, snapshot]);
 
   const runMutation = async (
     key: string,
@@ -873,11 +906,14 @@ export default function AdminApp() {
       setMemoryOverviewError(undefined);
       setMemoryDetailError(undefined);
       setAgents(undefined);
+      setAgentInvitations(undefined);
       setAgentsError(undefined);
       setSelectedAgentId("");
-      setAgentDraft(undefined);
-      setNewAgent(false);
-      setIssuedAgentCredential(undefined);
+      setSelectedAgentInvitationId("");
+      setAgentPolicyDraft(undefined);
+      setAgentInvitationDraft(undefined);
+      setNewAgentInvitation(false);
+      setIssuedAgentInvitation(undefined);
       setPassword("");
       setAuthPhase("signed-out");
     } catch (error) {
@@ -1064,15 +1100,46 @@ export default function AdminApp() {
       : [next]);
   };
 
-  const saveAgent = async (event: FormEvent): Promise<void> => {
+  const replaceAgentInvitation = (next: AdminExternalAgentInvitation): void => {
+    setAgentInvitations((current) => current
+      ? current.some((invitation) => invitation.id === next.id)
+        ? current.map((invitation) => invitation.id === next.id ? next : invitation)
+        : [next, ...current]
+      : [next]);
+  };
+
+  const presentAndReconcileAgentInvitation = (
+    issued: AdminIssuedExternalAgentInvitation,
+    preferred: AdminAgentSelection,
+  ): void => {
+    // The one-time secret must reach local UI state before any secondary
+    // catalog request can fail. The local invitation is also a durable visual
+    // fallback until a complete authoritative list replaces it.
+    replaceAgentInvitation(issued.invitation);
+    setIssuedAgentInvitation({ ...issued, copied: null });
+    if (preferred.kind === "agent") {
+      setSelectedAgentId(preferred.id);
+      setSelectedAgentInvitationId("");
+    } else {
+      setSelectedAgentId("");
+      setSelectedAgentInvitationId(preferred.id);
+    }
+    void refreshAgents(preferred).catch(() => {
+      // `refreshAgents` reports the error separately. Reassert the local row;
+      // never clear or replace the one-time secret dialog on reconciliation failure.
+      replaceAgentInvitation(issued.invitation);
+    });
+  };
+
+  const saveAgentInvitation = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
-    if (!agentDraft) return;
+    if (!agentInvitationDraft) return;
     const channelIds = snapshot.channels
       .map((channel) => channel.id)
-      .filter((channelId) => agentDraft.channelIds.includes(channelId));
+      .filter((channelId) => agentInvitationDraft.channelIds.includes(channelId));
     const scopes = agentScopes
       .map((scope) => scope.id)
-      .filter((scope) => agentDraft.scopes.includes(scope));
+      .filter((scope) => agentInvitationDraft.scopes.includes(scope));
     if (!channelIds.length) {
       setNotice({ tone: "error", message: "Choose at least one room. An empty room allowlist never means every room." });
       return;
@@ -1081,28 +1148,54 @@ export default function AdminApp() {
       setNotice({ tone: "error", message: "Choose at least one API scope. Empty permissions do not grant implicit access." });
       return;
     }
-    const payload: AdminExternalAgentWrite = {
-      displayName: agentDraft.displayName.trim(),
-      publicBio: agentDraft.publicBio.trim(),
-      personalityPrompt: agentDraft.personalityPrompt.trim(),
+    if (!scopes.includes("rooms:read")) {
+      setNotice({ tone: "error", message: "External agents require Read rooms so the owner runtime receives context before acting." });
+      return;
+    }
+    const payload: AdminExternalAgentInvitationWrite = {
+      label: agentInvitationDraft.label.trim(),
+      expiresInSeconds: agentInvitationDraft.expiresInSeconds,
       channelIds,
       scopes,
     };
-    setBusy(newAgent ? "create-agent" : "save-agent");
+    setBusy("create-agent-invitation");
     setNotice(undefined);
     try {
-      if (newAgent) {
-        const issued = await createAdminAgent(payload);
-        replaceAgent(issued.agent);
-        setSelectedAgentId(issued.agent.id);
-        setNewAgent(false);
-        setIssuedAgentCredential({ ...issued, copied: null });
-        setNotice({ tone: "success", message: `${issued.agent.displayName} can now enter The Third Place.` });
-      } else {
-        const updated = await patchAdminAgent(selectedAgentId, payload);
-        replaceAgent(updated);
-        setNotice({ tone: "success", message: `${updated.displayName}'s API profile was updated.` });
+      const issued = await createAdminAgentInvitation(payload);
+      presentAndReconcileAgentInvitation(issued, { kind: "invitation", id: issued.invitation.id });
+      setNewAgentInvitation(false);
+      setAgentInvitationDraft(undefined);
+      setNotice({ tone: "success", message: "The one-time enrollment invitation is ready for its owner." });
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setAuthPhase("signed-out");
       }
+      setNotice({ tone: "error", message: mutationErrorMessage(error) });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const saveAgentPolicy = async (event: FormEvent): Promise<void> => {
+    event.preventDefault();
+    if (!agentPolicyDraft || !selectedAgentId) return;
+    const channelIds = snapshot.channels
+      .map((channel) => channel.id)
+      .filter((channelId) => agentPolicyDraft.channelIds.includes(channelId));
+    const scopes = agentScopes
+      .map((scope) => scope.id)
+      .filter((scope) => agentPolicyDraft.scopes.includes(scope));
+    if (!channelIds.length || !scopes.includes("rooms:read")) {
+      setNotice({ tone: "error", message: "Choose at least one room. Read rooms is required for every external agent." });
+      return;
+    }
+    setBusy("save-agent-policy");
+    setNotice(undefined);
+    try {
+      const updated = await patchAdminAgentPolicy(selectedAgentId, { channelIds, scopes });
+      replaceAgent(updated);
+      setNotice({ tone: "success", message: `${updated.displayName}'s access policy was updated.` });
     } catch (error) {
       if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
         setSnapshot(null);
@@ -1134,14 +1227,36 @@ export default function AdminApp() {
     }
   };
 
-  const rotateAgentCredential = async (agent: AdminExternalAgent): Promise<boolean> => {
-    setBusy(`rotate-agent-${agent.id}`);
+  const revokeAgentInvitationAccess = async (invitation: AdminExternalAgentInvitation): Promise<boolean> => {
+    setBusy(`revoke-agent-invitation-${invitation.id}`);
     setNotice(undefined);
     try {
-      const issued = await rotateAdminAgentToken(agent.id);
-      replaceAgent(issued.agent);
-      setIssuedAgentCredential({ ...issued, copied: null });
-      setNotice({ tone: "success", message: `${issued.agent.displayName}'s previous token is now invalid.` });
+      const updated = await revokeAdminAgentInvitation(invitation.id);
+      replaceAgentInvitation(updated);
+      setNotice({ tone: "success", message: `The invitation “${updated.label}” was revoked.` });
+      return true;
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setAuthPhase("signed-out");
+      }
+      setNotice({ tone: "error", message: mutationErrorMessage(error) });
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const issueReconnectInvitation = async (agent: AdminExternalAgent): Promise<boolean> => {
+    setBusy(`reconnect-agent-${agent.id}`);
+    setNotice(undefined);
+    try {
+      const issued = await createAdminAgentReconnectInvitation(agent.id, {
+        label: `Reconnect ${agent.displayName}`,
+        expiresInSeconds: 86_400,
+      });
+      presentAndReconcileAgentInvitation(issued, { kind: "agent", id: agent.id });
+      setNotice({ tone: "success", message: `A one-time reconnect invitation for ${agent.displayName} is ready.` });
       return true;
     } catch (error) {
       if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
@@ -2100,20 +2215,36 @@ export default function AdminApp() {
   );
 
   const selectedAgent = agents?.find((agent) => agent.id === selectedAgentId);
+  const selectedAgentInvitation = agentInvitations?.find((invitation) => invitation.id === selectedAgentInvitationId);
   const enabledAgents = (agents ?? []).filter((agent) => agent.state === "enabled");
   const revokedAgents = (agents ?? []).filter((agent) => agent.state === "revoked");
+  const pendingInvitations = (agentInvitations ?? []).filter((invitation) => invitation.state === "pending");
+  const redeemedInvitations = (agentInvitations ?? []).filter((invitation) => invitation.state === "redeemed");
+  const closedInvitations = (agentInvitations ?? []).filter((invitation) => invitation.state === "expired" || invitation.state === "revoked");
+
+  const selectAgent = (agentId: string): void => {
+    setNewAgentInvitation(false);
+    setAgentInvitationDraft(undefined);
+    setSelectedAgentInvitationId("");
+    setSelectedAgentId(agentId);
+  };
+
+  const selectAgentInvitation = (invitationId: string): void => {
+    setNewAgentInvitation(false);
+    setAgentInvitationDraft(undefined);
+    setSelectedAgentId("");
+    setSelectedAgentInvitationId(invitationId);
+  };
+
   const agentListGroup = (label: string, entries: AdminExternalAgent[]) => entries.length ? (
     <div className="admin-agent-list-group" key={label}>
       <p>{label}<span>{entries.length}</span></p>
       {entries.map((agent) => (
         <button
-          aria-current={!newAgent && selectedAgentId === agent.id ? "true" : undefined}
-          className={!newAgent && selectedAgentId === agent.id ? "active" : ""}
+          aria-current={!newAgentInvitation && selectedAgentId === agent.id ? "true" : undefined}
+          className={!newAgentInvitation && selectedAgentId === agent.id ? "active" : ""}
           key={agent.id}
-          onClick={() => {
-            setNewAgent(false);
-            setSelectedAgentId(agent.id);
-          }}
+          onClick={() => selectAgent(agent.id)}
           type="button"
         >
           <span className="admin-agent-avatar">{agent.displayName.slice(0, 1).toLocaleUpperCase() || "A"}</span>
@@ -2127,6 +2258,88 @@ export default function AdminApp() {
     </div>
   ) : null;
 
+  const invitationListGroup = (label: string, entries: AdminExternalAgentInvitation[]) => entries.length ? (
+    <div className="admin-agent-list-group admin-invitation-list-group" key={label}>
+      <p>{label}<span>{entries.length}</span></p>
+      {entries.map((invitation) => (
+        <button
+          aria-current={!newAgentInvitation && selectedAgentInvitationId === invitation.id ? "true" : undefined}
+          className={!newAgentInvitation && selectedAgentInvitationId === invitation.id ? "active" : ""}
+          key={invitation.id}
+          onClick={() => selectAgentInvitation(invitation.id)}
+          type="button"
+        >
+          <span className="admin-agent-avatar invitation">↗</span>
+          <span>
+            <strong>{invitation.label}</strong>
+            <small>{invitation.channelIds.length} room{invitation.channelIds.length === 1 ? "" : "s"} · expires {formatDateTime(invitation.expiresAt)}</small>
+          </span>
+          <i className={`admin-agent-state ${invitation.state}`}>{invitation.state}</i>
+        </button>
+      ))}
+    </div>
+  ) : null;
+
+  const agentAccessFields = (
+    draft: AdminExternalAgentPolicyWrite,
+    update: (next: AdminExternalAgentPolicyWrite) => void,
+    disabled = false,
+  ): ReactNode => (
+    <>
+      <fieldset className="admin-fieldset" disabled={disabled}>
+        <legend>Room allowlist</legend>
+        <p className="admin-fieldset-note">Choose explicitly. No rooms means no access; it never means the whole server.</p>
+        <div className="admin-agent-choice-grid">
+          {snapshot.channels.map((channel) => {
+            const checked = draft.channelIds.includes(channel.id);
+            return (
+              <label className={`admin-checkbox ${checked ? "selected" : ""}`} key={channel.id}>
+                <input
+                  checked={checked}
+                  onChange={(event) => update({
+                    ...draft,
+                    channelIds: event.target.checked
+                      ? [...draft.channelIds, channel.id]
+                      : draft.channelIds.filter((id) => id !== channel.id),
+                  })}
+                  type="checkbox"
+                />
+                <span><strong>#{channel.name}</strong><small>{channel.description}</small></span>
+              </label>
+            );
+          })}
+        </div>
+        {!draft.channelIds.length && <p className="admin-agent-validation" role="alert">Select at least one room.</p>}
+      </fieldset>
+      <fieldset className="admin-fieldset" disabled={disabled}>
+        <legend>API scopes</legend>
+        <p className="admin-fieldset-note">Read rooms is required so the owner runtime receives bounded context before acting.</p>
+        <div className="admin-agent-choice-grid scopes">
+          {agentScopes.map((scope) => {
+            const checked = draft.scopes.includes(scope.id);
+            return (
+              <label className={`admin-checkbox ${checked ? "selected" : ""}`} key={scope.id}>
+                <input
+                  checked={checked}
+                  disabled={disabled || scope.id === "rooms:read"}
+                  onChange={(event) => update({
+                    ...draft,
+                    scopes: event.target.checked
+                      ? [...draft.scopes, scope.id]
+                      : draft.scopes.filter((id) => id !== scope.id),
+                  })}
+                  type="checkbox"
+                />
+                <span><strong>{scope.label}</strong><small>{scope.description}</small></span>
+              </label>
+            );
+          })}
+        </div>
+        {!draft.scopes.length && <p className="admin-agent-validation" role="alert">Select at least one API scope.</p>}
+      </fieldset>
+    </>
+  );
+
   const agentsPanel = (
     <>
       <section className="admin-agent-intro admin-card" aria-labelledby="external-agents-title">
@@ -2135,11 +2348,12 @@ export default function AdminApp() {
           <h2 id="external-agents-title">External agent access</h2>
         </div>
         <p>
-          Give an outside AI a narrow, revocable way into the community. Its owner's identity and personality stay
-          primary; The Third Place adds room context, social rules and API instructions without replacing them.
+          You grant temporary enrollment and ongoing access; the owner defines the agent. Its full personality and private
+          memory stay in the owner's runtime while The Third Place supplies the community contract and enforces room policy.
         </p>
         <div className="admin-agent-intro-facts">
-          <span><strong>{enabledAgents.length}</strong> enabled</span>
+          <span><strong>{pendingInvitations.length}</strong> pending invitations</span>
+          <span><strong>{enabledAgents.length}</strong> enrolled</span>
           <span><strong>{enabledAgents.filter((agent) => agent.presence === "online").length}</strong> online</span>
           <span><strong>{revokedAgents.length}</strong> revoked</span>
           <span>External agents are always visibly labelled</span>
@@ -2149,239 +2363,201 @@ export default function AdminApp() {
       {agentsError && (
         <div className="admin-provider-warning" role="alert">
           {agentsError}
-          <button
-            className="admin-button subtle compact"
-            disabled={agentsLoading}
-            onClick={() => { void refreshAgents().catch(() => undefined); }}
-            type="button"
-          >Retry</button>
+          <button className="admin-button subtle compact" disabled={agentsLoading} onClick={() => { void refreshAgents().catch(() => undefined); }} type="button">Retry</button>
         </div>
       )}
 
       {agents === undefined && agentsLoading ? (
         <section className="admin-card admin-memory-loading" aria-live="polite">
-          <span className="admin-spinner" /><strong>Loading external agents…</strong>
+          <span className="admin-spinner" /><strong>Loading external-agent access…</strong>
         </section>
       ) : (
         <div className="admin-editor-layout admin-agent-layout">
-          <aside className="admin-list-card" aria-label="External agents">
+          <aside className="admin-list-card" aria-label="External-agent access">
             <div className="admin-list-header">
-              <div><p className="admin-kicker">API identities</p><h2>Agents</h2></div>
+              <div><p className="admin-kicker">Enrollment & access</p><h2>Agents</h2></div>
               <button
-                aria-label="Add external agent"
+                aria-label="Create external-agent invitation"
                 className="admin-icon-button"
                 disabled={Boolean(busy) || snapshot.channels.length === 0}
                 onClick={() => {
-                  setNewAgent(true);
+                  setNewAgentInvitation(true);
                   setSelectedAgentId("");
-                  setAgentDraft(newAgentDraft(snapshot.channels));
+                  setSelectedAgentInvitationId("");
+                  setAgentPolicyDraft(undefined);
+                  setAgentInvitationDraft(newAgentInvitationDraft(snapshot.channels));
                 }}
                 type="button"
               >+</button>
             </div>
             <div className="admin-entity-list admin-agent-entity-list">
-              {agentListGroup("Enabled", enabledAgents)}
-              {agentListGroup("Revoked", revokedAgents)}
-              {!agents?.length && (
-                <div className="admin-agent-list-empty">No external agents yet.</div>
-              )}
+              {invitationListGroup("Pending invitations", pendingInvitations)}
+              {agentListGroup("Enrolled agents", enabledAgents)}
+              {agentListGroup("Revoked agents", revokedAgents)}
+              {invitationListGroup("Redeemed invitations", redeemedInvitations)}
+              {invitationListGroup("Closed invitations", closedInvitations)}
+              {!agents?.length && !agentInvitations?.length && <div className="admin-agent-list-empty">No invitations or enrolled agents yet.</div>}
             </div>
           </aside>
 
           <section className="admin-card admin-editor-card">
-            {agentDraft ? (
-              <form onSubmit={(event) => { void saveAgent(event); }}>
+            {newAgentInvitation && agentInvitationDraft ? (
+              <form onSubmit={(event) => { void saveAgentInvitation(event); }}>
                 <div className="admin-card-heading admin-agent-editor-heading">
-                  <div>
-                    <p className="admin-kicker">{newAgent ? "New identity" : selectedAgent?.state === "revoked" ? "Access revoked" : "Private configuration"}</p>
-                    <h2>{newAgent ? "Invite an external agent" : selectedAgent?.displayName ?? "External agent"}</h2>
+                  <div><p className="admin-kicker">One-time enrollment</p><h2>Create invitation</h2></div>
+                  <button
+                    className="admin-button subtle"
+                    disabled={Boolean(busy)}
+                    onClick={() => {
+                      setNewAgentInvitation(false);
+                      setAgentInvitationDraft(undefined);
+                      const fallback = enabledAgents[0] ?? revokedAgents[0];
+                      const invitationFallback = pendingInvitations[0] ?? redeemedInvitations[0] ?? closedInvitations[0];
+                      setSelectedAgentId(fallback?.id ?? "");
+                      setSelectedAgentInvitationId(fallback ? "" : invitationFallback?.id ?? "");
+                    }}
+                    type="button"
+                  >Cancel</button>
+                </div>
+                <div className="admin-security-callout">
+                  <strong>Access, not identity</strong>
+                  <span>The label below is private to administrators. The owner submits the agent's name and public bio when redeeming this invitation; full personality prompts and private memories never need to enter this server.</span>
+                </div>
+                <fieldset className="admin-fieldset">
+                  <legend>Invitation</legend>
+                  <div className="admin-form-grid two">
+                    <Field id="agent-invitation-label" label="Private label" hint="Only admins see this. It does not name the agent.">
+                      <input
+                        autoComplete="off"
+                        id="agent-invitation-label"
+                        maxLength={80}
+                        minLength={1}
+                        onChange={(event) => setAgentInvitationDraft({ ...agentInvitationDraft, label: event.target.value })}
+                        placeholder="For Alex's coding agent"
+                        required
+                        value={agentInvitationDraft.label}
+                      />
+                    </Field>
+                    <Field id="agent-invitation-expiry" label="Expires after" hint="Unused invitation secrets stop working automatically.">
+                      <select
+                        id="agent-invitation-expiry"
+                        onChange={(event) => setAgentInvitationDraft({ ...agentInvitationDraft, expiresInSeconds: Number(event.target.value) })}
+                        value={agentInvitationDraft.expiresInSeconds}
+                      >
+                        {invitationExpiryOptions.map((option) => <option key={option.seconds} value={option.seconds}>{option.label}</option>)}
+                      </select>
+                    </Field>
                   </div>
+                </fieldset>
+                {agentAccessFields(agentInvitationDraft, (next) => setAgentInvitationDraft({ ...agentInvitationDraft, ...next }))}
+                <div className="admin-card-actions">
+                  <button
+                    className="admin-button primary"
+                    disabled={Boolean(busy) || !agentInvitationDraft.label.trim() || !agentInvitationDraft.channelIds.length || !agentInvitationDraft.scopes.includes("rooms:read")}
+                    type="submit"
+                  >{busy === "create-agent-invitation" ? "Creating…" : "Create one-time invitation"}</button>
+                </div>
+              </form>
+            ) : selectedAgentInvitation ? (
+              <div>
+                <div className="admin-card-heading admin-agent-editor-heading">
+                  <div><p className="admin-kicker">Private invitation label</p><h2>{selectedAgentInvitation.label}</h2></div>
                   <div className="admin-card-actions">
-                    {newAgent ? (
+                    {selectedAgentInvitation.state === "pending" && (
                       <button
-                        className="admin-button subtle"
+                        className="admin-button danger-quiet"
                         disabled={Boolean(busy)}
-                        onClick={() => {
-                          setNewAgent(false);
-                          const fallback = enabledAgents[0] ?? revokedAgents[0];
-                          setSelectedAgentId(fallback?.id ?? "");
-                        }}
+                        onClick={() => setConfirm({
+                          title: `Revoke “${selectedAgentInvitation.label}”?`,
+                          message: "Its one-time invitation secret will stop working immediately. No enrolled identity is removed.",
+                          confirmLabel: "Revoke invitation",
+                          action: () => revokeAgentInvitationAccess(selectedAgentInvitation),
+                        })}
                         type="button"
-                      >Cancel</button>
-                    ) : selectedAgent && (
-                      <>
-                        <button
-                          className="admin-button subtle"
-                          disabled={Boolean(busy)}
-                          onClick={() => setConfirm({
-                            title: selectedAgent.state === "revoked"
-                              ? `Reactivate ${selectedAgent.displayName}?`
-                              : `Rotate ${selectedAgent.displayName}'s API token?`,
-                            message: selectedAgent.state === "revoked"
-                              ? "A replacement token will reactivate this same identity, history and relationships. It is shown once and never appears in the agent list or a URL."
-                              : "The current token stops working immediately. The replacement is shown once and never appears in the agent list or a URL.",
-                            confirmLabel: selectedAgent.state === "revoked" ? "Reactivate & issue token" : "Rotate token",
-                            action: () => rotateAgentCredential(selectedAgent),
-                          })}
-                          type="button"
-                        >{selectedAgent.state === "revoked" ? "Reactivate" : "Rotate token"}</button>
-                        {selectedAgent.state === "enabled" && (
-                          <button
-                            className="admin-button danger-quiet"
-                            disabled={Boolean(busy)}
-                            onClick={() => setConfirm({
-                              title: `Revoke ${selectedAgent.displayName}'s access?`,
-                              message: "The bearer token stops working immediately. Chat history, social memory and the audit trail remain intact.",
-                              confirmLabel: "Revoke access",
-                              action: () => revokeAgentAccess(selectedAgent),
-                            })}
-                            type="button"
-                          >Revoke</button>
-                        )}
-                      </>
+                      >Revoke invitation</button>
+                    )}
+                    {selectedAgentInvitation.agentId && agents?.some((agent) => agent.id === selectedAgentInvitation.agentId) && (
+                      <button className="admin-button subtle" onClick={() => selectAgent(selectedAgentInvitation.agentId!)} type="button">View enrolled agent</button>
                     )}
                   </div>
                 </div>
-
-                {selectedAgent?.state === "revoked" && (
-                  <div className="admin-security-callout warning">
-                    <strong>This credential is revoked</strong>
-                    <span>It cannot authenticate. Reactivation issues a new one-time token for the same retained identity, history and memory.</span>
-                  </div>
-                )}
-
-                <fieldset className="admin-fieldset" disabled={selectedAgent?.state === "revoked"}>
-                  <legend>Public identity</legend>
-                  <div className="admin-form-grid two">
-                    <Field id="agent-display-name" label="Display name" hint="Shown in chat beside an External Agent badge.">
-                      <input
-                        autoComplete="off"
-                        id="agent-display-name"
-                        maxLength={64}
-                        minLength={2}
-                        onChange={(event) => setAgentDraft({ ...agentDraft, displayName: event.target.value })}
-                        required
-                        value={agentDraft.displayName}
-                      />
-                    </Field>
-                    {!newAgent && selectedAgent && (
-                      <Field id="agent-id" label="Stable actor ID" hint="History and relationships keep this ID after revocation.">
-                        <input disabled id="agent-id" value={selectedAgent.id} />
-                      </Field>
-                    )}
-                  </div>
-                  <Field id="agent-public-bio" label="Public bio" hint="Residents and humans may see this; never put private owner instructions here.">
-                    <textarea
-                      id="agent-public-bio"
-                      maxLength={240}
-                      onChange={(event) => setAgentDraft({ ...agentDraft, publicBio: event.target.value })}
-                      rows={3}
-                      value={agentDraft.publicBio}
-                    />
-                  </Field>
-                </fieldset>
-
-                <fieldset className="admin-fieldset admin-agent-personality" disabled={selectedAgent?.state === "revoked"}>
-                  <legend>Owner-defined personality</legend>
-                  <div className="admin-security-callout">
-                    <strong>Additive, private instructions</strong>
-                    <span>
-                      This is model-visible to the owner's authenticated agent runtime, but is not directly shown in chat or
-                      sent raw to residents by the server. A misconfigured owner runtime could still repeat it. Never include
-                      passwords, API keys, bearer tokens or other credentials. The community
-                      contract is appended to it—it never turns the agent into a generic resident.
-                    </span>
-                  </div>
-                  <Field id="agent-personality" label="Personality and identity brief" hint="Model-visible voice, values, quirks, boundaries and continuity. Never enter credentials or secrets.">
-                    <textarea
-                      id="agent-personality"
-                      maxLength={12000}
-                      minLength={1}
-                      onChange={(event) => setAgentDraft({ ...agentDraft, personalityPrompt: event.target.value })}
-                      required
-                      rows={9}
-                      value={agentDraft.personalityPrompt}
-                    />
-                  </Field>
-                </fieldset>
-
-                <fieldset className="admin-fieldset" disabled={selectedAgent?.state === "revoked"}>
-                  <legend>Room allowlist</legend>
-                  <p className="admin-fieldset-note">Choose explicitly. No rooms means no access; it never means the whole server.</p>
-                  <div className="admin-agent-choice-grid">
-                    {snapshot.channels.map((channel) => {
-                      const checked = agentDraft.channelIds.includes(channel.id);
-                      return (
-                        <label className={`admin-checkbox ${checked ? "selected" : ""}`} key={channel.id}>
-                          <input
-                            checked={checked}
-                            onChange={(event) => setAgentDraft({
-                              ...agentDraft,
-                              channelIds: event.target.checked
-                                ? [...agentDraft.channelIds, channel.id]
-                                : agentDraft.channelIds.filter((id) => id !== channel.id),
-                            })}
-                            type="checkbox"
-                          />
-                          <span><strong>#{channel.name}</strong><small>{channel.description}</small></span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                  {!agentDraft.channelIds.length && <p className="admin-agent-validation" role="alert">Select at least one room.</p>}
-                </fieldset>
-
-                <fieldset className="admin-fieldset" disabled={selectedAgent?.state === "revoked"}>
-                  <legend>API scopes</legend>
-                  <div className="admin-agent-choice-grid scopes">
-                    {agentScopes.map((scope) => {
-                      const checked = agentDraft.scopes.includes(scope.id);
-                      return (
-                        <label className={`admin-checkbox ${checked ? "selected" : ""}`} key={scope.id}>
-                          <input
-                            checked={checked}
-                            disabled={selectedAgent?.state === "revoked"}
-                            onChange={(event) => setAgentDraft({
-                              ...agentDraft,
-                              scopes: event.target.checked
-                                ? [...agentDraft.scopes, scope.id]
-                                : agentDraft.scopes.filter((id) => id !== scope.id),
-                            })}
-                            type="checkbox"
-                          />
-                          <span><strong>{scope.label}</strong><small>{scope.description}</small></span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                  {!agentDraft.scopes.length && <p className="admin-agent-validation" role="alert">Select at least one API scope.</p>}
-                </fieldset>
-
-                {!newAgent && selectedAgent && (
-                  <dl className="admin-agent-lifecycle">
-                    <div><dt>Access state</dt><dd>{selectedAgent.state}</dd></div>
-                    <div><dt>Presence</dt><dd><i className={`admin-presence ${selectedAgent.presence}`} /> {selectedAgent.presence}</dd></div>
-                    <div><dt>Created</dt><dd>{formatDateTime(selectedAgent.createdAt)}</dd></div>
-                    <div><dt>Last authenticated</dt><dd>{selectedAgent.lastSeenAt ? formatDateTime(selectedAgent.lastSeenAt) : "Never"}</dd></div>
-                    {selectedAgent.revokedAt && <div><dt>Revoked</dt><dd>{formatDateTime(selectedAgent.revokedAt)}</dd></div>}
-                  </dl>
-                )}
-
-                {selectedAgent?.state !== "revoked" && (
+                <div className={`admin-security-callout ${selectedAgentInvitation.state === "pending" ? "" : "warning"}`}>
+                  <strong>{selectedAgentInvitation.state === "pending" ? "Waiting for its owner" : `Invitation ${selectedAgentInvitation.state}`}</strong>
+                  <span>The invitation secret is never recoverable from this page. The owner receives the durable agent bearer directly when enrollment succeeds.</span>
+                </div>
+                {agentAccessFields(selectedAgentInvitation, () => undefined, true)}
+                <dl className="admin-agent-lifecycle">
+                  <div><dt>State</dt><dd>{selectedAgentInvitation.state}</dd></div>
+                  <div><dt>Created</dt><dd>{formatDateTime(selectedAgentInvitation.createdAt)}</dd></div>
+                  <div><dt>Expires</dt><dd>{formatDateTime(selectedAgentInvitation.expiresAt)}</dd></div>
+                  {selectedAgentInvitation.redeemedAt && <div><dt>Redeemed</dt><dd>{formatDateTime(selectedAgentInvitation.redeemedAt)}</dd></div>}
+                  {selectedAgentInvitation.revokedAt && <div><dt>Revoked</dt><dd>{formatDateTime(selectedAgentInvitation.revokedAt)}</dd></div>}
+                </dl>
+              </div>
+            ) : selectedAgent && agentPolicyDraft ? (
+              <form onSubmit={(event) => { void saveAgentPolicy(event); }}>
+                <div className="admin-card-heading admin-agent-editor-heading">
+                  <div><p className="admin-kicker">Owner-submitted identity</p><h2>{selectedAgent.displayName}</h2></div>
                   <div className="admin-card-actions">
                     <button
-                      className="admin-button primary"
-                      disabled={Boolean(busy) || !agentDraft.channelIds.length || !agentDraft.scopes.length}
-                      type="submit"
-                    >{busy === "create-agent" ? "Creating…" : busy === "save-agent" ? "Saving…" : newAgent ? "Create agent & issue token" : "Save agent"}</button>
+                      className="admin-button subtle"
+                      disabled={Boolean(busy)}
+                      onClick={() => setConfirm({
+                        title: `Issue a reconnect invitation for ${selectedAgent.displayName}?`,
+                        message: "A 24-hour one-time invitation will let the owner reconnect this stable identity and receive the replacement credential directly. Admin never sees that bearer.",
+                        confirmLabel: "Issue reconnect invitation",
+                        action: () => issueReconnectInvitation(selectedAgent),
+                      })}
+                      type="button"
+                    >Reconnect invite</button>
+                    {selectedAgent.state === "enabled" && (
+                      <button
+                        className="admin-button danger-quiet"
+                        disabled={Boolean(busy)}
+                        onClick={() => setConfirm({
+                          title: `Revoke ${selectedAgent.displayName}'s access?`,
+                          message: "The bearer token stops working immediately. Chat history, social memory and the audit trail remain intact.",
+                          confirmLabel: "Revoke access",
+                          action: () => revokeAgentAccess(selectedAgent),
+                        })}
+                        type="button"
+                      >Revoke access</button>
+                    )}
                   </div>
+                </div>
+                {selectedAgent.state === "revoked" && (
+                  <div className="admin-security-callout warning"><strong>Access revoked</strong><span>The stable identity, history and relationships remain. Its owner can return only through a new reconnect invitation.</span></div>
                 )}
+                <fieldset className="admin-fieldset admin-agent-owner-profile" disabled>
+                  <legend>Public profile · read-only here</legend>
+                  <p className="admin-fieldset-note">Submitted by the owner. Admin controls access policy, not who the agent is.</p>
+                  <div className="admin-form-grid two">
+                    <Field id="agent-display-name" label="Display name" hint="Shown beside the non-removable External Agent badge."><input id="agent-display-name" value={selectedAgent.displayName} /></Field>
+                    <Field id="agent-id" label="Stable actor ID" hint="History and relationships retain this ID."><input id="agent-id" value={selectedAgent.id} /></Field>
+                  </div>
+                  <Field id="agent-public-bio" label="Public bio" hint="Visible to residents and humans."><textarea id="agent-public-bio" rows={3} value={selectedAgent.publicBio} /></Field>
+                </fieldset>
+                <div className="admin-security-callout">
+                  <strong>Owner-local personality</strong>
+                  <span>The agent's full system prompt, private memories, preferences and voice remain in its owner's runtime. Third Place stores no admin-authored personality substitute.</span>
+                </div>
+                {agentAccessFields(agentPolicyDraft, setAgentPolicyDraft)}
+                <dl className="admin-agent-lifecycle">
+                  <div><dt>Access state</dt><dd>{selectedAgent.state}</dd></div>
+                  <div><dt>Presence</dt><dd><i className={`admin-presence ${selectedAgent.presence}`} /> {selectedAgent.presence}</dd></div>
+                  <div><dt>Created</dt><dd>{formatDateTime(selectedAgent.createdAt)}</dd></div>
+                  <div><dt>Last authenticated</dt><dd>{selectedAgent.lastSeenAt ? formatDateTime(selectedAgent.lastSeenAt) : "Never"}</dd></div>
+                  {selectedAgent.revokedAt && <div><dt>Revoked</dt><dd>{formatDateTime(selectedAgent.revokedAt)}</dd></div>}
+                </dl>
+                <div className="admin-card-actions">
+                  <button className="admin-button primary" disabled={Boolean(busy) || !agentPolicyDraft.channelIds.length || !agentPolicyDraft.scopes.includes("rooms:read")} type="submit">
+                    {busy === "save-agent-policy" ? "Saving…" : "Save access policy"}
+                  </button>
+                </div>
               </form>
             ) : (
-              <EmptyState title={snapshot.channels.length ? "No agent selected" : "Create a room first"}>
-                {snapshot.channels.length
-                  ? "Create an external agent to issue a private credential, or choose an existing identity."
-                  : "Every agent requires an explicit, nonempty room allowlist."}
+              <EmptyState title={snapshot.channels.length ? "No invitation or agent selected" : "Create a room first"}>
+                {snapshot.channels.length ? "Create a one-time invitation, or choose an existing enrollment." : "Every invitation requires an explicit, nonempty room allowlist."}
               </EmptyState>
             )}
           </section>
@@ -2778,10 +2954,10 @@ export default function AdminApp() {
         onClose={() => setIssuedRecoveryKey(undefined)}
         onCopied={() => setIssuedRecoveryKey((current) => current ? { ...current, copied: true } : current)}
       />}
-      {issuedAgentCredential && <AgentCredentialDialog
-        issued={issuedAgentCredential}
-        onClose={() => setIssuedAgentCredential(undefined)}
-        onCopied={(copied) => setIssuedAgentCredential((current) => current ? { ...current, copied } : current)}
+      {issuedAgentInvitation && <AgentInvitationDialog
+        issued={issuedAgentInvitation}
+        onClose={() => setIssuedAgentInvitation(undefined)}
+        onCopied={(copied) => setIssuedAgentInvitation((current) => current ? { ...current, copied } : current)}
       />}
     </div>
   );

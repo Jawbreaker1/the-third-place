@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AdminExternalAgentWrite } from "../shared/adminTypes";
+import type {
+  AdminExternalAgentInvitationWrite,
+  AdminExternalAgentPolicyWrite,
+} from "../shared/adminTypes";
 import {
-  createAdminAgent,
+  createAdminAgentInvitation,
+  createAdminAgentReconnectInvitation,
   deleteAdminCodexSession,
   deleteAdminMemoryActor,
   deleteAdminMemoryItem,
@@ -13,13 +17,13 @@ import {
   getAdminMemoryActor,
   issueAdminHumanRecoveryKey,
   patchAdminBehavior,
-  patchAdminAgent,
+  patchAdminAgentPolicy,
   patchAdminChannelFeed,
   patchAdminLlmProvider,
   patchAdminMemoryItem,
   patchAdminPersona,
   revokeAdminAgent,
-  rotateAdminAgentToken,
+  revokeAdminAgentInvitation,
   startAdminCodexLogin,
 } from "./adminApi";
 
@@ -27,7 +31,6 @@ const adminAgent = {
   id: "agent-cato",
   displayName: "Cato",
   publicBio: "A curious owner-operated agent.",
-  personalityPrompt: "Be dry, curious and concrete without losing your own established voice.",
   channelIds: ["lobby", "ai-lab"],
   scopes: ["rooms:read", "messages:write", "reactions:write"],
   state: "enabled",
@@ -35,42 +38,57 @@ const adminAgent = {
   createdAt: "2026-07-22T12:00:00.000Z",
 } as const;
 
+const adminInvitation = {
+  id: "agent-invite-cato",
+  label: "Cato's owner",
+  channelIds: ["lobby", "ai-lab"],
+  scopes: ["rooms:read", "messages:write", "reactions:write"],
+  state: "pending",
+  createdAt: "2026-07-22T11:00:00.000Z",
+  expiresAt: "2026-07-23T11:00:00.000Z",
+} as const;
+
 describe("admin external-agent API", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("lists private agent configuration through the authenticated admin boundary", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ agents: [adminAgent] }), { status: 200 }));
+  it("lists owner-submitted agents and token-free invitations through the authenticated admin boundary", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      agents: [{ ...adminAgent, personalityPrompt: "must-not-enter-admin-state", tokenDigest: "private-digest" }],
+      invitations: [{ ...adminInvitation, tokenDigest: "private-invitation-digest" }],
+    }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(getAdminAgents()).resolves.toEqual({ agents: [adminAgent] });
+    const result = await getAdminAgents();
+    expect(result).toEqual({ agents: [adminAgent], invitations: [adminInvitation] });
+    expect(JSON.stringify(result)).not.toContain("must-not-enter-admin-state");
+    expect(JSON.stringify(result)).not.toContain("private-digest");
     expect(fetchMock).toHaveBeenCalledWith("/api/admin/agents", expect.objectContaining({
       credentials: "same-origin",
       headers: expect.objectContaining({ Accept: "application/json" }),
     }));
   });
 
-  it("creates an explicitly scoped agent and returns its one-time credential", async () => {
-    const token = "ttp_agent_one-time-secret";
+  it("creates a scoped invitation and returns only its one-time enrollment secret", async () => {
+    const token = "ttp_invite_one-time-secret";
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      agent: adminAgent,
+      invitation: adminInvitation,
       token,
-      bootstrapUrl: "/api/agents/v1/bootstrap",
-      handoffPrompt: "Keep your existing identity; append the community contract.",
+      enrollmentUrl: "/api/agents/v1/enroll",
+      handoffPrompt: "Submit your owner-defined public identity during enrollment.",
     }), { status: 201 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const write: AdminExternalAgentWrite = {
-      displayName: adminAgent.displayName,
-      publicBio: adminAgent.publicBio,
-      personalityPrompt: adminAgent.personalityPrompt,
-      channelIds: [...adminAgent.channelIds],
-      scopes: [...adminAgent.scopes],
+    const write: AdminExternalAgentInvitationWrite = {
+      label: adminInvitation.label,
+      expiresInSeconds: 86_400,
+      channelIds: [...adminInvitation.channelIds],
+      scopes: [...adminInvitation.scopes],
     };
-    await expect(createAdminAgent(write)).resolves.toMatchObject({ token, agent: adminAgent });
+    await expect(createAdminAgentInvitation(write)).resolves.toMatchObject({ token, invitation: adminInvitation });
 
-    expect(fetchMock).toHaveBeenCalledWith("/api/admin/agents", expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/agent-invitations", expect.objectContaining({
       method: "POST",
       credentials: "same-origin",
       body: JSON.stringify(write),
@@ -78,62 +96,72 @@ describe("admin external-agent API", () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain(token);
   });
 
-  it("rejects a one-time secret response that has no valid agent projection", async () => {
+  it("rejects a one-time secret response that has no valid invitation projection", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      token: "ttp_agent_orphan-secret",
-      bootstrapUrl: "/api/agents/v1/bootstrap",
+      token: "ttp_invite_orphan-secret",
+      enrollmentUrl: "/api/agents/v1/enroll",
     }), { status: 201 })));
 
-    await expect(createAdminAgent({
-      displayName: "Cato",
-      publicBio: "",
-      personalityPrompt: "Dry and curious.",
+    await expect(createAdminAgentInvitation({
+      label: "Cato's owner",
+      expiresInSeconds: 3_600,
       channelIds: ["lobby"],
       scopes: ["rooms:read"],
     })).rejects.toMatchObject({ name: "AdminApiError", status: 502 });
   });
 
-  it("updates configuration without ever sending or expecting a bearer token", async () => {
+  it("updates policy without letting administration rewrite the owner-submitted profile", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ agent: adminAgent }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
-    const write: AdminExternalAgentWrite = {
-      displayName: "Cato Prime",
-      publicBio: adminAgent.publicBio,
-      personalityPrompt: adminAgent.personalityPrompt,
+    const write: AdminExternalAgentPolicyWrite = {
       channelIds: ["lobby"],
       scopes: ["rooms:read", "messages:write"],
     };
 
-    await expect(patchAdminAgent("agent/cato", write)).resolves.toEqual(adminAgent);
+    await expect(patchAdminAgentPolicy("agent/cato", write)).resolves.toEqual(adminAgent);
     expect(fetchMock).toHaveBeenCalledWith("/api/admin/agents/agent%2Fcato", expect.objectContaining({
       method: "PATCH",
       body: JSON.stringify(write),
     }));
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toEqual(write);
     expect((fetchMock.mock.calls[0]?.[1] as RequestInit).headers).not.toHaveProperty("Authorization");
   });
 
-  it("revokes access and rotates a token only through explicit POST actions", async () => {
+  it("revokes access and issues a reconnect invitation through explicit POST actions", async () => {
     const revoked = { ...adminAgent, state: "revoked", revokedAt: "2026-07-22T13:00:00.000Z" } as const;
-    const token = "ttp_agent_replacement-secret";
+    const revokedInvitation = { ...adminInvitation, state: "revoked", revokedAt: "2026-07-22T13:00:00.000Z" } as const;
+    const token = "ttp_invite_reconnect-secret";
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ agent: revoked }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ invitation: revokedInvitation }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        agent: adminAgent,
+        invitation: { ...adminInvitation, id: "agent-invite-reconnect" },
         token,
-        bootstrapUrl: "https://example.test/api/agents/v1/bootstrap",
+        enrollmentUrl: "https://example.test/api/agents/v1/enroll",
       }), { status: 201 }));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(revokeAdminAgent("agent/cato")).resolves.toEqual(revoked);
-    await expect(rotateAdminAgentToken("agent/cato")).resolves.toMatchObject({ token });
+    await expect(revokeAdminAgentInvitation("agent-invite-cato")).resolves.toEqual(revokedInvitation);
+    await expect(createAdminAgentReconnectInvitation("agent/cato", {
+      label: "Reconnect Cato",
+      expiresInSeconds: 21_600,
+    })).resolves.toMatchObject({ token });
 
     expect(fetchMock.mock.calls[0]).toEqual([
       "/api/admin/agents/agent%2Fcato/revoke",
       expect.objectContaining({ method: "POST", body: "{}" }),
     ]);
     expect(fetchMock.mock.calls[1]).toEqual([
-      "/api/admin/agents/agent%2Fcato/rotate-token",
+      "/api/admin/agent-invitations/agent-invite-cato/revoke",
       expect.objectContaining({ method: "POST", body: "{}" }),
+    ]);
+    expect(fetchMock.mock.calls[2]).toEqual([
+      "/api/admin/agents/agent%2Fcato/reconnect-invitations",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ label: "Reconnect Cato", expiresInSeconds: 21_600 }),
+      }),
     ]);
     expect(fetchMock.mock.calls.map(([url]) => String(url)).join(" ")).not.toContain(token);
   });

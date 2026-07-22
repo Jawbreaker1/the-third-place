@@ -35,13 +35,21 @@ import type {
 import { isPublicReactionEmoji } from "../shared/reactions.js";
 import type {
   AdminExternalAgent,
-  AdminExternalAgentCredential,
-  AdminExternalAgentWrite,
+  AdminExternalAgentInvitation,
+  AdminExternalAgentInvitationWrite,
+  AdminExternalAgentList,
+  AdminExternalAgentPolicyWrite,
+  AdminExternalAgentReconnectInvitationWrite,
+  AdminIssuedExternalAgentInvitation,
   AdminHumanMember,
 } from "../shared/adminTypes.js";
 import {
-  createExternalAgentInputSchema,
+  createExternalAgentInvitationInputSchema,
+  externalAgentAccessPolicyInputSchema,
+  externalAgentPublicProfileInputSchema,
   type AuthenticatedExternalAgent,
+  type CanonicalUpdateExternalAgentPublicProfileInput,
+  type ExternalAgentInvitationSummary,
   type ExternalAgentScope,
   type ExternalAgentSummary,
 } from "../shared/agentTypes.js";
@@ -49,7 +57,7 @@ import { displayNameGlyph, normalizeDisplayName, validDisplayName } from "../sha
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { HUMAN_IDLE_AFTER_MS } from "../shared/presence.js";
 import { AdminAuthManager } from "./adminAuth.js";
-import { AgentAccessStore } from "./agentAccessStore.js";
+import { AgentAccessStore, AgentAccessStoreCapacityError } from "./agentAccessStore.js";
 import {
   createExternalAgentRouter,
   EXTERNAL_AGENT_API_BASE_PATH,
@@ -1474,7 +1482,6 @@ const projectAdminExternalAgent = (agent: AuthenticatedExternalAgent): AdminExte
   id: agent.id,
   displayName: agent.displayName,
   publicBio: agent.publicBio,
-  personalityPrompt: agent.personalityPrompt,
   channelIds: [...agent.channelIds],
   scopes: [...agent.scopes],
   state: agent.revokedAt ? "revoked" : "enabled",
@@ -1490,16 +1497,33 @@ const projectAdminExternalAgent = (agent: AuthenticatedExternalAgent): AdminExte
   ...(agent.revokedAt ? { revokedAt: agent.revokedAt } : {}),
 });
 
+const projectAdminExternalAgentInvitation = (
+  invitation: ExternalAgentInvitationSummary,
+): AdminExternalAgentInvitation => ({
+  id: invitation.id,
+  label: invitation.adminLabel,
+  channelIds: [...invitation.channelIds],
+  scopes: [...invitation.scopes],
+  state: invitation.status,
+  createdAt: invitation.createdAt,
+  expiresAt: invitation.expiresAt,
+  agentId: invitation.agentId,
+  ...(invitation.redeemedAt ? { redeemedAt: invitation.redeemedAt } : {}),
+  ...(invitation.revokedAt ? { revokedAt: invitation.revokedAt } : {}),
+});
+
 const listAdminExternalAgents = (): AdminExternalAgent[] => agentAccessStore.list().flatMap((summary) => {
   const detail = agentAccessStore.get(summary.id);
   return detail ? [projectAdminExternalAgent(detail)] : [];
 });
 
-const validateExternalAgentWrite = (
-  input: AdminExternalAgentWrite,
-  currentAgentId?: string,
+const listAdminExternalAgentInvitations = (): AdminExternalAgentInvitation[] =>
+  agentAccessStore.listInvitations().map(projectAdminExternalAgentInvitation);
+
+const validateExternalAgentAccessPolicy = (
+  input: AdminExternalAgentPolicyWrite,
 ) => {
-  const parsed = createExternalAgentInputSchema.parse(input);
+  const parsed = externalAgentAccessPolicyInputSchema.parse(input);
   if (!parsed.scopes.includes("rooms:read")) {
     throw new AdminStateError(
       400,
@@ -1512,6 +1536,14 @@ const validateExternalAgentWrite = (
   if (unknownChannelId) {
     throw new AdminStateError(409, "AGENT_ROOM_NOT_FOUND", `The room #${unknownChannelId} is not active.`);
   }
+  return parsed;
+};
+
+const validateExternalAgentPublicProfile = (
+  input: { displayName: string; publicBio: string },
+  currentAgentId?: string,
+) => {
+  const parsed = externalAgentPublicProfileInputSchema.parse(input);
   const identityKey = safeNameKey(parsed.displayName);
   const reservedParticipant = [
     ...PERSONAS.map((persona) => ({ id: persona.id, name: persona.name })),
@@ -1529,21 +1561,26 @@ const validateExternalAgentWrite = (
   return parsed;
 };
 
-const externalAgentBootstrapUrl = (): string => {
-  const path = `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap`;
-  return publicOrigin ? new URL(path, `${publicOrigin}/`).toString() : path;
+const invitationExpiryMinutes = (seconds: number): number => {
+  const parsed = z.number().int().min(5 * 60).max(24 * 60 * 60)
+    .refine((value) => value % 60 === 0, "Invitation expiry must use whole minutes")
+    .parse(seconds);
+  return parsed / 60;
 };
 
-const projectIssuedExternalAgent = (issued: {
-  agent: AuthenticatedExternalAgent;
+const projectIssuedExternalAgentInvitation = (issued: {
+  invitation: ExternalAgentInvitationSummary;
   token: string;
-}): AdminExternalAgentCredential => ({
-  agent: projectAdminExternalAgent(issued.agent),
+}): AdminIssuedExternalAgentInvitation => ({
+  invitation: projectAdminExternalAgentInvitation(issued.invitation),
   token: issued.token,
-  bootstrapUrl: externalAgentBootstrapUrl(),
+  enrollmentUrl: publicOrigin
+    ? new URL(`${EXTERNAL_AGENT_API_BASE_PATH}/enroll`, `${publicOrigin}/`).toString()
+    : `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
   handoffPrompt:
-    "Keep your existing owner-defined identity and personality. Fetch the authenticated bootstrap document, " +
-    "append its Third Place community instructions, read current context, and then choose naturally whether to speak, reply, react, or stay quiet.",
+    "Keep the full owner-defined system prompt, personality and memories in your own runtime. Redeem this invitation " +
+    "with a public name and bio, store the returned agent bearer outside model context, then append the authenticated " +
+    "Third Place community contract without replacing the owner's identity.",
 });
 
 const publishExternalAgentCatalog = (): void => {
@@ -1580,42 +1617,55 @@ const finishExternalAgentAuthorityMutation = (agentId: string): void => {
 };
 
 const externalAgentAdmin = {
-  list: listAdminExternalAgents,
-  create: async (input: AdminExternalAgentWrite): Promise<AdminExternalAgentCredential> => {
-    // Agent and human names share one public namespace. Validate and persist
-    // under the same global identity transaction used by account/guest
-    // creation so two concurrent requests cannot reserve the same name.
-    return await identityMutations.run(async () => {
-      const issued = await agentAccessStore.create(validateExternalAgentWrite(input));
-      publishExternalAgentCatalog();
-      return projectIssuedExternalAgent(issued);
+  list: (): AdminExternalAgentList => ({
+    agents: listAdminExternalAgents(),
+    invitations: listAdminExternalAgentInvitations(),
+  }),
+  createInvitation: async (
+    input: AdminExternalAgentInvitationWrite,
+  ): Promise<AdminIssuedExternalAgentInvitation> => await identityMutations.run(async () => {
+    const access = validateExternalAgentAccessPolicy({
+      channelIds: input.channelIds,
+      scopes: input.scopes,
     });
-  },
-  update: async (
+    const canonical = createExternalAgentInvitationInputSchema.parse({
+      purpose: "enroll",
+      adminLabel: input.label,
+      channelIds: access.channelIds,
+      scopes: access.scopes,
+      expiresInMinutes: invitationExpiryMinutes(input.expiresInSeconds),
+    });
+    const issued = await agentAccessStore.createInvitation(canonical);
+    if (!issued) {
+      throw new AdminStateError(409, "AGENT_INVITATION_CONFLICT", "An open invitation already exists for that actor.");
+    }
+    return projectIssuedExternalAgentInvitation(issued);
+  }),
+  revokeInvitation: async (
+    invitationId: string,
+  ): Promise<AdminExternalAgentInvitation | undefined> => await identityMutations.run(async () => {
+    const invitation = await agentAccessStore.revokeInvitation(invitationId);
+    return invitation ? projectAdminExternalAgentInvitation(invitation) : undefined;
+  }),
+  updatePolicy: async (
     agentId: string,
-    input: AdminExternalAgentWrite,
-  ): Promise<AdminExternalAgent | undefined> => {
-    return await identityMutations.run(async () => {
+    input: AdminExternalAgentPolicyWrite,
+  ): Promise<AdminExternalAgent | undefined> => await identityMutations.run(async () => {
+    const canonical = validateExternalAgentAccessPolicy(input);
+    return await runExternalAgentMutation(agentId, async () => {
       if (!agentAccessStore.get(agentId)) return undefined;
-      // Revalidate after entering the shared identity transaction. A human or
-      // another agent may have claimed this normalized name while the admin
-      // request was waiting.
-      const canonical = validateExternalAgentWrite(input, agentId);
-      return await runExternalAgentMutation(agentId, async () => {
-        if (!agentAccessStore.get(agentId)) return undefined;
-        beginExternalAgentAuthorityMutation(agentId);
-        try {
-          const updated = await agentAccessStore.update(agentId, canonical);
-          if (!updated) return undefined;
-          publishExternalAgentCatalog();
-          return projectAdminExternalAgent(updated);
-        } finally {
-          finishExternalAgentAuthorityMutation(agentId);
-        }
-      });
+      beginExternalAgentAuthorityMutation(agentId);
+      try {
+        const updated = await agentAccessStore.updateAccess(agentId, canonical);
+        if (!updated) return undefined;
+        publishExternalAgentCatalog();
+        return projectAdminExternalAgent(updated);
+      } finally {
+        finishExternalAgentAuthorityMutation(agentId);
+      }
     });
-  },
-  revoke: async (agentId: string): Promise<AdminExternalAgent | undefined> => {
+  }),
+  revoke: async (agentId: string): Promise<AdminExternalAgent | undefined> => await identityMutations.run(async () => {
     if (!agentAccessStore.get(agentId)) return undefined;
     return await runExternalAgentMutation(agentId, async () => {
       if (!agentAccessStore.get(agentId)) return undefined;
@@ -1631,22 +1681,35 @@ const externalAgentAdmin = {
         finishExternalAgentAuthorityMutation(agentId);
       }
     });
-  },
-  rotate: async (agentId: string): Promise<AdminExternalAgentCredential | undefined> => {
-    if (!agentAccessStore.get(agentId)) return undefined;
-    return await runExternalAgentMutation(agentId, async () => {
-      if (!agentAccessStore.get(agentId)) return undefined;
-      beginExternalAgentAuthorityMutation(agentId);
-      try {
-        const issued = await agentAccessStore.rotate(agentId);
-        if (!issued) return undefined;
-        publishExternalAgentCatalog();
-        return projectIssuedExternalAgent(issued);
-      } finally {
-        finishExternalAgentAuthorityMutation(agentId);
-      }
+  }),
+  createReconnectInvitation: async (
+    agentId: string,
+    input: AdminExternalAgentReconnectInvitationWrite,
+  ): Promise<AdminIssuedExternalAgentInvitation | undefined> => await identityMutations.run(async () => {
+    const current = agentAccessStore.get(agentId);
+    if (!current) return undefined;
+    const access = validateExternalAgentAccessPolicy({
+      channelIds: current.channelIds,
+      scopes: current.scopes,
     });
-  },
+    const canonical = createExternalAgentInvitationInputSchema.parse({
+      purpose: "reconnect",
+      agentId,
+      adminLabel: input.label,
+      channelIds: access.channelIds,
+      scopes: access.scopes,
+      expiresInMinutes: invitationExpiryMinutes(input.expiresInSeconds),
+    });
+    const issued = await agentAccessStore.createInvitation(canonical);
+    if (!issued) {
+      throw new AdminStateError(
+        409,
+        "AGENT_INVITATION_PENDING",
+        "That external agent already has an open reconnect invitation.",
+      );
+    }
+    return projectIssuedExternalAgentInvitation(issued);
+  }),
 };
 
 const socialMemoryAdmin = new SocialMemoryAdmin({
@@ -1862,6 +1925,20 @@ adminState.setHooks({
         `Remove #${blockedGrant.channelId} from external agent ${blockedGrant.agent.displayName} before deleting the room.`,
       );
     }
+    const blockedInvitation = agentAccessStore.listInvitations().flatMap((invitation) =>
+      invitation.status === "pending" && invitation.purpose === "enroll"
+        ? invitation.channelIds
+          .filter((channelId) => !retainedChannelIds.has(channelId))
+          .map((channelId) => ({ invitation, channelId }))
+        : [],
+    )[0];
+    if (blockedInvitation) {
+      throw new AdminStateError(
+        409,
+        "CHANNEL_GRANTED_TO_AGENT_INVITATION",
+        `Revoke the pending external-agent invitation ${blockedInvitation.invitation.adminLabel} before deleting #${blockedInvitation.channelId}.`,
+      );
+    }
   },
   validatePersonaIds: (personaIds) => {
     const result = voiceRooms.validatePersonaIds(personaIds);
@@ -1953,6 +2030,7 @@ app.use("/api/admin", createAdminRouter({
   },
   socialMemory: socialMemoryAdmin,
   forgetHumanActor,
+  runCatalogMutation: (operation) => identityMutations.run(operation),
 }));
 
 const externalAgentFailure = (
@@ -2012,8 +2090,122 @@ const noteExternalAgentPresence = (
     externalAgentPresence.heartbeat(agentId, status));
 };
 
+const invalidExternalAgentInvitation = (): ExternalAgentApiFailure => externalAgentFailure(
+  401,
+  "INVALID_INVITATION",
+  "A valid, unexpired and unused external-agent invitation is required.",
+);
+
+const enrollExternalAgent = async (
+  invitationToken: string,
+  profileInput: { displayName: string; publicBio: string },
+) => identityMutations.run(async () => {
+  // Re-authenticate only after entering the global identity transaction. This
+  // serializes name reservation with humans, residents and other agents, while
+  // redeemInvitation performs the final token check and consume/create commit
+  // atomically inside the credential store's own write queue.
+  const invitation = agentAccessStore.authenticateInvitation(invitationToken);
+  if (!invitation) return invalidExternalAgentInvitation();
+  const reconnectTarget = invitation.purpose === "reconnect"
+    ? agentAccessStore.get(invitation.agentId)
+    : undefined;
+  if (invitation.purpose === "reconnect" && !reconnectTarget) {
+    return invalidExternalAgentInvitation();
+  }
+  try {
+    const effectivePolicy = reconnectTarget ?? invitation;
+    validateExternalAgentAccessPolicy({
+      channelIds: effectivePolicy.channelIds,
+      scopes: effectivePolicy.scopes,
+    });
+    const profile = validateExternalAgentPublicProfile(profileInput, reconnectTarget?.id);
+
+    const redeem = async () => {
+      const mutatingExistingActor = Boolean(reconnectTarget);
+      if (mutatingExistingActor) beginExternalAgentAuthorityMutation(invitation.agentId);
+      try {
+        const redeemed = await agentAccessStore.redeemInvitation(invitationToken, profile);
+        if (!redeemed) return invalidExternalAgentInvitation();
+        if (mutatingExistingActor) externalAgentPresence.forget(invitation.agentId);
+        publishExternalAgentCatalog();
+        return { ok: true as const, value: { agent: redeemed.agent, token: redeemed.token } };
+      } finally {
+        if (mutatingExistingActor) finishExternalAgentAuthorityMutation(invitation.agentId);
+      }
+    };
+
+    return reconnectTarget
+      ? await runExternalAgentMutation(invitation.agentId, redeem)
+      : await redeem();
+  } catch (error) {
+    if (error instanceof AdminStateError) {
+      return externalAgentFailure(
+        error.status === 400 ? 400 : error.status === 409 ? 409 : 503,
+        error.code,
+        error.message,
+      );
+    }
+    if (error instanceof z.ZodError) {
+      return externalAgentFailure(400, "INVALID_INPUT", "The public external-agent profile is invalid.");
+    }
+    if (error instanceof AgentAccessStoreCapacityError) {
+      return externalAgentFailure(409, error.code, error.message);
+    }
+    throw error;
+  }
+});
+
+const updateExternalAgentPublicProfile = async (
+  admitted: AuthenticatedExternalAgent,
+  profilePatch: CanonicalUpdateExternalAgentPublicProfileInput,
+) => identityMutations.run(async () => {
+  const current = agentAccessStore.get(admitted.id);
+  if (!current || current.revokedAt || current.updatedAt !== admitted.updatedAt) {
+    return externalAgentAuthorityChanged();
+  }
+  try {
+    const canonical = validateExternalAgentPublicProfile({
+      displayName: profilePatch.displayName ?? current.displayName,
+      publicBio: profilePatch.publicBio ?? current.publicBio,
+    }, admitted.id);
+    const canonicalPatch: CanonicalUpdateExternalAgentPublicProfileInput = {
+      ...(profilePatch.displayName !== undefined ? { displayName: canonical.displayName } : {}),
+      ...(profilePatch.publicBio !== undefined ? { publicBio: canonical.publicBio } : {}),
+    };
+    return await runExternalAgentMutation(admitted.id, async () => {
+      const latest = agentAccessStore.get(admitted.id);
+      if (!latest || latest.revokedAt || latest.updatedAt !== admitted.updatedAt) {
+        return externalAgentAuthorityChanged();
+      }
+      beginExternalAgentAuthorityMutation(admitted.id);
+      try {
+        const updated = await agentAccessStore.updateProfile(admitted.id, canonicalPatch);
+        if (!updated) return externalAgentAuthorityChanged();
+        publishExternalAgentCatalog();
+        return { ok: true as const, value: updated };
+      } finally {
+        finishExternalAgentAuthorityMutation(admitted.id);
+      }
+    });
+  } catch (error) {
+    if (error instanceof AdminStateError) {
+      return externalAgentFailure(
+        error.status === 400 ? 400 : error.status === 409 ? 409 : 503,
+        error.code,
+        error.message,
+      );
+    }
+    if (error instanceof z.ZodError) {
+      return externalAgentFailure(400, "INVALID_INPUT", "The public external-agent profile is invalid.");
+    }
+    throw error;
+  }
+});
+
 app.use(EXTERNAL_AGENT_API_BASE_PATH, createExternalAgentRouter({
   access: agentAccessStore,
+  enroll: enrollExternalAgent,
+  updateProfile: updateExternalAgentPublicProfile,
   publicOrigin,
   apiBasePath: EXTERNAL_AGENT_API_BASE_PATH,
   onAuthenticated: noteExternalAgentAuthenticated,
@@ -2729,6 +2921,18 @@ app.post("/api/auth/register", async (request, response) => {
   }
 
   const attempted = await runAccountCrypto(() => identityMutations.run(async () => {
+    // Revalidate the shared public namespace after obtaining the same global
+    // transaction used by agent enrollment and Admin resident edits. The
+    // optimistic check above is only an early rejection path.
+    if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey) ||
+        externalAgentReservingName(identityKey)) {
+      return {
+        ok: false as const,
+        status: 409,
+        code: "NAME_RESERVED",
+        error: "That display name belongs to another community participant.",
+      };
+    }
     const existingProfile = humanMemory.listProfiles().find((profile) =>
       safeNameKey(profile.member.name) === identityKey
     );
@@ -4076,13 +4280,24 @@ const humanMemoryLoad = await humanMemory.load();
 for (const summary of agentAccessStore.list()) {
   const agent = agentAccessStore.get(summary.id);
   if (!agent) throw new Error(`External-agent catalog lost ${summary.id} during startup validation.`);
-  validateExternalAgentWrite({
+  validateExternalAgentPublicProfile({
     displayName: agent.displayName,
     publicBio: agent.publicBio,
-    personalityPrompt: agent.personalityPrompt,
+  }, agent.id);
+  validateExternalAgentAccessPolicy({
     channelIds: agent.channelIds,
     scopes: agent.scopes,
-  }, agent.id);
+  });
+}
+for (const invitation of agentAccessStore.listInvitations()) {
+  if (invitation.status !== "pending") continue;
+  const effectivePolicy = invitation.purpose === "reconnect"
+    ? agentAccessStore.get(invitation.agentId) ?? invitation
+    : invitation;
+  validateExternalAgentAccessPolicy({
+    channelIds: effectivePolicy.channelIds,
+    scopes: effectivePolicy.scopes,
+  });
 }
 adminState.validateActiveCatalog();
 await store.load();

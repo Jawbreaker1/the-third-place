@@ -27,6 +27,7 @@ interface DispatchOptions {
   body?: unknown;
   remoteAddress?: string;
   encrypted?: boolean;
+  xForwardedProto?: string;
 }
 
 interface DispatchResult {
@@ -53,6 +54,7 @@ const dispatch = async (app: Express, options: DispatchOptions): Promise<Dispatc
       ...(options.authorization ? { authorization: options.authorization } : {}),
       ...(options.cookie ? { cookie: options.cookie } : {}),
       ...(options.origin ? { origin: options.origin } : {}),
+      ...(options.xForwardedProto ? { "x-forwarded-proto": options.xForwardedProto } : {}),
       ...(options.body !== undefined ? { "content-type": "application/json" } : {}),
     };
     (request as IncomingMessage & { body?: unknown }).body = options.body;
@@ -76,12 +78,13 @@ const dispatch = async (app: Express, options: DispatchOptions): Promise<Dispatc
     app.handle(request, response, reject);
   });
 
-const TOKEN = "owner-secret-token";
+const TOKEN = `ttp_agent_${"A".repeat(43)}`;
+const INVITATION_TOKEN = `ttp_invite_${"B".repeat(43)}`;
+const PRIVATE_PERSONALITY_CANARY = "owner-private-personality-must-never-cross-the-api";
 const AGENT: AuthenticatedExternalAgent = {
   id: "agent-owner-defined",
   displayName: "Patchwork Finch",
   publicBio: "A dry-witted field researcher from outside the server.",
-  personalityPrompt: "Speak with my owner's patient curiosity, clipped humour, and dislike of performative certainty.",
   channelIds: ["lobby"],
   scopes: ["rooms:read", "messages:write"],
   createdAt: "2026-07-22T08:00:00.000Z",
@@ -179,6 +182,24 @@ const dependencies = (
     authenticate: (token) => token === TOKEN ? { ...AGENT, channelIds: [...AGENT.channelIds], scopes: [...AGENT.scopes] } : undefined,
     touch: async (agentId) => agentId === AGENT.id ? { ...AGENT, channelIds: [...AGENT.channelIds], scopes: [...AGENT.scopes] } : undefined,
   },
+  enroll: async (invitationToken, profile) => invitationToken === INVITATION_TOKEN
+    ? {
+      ok: true,
+      value: {
+        agent: { ...AGENT, ...profile, channelIds: [...AGENT.channelIds], scopes: [...AGENT.scopes] },
+        token: TOKEN,
+      },
+    }
+    : {
+      ok: false,
+      status: 401,
+      code: "INVALID_INVITATION",
+      error: "A valid, unexpired and unused external-agent invitation is required.",
+    },
+  updateProfile: async (agent, profile) => ({
+    ok: true,
+    value: { ...agent, ...profile, updatedAt: "2026-07-22T08:04:00.000Z" },
+  }),
   getBootstrapState: () => ({
     ok: true,
     value: {
@@ -254,6 +275,19 @@ describe("external-agent HTTP API", () => {
     });
     expect(cookieOnly.status).toBe(401);
 
+    const invitationAsBearer = await dispatch(app, {
+      method: "GET",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap`,
+      authorization: `Bearer ${INVITATION_TOKEN}`,
+    });
+    const agentTokenAsInvitation = await dispatch(app, {
+      method: "GET",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap`,
+      authorization: `Invite ${TOKEN}`,
+    });
+    expect(invitationAsBearer.status).toBe(401);
+    expect(agentTokenAsInvitation.status).toBe(401);
+
     const queryCredential = await dispatch(app, {
       method: "GET",
       path: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap?access_token=${encodeURIComponent(TOKEN)}`,
@@ -273,7 +307,223 @@ describe("external-agent HTTP API", () => {
     expect(getBootstrapState).not.toHaveBeenCalled();
   });
 
-  it("keeps the owner's private personality first while appending the bounded community contract", async () => {
+  it("redeems a header-only invitation into a public profile and one-time bearer", async () => {
+    const enroll = vi.fn(dependencies().enroll);
+    const app = application({ enroll });
+    const result = await dispatch(app, {
+      method: "POST",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+      authorization: `Invite ${INVITATION_TOKEN}`,
+      body: {
+        displayName: "  Patchwork Finch  ",
+        publicBio: "  A curious visitor.\u0000  ",
+      },
+    });
+
+    expect(result.status).toBe(201);
+    expect(result.headers["cache-control"]).toContain("no-store");
+    expect(result.body).toMatchObject({
+      ok: true,
+      protocolVersion: EXTERNAL_AGENT_API_VERSION,
+      agent: {
+        id: AGENT.id,
+        displayName: "Patchwork Finch",
+        publicBio: "A curious visitor.",
+        channelIds: ["lobby"],
+      },
+      token: TOKEN,
+      bootstrapPath: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap`,
+    });
+    expect(enroll).toHaveBeenCalledWith(INVITATION_TOKEN, {
+      displayName: "Patchwork Finch",
+      publicBio: "A curious visitor.",
+    });
+    expect(JSON.stringify(result.body)).not.toContain("personalityPrompt");
+  });
+
+  it("makes missing, replayed and wrong-class invitation credentials indistinguishable", async () => {
+    const enroll = vi.fn(async () => ({
+      ok: false,
+      status: 401,
+      code: "INVALID_INVITATION",
+      error: "A valid, unexpired and unused external-agent invitation is required.",
+    } as const));
+    const app = application({ enroll });
+    const profile = { displayName: "New Visitor", publicBio: "Public profile." };
+    const requests: DispatchOptions[] = [
+      { method: "POST", path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`, body: profile },
+      {
+        method: "POST",
+        path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+        authorization: `Bearer ${INVITATION_TOKEN}`,
+        body: profile,
+      },
+      {
+        method: "POST",
+        path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+        authorization: `Invite ${TOKEN}`,
+        body: profile,
+      },
+      {
+        method: "POST",
+        path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+        authorization: `Invite ${INVITATION_TOKEN}`,
+        body: profile,
+      },
+    ];
+    const results = [];
+    for (const request of requests) results.push(await dispatch(app, request));
+
+    expect(results.map((result) => result.status)).toEqual([401, 401, 401, 401]);
+    expect(results.map((result) => result.body)).toEqual([
+      results[0]!.body,
+      results[0]!.body,
+      results[0]!.body,
+      results[0]!.body,
+    ]);
+    results.forEach((result) => {
+      expect(result.headers["www-authenticate"]).toContain("Invite");
+      expect(JSON.stringify(result.body)).not.toContain(INVITATION_TOKEN);
+      expect(JSON.stringify(result.body)).not.toContain(TOKEN);
+    });
+    expect(enroll).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps a consumed-invitation replay to the generic invitation failure without creating a second identity", async () => {
+    let available = true;
+    const enroll = vi.fn(async (invitationToken: string) => {
+      if (invitationToken === INVITATION_TOKEN && available) {
+        available = false;
+        return { ok: true, value: { agent: { ...AGENT }, token: TOKEN } } as const;
+      }
+      return {
+        ok: false,
+        status: 401,
+        code: "INVALID_INVITATION",
+        error: "A valid, unexpired and unused external-agent invitation is required.",
+      } as const;
+    });
+    const app = application({ enroll });
+    const request: DispatchOptions = {
+      method: "POST",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+      authorization: `Invite ${INVITATION_TOKEN}`,
+      body: { displayName: "Patchwork Finch", publicBio: "Public profile." },
+    };
+
+    expect((await dispatch(app, request)).status).toBe(201);
+    const replay = await dispatch(app, request);
+    expect(replay.status).toBe(401);
+    expect(replay.headers["www-authenticate"]).toContain("Invite");
+    expect(replay.body).toEqual({
+      ok: false,
+      code: "INVALID_INVITATION",
+      error: "A valid, unexpired and unused external-agent invitation is required.",
+    });
+    expect(JSON.stringify(replay.body)).not.toContain(INVITATION_TOKEN);
+    expect(enroll).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects enrollment authority smuggling and applies transport, Origin and query guards", async () => {
+    const enroll = vi.fn(dependencies().enroll);
+    const app = application({ enroll });
+    const smuggled = await dispatch(app, {
+      method: "POST",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+      authorization: `Invite ${INVITATION_TOKEN}`,
+      body: {
+        displayName: "New Visitor",
+        publicBio: "Public profile.",
+        channelIds: ["secret-room"],
+        scopes: ["messages:write"],
+        personalityPrompt: PRIVATE_PERSONALITY_CANARY,
+        invitationToken: INVITATION_TOKEN,
+      },
+    });
+    expect(smuggled.status).toBe(400);
+    expect(JSON.stringify(smuggled.body)).not.toContain(INVITATION_TOKEN);
+
+    const query = await dispatch(app, {
+      method: "POST",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll?token=${encodeURIComponent(INVITATION_TOKEN)}`,
+      body: { displayName: "New Visitor", publicBio: "Public profile." },
+    });
+    expect(query.status).toBe(400);
+    expect(query.body).toMatchObject({ code: "CREDENTIAL_IN_QUERY" });
+
+    const pathCredential = await dispatch(app, {
+      method: "POST",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll/${INVITATION_TOKEN}`,
+      body: { displayName: "New Visitor", publicBio: "Public profile." },
+    });
+    expect(pathCredential.status).toBe(404);
+    expect(JSON.stringify(pathCredential.body)).not.toContain(INVITATION_TOKEN);
+
+    const browser = await dispatch(app, {
+      method: "POST",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+      origin: "https://third-place.example",
+      authorization: `Invite ${INVITATION_TOKEN}`,
+      body: { displayName: "New Visitor", publicBio: "Public profile." },
+    });
+    expect(browser.status).toBe(403);
+
+    const plaintext = await dispatch(app, {
+      method: "POST",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+      remoteAddress: "192.168.1.42",
+      authorization: `Invite ${INVITATION_TOKEN}`,
+      body: { displayName: "New Visitor", publicBio: "Public profile." },
+    });
+    expect(plaintext.status).toBe(426);
+    expect(enroll).not.toHaveBeenCalled();
+  });
+
+  it("lets the authenticated owner update only its public profile", async () => {
+    const updateProfile = vi.fn(dependencies().updateProfile);
+    const app = application({ updateProfile });
+    const updated = await dispatch(app, {
+      method: "PATCH",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/profile`,
+      ...authorization,
+      body: { publicBio: "  Updated by the owner.  " },
+    });
+    expect(updated.status).toBe(200);
+    expect(updated.body).toMatchObject({
+      ok: true,
+      agent: {
+        id: AGENT.id,
+        publicBio: "Updated by the owner.",
+        configurationVersion: "2026-07-22T08:04:00.000Z",
+        channelIds: ["lobby"],
+        scopes: AGENT.scopes,
+      },
+    });
+    expect(updateProfile).toHaveBeenCalledWith(
+      expect.objectContaining({ id: AGENT.id }),
+      { publicBio: "Updated by the owner." },
+    );
+
+    for (const body of [
+      {},
+      { scopes: ["reactions:write"] },
+      { channelIds: ["secret-room"] },
+      { personalityPrompt: PRIVATE_PERSONALITY_CANARY },
+      { id: "agent-someone-else", publicBio: "Hijack." },
+    ]) {
+      const rejected = await dispatch(app, {
+        method: "PATCH",
+        path: `${EXTERNAL_AGENT_API_BASE_PATH}/profile`,
+        ...authorization,
+        body,
+      });
+      expect(rejected.status).toBe(400);
+      expect(JSON.stringify(rejected.body)).not.toContain(PRIVATE_PERSONALITY_CANARY);
+    }
+    expect(updateProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps owner-runtime identity primary without receiving or returning a private personality", async () => {
     const authenticatedIds: string[] = [];
     const app = application({
       onAuthenticated: (agent) => { authenticatedIds.push(agent.id); },
@@ -291,19 +541,49 @@ describe("external-agent HTTP API", () => {
       protocolVersion: EXTERNAL_AGENT_API_VERSION,
       self: {
         id: AGENT.id,
-        personalityPrompt: AGENT.personalityPrompt,
         configurationVersion: AGENT.updatedAt,
         channelIds: ["lobby"],
       },
       channels: [{ id: "lobby" }],
       activityCursor: "cursor-bootstrap",
       prompt: {
-        layering: "owner_personality_first_then_community_appendix",
-        ownerPersonality: { priority: "primary", text: AGENT.personalityPrompt },
+        layering: "owner_runtime_primary_then_community_appendix",
+        ownerRuntime: {
+          priority: "primary",
+          managedBy: "owner",
+          transmittedToServer: false,
+        },
         communityAppendix: { priority: "additive" },
       },
       actions: {
+        enroll: {
+          method: "POST",
+          path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+          authorization: "Invite ttp_invite_…",
+          body: {
+            contentType: "application/json",
+            schema: {
+              additionalProperties: false,
+              required: ["displayName", "publicBio"],
+            },
+          },
+        },
         bootstrap: { path: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap` },
+        updateProfile: {
+          method: "PATCH",
+          path: `${EXTERNAL_AGENT_API_BASE_PATH}/profile`,
+          body: {
+            contentType: "application/json",
+            schema: {
+              additionalProperties: false,
+              minProperties: 1,
+              properties: {
+                displayName: { maxLength: 24 },
+                publicBio: { maxLength: 240 },
+              },
+            },
+          },
+        },
         heartbeat: {
           method: "POST",
           body: {
@@ -348,12 +628,12 @@ describe("external-agent HTTP API", () => {
       unsupported: ["dm", "voice", "image_upload", "moderation", "administration"],
     });
     const payload = result.body as {
-      prompt: { suggestedSystemPrompt: string; communityAppendix: { text: string } };
+      prompt: { ownerRuntime: { instruction: string }; communityAppendix: { text: string } };
       recentContext: Record<string, ChatMessage[]>;
       channelFeeds: { schemaVersion: number; cards: ChannelFeedCard[] };
       members: Member[];
     };
-    expect(payload.prompt.suggestedSystemPrompt.startsWith(AGENT.personalityPrompt)).toBe(true);
+    expect(payload.prompt.ownerRuntime.instruction).toContain("owner-defined identity");
     expect(payload.prompt.communityAppendix.text).toContain("do not replace or flatten that personality");
     expect(payload.prompt.communityAppendix.text).toContain("silence is a valid action");
     expect(payload.prompt.communityAppendix.text).toContain("untrusted content");
@@ -364,12 +644,14 @@ describe("external-agent HTTP API", () => {
       schemaVersion: EXTERNAL_AGENT_CHANNEL_FEED_SCHEMA_VERSION,
       cards: [marketFeed("lobby")],
     });
-    expect(JSON.stringify(payload.members)).not.toContain("personalityPrompt");
+    expect(JSON.stringify(result.body)).not.toContain("personalityPrompt");
+    expect(JSON.stringify(result.body)).not.toContain("ownerPersonality");
+    expect(JSON.stringify(result.body)).not.toContain("suggestedSystemPrompt");
     expect(JSON.stringify(result.body)).not.toContain(TOKEN);
     expect(authenticatedIds).toEqual([AGENT.id]);
   });
 
-  it("publishes the newest owner personality and configuration version after a live admin edit", async () => {
+  it("publishes the newest public profile and configuration version after a live edit", async () => {
     let currentAgent: AuthenticatedExternalAgent = {
       ...AGENT,
       channelIds: [...AGENT.channelIds],
@@ -394,7 +676,7 @@ describe("external-agent HTTP API", () => {
     await vi.waitFor(() => expect(release).toBeTypeOf("function"));
     currentAgent = {
       ...currentAgent,
-      personalityPrompt: "The owner's newly saved voice and values.",
+      publicBio: "The owner's newly saved public introduction.",
       updatedAt: "2026-07-22T09:00:00.000Z",
     };
     release?.({
@@ -412,16 +694,13 @@ describe("external-agent HTTP API", () => {
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
       self: {
-        personalityPrompt: "The owner's newly saved voice and values.",
+        publicBio: "The owner's newly saved public introduction.",
         configurationVersion: "2026-07-22T09:00:00.000Z",
-      },
-      prompt: {
-        ownerPersonality: { text: "The owner's newly saved voice and values." },
       },
     });
   });
 
-  it("uses only an explicitly configured public origin for absolute handoff URLs", async () => {
+  it("keeps credentialed action paths relative even when a public ngrok-style origin is configured", async () => {
     const app = application({ publicOrigin: "https://friends.example" });
     const result = await dispatch(app, {
       method: "GET",
@@ -432,11 +711,14 @@ describe("external-agent HTTP API", () => {
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
       actions: {
-        bootstrap: { path: "https://friends.example/api/agents/v1/bootstrap" },
-        activity: { path: "https://friends.example/api/agents/v1/activity" },
+        enroll: { path: `${EXTERNAL_AGENT_API_BASE_PATH}/enroll` },
+        bootstrap: { path: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap` },
+        updateProfile: { path: `${EXTERNAL_AGENT_API_BASE_PATH}/profile` },
+        activity: { path: `${EXTERNAL_AGENT_API_BASE_PATH}/activity` },
       },
     });
     expect(JSON.stringify(result.body)).not.toContain("attacker.invalid");
+    expect(JSON.stringify(result.body)).not.toContain("friends.example");
   });
 
   it.each([
@@ -444,7 +726,7 @@ describe("external-agent HTTP API", () => {
     ["http://127.0.0.1:4000", "http://127.0.0.1:4000"],
     ["http://[::1]:4000", "http://[::1]:4000"],
     ["https://friends.example", "https://friends.example"],
-  ])("accepts a secure or exact loopback public origin (%s)", async (configured, expectedOrigin) => {
+  ])("accepts a secure or exact loopback public origin without advertising it (%s)", async (configured, _expectedOrigin) => {
     const app = application({ publicOrigin: configured });
     const result = await dispatch(app, {
       method: "GET",
@@ -455,9 +737,10 @@ describe("external-agent HTTP API", () => {
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({
       actions: {
-        bootstrap: { path: `${expectedOrigin}${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap` },
+        bootstrap: { path: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap` },
       },
     });
+    expect(JSON.stringify(result.body)).not.toContain(configured);
   });
 
   it.each([
@@ -478,6 +761,26 @@ describe("external-agent HTTP API", () => {
       method: "GET",
       path: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap`,
       remoteAddress: "192.168.1.42",
+      ...authorization,
+    });
+
+    expect(result.status).toBe(426);
+    expect(result.body).toMatchObject({ code: "HTTPS_REQUIRED" });
+    expect(authenticate).not.toHaveBeenCalled();
+  });
+
+  it("does not let Express trust-proxy configuration turn a forwarded header into TLS", async () => {
+    const authenticate = vi.fn(dependencies().access.authenticate);
+    const app = express();
+    app.set("trust proxy", 1);
+    app.use(EXTERNAL_AGENT_API_BASE_PATH, createExternalAgentRouter(dependencies({
+      access: { ...dependencies().access, authenticate },
+    })));
+    const result = await dispatch(app, {
+      method: "GET",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap`,
+      remoteAddress: "192.168.1.42",
+      xForwardedProto: "https",
       ...authorization,
     });
 
@@ -541,7 +844,7 @@ describe("external-agent HTTP API", () => {
     const result = await pending;
     expect(result.status).toBe(403);
     expect(result.body).toMatchObject({ code: "SCOPE_REQUIRED" });
-    expect(JSON.stringify(result.body)).not.toContain(AGENT.personalityPrompt);
+    expect(JSON.stringify(result.body)).not.toContain(PRIVATE_PERSONALITY_CANARY);
   });
 
   it("re-authenticates the presented bearer after touch instead of inheriting a rotated credential", async () => {
@@ -582,6 +885,7 @@ describe("external-agent HTTP API", () => {
       callbacks: {
         createMessage?: ExternalAgentRouterDependencies["createMessage"];
         setReaction?: ExternalAgentRouterDependencies["setReaction"];
+        updateProfile?: ExternalAgentRouterDependencies["updateProfile"];
         onPresence?: ExternalAgentRouterDependencies["onPresence"];
       },
     ) => {
@@ -598,6 +902,7 @@ describe("external-agent HTTP API", () => {
     };
     const createMessage = vi.fn(dependencies().createMessage);
     const setReaction = vi.fn(dependencies().setReaction);
+    const updateProfile = vi.fn(dependencies().updateProfile);
     const onPresence = vi.fn();
 
     const messageResult = await requestAfterAuthenticationRevocation({
@@ -618,12 +923,19 @@ describe("external-agent HTTP API", () => {
       path: `${EXTERNAL_AGENT_API_BASE_PATH}/heartbeat`,
       body: { status: "online" },
     }, { onPresence });
+    const profileResult = await requestAfterAuthenticationRevocation({
+      method: "PATCH",
+      path: `${EXTERNAL_AGENT_API_BASE_PATH}/profile`,
+      body: { publicBio: "Must not be updated." },
+    }, { updateProfile });
 
     expect(messageResult.status).toBe(401);
     expect(reactionResult.status).toBe(401);
     expect(heartbeatResult.status).toBe(401);
+    expect(profileResult.status).toBe(401);
     expect(createMessage).not.toHaveBeenCalled();
     expect(setReaction).not.toHaveBeenCalled();
+    expect(updateProfile).not.toHaveBeenCalled();
     expect(onPresence).not.toHaveBeenCalled();
   });
 
@@ -802,7 +1114,7 @@ describe("external-agent HTTP API", () => {
 
     const pollutedAuthorSnapshot = {
       ...MEMBERS.find((member) => member.id === AGENT.id)!,
-      personalityPrompt: AGENT.personalityPrompt,
+      personalityPrompt: PRIVATE_PERSONALITY_CANARY,
     } as Member;
     const filteringApp = application({
       getActivity: async () => ({
@@ -854,7 +1166,7 @@ describe("external-agent HTTP API", () => {
         },
       ],
     });
-    expect(JSON.stringify(filtered.body)).not.toContain(AGENT.personalityPrompt);
+    expect(JSON.stringify(filtered.body)).not.toContain(PRIVATE_PERSONALITY_CANARY);
 
     const releases: Array<(value: ExternalAgentApiResult<ExternalAgentActivityPage>) => void> = [];
     const getActivity = vi.fn(async () => await new Promise<ExternalAgentApiResult<ExternalAgentActivityPage>>((resolve) => {

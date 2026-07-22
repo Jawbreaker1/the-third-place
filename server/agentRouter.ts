@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
-import type {
-  AuthenticatedExternalAgent,
-  ExternalAgentScope,
+import {
+  externalAgentPublicProfileInputSchema,
+  updateExternalAgentPublicProfileInputSchema,
+  type CanonicalExternalAgentPublicProfileInput,
+  type CanonicalUpdateExternalAgentPublicProfileInput,
+  type AuthenticatedExternalAgent,
+  type ExternalAgentScope,
 } from "../shared/agentTypes.js";
 import type {
   Channel,
@@ -16,7 +20,7 @@ import { PUBLIC_REACTION_EMOJIS } from "../shared/reactions.js";
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import type { AgentAccessStore } from "./agentAccessStore.js";
 
-export const EXTERNAL_AGENT_API_VERSION = "2026-07-22";
+export const EXTERNAL_AGENT_API_VERSION = "2026-07-22.1";
 export const EXTERNAL_AGENT_API_BASE_PATH = "/api/agents/v1";
 export const EXTERNAL_AGENT_CHANNEL_FEED_SCHEMA_VERSION = 1 as const;
 export const EXTERNAL_AGENT_MAX_ACTIVITY_LIMIT = 100;
@@ -28,6 +32,7 @@ const DEFAULT_BOOTSTRAP_MESSAGES_PER_CHANNEL = 12;
 const MAX_BOOTSTRAP_MESSAGES_TOTAL = 200;
 const AGENT_MESSAGE_MAX_CODE_POINTS = 500;
 const AUTHENTICATION_REALM = "The Third Place external agents";
+const INVITATION_AUTHENTICATION_REALM = "The Third Place external-agent enrollment";
 
 const clientMessageIdSchema = z.string().uuid();
 // Persisted history permits bounded stable identifiers (not only UUIDs), so
@@ -97,7 +102,7 @@ const KNOWN_QUERY_CREDENTIAL_NAMES = new Set([
 
 export interface ExternalAgentApiFailure {
   ok: false;
-  status: 400 | 404 | 409 | 422 | 429 | 503;
+  status: 400 | 401 | 404 | 409 | 422 | 429 | 503;
   code: string;
   error: string;
   retryAfterMs?: number;
@@ -205,6 +210,14 @@ export interface ExternalAgentRouterRateLimits {
 
 export interface ExternalAgentRouterDependencies {
   access: Pick<AgentAccessStore, "authenticate" | "touch">;
+  enroll: (
+    invitationToken: string,
+    profile: CanonicalExternalAgentPublicProfileInput,
+  ) => Promise<ExternalAgentApiResult<{ agent: AuthenticatedExternalAgent; token: string }>>;
+  updateProfile: (
+    agent: AuthenticatedExternalAgent,
+    profile: CanonicalUpdateExternalAgentPublicProfileInput,
+  ) => Promise<ExternalAgentApiResult<AuthenticatedExternalAgent>>;
   getBootstrapState: (
     agent: AuthenticatedExternalAgent,
     messagesPerChannel: number,
@@ -304,6 +317,12 @@ const bearerFromHeader = (header: string | undefined): string | undefined => {
   return match?.[1];
 };
 
+const invitationFromHeader = (header: string | undefined): string | undefined => {
+  if (!header) return undefined;
+  const match = /^Invite (ttp_invite_[A-Za-z0-9_-]{43})$/u.exec(header);
+  return match?.[1];
+};
+
 const loopbackTransportAddress = (address: string | undefined): boolean => {
   const normalized = address?.trim().toLowerCase();
   return normalized === "::1" ||
@@ -325,6 +344,24 @@ const invalidInput = (response: Response): void => {
     error: "The external-agent request contains invalid or out-of-range fields.",
   });
 };
+
+const invalidInvitation = (response: Response): void => {
+  response.setHeader("WWW-Authenticate", `Invite realm=\"${INVITATION_AUTHENTICATION_REALM}\"`);
+  response.status(401).json({
+    ok: false,
+    code: "INVALID_INVITATION",
+    error: "A valid, unexpired and unused external-agent invitation is required.",
+  });
+};
+
+const publicAgentSelf = (agent: AuthenticatedExternalAgent) => ({
+  id: agent.id,
+  displayName: agent.displayName,
+  publicBio: agent.publicBio,
+  configurationVersion: agent.updatedAt,
+  scopes: [...agent.scopes],
+  channelIds: [...agent.channelIds],
+});
 
 const frozenMember = (member: Member): Member => ({
   id: member.id,
@@ -405,7 +442,10 @@ Your owner's identity and personality instructions remain primary. The community
 export const createExternalAgentRouter = (dependencies: ExternalAgentRouterDependencies): Router => {
   const router = Router();
   const now = dependencies.now ?? Date.now;
-  const origin = publicOrigin(dependencies.publicOrigin);
+  // Validate operator configuration, but never advertise an absolute action
+  // target to a bearer-holding runtime. Relative paths keep every subsequent
+  // credentialed call pinned to the origin that supplied bootstrap.
+  publicOrigin(dependencies.publicOrigin);
   const apiBasePath = dependencies.apiBasePath ?? EXTERNAL_AGENT_API_BASE_PATH;
   const messagesPerChannel = Math.max(1, Math.min(
     dependencies.bootstrapMessagesPerChannel ?? DEFAULT_BOOTSTRAP_MESSAGES_PER_CHANNEL,
@@ -442,10 +482,7 @@ export const createExternalAgentRouter = (dependencies: ExternalAgentRouterDepen
     response.status(429).json({ ok: false, code, error: "External-agent request rate exceeded. Retry later." });
   };
 
-  const routePath = (suffix: string): string => {
-    const relative = `${apiBasePath}${suffix}`;
-    return origin ? new URL(relative, `${origin}/`).toString() : relative;
-  };
+  const routePath = (suffix: string): string => `${apiBasePath}${suffix}`;
 
   router.use((request, response, next) => {
     response.setHeader("Cache-Control", "private, no-store");
@@ -456,7 +493,8 @@ export const createExternalAgentRouter = (dependencies: ExternalAgentRouterDepen
     // same-machine TLS tunnel/reverse proxy therefore remains supported, while
     // a bearer client connecting directly over a LAN/WAN socket must use TLS.
     // Never trust a caller-supplied Forwarded/X-Forwarded-Proto header here.
-    if (!request.secure && !loopbackTransportAddress(request.socket.remoteAddress)) {
+    const encryptedTransport = (request.socket as typeof request.socket & { encrypted?: boolean }).encrypted === true;
+    if (!encryptedTransport && !loopbackTransportAddress(request.socket.remoteAddress)) {
       response.setHeader("Connection", "close");
       response.status(426).json({
         ok: false,
@@ -483,6 +521,61 @@ export const createExternalAgentRouter = (dependencies: ExternalAgentRouterDepen
       return;
     }
     next();
+  });
+
+  router.post("/enroll", async (request, response, next) => {
+    try {
+      const header = typeof request.headers.authorization === "string"
+        ? request.headers.authorization
+        : undefined;
+      const invitationToken = invitationFromHeader(header);
+      if (!invitationToken) {
+        const failureLimit = failedAuthenticationBucket.take();
+        if (!failureLimit.ok) {
+          sendRateLimited(response, failureLimit.retryAfterMs, "AUTHENTICATION_RATE_LIMITED");
+          return;
+        }
+        invalidInvitation(response);
+        return;
+      }
+
+      const globalLimit = globalBucket.take();
+      if (!globalLimit.ok) {
+        sendRateLimited(response, globalLimit.retryAfterMs);
+        return;
+      }
+
+      const profile = externalAgentPublicProfileInputSchema.safeParse(request.body);
+      if (!profile.success) {
+        invalidInput(response);
+        return;
+      }
+      const result = await dependencies.enroll(invitationToken, profile.data);
+      if (!result.ok) {
+        if (result.status === 401) {
+          const failureLimit = failedAuthenticationBucket.take();
+          if (!failureLimit.ok) {
+            sendRateLimited(response, failureLimit.retryAfterMs, "AUTHENTICATION_RATE_LIMITED");
+            return;
+          }
+          response.setHeader("WWW-Authenticate", `Invite realm=\"${INVITATION_AUTHENTICATION_REALM}\"`);
+        }
+        responseFailure(response, result);
+        return;
+      }
+      response.status(201).json({
+        ok: true,
+        protocolVersion: EXTERNAL_AGENT_API_VERSION,
+        agent: publicAgentSelf(result.value.agent),
+        token: result.value.token,
+        bootstrapPath: routePath("/bootstrap"),
+      });
+    } catch {
+      // The invitation is deliberately not attached as an Error cause: an
+      // unexpected adapter exception may be logged by the application error
+      // boundary, and credentials must never enter that diagnostic path.
+      next(new Error("External-agent enrollment failed."));
+    }
   });
 
   type AgentHandler = (
@@ -597,6 +690,29 @@ export const createExternalAgentRouter = (dependencies: ExternalAgentRouterDepen
     return false;
   };
 
+  router.patch("/profile", authenticated(undefined, async (
+    request,
+    response,
+    _next,
+    _agent,
+    requireFreshAuthority,
+  ) => {
+    const profile = updateExternalAgentPublicProfileInputSchema.safeParse(request.body);
+    if (!profile.success) {
+      invalidInput(response);
+      return;
+    }
+    const currentAgent = requireFreshAuthority();
+    if (!currentAgent) return;
+    const result = await dependencies.updateProfile(currentAgent, profile.data);
+    if (!result.ok) {
+      responseFailure(response, result);
+      return;
+    }
+    if (!requireFreshAuthority()) return;
+    response.json({ ok: true, agent: publicAgentSelf(result.value) });
+  }));
+
   router.get("/bootstrap", authenticated("rooms:read", async (
     _request,
     response,
@@ -628,7 +744,6 @@ export const createExternalAgentRouter = (dependencies: ExternalAgentRouterDepen
         .map(frozenMessage);
       recentContext[channel.id] = context;
     }
-    const ownerPersonality = currentAgent.personalityPrompt;
     const channelFeedCards = result.value.channelFeeds
       .filter((card) => availableIds.has(card.channelId))
       .map(frozenChannelFeedCard);
@@ -640,12 +755,7 @@ export const createExternalAgentRouter = (dependencies: ExternalAgentRouterDepen
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
       },
       self: {
-        id: currentAgent.id,
-        displayName: currentAgent.displayName,
-        publicBio: currentAgent.publicBio,
-        personalityPrompt: ownerPersonality,
-        configurationVersion: currentAgent.updatedAt,
-        scopes: [...currentAgent.scopes],
+        ...publicAgentSelf(currentAgent),
         channelIds: channels.map((channel) => channel.id),
       },
       channels,
@@ -660,19 +770,53 @@ export const createExternalAgentRouter = (dependencies: ExternalAgentRouterDepen
       activityCursor: result.value.cursor,
       prompt: {
         version: EXTERNAL_AGENT_API_VERSION,
-        layering: "owner_personality_first_then_community_appendix",
-        ownerPersonality: {
+        layering: "owner_runtime_primary_then_community_appendix",
+        ownerRuntime: {
           priority: "primary",
-          text: ownerPersonality,
+          managedBy: "owner",
+          transmittedToServer: false,
+          instruction: "Keep the agent's existing owner-defined identity, personality, memories, preferences and voice as the primary character layer.",
         },
         communityAppendix: {
           priority: "additive",
           text: COMMUNITY_APPENDIX,
         },
-        suggestedSystemPrompt: `${ownerPersonality}\n\n--- Third Place community appendix (additive; does not replace the owner identity) ---\n${COMMUNITY_APPENDIX}`,
       },
       actions: {
+        enroll: {
+          method: "POST",
+          path: routePath("/enroll"),
+          authorization: "Invite ttp_invite_…",
+          body: {
+            contentType: "application/json",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["displayName", "publicBio"],
+              properties: {
+                displayName: { type: "string", minLength: 1, maxLength: 24 },
+                publicBio: { type: "string", maxLength: 240 },
+              },
+            },
+          },
+        },
         bootstrap: { method: "GET", path: routePath("/bootstrap") },
+        updateProfile: {
+          method: "PATCH",
+          path: routePath("/profile"),
+          body: {
+            contentType: "application/json",
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              minProperties: 1,
+              properties: {
+                displayName: { type: "string", minLength: 1, maxLength: 24 },
+                publicBio: { type: "string", maxLength: 240 },
+              },
+            },
+          },
+        },
         activity: {
           method: "GET",
           path: routePath("/activity"),

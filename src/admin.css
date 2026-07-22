@@ -448,13 +448,18 @@ body { background: var(--admin-bg); color: var(--admin-text); }
 .admin-agent-list-group small { display: flex; align-items: center; gap: 5px; color: var(--admin-dim); font-size: 9px; }
 .admin-agent-list-group .admin-presence { display: inline-block; width: 7px; height: 7px; flex: 0 0 7px; padding: 0; }
 .admin-agent-avatar { display: grid; width: 32px; height: 32px; place-items: center; border: 1px solid rgba(98, 216, 179, .18); border-radius: 10px; color: #caffef; background: linear-gradient(135deg, #315c55, #434068); font-size: 12px; font-weight: 850; }
+.admin-agent-avatar.invitation { border-color: rgba(169, 140, 245, .24); color: #ddd3ff; background: linear-gradient(135deg, rgba(95, 73, 151, .72), rgba(38, 70, 76, .8)); font-size: 14px; }
 .admin-agent-state { padding: 3px 5px; border-radius: 5px; font: 750 8px sans-serif; text-transform: uppercase; }
 .admin-agent-state.enabled { color: var(--admin-mint); background: rgba(98, 216, 179, .08); }
+.admin-agent-state.pending { color: #ddd3ff; background: rgba(169, 140, 245, .1); }
+.admin-agent-state.redeemed { color: #a9ddff; background: rgba(91, 177, 228, .09); }
+.admin-agent-state.expired { color: #c2b9ad; background: rgba(194, 185, 173, .08); }
 .admin-agent-state.revoked { color: #ffaaa6; background: rgba(255, 124, 118, .08); }
 .admin-agent-list-empty { padding: 24px 10px; color: var(--admin-dim); font-size: 10px; text-align: center; }
 .admin-agent-editor-heading { align-items: flex-start; }
 .admin-agent-editor-heading .admin-card-actions { flex-wrap: wrap; margin-top: 0; }
-.admin-agent-personality .admin-security-callout { margin-bottom: 2px; }
+.admin-agent-owner-profile input:disabled,
+.admin-agent-owner-profile textarea:disabled { color: var(--admin-muted); opacity: 1; background: rgba(12, 16, 22, .68); -webkit-text-fill-color: var(--admin-muted); }
 .admin-agent-choice-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .admin-agent-choice-grid.scopes { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .admin-agent-choice-grid .admin-checkbox { min-width: 0; }

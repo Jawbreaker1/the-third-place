@@ -3,9 +3,12 @@ import type {
   AdminChannelFeedPatch,
   AdminChannelWrite,
   AdminExternalAgent,
-  AdminExternalAgentCredential,
+  AdminExternalAgentInvitation,
+  AdminExternalAgentInvitationWrite,
   AdminExternalAgentList,
-  AdminExternalAgentWrite,
+  AdminExternalAgentPolicyWrite,
+  AdminExternalAgentReconnectInvitationWrite,
+  AdminIssuedExternalAgentInvitation,
   AdminMemoryActorDetail,
   AdminMemoryItemPatch,
   AdminMemoryOverview,
@@ -74,7 +77,6 @@ const isAdminExternalAgent = (value: unknown): value is AdminExternalAgent => {
   return typeof record.id === "string"
     && typeof record.displayName === "string"
     && typeof record.publicBio === "string"
-    && typeof record.personalityPrompt === "string"
     && Array.isArray(record.channelIds)
     && record.channelIds.every((channelId) => typeof channelId === "string")
     && Array.isArray(scopes)
@@ -86,6 +88,52 @@ const isAdminExternalAgent = (value: unknown): value is AdminExternalAgent => {
     && (record.revokedAt === undefined || typeof record.revokedAt === "string");
 };
 
+const isAdminExternalAgentInvitation = (value: unknown): value is AdminExternalAgentInvitation => {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const scopes = record.scopes;
+  return typeof record.id === "string"
+    && typeof record.label === "string"
+    && Array.isArray(record.channelIds)
+    && record.channelIds.every((channelId) => typeof channelId === "string")
+    && Array.isArray(scopes)
+    && scopes.every((scope) => scope === "rooms:read" || scope === "messages:write" || scope === "reactions:write")
+    && (record.state === "pending" || record.state === "redeemed" || record.state === "expired" || record.state === "revoked")
+    && typeof record.createdAt === "string"
+    && typeof record.expiresAt === "string"
+    && (record.redeemedAt === undefined || typeof record.redeemedAt === "string")
+    && (record.revokedAt === undefined || typeof record.revokedAt === "string")
+    && (record.agentId === undefined || typeof record.agentId === "string");
+};
+
+const projectAdminExternalAgent = (agent: AdminExternalAgent): AdminExternalAgent => ({
+  id: agent.id,
+  displayName: agent.displayName,
+  publicBio: agent.publicBio,
+  channelIds: [...agent.channelIds],
+  scopes: [...agent.scopes],
+  state: agent.state,
+  presence: agent.presence,
+  createdAt: agent.createdAt,
+  ...(agent.lastSeenAt ? { lastSeenAt: agent.lastSeenAt } : {}),
+  ...(agent.revokedAt ? { revokedAt: agent.revokedAt } : {}),
+});
+
+const projectAdminExternalAgentInvitation = (
+  invitation: AdminExternalAgentInvitation,
+): AdminExternalAgentInvitation => ({
+  id: invitation.id,
+  label: invitation.label,
+  channelIds: [...invitation.channelIds],
+  scopes: [...invitation.scopes],
+  state: invitation.state,
+  createdAt: invitation.createdAt,
+  expiresAt: invitation.expiresAt,
+  ...(invitation.redeemedAt ? { redeemedAt: invitation.redeemedAt } : {}),
+  ...(invitation.revokedAt ? { revokedAt: invitation.revokedAt } : {}),
+  ...(invitation.agentId ? { agentId: invitation.agentId } : {}),
+});
+
 const agentFromResponse = (body: unknown, error = "The external-agent response was invalid."): AdminExternalAgent => {
   if (!body || typeof body !== "object") throw new AdminApiError(error, 502);
   const record = body as Record<string, unknown>;
@@ -93,26 +141,40 @@ const agentFromResponse = (body: unknown, error = "The external-agent response w
     ? record.agent
     : record;
   if (!isAdminExternalAgent(candidate)) throw new AdminApiError(error, 502);
-  return candidate;
+  return projectAdminExternalAgent(candidate);
 };
 
-const credentialFromResponse = (body: unknown): AdminExternalAgentCredential => {
+const invitationFromResponse = (body: unknown): AdminExternalAgentInvitation => {
   if (!body || typeof body !== "object") {
-    throw new AdminApiError("The one-time external-agent credential response was invalid.", 502);
+    throw new AdminApiError("The external-agent invitation response was invalid.", 502);
+  }
+  const record = body as Record<string, unknown>;
+  const candidate = record.invitation && typeof record.invitation === "object"
+    ? record.invitation
+    : record;
+  if (!isAdminExternalAgentInvitation(candidate)) {
+    throw new AdminApiError("The external-agent invitation response was invalid.", 502);
+  }
+  return projectAdminExternalAgentInvitation(candidate);
+};
+
+const issuedInvitationFromResponse = (body: unknown): AdminIssuedExternalAgentInvitation => {
+  if (!body || typeof body !== "object") {
+    throw new AdminApiError("The one-time external-agent invitation response was invalid.", 502);
   }
   const record = body as Record<string, unknown>;
   if (
     typeof record.token !== "string"
     || !record.token
-    || typeof record.bootstrapUrl !== "string"
-    || !record.bootstrapUrl
+    || typeof record.enrollmentUrl !== "string"
+    || !record.enrollmentUrl
   ) {
-    throw new AdminApiError("The one-time external-agent credential response was invalid.", 502);
+    throw new AdminApiError("The one-time external-agent invitation response was invalid.", 502);
   }
   return {
-    agent: agentFromResponse(record),
+    invitation: invitationFromResponse(record),
     token: record.token,
-    bootstrapUrl: record.bootstrapUrl,
+    enrollmentUrl: record.enrollmentUrl,
     ...(typeof record.handoffPrompt === "string" ? { handoffPrompt: record.handoffPrompt } : {}),
   };
 };
@@ -228,26 +290,39 @@ export async function deleteAdminBan(memberId: string): Promise<void> {
 
 export async function getAdminAgents(): Promise<AdminExternalAgentList> {
   const body = await request("/api/admin/agents");
-  const agents = Array.isArray(body)
-    ? body
-    : body && typeof body === "object" ? (body as Record<string, unknown>).agents : undefined;
-  if (!Array.isArray(agents) || !agents.every(isAdminExternalAgent)) {
+  const record = body && typeof body === "object" ? body as Record<string, unknown> : undefined;
+  const agents = record?.agents;
+  const invitations = record?.invitations;
+  if (
+    !Array.isArray(agents)
+    || !agents.every(isAdminExternalAgent)
+    || !Array.isArray(invitations)
+    || !invitations.every(isAdminExternalAgentInvitation)
+  ) {
     throw new AdminApiError("The external-agent list response was invalid.", 502);
   }
-  return { agents };
+  return {
+    agents: agents.map(projectAdminExternalAgent),
+    invitations: invitations.map(projectAdminExternalAgentInvitation),
+  };
 }
 
-export async function createAdminAgent(agent: AdminExternalAgentWrite): Promise<AdminExternalAgentCredential> {
-  return credentialFromResponse(await request("/api/admin/agents", {
+export async function createAdminAgentInvitation(
+  invitation: AdminExternalAgentInvitationWrite,
+): Promise<AdminIssuedExternalAgentInvitation> {
+  return issuedInvitationFromResponse(await request("/api/admin/agent-invitations", {
     method: "POST",
-    body: jsonBody(agent),
+    body: jsonBody(invitation),
   }));
 }
 
-export async function patchAdminAgent(id: string, agent: AdminExternalAgentWrite): Promise<AdminExternalAgent> {
+export async function patchAdminAgentPolicy(
+  id: string,
+  policy: AdminExternalAgentPolicyWrite,
+): Promise<AdminExternalAgent> {
   return agentFromResponse(await request(`/api/admin/agents/${encodeURIComponent(id)}`, {
     method: "PATCH",
-    body: jsonBody(agent),
+    body: jsonBody(policy),
   }));
 }
 
@@ -258,10 +333,20 @@ export async function revokeAdminAgent(id: string): Promise<AdminExternalAgent> 
   }));
 }
 
-export async function rotateAdminAgentToken(id: string): Promise<AdminExternalAgentCredential> {
-  return credentialFromResponse(await request(`/api/admin/agents/${encodeURIComponent(id)}/rotate-token`, {
+export async function revokeAdminAgentInvitation(id: string): Promise<AdminExternalAgentInvitation> {
+  return invitationFromResponse(await request(`/api/admin/agent-invitations/${encodeURIComponent(id)}/revoke`, {
     method: "POST",
     body: jsonBody({}),
+  }));
+}
+
+export async function createAdminAgentReconnectInvitation(
+  id: string,
+  invitation: AdminExternalAgentReconnectInvitationWrite,
+): Promise<AdminIssuedExternalAgentInvitation> {
+  return issuedInvitationFromResponse(await request(`/api/admin/agents/${encodeURIComponent(id)}/reconnect-invitations`, {
+    method: "POST",
+    body: jsonBody(invitation),
   }));
 }
 

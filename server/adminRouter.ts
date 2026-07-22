@@ -5,10 +5,20 @@ import type {
   AdminChannelFeedControl,
   AdminChannelFeedPatch,
   AdminExternalAgent,
-  AdminExternalAgentCredential,
-  AdminExternalAgentWrite,
+  AdminExternalAgentInvitation,
+  AdminExternalAgentInvitationWrite,
+  AdminExternalAgentList,
+  AdminExternalAgentPolicyWrite,
+  AdminExternalAgentReconnectInvitationWrite,
+  AdminIssuedExternalAgentInvitation,
   AdminHumanMember,
 } from "../shared/adminTypes.js";
+import {
+  externalAgentAccessPolicyInputSchema,
+  externalAgentChannelIdsSchema,
+  externalAgentInvitationLabelInputSchema,
+  externalAgentScopesSchema,
+} from "../shared/agentTypes.js";
 import {
   AdminAuthManager,
   adminCookie,
@@ -27,6 +37,18 @@ const idParam = z.string().min(1).max(100);
 const providerPatchSchema = z.object({ activeProvider: z.enum(["lmstudio", "codex"]) }).strict();
 const emptyBodySchema = z.object({}).strict();
 const memoryPatchSchema = z.object({ pinned: z.boolean() }).strict();
+const invitationExpirySecondsSchema = z.number().int().min(5 * 60).max(24 * 60 * 60)
+  .refine((value) => value % 60 === 0, "Invitation expiry must use whole minutes");
+const externalAgentInvitationWriteSchema = z.object({
+  label: externalAgentInvitationLabelInputSchema,
+  expiresInSeconds: invitationExpirySecondsSchema,
+  channelIds: externalAgentChannelIdsSchema,
+  scopes: externalAgentScopesSchema,
+}).strict();
+const externalAgentReconnectInvitationWriteSchema = z.object({
+  label: externalAgentInvitationLabelInputSchema,
+  expiresInSeconds: invitationExpirySecondsSchema,
+}).strict();
 const channelFeedPatchSchema = z.object({
   enabled: z.boolean(),
   discussionFrequency: z.number().int().min(0).max(100),
@@ -62,12 +84,21 @@ export interface AdminRouterDependencies {
   >;
   /** Durable cross-store erasure for a trusted human identity. */
   forgetHumanActor?: (actorId: string) => Promise<boolean>;
+  /**
+   * Serializes room/resident catalog edits with every participant-identity and
+   * external-agent authority mutation that depends on that live catalog.
+   */
+  runCatalogMutation?: <T>(operation: () => Promise<T>) => Promise<T>;
   externalAgents?: {
-    list(): AdminExternalAgent[];
-    create(input: AdminExternalAgentWrite): Promise<AdminExternalAgentCredential>;
-    update(agentId: string, input: AdminExternalAgentWrite): Promise<AdminExternalAgent | undefined>;
+    list(): AdminExternalAgentList;
+    createInvitation(input: AdminExternalAgentInvitationWrite): Promise<AdminIssuedExternalAgentInvitation>;
+    revokeInvitation(invitationId: string): Promise<AdminExternalAgentInvitation | undefined>;
+    updatePolicy(agentId: string, input: AdminExternalAgentPolicyWrite): Promise<AdminExternalAgent | undefined>;
     revoke(agentId: string): Promise<AdminExternalAgent | undefined>;
-    rotate(agentId: string): Promise<AdminExternalAgentCredential | undefined>;
+    createReconnectInvitation(
+      agentId: string,
+      input: AdminExternalAgentReconnectInvitationWrite,
+    ): Promise<AdminIssuedExternalAgentInvitation | undefined>;
   };
 }
 
@@ -94,6 +125,8 @@ const sendError = (response: Response, error: unknown): void => {
 export const createAdminRouter = (dependencies: AdminRouterDependencies): Router => {
   const router = Router();
   const now = dependencies.now ?? Date.now;
+  const runCatalogMutation = <T>(operation: () => Promise<T>): Promise<T> =>
+    dependencies.runCatalogMutation ? dependencies.runCatalogMutation(operation) : operation();
   const secure = (request: Request) =>
     dependencies.isSecure?.(request) ?? (request.secure || process.env.PUBLIC_ORIGIN?.startsWith("https://") === true);
 
@@ -189,17 +222,37 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
       response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
       return;
     }
-    response.json({ agents: dependencies.externalAgents.list() });
+    response.json(dependencies.externalAgents.list());
   });
 
-  router.post("/agents", async (request, response, next) => {
+  router.post("/agent-invitations", async (request, response, next) => {
     if (!dependencies.externalAgents) {
       response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
       return;
     }
     try {
-      const issued = await dependencies.externalAgents.create(request.body as AdminExternalAgentWrite);
+      const issued = await dependencies.externalAgents.createInvitation(
+        externalAgentInvitationWriteSchema.parse(request.body) as AdminExternalAgentInvitationWrite,
+      );
       response.status(201).json(issued);
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.post("/agent-invitations/:id/revoke", async (request, response, next) => {
+    if (!dependencies.externalAgents) {
+      response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
+      return;
+    }
+    try {
+      emptyBodySchema.parse(request.body ?? {});
+      const invitation = await dependencies.externalAgents.revokeInvitation(idParam.parse(request.params.id));
+      if (!invitation) {
+        response.status(404).json({ ok: false, error: "That external-agent invitation was not found." });
+        return;
+      }
+      response.json({ invitation });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }
     }
@@ -211,9 +264,9 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
       return;
     }
     try {
-      const agent = await dependencies.externalAgents.update(
+      const agent = await dependencies.externalAgents.updatePolicy(
         idParam.parse(request.params.id),
-        request.body as AdminExternalAgentWrite,
+        externalAgentAccessPolicyInputSchema.parse(request.body) as AdminExternalAgentPolicyWrite,
       );
       if (!agent) {
         response.status(404).json({ ok: false, error: "That external agent was not found." });
@@ -243,14 +296,16 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
     }
   });
 
-  router.post("/agents/:id/rotate-token", async (request, response, next) => {
+  router.post("/agents/:id/reconnect-invitations", async (request, response, next) => {
     if (!dependencies.externalAgents) {
       response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
       return;
     }
     try {
-      emptyBodySchema.parse(request.body ?? {});
-      const issued = await dependencies.externalAgents.rotate(idParam.parse(request.params.id));
+      const issued = await dependencies.externalAgents.createReconnectInvitation(
+        idParam.parse(request.params.id),
+        externalAgentReconnectInvitationWriteSchema.parse(request.body) as AdminExternalAgentReconnectInvitationWrite,
+      );
       if (!issued) {
         response.status(404).json({ ok: false, error: "That external agent was not found." });
         return;
@@ -326,7 +381,7 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
 
   router.post("/personas", async (request, response, next) => {
     try {
-      await dependencies.state.createPersona(request.body);
+      await runCatalogMutation(() => dependencies.state.createPersona(request.body));
       response.status(201).json({ ok: true, state: stateResponse() });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }
@@ -335,7 +390,7 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
   const updatePersona = async (request: Request, response: Response, next: NextFunction) => {
     try {
       const id = idParam.parse(request.params.id);
-      await dependencies.state.updatePersona(id, request.body);
+      await runCatalogMutation(() => dependencies.state.updatePersona(id, request.body));
       response.json({ ok: true, state: stateResponse() });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }
@@ -345,7 +400,8 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
   router.put("/personas/:id", updatePersona);
   router.delete("/personas/:id", async (request, response, next) => {
     try {
-      await dependencies.state.deletePersona(idParam.parse(request.params.id));
+      const id = idParam.parse(request.params.id);
+      await runCatalogMutation(() => dependencies.state.deletePersona(id));
       response.json({ ok: true, state: stateResponse() });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }
@@ -354,7 +410,7 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
 
   router.post("/channels", async (request, response, next) => {
     try {
-      await dependencies.state.createChannel(request.body);
+      await runCatalogMutation(() => dependencies.state.createChannel(request.body));
       response.status(201).json({ ok: true, state: stateResponse() });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }
@@ -363,7 +419,7 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
   const updateChannel = async (request: Request, response: Response, next: NextFunction) => {
     try {
       const id = idParam.parse(request.params.id);
-      await dependencies.state.updateChannel(id, request.body);
+      await runCatalogMutation(() => dependencies.state.updateChannel(id, request.body));
       response.json({ ok: true, state: stateResponse() });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }
@@ -373,7 +429,8 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
   router.put("/channels/:id", updateChannel);
   router.delete("/channels/:id", async (request, response, next) => {
     try {
-      await dependencies.state.deleteChannel(idParam.parse(request.params.id));
+      const id = idParam.parse(request.params.id);
+      await runCatalogMutation(() => dependencies.state.deleteChannel(id));
       response.json({ ok: true, state: stateResponse() });
     } catch (error) {
       try { sendError(response, error); } catch (unhandled) { next(unhandled); }

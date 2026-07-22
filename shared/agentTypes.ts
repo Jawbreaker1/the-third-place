@@ -13,7 +13,10 @@ export type ExternalAgentScope = z.infer<typeof externalAgentScopeSchema>;
 
 export const EXTERNAL_AGENT_MAX_CHANNELS = 64;
 export const EXTERNAL_AGENT_MAX_PUBLIC_BIO_CODE_POINTS = 240;
-export const EXTERNAL_AGENT_MAX_PERSONALITY_PROMPT_CODE_POINTS = 12_000;
+export const EXTERNAL_AGENT_MAX_INVITATION_LABEL_CODE_POINTS = 120;
+export const EXTERNAL_AGENT_INVITATION_MIN_EXPIRY_MINUTES = 5;
+export const EXTERNAL_AGENT_INVITATION_DEFAULT_EXPIRY_MINUTES = 24 * 60;
+export const EXTERNAL_AGENT_INVITATION_MAX_EXPIRY_MINUTES = 24 * 60;
 
 const codePointLength = (value: string): number => [...value].length;
 
@@ -26,7 +29,7 @@ const canonicalDisplayNameSchema = z.string().superRefine((value, context) => {
   }
 });
 
-/** Accepts ordinary administrator input and emits the same canonical display-name shape used by humans. */
+/** Accepts owner input and emits the same canonical display-name shape used by humans. */
 export const externalAgentDisplayNameInputSchema = z.string()
   .transform(normalizeDisplayName)
   .pipe(canonicalDisplayNameSchema);
@@ -62,12 +65,13 @@ export const externalAgentPublicBioSchema = canonicalBoundedText(
   EXTERNAL_AGENT_MAX_PUBLIC_BIO_CODE_POINTS,
   0,
 );
-export const externalAgentPersonalityPromptInputSchema = boundedTextInput(
-  EXTERNAL_AGENT_MAX_PERSONALITY_PROMPT_CODE_POINTS,
+
+export const externalAgentInvitationLabelInputSchema = boundedTextInput(
+  EXTERNAL_AGENT_MAX_INVITATION_LABEL_CODE_POINTS,
   1,
 );
-export const externalAgentPersonalityPromptSchema = canonicalBoundedText(
-  EXTERNAL_AGENT_MAX_PERSONALITY_PROMPT_CODE_POINTS,
+export const externalAgentInvitationLabelSchema = canonicalBoundedText(
+  EXTERNAL_AGENT_MAX_INVITATION_LABEL_CODE_POINTS,
   1,
 );
 
@@ -95,31 +99,77 @@ export const externalAgentScopesSchema = z.array(externalAgentScopeSchema)
     }
   });
 
-export const createExternalAgentInputSchema = z.object({
+/** Public, owner-controlled identity. Private personality and memory stay in the owner's runtime. */
+export const externalAgentPublicProfileInputSchema = z.object({
   displayName: externalAgentDisplayNameInputSchema,
   publicBio: externalAgentPublicBioInputSchema,
-  personalityPrompt: externalAgentPersonalityPromptInputSchema,
+}).strict();
+
+export interface ExternalAgentPublicProfileInput {
+  displayName: string;
+  publicBio: string;
+}
+export type CanonicalExternalAgentPublicProfileInput = z.output<typeof externalAgentPublicProfileInputSchema>;
+
+export const updateExternalAgentPublicProfileInputSchema = externalAgentPublicProfileInputSchema
+  .partial()
+  .refine((value) => Object.keys(value).length > 0, "At least one public profile field must be updated");
+
+export type UpdateExternalAgentPublicProfileInput = Partial<ExternalAgentPublicProfileInput>;
+export type CanonicalUpdateExternalAgentPublicProfileInput = z.output<
+  typeof updateExternalAgentPublicProfileInputSchema
+>;
+
+/** Host-controlled authorization policy. It can never be widened by the agent profile manifest. */
+export const externalAgentAccessPolicyInputSchema = z.object({
   channelIds: externalAgentChannelIdsSchema,
   scopes: externalAgentScopesSchema,
 }).strict();
 
-export interface CreateExternalAgentInput {
-  displayName: string;
-  publicBio: string;
-  personalityPrompt: string;
+export interface ExternalAgentAccessPolicyInput {
   channelIds: readonly string[];
   scopes: readonly ExternalAgentScope[];
 }
-export type CanonicalCreateExternalAgentInput = z.output<typeof createExternalAgentInputSchema>;
+export type CanonicalExternalAgentAccessPolicyInput = z.output<typeof externalAgentAccessPolicyInputSchema>;
 
-export const updateExternalAgentInputSchema = createExternalAgentInputSchema
-  .partial()
-  .refine((value) => Object.keys(value).length > 0, "At least one agent field must be updated");
+export const updateExternalAgentAccessPolicyInputSchema = externalAgentAccessPolicyInputSchema;
+export type UpdateExternalAgentAccessPolicyInput = ExternalAgentAccessPolicyInput;
+export type CanonicalUpdateExternalAgentAccessPolicyInput = CanonicalExternalAgentAccessPolicyInput;
 
-export type UpdateExternalAgentInput = Partial<CreateExternalAgentInput>;
-export type CanonicalUpdateExternalAgentInput = z.output<typeof updateExternalAgentInputSchema>;
+export const externalAgentInvitationPurposeSchema = z.enum(["enroll", "reconnect"]);
+export type ExternalAgentInvitationPurpose = z.infer<typeof externalAgentInvitationPurposeSchema>;
 
-/** Safe for catalogs, member projections and administrator list responses. */
+const invitationCommonInputShape = {
+  adminLabel: externalAgentInvitationLabelInputSchema,
+  channelIds: externalAgentChannelIdsSchema,
+  scopes: externalAgentScopesSchema,
+  expiresInMinutes: z.number()
+    .int()
+    .min(EXTERNAL_AGENT_INVITATION_MIN_EXPIRY_MINUTES)
+    .max(EXTERNAL_AGENT_INVITATION_MAX_EXPIRY_MINUTES)
+    .optional(),
+};
+
+export const createExternalAgentInvitationInputSchema = z.discriminatedUnion("purpose", [
+  z.object({
+    ...invitationCommonInputShape,
+    purpose: z.literal("enroll"),
+  }).strict(),
+  z.object({
+    ...invitationCommonInputShape,
+    purpose: z.literal("reconnect"),
+    agentId: z.string().min(7).max(100).regex(/^agent-[a-z0-9][a-z0-9-]*$/u),
+  }).strict(),
+]);
+
+export type CreateExternalAgentInvitationInput = z.input<
+  typeof createExternalAgentInvitationInputSchema
+>;
+export type CanonicalCreateExternalAgentInvitationInput = z.output<
+  typeof createExternalAgentInvitationInputSchema
+>;
+
+/** Safe for catalogs, member projections, authenticated self and administrator responses. */
 export interface ExternalAgentSummary {
   id: string;
   displayName: string;
@@ -132,15 +182,41 @@ export interface ExternalAgentSummary {
   revokedAt?: string;
 }
 
-/** Private administrator/authenticated-self view. It still never contains bearer-token material. */
-export interface ExternalAgentAdminDetail extends ExternalAgentSummary {
-  personalityPrompt: string;
+/** There is no longer a server-stored private detail; this alias eases API migration. */
+export type ExternalAgentAdminDetail = ExternalAgentSummary;
+export type AuthenticatedExternalAgent = ExternalAgentSummary;
+
+/** The plaintext bearer is returned only by invitation redemption and cannot be recovered later. */
+export interface IssuedExternalAgentCredential {
+  agent: ExternalAgentSummary;
+  token: string;
 }
 
-export type AuthenticatedExternalAgent = ExternalAgentAdminDetail;
+export type ExternalAgentInvitationStatus = "pending" | "expired" | "redeemed" | "revoked";
 
-/** The plaintext bearer is returned only by create/rotate and cannot be recovered later. */
-export interface IssuedExternalAgentCredential {
-  agent: ExternalAgentAdminDetail;
+/** Token-free invitation projection safe for the authenticated administrator. */
+export interface ExternalAgentInvitationSummary {
+  id: string;
+  agentId: string;
+  adminLabel: string;
+  purpose: ExternalAgentInvitationPurpose;
+  channelIds: string[];
+  scopes: ExternalAgentScope[];
+  status: ExternalAgentInvitationStatus;
+  createdAt: string;
+  expiresAt: string;
+  redeemedAt?: string;
+  revokedAt?: string;
+  expiredAt?: string;
+}
+
+/** The invitation bearer is disclosed exactly once when the host creates it. */
+export interface IssuedExternalAgentInvitation {
+  invitation: ExternalAgentInvitationSummary;
   token: string;
+}
+
+/** Successful one-time exchange. The invitation secret itself is never returned. */
+export interface RedeemedExternalAgentInvitation extends IssuedExternalAgentCredential {
+  invitation: ExternalAgentInvitationSummary;
 }
