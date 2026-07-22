@@ -174,6 +174,12 @@ export interface HumanMemoryContinuityInventory {
   socialActorCount: number;
   retainedHumanActorIds: readonly string[];
   residentActorIds: readonly string[];
+  /**
+   * Stable actors owned by another complete, trusted identity authority.
+   * External-agent access records belong here, including revoked tombstones,
+   * so their surviving social history is never mistaken for an orphaned human.
+   */
+  trustedAdditionalActorIds?: readonly string[];
   pendingActorForgetIds: readonly string[];
   /** Other durable private actor stores, such as RoomStore DM participants. */
   additionalActorInventories?: readonly {
@@ -1484,22 +1490,30 @@ export const reconcilePendingActorForgets = async (
  * guesses actor type from a prefix and never deletes an unknown actor. The
  * caller may trust a new baseline only when every complete private actor-store
  * inventory is accounted for by retained humans, the current resident catalog,
- * or durable pending-erasure tombstones.
+ * an explicitly supplied trusted identity authority, or durable
+ * pending-erasure tombstones.
  */
 export const assertHumanMemoryContinuity = (inventory: HumanMemoryContinuityInventory): void => {
   const residentActorIds = new Set(inventory.residentActorIds);
+  const retainedHumanActorIds = new Set(inventory.retainedHumanActorIds);
+  const trustedAdditionalActorIds = new Set(inventory.trustedAdditionalActorIds ?? []);
+  const pendingActorForgetIds = new Set(inventory.pendingActorForgetIds);
   const actorTypeCollision = inventory.retainedHumanActorIds.some((actorId) => residentActorIds.has(actorId)) ||
-    inventory.pendingActorForgetIds.some((actorId) => residentActorIds.has(actorId));
+    inventory.pendingActorForgetIds.some((actorId) => residentActorIds.has(actorId)) ||
+    [...trustedAdditionalActorIds].some((actorId) =>
+      residentActorIds.has(actorId) || retainedHumanActorIds.has(actorId) || pendingActorForgetIds.has(actorId)
+    );
   if (actorTypeCollision) {
     throw new Error(
-      "Human-memory continuity contains an ambiguous resident identity. The server will not erase any actor.",
+      "Human-memory continuity contains an ambiguous trusted actor identity. The server will not erase any actor.",
     );
   }
   if (inventory.continuityVerified) return;
   const accountedFor = new Set([
-    ...inventory.retainedHumanActorIds,
+    ...retainedHumanActorIds,
     ...residentActorIds,
-    ...inventory.pendingActorForgetIds,
+    ...trustedAdditionalActorIds,
+    ...pendingActorForgetIds,
   ]);
   const durableInventories = [
     { actorIds: inventory.socialActorIds, actorCount: inventory.socialActorCount },

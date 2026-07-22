@@ -1,5 +1,9 @@
 export type Presence = "online" | "idle" | "dnd" | "offline";
-export type MemberKind = "human" | "ai";
+/**
+ * `agent` is an externally operated, visibly labelled participant. It is not a
+ * browser human and it is not one of the server-owned AI residents.
+ */
+export type MemberKind = "human" | "ai" | "agent";
 export type HumanIdentityKind = "registered" | "guest" | "legacy";
 
 export interface HumanSessionIdentity {
@@ -375,7 +379,8 @@ export type VoiceParticipantRole = "host" | "guest" | "ai";
 export interface VoiceParticipantView {
   memberId: string;
   name: string;
-  kind: MemberKind;
+  /** External API agents are deliberately outside the v1 voice transport. */
+  kind: Exclude<MemberKind, "agent">;
   role: VoiceParticipantRole;
   joinedAt: string;
   muted: boolean;

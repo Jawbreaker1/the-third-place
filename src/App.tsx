@@ -241,6 +241,42 @@ const BrandMark = ({ large = false }: { large?: boolean }) => (
 
 const AiBadge = ({ label = "AI" }: { label?: string }) => <span className="ai-badge"><Icon name="spark" size={10} />{label}</span>;
 
+const ExternalAgentBadge = () => <span className="external-agent-badge"><Icon name="external" size={10} />EXTERNAL AGENT</span>;
+
+export const MemberKindBadge = ({ kind, verbose = false }: { kind: Member["kind"]; verbose?: boolean }) => {
+  if (kind === "ai") return <AiBadge label={verbose ? "AI RESIDENT" : "AI"} />;
+  if (kind === "agent") return <ExternalAgentBadge />;
+  return null;
+};
+
+export const canDirectMessageMember = (me: Member | null | undefined, peer: Member): boolean =>
+  Boolean(me && peer.id !== me.id && peer.kind !== "agent");
+
+const presenceOrder: Record<Member["status"], number> = {
+  online: 0,
+  idle: 1,
+  dnd: 2,
+  offline: 3,
+};
+
+export const externalAgentMembers = (members: Member[]): Member[] => members
+  .filter((member) => member.kind === "agent")
+  .sort((left, right) => presenceOrder[left.status] - presenceOrder[right.status] || left.name.localeCompare(right.name));
+
+export const reactionParticipantsLabel = (
+  emoji: string,
+  memberIds: string[],
+  members: ReadonlyMap<string, Member>,
+): string => {
+  const participantNames = memberIds.map((memberId) => {
+    const member = members.get(memberId);
+    if (!member) return "Unknown participant";
+    return member.kind === "agent" ? `${member.name} (External Agent)` : member.name;
+  });
+  if (participantNames.length === 0) return `${emoji} reaction with no participants`;
+  return `${emoji} reaction by ${participantNames.join(", ")}`;
+};
+
 const BotBadge = () => <span className="bot-badge"><Icon name="radio" size={10} />BOT</span>;
 
 const FeedAvatar = ({ publisher }: { publisher: ChannelFeedPublisher }) => {
@@ -1229,7 +1265,7 @@ export default function App() {
         if (!current) return current;
         const next = payload.members.find((member) => member.id === current.id);
         if (next) return next;
-        return current.kind === "human" ? { ...current, status: "offline" } : current;
+        return current.kind !== "ai" ? { ...current, status: "offline" } : current;
       });
     });
     socket.on("catalog:update", (payload: CatalogUpdatePayload) => {
@@ -1726,7 +1762,11 @@ export default function App() {
   );
   const integrationsCollapsed = collapsedIntegrationChannels[activeChannelId] ?? false;
   const activeTitle = activeChannel?.name ?? activePeer?.name ?? "conversation";
-  const activeDescription = activeChannel?.description ?? (activePeer?.kind === "ai" ? "Private chat with an AI resident" : "Private conversation");
+  const activeDescription = activeChannel?.description ?? (activePeer?.kind === "ai"
+    ? "Private chat with an AI resident"
+    : activePeer?.kind === "agent"
+      ? "Private history with an external agent"
+      : "Private conversation");
   const typingMembers = (typing[activeChannelId] ?? []).map((id) => memberMap.get(id)).filter((member): member is Member => Boolean(member));
   const activeHistory = historyPageInfo[activeChannelId] ?? { hasMore: false };
   const pendingImage = imageDrafts[activeChannelId];
@@ -2895,7 +2935,7 @@ export default function App() {
   };
 
   const openDm = (peer: Member) => {
-    if (!socketRef.current || !me || peer.id === me.id) return;
+    if (!socketRef.current || !canDirectMessageMember(me, peer)) return;
     socketRef.current.emit("dm:open", { peerId: peer.id }, (result: { ok: boolean; thread?: DmThread; error?: string }) => {
       if (!result.ok || !result.thread) {
         pushToast({ tone: "warning", title: "DM unavailable", message: result.error ?? "Try again in a moment." });
@@ -2992,6 +3032,7 @@ export default function App() {
   const connectedHumans = [...onlineHumans, ...idleHumans];
   const activeResidents = members.filter((member) => member.kind === "ai" && member.status === "online");
   const quietResidents = members.filter((member) => member.kind === "ai" && member.status !== "online");
+  const externalAgents = externalAgentMembers(members);
   const displayMembers = members.length ? members : preview?.members ?? [];
   const normalizedJoinName = normalizeDisplayName(joinName);
   const joinNameReady = validDisplayName(normalizedJoinName);
@@ -3096,7 +3137,7 @@ export default function App() {
                 if (!peer) return null;
                 return (
                   <button key={thread.id} className={`dm-button ${activeChannelId === thread.id ? "active" : ""}`} onClick={() => selectChannel(thread.id)}>
-                    <Avatar member={peer} size="sm" /><span dir="auto">{peer.name}</span>{peer.kind === "ai" && <AiBadge />}{thread.unread > 0 && <i className="channel-unread" aria-label={`${thread.unread} unread messages`}>{thread.unread > 9 ? "9+" : thread.unread}</i>}
+                    <Avatar member={peer} size="sm" /><span dir="auto">{peer.name}</span><MemberKindBadge kind={peer.kind} />{thread.unread > 0 && <i className="channel-unread" aria-label={`${thread.unread} unread messages`}>{thread.unread > 9 ? "9+" : thread.unread}</i>}
                   </button>
                 );
               })
@@ -3405,6 +3446,7 @@ export default function App() {
             <h1 dir="auto">{activePeer ? activePeer.name : `Welcome to #${activeTitle}`}</h1>
             <p dir="auto">{activeDescription}</p>
             {activePeer?.kind === "ai" && <div className="transparency-note"><AiBadge label="AI RESIDENT" /><span>This character is generated by a local language model. Private history is stored locally by this server.</span></div>}
+            {activePeer?.kind === "agent" && <div className="transparency-note external-agent-note"><ExternalAgentBadge /><span>This identity is operated by an outside agent and managed by its owner.</span></div>}
           </div>}
           {activeMessages.length === 0 && <div className="empty-conversation"><Icon name="message" size={22} /><strong>Quiet, for once.</strong><span>Say something and see who notices.</span></div>}
           {activeMessages.map((message, index) => {
@@ -3451,7 +3493,7 @@ export default function App() {
                 {!grouped ? <Avatar member={author} size="md" /> : <time className="group-time">{formatTime(message.createdAt)}</time>}
                 <div className="message-body">
                   {replyDisplay && <button className="reply-preview"><Icon name="reply" size={12} /><strong dir="auto">{replyDisplay.authorName}</strong><span dir="auto">{replyDisplay.content.slice(0, 92)}</span></button>}
-                  {!grouped && <div className="message-meta"><button dir="auto" onClick={() => setProfile(author)}>{author.name}</button>{author.kind === "ai" && <AiBadge />}<time>{formatTime(message.createdAt)}</time></div>}
+                  {!grouped && <div className="message-meta"><button dir="auto" onClick={() => setProfile(author)}>{author.name}</button><MemberKindBadge kind={author.kind} /><time>{formatTime(message.createdAt)}</time></div>}
                   {message.content && <div className="message-content" dir="auto"><MessageText content={message.content} members={displayMembers} /></div>}
                   {message.attachments?.map((attachment) => {
                     const description = attachment.analysis.status === "ready"
@@ -3522,11 +3564,12 @@ export default function App() {
                       {message.reactions.map((reaction) => (
                         <button
                           key={reaction.emoji}
-                          aria-label={`${reaction.emoji} reaction, ${reaction.memberIds.length} ${reaction.memberIds.length === 1 ? "person" : "people"}`}
+                          aria-label={reactionParticipantsLabel(reaction.emoji, reaction.memberIds, memberMap)}
                           aria-pressed={Boolean(me && reaction.memberIds.includes(me.id))}
                           className={me && reaction.memberIds.includes(me.id) ? "mine" : ""}
                           onClick={() => me && react(message, reaction.emoji)}
                           disabled={!me}
+                          title={reactionParticipantsLabel(reaction.emoji, reaction.memberIds, memberMap)}
                         >
                           <span>{reaction.emoji}</span><b>{reaction.memberIds.length}</b>
                           <i>{reaction.memberIds.slice(0, 3).map((id) => memberMap.get(id)).filter((member): member is Member => Boolean(member)).map((member) => <Avatar key={member.id} member={member} size="sm" showStatus={false} />)}</i>
@@ -3702,14 +3745,14 @@ export default function App() {
       )}
 
       <aside className={`member-panel ${mobilePanel === "people" ? "mobile-open" : ""}`}>
-        <div className="member-panel-head"><div><strong>{voiceRoomInView ? "In voice" : "In the room"}</strong><span>{voiceRoomInView ? `${voiceRoomInView.participants.length} connected` : `${connectedHumans.length} people here · ${offlineHumans.length} offline members · ${activeResidents.length} active residents`}</span></div><button className="icon-button mobile-only" onClick={() => setMobilePanel(null)}><Icon name="close" /></button></div>
+        <div className="member-panel-head"><div><strong>{voiceRoomInView ? "In voice" : "In the room"}</strong><span>{voiceRoomInView ? `${voiceRoomInView.participants.length} connected` : `${connectedHumans.length} people here · ${offlineHumans.length} offline members · ${activeResidents.length} active residents${externalAgents.length ? ` · ${externalAgents.length} external agents` : ""}`}</span></div><button className="icon-button mobile-only" onClick={() => setMobilePanel(null)}><Icon name="close" /></button></div>
         {!voiceRoomInView && <div className="room-pulse-card" onClick={() => setShowDirector(true)} role="button" tabIndex={0}>
           <div className="pulse-orb"><i /><i /><i /></div>
           <div><strong>Room pulse</strong><span>{typingMembers.length ? `${typingMembers.length} composing now` : directorEvents.at(-1)?.summary ?? "Quietly paying attention"}</span></div>
           <Icon name="chevron" size={15} />
         </div>}
         <div className="member-scroll">
-          {voiceRoomInView ? <><MemberGroup title="Connected" members={voicePanelMembers} onSelect={setProfile} /><MemberGroup title="Available AI residents" members={availableVoiceBots.slice(0, 10)} onSelect={setProfile} /></> : <><MemberGroup title="Online people" members={onlineHumans} onSelect={setProfile} /><MemberGroup title="Idle" members={idleHumans} onSelect={setProfile} /><MemberGroup title="Offline members" members={offlineHumans} onSelect={setProfile} /><MemberGroup title="Active residents" members={activeResidents} onSelect={setProfile} /><MemberGroup title="Around · quieter" members={quietResidents} onSelect={setProfile} /></>}
+          {voiceRoomInView ? <><MemberGroup title="Connected" members={voicePanelMembers} onSelect={setProfile} /><MemberGroup title="Available AI residents" members={availableVoiceBots.slice(0, 10)} onSelect={setProfile} /></> : <><MemberGroup title="Online people" members={onlineHumans} onSelect={setProfile} /><MemberGroup title="Idle" members={idleHumans} onSelect={setProfile} /><MemberGroup title="Offline members" members={offlineHumans} onSelect={setProfile} /><MemberGroup title="External agents" members={externalAgents} onSelect={setProfile} /><MemberGroup title="Active residents" members={activeResidents} onSelect={setProfile} /><MemberGroup title="Around · quieter" members={quietResidents} onSelect={setProfile} /></>}
         </div>
         <div className="model-card">
           <div className="model-icon"><Icon name="spark" size={15} /></div>
@@ -3823,13 +3866,13 @@ export default function App() {
             <button className="profile-close" onClick={() => setProfile(null)}><Icon name="close" /></button>
             <Avatar member={profile} size="xl" />
             <div className="profile-body">
-              <div className="profile-name"><h2 dir="auto">{profile.name}</h2>{profile.kind === "ai" && <AiBadge label="AI RESIDENT" />}</div>
+              <div className="profile-name"><h2 dir="auto">{profile.name}</h2><MemberKindBadge kind={profile.kind} verbose /></div>
               <p className="profile-role" dir="auto">{profile.role}</p>
               <p className="profile-bio" dir="auto">{profile.bio}</p>
               <div className="profile-facts">
                 <span><small>STATUS</small><b dir="auto"><i className={`presence-${profile.status}`} />{profile.status}</b></span>
                 {profile.activity && <span><small>CURRENTLY</small><b dir="auto">{profile.activity}</b></span>}
-                <span><small>MEMORY</small><b>{me && profile.id === me.id
+                <span><small>{profile.kind === "agent" ? "IDENTITY" : "MEMORY"}</small><b>{me && profile.id === me.id
                   ? sessionIdentity?.kind === "registered"
                     ? "Persistent local account"
                     : sessionIdentity?.kind === "legacy"
@@ -3837,6 +3880,8 @@ export default function App() {
                       : "Temporary guest identity"
                   : profile.kind === "ai"
                     ? "Recent room context"
+                    : profile.kind === "agent"
+                      ? "Owner-managed external agent"
                     : profile.status === "offline"
                       ? "Local member"
                       : "Human visitor"}</b></span>
@@ -3876,7 +3921,7 @@ export default function App() {
                         : "Leave and erase this legacy identity"}
                 </button>
               )}
-              {me && profile.id !== me.id && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message <span dir="auto">{profile.name}</span></button>}
+              {canDirectMessageMember(me, profile) && <button className="profile-message" onClick={() => openDm(profile)}><Icon name="message" /> Message <span dir="auto">{profile.name}</span></button>}
             </div>
           </article>
         </div>
@@ -3908,9 +3953,9 @@ export default function App() {
   );
 }
 
-function MemberGroup({ title, members, onSelect }: { title: string; members: Member[]; onSelect: (member: Member) => void }) {
+export function MemberGroup({ title, members, onSelect }: { title: string; members: Member[]; onSelect: (member: Member) => void }) {
   if (members.length === 0) return null;
   return (
-    <section className="member-group"><p className="eyebrow">{title} <span>{members.length}</span></p>{members.map((member) => <button className="member-row" key={member.id} onClick={() => onSelect(member)}><Avatar member={member} size="sm" /><span className="member-copy"><strong dir="auto">{member.name}{member.kind === "ai" && <AiBadge />}</strong><small dir="auto">{member.activity ?? member.role}</small></span></button>)}</section>
+    <section className="member-group"><p className="eyebrow">{title} <span>{members.length}</span></p>{members.map((member) => <button className="member-row" key={member.id} onClick={() => onSelect(member)}><Avatar member={member} size="sm" /><span className="member-copy"><strong><span className="member-name" dir="auto">{member.name}</span><MemberKindBadge kind={member.kind} /></strong><small dir="auto">{member.activity ?? member.role}</small></span></button>)}</section>
   );
 }

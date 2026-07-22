@@ -484,6 +484,31 @@ describe("social-memory admin projection", () => {
     });
   });
 
+  it("keeps trusted external agents distinct in the memory inspector catalog", () => {
+    const store = createStore();
+    store.recordEvent(firstEvent());
+    const admin = new SocialMemoryAdmin({
+      store,
+      getActors: () => [
+        ...actors,
+        { id: "agent-field-observer", name: "Field Observer", kind: "agent" },
+      ],
+    });
+
+    expect(admin.getOverview().actors).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "agent-field-observer",
+        name: "Field Observer",
+        kind: "agent",
+        memoryCount: 0,
+      }),
+    ]));
+    expect(admin.getActorDetail("agent-field-observer")?.actor).toMatchObject({
+      id: "agent-field-observer",
+      kind: "agent",
+    });
+  });
+
   it("bounds the actor catalog used by the inspector", () => {
     const store = createStore();
     const oversizedCatalog: SocialMemoryAdminActor[] = Array.from({ length: 260 }, (_, index) => ({

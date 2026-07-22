@@ -2817,7 +2817,7 @@ const candidateOutputLanguageSchema = z.object({
 }).strict();
 const candidateReviewTimelineRowSchema = z.object({
   author: boundedText(80),
-  kind: z.enum(["human", "ai", "system"]),
+  kind: z.enum(["human", "ai", "agent", "system"]),
   content: boundedText(1_200),
   createdAt: z.string().datetime(),
   ageSeconds: z.number().int().min(0).nullable(),

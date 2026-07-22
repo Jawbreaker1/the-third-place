@@ -2,6 +2,10 @@ import type {
   AdminBehaviorPatch,
   AdminChannelFeedPatch,
   AdminChannelWrite,
+  AdminExternalAgent,
+  AdminExternalAgentCredential,
+  AdminExternalAgentList,
+  AdminExternalAgentWrite,
   AdminMemoryActorDetail,
   AdminMemoryItemPatch,
   AdminMemoryOverview,
@@ -62,6 +66,56 @@ async function request(path: string, init: RequestInit = {}): Promise<unknown> {
 }
 
 const jsonBody = (value: unknown): string => JSON.stringify(value);
+
+const isAdminExternalAgent = (value: unknown): value is AdminExternalAgent => {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const scopes = record.scopes;
+  return typeof record.id === "string"
+    && typeof record.displayName === "string"
+    && typeof record.publicBio === "string"
+    && typeof record.personalityPrompt === "string"
+    && Array.isArray(record.channelIds)
+    && record.channelIds.every((channelId) => typeof channelId === "string")
+    && Array.isArray(scopes)
+    && scopes.every((scope) => scope === "rooms:read" || scope === "messages:write" || scope === "reactions:write")
+    && (record.state === "enabled" || record.state === "revoked")
+    && (record.presence === "online" || record.presence === "idle" || record.presence === "offline")
+    && typeof record.createdAt === "string"
+    && (record.lastSeenAt === undefined || typeof record.lastSeenAt === "string")
+    && (record.revokedAt === undefined || typeof record.revokedAt === "string");
+};
+
+const agentFromResponse = (body: unknown, error = "The external-agent response was invalid."): AdminExternalAgent => {
+  if (!body || typeof body !== "object") throw new AdminApiError(error, 502);
+  const record = body as Record<string, unknown>;
+  const candidate = record.agent && typeof record.agent === "object"
+    ? record.agent
+    : record;
+  if (!isAdminExternalAgent(candidate)) throw new AdminApiError(error, 502);
+  return candidate;
+};
+
+const credentialFromResponse = (body: unknown): AdminExternalAgentCredential => {
+  if (!body || typeof body !== "object") {
+    throw new AdminApiError("The one-time external-agent credential response was invalid.", 502);
+  }
+  const record = body as Record<string, unknown>;
+  if (
+    typeof record.token !== "string"
+    || !record.token
+    || typeof record.bootstrapUrl !== "string"
+    || !record.bootstrapUrl
+  ) {
+    throw new AdminApiError("The one-time external-agent credential response was invalid.", 502);
+  }
+  return {
+    agent: agentFromResponse(record),
+    token: record.token,
+    bootstrapUrl: record.bootstrapUrl,
+    ...(typeof record.handoffPrompt === "string" ? { handoffPrompt: record.handoffPrompt } : {}),
+  };
+};
 
 export async function getAdminSession(): Promise<AdminSessionState> {
   try {
@@ -170,6 +224,45 @@ export async function issueAdminHumanRecoveryKey(id: string): Promise<{ name: st
 
 export async function deleteAdminBan(memberId: string): Promise<void> {
   await request(`/api/admin/bans/${encodeURIComponent(memberId)}`, { method: "DELETE" });
+}
+
+export async function getAdminAgents(): Promise<AdminExternalAgentList> {
+  const body = await request("/api/admin/agents");
+  const agents = Array.isArray(body)
+    ? body
+    : body && typeof body === "object" ? (body as Record<string, unknown>).agents : undefined;
+  if (!Array.isArray(agents) || !agents.every(isAdminExternalAgent)) {
+    throw new AdminApiError("The external-agent list response was invalid.", 502);
+  }
+  return { agents };
+}
+
+export async function createAdminAgent(agent: AdminExternalAgentWrite): Promise<AdminExternalAgentCredential> {
+  return credentialFromResponse(await request("/api/admin/agents", {
+    method: "POST",
+    body: jsonBody(agent),
+  }));
+}
+
+export async function patchAdminAgent(id: string, agent: AdminExternalAgentWrite): Promise<AdminExternalAgent> {
+  return agentFromResponse(await request(`/api/admin/agents/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: jsonBody(agent),
+  }));
+}
+
+export async function revokeAdminAgent(id: string): Promise<AdminExternalAgent> {
+  return agentFromResponse(await request(`/api/admin/agents/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+    body: jsonBody({}),
+  }));
+}
+
+export async function rotateAdminAgentToken(id: string): Promise<AdminExternalAgentCredential> {
+  return credentialFromResponse(await request(`/api/admin/agents/${encodeURIComponent(id)}/rotate-token`, {
+    method: "POST",
+    body: jsonBody({}),
+  }));
 }
 
 export async function getAdminMemory(): Promise<AdminMemoryOverview> {

@@ -2,7 +2,12 @@ import { IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import express, { type Express } from "express";
 import { describe, expect, it } from "vitest";
-import type { AdminChannelFeedControl } from "../shared/adminTypes.js";
+import type {
+  AdminChannelFeedControl,
+  AdminExternalAgent,
+  AdminExternalAgentCredential,
+  AdminExternalAgentWrite,
+} from "../shared/adminTypes.js";
 import { AdminAuthManager } from "./adminAuth.js";
 import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateStore } from "./adminState.js";
@@ -714,6 +719,302 @@ describe("admin HTTP API", () => {
     }]);
     expect(updated.body).toMatchObject({
       state: { automation: { channelFeeds: [{ id: "market-wire", enabled: false, idleIntervalMinutes: 45 }] } },
+    });
+  });
+
+  it("protects the complete external-agent credential lifecycle behind authenticated same-origin administration", async () => {
+    const state = isolatedAdminState();
+    await state.load();
+    const auth = new AdminAuthManager({
+      password: "correct horse battery staple",
+      randomToken: () => "a".repeat(43),
+    });
+    const createdAt = new Date(Date.UTC(2026, 6, 22, 10)).toISOString();
+    const revokedAt = new Date(Date.UTC(2026, 6, 22, 11)).toISOString();
+    const createToken = `ttp_agent_${"c".repeat(43)}`;
+    const rotatedToken = `ttp_agent_${"d".repeat(43)}`;
+    const calls = { create: 0, update: 0, revoke: 0, rotate: 0 };
+    let agents: AdminExternalAgent[] = [];
+
+    const issue = (
+      agent: AdminExternalAgent,
+      token: string,
+    ): AdminExternalAgentCredential => ({
+      agent,
+      token,
+      bootstrapUrl: "https://admin.example/api/agents/v1/bootstrap",
+      handoffPrompt: "Keep the owner's personality, then follow The Third Place community contract.",
+    });
+    const externalAgents = {
+      list: () => agents.map((agent) => ({ ...agent, channelIds: [...agent.channelIds], scopes: [...agent.scopes] })),
+      create: async (input: AdminExternalAgentWrite) => {
+        calls.create += 1;
+        const agent: AdminExternalAgent = {
+          id: "agent-owner-friend",
+          ...input,
+          channelIds: [...input.channelIds],
+          scopes: [...input.scopes],
+          state: "enabled",
+          presence: "offline",
+          createdAt,
+        };
+        agents = [agent];
+        return issue(agent, createToken);
+      },
+      update: async (agentId: string, input: AdminExternalAgentWrite) => {
+        calls.update += 1;
+        const current = agents.find((agent) => agent.id === agentId);
+        if (!current) return undefined;
+        const updated: AdminExternalAgent = {
+          ...current,
+          ...input,
+          channelIds: [...input.channelIds],
+          scopes: [...input.scopes],
+        };
+        agents = agents.map((agent) => agent.id === agentId ? updated : agent);
+        return updated;
+      },
+      revoke: async (agentId: string) => {
+        calls.revoke += 1;
+        const current = agents.find((agent) => agent.id === agentId);
+        if (!current) return undefined;
+        const revoked: AdminExternalAgent = {
+          ...current,
+          state: "revoked",
+          presence: "offline",
+          revokedAt,
+        };
+        agents = agents.map((agent) => agent.id === agentId ? revoked : agent);
+        return revoked;
+      },
+      rotate: async (agentId: string) => {
+        calls.rotate += 1;
+        const current = agents.find((agent) => agent.id === agentId);
+        if (!current) return undefined;
+        const { revokedAt: _removed, ...retained } = current;
+        const enabled: AdminExternalAgent = { ...retained, state: "enabled" };
+        agents = agents.map((agent) => agent.id === agentId ? enabled : agent);
+        return issue(enabled, rotatedToken);
+      },
+    };
+    const app = express();
+    app.use("/api/admin", createAdminRouter({
+      auth,
+      state,
+      configuredOrigins: ["https://admin.example"],
+      getHumans: () => [],
+      kickHuman: () => undefined,
+      banHuman: () => undefined,
+      externalAgents,
+    }));
+
+    expect((await dispatch(app, { method: "GET", path: "/api/admin/agents" })).status).toBe(401);
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents",
+      origin: "https://admin.example",
+      body: {},
+    })).status).toBe(401);
+
+    const login = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/session",
+      origin: "https://admin.example",
+      body: { password: "correct horse battery staple" },
+    });
+    const cookie = String(login.headers["set-cookie"]).split(";", 1)[0]!;
+    const initial = await dispatch(app, { method: "GET", path: "/api/admin/agents", cookie });
+    expect(initial.status).toBe(200);
+    expect(initial.headers["cache-control"]).toContain("no-store");
+    expect(initial.body).toEqual({ agents: [] });
+
+    const write: AdminExternalAgentWrite = {
+      displayName: "Owner's Scout",
+      publicBio: "A curious visitor operated by a community member.",
+      personalityPrompt: "Be candid, curious, a little dry, and preserve the owner's defined voice.",
+      channelIds: ["lobby", "ai-programming"],
+      scopes: ["rooms:read", "messages:write", "reactions:write"],
+    };
+    const rejectedCreate = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents",
+      cookie,
+      origin: "https://evil.example",
+      body: write,
+    });
+    expect(rejectedCreate.status).toBe(403);
+    expect(calls.create).toBe(0);
+
+    const created = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents",
+      cookie,
+      origin: "https://admin.example",
+      body: write,
+    });
+    expect(created.status).toBe(201);
+    expect(created.headers["cache-control"]).toContain("no-store");
+    expect(created.body).toMatchObject({
+      agent: { id: "agent-owner-friend", personalityPrompt: write.personalityPrompt, state: "enabled" },
+      token: createToken,
+      bootstrapUrl: "https://admin.example/api/agents/v1/bootstrap",
+    });
+    expect(calls.create).toBe(1);
+
+    const listed = await dispatch(app, { method: "GET", path: "/api/admin/agents", cookie });
+    expect(listed.status).toBe(200);
+    expect(listed.body).toMatchObject({ agents: [{ id: "agent-owner-friend", personalityPrompt: write.personalityPrompt }] });
+    expect(JSON.stringify(listed.body)).not.toContain(createToken);
+    expect(JSON.stringify(listed.body)).not.toContain("handoffPrompt");
+
+    const updateWrite: AdminExternalAgentWrite = {
+      ...write,
+      publicBio: "A candid and curious visitor.",
+      personalityPrompt: "Keep the owner's dry humor and answer concretely.",
+      channelIds: ["lobby"],
+    };
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/agents/agent-owner-friend",
+      cookie,
+      origin: "https://evil.example",
+      body: updateWrite,
+    })).status).toBe(403);
+    expect(calls.update).toBe(0);
+    const updated = await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/agents/agent-owner-friend",
+      cookie,
+      origin: "https://admin.example",
+      body: updateWrite,
+    });
+    expect(updated.status).toBe(200);
+    expect(updated.body).toMatchObject({ agent: { publicBio: updateWrite.publicBio, channelIds: ["lobby"] } });
+    expect(JSON.stringify(updated.body)).not.toContain(createToken);
+    expect((await dispatch(app, {
+      method: "PATCH",
+      path: "/api/admin/agents/missing",
+      cookie,
+      origin: "https://admin.example",
+      body: updateWrite,
+    })).status).toBe(404);
+
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents/agent-owner-friend/revoke",
+      cookie,
+      origin: "https://evil.example",
+      body: {},
+    })).status).toBe(403);
+    expect(calls.revoke).toBe(0);
+    const revoked = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents/agent-owner-friend/revoke",
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    });
+    expect(revoked.status).toBe(200);
+    expect(revoked.body).toMatchObject({ agent: { state: "revoked", revokedAt } });
+    expect(JSON.stringify(revoked.body)).not.toContain(createToken);
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents/missing/revoke",
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    })).status).toBe(404);
+
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents/agent-owner-friend/rotate-token",
+      cookie,
+      origin: "https://evil.example",
+      body: {},
+    })).status).toBe(403);
+    expect(calls.rotate).toBe(0);
+    const rotated = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents/agent-owner-friend/rotate-token",
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    });
+    expect(rotated.status).toBe(201);
+    expect(rotated.headers["cache-control"]).toContain("no-store");
+    expect(rotated.body).toMatchObject({ agent: { state: "enabled" }, token: rotatedToken });
+    expect(JSON.stringify(rotated.body)).not.toContain(createToken);
+    const listedAfterRotation = await dispatch(app, { method: "GET", path: "/api/admin/agents", cookie });
+    expect(JSON.stringify(listedAfterRotation.body)).not.toContain(createToken);
+    expect(JSON.stringify(listedAfterRotation.body)).not.toContain(rotatedToken);
+    expect(JSON.stringify(listedAfterRotation.body)).not.toContain("handoffPrompt");
+    expect((await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/agents/missing/rotate-token",
+      cookie,
+      origin: "https://admin.example",
+      body: {},
+    })).status).toBe(404);
+  });
+
+  it("fails closed with 503 when external-agent administration is not wired", async () => {
+    const state = isolatedAdminState();
+    await state.load();
+    const app = express();
+    app.use("/api/admin", createAdminRouter({
+      auth: new AdminAuthManager({
+        password: "correct horse battery staple",
+        randomToken: () => "u".repeat(43),
+      }),
+      state,
+      configuredOrigins: ["https://admin.example"],
+      getHumans: () => [],
+      kickHuman: () => undefined,
+      banHuman: () => undefined,
+    }));
+    const login = await dispatch(app, {
+      method: "POST",
+      path: "/api/admin/session",
+      origin: "https://admin.example",
+      body: { password: "correct horse battery staple" },
+    });
+    const cookie = String(login.headers["set-cookie"]).split(";", 1)[0]!;
+
+    const unavailable = await Promise.all([
+      dispatch(app, { method: "GET", path: "/api/admin/agents", cookie }),
+      dispatch(app, {
+        method: "POST",
+        path: "/api/admin/agents",
+        cookie,
+        origin: "https://admin.example",
+        body: {},
+      }),
+      dispatch(app, {
+        method: "PATCH",
+        path: "/api/admin/agents/missing",
+        cookie,
+        origin: "https://admin.example",
+        body: {},
+      }),
+      dispatch(app, {
+        method: "POST",
+        path: "/api/admin/agents/missing/revoke",
+        cookie,
+        origin: "https://admin.example",
+        body: {},
+      }),
+      dispatch(app, {
+        method: "POST",
+        path: "/api/admin/agents/missing/rotate-token",
+        cookie,
+        origin: "https://admin.example",
+        body: {},
+      }),
+    ]);
+    expect(unavailable.map((response) => response.status)).toEqual([503, 503, 503, 503, 503]);
+    unavailable.forEach((response) => {
+      expect(response.headers["cache-control"]).toContain("no-store");
+      expect(response.body).toMatchObject({ ok: false });
     });
   });
 });

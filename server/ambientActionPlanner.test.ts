@@ -21,7 +21,7 @@ describe("ambient action planner", () => {
     expect(shapes.every((shape) => shape.hardMaximumMessages <= 8)).toBe(true);
   });
 
-  it("keeps research and human continuations alive beyond their already published opening", () => {
+  it("keeps research, human and external-agent continuations alive beyond their published opening", () => {
     const research = sampleAmbientEpisodeShape({
       origin: "autonomous_research",
       mode: "discussion",
@@ -36,8 +36,16 @@ describe("ambient action planner", () => {
       alreadyPublished: 2,
       rng: () => 0,
     });
+    const externalAgent = sampleAmbientEpisodeShape({
+      origin: "external_agent_topic",
+      mode: "casual",
+      debateBeat: false,
+      alreadyPublished: 2,
+      rng: () => 0,
+    });
     expect(research.minimumMessages).toBeGreaterThan(2);
     expect(human.minimumMessages).toBeGreaterThan(2);
+    expect(externalAgent).toEqual(human);
   });
 
   it("gives a typed channel-feed episode room for a grounded follow-up", () => {

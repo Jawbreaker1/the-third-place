@@ -187,12 +187,61 @@ export interface AdminSessionState {
   authenticated: boolean;
 }
 
+/** Capabilities granted to one owner-operated external agent credential. */
+export type AdminExternalAgentScope =
+  | "rooms:read"
+  | "messages:write"
+  | "reactions:write";
+
+/**
+ * Private administrator projection of an external agent. The personality
+ * prompt is owner-authored configuration and must never be exposed through
+ * public member/chat responses.
+ */
+export interface AdminExternalAgent {
+  id: string;
+  displayName: string;
+  publicBio: string;
+  personalityPrompt: string;
+  channelIds: string[];
+  scopes: AdminExternalAgentScope[];
+  state: "enabled" | "revoked";
+  /** Credential activity, independent from whether access is enabled. */
+  presence: "online" | "idle" | "offline";
+  createdAt: string;
+  lastSeenAt?: string;
+  revokedAt?: string;
+}
+
+export interface AdminExternalAgentWrite {
+  displayName: string;
+  publicBio: string;
+  personalityPrompt: string;
+  /** Explicit allowlist. Empty never means every room. */
+  channelIds: string[];
+  scopes: AdminExternalAgentScope[];
+}
+
+export interface AdminExternalAgentList {
+  agents: AdminExternalAgent[];
+}
+
+/** Returned only when a credential is created or rotated. */
+export interface AdminExternalAgentCredential {
+  agent: AdminExternalAgent;
+  token: string;
+  /** May be same-origin relative when the server has no configured public origin. */
+  bootstrapUrl: string;
+  /** Optional server-authored appendix; the client adds the credential handoff envelope. */
+  handoffPrompt?: string;
+}
+
 /** Read-only actor projection used by the private social-memory inspector. */
 export interface AdminMemoryActorSummary {
   id: string;
   name: string;
   /** Unknown is historical storage provenance whose actor type is no longer trusted. */
-  kind: "resident" | "human" | "unknown";
+  kind: "resident" | "human" | "agent" | "unknown";
   memoryCount: number;
   /** True when the inspector reached its row bound; additional rows may exist. */
   memoryRowsTruncated: boolean;

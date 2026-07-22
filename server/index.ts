@@ -33,11 +33,35 @@ import type {
   VoiceTranscriptEntry,
 } from "../shared/types.js";
 import { isPublicReactionEmoji } from "../shared/reactions.js";
-import type { AdminHumanMember } from "../shared/adminTypes.js";
+import type {
+  AdminExternalAgent,
+  AdminExternalAgentCredential,
+  AdminExternalAgentWrite,
+  AdminHumanMember,
+} from "../shared/adminTypes.js";
+import {
+  createExternalAgentInputSchema,
+  type AuthenticatedExternalAgent,
+  type ExternalAgentScope,
+  type ExternalAgentSummary,
+} from "../shared/agentTypes.js";
 import { displayNameGlyph, normalizeDisplayName, validDisplayName } from "../shared/displayName.js";
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import { HUMAN_IDLE_AFTER_MS } from "../shared/presence.js";
 import { AdminAuthManager } from "./adminAuth.js";
+import { AgentAccessStore } from "./agentAccessStore.js";
+import {
+  createExternalAgentRouter,
+  EXTERNAL_AGENT_API_BASE_PATH,
+  EXTERNAL_AGENT_CHANNEL_FEED_SCHEMA_VERSION,
+  externalAgentMessageId,
+  type ExternalAgentApiFailure,
+} from "./agentRouter.js";
+import {
+  ExternalAgentActivityCursorError,
+  ExternalAgentActivityHub,
+} from "./externalAgentActivity.js";
+import { ExternalAgentPresenceRuntime } from "./externalAgentPresence.js";
 import {
   AccountStore,
   type AccountRecord,
@@ -47,7 +71,7 @@ import { AdminModerationGuard } from "./adminModeration.js";
 import { createAdminRouter } from "./adminRouter.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
 import { ActorChannelRuntime } from "./actorChannels.js";
-import { ActorPublicationGate } from "./actorPublicationGate.js";
+import { ActorPublicationGate, type ActorPublicationLease } from "./actorPublicationGate.js";
 import { addressedPersonaIds, analyzeSocialSignals, SocialDirector } from "./director.js";
 import { AmbientEpisodeLedger } from "./ambientEpisodeLedger.js";
 import { LinkPreviewBroker } from "./linkPreviewBroker.js";
@@ -491,6 +515,10 @@ const io = new Server(httpServer, {
 const store = new RoomStore();
 const humanMemory = new HumanMemoryStore();
 const accountStore = new AccountStore();
+const agentAccessStore = new AgentAccessStore();
+await agentAccessStore.load();
+const externalAgentPresence = new ExternalAgentPresenceRuntime();
+const externalAgentActivity = new ExternalAgentActivityHub();
 const socialMemoryStore = new SocialMemoryStore({
   filePath: resolve(process.env.SOCIAL_MEMORY_PATH ?? "./data/social-memory.sqlite"),
   resolveActorKind: createLiveActorKindResolver({
@@ -602,6 +630,23 @@ const protectedHumanActorIds = (...extraActorIds: string[]): Set<string> => new 
 ]);
 const identityMutations = new HumanIdentityMutationCoordinator();
 const actorPublicationGate = new ActorPublicationGate();
+// External-agent writes and authority edits share an actor-local serial
+// boundary. An admin edit must never race the durable room commit for the same
+// actor, while one slow owner-operated agent must not block unrelated agents.
+// The credential catalog is bounded, so retaining one tiny coordinator per
+// observed agent is bounded as well.
+const externalAgentMutations = new Map<string, HumanIdentityMutationCoordinator>();
+const runExternalAgentMutation = async <T>(
+  agentId: string,
+  operation: () => Promise<T>,
+): Promise<T> => {
+  let coordinator = externalAgentMutations.get(agentId);
+  if (!coordinator) {
+    coordinator = new HumanIdentityMutationCoordinator();
+    externalAgentMutations.set(agentId, coordinator);
+  }
+  return await coordinator.run(operation);
+};
 const isActiveHumanSession = (session: HumanSession): boolean =>
   sessions.get(session.tokenHash) === session &&
   !session.revoked &&
@@ -763,6 +808,32 @@ const historyPageFor = (channelId: string, before?: HistoryPosition, limit = 40)
 
 const humanPresenceRank = (status: Member["status"]): number =>
   status === "online" ? 3 : status === "idle" ? 2 : status === "dnd" ? 1 : 0;
+const externalAgentReservingName = (identityKey: string): ExternalAgentSummary | undefined =>
+  agentAccessStore.list().find((agent) => safeNameKey(agent.displayName) === identityKey);
+const externalAgentMember = (agent: ExternalAgentSummary): Member => {
+  const digest = createHash("sha256").update(agent.id, "utf8").digest();
+  const palettes = [
+    ["#38bda7", "#91e1d1"],
+    ["#7787ee", "#b7c1ff"],
+    ["#bd6fd9", "#edafea"],
+    ["#d18255", "#f0c58e"],
+  ] as const;
+  const palette = palettes[(digest[0] ?? 0) % palettes.length]!;
+  return {
+    id: agent.id,
+    name: agent.displayName,
+    kind: "agent",
+    status: externalAgentPresence.status(agent.id),
+    avatar: {
+      color: palette[0],
+      accent: palette[1],
+      glyph: displayNameGlyph(agent.displayName),
+    },
+    role: "External agent",
+    // Frozen message snapshots are bounded to the shared Member contract.
+    bio: [...agent.publicBio].slice(0, 240).join(""),
+  };
+};
 const getMembers = (): Member[] => {
   const humans = new Map<string, Member>();
   // A registered account is durable community membership, not a connection.
@@ -789,9 +860,13 @@ const getMembers = (): Member[] => {
   }
   return [
     ...PERSONAS.map((persona) => ({ ...memberView(persona), activity: actorChannels.activityLabel(persona) })),
+    ...agentAccessStore.list()
+      .filter((agent) => !agent.revokedAt)
+      .map(externalAgentMember),
     ...humans.values(),
   ];
 };
+const lastPublishedExternalAgentPresence = new Map<string, Member["status"]>();
 const replyPreviewFor = (message: ChatMessage) => ({
   authorId: message.authorId,
   authorName:
@@ -856,6 +931,37 @@ const visibleChannelFeedCards = (cards: readonly ChannelFeedCard[]): ChannelFeed
   const activeChannelIds = new Set(CHANNELS.map((channel) => channel.id));
   return cards.filter((card) => activeChannelIds.has(card.channelId));
 };
+const publishedExternalAgentFeedSignatures = new Map<string, string>();
+const publishExternalAgentChannelFeedSync = (cards: readonly ChannelFeedCard[]): void => {
+  const visibleCards = visibleChannelFeedCards(cards);
+  const cardsByRoom = new Map<string, ChannelFeedCard[]>();
+  for (const card of visibleCards) {
+    const roomCards = cardsByRoom.get(card.channelId) ?? [];
+    roomCards.push(structuredClone(card));
+    cardsByRoom.set(card.channelId, roomCards);
+  }
+  const roomIds = new Set([
+    ...publishedExternalAgentFeedSignatures.keys(),
+    ...cardsByRoom.keys(),
+  ]);
+  const occurredAt = new Date().toISOString();
+  for (const channelId of roomIds) {
+    const roomCards = (cardsByRoom.get(channelId) ?? [])
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const signature = roomCards.map((card) => `${card.id}:${card.revision}`).join("|");
+    const previous = publishedExternalAgentFeedSignatures.get(channelId);
+    if (previous === signature || (previous === undefined && roomCards.length === 0)) continue;
+    externalAgentActivity.publish({
+      type: "channel_feed.sync",
+      schemaVersion: EXTERNAL_AGENT_CHANNEL_FEED_SCHEMA_VERSION,
+      channelId,
+      occurredAt,
+      cards: roomCards,
+    });
+    if (roomCards.length > 0) publishedExternalAgentFeedSignatures.set(channelId, signature);
+    else publishedExternalAgentFeedSignatures.delete(channelId);
+  }
+};
 const channelFeedCoordinator = channelFeedAdapters.length > 0
   ? new ChannelFeedCoordinator<ChannelFeedCard>({
       adapters: channelFeedAdapters,
@@ -867,6 +973,7 @@ const channelFeedCoordinator = channelFeedAdapters.length > 0
       onCardsChanged: (cards) => {
         const payload: ChannelFeedSyncPayload = { cards: visibleChannelFeedCards(cards) };
         io.to("public").emit("channel-feed:sync", payload);
+        publishExternalAgentChannelFeedSync(payload.cards);
       },
       onError: (feedId, error) => {
         console.warn(
@@ -888,6 +995,7 @@ const reconcileChannelFeedRooms = async (): Promise<void> => {
   );
   const payload: ChannelFeedSyncPayload = { cards: currentChannelFeeds() };
   io.to("public").emit("channel-feed:sync", payload);
+  publishExternalAgentChannelFeedSync(payload.cards);
   const results = await Promise.allSettled(
     orphaned.map((control) => channelFeedCoordinator.configure(control.id, { enabled: false })),
   );
@@ -937,6 +1045,8 @@ const director = new SocialDirector(
     marketPulseCoordinator,
     ambientEpisodeLedger,
     socialMemory,
+    onPublicMessagePublished: publishExternalAgentMessageActivity,
+    onPublicReactionChanged: publishExternalAgentReactionActivity,
     romanceEligibleHumanActor: (actorId) =>
       accountStore.getAccountByActorId(actorId)?.adultConfirmed === true,
     romanceEligibleResidentActor: (actorId) => adminState.isRomanceEligibleResident(actorId),
@@ -1053,6 +1163,11 @@ const analyzeImageMessage = (
     };
     if (audience.kind === "public") {
       io.to("public").emit("image-analysis:update", payload);
+      // External agents do not consume the browser-only attachment patch.
+      // Republish the complete public message so their room view reaches the
+      // same ready/unavailable analysis state without a second media surface.
+      const updatedMessage = store.getMessage(message.id);
+      if (updatedMessage) publishExternalAgentMessageActivity(updatedMessage, "message.updated");
       if (audience.isAuthorCurrent && !audience.isAuthorCurrent()) return;
       director.onHumanImageReady(message, human, analysis.status === "ready" ? analysis.observation : undefined);
       return;
@@ -1274,11 +1389,44 @@ const snapshotFor = (session: HumanSession): RoomSnapshot => {
   };
 };
 
-const attachLinkPreview = (message: ChatMessage, requesterId: string): void => {
+function publishExternalAgentMessageActivity(
+  message: ChatMessage,
+  type: "message.created" | "message.updated" = "message.created",
+): void {
+  externalAgentActivity.publish({
+    type,
+    channelId: message.channelId,
+    occurredAt: type === "message.created" ? message.createdAt : new Date().toISOString(),
+    message,
+  });
+}
+
+function publishExternalAgentReactionActivity(event: {
+  channelId: string;
+  messageId: string;
+  memberId: string;
+  emoji: string;
+  active: boolean;
+}): void {
+  externalAgentActivity.publish({
+    type: "reaction.changed",
+    occurredAt: new Date().toISOString(),
+    ...event,
+  });
+}
+
+const attachLinkPreview = (
+  message: ChatMessage,
+  requesterId: string,
+  mayPublish: () => boolean = () => true,
+): void => {
   void linkPreviewBroker.previewMessage(message.content, requesterId).then((linkPreview) => {
-    if (!linkPreview || !store.setLinkPreview(message.channelId, message.id, linkPreview)) return;
+    if (!linkPreview || !mayPublish()) return;
+    const updated = store.setLinkPreview(message.channelId, message.id, linkPreview);
+    if (!updated) return;
     const payload: LinkPreviewPayload = { channelId: message.channelId, messageId: message.id, linkPreview };
     io.to("public").emit("link-preview:update", payload);
+    publishExternalAgentMessageActivity(updated, "message.updated");
   });
 };
 
@@ -1322,6 +1470,185 @@ const adminHumans = (): AdminHumanMember[] => buildAdminHumanCatalog({
   hasRecoveryKey: (actorId) => humanMemory.hasRecoveryKey(actorId),
 });
 
+const projectAdminExternalAgent = (agent: AuthenticatedExternalAgent): AdminExternalAgent => ({
+  id: agent.id,
+  displayName: agent.displayName,
+  publicBio: agent.publicBio,
+  personalityPrompt: agent.personalityPrompt,
+  channelIds: [...agent.channelIds],
+  scopes: [...agent.scopes],
+  state: agent.revokedAt ? "revoked" : "enabled",
+  presence: agent.revokedAt
+    ? "offline"
+    : externalAgentPresence.status(agent.id) === "online"
+      ? "online"
+      : externalAgentPresence.status(agent.id) === "idle"
+        ? "idle"
+        : "offline",
+  createdAt: agent.createdAt,
+  ...(agent.lastSeenAt ? { lastSeenAt: agent.lastSeenAt } : {}),
+  ...(agent.revokedAt ? { revokedAt: agent.revokedAt } : {}),
+});
+
+const listAdminExternalAgents = (): AdminExternalAgent[] => agentAccessStore.list().flatMap((summary) => {
+  const detail = agentAccessStore.get(summary.id);
+  return detail ? [projectAdminExternalAgent(detail)] : [];
+});
+
+const validateExternalAgentWrite = (
+  input: AdminExternalAgentWrite,
+  currentAgentId?: string,
+) => {
+  const parsed = createExternalAgentInputSchema.parse(input);
+  if (!parsed.scopes.includes("rooms:read")) {
+    throw new AdminStateError(
+      400,
+      "AGENT_READ_SCOPE_REQUIRED",
+      "External agents require rooms:read so their owner wrapper can receive room context before acting.",
+    );
+  }
+  const activeChannelIds = new Set(CHANNELS.map((channel) => channel.id));
+  const unknownChannelId = parsed.channelIds.find((channelId) => !activeChannelIds.has(channelId));
+  if (unknownChannelId) {
+    throw new AdminStateError(409, "AGENT_ROOM_NOT_FOUND", `The room #${unknownChannelId} is not active.`);
+  }
+  const identityKey = safeNameKey(parsed.displayName);
+  const reservedParticipant = [
+    ...PERSONAS.map((persona) => ({ id: persona.id, name: persona.name })),
+    ...humanMemory.listProfiles().map((profile) => ({ id: profile.member.id, name: profile.member.name })),
+    ...[...sessions.values()].map((session) => ({ id: session.member.id, name: session.member.name })),
+    ...agentAccessStore.list().map((agent) => ({ id: agent.id, name: agent.displayName })),
+  ].find((participant) => participant.id !== currentAgentId && safeNameKey(participant.name) === identityKey);
+  if (reservedParticipant) {
+    throw new AdminStateError(
+      409,
+      "AGENT_NAME_RESERVED",
+      `The display name ${parsed.displayName} already belongs to ${reservedParticipant.name}.`,
+    );
+  }
+  return parsed;
+};
+
+const externalAgentBootstrapUrl = (): string => {
+  const path = `${EXTERNAL_AGENT_API_BASE_PATH}/bootstrap`;
+  return publicOrigin ? new URL(path, `${publicOrigin}/`).toString() : path;
+};
+
+const projectIssuedExternalAgent = (issued: {
+  agent: AuthenticatedExternalAgent;
+  token: string;
+}): AdminExternalAgentCredential => ({
+  agent: projectAdminExternalAgent(issued.agent),
+  token: issued.token,
+  bootstrapUrl: externalAgentBootstrapUrl(),
+  handoffPrompt:
+    "Keep your existing owner-defined identity and personality. Fetch the authenticated bootstrap document, " +
+    "append its Third Place community instructions, read current context, and then choose naturally whether to speak, reply, react, or stay quiet.",
+});
+
+const publishExternalAgentCatalog = (): void => {
+  const activeIds = new Set<string>();
+  for (const agent of agentAccessStore.list()) {
+    if (agent.revokedAt) continue;
+    activeIds.add(agent.id);
+    lastPublishedExternalAgentPresence.set(agent.id, externalAgentPresence.status(agent.id));
+  }
+  for (const agentId of lastPublishedExternalAgentPresence.keys()) {
+    if (!activeIds.has(agentId)) lastPublishedExternalAgentPresence.delete(agentId);
+  }
+  io.to("public").emit("catalog:update", {
+    channels: CHANNELS.map((channel) => ({ ...channel })),
+    members: getMembers(),
+  });
+};
+
+const beginExternalAgentAuthorityMutation = (agentId: string): void => {
+  // This callback runs while the actor-local mutation coordinator is held.
+  // Advance the epoch synchronously before the credential store can yield to
+  // disk, and close any resident work causally rooted in the old authority.
+  actorPublicationGate.invalidate(agentId);
+  director.invalidatePublicWorkForHumanActor(agentId);
+};
+
+const finishExternalAgentAuthorityMutation = (agentId: string): void => {
+  // Requests can finish authentication while the credential file is being
+  // replaced. A second epoch advance rejects those waiters even though they
+  // were not present for the opening barrier.
+  actorPublicationGate.invalidate(agentId);
+  const current = agentAccessStore.get(agentId);
+  if (current && !current.revokedAt) director.restorePublicWorkForExternalAgent(agentId);
+};
+
+const externalAgentAdmin = {
+  list: listAdminExternalAgents,
+  create: async (input: AdminExternalAgentWrite): Promise<AdminExternalAgentCredential> => {
+    // Agent and human names share one public namespace. Validate and persist
+    // under the same global identity transaction used by account/guest
+    // creation so two concurrent requests cannot reserve the same name.
+    return await identityMutations.run(async () => {
+      const issued = await agentAccessStore.create(validateExternalAgentWrite(input));
+      publishExternalAgentCatalog();
+      return projectIssuedExternalAgent(issued);
+    });
+  },
+  update: async (
+    agentId: string,
+    input: AdminExternalAgentWrite,
+  ): Promise<AdminExternalAgent | undefined> => {
+    return await identityMutations.run(async () => {
+      if (!agentAccessStore.get(agentId)) return undefined;
+      // Revalidate after entering the shared identity transaction. A human or
+      // another agent may have claimed this normalized name while the admin
+      // request was waiting.
+      const canonical = validateExternalAgentWrite(input, agentId);
+      return await runExternalAgentMutation(agentId, async () => {
+        if (!agentAccessStore.get(agentId)) return undefined;
+        beginExternalAgentAuthorityMutation(agentId);
+        try {
+          const updated = await agentAccessStore.update(agentId, canonical);
+          if (!updated) return undefined;
+          publishExternalAgentCatalog();
+          return projectAdminExternalAgent(updated);
+        } finally {
+          finishExternalAgentAuthorityMutation(agentId);
+        }
+      });
+    });
+  },
+  revoke: async (agentId: string): Promise<AdminExternalAgent | undefined> => {
+    if (!agentAccessStore.get(agentId)) return undefined;
+    return await runExternalAgentMutation(agentId, async () => {
+      if (!agentAccessStore.get(agentId)) return undefined;
+      beginExternalAgentAuthorityMutation(agentId);
+      try {
+        const revoked = await agentAccessStore.revoke(agentId);
+        if (!revoked) return undefined;
+        externalAgentPresence.forget(agentId);
+        await store.flush();
+        publishExternalAgentCatalog();
+        return projectAdminExternalAgent(revoked);
+      } finally {
+        finishExternalAgentAuthorityMutation(agentId);
+      }
+    });
+  },
+  rotate: async (agentId: string): Promise<AdminExternalAgentCredential | undefined> => {
+    if (!agentAccessStore.get(agentId)) return undefined;
+    return await runExternalAgentMutation(agentId, async () => {
+      if (!agentAccessStore.get(agentId)) return undefined;
+      beginExternalAgentAuthorityMutation(agentId);
+      try {
+        const issued = await agentAccessStore.rotate(agentId);
+        if (!issued) return undefined;
+        publishExternalAgentCatalog();
+        return projectIssuedExternalAgent(issued);
+      } finally {
+        finishExternalAgentAuthorityMutation(agentId);
+      }
+    });
+  },
+};
+
 const socialMemoryAdmin = new SocialMemoryAdmin({
   store: socialMemoryStore,
   onStateChanged: () => {
@@ -1329,7 +1656,7 @@ const socialMemoryAdmin = new SocialMemoryAdmin({
     socialMemoryLifecycle.notifyMemoryChanged();
   },
   getActors: () => {
-    const actors = new Map<string, { id: string; name: string; kind: "resident" | "human" }>();
+    const actors = new Map<string, { id: string; name: string; kind: "resident" | "human" | "agent" }>();
     for (const persona of PERSONAS) {
       actors.set(persona.id, { id: persona.id, name: persona.name, kind: "resident" });
     }
@@ -1338,6 +1665,9 @@ const socialMemoryAdmin = new SocialMemoryAdmin({
     }
     for (const session of sessions.values()) {
       actors.set(session.member.id, { id: session.member.id, name: session.member.name, kind: "human" });
+    }
+    for (const agent of agentAccessStore.list()) {
+      actors.set(agent.id, { id: agent.id, name: agent.displayName, kind: "agent" });
     }
     return [...actors.values()];
   },
@@ -1519,6 +1849,19 @@ adminState.setHooks({
     if (!result.ok) {
       throw new AdminStateError(409, "CHANNEL_IN_USE", `Close the active voice room in #${result.channelIds[0]} before removing that channel.`);
     }
+    const retainedChannelIds = new Set(channelIds);
+    const blockedGrant = agentAccessStore.list().flatMap((agent) =>
+      agent.channelIds
+        .filter((channelId) => !retainedChannelIds.has(channelId))
+        .map((channelId) => ({ agent, channelId })),
+    )[0];
+    if (blockedGrant) {
+      throw new AdminStateError(
+        409,
+        "CHANNEL_GRANTED_TO_AGENT",
+        `Remove #${blockedGrant.channelId} from external agent ${blockedGrant.agent.displayName} before deleting the room.`,
+      );
+    }
   },
   validatePersonaIds: (personaIds) => {
     const result = voiceRooms.validatePersonaIds(personaIds);
@@ -1527,18 +1870,21 @@ adminState.setHooks({
     }
   },
   validatePersonaNames: (personas) => {
-    const humansByName = new Map<string, string>();
-    for (const session of sessions.values()) humansByName.set(safeNameKey(session.member.name), session.member.name);
+    const reservedByName = new Map<string, string>();
+    for (const session of sessions.values()) reservedByName.set(safeNameKey(session.member.name), session.member.name);
     for (const profile of humanMemory.listProfiles()) {
-      humansByName.set(safeNameKey(profile.member.name), profile.member.name);
+      reservedByName.set(safeNameKey(profile.member.name), profile.member.name);
+    }
+    for (const agent of agentAccessStore.list()) {
+      reservedByName.set(safeNameKey(agent.displayName), agent.displayName);
     }
     for (const persona of personas) {
-      const reservedBy = humansByName.get(safeNameKey(persona.name));
+      const reservedBy = reservedByName.get(safeNameKey(persona.name));
       if (!reservedBy) continue;
       throw new AdminStateError(
         409,
         "PERSONA_NAME_RESERVED",
-        `The resident name ${persona.name} conflicts with the remembered human identity ${reservedBy}.`,
+        `The resident name ${persona.name} conflicts with the retained participant identity ${reservedBy}.`,
       );
     }
   },
@@ -1571,6 +1917,7 @@ app.use("/api/admin", createAdminRouter({
   state: adminState,
   configuredOrigins: adminOrigins,
   getHumans: adminHumans,
+  externalAgents: externalAgentAdmin,
   getAutonomousResearchDiagnostics: () => director.getAutonomousResearchDiagnostics(),
   getChannelFeedControls: () => projectChannelFeedAdminControls(
     channelFeedCoordinator?.controls() ?? [],
@@ -1606,6 +1953,275 @@ app.use("/api/admin", createAdminRouter({
   },
   socialMemory: socialMemoryAdmin,
   forgetHumanActor,
+}));
+
+const externalAgentFailure = (
+  status: ExternalAgentApiFailure["status"],
+  code: string,
+  error: string,
+): ExternalAgentApiFailure => ({ ok: false, status, code, error });
+
+const currentExternalAgentMutationAuthority = (
+  admitted: AuthenticatedExternalAgent,
+  lease: ActorPublicationLease,
+  requiredScope: ExternalAgentScope,
+  channelId: string,
+): AuthenticatedExternalAgent | undefined => {
+  if (!actorPublicationGate.isCurrent(lease)) return undefined;
+  const current = agentAccessStore.get(admitted.id);
+  if (!current || current.revokedAt || current.updatedAt !== admitted.updatedAt) return undefined;
+  if (!current.scopes.includes(requiredScope) || !current.channelIds.includes(channelId)) return undefined;
+  if (!CHANNELS.some((channel) => channel.id === channelId)) return undefined;
+  return current;
+};
+
+const externalAgentAuthorityChanged = (): ExternalAgentApiFailure => externalAgentFailure(
+  409,
+  "AGENT_STATE_CHANGED",
+  "This external-agent access changed while the action was being saved. Bootstrap again and retry if it is still allowed.",
+);
+
+const applyExternalAgentPresenceTransition = (
+  agent: AuthenticatedExternalAgent,
+  transition: (agentId: string) => Member["status"],
+): void => {
+  const current = agentAccessStore.get(agent.id);
+  if (!current || current.revokedAt || current.updatedAt !== agent.updatedAt) return;
+  const before = lastPublishedExternalAgentPresence.get(agent.id) ??
+    externalAgentPresence.status(agent.id);
+  const after = transition(agent.id);
+  lastPublishedExternalAgentPresence.set(agent.id, after);
+  if (before !== after) io.to("public").emit("presence:update", { members: getMembers() });
+};
+
+const noteExternalAgentAuthenticated = (agent: AuthenticatedExternalAgent): void => {
+  applyExternalAgentPresenceTransition(agent, (agentId) =>
+    externalAgentPresence.noteAuthenticated(agentId));
+};
+
+const noteExternalAgentInteractive = (agent: AuthenticatedExternalAgent): void => {
+  applyExternalAgentPresenceTransition(agent, (agentId) =>
+    externalAgentPresence.noteInteractive(agentId));
+};
+
+const noteExternalAgentPresence = (
+  agent: AuthenticatedExternalAgent,
+  status: "online" | "idle",
+): void => {
+  applyExternalAgentPresenceTransition(agent, (agentId) =>
+    externalAgentPresence.heartbeat(agentId, status));
+};
+
+app.use(EXTERNAL_AGENT_API_BASE_PATH, createExternalAgentRouter({
+  access: agentAccessStore,
+  publicOrigin,
+  apiBasePath: EXTERNAL_AGENT_API_BASE_PATH,
+  onAuthenticated: noteExternalAgentAuthenticated,
+  onInteractive: noteExternalAgentInteractive,
+  onPresence: noteExternalAgentPresence,
+  getBootstrapState: (agent, messagesPerChannel) => {
+    const granted = new Set(agent.channelIds);
+    const channels = CHANNELS
+      .filter((channel) => granted.has(channel.id))
+      .map((channel) => ({
+        id: channel.id,
+        name: channel.name,
+        description: channel.description,
+        ...(channel.icon ? { icon: channel.icon } : {}),
+      }));
+    return {
+      ok: true,
+      value: {
+        cursor: externalAgentActivity.cursor(),
+        channels,
+        members: getMembers(),
+        channelFeeds: currentChannelFeeds(),
+        recentMessagesByChannel: Object.fromEntries(
+          channels.map((channel) => [channel.id, store.getRecent(channel.id, messagesPerChannel)]),
+        ),
+      },
+    };
+  },
+  getActivity: async ({ channelIds, cursor, limit, waitMs, signal }) => {
+    try {
+      return {
+        ok: true,
+        value: await externalAgentActivity.activity({
+          ...(cursor ? { cursor } : {}),
+          channelIds,
+          limit,
+          waitMs,
+          signal,
+        }),
+      };
+    } catch (error) {
+      if (error instanceof ExternalAgentActivityCursorError) {
+        return externalAgentFailure(409, error.code, error.message);
+      }
+      console.warn("External-agent activity polling failed safely:", error instanceof Error ? error.message : error);
+      return externalAgentFailure(503, "ACTIVITY_UNAVAILABLE", "Room activity is temporarily unavailable.");
+    }
+  },
+  createMessage: async (input) => {
+    const publicationLease = actorPublicationGate.capture(input.agent.id);
+    return await runExternalAgentMutation(input.agent.id, async () => {
+      let current = currentExternalAgentMutationAuthority(
+        input.agent,
+        publicationLease,
+        "messages:write",
+        input.channelId,
+      );
+      if (!current) return externalAgentAuthorityChanged();
+
+      const messageId = externalAgentMessageId(current.id, input.clientMessageId);
+      const existing = store.getMessage(messageId);
+      if (existing) {
+        const same = existing.authorId === current.id &&
+          existing.channelId === input.channelId &&
+          existing.content === input.content &&
+          existing.replyToId === input.replyToId;
+        return same
+          ? { ok: true, value: { message: existing, duplicate: true } }
+          : externalAgentFailure(409, "IDEMPOTENCY_CONFLICT", "That clientMessageId was already used for another message.");
+      }
+      const replied = input.replyToId ? store.getMessage(input.replyToId) : undefined;
+      if (input.replyToId && (!replied || replied.channelId !== input.channelId)) {
+        return externalAgentFailure(404, "REPLY_TARGET_NOT_FOUND", "That reply target is no longer available in this room.");
+      }
+      const member = externalAgentMember(current);
+      const message = createMessage(input.channelId, current.id, input.content, {
+        id: messageId,
+        ...(input.replyToId ? { replyToId: input.replyToId } : {}),
+        ...(replied ? { replyPreview: replyPreviewFor(replied) } : {}),
+        authorSnapshot: { ...member, status: "offline", avatar: { ...member.avatar } },
+      });
+      const targetPersonaIds = publicTurnTargetIds(message.content, replied);
+      try {
+        await store.addPublicMessageDurably(
+          message,
+          undefined,
+          targetPersonaIds.length > 0 ? { targetPersonaIds } : undefined,
+        );
+      } catch (error) {
+        console.warn("Could not durably accept an external-agent message:", error instanceof Error ? error.message : error);
+        return externalAgentFailure(503, "MESSAGE_PERSISTENCE_FAILED", "That message could not be saved safely. Retry it with the same clientMessageId.");
+      }
+
+      // Re-read every mutable authority field after the durable await and
+      // before any observable publication or downstream resident work.
+      current = currentExternalAgentMutationAuthority(
+        input.agent,
+        publicationLease,
+        "messages:write",
+        input.channelId,
+      );
+      if (!current) return externalAgentAuthorityChanged();
+      io.to("public").emit("message:new", message);
+      publishExternalAgentMessageActivity(message);
+      attachLinkPreview(message, current.id, () => Boolean(currentExternalAgentMutationAuthority(
+        input.agent,
+        publicationLease,
+        "messages:write",
+        input.channelId,
+      )));
+      director.onExternalAgentMessage(message, member);
+      return { ok: true, value: { message, duplicate: false } };
+    });
+  },
+  setReaction: async (input) => {
+    const publicationLease = actorPublicationGate.capture(input.agent.id);
+    return await runExternalAgentMutation(input.agent.id, async () => {
+      let current = currentExternalAgentMutationAuthority(
+        input.agent,
+        publicationLease,
+        "reactions:write",
+        input.channelId,
+      );
+      if (!current) return externalAgentAuthorityChanged();
+      if (!isPublicReactionEmoji(input.emoji)) {
+        return externalAgentFailure(422, "REACTION_NOT_SUPPORTED", "That reaction is not available in this community.");
+      }
+      const target = store.getMessage(input.messageId);
+      if (!target || target.channelId !== input.channelId) {
+        return externalAgentFailure(404, "MESSAGE_NOT_FOUND", "That message is no longer available in this room.");
+      }
+      const actorId = current.id;
+      const wasActive = target.reactions.some(
+        (reaction) => reaction.emoji === input.emoji && reaction.memberIds.includes(actorId),
+      );
+      const reaction = store.setPublicReaction(
+        input.channelId,
+        input.messageId,
+        input.emoji,
+        actorId,
+        input.active,
+      );
+      if (!reaction) {
+        return externalAgentFailure(404, "MESSAGE_NOT_FOUND", "That message is no longer available in this room.");
+      }
+      try {
+        await store.flush();
+      } catch (error) {
+        // RoomStore mutates reactions before flushing. Restore the prior
+        // desired state so a safe retry does not become an invisible no-op.
+        store.setPublicReaction(
+          input.channelId,
+          input.messageId,
+          input.emoji,
+          actorId,
+          wasActive,
+        );
+        try {
+          await store.flush();
+        } catch (rollbackError) {
+          console.error(
+            "Could not durably restore an external-agent reaction after a failed write:",
+            rollbackError instanceof Error ? rollbackError.message : rollbackError,
+          );
+        }
+        console.warn("Could not durably save an external-agent reaction:", error instanceof Error ? error.message : error);
+        return externalAgentFailure(503, "REACTION_PERSISTENCE_FAILED", "That reaction could not be saved safely. Retry the desired state.");
+      }
+
+      current = currentExternalAgentMutationAuthority(
+        input.agent,
+        publicationLease,
+        "reactions:write",
+        input.channelId,
+      );
+      if (!current) return externalAgentAuthorityChanged();
+      if (wasActive !== input.active) {
+        io.to("public").emit("reaction:update", {
+          channelId: input.channelId,
+          messageId: input.messageId,
+          reaction,
+        });
+        publishExternalAgentReactionActivity({
+          channelId: input.channelId,
+          messageId: input.messageId,
+          memberId: current.id,
+          emoji: input.emoji,
+          active: input.active,
+        });
+        if (input.active) {
+          director.onExternalAgentReaction({
+            channelId: input.channelId,
+            messageId: input.messageId,
+            emoji: input.emoji,
+          }, externalAgentMember(current));
+        }
+      }
+      return {
+        ok: true,
+        value: {
+          channelId: input.channelId,
+          messageId: input.messageId,
+          emoji: input.emoji,
+          active: reaction.memberIds.includes(current.id),
+        },
+      };
+    });
+  },
 }));
 
 app.get("/api/voice/capabilities", (_request, response) => {
@@ -1834,6 +2450,7 @@ const handleImageMessageUpload = async (
       }
       attachmentId = undefined;
       io.to("public").emit("message:new", message);
+      publishExternalAgentMessageActivity(message);
       channelFeedCoordinator?.noteHumanActivity(message.channelId);
       if (message.content) humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
       director.onHumanImagePosted(message);
@@ -1939,7 +2556,9 @@ app.post("/api/dms/:threadId/image-messages", async (request, response) => {
   }
   const threadId = request.params.threadId;
   const participants = store.getDmParticipants(threadId);
-  if (!participants?.includes(session.member.id)) {
+  if (!participants?.includes(session.member.id) || participants.some(
+    (participantId) => getMembers().find((member) => member.id === participantId)?.kind === "agent",
+  )) {
     // Do not reveal whether an inaccessible private thread exists.
     response.status(404).json({ ok: false, error: "That private conversation is not available." } satisfies ImageMessageResult);
     return;
@@ -2100,8 +2719,8 @@ app.post("/api/auth/register", async (request, response) => {
     return;
   }
   const identityKey = safeNameKey(name);
-  if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey)) {
-    response.status(409).json({ ok: false, code: "NAME_RESERVED", error: "That display name belongs to an AI resident." });
+  if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey) || externalAgentReservingName(identityKey)) {
+    response.status(409).json({ ok: false, code: "NAME_RESERVED", error: "That display name belongs to another community participant." });
     return;
   }
   if (adminState.isBanned(undefined, name)) {
@@ -2814,11 +3433,11 @@ app.post("/api/session", async (request, response) => {
     return;
   }
   const identityKey = safeNameKey(name);
-  if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey)) {
+  if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey) || externalAgentReservingName(identityKey)) {
     response.status(409).json({
       ok: false,
       code: "NAME_RESERVED",
-      error: "That display name belongs to an AI resident. Choose another name.",
+      error: "That display name belongs to another community participant. Choose another name.",
     });
     return;
   }
@@ -2834,11 +3453,11 @@ app.post("/api/session", async (request, response) => {
     // Persona edits are validated against humans too, but repeat this check
     // after waiting for the identity transaction so simultaneous catalog/name
     // changes cannot create a human/resident collision.
-    if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey)) {
+    if (PERSONAS.some((persona) => safeNameKey(persona.name) === identityKey) || externalAgentReservingName(identityKey)) {
       response.status(409).json({
         ok: false,
         code: "NAME_RESERVED",
-        error: "That display name belongs to an AI resident. Choose another name.",
+        error: "That display name belongs to another community participant. Choose another name.",
       });
       return;
     }
@@ -3006,6 +3625,7 @@ io.on("connection", (socket) => {
       );
       store.addPublicMessage(joinMessage);
       io.to("public").emit("message:new", joinMessage);
+      publishExternalAgentMessageActivity(joinMessage);
       void director.welcome(session.member, {
         returning: visit?.returning ?? false,
         languageHint: preferredRequestLanguage(socket.handshake.headers["accept-language"]),
@@ -3252,6 +3872,7 @@ io.on("connection", (socket) => {
         store.addPublicMessage(message);
       }
       io.to("public").emit("message:new", message);
+      publishExternalAgentMessageActivity(message);
       channelFeedCoordinator?.noteHumanActivity(message.channelId);
       attachLinkPreview(message, session.member.id);
       humanMemory.notePublicMessage(session.member.id, message.channelId, message.content);
@@ -3266,7 +3887,8 @@ io.on("connection", (socket) => {
       return;
     }
     const peerId = participants.find((id) => id !== session.member.id);
-    if (!peerId || !getMembers().some((member) => member.id === peerId)) {
+    const peer = peerId ? getMembers().find((member) => member.id === peerId) : undefined;
+    if (!peer || peer.kind === "agent") {
       acknowledge?.({ ok: false, error: "That person isn't available for a private message." });
       return;
     }
@@ -3284,7 +3906,7 @@ io.on("connection", (socket) => {
   socket.on("dm:open", (raw: unknown, acknowledge?: (result: unknown) => void) => {
     const parsed = z.object({ peerId: z.string().min(1).max(100) }).safeParse(raw);
     const peer = parsed.success ? getMembers().find((member) => member.id === parsed.data.peerId) : undefined;
-    if (!peer || peer.id === session.member.id) {
+    if (!peer || peer.id === session.member.id || peer.kind === "agent") {
       acknowledge?.({ ok: false, error: "That person isn't available for a private chat." });
       return;
     }
@@ -3335,6 +3957,13 @@ io.on("connection", (socket) => {
       channelId: parsed.data.channelId,
       messageId: parsed.data.messageId,
       reaction,
+    });
+    publishExternalAgentReactionActivity({
+      channelId: parsed.data.channelId,
+      messageId: parsed.data.messageId,
+      memberId: session.member.id,
+      emoji: parsed.data.emoji,
+      active: reaction.memberIds.includes(session.member.id),
     });
     channelFeedCoordinator?.noteHumanActivity(parsed.data.channelId);
     if (reaction.memberIds.includes(session.member.id)) {
@@ -3444,6 +4073,17 @@ app.use((error: unknown, request: Request, response: Response, _next: unknown) =
 
 await accountStore.load();
 const humanMemoryLoad = await humanMemory.load();
+for (const summary of agentAccessStore.list()) {
+  const agent = agentAccessStore.get(summary.id);
+  if (!agent) throw new Error(`External-agent catalog lost ${summary.id} during startup validation.`);
+  validateExternalAgentWrite({
+    displayName: agent.displayName,
+    publicBio: agent.publicBio,
+    personalityPrompt: agent.personalityPrompt,
+    channelIds: agent.channelIds,
+    scopes: agent.scopes,
+  }, agent.id);
+}
 adminState.validateActiveCatalog();
 await store.load();
 let cancelledBannedPublicTurnTargets = 0;
@@ -3526,6 +4166,7 @@ assertHumanMemoryContinuity({
   socialActorCount: socialActorInventory.stats.actors,
   retainedHumanActorIds: humanMemory.listProfiles().map((profile) => profile.member.id),
   residentActorIds: PERSONAS.map((persona) => persona.id),
+  trustedAdditionalActorIds: agentAccessStore.list().map((agent) => agent.id),
   pendingActorForgetIds: humanMemoryLoad.pendingActorForgetIds,
   additionalActorInventories: [
     { actorIds: dmActorIds, actorCount: dmActorIds.length },
@@ -3613,6 +4254,18 @@ const healthInterval = setInterval(async () => {
       }
     }
     if (refreshHumanPresence(session, now)) presenceChanged = true;
+  }
+  const activeAgentIds = new Set<string>();
+  for (const agent of agentAccessStore.list()) {
+    if (agent.revokedAt) continue;
+    activeAgentIds.add(agent.id);
+    const status = externalAgentPresence.status(agent.id, now);
+    const previouslyPublished = lastPublishedExternalAgentPresence.get(agent.id);
+    if (previouslyPublished !== undefined && previouslyPublished !== status) presenceChanged = true;
+    lastPublishedExternalAgentPresence.set(agent.id, status);
+  }
+  for (const agentId of [...lastPublishedExternalAgentPresence.keys()]) {
+    if (!activeAgentIds.has(agentId)) lastPublishedExternalAgentPresence.delete(agentId);
   }
   if (presenceChanged) io.to("public").emit("presence:update", { members: getMembers() });
   adminAuth.prune(now);
@@ -3707,6 +4360,7 @@ const shutdown = async (signal: string) => {
     accountStore.flush(),
     store.flush(),
     humanMemory.flush(),
+    agentAccessStore.flush(),
     ambientEpisodeLedger.flush(),
     adminState.flush(),
     modelProviders.close(),

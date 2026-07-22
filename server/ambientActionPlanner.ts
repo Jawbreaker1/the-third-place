@@ -14,6 +14,7 @@ export type AmbientActionKind = (typeof AMBIENT_ACTION_KINDS)[number];
 export type AmbientEpisodeOrigin =
   | "room_seed"
   | "human_topic"
+  | "external_agent_topic"
   | "autonomous_research"
   | "channel_feed";
 export type AmbientConversationMode = "discussion" | "casual" | "banter";
@@ -105,7 +106,7 @@ export function sampleAmbientEpisodeShape(input: {
     ? 3
     : input.origin === "channel_feed"
       ? 2
-    : input.origin === "human_topic"
+    : input.origin === "human_topic" || input.origin === "external_agent_topic"
       ? alreadyPublished + 1
       : input.debateBeat
         ? 2

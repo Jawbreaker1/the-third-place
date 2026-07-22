@@ -899,7 +899,7 @@ describe("VoiceDirector", () => {
       reply: "Nä, det sa jag inte. Du är Alex.",
     });
 
-    expect(result.scenePremise).toContain("answer the actual person or claim the human referred to");
+    expect(result.scenePremise).toContain("answer the actual participant or claim the triggering participant referred to");
     expect(result.scenePremise).toContain("If this resident is accused, deny or playfully dismiss it");
     expect(result.scenePremise).toContain("never volunteer the resident's own implementation identity as a contrast");
     expect(result.payloads).toEqual([expect.objectContaining({ text: "Nä, det sa jag inte. Du är Alex." })]);

@@ -565,6 +565,29 @@ textarea:focus-visible,
   vertical-align: 1px;
 }
 
+.external-agent-badge {
+  display: inline-flex;
+  height: 16px;
+  align-items: center;
+  gap: 3px;
+  padding: 0 5px 0 4px;
+  border: 1px solid rgba(95, 183, 217, 0.24);
+  border-radius: 5px;
+  color: #91cfe7;
+  background: rgba(65, 151, 190, 0.1);
+  font-size: 8px;
+  font-weight: 790;
+  letter-spacing: 0.055em;
+  line-height: 1;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
+.transparency-note.external-agent-note {
+  border-color: rgba(95, 183, 217, 0.14);
+  background: rgba(65, 151, 190, 0.045);
+}
+
 .chat-panel {
   position: relative;
   display: flex;
@@ -2550,6 +2573,15 @@ textarea:focus-visible,
   font-size: 13px;
   font-weight: 620;
 }
+
+.member-copy .member-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-copy .external-agent-badge { flex: 0 0 auto; }
 
 .member-copy small {
   overflow: hidden;

@@ -2815,6 +2815,42 @@ const reviewInput = (): NormalizedCandidateReviewInput => candidateReviewInputSc
   ],
 });
 
+describe("candidate review transcript participant kinds", () => {
+  it("accepts an owner-operated external agent in recent and recalled room history", () => {
+    const base = reviewInput();
+    const externalAgentRow = {
+      author: "Owner's Scout",
+      kind: "agent" as const,
+      content: "@Mira What makes this room different?",
+      createdAt: "2026-07-14T11:59:55.000Z",
+      ageSeconds: 5,
+      sincePreviousSeconds: null,
+    };
+    const parsed = candidateReviewInputSchema.parse({
+      ...base,
+      temporalContext: {
+        ...base.temporalContext,
+        recentTimeline: [externalAgentRow],
+      },
+      roomRecall: {
+        witnessPersonaIds: ["ai-mira"],
+        timeline: [{
+          ...externalAgentRow,
+          messageId: "agent-message-1",
+          authorId: "agent-owner-scout",
+          role: "anchor",
+          anchorMatches: ["content"],
+          system: false,
+          generation: null,
+        }],
+      },
+    });
+
+    expect(parsed.temporalContext.recentTimeline[0]?.kind).toBe("agent");
+    expect(parsed.roomRecall?.timeline[0]?.kind).toBe("agent");
+  });
+});
+
 const explicitRequestReviewInput = (options: {
   trigger?: string;
   candidate?: string;

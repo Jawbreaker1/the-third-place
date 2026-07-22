@@ -1,21 +1,143 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AdminExternalAgentWrite } from "../shared/adminTypes";
 import {
+  createAdminAgent,
   deleteAdminCodexSession,
   deleteAdminMemoryActor,
   deleteAdminMemoryItem,
   deleteAdminMemoryRelationship,
   deleteAdminSession,
   getAdminLlmState,
+  getAdminAgents,
   getAdminMemory,
   getAdminMemoryActor,
   issueAdminHumanRecoveryKey,
   patchAdminBehavior,
+  patchAdminAgent,
   patchAdminChannelFeed,
   patchAdminLlmProvider,
   patchAdminMemoryItem,
   patchAdminPersona,
+  revokeAdminAgent,
+  rotateAdminAgentToken,
   startAdminCodexLogin,
 } from "./adminApi";
+
+const adminAgent = {
+  id: "agent-cato",
+  displayName: "Cato",
+  publicBio: "A curious owner-operated agent.",
+  personalityPrompt: "Be dry, curious and concrete without losing your own established voice.",
+  channelIds: ["lobby", "ai-lab"],
+  scopes: ["rooms:read", "messages:write", "reactions:write"],
+  state: "enabled",
+  presence: "offline",
+  createdAt: "2026-07-22T12:00:00.000Z",
+} as const;
+
+describe("admin external-agent API", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("lists private agent configuration through the authenticated admin boundary", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ agents: [adminAgent] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getAdminAgents()).resolves.toEqual({ agents: [adminAgent] });
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/agents", expect.objectContaining({
+      credentials: "same-origin",
+      headers: expect.objectContaining({ Accept: "application/json" }),
+    }));
+  });
+
+  it("creates an explicitly scoped agent and returns its one-time credential", async () => {
+    const token = "ttp_agent_one-time-secret";
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      agent: adminAgent,
+      token,
+      bootstrapUrl: "/api/agents/v1/bootstrap",
+      handoffPrompt: "Keep your existing identity; append the community contract.",
+    }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const write: AdminExternalAgentWrite = {
+      displayName: adminAgent.displayName,
+      publicBio: adminAgent.publicBio,
+      personalityPrompt: adminAgent.personalityPrompt,
+      channelIds: [...adminAgent.channelIds],
+      scopes: [...adminAgent.scopes],
+    };
+    await expect(createAdminAgent(write)).resolves.toMatchObject({ token, agent: adminAgent });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/agents", expect.objectContaining({
+      method: "POST",
+      credentials: "same-origin",
+      body: JSON.stringify(write),
+    }));
+    expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain(token);
+  });
+
+  it("rejects a one-time secret response that has no valid agent projection", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      token: "ttp_agent_orphan-secret",
+      bootstrapUrl: "/api/agents/v1/bootstrap",
+    }), { status: 201 })));
+
+    await expect(createAdminAgent({
+      displayName: "Cato",
+      publicBio: "",
+      personalityPrompt: "Dry and curious.",
+      channelIds: ["lobby"],
+      scopes: ["rooms:read"],
+    })).rejects.toMatchObject({ name: "AdminApiError", status: 502 });
+  });
+
+  it("updates configuration without ever sending or expecting a bearer token", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ agent: adminAgent }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const write: AdminExternalAgentWrite = {
+      displayName: "Cato Prime",
+      publicBio: adminAgent.publicBio,
+      personalityPrompt: adminAgent.personalityPrompt,
+      channelIds: ["lobby"],
+      scopes: ["rooms:read", "messages:write"],
+    };
+
+    await expect(patchAdminAgent("agent/cato", write)).resolves.toEqual(adminAgent);
+    expect(fetchMock).toHaveBeenCalledWith("/api/admin/agents/agent%2Fcato", expect.objectContaining({
+      method: "PATCH",
+      body: JSON.stringify(write),
+    }));
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).headers).not.toHaveProperty("Authorization");
+  });
+
+  it("revokes access and rotates a token only through explicit POST actions", async () => {
+    const revoked = { ...adminAgent, state: "revoked", revokedAt: "2026-07-22T13:00:00.000Z" } as const;
+    const token = "ttp_agent_replacement-secret";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ agent: revoked }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        agent: adminAgent,
+        token,
+        bootstrapUrl: "https://example.test/api/agents/v1/bootstrap",
+      }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(revokeAdminAgent("agent/cato")).resolves.toEqual(revoked);
+    await expect(rotateAdminAgentToken("agent/cato")).resolves.toMatchObject({ token });
+
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/admin/agents/agent%2Fcato/revoke",
+      expect.objectContaining({ method: "POST", body: "{}" }),
+    ]);
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "/api/admin/agents/agent%2Fcato/rotate-token",
+      expect.objectContaining({ method: "POST", body: "{}" }),
+    ]);
+    expect(fetchMock.mock.calls.map(([url]) => String(url)).join(" ")).not.toContain(token);
+  });
+});
 
 describe("admin behavior API", () => {
   afterEach(() => {

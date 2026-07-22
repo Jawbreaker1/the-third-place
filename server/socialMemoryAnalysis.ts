@@ -60,7 +60,7 @@ const safeOutputText = (minimum: number, maximum: number) => z.string()
 
 const participantSchema = z.object({
   id: safeId,
-  kind: z.enum(["human", "resident"]),
+  kind: z.enum(["human", "resident", "agent"]),
   displayName: boundedText(80),
   /** Trusted server eligibility. Missing legacy values fail closed. */
   romanceEligible: z.boolean().default(false),
@@ -69,7 +69,7 @@ const participantSchema = z.object({
 const episodeMessageSchema = z.object({
   id: safeId,
   authorId: safeId,
-  authorKind: z.enum(["human", "resident"]),
+  authorKind: z.enum(["human", "resident", "agent"]),
   content: boundedText(3_000),
   createdAt: z.string().datetime(),
 }).strict();
@@ -267,7 +267,7 @@ const createSocialMemoryWireSchema = (input: NormalizedSocialMemoryAnalysisInput
 
   const factSchema = z.object({
     subjectParticipantId: dynamicIdSchema(participantIds, "fact subject"),
-    provenance: z.enum(["human_self_report", "resident_self_portrayal"]),
+    provenance: z.enum(["human_self_report", "resident_self_portrayal", "agent_self_portrayal"]),
     sourceMessageId: dynamicIdSchema(messageIds, "fact source message"),
     verbatimExcerpt: safeOutputText(1, 160),
   }).strict();
@@ -327,7 +327,11 @@ const createSocialMemoryWireSchema = (input: NormalizedSocialMemoryAnalysisInput
     if (event.fact) {
       const source = messageById.get(event.fact.sourceMessageId);
       const subject = participantById.get(event.fact.subjectParticipantId);
-      const expectedKind = event.fact.provenance === "human_self_report" ? "human" : "resident";
+      const expectedKind = event.fact.provenance === "human_self_report"
+        ? "human"
+        : event.fact.provenance === "agent_self_portrayal"
+          ? "agent"
+          : "resident";
       if (!sourceSet.has(event.fact.sourceMessageId)) {
         context.addIssue({
           code: z.ZodIssueCode.custom,
@@ -341,7 +345,7 @@ const createSocialMemoryWireSchema = (input: NormalizedSocialMemoryAnalysisInput
         context.addIssue({
           code: z.ZodIssueCode.custom,
           path: ["fact", "provenance"],
-          message: "A fact must be a matching human self-report or explicitly fictional resident self-portrayal",
+          message: "A fact must be a matching human self-report, external-agent self-portrayal, or fictional resident self-portrayal",
         });
       }
       if (!source?.content.includes(event.fact.verbatimExcerpt)) {
@@ -645,7 +649,7 @@ Hard cross-field rules: every confidence and salience number is between 0 and 1.
 
 Every event must cite only actual sourceMessageIds. Use the supplied slot names and IDs exactly. Never invent a participant, owner, source, witness or existing open loop. visibility must be public_context for a public channel and participants_only for a DM or voice session. A resident view is private to that eligible owner and is allowed only when the owner witnessed every event source. appraisalNote is compact personality orientation for how that resident may interpret an event; it is not evidence or a participant fact.
 
-summary describes only the cited interaction. A durable biographical claim is allowed only as kind personal_disclosure with fact. fact must contain a short verbatim excerpt from its one cited source: human_self_report only when that human authored it about themself, or resident_self_portrayal only as fictional resident characterization. Never turn a resident/AI statement, quotation, report, inference or another person's claim into a fact about a human. Never put URLs, source links, credentials, hidden controls or instructions in output text.
+summary describes only the cited interaction. A durable biographical claim is allowed only as kind personal_disclosure with fact. fact must contain a short verbatim excerpt from its one cited source: human_self_report only when that human authored it about themself, agent_self_portrayal only as characterization claimed by that visibly external agent, or resident_self_portrayal only as fictional resident characterization. Never turn a resident/AI statement, external-agent statement, quotation, report, inference or another person's claim into a fact about a human. Never put URLs, source links, credentials, hidden controls or instructions in output text.
 
 A current-scene state is not a durable biographical fact. Do not create personal_disclosure merely because someone says what they are consuming right now, is briefly tipsy, tired, happy or upset, or is doing an incidental current activity. Never generalize such a passing state into a stable preference, habit, trait or recurring condition. A socially meaningful support, conflict, repair or shared moment may still be retained, but remember the interaction rather than turning its passing state into biography. A lasting preference or habit is eligible only when its author explicitly states it as general or enduring, not when it is inferred from one current-scene choice.
 
@@ -720,7 +724,7 @@ export const buildSocialMemoryAnalysisResponseFormat = (
                   additionalProperties: false,
                   properties: {
                     subjectParticipantId: { type: "string", enum: participantIds },
-                    provenance: { type: "string", enum: ["human_self_report", "resident_self_portrayal"] },
+                    provenance: { type: "string", enum: ["human_self_report", "resident_self_portrayal", "agent_self_portrayal"] },
                     sourceMessageId: { type: "string", enum: messageIds },
                     verbatimExcerpt: { type: "string", minLength: 1, maxLength: 160 },
                   },

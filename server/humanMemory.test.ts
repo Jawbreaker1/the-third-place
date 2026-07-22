@@ -1010,4 +1010,43 @@ describe("persistent human memory", () => {
       pendingActorForgetIds: ["ai-mira"],
     })).toThrow(/will not erase any actor/iu);
   });
+
+  it("accounts for external agents only through an explicit trusted identity inventory", () => {
+    const inventory = {
+      continuityVerified: false,
+      socialActorIds: ["ai-mira", "agent-field-observer"],
+      socialActorCount: 2,
+      retainedHumanActorIds: ["human-johan"],
+      residentActorIds: ["ai-mira"],
+      pendingActorForgetIds: [] as string[],
+      additionalActorInventories: [{
+        actorIds: ["human-johan", "agent-field-observer"],
+        actorCount: 2,
+      }],
+    };
+
+    expect(() => assertHumanMemoryContinuity(inventory)).toThrow(/continuity/iu);
+    expect(() => assertHumanMemoryContinuity({
+      ...inventory,
+      trustedAdditionalActorIds: ["agent-field-observer"],
+    })).not.toThrow();
+  });
+
+  it("fails closed when an additional trusted actor collides with another actor authority", () => {
+    const baseline = {
+      continuityVerified: true,
+      socialActorIds: [] as string[],
+      socialActorCount: 0,
+      retainedHumanActorIds: ["human-johan"],
+      residentActorIds: ["ai-mira"],
+      pendingActorForgetIds: ["human-retired"],
+    };
+
+    for (const actorId of ["human-johan", "ai-mira", "human-retired"]) {
+      expect(() => assertHumanMemoryContinuity({
+        ...baseline,
+        trustedAdditionalActorIds: [actorId],
+      })).toThrow(/ambiguous trusted actor identity/iu);
+    }
+  });
 });

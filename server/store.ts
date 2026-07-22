@@ -347,7 +347,7 @@ const isReplyPreview = (value: unknown): value is ReplyPreview =>
 const isFrozenMember = (value: unknown, authorId: string): value is Member => {
   if (!isRecord(value) || !hasOnlyKeys(value, MEMBER_KEYS) || value.id !== authorId ||
       !isBoundedIdentifier(value.id) || !isBoundedString(value.name, 100, 1) || value.name.trim().length < 1 ||
-      (value.kind !== "human" && value.kind !== "ai") ||
+      (value.kind !== "human" && value.kind !== "ai" && value.kind !== "agent") ||
       !["online", "idle", "dnd", "offline"].includes(String(value.status)) ||
       !isRecord(value.avatar) || !hasOnlyKeys(value.avatar, AVATAR_KEYS)) return false;
   const avatar = value.avatar;
@@ -950,6 +950,8 @@ export const createMessage = (
   authorId: string,
   content: string,
   options: {
+    /** Optional trusted stable identifier for idempotent transport adapters. */
+    id?: string;
     replyToId?: string;
     replyPreview?: ReplyPreview;
     system?: boolean;
@@ -961,7 +963,7 @@ export const createMessage = (
     attachments?: ImageAttachment[];
   } = {},
 ): ChatMessage => ({
-  id: randomUUID(),
+  id: options.id ?? randomUUID(),
   channelId,
   authorId,
   content,
@@ -1076,7 +1078,7 @@ export class RoomStore {
           messages: restored.messages.slice(-this.dmHistoryHardLimit),
         });
       }
-      this.pruneAutonomousPublications();
+      this.pruneAutonomousPublications(this.nowMs());
       const pendingPublicTurnsChanged = this.reconcilePendingPublicTurns(this.nowMs(), false);
       const populatedChannels = new Set(this.messages.map((message) => message.channelId));
       const missingChannelSeeds = builtInScene.filter((message) => !populatedChannels.has(message.channelId));
@@ -1893,16 +1895,36 @@ export class RoomStore {
   ): Reaction | undefined {
     const message = this.messages.find((candidate) => candidate.id === messageId && candidate.channelId === channelId);
     if (!message) return undefined;
+    const currentlyActive = message.reactions.some(
+      (candidate) => candidate.emoji === emoji && candidate.memberIds.includes(memberId),
+    );
+    return this.setPublicReaction(channelId, messageId, emoji, memberId, forceAdd || !currentlyActive);
+  }
+
+  /**
+   * Retry-safe reaction mutation for HTTP clients. `active` is desired state,
+   * unlike the browser socket's intentionally interactive toggle operation.
+   */
+  setPublicReaction(
+    channelId: string,
+    messageId: string,
+    emoji: string,
+    memberId: string,
+    active: boolean,
+  ): Reaction | undefined {
+    const message = this.messages.find((candidate) => candidate.id === messageId && candidate.channelId === channelId);
+    if (!message) return undefined;
 
     let reaction = message.reactions.find((candidate) => candidate.emoji === emoji);
-    if (!reaction) {
+    if (!reaction && active) {
       reaction = { emoji, memberIds: [] };
       message.reactions.push(reaction);
     }
+    if (!reaction) return { emoji, memberIds: [] };
 
     const existing = reaction.memberIds.indexOf(memberId);
-    if (existing >= 0 && !forceAdd) reaction.memberIds.splice(existing, 1);
-    else if (existing < 0) reaction.memberIds.push(memberId);
+    if (active && existing < 0) reaction.memberIds.push(memberId);
+    else if (!active && existing >= 0) reaction.memberIds.splice(existing, 1);
 
     if (reaction.memberIds.length === 0) message.reactions = message.reactions.filter((candidate) => candidate !== reaction);
     this.schedulePersist();

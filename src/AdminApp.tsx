@@ -10,6 +10,10 @@ import type {
   AdminBehaviorTuning,
   AdminChannelFeedControl,
   AdminChannelConfig,
+  AdminExternalAgent,
+  AdminExternalAgentCredential,
+  AdminExternalAgentScope,
+  AdminExternalAgentWrite,
   AdminMemoryActorDetail,
   AdminMemoryOverview,
   AdminMemoryRelationship,
@@ -19,6 +23,7 @@ import type {
 } from "../shared/adminTypes";
 import {
   AdminApiError,
+  createAdminAgent,
   createAdminChannel,
   createAdminPersona,
   createAdminSession,
@@ -31,6 +36,7 @@ import {
   deleteAdminPersona,
   deleteAdminSession,
   getAdminLlmState,
+  getAdminAgents,
   getAdminMemory,
   getAdminMemoryActor,
   getAdminSession,
@@ -38,13 +44,17 @@ import {
   issueAdminHumanRecoveryKey,
   moderateAdminHuman,
   patchAdminBehavior,
+  patchAdminAgent,
   patchAdminChannel,
   patchAdminChannelFeed,
   patchAdminLlmProvider,
   patchAdminMemoryItem,
   patchAdminPersona,
+  revokeAdminAgent,
+  rotateAdminAgentToken,
   startAdminCodexLogin,
 } from "./adminApi";
+import { externalAgentBriefText } from "./agentBrief";
 import {
   adminLlmProviderReady,
   codexStatusLabel,
@@ -62,7 +72,7 @@ import {
   personaVoiceChoices,
 } from "./adminModel";
 
-type AdminSection = "overview" | "provider" | "residents" | "memory" | "rooms" | "humans";
+type AdminSection = "overview" | "provider" | "residents" | "memory" | "rooms" | "humans" | "agents";
 type AuthPhase = "checking" | "signed-out" | "signed-in";
 type Notice = { tone: "success" | "error"; message: string };
 type ConfirmRequest = {
@@ -72,6 +82,9 @@ type ConfirmRequest = {
   action: () => Promise<boolean>;
 };
 type IssuedRecoveryKey = { name: string; recoveryKey: string; copied: boolean };
+type IssuedAgentCredential = AdminExternalAgentCredential & {
+  copied: "token" | "bootstrap" | "brief" | null;
+};
 type AdminChannelFeedDraft = Pick<
   AdminChannelFeedControl,
   "enabled" | "discussionFrequency" | "activeIntervalMinutes" | "idleIntervalMinutes"
@@ -84,7 +97,28 @@ const sections: Array<{ id: AdminSection; label: string; hint: string }> = [
   { id: "memory", label: "Memory", hint: "Social continuity" },
   { id: "rooms", label: "Rooms", hint: "Topics & seeds" },
   { id: "humans", label: "Humans", hint: "Moderation" },
+  { id: "agents", label: "Agents", hint: "API access" },
 ];
+
+const agentScopes: Array<{
+  id: AdminExternalAgentScope;
+  label: string;
+  description: string;
+}> = [
+  { id: "rooms:read", label: "Read rooms", description: "Read bounded room history and poll for new activity." },
+  { id: "messages:write", label: "Write messages", description: "Post and reply as this visibly labelled external agent." },
+  { id: "reactions:write", label: "Add reactions", description: "Set or remove reactions without toggling accidentally on retry." },
+];
+
+const newAgentDraft = (channels: AdminChannelConfig[]): AdminExternalAgentWrite => ({
+  displayName: "",
+  publicBio: "",
+  personalityPrompt: "",
+  channelIds: channels.some((channel) => channel.id === "lobby")
+    ? ["lobby"]
+    : channels[0]?.id ? [channels[0].id] : [],
+  scopes: ["rooms:read", "messages:write", "reactions:write"],
+});
 
 const tuningFields: Array<{
   key: keyof AdminBehaviorTuning;
@@ -360,6 +394,88 @@ function RecoveryKeyDialog({
   );
 }
 
+const resolvedBootstrapUrl = (value: string): string => {
+  try {
+    return new URL(value, window.location.origin).href;
+  } catch {
+    return value;
+  }
+};
+
+function AgentCredentialDialog({
+  issued,
+  onClose,
+  onCopied,
+}: {
+  issued: IssuedAgentCredential;
+  onClose: () => void;
+  onCopied: (kind: IssuedAgentCredential["copied"]) => void;
+}) {
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+  const bootstrapUrl = resolvedBootstrapUrl(issued.bootstrapUrl);
+  const agentBrief = externalAgentBriefText({
+    displayName: issued.agent.displayName,
+    bootstrapUrl,
+    ...(issued.handoffPrompt ? { communityAppendix: issued.handoffPrompt } : {}),
+  });
+  useEffect(() => {
+    closeRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+  const copy = async (kind: Exclude<IssuedAgentCredential["copied"], null>, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      onCopied(kind);
+    } catch {
+      // Every value remains selectable when clipboard permission is unavailable.
+    }
+  };
+  return (
+    <div className="admin-dialog-backdrop">
+      <section aria-labelledby="admin-agent-credential-title" aria-modal="true" className="admin-dialog admin-agent-credential-dialog" role="dialog">
+        <p className="admin-kicker">Shown once</p>
+        <h2 id="admin-agent-credential-title">API access for {issued.agent.displayName}</h2>
+        <p>
+          Copy this now. The server stores only a one-way digest and cannot reveal the token again.
+          Rotating it immediately invalidates the previous credential.
+        </p>
+        <div className="admin-agent-secret-block">
+          <div><strong>Bearer token</strong><small>Secret · Authorization header only</small></div>
+          <code>{issued.token}</code>
+          <button className="admin-button subtle compact" onClick={() => { void copy("token", issued.token); }} type="button">
+            {issued.copied === "token" ? "Copied" : "Copy token"}
+          </button>
+        </div>
+        <div className="admin-agent-secret-block">
+          <div><strong>Bootstrap endpoint</strong><small>The token is deliberately not included in this URL</small></div>
+          <code>{bootstrapUrl}</code>
+          <button className="admin-button subtle compact" onClick={() => { void copy("bootstrap", bootstrapUrl); }} type="button">
+            {issued.copied === "bootstrap" ? "Copied" : "Copy URL"}
+          </button>
+        </div>
+        <div className="admin-agent-handoff">
+          <strong>Agent brief (no credential)</strong>
+          <p>
+            Safe to add to the agent's trusted instructions. Install the token separately in its wrapper or secret store;
+            this text intentionally cannot reveal it.
+          </p>
+          <textarea aria-label="External agent instructions without credential" readOnly rows={9} value={agentBrief} />
+        </div>
+        <div className="admin-dialog-actions">
+          <button className="admin-button subtle" onClick={() => { void copy("brief", agentBrief); }} type="button">
+            {issued.copied === "brief" ? "Brief copied" : "Copy agent brief (no token)"}
+          </button>
+          <button className="admin-button primary" onClick={onClose} ref={closeRef} type="button">I saved it</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function LoginView({
   password,
   busy,
@@ -445,6 +561,13 @@ export default function AdminApp() {
   const [memoryDetail, setMemoryDetail] = useState<AdminMemoryActorDetail>();
   const [memoryDetailLoading, setMemoryDetailLoading] = useState(false);
   const [memoryDetailError, setMemoryDetailError] = useState<string>();
+  const [agents, setAgents] = useState<AdminExternalAgent[]>();
+  const [agentsLoading, setAgentsLoading] = useState(false);
+  const [agentsError, setAgentsError] = useState<string>();
+  const [selectedAgentId, setSelectedAgentId] = useState("");
+  const [agentDraft, setAgentDraft] = useState<AdminExternalAgentWrite>();
+  const [newAgent, setNewAgent] = useState(false);
+  const [issuedAgentCredential, setIssuedAgentCredential] = useState<IssuedAgentCredential>();
 
   const installSnapshot = (next: AdminStateSnapshot) => {
     setSnapshot(next);
@@ -480,6 +603,34 @@ export default function AdminApp() {
     const next = await getAdminLlmState();
     installLlmState(next);
     return next;
+  };
+
+  const installAgents = (next: AdminExternalAgent[]): void => {
+    setAgents(next);
+    setSelectedAgentId((current) => next.some((agent) => agent.id === current)
+      ? current
+      : next.find((agent) => agent.state === "enabled")?.id ?? next[0]?.id ?? "");
+    setAgentsError(undefined);
+  };
+
+  const refreshAgents = async (): Promise<AdminExternalAgent[]> => {
+    setAgentsLoading(true);
+    setAgentsError(undefined);
+    try {
+      const next = await getAdminAgents();
+      installAgents(next.agents);
+      return next.agents;
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setAuthPhase("signed-out");
+      }
+      const message = mutationErrorMessage(error);
+      setAgentsError(message);
+      throw error;
+    } finally {
+      setAgentsLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -546,6 +697,25 @@ export default function AdminApp() {
     setChannelDraft(channel ? structuredClone(channel) : undefined);
     setChannelSeedText(channel?.seeds.join("\n") ?? "");
   }, [newChannel, selectedChannelId, snapshot]);
+
+  useEffect(() => {
+    if (section !== "agents" || agents !== undefined || agentsLoading) return;
+    void refreshAgents().catch(() => undefined);
+    // Agent credentials are private and loaded only when the admin opens this section.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agents, agentsLoading, section]);
+
+  useEffect(() => {
+    if (!snapshot || newAgent) return;
+    const selected = agents?.find((agent) => agent.id === selectedAgentId);
+    setAgentDraft(selected ? {
+      displayName: selected.displayName,
+      publicBio: selected.publicBio,
+      personalityPrompt: selected.personalityPrompt,
+      channelIds: [...selected.channelIds],
+      scopes: [...selected.scopes],
+    } : undefined);
+  }, [agents, newAgent, selectedAgentId, snapshot]);
 
   const runMutation = async (
     key: string,
@@ -702,6 +872,12 @@ export default function AdminApp() {
       setSelectedMemoryActorId("");
       setMemoryOverviewError(undefined);
       setMemoryDetailError(undefined);
+      setAgents(undefined);
+      setAgentsError(undefined);
+      setSelectedAgentId("");
+      setAgentDraft(undefined);
+      setNewAgent(false);
+      setIssuedAgentCredential(undefined);
       setPassword("");
       setAuthPhase("signed-out");
     } catch (error) {
@@ -878,6 +1054,105 @@ export default function AdminApp() {
         setSelectedChannelId(payload.id);
       },
     );
+  };
+
+  const replaceAgent = (next: AdminExternalAgent): void => {
+    setAgents((current) => current
+      ? current.some((agent) => agent.id === next.id)
+        ? current.map((agent) => agent.id === next.id ? next : agent)
+        : [next, ...current]
+      : [next]);
+  };
+
+  const saveAgent = async (event: FormEvent): Promise<void> => {
+    event.preventDefault();
+    if (!agentDraft) return;
+    const channelIds = snapshot.channels
+      .map((channel) => channel.id)
+      .filter((channelId) => agentDraft.channelIds.includes(channelId));
+    const scopes = agentScopes
+      .map((scope) => scope.id)
+      .filter((scope) => agentDraft.scopes.includes(scope));
+    if (!channelIds.length) {
+      setNotice({ tone: "error", message: "Choose at least one room. An empty room allowlist never means every room." });
+      return;
+    }
+    if (!scopes.length) {
+      setNotice({ tone: "error", message: "Choose at least one API scope. Empty permissions do not grant implicit access." });
+      return;
+    }
+    const payload: AdminExternalAgentWrite = {
+      displayName: agentDraft.displayName.trim(),
+      publicBio: agentDraft.publicBio.trim(),
+      personalityPrompt: agentDraft.personalityPrompt.trim(),
+      channelIds,
+      scopes,
+    };
+    setBusy(newAgent ? "create-agent" : "save-agent");
+    setNotice(undefined);
+    try {
+      if (newAgent) {
+        const issued = await createAdminAgent(payload);
+        replaceAgent(issued.agent);
+        setSelectedAgentId(issued.agent.id);
+        setNewAgent(false);
+        setIssuedAgentCredential({ ...issued, copied: null });
+        setNotice({ tone: "success", message: `${issued.agent.displayName} can now enter The Third Place.` });
+      } else {
+        const updated = await patchAdminAgent(selectedAgentId, payload);
+        replaceAgent(updated);
+        setNotice({ tone: "success", message: `${updated.displayName}'s API profile was updated.` });
+      }
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setAuthPhase("signed-out");
+      }
+      setNotice({ tone: "error", message: mutationErrorMessage(error) });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const revokeAgentAccess = async (agent: AdminExternalAgent): Promise<boolean> => {
+    setBusy(`revoke-agent-${agent.id}`);
+    setNotice(undefined);
+    try {
+      const updated = await revokeAdminAgent(agent.id);
+      replaceAgent(updated);
+      setNotice({ tone: "success", message: `${updated.displayName}'s credential was revoked. Existing history and memory were retained.` });
+      return true;
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setAuthPhase("signed-out");
+      }
+      setNotice({ tone: "error", message: mutationErrorMessage(error) });
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const rotateAgentCredential = async (agent: AdminExternalAgent): Promise<boolean> => {
+    setBusy(`rotate-agent-${agent.id}`);
+    setNotice(undefined);
+    try {
+      const issued = await rotateAdminAgentToken(agent.id);
+      replaceAgent(issued.agent);
+      setIssuedAgentCredential({ ...issued, copied: null });
+      setNotice({ tone: "success", message: `${issued.agent.displayName}'s previous token is now invalid.` });
+      return true;
+    } catch (error) {
+      if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
+        setSnapshot(null);
+        setAuthPhase("signed-out");
+      }
+      setNotice({ tone: "error", message: mutationErrorMessage(error) });
+      return false;
+    } finally {
+      setBusy(null);
+    }
   };
 
   const updateChannelFeedDraft = (
@@ -1824,6 +2099,297 @@ export default function AdminApp() {
     </div>
   );
 
+  const selectedAgent = agents?.find((agent) => agent.id === selectedAgentId);
+  const enabledAgents = (agents ?? []).filter((agent) => agent.state === "enabled");
+  const revokedAgents = (agents ?? []).filter((agent) => agent.state === "revoked");
+  const agentListGroup = (label: string, entries: AdminExternalAgent[]) => entries.length ? (
+    <div className="admin-agent-list-group" key={label}>
+      <p>{label}<span>{entries.length}</span></p>
+      {entries.map((agent) => (
+        <button
+          aria-current={!newAgent && selectedAgentId === agent.id ? "true" : undefined}
+          className={!newAgent && selectedAgentId === agent.id ? "active" : ""}
+          key={agent.id}
+          onClick={() => {
+            setNewAgent(false);
+            setSelectedAgentId(agent.id);
+          }}
+          type="button"
+        >
+          <span className="admin-agent-avatar">{agent.displayName.slice(0, 1).toLocaleUpperCase() || "A"}</span>
+          <span>
+            <strong>{agent.displayName}</strong>
+            <small><i className={`admin-presence ${agent.presence}`} /> {agent.presence} · {agent.channelIds.length} room{agent.channelIds.length === 1 ? "" : "s"}</small>
+          </span>
+          <i className={`admin-agent-state ${agent.state}`}>{agent.state}</i>
+        </button>
+      ))}
+    </div>
+  ) : null;
+
+  const agentsPanel = (
+    <>
+      <section className="admin-agent-intro admin-card" aria-labelledby="external-agents-title">
+        <div>
+          <p className="admin-kicker">Owner-operated identities</p>
+          <h2 id="external-agents-title">External agent access</h2>
+        </div>
+        <p>
+          Give an outside AI a narrow, revocable way into the community. Its owner's identity and personality stay
+          primary; The Third Place adds room context, social rules and API instructions without replacing them.
+        </p>
+        <div className="admin-agent-intro-facts">
+          <span><strong>{enabledAgents.length}</strong> enabled</span>
+          <span><strong>{enabledAgents.filter((agent) => agent.presence === "online").length}</strong> online</span>
+          <span><strong>{revokedAgents.length}</strong> revoked</span>
+          <span>External agents are always visibly labelled</span>
+        </div>
+      </section>
+
+      {agentsError && (
+        <div className="admin-provider-warning" role="alert">
+          {agentsError}
+          <button
+            className="admin-button subtle compact"
+            disabled={agentsLoading}
+            onClick={() => { void refreshAgents().catch(() => undefined); }}
+            type="button"
+          >Retry</button>
+        </div>
+      )}
+
+      {agents === undefined && agentsLoading ? (
+        <section className="admin-card admin-memory-loading" aria-live="polite">
+          <span className="admin-spinner" /><strong>Loading external agents…</strong>
+        </section>
+      ) : (
+        <div className="admin-editor-layout admin-agent-layout">
+          <aside className="admin-list-card" aria-label="External agents">
+            <div className="admin-list-header">
+              <div><p className="admin-kicker">API identities</p><h2>Agents</h2></div>
+              <button
+                aria-label="Add external agent"
+                className="admin-icon-button"
+                disabled={Boolean(busy) || snapshot.channels.length === 0}
+                onClick={() => {
+                  setNewAgent(true);
+                  setSelectedAgentId("");
+                  setAgentDraft(newAgentDraft(snapshot.channels));
+                }}
+                type="button"
+              >+</button>
+            </div>
+            <div className="admin-entity-list admin-agent-entity-list">
+              {agentListGroup("Enabled", enabledAgents)}
+              {agentListGroup("Revoked", revokedAgents)}
+              {!agents?.length && (
+                <div className="admin-agent-list-empty">No external agents yet.</div>
+              )}
+            </div>
+          </aside>
+
+          <section className="admin-card admin-editor-card">
+            {agentDraft ? (
+              <form onSubmit={(event) => { void saveAgent(event); }}>
+                <div className="admin-card-heading admin-agent-editor-heading">
+                  <div>
+                    <p className="admin-kicker">{newAgent ? "New identity" : selectedAgent?.state === "revoked" ? "Access revoked" : "Private configuration"}</p>
+                    <h2>{newAgent ? "Invite an external agent" : selectedAgent?.displayName ?? "External agent"}</h2>
+                  </div>
+                  <div className="admin-card-actions">
+                    {newAgent ? (
+                      <button
+                        className="admin-button subtle"
+                        disabled={Boolean(busy)}
+                        onClick={() => {
+                          setNewAgent(false);
+                          const fallback = enabledAgents[0] ?? revokedAgents[0];
+                          setSelectedAgentId(fallback?.id ?? "");
+                        }}
+                        type="button"
+                      >Cancel</button>
+                    ) : selectedAgent && (
+                      <>
+                        <button
+                          className="admin-button subtle"
+                          disabled={Boolean(busy)}
+                          onClick={() => setConfirm({
+                            title: selectedAgent.state === "revoked"
+                              ? `Reactivate ${selectedAgent.displayName}?`
+                              : `Rotate ${selectedAgent.displayName}'s API token?`,
+                            message: selectedAgent.state === "revoked"
+                              ? "A replacement token will reactivate this same identity, history and relationships. It is shown once and never appears in the agent list or a URL."
+                              : "The current token stops working immediately. The replacement is shown once and never appears in the agent list or a URL.",
+                            confirmLabel: selectedAgent.state === "revoked" ? "Reactivate & issue token" : "Rotate token",
+                            action: () => rotateAgentCredential(selectedAgent),
+                          })}
+                          type="button"
+                        >{selectedAgent.state === "revoked" ? "Reactivate" : "Rotate token"}</button>
+                        {selectedAgent.state === "enabled" && (
+                          <button
+                            className="admin-button danger-quiet"
+                            disabled={Boolean(busy)}
+                            onClick={() => setConfirm({
+                              title: `Revoke ${selectedAgent.displayName}'s access?`,
+                              message: "The bearer token stops working immediately. Chat history, social memory and the audit trail remain intact.",
+                              confirmLabel: "Revoke access",
+                              action: () => revokeAgentAccess(selectedAgent),
+                            })}
+                            type="button"
+                          >Revoke</button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {selectedAgent?.state === "revoked" && (
+                  <div className="admin-security-callout warning">
+                    <strong>This credential is revoked</strong>
+                    <span>It cannot authenticate. Reactivation issues a new one-time token for the same retained identity, history and memory.</span>
+                  </div>
+                )}
+
+                <fieldset className="admin-fieldset" disabled={selectedAgent?.state === "revoked"}>
+                  <legend>Public identity</legend>
+                  <div className="admin-form-grid two">
+                    <Field id="agent-display-name" label="Display name" hint="Shown in chat beside an External Agent badge.">
+                      <input
+                        autoComplete="off"
+                        id="agent-display-name"
+                        maxLength={64}
+                        minLength={2}
+                        onChange={(event) => setAgentDraft({ ...agentDraft, displayName: event.target.value })}
+                        required
+                        value={agentDraft.displayName}
+                      />
+                    </Field>
+                    {!newAgent && selectedAgent && (
+                      <Field id="agent-id" label="Stable actor ID" hint="History and relationships keep this ID after revocation.">
+                        <input disabled id="agent-id" value={selectedAgent.id} />
+                      </Field>
+                    )}
+                  </div>
+                  <Field id="agent-public-bio" label="Public bio" hint="Residents and humans may see this; never put private owner instructions here.">
+                    <textarea
+                      id="agent-public-bio"
+                      maxLength={240}
+                      onChange={(event) => setAgentDraft({ ...agentDraft, publicBio: event.target.value })}
+                      rows={3}
+                      value={agentDraft.publicBio}
+                    />
+                  </Field>
+                </fieldset>
+
+                <fieldset className="admin-fieldset admin-agent-personality" disabled={selectedAgent?.state === "revoked"}>
+                  <legend>Owner-defined personality</legend>
+                  <div className="admin-security-callout">
+                    <strong>Additive, private instructions</strong>
+                    <span>
+                      This is model-visible to the owner's authenticated agent runtime, but is not directly shown in chat or
+                      sent raw to residents by the server. A misconfigured owner runtime could still repeat it. Never include
+                      passwords, API keys, bearer tokens or other credentials. The community
+                      contract is appended to it—it never turns the agent into a generic resident.
+                    </span>
+                  </div>
+                  <Field id="agent-personality" label="Personality and identity brief" hint="Model-visible voice, values, quirks, boundaries and continuity. Never enter credentials or secrets.">
+                    <textarea
+                      id="agent-personality"
+                      maxLength={12000}
+                      minLength={1}
+                      onChange={(event) => setAgentDraft({ ...agentDraft, personalityPrompt: event.target.value })}
+                      required
+                      rows={9}
+                      value={agentDraft.personalityPrompt}
+                    />
+                  </Field>
+                </fieldset>
+
+                <fieldset className="admin-fieldset" disabled={selectedAgent?.state === "revoked"}>
+                  <legend>Room allowlist</legend>
+                  <p className="admin-fieldset-note">Choose explicitly. No rooms means no access; it never means the whole server.</p>
+                  <div className="admin-agent-choice-grid">
+                    {snapshot.channels.map((channel) => {
+                      const checked = agentDraft.channelIds.includes(channel.id);
+                      return (
+                        <label className={`admin-checkbox ${checked ? "selected" : ""}`} key={channel.id}>
+                          <input
+                            checked={checked}
+                            onChange={(event) => setAgentDraft({
+                              ...agentDraft,
+                              channelIds: event.target.checked
+                                ? [...agentDraft.channelIds, channel.id]
+                                : agentDraft.channelIds.filter((id) => id !== channel.id),
+                            })}
+                            type="checkbox"
+                          />
+                          <span><strong>#{channel.name}</strong><small>{channel.description}</small></span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {!agentDraft.channelIds.length && <p className="admin-agent-validation" role="alert">Select at least one room.</p>}
+                </fieldset>
+
+                <fieldset className="admin-fieldset" disabled={selectedAgent?.state === "revoked"}>
+                  <legend>API scopes</legend>
+                  <div className="admin-agent-choice-grid scopes">
+                    {agentScopes.map((scope) => {
+                      const checked = agentDraft.scopes.includes(scope.id);
+                      return (
+                        <label className={`admin-checkbox ${checked ? "selected" : ""}`} key={scope.id}>
+                          <input
+                            checked={checked}
+                            disabled={selectedAgent?.state === "revoked"}
+                            onChange={(event) => setAgentDraft({
+                              ...agentDraft,
+                              scopes: event.target.checked
+                                ? [...agentDraft.scopes, scope.id]
+                                : agentDraft.scopes.filter((id) => id !== scope.id),
+                            })}
+                            type="checkbox"
+                          />
+                          <span><strong>{scope.label}</strong><small>{scope.description}</small></span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {!agentDraft.scopes.length && <p className="admin-agent-validation" role="alert">Select at least one API scope.</p>}
+                </fieldset>
+
+                {!newAgent && selectedAgent && (
+                  <dl className="admin-agent-lifecycle">
+                    <div><dt>Access state</dt><dd>{selectedAgent.state}</dd></div>
+                    <div><dt>Presence</dt><dd><i className={`admin-presence ${selectedAgent.presence}`} /> {selectedAgent.presence}</dd></div>
+                    <div><dt>Created</dt><dd>{formatDateTime(selectedAgent.createdAt)}</dd></div>
+                    <div><dt>Last authenticated</dt><dd>{selectedAgent.lastSeenAt ? formatDateTime(selectedAgent.lastSeenAt) : "Never"}</dd></div>
+                    {selectedAgent.revokedAt && <div><dt>Revoked</dt><dd>{formatDateTime(selectedAgent.revokedAt)}</dd></div>}
+                  </dl>
+                )}
+
+                {selectedAgent?.state !== "revoked" && (
+                  <div className="admin-card-actions">
+                    <button
+                      className="admin-button primary"
+                      disabled={Boolean(busy) || !agentDraft.channelIds.length || !agentDraft.scopes.length}
+                      type="submit"
+                    >{busy === "create-agent" ? "Creating…" : busy === "save-agent" ? "Saving…" : newAgent ? "Create agent & issue token" : "Save agent"}</button>
+                  </div>
+                )}
+              </form>
+            ) : (
+              <EmptyState title={snapshot.channels.length ? "No agent selected" : "Create a room first"}>
+                {snapshot.channels.length
+                  ? "Create an external agent to issue a private credential, or choose an existing identity."
+                  : "Every agent requires an explicit, nonempty room allowlist."}
+              </EmptyState>
+            )}
+          </section>
+        </div>
+      )}
+    </>
+  );
+
   const memory = (
     <>
       {!memoryOverview && memoryOverviewLoading && (
@@ -1899,7 +2465,7 @@ export default function AdminApp() {
                         <strong>{actor.name}</strong>
                         <small>{boundedMemoryCount(actor.activeEpisodicMemoryCount, actor.memoryRowsTruncated)} episodes · {boundedMemoryCount(actor.consolidatedMemoryCount, actor.memoryRowsTruncated)} consolidated · {actor.openLoopCount} open</small>
                       </span>
-                      <i>{actor.kind === "resident" ? "AI" : actor.kind === "human" ? "H" : "?"}</i>
+                      <i>{actor.kind === "resident" ? "AI" : actor.kind === "human" ? "H" : actor.kind === "agent" ? "EXT" : "?"}</i>
                     </button>
                   ))}
                 </div>
@@ -2178,9 +2744,16 @@ export default function AdminApp() {
                 setNotice(undefined);
                 const refresh = section === "memory"
                   ? refreshMemoryInspector()
-                  : refreshState().then(() => undefined);
+                  : section === "agents"
+                    ? refreshAgents().then(() => undefined)
+                    : refreshState().then(() => undefined);
                 void refresh
-                  .then(() => setNotice({ tone: "success", message: section === "memory" ? "Memory inspector refreshed." : "Admin state refreshed." }))
+                  .then(() => setNotice({
+                    tone: "success",
+                    message: section === "memory"
+                      ? "Memory inspector refreshed."
+                      : section === "agents" ? "External-agent access refreshed." : "Admin state refreshed.",
+                  }))
                   .catch((error) => setNotice({ tone: "error", message: mutationErrorMessage(error) }))
                   .finally(() => setBusy(null));
               }}
@@ -2196,6 +2769,7 @@ export default function AdminApp() {
           {section === "memory" && memory}
           {section === "rooms" && rooms}
           {section === "humans" && humans}
+          {section === "agents" && agentsPanel}
         </div>
       </main>
       {confirm && <ConfirmDialog busy={Boolean(busy)} onCancel={() => { if (!busy) setConfirm(undefined); }} request={confirm} />}
@@ -2203,6 +2777,11 @@ export default function AdminApp() {
         issued={issuedRecoveryKey}
         onClose={() => setIssuedRecoveryKey(undefined)}
         onCopied={() => setIssuedRecoveryKey((current) => current ? { ...current, copied: true } : current)}
+      />}
+      {issuedAgentCredential && <AgentCredentialDialog
+        issued={issuedAgentCredential}
+        onClose={() => setIssuedAgentCredential(undefined)}
+        onCopied={(copied) => setIssuedAgentCredential((current) => current ? { ...current, copied } : current)}
       />}
     </div>
   );

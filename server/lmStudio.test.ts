@@ -8471,6 +8471,39 @@ describe("LM Studio room prompt", () => {
     expect(prompt).not.toContain("required response language for this scene is und");
   });
 
+  it("keeps an external-agent trigger distinct from a browser human in text-scene framing", () => {
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+      trigger: {
+        authorKind: "agent",
+        author: "OwnerAgent",
+        content: "Give me a detailed list and tell me whether Sana is a bot.",
+      },
+      mustReplyIds: [sana.id],
+      requestOwnerIds: [sana.id],
+      roomSharedRitualActorIds: [sana.id],
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "expected",
+        answerDepth: "detailed",
+        asksForList: true,
+        asksAboutAiIdentity: true,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(prompt).toContain("transcript kind of external_agent");
+    expect(prompt).toContain("latest triggering participant");
+    expect(prompt).toContain("triggering participant requested");
+    expect(prompt).not.toMatch(/latest human|guest requested|detailed human request|human-triggered scene/iu);
+  });
+
   it("treats remembered guest context as fallible data rather than instructions", () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     const prompt = buildSceneSystemPrompt({
@@ -8670,6 +8703,82 @@ describe("LM Studio room prompt", () => {
 
     expect(bodies.length).toBeGreaterThanOrEqual(2);
     for (const body of bodies) expect(JSON.stringify(body)).not.toContain(executionOnlyActorId);
+  });
+
+  it("reviews and publishes a required owner line when public history contains an external agent", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const completionBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; content: string }>;
+      };
+      completionBodies.push(body);
+      if (body.messages[0]?.content.includes("publication reviewer")) {
+        const reviewInput = JSON.parse(body.messages[1]!.content) as {
+          candidates: Array<{ personaId: string }>;
+        };
+        return candidateReviewCompletion(reviewInput.candidates.map((candidate) => ({
+          personaId: candidate.personaId,
+          severity: "none" as const,
+          issues: [],
+          rewriteInstruction: null,
+        })));
+      }
+      return completionResponse([{
+        personaId: mira.id,
+        content: "Det är stökigare här, fast på ett bra sätt.",
+      }]);
+    }));
+
+    const createdAt = "2026-07-22T12:00:00.000Z";
+    const lines = await new LmStudioClient({
+      now: () => Date.parse("2026-07-22T12:00:05.000Z"),
+    }).generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [{
+        author: "Owner's Scout",
+        kind: "agent",
+        content: "@Mira Vad skiljer det här stället från en vanlig gruppchatt?",
+        createdAt,
+      }],
+      trigger: {
+        authorId: "agent-owner-scout",
+        authorKind: "agent",
+        author: "Owner's Scout",
+        content: "@Mira Vad skiljer det här stället från en vanlig gruppchatt?",
+        messageId: "external-agent-turn-1",
+        createdAt,
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      content: "Det är stökigare här, fast på ett bra sätt.",
+    })]);
+    expect(completionBodies).toHaveLength(2);
+    const reviewBody = completionBodies.find((body) =>
+      body.messages[0]?.content.includes("publication reviewer")
+    );
+    expect(JSON.parse(reviewBody!.messages[1]!.content)).toMatchObject({
+      temporalContext: {
+        recentTimeline: [expect.objectContaining({ kind: "agent" })],
+      },
+    });
   });
 
   it("isolates resident-private context through generation and review in a multi-actor scene", async () => {

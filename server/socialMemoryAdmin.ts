@@ -28,7 +28,7 @@ const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/u;
 export interface SocialMemoryAdminActor {
   id: string;
   name: string;
-  kind: "resident" | "human" | "unknown";
+  kind: "resident" | "human" | "agent" | "unknown";
 }
 
 export interface SocialMemoryAdminOptions {
@@ -277,14 +277,15 @@ export class SocialMemoryAdmin {
     const result: SocialMemoryAdminActor[] = [];
     const seen = new Set<string>();
     for (const candidate of this.#getActors().slice(0, MAX_CATALOG_ACTORS)) {
-      if (!candidate || (candidate.kind !== "resident" && candidate.kind !== "human")) continue;
+      if (!candidate ||
+          (candidate.kind !== "resident" && candidate.kind !== "human" && candidate.kind !== "agent")) continue;
       const id = boundedId(candidate.id);
       const name = boundedText(candidate.name, 160);
       if (!id || !name || seen.has(id)) continue;
       seen.add(id);
       result.push({ id, name, kind: candidate.kind });
     }
-    // A human can leave, or a resident can be removed, while their directed
+    // A human or agent can leave, or a resident can be removed, while their directed
     // relationship edges remain useful historical state. Keep those actors
     // inspectable, but never infer actor type from an ID prefix: only the
     // durable companion/catalog can authorize human erasure.

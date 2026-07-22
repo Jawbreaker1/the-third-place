@@ -4,6 +4,9 @@ import type {
   AdminAutonomousResearchDiagnostics,
   AdminChannelFeedControl,
   AdminChannelFeedPatch,
+  AdminExternalAgent,
+  AdminExternalAgentCredential,
+  AdminExternalAgentWrite,
   AdminHumanMember,
 } from "../shared/adminTypes.js";
 import {
@@ -14,6 +17,7 @@ import {
   hasStrictAdminOrigin,
 } from "./adminAuth.js";
 import { AdminStateError, AdminStateStore } from "./adminState.js";
+import { AgentAccessStoreCapacityError } from "./agentAccessStore.js";
 import { ModelProviderManagerError, type AdminLlmProviderControl } from "./modelProviderManager.js";
 import type { SocialMemoryAdmin } from "./socialMemoryAdmin.js";
 
@@ -58,6 +62,13 @@ export interface AdminRouterDependencies {
   >;
   /** Durable cross-store erasure for a trusted human identity. */
   forgetHumanActor?: (actorId: string) => Promise<boolean>;
+  externalAgents?: {
+    list(): AdminExternalAgent[];
+    create(input: AdminExternalAgentWrite): Promise<AdminExternalAgentCredential>;
+    update(agentId: string, input: AdminExternalAgentWrite): Promise<AdminExternalAgent | undefined>;
+    revoke(agentId: string): Promise<AdminExternalAgent | undefined>;
+    rotate(agentId: string): Promise<AdminExternalAgentCredential | undefined>;
+  };
 }
 
 const sendError = (response: Response, error: unknown): void => {
@@ -67,6 +78,10 @@ const sendError = (response: Response, error: unknown): void => {
   }
   if (error instanceof ModelProviderManagerError) {
     response.status(error.status).json({ ok: false, code: error.code, error: error.message });
+    return;
+  }
+  if (error instanceof AgentAccessStoreCapacityError) {
+    response.status(409).json({ ok: false, code: error.code, error: error.message });
     return;
   }
   if (error instanceof z.ZodError) {
@@ -168,6 +183,83 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
     };
   };
   router.get("/state", (_request, response) => response.json({ ok: true, state: stateResponse() }));
+
+  router.get("/agents", (_request, response) => {
+    if (!dependencies.externalAgents) {
+      response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
+      return;
+    }
+    response.json({ agents: dependencies.externalAgents.list() });
+  });
+
+  router.post("/agents", async (request, response, next) => {
+    if (!dependencies.externalAgents) {
+      response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
+      return;
+    }
+    try {
+      const issued = await dependencies.externalAgents.create(request.body as AdminExternalAgentWrite);
+      response.status(201).json(issued);
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.patch("/agents/:id", async (request, response, next) => {
+    if (!dependencies.externalAgents) {
+      response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
+      return;
+    }
+    try {
+      const agent = await dependencies.externalAgents.update(
+        idParam.parse(request.params.id),
+        request.body as AdminExternalAgentWrite,
+      );
+      if (!agent) {
+        response.status(404).json({ ok: false, error: "That external agent was not found." });
+        return;
+      }
+      response.json({ agent });
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.post("/agents/:id/revoke", async (request, response, next) => {
+    if (!dependencies.externalAgents) {
+      response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
+      return;
+    }
+    try {
+      emptyBodySchema.parse(request.body ?? {});
+      const agent = await dependencies.externalAgents.revoke(idParam.parse(request.params.id));
+      if (!agent) {
+        response.status(404).json({ ok: false, error: "That external agent was not found." });
+        return;
+      }
+      response.json({ agent });
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
+
+  router.post("/agents/:id/rotate-token", async (request, response, next) => {
+    if (!dependencies.externalAgents) {
+      response.status(503).json({ ok: false, error: "External-agent administration is unavailable." });
+      return;
+    }
+    try {
+      emptyBodySchema.parse(request.body ?? {});
+      const issued = await dependencies.externalAgents.rotate(idParam.parse(request.params.id));
+      if (!issued) {
+        response.status(404).json({ ok: false, error: "That external agent was not found." });
+        return;
+      }
+      response.status(201).json(issued);
+    } catch (error) {
+      try { sendError(response, error); } catch (unhandled) { next(unhandled); }
+    }
+  });
 
   router.get("/llm", async (_request, response, next) => {
     if (!dependencies.llmProviders) {

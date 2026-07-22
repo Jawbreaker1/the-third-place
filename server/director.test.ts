@@ -2371,7 +2371,7 @@ describe("social director", () => {
       });
       generateScene.mockImplementationOnce(async (request) => {
         assertMentionedFailureScene(request);
-        expect(request.premise).toContain("owns the human's explicit request");
+        expect(request.premise).toContain("owns the triggering participant's explicit request");
         return [{
           personaId: "ai-mira",
           content: "Hm, jag kommer inte åt just den sidan nu.",
@@ -7801,6 +7801,107 @@ describe("social director", () => {
     }
   });
 
+  it("retains an external-agent topic as an explicitly autonomous continuation", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-07-22T18:00:00.000Z");
+      vi.setSystemTime(now);
+      const agent = {
+        id: "agent-topic-starter",
+        name: "Patchwork Finch",
+        kind: "agent" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "P" },
+        role: "External agent",
+        bio: "An owner-operated participant.",
+      };
+      const store = new RoomStore("/tmp/director-external-agent-topic-unused.json");
+      const incoming = createMessage(
+        "lobby",
+        agent.id,
+        "Could we compare two concrete ways to keep a long-running agent loop accountable?",
+        { authorSnapshot: { ...agent, status: "offline" } },
+      );
+      store.addPublicMessage(incoming);
+      const persistence = new MemoryAmbientEpisodePersistence();
+      const ledger = new AmbientEpisodeLedger({ persistence, now: () => now, persistDelayMs: 60_000 });
+      await ledger.load();
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        trigger?: { authorKind?: string };
+      }) => [{
+        personaId: request.selected[0]!.id,
+        content: "Use a short lease plus an append-only decision log; either one alone leaves a nasty blind spot.",
+        source: "lm" as const,
+        sourceIds: [],
+      }]);
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn({
+            language: { tag: "en", confidence: 0.99 },
+            intent: { kind: "question", isQuestion: true, replyExpected: "expected", confidence: 0.99 },
+          })),
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+          health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+        } as never,
+        new ActorChannelRuntime(),
+        { research: vi.fn(), researchSite: vi.fn() } as never,
+        {
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [agent, ...PERSONAS],
+        () => 0,
+        {
+          now: () => now,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+          rng: () => 0.99,
+          ambientEpisodeLedger: ledger,
+        },
+      );
+
+      const internals = director as unknown as {
+        noteParticipantChannelEvent: (message: typeof incoming, humanActivity: boolean) => void;
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof agent) => Promise<void>;
+        ambientThreads: Map<string, AmbientThreadState>;
+        lastHumanMessageAtByChannel: Map<string, number>;
+        lastHumanResearchActivityAtByChannel: Map<string, number>;
+        lastMeaningfulHumanActivityAt?: number;
+      };
+      internals.noteParticipantChannelEvent(incoming, false);
+      const pending = internals.handleHumanBurst([incoming], agent);
+      await vi.runAllTimersAsync();
+      await pending;
+
+      expect(generateScene).toHaveBeenCalled();
+      expect(generateScene.mock.calls[0]?.[0].trigger?.authorKind).toBe("agent");
+      expect(internals.lastMeaningfulHumanActivityAt).toBeUndefined();
+      expect(internals.lastHumanMessageAtByChannel.has("lobby")).toBe(false);
+      expect(internals.lastHumanResearchActivityAtByChannel.has("lobby")).toBe(false);
+      expect(internals.ambientThreads.get("lobby")).toMatchObject({
+        origin: "external_agent_topic",
+        initiatorActorId: agent.id,
+        semanticFamily: "external-agent-started-topic",
+        messageCount: 1,
+      });
+      expect(ledger.current("lobby")).toMatchObject({
+        sourceKind: "external_agent_topic",
+        causalRootId: incoming.id,
+      });
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("persists an ordinary expected reply before generation and recovers it after provider failure", async () => {
     const human = {
       id: "human-expected-recovery",
@@ -10154,14 +10255,14 @@ describe("social director", () => {
     );
     const baseThread = (input: {
       root: typeof retiredRoot;
-      humanActorId: string;
+      initiatorActorId: string;
     }): AmbientThreadState => ({
       seed: "Continue the exact human-rooted topic.",
       seedKey: `human:${input.root.id}`,
       semanticFamily: "human-started-topic",
       episodeId: `episode-${input.root.id}`,
       causalRootId: input.root.id,
-      humanActorId: input.humanActorId,
+      initiatorActorId: input.initiatorActorId,
       messageCount: 0,
       participantIds: [],
       actionHistory: [],
@@ -10174,8 +10275,8 @@ describe("social director", () => {
       openedAt: now,
       updatedAt: now,
     });
-    const retiredThread = baseThread({ root: retiredRoot, humanActorId: retiredHuman.id });
-    const survivingThread = baseThread({ root: survivingRoot, humanActorId: survivingHuman.id });
+    const retiredThread = baseThread({ root: retiredRoot, initiatorActorId: retiredHuman.id });
+    const survivingThread = baseThread({ root: survivingRoot, initiatorActorId: survivingHuman.id });
     const internals = director as unknown as {
       runAmbient: () => Promise<void>;
       ambientThreads: Map<string, AmbientThreadState>;
