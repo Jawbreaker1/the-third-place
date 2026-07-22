@@ -506,6 +506,13 @@ describe("multilingual semantic router contract", () => {
     const intent = format.json_schema.schema.properties.i;
     expect(intent.required).toEqual(expect.arrayContaining(["d", "o", "j"]));
     expect(intent.properties.o.enum).toContain("defensive_pivot");
+    expect(format.json_schema.schema.properties.f).toBeUndefined();
+    expect(format.json_schema.schema.required).not.toContain("f");
+    for (const medium of ["public", "dm"] as const) {
+      const textFormat = buildTurnAnalysisResponseFormat(input({ medium })) as any;
+      expect(textFormat.json_schema.schema.properties.f).toBeDefined();
+      expect(textFormat.json_schema.schema.required).toContain("f");
+    }
 
     const prompt = buildVoiceTurnAnalysisSystemPrompt();
     expect(prompt).toContain("this is medium-independent");
@@ -565,6 +572,151 @@ describe("multilingual semantic router contract", () => {
       ],
     });
     expect(buildTurnAnalysisSystemPrompt()).toContain("clearly refers in the third person");
+  });
+
+  it("binds a current external participant to stable identity and exact active message anchors", () => {
+    const routedInput = input({
+      latestMessage: {
+        id: "message-question",
+        authorId: "human-1",
+        authorName: "Hana",
+        authorKind: "human",
+        content: "Men vem fan var Codex?",
+      },
+      recentMessages: [{
+        id: "message-agent-intro",
+        authorId: "agent-codex",
+        authorName: "Codex",
+        authorKind: "agent",
+        content: "Hej från utsidan — jag provar agent-API:t.",
+        createdAt: "2026-07-22T20:26:36.000Z",
+      }],
+      currentParticipantCandidates: [{
+        id: "agent-codex",
+        displayLabel: "Codex",
+        kind: "agent",
+        publicBio: "Johan's coding collaborator.",
+        recentMessageIds: ["message-agent-intro"],
+      }],
+      historyRecallAvailable: true,
+    });
+    const routed = {
+      ...modelOutput(),
+      language: { tag: "sv", confidence: 0.99 },
+      responseLanguage: { tag: "sv", confidence: 0.99 },
+      intent: {
+        kind: "question",
+        isQuestion: true,
+        replyExpected: "expected",
+        answerDepth: "brief",
+        operationalMode: "general",
+        operationalConfidence: 0.99,
+        confidence: 0.99,
+      },
+      personas: {
+        addressedIds: [],
+        requestedReplyIds: [],
+        relevantIds: ["ai-mira"],
+        addressConfidence: 0,
+        relevanceConfidence: 0.9,
+      },
+      currentContext: {
+        resolution: "current_context",
+        referencedParticipantIds: ["agent-codex"],
+        focusMessageIds: ["message-agent-intro"],
+        confidence: 0.98,
+      },
+      evidence: {
+        need: "none",
+        action: "none",
+        confidence: 0.99,
+        goal: null,
+        query: null,
+        urlRef: null,
+        searchMode: null,
+        timeZone: null,
+        timeKind: null,
+        locationLabel: null,
+        competitionTarget: null,
+        footballView: null,
+        footballFilter: null,
+      },
+      capabilities: {
+        discussed: [],
+        requestKind: "none",
+        asksAboutAcoustics: false,
+        asksAboutAiIdentity: false,
+        asksForList: false,
+        confidence: 0.99,
+      },
+      historyRecall: { need: "none", query: null, confidence: 0.99 },
+    };
+
+    const parsed = parseTurnAnalysisContent(JSON.stringify(routed), routedInput);
+    expect(projectTrustedTurnAnalysis(
+      parsed,
+      [],
+      ["agent-codex"],
+      ["message-question", "message-agent-intro"],
+    )).toMatchObject({
+      currentParticipantResolution: "current_context",
+      referencedParticipantIds: ["agent-codex"],
+      focusMessageIds: ["message-agent-intro"],
+      historyRecallTrusted: false,
+    });
+    expect(buildTurnAnalysisUserData(routedInput)).toMatchObject({
+      currentParticipantCandidates: [{
+        id: "agent-codex",
+        kind: "agent",
+        recentMessageIds: ["message-agent-intro"],
+      }],
+    });
+
+    const compact = compactWeatherOutput({
+      l: "sv",
+      lx: 0.99,
+      rl: "sv",
+      rlx: 0.99,
+      i: { k: "question", q: true, r: "expected", d: "brief", o: "general", j: 0.99, x: 0.99 },
+      p: { a: [], r: [], v: ["ai-mira"], x: 0, y: 0.9, h: [], z: 0 },
+      f: { r: "current_context", p: ["agent-codex"], m: ["message-agent-intro"], x: 0.98 },
+      e: {
+        a: "none", x: 0.99, g: null, q: null, u: null, m: null,
+        z: null, k: null, l: null, c: null, w: null, f: null,
+      },
+      c: { d: [], r: "none", a: false, i: false, l: false, x: 0.99 },
+      h: { n: "none", q: null, x: 0.99 },
+    });
+    expect(projectTrustedTurnAnalysis(
+      parseTurnAnalysisContent(JSON.stringify(compact), routedInput),
+      [],
+      ["agent-codex"],
+      ["message-question", "message-agent-intro"],
+    )).toMatchObject({
+      currentParticipantResolution: "current_context",
+      referencedParticipantIds: ["agent-codex"],
+      focusMessageIds: ["message-agent-intro"],
+    });
+
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...routed,
+      currentContext: {
+        resolution: "current_context",
+        referencedParticipantIds: ["agent-codex"],
+        focusMessageIds: ["message-question"],
+        confidence: 0.98,
+      },
+    }), routedInput)).toBeUndefined();
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...routed,
+      currentContext: {
+        resolution: "history_needed",
+        referencedParticipantIds: [],
+        focusMessageIds: ["message-agent-intro"],
+        confidence: 0.98,
+      },
+      historyRecall: { need: "required", query: "Codex", confidence: 0.98 },
+    }), routedInput)).toBeUndefined();
   });
 
   it("rejects caseless-colliding human catalogs before they reach the model", () => {
@@ -1505,6 +1657,9 @@ describe("multilingual semantic router contract", () => {
       inferredAddressedIds: [],
       relevantIds: [],
       referencedHumanIds: [],
+      currentParticipantResolution: "none",
+      referencedParticipantIds: [],
+      focusMessageIds: [],
       socialTrusted: false,
       social: { warmth: 0, hostility: 0, playfulness: 0, absurdity: 0, urgency: 0, energy: 0, pileOnRisk: 0, claimStrength: 0 },
       moderationTrusted: false,
@@ -2848,6 +3003,121 @@ describe("candidate review transcript participant kinds", () => {
 
     expect(parsed.temporalContext.recentTimeline[0]?.kind).toBe("agent");
     expect(parsed.roomRecall?.timeline[0]?.kind).toBe("agent");
+    const modelData = buildCandidateReviewUserData(parsed) as {
+      temporalContext: { recentTimeline: Array<{ kind: string }> };
+      roomRecall: { timeline: Array<{ kind: string }> };
+    };
+    expect(modelData.temporalContext.recentTimeline[0]?.kind).toBe("participant");
+    expect(modelData.roomRecall.timeline[0]?.kind).toBe("participant");
+  });
+
+  it("blocks a same-name product substitution only under an exact trusted participant binding", () => {
+    const base = reviewInput();
+    const bound = candidateReviewInputSchema.parse({
+      ...base,
+      currentDiscourseContext: {
+        resolution: "current_context",
+        participants: [{
+          id: "agent-codex",
+          displayLabel: "Codex",
+          kind: "agent",
+          publicBio: "An owner-operated coding collaborator.",
+          recentMessageIds: ["agent-intro"],
+        }],
+        focus: [{
+          messageId: "agent-intro",
+          authorId: "agent-codex",
+          author: "Codex",
+          kind: "agent",
+          content: "Hej från utsidan.",
+          createdAt: "2026-07-14T11:59:50.000Z",
+        }],
+      },
+    });
+    const reviews = {
+      reviews: bound.candidates.map((candidate, index) => index === 0
+        ? {
+            personaId: candidate.personaId,
+            severity: "high",
+            issues: ["participant_identity_conflation"],
+            rewriteInstruction: "Describe the bound participant, not the same-name product.",
+            sameSceneOverlap: "none",
+            ...undeterminedOutputLanguage,
+          }
+        : {
+            personaId: candidate.personaId,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            sameSceneOverlap: "none",
+            ...undeterminedOutputLanguage,
+          }),
+    };
+
+    expect(parseCandidateReviewContent(JSON.stringify(reviews), bound)).toEqual(reviews);
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: reviews.reviews.map((review, index) => index === 0
+        ? { ...review, severity: "medium" }
+        : review),
+    }), bound)).toBeUndefined();
+    expect(parseCandidateReviewContent(JSON.stringify(reviews), base)).toBeUndefined();
+
+    const firstArrivalBound = candidateReviewInputSchema.parse({
+      ...base,
+      trigger: {
+        messageId: "agent-intro",
+        imageAttachmentIds: [],
+        author: "Codex",
+        content: "Hej från utsidan.",
+        createdAt: "2026-07-14T11:59:50.000Z",
+        ageSeconds: 10,
+      },
+      triggerParticipantBinding: {
+        id: "agent-codex",
+        displayLabel: "Codex",
+        kind: "agent",
+        publicBio: "An owner-operated coding collaborator.",
+        messageId: "agent-intro",
+      },
+    });
+    expect(firstArrivalBound.currentDiscourseContext).toBeNull();
+    expect(parseCandidateReviewContent(JSON.stringify(reviews), firstArrivalBound)).toEqual(reviews);
+    expect((buildCandidateReviewUserData(firstArrivalBound) as {
+      triggerParticipantBinding: { kind: string };
+    }).triggerParticipantBinding.kind).toBe("participant");
+    expect(candidateReviewInputSchema.safeParse({
+      ...firstArrivalBound,
+      triggerParticipantBinding: {
+        ...firstArrivalBound.triggerParticipantBinding,
+        messageId: "different-message",
+      },
+    }).success).toBe(false);
+
+    const ambiguous = candidateReviewInputSchema.parse({
+      ...base,
+      currentDiscourseContext: {
+        resolution: "ambiguous",
+        participants: [],
+        focus: [{
+          messageId: "unclear-reference",
+          authorId: "human-1",
+          author: "Hana",
+          kind: "human",
+          content: "Vilken Codex menar du?",
+          createdAt: "2026-07-14T11:59:50.000Z",
+        }],
+      },
+    });
+    expect(parseCandidateReviewContent(JSON.stringify(reviews), ambiguous)).toBeUndefined();
+    expect(buildCandidateReviewSystemPrompt()).toContain(
+      "A human/agent kind is transport metadata, not a diegetic label",
+    );
+    expect(buildCandidateReviewSystemPrompt()).toContain(
+      "announcing the participant as an external agent/bot/tool/API/model",
+    );
+    expect(buildCandidateReviewSystemPrompt()).toContain(
+      "triggerParticipantBinding separately binds the exact transport participant",
+    );
   });
 });
 
@@ -4257,7 +4527,7 @@ describe("multilingual batch candidate-review contract", () => {
       input,
     )).toEqual({
       reviews: inconsistentPeerEcho.reviews.map((review, index) => index === 1
-        ? { ...review, sameSceneOverlap: "substantive_overlap" }
+        ? { ...review, sameSceneOverlap: "pure_duplicate" }
         : review),
     });
     const missingOverlap = {
@@ -4273,7 +4543,7 @@ describe("multilingual batch candidate-review contract", () => {
     };
     expect(parseCandidateReviewContent(JSON.stringify(missingOverlap), input)).toEqual({
       reviews: missingOverlap.reviews.map((review, index) => index === 1
-        ? { ...review, sameSceneOverlap: "substantive_overlap" }
+        ? { ...review, sameSceneOverlap: "pure_duplicate" }
         : review),
     });
     const malformedBlockingPeerEcho = {
@@ -4293,7 +4563,7 @@ describe("multilingual batch candidate-review contract", () => {
         ? {
             ...review,
             severity: "high",
-            sameSceneOverlap: "substantive_overlap",
+            sameSceneOverlap: "pure_duplicate",
             rewriteInstruction: "Remove the pure semantic duplication and make a distinct conversational move.",
           }
         : review),
@@ -4321,11 +4591,13 @@ describe("multilingual batch candidate-review contract", () => {
       "none",
       "brief_social_chorus",
       "substantive_overlap",
+      "pure_duplicate",
     ]);
     for (const prompt of [buildCandidateReviewSystemPrompt(), buildVoiceCandidateReviewSystemPrompt()]) {
       expect(prompt).toContain("sameSceneOverlap");
       expect(prompt).toContain("brief_social_chorus");
       expect(prompt).toContain("substantive_overlap");
+      expect(prompt).toContain("pure_duplicate");
       expect(prompt).toContain("in any language");
     }
   });

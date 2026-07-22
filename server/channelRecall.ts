@@ -33,6 +33,12 @@ export interface ChannelRecallInput {
   recentMessageIds: IdCollection;
   /** Server-owned persona IDs permitted to become episode witnesses. */
   allowedPersonaIds: IdCollection;
+  /**
+   * Optional stable participant binding supplied only after semantic
+   * resolution. When present, a same-label product/topic mention can never be
+   * the retrieval anchor for that participant.
+   */
+  participantSubjects?: ReadonlyArray<{ id: string; displayLabel: string }>;
   /** Defaults to eight and is mechanically capped at ten. */
   maxMessages?: number;
   /** Structural conversation boundary, independent of language or message content. */
@@ -176,7 +182,18 @@ const documentFrequency = (records: readonly IndexedRecord[]): Map<string, numbe
 const inverseDocumentFrequency = (documentCount: number, frequency: number): number =>
   Math.log((documentCount + 1) / (frequency + 1)) + 1;
 
-const scoredHistory = (records: readonly SourceRecord[], queryTokens: readonly string[]): ScoredRecord[] => {
+const scoredHistory = (
+  records: readonly SourceRecord[],
+  queryTokens: readonly string[],
+  participantSubjects: ReadonlyArray<{ id: string; displayLabel: string }> = [],
+): ScoredRecord[] => {
+  const subjectIds = new Set(participantSubjects.map((subject) => subject.id));
+  const subjectLabelTokens = new Set(
+    participantSubjects.flatMap((subject) => channelRecallTokens(subject.displayLabel, MAX_QUERY_TOKENS)),
+  );
+  const contentQueryTokens = participantSubjects.length > 0
+    ? queryTokens.filter((token) => !subjectLabelTokens.has(token))
+    : [...queryTokens];
   const querySet = new Set(queryTokens);
   const indexed: IndexedRecord[] = records.map((record) => ({
     ...record,
@@ -186,7 +203,7 @@ const scoredHistory = (records: readonly SourceRecord[], queryTokens: readonly s
   const frequencies = documentFrequency(indexed);
   const rareFrequencyCeiling = Math.max(1, Math.floor(indexed.length * RARE_DOCUMENT_SHARE));
   const discriminative = new Set(
-    queryTokens.filter((token) => {
+    contentQueryTokens.filter((token) => {
       const frequency = frequencies.get(token) ?? 0;
       return frequency > 0 && frequency <= rareFrequencyCeiling &&
         inverseDocumentFrequency(indexed.length, frequency) >= MIN_DISCRIMINATIVE_IDF;
@@ -194,12 +211,16 @@ const scoredHistory = (records: readonly SourceRecord[], queryTokens: readonly s
   );
 
   return indexed.flatMap((record) => {
-    const identityMatch = record.authorNameTokens.size > 0 &&
-      [...record.authorNameTokens].every((token) => querySet.has(token));
+    const identityMatch = participantSubjects.length > 0
+      ? subjectIds.has(record.message.authorId)
+      : record.authorNameTokens.size > 0 && [...record.authorNameTokens].every((token) => querySet.has(token));
     const rareMatches = [...discriminative].filter((token) => record.tokens.has(token));
     const contentMatch = rareMatches.length > 0;
+    // An entity-bound recall may use other rows only as surrounding episode
+    // context. It requires the exact stable author ID as its direct anchor.
+    if (participantSubjects.length > 0 && !identityMatch) return [];
     if (!identityMatch && !contentMatch) return [];
-    const commonMatches = queryTokens.filter((token) =>
+    const commonMatches = contentQueryTokens.filter((token) =>
       !discriminative.has(token) && (frequencies.get(token) ?? 0) > 0 && record.tokens.has(token)
     );
     const rareScore = rareMatches.reduce((total, token) => {
@@ -307,9 +328,15 @@ export const recallChannelHistory = (input: ChannelRecallInput): ChannelRecallRe
   const { eligible } = sourceHistory(input, triggerTime, notBefore);
   if (eligible.length === 0) return undefined;
 
-  const scored = scoredHistory(eligible, queryTokens);
+  const participantSubjects = (input.participantSubjects ?? [])
+    .filter((subject, index, subjects) =>
+      Boolean(subject.id) && subjects.findIndex((candidate) => candidate.id === subject.id) === index
+    )
+    .slice(0, 2);
+  const scored = scoredHistory(eligible, queryTokens, participantSubjects);
   if (scored.length === 0) return undefined;
   const identityMatches = scored.filter((record) => record.identityMatch);
+  if (participantSubjects.length > 0 && identityMatches.length === 0) return undefined;
   const seedPool = identityMatches.length > 0 ? identityMatches : scored;
   const seed = [...seedPool].sort((left, right) =>
     right.score - left.score || right.time - left.time || left.message.id.localeCompare(right.message.id)

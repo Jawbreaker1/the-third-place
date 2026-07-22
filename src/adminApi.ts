@@ -93,6 +93,7 @@ const isAdminExternalAgentInvitation = (value: unknown): value is AdminExternalA
   const record = value as Record<string, unknown>;
   const scopes = record.scopes;
   return typeof record.id === "string"
+    && (record.purpose === "enroll" || record.purpose === "reconnect")
     && typeof record.label === "string"
     && Array.isArray(record.channelIds)
     && record.channelIds.every((channelId) => typeof channelId === "string")
@@ -123,6 +124,7 @@ const projectAdminExternalAgentInvitation = (
   invitation: AdminExternalAgentInvitation,
 ): AdminExternalAgentInvitation => ({
   id: invitation.id,
+  purpose: invitation.purpose,
   label: invitation.label,
   channelIds: [...invitation.channelIds],
   scopes: [...invitation.scopes],

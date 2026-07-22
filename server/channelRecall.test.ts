@@ -20,6 +20,7 @@ const message = (
     channelId?: string;
     authorId?: string;
     authorName?: string;
+    authorKind?: Member["kind"];
     system?: boolean;
     replyToId?: string;
     replyPreview?: ReplyPreview;
@@ -33,7 +34,14 @@ const message = (
   content,
   createdAt: new Date(options.time ?? start + index * 10_000).toISOString(),
   reactions: options.reactions ?? [],
-  ...(options.authorName ? { authorSnapshot: human(options.authorId ?? "human-filler", options.authorName) } : {}),
+  ...(options.authorName
+    ? {
+        authorSnapshot: {
+          ...human(options.authorId ?? "human-filler", options.authorName),
+          kind: options.authorKind ?? "human",
+        },
+      }
+    : {}),
   ...(options.system ? { system: true } : {}),
   ...(options.replyToId ? { replyToId: options.replyToId } : {}),
   ...(options.replyPreview ? { replyPreview: options.replyPreview } : {}),
@@ -43,6 +51,67 @@ const trigger = (index: number, channelId = "lobby"): ChatMessage =>
   message(index, "Kommer ni ihåg det här?", { id: "trigger", channelId, authorId: "human-question" });
 
 describe("source-bound channel recall", () => {
+  it("binds participant recall to stable author identity instead of a same-name product topic", () => {
+    const productDiscussion = message(1, "Codex cache keys can go stale after a model update.", {
+      id: "product-codex",
+      authorId: "ai-sana",
+      authorName: "Sana",
+      time: start,
+    });
+    const agentArrival = message(2, "Hej från utsidan — jag provar agent-API:t.", {
+      id: "agent-codex-arrival",
+      authorId: "agent-codex",
+      authorName: "Codex",
+      authorKind: "agent",
+      time: start + 20 * 60_000,
+    });
+    const latest = message(3, "Vem var Codex som kom in tidigare?", {
+      id: "ask-codex",
+      authorId: "human-jaw",
+      authorName: "Jaw_B",
+      time: start + 60 * 60_000,
+    });
+
+    const recalled = recallChannelHistory({
+      messages: [productDiscussion, agentArrival, latest],
+      query: "Codex",
+      trigger: latest,
+      recentMessageIds: [],
+      allowedPersonaIds: ["ai-sana"],
+      participantSubjects: [{ id: "agent-codex", displayLabel: "Codex" }],
+    });
+
+    expect(recalled?.anchorMessageIds).toEqual(["agent-codex-arrival"]);
+    expect(recalled?.messages.map((entry) => entry.id)).not.toContain("product-codex");
+    expect(recalled?.rows[0]).toMatchObject({
+      authorId: "agent-codex",
+      anchorMatches: ["author_identity"],
+    });
+  });
+
+  it("fails closed when participant-bound history has only same-name topic rows", () => {
+    const productDiscussion = message(1, "Codex cache keys can go stale after a model update.", {
+      id: "product-only-codex",
+      authorId: "ai-sana",
+      authorName: "Sana",
+    });
+    const latest = message(2, "Vad skrev Codex förut?", {
+      id: "ask-missing-agent-codex",
+      authorId: "human-jaw",
+      authorName: "Jaw_B",
+      time: start + 60 * 60_000,
+    });
+
+    expect(recallChannelHistory({
+      messages: [productDiscussion, latest],
+      query: "Codex",
+      trigger: latest,
+      recentMessageIds: [],
+      allowedPersonaIds: ["ai-sana"],
+      participantSubjects: [{ id: "agent-codex", displayLabel: "Codex" }],
+    })).toBeUndefined();
+  });
+
   it("recalls Per with exact source messages after more than sixty later lines", () => {
     const messages = Array.from({ length: 78 }, (_, index) =>
       message(index, `bakgrund rad ${index} om vardagligt småprat`)

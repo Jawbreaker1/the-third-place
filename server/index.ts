@@ -1035,6 +1035,16 @@ const marketPulseCoordinator = process.env.MARKET_PULSE_ENABLED === "false"
         resolve(process.env.MARKET_PULSE_STATE_PATH ?? "./data/market-pulse-state.json"),
       ),
     );
+const externalAgentPublicTurnAuthorized = (actorId: string, channelId: string): boolean => {
+  const current = agentAccessStore.get(actorId);
+  return Boolean(
+    current &&
+    !current.revokedAt &&
+    current.scopes.includes("messages:write") &&
+    current.channelIds.includes(channelId) &&
+    CHANNELS.some((channel) => channel.id === channelId),
+  );
+};
 const director = new SocialDirector(
   io,
   store,
@@ -1058,6 +1068,7 @@ const director = new SocialDirector(
     romanceEligibleHumanActor: (actorId) =>
       accountStore.getAccountByActorId(actorId)?.adultConfirmed === true,
     romanceEligibleResidentActor: (actorId) => adminState.isRomanceEligibleResident(actorId),
+    canRecoverExternalAgentPublicTurn: externalAgentPublicTurnAuthorized,
   },
 );
 
@@ -1501,6 +1512,7 @@ const projectAdminExternalAgentInvitation = (
   invitation: ExternalAgentInvitationSummary,
 ): AdminExternalAgentInvitation => ({
   id: invitation.id,
+  purpose: invitation.purpose,
   label: invitation.adminLabel,
   channelIds: [...invitation.channelIds],
   scopes: [...invitation.scopes],
@@ -1604,7 +1616,9 @@ const beginExternalAgentAuthorityMutation = (agentId: string): void => {
   // Advance the epoch synchronously before the credential store can yield to
   // disk, and close any resident work causally rooted in the old authority.
   actorPublicationGate.invalidate(agentId);
-  director.invalidatePublicWorkForHumanActor(agentId);
+  // Keep the durable outbox until the credential mutation commits. Cancelling
+  // here would lose valid delivery work when the access-store write fails.
+  director.invalidatePublicWorkForHumanActor(agentId, { cancelPending: false });
 };
 
 const finishExternalAgentAuthorityMutation = (agentId: string): void => {
@@ -1658,6 +1672,17 @@ const externalAgentAdmin = {
       try {
         const updated = await agentAccessStore.updateAccess(agentId, canonical);
         if (!updated) return undefined;
+        const deliveryChannels = updated.scopes.includes("messages:write")
+          ? updated.channelIds
+          : [];
+        const cancelled = store.cancelPendingPublicTurnsForActorOutsideChannels(
+          agentId,
+          deliveryChannels,
+        );
+        // Access is authoritative and committed first. Await the derived room
+        // cleanup before reopening generation; startup/recovery independently
+        // revalidates policy if the process dies between these two local files.
+        if (cancelled > 0) await store.flush();
         publishExternalAgentCatalog();
         return projectAdminExternalAgent(updated);
       } finally {
@@ -1673,6 +1698,7 @@ const externalAgentAdmin = {
       try {
         const revoked = await agentAccessStore.revoke(agentId);
         if (!revoked) return undefined;
+        store.cancelPendingPublicTurnsForActor(agentId);
         externalAgentPresence.forget(agentId);
         await store.flush();
         publishExternalAgentCatalog();
@@ -2118,7 +2144,9 @@ const enrollExternalAgent = async (
       channelIds: effectivePolicy.channelIds,
       scopes: effectivePolicy.scopes,
     });
-    const profile = validateExternalAgentPublicProfile(profileInput, reconnectTarget?.id);
+    const profile = reconnectTarget
+      ? { displayName: reconnectTarget.displayName, publicBio: reconnectTarget.publicBio }
+      : validateExternalAgentPublicProfile(profileInput);
 
     const redeem = async () => {
       const mutatingExistingActor = Boolean(reconnectTarget);
@@ -2288,12 +2316,19 @@ app.use(EXTERNAL_AGENT_API_BASE_PATH, createExternalAgentRouter({
         authorSnapshot: { ...member, status: "offline", avatar: { ...member.avatar } },
       });
       const targetPersonaIds = publicTurnTargetIds(message.content, replied);
+      const firstArrivalTargetId = targetPersonaIds.length === 0 &&
+          !store.hasExternalAgentAppeared(current.id)
+        ? director.firstArrivalResidentTarget(input.channelId, current.id)
+        : undefined;
       try {
-        await store.addPublicMessageDurably(
-          message,
-          undefined,
-          targetPersonaIds.length > 0 ? { targetPersonaIds } : undefined,
-        );
+        await store.addExternalAgentPublicMessageDurably(message, {
+          ...(targetPersonaIds.length > 0
+            ? { pendingTurn: { targetPersonaIds, deliveryKind: "direct" as const } }
+            : {}),
+          ...(firstArrivalTargetId
+            ? { firstArrivalTurn: { targetPersonaIds: [firstArrivalTargetId] } }
+            : {}),
+        });
       } catch (error) {
         console.warn("Could not durably accept an external-agent message:", error instanceof Error ? error.message : error);
         return externalAgentFailure(503, "MESSAGE_PERSISTENCE_FAILED", "That message could not be saved safely. Retry it with the same clientMessageId.");
@@ -4305,7 +4340,16 @@ let cancelledBannedPublicTurnTargets = 0;
 for (const ban of adminState.snapshot().bans) {
   cancelledBannedPublicTurnTargets += store.cancelPendingPublicTurnsForActor(ban.memberId);
 }
-if (cancelledBannedPublicTurnTargets > 0) await store.flush();
+let cancelledUnauthorizedAgentPublicTurnTargets = 0;
+for (const turn of store.getPendingPublicTurns()) {
+  const trigger = store.getMessage(turn.messageId);
+  if (trigger?.authorSnapshot?.kind !== "agent") continue;
+  if (externalAgentPublicTurnAuthorized(turn.authorId, turn.channelId)) continue;
+  cancelledUnauthorizedAgentPublicTurnTargets += store.cancelPendingPublicTurn(turn.messageId);
+}
+if (cancelledBannedPublicTurnTargets + cancelledUnauthorizedAgentPublicTurnTargets > 0) {
+  await store.flush();
+}
 const socialActorInventory = socialMemoryStore.overview();
 const dmActorIds = store.getAllDmParticipantIds();
 const publicParticipantActorIds = store.getAllPublicParticipantActorIds();

@@ -18,6 +18,15 @@ const imageAttachment = (id = "7fa0a7d6-3915-4b2c-9db0-928f416a8301"): ImageAtta
   sizeBytes: 12_345,
   analysis: { status: "pending" },
 });
+const externalAgent = (id = "agent-codex"): Member => ({
+  id,
+  name: "Codex",
+  kind: "agent",
+  status: "online",
+  avatar: { color: "#7c4dff", accent: "#a889ff", glyph: "C" },
+  role: "External agent",
+  bio: "A remotely operated community participant.",
+});
 
 describe("room history", () => {
   it("seeds every configured channel so newly added rooms do not open empty", async () => {
@@ -102,10 +111,10 @@ describe("room history", () => {
     ]);
 
     const firstMigratedBytes = await readFile(filePath, "utf8");
-    expect(JSON.parse(firstMigratedBytes)).toMatchObject({ version: 6 });
+    expect(JSON.parse(firstMigratedBytes)).toMatchObject({ version: 7, seenExternalAgentIds: [] });
     expect(firstMigratedBytes).not.toContain('"channelId": "ai-lab"');
     const backupName = (await readdir(dirname(filePath))).find((name) =>
-      name.startsWith(`${basename(filePath)}.pre-v6-from-5-`)
+      name.startsWith(`${basename(filePath)}.pre-v7-from-5-`)
     );
     expect(backupName).toBeDefined();
     expect(await readFile(`${dirname(filePath)}/${backupName}`, "utf8")).toBe(originalBytes);
@@ -272,9 +281,10 @@ describe("room history", () => {
     ]);
     expect(restored.getAllMessages().some((message) => message.channelId === thread.id)).toBe(false);
     expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
-      version: 6,
+      version: 7,
       trustedChannelLanguages: [],
       pendingPublicTurns: [],
+      seenExternalAgentIds: [],
     });
   });
 
@@ -325,10 +335,10 @@ describe("room history", () => {
       version: number;
       privateThreads: Array<{ readReceipts?: unknown[] }>;
     };
-    expect(persisted.version).toBe(6);
+    expect(persisted.version).toBe(7);
     expect(persisted.privateThreads[0]?.readReceipts).toHaveLength(2);
     const backupName = (await readdir(dirname(filePath))).find((name) =>
-      name.startsWith(`${basename(filePath)}.pre-v6-from-4-`)
+      name.startsWith(`${basename(filePath)}.pre-v7-from-4-`)
     );
     expect(backupName).toBeDefined();
     expect(await readFile(`${dirname(filePath)}/${backupName}`, "utf8")).toBe(legacyBytes);
@@ -540,7 +550,7 @@ describe("room history", () => {
       trustedChannelLanguages: unknown[];
     };
     expect(persisted).toMatchObject({
-      version: 6,
+      version: 7,
       trustedChannelLanguages: [{
         channelId: "lobby",
         languageTag: "sv",
@@ -1024,7 +1034,7 @@ describe("room history", () => {
       version: number;
       messages: Array<{ id: string }>;
     };
-    expect(persisted.version).toBe(6);
+    expect(persisted.version).toBe(7);
     expect(persisted.messages.map((message) => message.id)).toEqual(expectedIds);
 
     const temporaryPrefix = `${basename(filePath)}.`;
@@ -1052,7 +1062,7 @@ describe("room history", () => {
       messages: Array<{ id: string }>;
       pendingPublicTurns: Array<{ messageId: string; targets: Array<{ personaId: string }> }>;
     };
-    expect(persisted.version).toBe(6);
+    expect(persisted.version).toBe(7);
     expect(persisted.messages.some((message) => message.id === trigger.id)).toBe(true);
     expect(persisted.pendingPublicTurns).toEqual([expect.objectContaining({
       messageId: trigger.id,
@@ -1072,6 +1082,222 @@ describe("room history", () => {
         expect.objectContaining({ personaId: "ai-vale", attempts: 0 }),
       ]),
     })]);
+  });
+
+  it("migrates durable external-agent appearances from trusted historical snapshots", async () => {
+    const filePath = tempStorePath();
+    const agent = externalAgent();
+    const historical = createMessage("ai-programming", agent.id, "I was already here.", {
+      authorSnapshot: agent,
+    });
+    await writeFile(filePath, JSON.stringify({
+      version: 6,
+      messages: [historical],
+      privateThreads: [],
+      autonomousPublications: [],
+      trustedChannelLanguages: [],
+      pendingPublicTurns: [],
+    }), "utf8");
+
+    const migrated = new RoomStore(filePath);
+    await migrated.load();
+
+    expect(migrated.hasExternalAgentAppeared(agent.id)).toBe(true);
+    const persisted = JSON.parse(await readFile(filePath, "utf8")) as {
+      version: number;
+      seenExternalAgentIds: string[];
+    };
+    expect(persisted).toMatchObject({ version: 7, seenExternalAgentIds: [agent.id] });
+
+    const restarted = new RoomStore(filePath);
+    await restarted.load();
+    expect(restarted.hasExternalAgentAppeared(agent.id)).toBe(true);
+  });
+
+  it("atomically marks and queues exactly one external-agent first arrival", async () => {
+    const now = Date.parse("2026-07-22T20:00:00.000Z");
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath, { now: () => now });
+    const agent = externalAgent();
+    const first = createMessage("ai-programming", agent.id, "Hej från utsidan.", {
+      authorSnapshot: agent,
+      createdAt: new Date(now).toISOString(),
+    });
+
+    await expect(store.addExternalAgentPublicMessageDurably(first, {
+      firstArrivalTurn: { targetPersonaIds: ["ai-mira"] },
+    })).resolves.toEqual({ removedMessages: [], firstAppearance: true });
+    expect(store.hasExternalAgentAppeared(agent.id)).toBe(true);
+    expect(store.getPendingPublicTurns()).toEqual([expect.objectContaining({
+      messageId: first.id,
+      authorId: agent.id,
+      deliveryKind: "first_arrival",
+      targets: [{ personaId: "ai-mira", attempts: 0 }],
+    })]);
+
+    const second = createMessage("ai-programming", agent.id, "Och ett inlägg till.", {
+      authorSnapshot: agent,
+      createdAt: new Date(now + 1_000).toISOString(),
+    });
+    await expect(store.addExternalAgentPublicMessageDurably(second, {
+      firstArrivalTurn: { targetPersonaIds: ["ai-sana"] },
+    })).resolves.toEqual({ removedMessages: [], firstAppearance: false });
+    expect(store.getPendingPublicTurns().map((turn) => turn.messageId)).toEqual([first.id]);
+
+    const persisted = JSON.parse(await readFile(filePath, "utf8")) as {
+      seenExternalAgentIds: string[];
+      pendingPublicTurns: Array<{ deliveryKind: string }>;
+    };
+    expect(persisted.seenExternalAgentIds).toEqual([agent.id]);
+    expect(persisted.pendingPublicTurns).toEqual([
+      expect.objectContaining({ deliveryKind: "first_arrival" }),
+    ]);
+  });
+
+  it("keeps a real direct outbox while consuming the external agent's first appearance", async () => {
+    const now = Date.parse("2026-07-22T20:00:00.000Z");
+    const store = new RoomStore(tempStorePath(), { now: () => now });
+    const agent = externalAgent("agent-addressed");
+    const addressed = createMessage("ai-programming", agent.id, "@Mira vad tror du?", {
+      authorSnapshot: agent,
+      createdAt: new Date(now).toISOString(),
+    });
+
+    await store.addExternalAgentPublicMessageDurably(addressed, {
+      pendingTurn: { targetPersonaIds: ["ai-mira"], deliveryKind: "direct" },
+      firstArrivalTurn: { targetPersonaIds: ["ai-sana"] },
+    });
+
+    expect(store.hasExternalAgentAppeared(agent.id)).toBe(true);
+    expect(store.getPendingPublicTurns()).toEqual([expect.objectContaining({
+      messageId: addressed.id,
+      deliveryKind: "direct",
+      targets: [{ personaId: "ai-mira", attempts: 0 }],
+    })]);
+
+    const ordinary = createMessage("ai-programming", agent.id, "Ingen särskild adress denna gång.", {
+      authorSnapshot: agent,
+      createdAt: new Date(now + 1_000).toISOString(),
+    });
+    store.addPublicMessage(ordinary);
+    expect(store.hasExternalAgentAppeared(agent.id)).toBe(true);
+    expect(store.registerPendingPublicTurn(ordinary.id, {
+      targetPersonaIds: ["ai-sana"],
+      deliveryKind: "first_arrival",
+    })).toBeUndefined();
+    expect(store.getPendingPublicTurns()).toHaveLength(1);
+  });
+
+  it("durably removes only external-agent deliveries outside the current room policy", async () => {
+    const now = Date.parse("2026-07-22T20:00:00.000Z");
+    const filePath = tempStorePath();
+    const store = new RoomStore(filePath, { now: () => now });
+    const agent = externalAgent("agent-policy-narrowed");
+    const removed = createMessage("ai-programming", agent.id, "This room was removed.", {
+      authorSnapshot: agent,
+      createdAt: new Date(now).toISOString(),
+    });
+    const allowed = createMessage("lobby", agent.id, "Keep this reply obligation.", {
+      authorSnapshot: agent,
+      createdAt: new Date(now + 1_000).toISOString(),
+    });
+    store.addPublicMessage(removed, undefined, {
+      targetPersonaIds: ["ai-sana"],
+      deliveryKind: "first_arrival",
+    });
+    store.addPublicMessage(allowed, undefined, {
+      targetPersonaIds: ["ai-mira"],
+      deliveryKind: "direct",
+    });
+
+    expect(store.cancelPendingPublicTurnsForActorOutsideChannels(agent.id, ["lobby"])).toBe(1);
+    expect(store.getPendingPublicTurns().map((turn) => turn.messageId)).toEqual([allowed.id]);
+    await store.flush();
+
+    const restarted = new RoomStore(filePath, { now: () => now });
+    await restarted.load();
+    expect(restarted.getPendingPublicTurns()).toEqual([
+      expect.objectContaining({ messageId: allowed.id, channelId: "lobby" }),
+    ]);
+    expect(restarted.getMessage(removed.id)).toBeDefined();
+  });
+
+  it("cancels one stale recovery row without disturbing another turn by the same actor", () => {
+    const now = Date.parse("2026-07-22T20:00:00.000Z");
+    const store = new RoomStore(tempStorePath(), { now: () => now });
+    const agent = externalAgent("agent-policy-recovery");
+    const stale = createMessage("ai-programming", agent.id, "Stale policy work.", {
+      authorSnapshot: agent,
+      createdAt: new Date(now).toISOString(),
+    });
+    const allowed = createMessage("lobby", agent.id, "Still allowed work.", {
+      authorSnapshot: agent,
+      createdAt: new Date(now + 1_000).toISOString(),
+    });
+    store.addPublicMessage(stale, undefined, {
+      targetPersonaIds: ["ai-mira"],
+      deliveryKind: "direct",
+    });
+    store.addPublicMessage(allowed, undefined, {
+      targetPersonaIds: ["ai-sana"],
+      deliveryKind: "direct",
+    });
+
+    expect(store.cancelPendingPublicTurn(stale.id)).toBe(1);
+    expect(store.cancelPendingPublicTurn(stale.id)).toBe(0);
+    expect(store.getPendingPublicTurns().map((turn) => turn.messageId)).toEqual([allowed.id]);
+  });
+
+  it("rolls back an external-agent appearance and first-arrival outbox when durable acceptance fails", async () => {
+    vi.useFakeTimers();
+    const filePath = tempStorePath();
+    await mkdir(filePath);
+    try {
+      const now = Date.parse("2026-07-22T20:00:00.000Z");
+      const store = new RoomStore(filePath, { now: () => now });
+      const agent = externalAgent("agent-rollback");
+      const incoming = createMessage("ai-programming", agent.id, "Do I survive?", {
+        authorSnapshot: agent,
+        createdAt: new Date(now).toISOString(),
+      });
+
+      await expect(store.addExternalAgentPublicMessageDurably(incoming, {
+        firstArrivalTurn: { targetPersonaIds: ["ai-mira"] },
+      })).rejects.toBeDefined();
+
+      expect(store.getMessage(incoming.id)).toBeUndefined();
+      expect(store.hasExternalAgentAppeared(agent.id)).toBe(false);
+      expect(store.getPendingPublicTurns()).toEqual([]);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      await rmdir(filePath);
+    }
+  });
+
+  it("transfers speculative appearance ownership across overlapping agent appends", () => {
+    const now = Date.parse("2026-07-22T20:00:00.000Z");
+    const store = new RoomStore(tempStorePath(), { now: () => now });
+    const agent = externalAgent("agent-overlap-rollback");
+    const first = createMessage("ai-programming", agent.id, "first speculative row", {
+      authorSnapshot: agent,
+      createdAt: new Date(now).toISOString(),
+    });
+    const second = createMessage("ai-programming", agent.id, "second speculative row", {
+      authorSnapshot: agent,
+      createdAt: new Date(now + 1_000).toISOString(),
+    });
+    const firstHandle = store.addUncommittedPublicMessage(first, undefined, {
+      targetPersonaIds: ["ai-mira"],
+      deliveryKind: "first_arrival",
+    });
+    const secondHandle = store.addUncommittedPublicMessage(second);
+
+    expect(store.rollbackUncommittedPublicMessage(firstHandle)).toBe("rolled_back");
+    expect(store.hasExternalAgentAppeared(agent.id)).toBe(true);
+    expect(store.rollbackUncommittedPublicMessage(secondHandle)).toBe("rolled_back");
+    expect(store.hasExternalAgentAppeared(agent.id)).toBe(false);
+    expect(store.getPendingPublicTurns()).toEqual([]);
   });
 
   it("rolls back a failed durable direct image append without a dangling row, outbox or retention cleanup", async () => {
@@ -1252,6 +1478,37 @@ describe("room history", () => {
       [otherRoom.id, "expected"],
       [otherHuman.id, "expected"],
     ]);
+  });
+
+  it("never supersedes a first-arrival delivery as ordinary expected work", () => {
+    const now = Date.parse("2026-07-22T20:00:00.000Z");
+    const store = new RoomStore(tempStorePath(), { now: () => now });
+    const agent = externalAgent("agent-first-arrival-scope");
+    const arrival = createMessage("ai-programming", agent.id, "Hello room.", {
+      authorSnapshot: agent,
+      createdAt: new Date(now).toISOString(),
+    });
+    const laterExpected = createMessage("ai-programming", agent.id, "Anyone have thoughts?", {
+      authorSnapshot: agent,
+      createdAt: new Date(now + 1_000).toISOString(),
+    });
+    store.addPublicMessage(arrival, undefined, {
+      targetPersonaIds: ["ai-mira"],
+      deliveryKind: "first_arrival",
+    });
+    store.addPublicMessage(laterExpected, undefined, {
+      targetPersonaIds: ["ai-sana"],
+      deliveryKind: "expected",
+    });
+
+    expect(store.cancelExpectedPendingPublicTurnsForActorScope(
+      "ai-programming",
+      agent.id,
+    )).toBe(1);
+    expect(store.getPendingPublicTurns()).toEqual([expect.objectContaining({
+      messageId: arrival.id,
+      deliveryKind: "first_arrival",
+    })]);
   });
 
   it("migrates legacy pending work without a delivery kind as direct", async () => {

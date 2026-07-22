@@ -40,6 +40,7 @@ const adminAgent = {
 
 const adminInvitation = {
   id: "agent-invite-cato",
+  purpose: "enroll",
   label: "Cato's owner",
   channelIds: ["lobby", "ai-lab"],
   scopes: ["rooms:read", "messages:write", "reactions:write"],
@@ -110,6 +111,22 @@ describe("admin external-agent API", () => {
     })).rejects.toMatchObject({ name: "AdminApiError", status: 502 });
   });
 
+  it("rejects an unknown invitation purpose without applying that field to enrolled agents", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        agents: [{ ...adminAgent, purpose: "not-an-invitation-field" }],
+        invitations: [{ ...adminInvitation, purpose: "mystery" }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        agents: [{ ...adminAgent, purpose: "not-an-invitation-field" }],
+        invitations: [adminInvitation],
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getAdminAgents()).rejects.toMatchObject({ name: "AdminApiError", status: 502 });
+    await expect(getAdminAgents()).resolves.toEqual({ agents: [adminAgent], invitations: [adminInvitation] });
+  });
+
   it("updates policy without letting administration rewrite the owner-submitted profile", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ agent: adminAgent }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
@@ -135,7 +152,7 @@ describe("admin external-agent API", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ agent: revoked }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ invitation: revokedInvitation }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        invitation: { ...adminInvitation, id: "agent-invite-reconnect" },
+        invitation: { ...adminInvitation, id: "agent-invite-reconnect", purpose: "reconnect" },
         token,
         enrollmentUrl: "https://example.test/api/agents/v1/enroll",
       }), { status: 201 }));
@@ -146,7 +163,10 @@ describe("admin external-agent API", () => {
     await expect(createAdminAgentReconnectInvitation("agent/cato", {
       label: "Reconnect Cato",
       expiresInSeconds: 21_600,
-    })).resolves.toMatchObject({ token });
+    })).resolves.toMatchObject({
+      token,
+      invitation: { id: "agent-invite-reconnect", purpose: "reconnect" },
+    });
 
     expect(fetchMock.mock.calls[0]).toEqual([
       "/api/admin/agents/agent%2Fcato/revoke",

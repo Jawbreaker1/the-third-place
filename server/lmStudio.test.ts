@@ -989,7 +989,7 @@ const candidateReviewCompletion = (reviews: Array<{
   severity: "none" | "low" | "medium" | "high";
   issues: string[];
   rewriteInstruction: string | null;
-  sameSceneOverlap?: "none" | "brief_social_chorus" | "substantive_overlap";
+  sameSceneOverlap?: "none" | "brief_social_chorus" | "substantive_overlap" | "pure_duplicate";
   outputLanguage?: { tag: string; confidence: number };
 }>) => jsonResponse({
   choices: [{
@@ -998,7 +998,7 @@ const candidateReviewCompletion = (reviews: Array<{
         reviews: reviews.map((review) => ({
           outputLanguage: { tag: "und", confidence: 0 },
           sameSceneOverlap: review.issues.includes("peer_echo")
-            ? "substantive_overlap"
+            ? "pure_duplicate"
             : "none",
           ...review,
         })),
@@ -7557,6 +7557,138 @@ describe("LM Studio multilingual batch candidate review", () => {
 });
 
 describe("LM Studio room prompt", () => {
+  it("treats a bound external participant as a person instead of exposing transport kind", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [mira],
+      history: [],
+      currentDiscourseContext: {
+        resolution: "current_context",
+        participants: [{
+          id: "agent-codex",
+          displayLabel: "Codex",
+          kind: "agent",
+          publicBio: "A coding collaborator.",
+          recentMessageIds: ["agent-intro"],
+        }],
+        focus: [{
+          messageId: "agent-intro",
+          authorId: "agent-codex",
+          author: "Codex",
+          kind: "agent",
+          content: "Hej från utsidan.",
+          createdAt: "2026-07-22T20:26:36.000Z",
+        }],
+      },
+    });
+
+    expect(prompt).toContain("Stable kind is transport metadata, not a social label");
+    expect(prompt).toContain("never announce them as an external agent, bot, tool, API or model");
+  });
+
+  it("carries a server-bound first-arrival participant through review and one identity-safe recovery", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Codex is an external AI agent that connected through the API.",
+        }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["participant_identity_conflation"],
+          rewriteInstruction: "Address the bound newcomer as a person, not as transport or model metadata.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: "Hej Codex — cache-invalidering är exakt sånt folk kan fastna i här.",
+        }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "ai-programming",
+      channelName: "ai-programming",
+      selected: [mira],
+      history: [],
+      trigger: {
+        authorKind: "agent",
+        author: "Codex",
+        content: "Hej från utsidan. Jag har testat cache-invalidering idag.",
+        messageId: "agent-intro",
+        createdAt: "2026-07-22T20:26:36.000Z",
+      },
+      triggerParticipantBinding: {
+        id: "agent-codex",
+        displayLabel: "Codex",
+        kind: "agent",
+        publicBio: "A coding collaborator.",
+        messageId: "agent-intro",
+      },
+      premise: "This is the triggering participant's first public appearance.",
+      mustReplyIds: [mira.id],
+      responseRecoveryIds: [mira.id],
+      requestOwnerIds: [],
+      responseRecoveryBudget: { retriesRemaining: 1 },
+      humanizerBudget: { repairsRemaining: 0 },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: false,
+        replyExpected: "optional",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines.map((line) => line.content)).toEqual([
+      "Hej Codex — cache-invalidering är exakt sånt folk kan fastna i här.",
+    ]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[0].messages[0].content).toContain(
+      "trustedTriggerParticipantBinding identifies the exact person",
+    );
+    const firstScene = JSON.parse(bodies[0].messages[1].content);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    const recoveryScene = JSON.parse(bodies[2].messages[1].content);
+    const recoveryReview = JSON.parse(bodies[3].messages[1].content);
+    for (const scene of [firstScene, recoveryScene]) {
+      expect(scene.trustedTriggerParticipantBinding).toMatchObject({
+        id: "agent-codex",
+        kind: "participant",
+        messageId: "agent-intro",
+      });
+    }
+    for (const review of [firstReview, recoveryReview]) {
+      expect(review.triggerParticipantBinding).toMatchObject({
+        id: "agent-codex",
+        kind: "participant",
+        messageId: "agent-intro",
+      });
+    }
+    expect(recoveryScene.premise).toContain('"participant_identity_conflation"');
+  });
+
   it("serializes an exact bounded recalled-room excerpt with witnesses and elapsed timing", async () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     const witnessIds = PERSONAS.slice(0, 10).map((persona) => persona.id);
@@ -8471,7 +8603,7 @@ describe("LM Studio room prompt", () => {
     expect(prompt).not.toContain("required response language for this scene is und");
   });
 
-  it("keeps an external-agent trigger distinct from a browser human in text-scene framing", () => {
+  it("keeps external transport identity out of diegetic text-scene framing", () => {
     const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
     const prompt = buildSceneSystemPrompt({
       kind: "public",
@@ -8498,7 +8630,8 @@ describe("LM Studio room prompt", () => {
       },
     });
 
-    expect(prompt).toContain("transcript kind of external_agent");
+    expect(prompt).toContain("transcript kind of participant");
+    expect(prompt).not.toContain("external_agent");
     expect(prompt).toContain("latest triggering participant");
     expect(prompt).toContain("triggering participant requested");
     expect(prompt).not.toMatch(/latest human|guest requested|detailed human request|human-triggered scene/iu);
@@ -8776,7 +8909,7 @@ describe("LM Studio room prompt", () => {
     );
     expect(JSON.parse(reviewBody!.messages[1]!.content)).toMatchObject({
       temporalContext: {
-        recentTimeline: [expect.objectContaining({ kind: "agent" })],
+        recentTimeline: [expect.objectContaining({ kind: "participant" })],
       },
     });
   });

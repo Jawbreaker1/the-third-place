@@ -221,6 +221,7 @@ export type AdminExternalAgentInvitationState = "pending" | "redeemed" | "expire
 /** Token-free administrator projection of an enrollment invitation. */
 export interface AdminExternalAgentInvitation {
   id: string;
+  purpose: "enroll" | "reconnect";
   /** Private administrative label; it does not choose the future agent's name. */
   label: string;
   channelIds: string[];

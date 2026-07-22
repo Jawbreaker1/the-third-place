@@ -503,13 +503,34 @@ body { background: var(--admin-bg); color: var(--admin-text); }
 .admin-dialog p:not(.admin-kicker) { color: var(--admin-muted); font-size: 12px; line-height: 1.55; }
 .admin-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
 .admin-recovery-dialog code { display: block; margin-top: 17px; padding: 13px 14px; overflow-wrap: anywhere; border: 1px solid rgba(98, 216, 179, .24); border-radius: 9px; color: #c6f6e7; background: rgba(4, 12, 12, .55); font: 700 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
-.admin-agent-credential-dialog { width: min(720px, 100%); max-height: calc(100dvh - 40px); overflow: auto; }
+.admin-agent-credential-dialog { width: min(860px, 100%); max-height: calc(100dvh - 40px); overflow: auto; }
+.admin-agent-token-warning { margin-top: 14px; }
+.admin-agent-origin-field { display: grid; gap: 5px; margin-top: 14px; }
+.admin-agent-origin-field > span { color: var(--admin-text); font-size: 11px; font-weight: 800; }
+.admin-agent-origin-field > small { color: var(--admin-dim); font-size: 9px; line-height: 1.45; }
+.admin-agent-origin-field input { width: 100%; padding: 10px 11px; border: 1px solid var(--admin-line); border-radius: 8px; outline: none; color: var(--admin-text); background: rgba(4, 8, 12, .5); font: 600 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.admin-agent-origin-field input:focus { border-color: rgba(98, 216, 179, .65); box-shadow: 0 0 0 3px rgba(98, 216, 179, .08); }
+.admin-agent-origin-warning { margin-top: 8px; }
+.admin-agent-connection-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 13px 0 0; }
+.admin-agent-connection-facts > div { min-width: 0; padding: 10px 11px; border: 1px solid var(--admin-line); border-radius: 9px; background: rgba(4, 8, 12, .3); }
+.admin-agent-connection-facts dt { margin-bottom: 5px; color: var(--admin-dim); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.admin-agent-connection-facts dd { margin: 0; overflow-wrap: anywhere; color: var(--admin-text); font: 650 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .admin-agent-secret-block { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; margin-top: 12px; padding: 13px; border: 1px solid var(--admin-line); border-radius: 10px; background: rgba(4, 8, 12, .38); }
 .admin-agent-secret-block > div { display: grid; gap: 3px; }
 .admin-agent-secret-block strong { font-size: 11px; }
 .admin-agent-secret-block small { color: var(--admin-dim); font-size: 9px; }
 .admin-agent-secret-block code { grid-column: 1; min-width: 0; overflow-wrap: anywhere; padding: 9px; border: 1px solid rgba(98, 216, 179, .16); border-radius: 7px; color: #c6f6e7; background: rgba(4, 12, 12, .55); font: 650 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
 .admin-agent-secret-block .admin-button { grid-column: 2; grid-row: 1 / 3; align-self: center; }
+.admin-agent-command-guide { display: grid; gap: 10px; margin-top: 17px; }
+.admin-agent-command-guide-heading strong { font-size: 12px; }
+.admin-agent-command-guide-heading p { margin: 4px 0 0 !important; color: var(--admin-dim) !important; font-size: 10px !important; }
+.admin-agent-command { min-width: 0; overflow: hidden; border: 1px solid var(--admin-line); border-radius: 10px; background: rgba(4, 8, 12, .38); }
+.admin-agent-command > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--admin-line); }
+.admin-agent-command > div > strong { font-size: 10px; }
+.admin-agent-command pre { margin: 0; padding: 11px; overflow: auto; color: #c6f6e7; background: rgba(4, 12, 12, .55); font: 600 10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
+.admin-agent-command code { font: inherit; }
+.admin-agent-bearer-step { margin: 0 !important; padding: 10px 11px; border-left: 2px solid var(--admin-mint); color: var(--admin-muted) !important; background: rgba(98, 216, 179, .04); font-size: 10px !important; }
+.admin-agent-bearer-step code { overflow-wrap: anywhere; color: #c6f6e7; font: 600 9px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .admin-agent-handoff { display: grid; gap: 6px; margin-top: 15px; }
 .admin-agent-handoff > strong { font-size: 12px; }
 .admin-agent-handoff > p { margin: 0 !important; color: var(--admin-dim) !important; font-size: 10px !important; }
@@ -608,6 +629,7 @@ body { background: var(--admin-bg); color: var(--admin-text); }
   .admin-agent-intro-facts { grid-column: 1; }
   .admin-agent-choice-grid { grid-template-columns: 1fr; }
   .admin-agent-lifecycle { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-agent-connection-facts { grid-template-columns: 1fr; }
   .admin-agent-secret-block { grid-template-columns: 1fr; }
   .admin-agent-secret-block code, .admin-agent-secret-block .admin-button { grid-column: 1; grid-row: auto; }
   .admin-agent-secret-block .admin-button { width: 100%; }

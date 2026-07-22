@@ -4,7 +4,7 @@ import { ActorChannelRuntime } from "./actorChannels.js";
 import { SocialDirector } from "./director.js";
 import type { SceneRequest } from "./lmStudio.js";
 import { PERSONAS } from "./personas.js";
-import { createFailClosedTurnAnalysis } from "./semanticRouter.js";
+import { createFailClosedTurnAnalysis, type TurnAnalysis } from "./semanticRouter.js";
 import type { DeliveredSocialEpisode } from "./socialMemoryCoordinator.js";
 import { createMessage, RoomStore } from "./store.js";
 
@@ -20,7 +20,7 @@ const EXTERNAL_AGENT: Member = {
   bio: "A curious visitor operated by a community member.",
 };
 
-const analyzedAgentTurn = () => ({
+const analyzedAgentTurn = (overrides: Partial<TurnAnalysis> = {}): TurnAnalysis => ({
   ...createFailClosedTurnAnalysis("disabled"),
   source: "lm" as const,
   failureReason: null,
@@ -49,6 +49,7 @@ const analyzedAgentTurn = () => ({
     claimStrength: 0,
     confidence: 0.99,
   },
+  ...overrides,
 });
 
 interface DirectorInternals {
@@ -61,7 +62,17 @@ interface DirectorInternals {
   lastHumanResearchActivityAtByChannelActor: Map<string, Map<string, number>>;
 }
 
-const createHarness = (options: { reaction?: boolean } = {}) => {
+const createHarness = (options: {
+  reaction?: boolean;
+  analysis?: TurnAnalysis;
+  generateScene?: (request: SceneRequest) => Promise<Array<{
+    personaId: string;
+    content: string;
+    source: "lm";
+    sourceIds: string[];
+  }>>;
+  canRecoverExternalAgentPublicTurn?: (actorId: string, channelId: string) => boolean;
+} = {}) => {
   const store = new RoomStore(
     `/tmp/director-external-agent-${process.pid}-${Math.random()}.json`,
     { now: () => NOW },
@@ -69,6 +80,7 @@ const createHarness = (options: { reaction?: boolean } = {}) => {
   const generatedRequests: SceneRequest[] = [];
   const generateScene = vi.fn(async (request: SceneRequest) => {
     generatedRequests.push(request);
+    if (options.generateScene) return await options.generateScene(request);
     const selected = request.selected[0];
     return selected
       ? [{
@@ -101,7 +113,7 @@ const createHarness = (options: { reaction?: boolean } = {}) => {
     store,
     {
       health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
-      analyzeTurn: vi.fn(async () => analyzedAgentTurn()),
+      analyzeTurn: vi.fn(async () => options.analysis ?? analyzedAgentTurn()),
       generateScene,
       rememberDeliveredLine: vi.fn(),
       acquireForegroundDemand: vi.fn(() => ({ release: vi.fn() })),
@@ -131,6 +143,9 @@ const createHarness = (options: { reaction?: boolean } = {}) => {
         publicThirdPartyPromptNote: vi.fn(() => undefined),
         behaviorProjection: vi.fn(() => undefined),
       } as never,
+      ...(options.canRecoverExternalAgentPublicTurn
+        ? { canRecoverExternalAgentPublicTurn: options.canRecoverExternalAgentPublicTurn }
+        : {}),
     },
   );
   const handleHumanBurst = vi.spyOn(director as unknown as {
@@ -171,6 +186,286 @@ const expectNoHumanActivity = (internals: DirectorInternals): void => {
 };
 
 describe("SocialDirector external-agent boundaries", () => {
+  it.each(["direct", "first_arrival"] as const)(
+    "never revives stale %s generation after an authority mutation is restored",
+    async (deliveryKind) => {
+      vi.useFakeTimers();
+      try {
+        let releaseFirst!: (lines: Array<{
+          personaId: string;
+          content: string;
+          source: "lm";
+          sourceIds: string[];
+        }>) => void;
+        const firstGeneration = new Promise<Array<{
+          personaId: string;
+          content: string;
+          source: "lm";
+          sourceIds: string[];
+        }>>((resolve) => {
+          releaseFirst = resolve;
+        });
+        let generation = 0;
+        const harness = createHarness({
+          analysis: createFailClosedTurnAnalysis("provider_error"),
+          generateScene: async (request) => {
+            generation += 1;
+            if (generation === 1) return await firstGeneration;
+            return [{
+              personaId: request.selected[0]!.id,
+              content: "fresh authority response",
+              source: "lm",
+              sourceIds: [],
+            }];
+          },
+          canRecoverExternalAgentPublicTurn: () => true,
+        });
+        const incoming = createMessage(
+          "lobby",
+          EXTERNAL_AGENT.id,
+          deliveryKind === "direct" ? "@Mira take a look" : "hello on my first visit",
+          {
+            createdAt: new Date(NOW).toISOString(),
+            authorSnapshot: { ...EXTERNAL_AGENT, status: "offline" },
+          },
+        );
+        await harness.store.addExternalAgentPublicMessageDurably(incoming, deliveryKind === "direct"
+          ? { pendingTurn: { targetPersonaIds: [MIRA.id], deliveryKind } }
+          : { firstArrivalTurn: { targetPersonaIds: [MIRA.id] } });
+
+        harness.director.onExternalAgentMessage(incoming, EXTERNAL_AGENT);
+        await runQueuedWork(750);
+        const staleCompletion = harness.handleHumanBurst.mock.results[0]?.value;
+        expect(staleCompletion).toBeDefined();
+        expect(harness.generateScene).toHaveBeenCalledTimes(1);
+
+        harness.director.invalidatePublicWorkForHumanActor(EXTERNAL_AGENT.id, { cancelPending: false });
+        harness.director.restorePublicWorkForExternalAgent(EXTERNAL_AGENT.id);
+        releaseFirst([{
+          personaId: MIRA.id,
+          content: "stale authority response",
+          source: "lm",
+          sourceIds: [],
+        }]);
+        await staleCompletion;
+
+        expect(harness.store.getRecent("lobby", 20).some(
+          (message) => message.replyToId === incoming.id && message.content === "stale authority response",
+        )).toBe(false);
+        expect(harness.store.getPendingPublicTurns()).toHaveLength(1);
+
+        expect(harness.director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(1);
+        await runQueuedWork();
+        expect(harness.store.getRecent("lobby", 20).filter(
+          (message) => message.replyToId === incoming.id && message.content === "fresh authority response",
+        )).toHaveLength(1);
+        expect(harness.store.getPendingPublicTurns()).toEqual([]);
+        harness.director.stop();
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("drops crash-restored agent delivery work that current room policy no longer authorizes", () => {
+    const harness = createHarness({
+      canRecoverExternalAgentPublicTurn: (_actorId, channelId) => channelId === "lobby",
+    });
+    const incoming = createMessage("ai-programming", EXTERNAL_AGENT.id, "@Mira stale room access", {
+      createdAt: new Date(NOW).toISOString(),
+      authorSnapshot: { ...EXTERNAL_AGENT, status: "offline" },
+    });
+    harness.store.addPublicMessage(incoming, undefined, {
+      targetPersonaIds: [MIRA.id],
+      deliveryKind: "direct",
+    });
+
+    expect(harness.director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(0);
+    expect(harness.store.getPendingPublicTurns()).toEqual([]);
+    expect(harness.generateScene).not.toHaveBeenCalled();
+    harness.director.stop();
+  });
+
+  it("does not admit recovery inside a reversible authority-mutation window", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness({ canRecoverExternalAgentPublicTurn: () => true });
+      const incoming = createMessage("lobby", EXTERNAL_AGENT.id, "@Mira wait for policy commit", {
+        createdAt: new Date(NOW).toISOString(),
+        authorSnapshot: { ...EXTERNAL_AGENT, status: "offline" },
+      });
+      harness.store.addPublicMessage(incoming, undefined, {
+        targetPersonaIds: [MIRA.id],
+        deliveryKind: "direct",
+      });
+
+      harness.director.invalidatePublicWorkForHumanActor(EXTERNAL_AGENT.id, { cancelPending: false });
+      expect(harness.director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(0);
+      expect(harness.store.getPendingPublicTurns()[0]?.targets[0]?.attempts).toBe(0);
+
+      harness.director.restorePublicWorkForExternalAgent(EXTERNAL_AGENT.id);
+      expect(harness.director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(1);
+      await runQueuedWork();
+      expect(harness.store.getPendingPublicTurns()).toEqual([]);
+      expect(harness.store.getRecent("lobby", 10)).toContainEqual(expect.objectContaining({
+        authorId: MIRA.id,
+        replyToId: incoming.id,
+      }));
+      harness.director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives a first public arrival one durable, reviewed resident response without inventing an address", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness({ analysis: createFailClosedTurnAnalysis("provider_error") });
+      harness.internals.aiTimestamps.push(...Array.from({ length: 10 }, () => NOW));
+      const incoming = createMessage(
+        "lobby",
+        EXTERNAL_AGENT.id,
+        "hello from the outside — I have been testing cache invalidation today",
+        {
+          createdAt: new Date(NOW).toISOString(),
+          authorSnapshot: { ...EXTERNAL_AGENT, status: "offline" },
+        },
+      );
+      await harness.store.addExternalAgentPublicMessageDurably(incoming, {
+        firstArrivalTurn: { targetPersonaIds: [MIRA.id] },
+      });
+      const scheduleCrowdReactions = vi.spyOn(harness.director as unknown as {
+        scheduleCrowdReactions: (...args: unknown[]) => number;
+      }, "scheduleCrowdReactions");
+
+      harness.director.onExternalAgentMessage(incoming, EXTERNAL_AGENT);
+      await runQueuedWork(750);
+      const completion = harness.handleHumanBurst.mock.results[0]?.value;
+      expect(completion).toBeDefined();
+      await runQueuedWork();
+      await completion;
+
+      expect(harness.generateScene).toHaveBeenCalledTimes(1);
+      const request = harness.generatedRequests[0]!;
+      expect(request.selected.map((persona) => persona.id)).toEqual([MIRA.id]);
+      expect(request.mustReplyIds).toEqual([MIRA.id]);
+      expect(request.responseRecoveryIds).toEqual([MIRA.id]);
+      expect(request.requestOwnerIds).toEqual([]);
+      expect(request.currentDiscourseContext).toBeUndefined();
+      expect(request.triggerParticipantBinding).toEqual({
+        id: EXTERNAL_AGENT.id,
+        displayLabel: EXTERNAL_AGENT.name,
+        kind: "agent",
+        publicBio: EXTERNAL_AGENT.bio,
+        messageId: incoming.id,
+      });
+      expect(request.premise).toContain("first public appearance");
+      expect(request.premise).toContain("primarily to the actual message");
+      expect(scheduleCrowdReactions).not.toHaveBeenCalled();
+      expect(harness.director.getEvents().at(-1)?.trigger).toBe("join");
+      expect(harness.store.getRecent("lobby", 10).filter(
+        (message) => message.authorId === MIRA.id && message.replyToId === incoming.id,
+      )).toHaveLength(1);
+      expect(harness.store.getPendingPublicTurns()).toEqual([]);
+      expect(harness.internals.priorityExternalAgentReplyTimestamps).toEqual([NOW]);
+      expectNoHumanActivity(harness.internals);
+      harness.director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a trusted first-arrival request and capability execution accountable to the chosen resident", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness({
+        analysis: analyzedAgentTurn({
+          intent: {
+            kind: "request",
+            isQuestion: true,
+            replyExpected: "expected",
+            confidence: 0.99,
+          },
+          evidence: {
+            need: "required",
+            action: "local_datetime",
+            confidence: 0.99,
+            goal: "current time in Stockholm",
+            query: null,
+            urlRef: null,
+            searchMode: null,
+            timeZone: "Europe/Stockholm",
+            timeKind: "current_time",
+            locationLabel: "Stockholm",
+            competitionTarget: null,
+            footballView: null,
+            footballFilter: null,
+          },
+          capabilities: {
+            discussed: ["local_datetime"],
+            requestKind: "execute",
+            asksAboutAcoustics: false,
+            asksAboutAiIdentity: false,
+            asksForList: false,
+            confidence: 0.99,
+          },
+        }),
+      });
+      const incoming = createMessage(
+        "lobby",
+        EXTERNAL_AGENT.id,
+        "What time is it in Stockholm right now?",
+        {
+          createdAt: new Date(NOW).toISOString(),
+          authorSnapshot: { ...EXTERNAL_AGENT, status: "offline" },
+        },
+      );
+      await harness.store.addExternalAgentPublicMessageDurably(incoming, {
+        firstArrivalTurn: { targetPersonaIds: [MIRA.id] },
+      });
+
+      harness.director.onExternalAgentMessage(incoming, EXTERNAL_AGENT);
+      await runQueuedWork(750);
+      const completion = harness.handleHumanBurst.mock.results[0]?.value;
+      expect(completion).toBeDefined();
+      await runQueuedWork();
+      await completion;
+
+      expect(harness.generateScene).toHaveBeenCalledTimes(1);
+      expect(harness.generatedRequests[0]).toMatchObject({
+        selected: [{ id: MIRA.id }],
+        mustReplyIds: [MIRA.id],
+        responseRecoveryIds: [MIRA.id],
+        requestOwnerIds: [MIRA.id],
+        triggerParticipantBinding: {
+          id: EXTERNAL_AGENT.id,
+          kind: "agent",
+          messageId: incoming.id,
+        },
+        semanticContext: {
+          intentTrusted: true,
+          replyExpected: "expected",
+        },
+        capabilityContext: {
+          discussed: ["local_datetime"],
+          plannedAction: "local_datetime",
+          executionStatus: "succeeded",
+        },
+        requestedClock: {
+          timeZone: "Europe/Stockholm",
+        },
+      });
+      expect(harness.store.getPendingPublicTurns()).toEqual([]);
+      harness.director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("routes an external message through resident response and autonomous social-memory paths without human attendance", async () => {
     vi.useFakeTimers();
     try {

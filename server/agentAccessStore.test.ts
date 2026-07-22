@@ -297,7 +297,7 @@ describe("external-agent access store v2", () => {
     expect(redeemed?.agent.displayName).toBe("Valid Owner Agent");
   });
 
-  it("reconnects a retained actor atomically with new profile, host policy and token", async () => {
+  it("reconnects a retained actor atomically without letting a stale handoff overwrite profile or host policy", async () => {
     const path = await makePath();
     let now = Date.UTC(2026, 6, 22, 8);
     const invitationTokens = [invitationToken(8), invitationToken(9)];
@@ -347,7 +347,8 @@ describe("external-agent access store v2", () => {
       token: agentToken(9),
       agent: {
         id: first!.agent.id,
-        displayName: "Original Voice Returns",
+        displayName: "Original Voice",
+        publicBio: "A curious visitor operated outside The Third Place.",
         channelIds: ["lobby"],
         scopes: ["rooms:read"],
         createdAt: originalCreatedAt,

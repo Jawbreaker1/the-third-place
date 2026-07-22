@@ -612,7 +612,10 @@ export class AgentAccessStore {
         if (!current) return undefined;
         nextAgent = {
           ...current,
-          ...canonicalProfile,
+          // Reconnection rotates authority; it does not mutate identity. The
+          // owner can PATCH the profile with the newly authenticated bearer.
+          // This also prevents a stale handoff page from rolling back a newer
+          // owner-authored name or bio while an invitation is outstanding.
           // A reconnect invitation carries an issuance-time access snapshot
           // for the handoff UI. It must never restore permissions that the
           // host narrowed while the invitation was outstanding.

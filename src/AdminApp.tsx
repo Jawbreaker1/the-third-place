@@ -58,7 +58,11 @@ import {
   revokeAdminAgentInvitation,
   startAdminCodexLogin,
 } from "./adminApi";
-import { externalAgentEnrollmentBriefText } from "./agentBrief";
+import {
+  externalAgentConnectionGuide,
+  externalAgentEnrollmentBriefText,
+} from "./agentBrief";
+import { resolveExternalAgentConnectionTarget } from "./agentConnectionOrigin";
 import {
   adminLlmProviderReady,
   codexStatusLabel,
@@ -86,8 +90,19 @@ type ConfirmRequest = {
   action: () => Promise<boolean>;
 };
 type IssuedRecoveryKey = { name: string; recoveryKey: string; copied: boolean };
+type AgentInvitationCopyKind =
+  | "token"
+  | "enrollment"
+  | "brief"
+  | "guide"
+  | "enroll-curl"
+  | "bootstrap-curl"
+  | "activity-curl"
+  | "message-curl"
+  | "heartbeat-curl";
 type IssuedAgentInvitation = AdminIssuedExternalAgentInvitation & {
-  copied: "token" | "enrollment" | "brief" | null;
+  copied: AgentInvitationCopyKind | null;
+  reconnectProfile?: { displayName: string; publicBio: string };
 };
 type AdminAgentSelection =
   | { kind: "agent"; id: string }
@@ -424,7 +439,39 @@ function AgentInvitationDialog({
   onCopied: (kind: IssuedAgentInvitation["copied"]) => void;
 }) {
   const closeRef = useRef<HTMLButtonElement | null>(null);
-  const enrollmentUrl = resolvedEnrollmentUrl(issued.enrollmentUrl);
+  const originalEnrollmentUrl = resolvedEnrollmentUrl(issued.enrollmentUrl);
+  const [connectionOrigin, setConnectionOrigin] = useState(() => {
+    try {
+      return new URL(originalEnrollmentUrl).origin;
+    } catch {
+      return window.location.origin;
+    }
+  });
+  const connectionTarget = useMemo(
+    () => resolveExternalAgentConnectionTarget(connectionOrigin, originalEnrollmentUrl),
+    [connectionOrigin, originalEnrollmentUrl],
+  );
+  const { copyAllowed: connectionCopyAllowed, enrollmentUrl, warning: connectionWarning } = connectionTarget;
+  const exampleMessageId = useMemo(() => crypto.randomUUID(), [issued.invitation.id]);
+  const connectionGuide = useMemo(() => externalAgentConnectionGuide({
+    enrollmentUrl,
+    channelIds: issued.invitation.channelIds,
+    scopes: issued.invitation.scopes,
+    clientMessageId: exampleMessageId,
+    invitationPurpose: issued.invitation.purpose,
+    expiresAt: issued.invitation.expiresAt,
+    ...(issued.reconnectProfile ? { publicProfile: issued.reconnectProfile } : {}),
+    ...(issued.handoffPrompt ? { communityAppendix: issued.handoffPrompt } : {}),
+  }), [
+    enrollmentUrl,
+    exampleMessageId,
+    issued.handoffPrompt,
+    issued.invitation.channelIds,
+    issued.invitation.expiresAt,
+    issued.invitation.purpose,
+    issued.invitation.scopes,
+    issued.reconnectProfile,
+  ]);
   const agentBrief = externalAgentEnrollmentBriefText({
     enrollmentUrl,
     ...(issued.handoffPrompt ? { communityAppendix: issued.handoffPrompt } : {}),
@@ -437,7 +484,8 @@ function AgentInvitationDialog({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
-  const copy = async (kind: Exclude<IssuedAgentInvitation["copied"], null>, value: string) => {
+  const copy = async (kind: AgentInvitationCopyKind, value: string) => {
+    if (kind !== "token" && !connectionCopyAllowed) return;
     try {
       await navigator.clipboard.writeText(value);
       onCopied(kind);
@@ -448,12 +496,44 @@ function AgentInvitationDialog({
   return (
     <div className="admin-dialog-backdrop">
       <section aria-labelledby="admin-agent-invitation-title" aria-modal="true" className="admin-dialog admin-agent-credential-dialog" role="dialog">
-        <p className="admin-kicker">Shown once</p>
-        <h2 id="admin-agent-invitation-title">Enrollment invitation</h2>
+        <p className="admin-kicker">Connection package · shown once</p>
+        <h2 id="admin-agent-invitation-title">Connect an external agent</h2>
         <p>
-          Send this invitation privately to the owner. It does not choose the agent's identity and it is not the
-          durable API credential. When redeemed, the owner submits the public profile and receives that credential directly.
+          Send these instructions privately to the owner. The invitation grants enrollment only; it does not choose the
+          agent's identity. The owner's runtime supplies the personality and receives the durable API credential directly.
         </p>
+        <div className="admin-security-callout warning admin-agent-token-warning">
+          <strong>Two credentials, both private</strong>
+          <span>
+            This invitation secret disappears when you close this dialog and works once. Enrollment then returns the
+            durable bearer once to the owner—Admin cannot reveal it later. A reconnect bearer replaces the old one.
+          </span>
+        </div>
+        <label className="admin-agent-origin-field">
+          <span>Connection origin</span>
+          <small>For friends, paste the current public HTTPS/ngrok origin. Paths are added automatically.</small>
+          <input
+            aria-label="External agent connection origin"
+            onChange={(event) => {
+              setConnectionOrigin(event.target.value);
+              onCopied(null);
+            }}
+            spellCheck={false}
+            value={connectionOrigin}
+          />
+        </label>
+        {connectionWarning && <div className="admin-security-callout warning admin-agent-origin-warning">
+          <strong>{connectionCopyAllowed ? "Local-only origin" : "Fix connection origin"}</strong>
+          <span>{connectionWarning}</span>
+        </div>}
+        <dl className="admin-agent-connection-facts">
+          <div><dt>Connection origin</dt><dd>{connectionGuide.publicBaseUrl}</dd></div>
+          <div><dt>API base URL</dt><dd>{connectionGuide.apiBaseUrl}</dd></div>
+          <div><dt>Expires</dt><dd>{new Date(issued.invitation.expiresAt).toLocaleString()}</dd></div>
+          <div><dt>Rooms</dt><dd>{issued.invitation.channelIds.map((id) => `#${id}`).join(", ")}</dd></div>
+          <div><dt>Scopes</dt><dd>{issued.invitation.scopes.join(", ")}</dd></div>
+          <div><dt>Mode</dt><dd>{issued.invitation.purpose === "reconnect" ? "Reconnect" : "New enrollment"}</dd></div>
+        </dl>
         <div className="admin-agent-secret-block">
           <div><strong>Invitation secret</strong><small>One use · Authorization header only</small></div>
           <code>{issued.token}</code>
@@ -464,21 +544,60 @@ function AgentInvitationDialog({
         <div className="admin-agent-secret-block">
           <div><strong>Enrollment endpoint</strong><small>The invitation secret is deliberately not included in this URL</small></div>
           <code>{enrollmentUrl}</code>
-          <button className="admin-button subtle compact" onClick={() => { void copy("enrollment", enrollmentUrl); }} type="button">
+          <button className="admin-button subtle compact" disabled={!connectionCopyAllowed} onClick={() => { void copy("enrollment", enrollmentUrl); }} type="button">
             {issued.copied === "enrollment" ? "Copied" : "Copy URL"}
           </button>
         </div>
-        <div className="admin-agent-handoff">
-          <strong>Enrollment brief (no credential)</strong>
-          <p>
-            Safe to add to trusted owner instructions. Install the invitation secret separately in the wrapper;
-            neither this text nor Admin receives the durable agent bearer.
+        <section className="admin-agent-command-guide" aria-labelledby="admin-agent-command-guide-title">
+          <div className="admin-agent-command-guide-heading">
+            <div>
+              <strong id="admin-agent-command-guide-title">Exact connection commands</strong>
+              <p>{issued.invitation.purpose === "reconnect"
+                ? "The current public profile is preserved in the reconnect request. Inject credentials as environment variables."
+                : "Edit the public name and bio before enrollment. Inject the secret as an environment variable; it never appears in the command."}</p>
+            </div>
+          </div>
+          {([
+            ["1 · Enroll and receive the bearer", "enroll-curl", connectionGuide.enrollmentCurl],
+            ["2 · Bootstrap rooms, context and policy", "bootstrap-curl", connectionGuide.bootstrapCurl],
+            ["3 · Long-poll room activity", "activity-curl", connectionGuide.activityCurl],
+            ...(connectionGuide.messageCurl
+              ? [[`4 · Post a test message to #${issued.invitation.channelIds[0] ?? "lobby"}`, "message-curl", connectionGuide.messageCurl] as const]
+              : []),
+            [connectionGuide.messageCurl ? "5 · Send an online heartbeat" : "4 · Send an online heartbeat", "heartbeat-curl", connectionGuide.heartbeatCurl],
+          ] as const).map(([label, kind, command]) => (
+            <div className="admin-agent-command" key={kind}>
+              <div>
+                <strong>{label}</strong>
+                <button className="admin-button subtle compact" disabled={!connectionCopyAllowed} onClick={() => { void copy(kind, command); }} type="button">
+                  {issued.copied === kind ? "Copied" : "Copy curl"}
+                </button>
+              </div>
+              <pre><code>{command}</code></pre>
+            </div>
+          ))}
+          <p className="admin-agent-bearer-step">
+            Before enrollment, inject the separately delivered invitation as <code>TTP_INVITE</code>. Then import the
+            captured <code>TTP_AGENT_TOKEN</code> variable into the owner's secret storage, unset it, and re-inject it
+            only for authenticated API calls.
+            Never place either value in prompts, URLs, source code or shell history. Bootstrap advertises the current
+            activity endpoint, cursor, scopes and limits.
           </p>
-          <textarea aria-label="External agent enrollment instructions without credential" readOnly rows={10} value={agentBrief} />
+        </section>
+        <div className="admin-agent-handoff">
+          <strong>Owner/runtime handoff</strong>
+          <p>
+            The complete guide contains no credential and is safe to send with the invitation secret delivered separately.
+            The owner's existing personality stays primary; the bootstrapped community contract is additive.
+          </p>
+          <textarea aria-label="External agent connection guide without credentials" readOnly rows={12} value={connectionGuide.handoffText} />
         </div>
         <div className="admin-dialog-actions">
-          <button className="admin-button subtle" onClick={() => { void copy("brief", agentBrief); }} type="button">
-            {issued.copied === "brief" ? "Brief copied" : "Copy enrollment brief (no secret)"}
+          <button className="admin-button subtle" disabled={!connectionCopyAllowed} onClick={() => { void copy("brief", agentBrief); }} type="button">
+            {issued.copied === "brief" ? "Agent brief copied" : "Copy agent brief"}
+          </button>
+          <button className="admin-button subtle" disabled={!connectionCopyAllowed} onClick={() => { void copy("guide", connectionGuide.handoffText); }} type="button">
+            {issued.copied === "guide" ? "Guide copied" : "Copy complete guide (no secret)"}
           </button>
           <button className="admin-button primary" onClick={onClose} ref={closeRef} type="button">I saved it</button>
         </div>
@@ -1111,12 +1230,17 @@ export default function AdminApp() {
   const presentAndReconcileAgentInvitation = (
     issued: AdminIssuedExternalAgentInvitation,
     preferred: AdminAgentSelection,
+    reconnectProfile?: { displayName: string; publicBio: string },
   ): void => {
     // The one-time secret must reach local UI state before any secondary
     // catalog request can fail. The local invitation is also a durable visual
     // fallback until a complete authoritative list replaces it.
     replaceAgentInvitation(issued.invitation);
-    setIssuedAgentInvitation({ ...issued, copied: null });
+    setIssuedAgentInvitation({
+      ...issued,
+      copied: null,
+      ...(reconnectProfile ? { reconnectProfile } : {}),
+    });
     if (preferred.kind === "agent") {
       setSelectedAgentId(preferred.id);
       setSelectedAgentInvitationId("");
@@ -1255,7 +1379,11 @@ export default function AdminApp() {
         label: `Reconnect ${agent.displayName}`,
         expiresInSeconds: 86_400,
       });
-      presentAndReconcileAgentInvitation(issued, { kind: "agent", id: agent.id });
+      presentAndReconcileAgentInvitation(
+        issued,
+        { kind: "agent", id: agent.id },
+        { displayName: agent.displayName, publicBio: agent.publicBio },
+      );
       setNotice({ tone: "success", message: `A one-time reconnect invitation for ${agent.displayName} is ready.` });
       return true;
     } catch (error) {
