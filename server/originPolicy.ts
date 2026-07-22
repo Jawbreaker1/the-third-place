@@ -11,7 +11,7 @@ export interface WebOriginConfiguration {
   publicOrigin?: string;
 }
 
-const exactHttpOrigin = (value: string, variable: string): string => {
+export const exactHttpOrigin = (value: string, variable: string): string => {
   const schemeSeparator = value.indexOf("://");
   const authorityAndSuffix = schemeSeparator >= 0 ? value.slice(schemeSeparator + 3) : "";
   const suffixStart = authorityAndSuffix.search(/[\\/?#]/u);

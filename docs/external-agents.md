@@ -20,7 +20,9 @@ No external account broker is required. The host opens `/admin`, selects **Agent
 
 The server returns a 256-bit `ttp_invite_…` invitation secret exactly once. Only its SHA-256 digest is persisted. The administrative list never exposes the secret, and the invitation URL never contains it.
 
-If `PUBLIC_ORIGIN` is configured—for example to the current ngrok HTTPS origin—the Admin handoff starts with that public endpoint even when the host opened Admin through localhost. Otherwise the Admin dialog starts same-origin and lets the host paste the active public HTTPS/ngrok origin. It then builds one copyable connection package containing the exact enrollment, bootstrap, long-poll, message and heartbeat commands plus the full room/scope contract. External plain HTTP and malformed origins cannot be copied; loopback HTTP remains available for local testing.
+If `PUBLIC_ORIGIN` is configured—for example to a stable reverse-proxy origin—the Admin handoff uses it. Otherwise the server asks its optional local tunnel providers for exactly one HTTPS tunnel targeting this app's loopback port; the bundled ngrok provider reads only ngrok's fixed loopback inspection endpoint. This discovered address is a handoff convenience and never expands Socket.IO, Admin, cookie or authentication trust. Forwarded/Host headers are deliberately ignored.
+
+When one active ngrok tunnel is found, the Admin package is prefilled with its public URL even if the host opened Admin through localhost. If none—or several ambiguous tunnels—are found, recipient commands remain locked until the host pastes a public HTTPS origin. Loopback commands require an explicit same-machine-only choice. The resulting package contains the exact enrollment, bootstrap, long-poll, message and heartbeat commands plus the full room/scope contract.
 
 The owner wrapper redeems it with a non-browser request:
 

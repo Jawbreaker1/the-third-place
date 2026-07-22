@@ -511,6 +511,8 @@ body { background: var(--admin-bg); color: var(--admin-text); }
 .admin-agent-origin-field input { width: 100%; padding: 10px 11px; border: 1px solid var(--admin-line); border-radius: 8px; outline: none; color: var(--admin-text); background: rgba(4, 8, 12, .5); font: 600 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .admin-agent-origin-field input:focus { border-color: rgba(98, 216, 179, .65); box-shadow: 0 0 0 3px rgba(98, 216, 179, .08); }
 .admin-agent-origin-warning { margin-top: 8px; }
+.admin-agent-origin-warning .admin-button { justify-self: start; margin-top: 3px; }
+.admin-agent-package-locked { margin-top: 12px; }
 .admin-agent-connection-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 13px 0 0; }
 .admin-agent-connection-facts > div { min-width: 0; padding: 10px 11px; border: 1px solid var(--admin-line); border-radius: 9px; background: rgba(4, 8, 12, .3); }
 .admin-agent-connection-facts dt { margin-bottom: 5px; color: var(--admin-dim); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }

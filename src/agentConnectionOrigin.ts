@@ -13,15 +13,33 @@ const invalidTarget = (
   warning,
 });
 
+const loopbackOrigin = (origin: URL): boolean => origin.hostname === "localhost" ||
+  origin.hostname === "127.0.0.1" || origin.hostname === "::1" || origin.hostname === "[::1]";
+
+export const isLoopbackConnectionOrigin = (value: string): boolean => {
+  try {
+    return loopbackOrigin(new URL(value));
+  } catch {
+    return false;
+  }
+};
+
 /**
- * Fails closed for every non-loopback plaintext or malformed handoff origin.
+ * Fails closed for plaintext, loopback-by-default or malformed handoff origins.
  * The original endpoint is retained only as inert display data; callers must
  * honor copyAllowed before copying any credential-bearing command or guide.
  */
 export const resolveExternalAgentConnectionTarget = (
   connectionOrigin: string,
   originalEnrollmentUrl: string,
+  options: { allowLoopback?: boolean } = {},
 ): ExternalAgentConnectionTarget => {
+  if (!connectionOrigin.trim()) {
+    return invalidTarget(
+      originalEnrollmentUrl,
+      "No public HTTPS address was detected. Start a tunnel, configure PUBLIC_ORIGIN, or paste the public address before sharing this package.",
+    );
+  }
   try {
     const original = new URL(originalEnrollmentUrl);
     const origin = new URL(connectionOrigin);
@@ -32,13 +50,18 @@ export const resolveExternalAgentConnectionTarget = (
       );
     }
     const enrollmentUrl = new URL(`${original.pathname}${original.search}`, `${origin.origin}/`).href;
-    const loopback = origin.hostname === "localhost" || origin.hostname === "127.0.0.1" ||
-      origin.hostname === "::1" || origin.hostname === "[::1]";
+    const loopback = loopbackOrigin(origin);
     if (loopback) {
+      if (!options.allowLoopback) {
+        return invalidTarget(
+          originalEnrollmentUrl,
+          "No public HTTPS address is selected. Start a tunnel, configure PUBLIC_ORIGIN, or paste the public address before sharing this package.",
+        );
+      }
       return {
         enrollmentUrl,
         copyAllowed: true,
-        warning: "This points to this computer only. Replace the connection origin with the active ngrok HTTPS URL before sending it to somebody else.",
+        warning: "Local-only mode is active. These commands work only on this computer and must not be sent to somebody else.",
       };
     }
     if (origin.protocol !== "https:") {

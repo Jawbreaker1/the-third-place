@@ -113,6 +113,10 @@ import {
   parseWebOriginConfiguration,
   socketOriginAllowed,
 } from "./originPolicy.js";
+import {
+  createNgrokPublicOriginProvider,
+  resolvePublicHandoffOrigin,
+} from "./publicOriginDiscovery.js";
 import { ResearchBroker } from "./researchBroker.js";
 import { PageReader } from "./pageReader.js";
 import { CapabilityRegistry } from "./capabilities/registry.js";
@@ -506,6 +510,7 @@ const { configuredOrigins, publicOrigin } = parseWebOriginConfiguration(
   process.env.ALLOWED_ORIGINS,
   process.env.PUBLIC_ORIGIN,
 );
+const publicHandoffOriginProviders = [createNgrokPublicOriginProvider({ localPort: PORT })];
 const io = new Server(httpServer, {
   maxHttpBufferSize: 64 * 1024,
   pingInterval: 22_000,
@@ -1583,17 +1588,19 @@ const invitationExpiryMinutes = (seconds: number): number => {
 const projectIssuedExternalAgentInvitation = (issued: {
   invitation: ExternalAgentInvitationSummary;
   token: string;
-}): AdminIssuedExternalAgentInvitation => ({
-  invitation: projectAdminExternalAgentInvitation(issued.invitation),
-  token: issued.token,
-  enrollmentUrl: publicOrigin
-    ? new URL(`${EXTERNAL_AGENT_API_BASE_PATH}/enroll`, `${publicOrigin}/`).toString()
-    : `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
-  handoffPrompt:
-    "Keep the full owner-defined system prompt, personality and memories in your own runtime. Redeem this invitation " +
-    "with a public name and bio, store the returned agent bearer outside model context, then append the authenticated " +
-    "Third Place community contract without replacing the owner's identity.",
-});
+}, handoffOrigin: string | undefined): AdminIssuedExternalAgentInvitation => {
+  return {
+    invitation: projectAdminExternalAgentInvitation(issued.invitation),
+    token: issued.token,
+    enrollmentUrl: handoffOrigin
+      ? new URL(`${EXTERNAL_AGENT_API_BASE_PATH}/enroll`, `${handoffOrigin}/`).toString()
+      : `${EXTERNAL_AGENT_API_BASE_PATH}/enroll`,
+    handoffPrompt:
+      "Keep the full owner-defined system prompt, personality and memories in your own runtime. Redeem this invitation " +
+      "with a public name and bio, store the returned agent bearer outside model context, then append the authenticated " +
+      "Third Place community contract without replacing the owner's identity.",
+  };
+};
 
 const publishExternalAgentCatalog = (): void => {
   const activeIds = new Set<string>();
@@ -1637,24 +1644,27 @@ const externalAgentAdmin = {
   }),
   createInvitation: async (
     input: AdminExternalAgentInvitationWrite,
-  ): Promise<AdminIssuedExternalAgentInvitation> => await identityMutations.run(async () => {
-    const access = validateExternalAgentAccessPolicy({
-      channelIds: input.channelIds,
-      scopes: input.scopes,
+  ): Promise<AdminIssuedExternalAgentInvitation> => {
+    const handoff = await resolvePublicHandoffOrigin(publicOrigin, publicHandoffOriginProviders);
+    return await identityMutations.run(async () => {
+      const access = validateExternalAgentAccessPolicy({
+        channelIds: input.channelIds,
+        scopes: input.scopes,
+      });
+      const canonical = createExternalAgentInvitationInputSchema.parse({
+        purpose: "enroll",
+        adminLabel: input.label,
+        channelIds: access.channelIds,
+        scopes: access.scopes,
+        expiresInMinutes: invitationExpiryMinutes(input.expiresInSeconds),
+      });
+      const issued = await agentAccessStore.createInvitation(canonical);
+      if (!issued) {
+        throw new AdminStateError(409, "AGENT_INVITATION_CONFLICT", "An open invitation already exists for that actor.");
+      }
+      return projectIssuedExternalAgentInvitation(issued, handoff.origin);
     });
-    const canonical = createExternalAgentInvitationInputSchema.parse({
-      purpose: "enroll",
-      adminLabel: input.label,
-      channelIds: access.channelIds,
-      scopes: access.scopes,
-      expiresInMinutes: invitationExpiryMinutes(input.expiresInSeconds),
-    });
-    const issued = await agentAccessStore.createInvitation(canonical);
-    if (!issued) {
-      throw new AdminStateError(409, "AGENT_INVITATION_CONFLICT", "An open invitation already exists for that actor.");
-    }
-    return projectIssuedExternalAgentInvitation(issued);
-  }),
+  },
   revokeInvitation: async (
     invitationId: string,
   ): Promise<AdminExternalAgentInvitation | undefined> => await identityMutations.run(async () => {
@@ -1711,31 +1721,34 @@ const externalAgentAdmin = {
   createReconnectInvitation: async (
     agentId: string,
     input: AdminExternalAgentReconnectInvitationWrite,
-  ): Promise<AdminIssuedExternalAgentInvitation | undefined> => await identityMutations.run(async () => {
-    const current = agentAccessStore.get(agentId);
-    if (!current) return undefined;
-    const access = validateExternalAgentAccessPolicy({
-      channelIds: current.channelIds,
-      scopes: current.scopes,
+  ): Promise<AdminIssuedExternalAgentInvitation | undefined> => {
+    const handoff = await resolvePublicHandoffOrigin(publicOrigin, publicHandoffOriginProviders);
+    return await identityMutations.run(async () => {
+      const current = agentAccessStore.get(agentId);
+      if (!current) return undefined;
+      const access = validateExternalAgentAccessPolicy({
+        channelIds: current.channelIds,
+        scopes: current.scopes,
+      });
+      const canonical = createExternalAgentInvitationInputSchema.parse({
+        purpose: "reconnect",
+        agentId,
+        adminLabel: input.label,
+        channelIds: access.channelIds,
+        scopes: access.scopes,
+        expiresInMinutes: invitationExpiryMinutes(input.expiresInSeconds),
+      });
+      const issued = await agentAccessStore.createInvitation(canonical);
+      if (!issued) {
+        throw new AdminStateError(
+          409,
+          "AGENT_INVITATION_PENDING",
+          "That external agent already has an open reconnect invitation.",
+        );
+      }
+      return projectIssuedExternalAgentInvitation(issued, handoff.origin);
     });
-    const canonical = createExternalAgentInvitationInputSchema.parse({
-      purpose: "reconnect",
-      agentId,
-      adminLabel: input.label,
-      channelIds: access.channelIds,
-      scopes: access.scopes,
-      expiresInMinutes: invitationExpiryMinutes(input.expiresInSeconds),
-    });
-    const issued = await agentAccessStore.createInvitation(canonical);
-    if (!issued) {
-      throw new AdminStateError(
-        409,
-        "AGENT_INVITATION_PENDING",
-        "That external agent already has an open reconnect invitation.",
-      );
-    }
-    return projectIssuedExternalAgentInvitation(issued);
-  }),
+  },
 };
 
 const socialMemoryAdmin = new SocialMemoryAdmin({

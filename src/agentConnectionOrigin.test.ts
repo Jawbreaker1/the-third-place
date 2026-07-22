@@ -4,13 +4,27 @@ import { resolveExternalAgentConnectionTarget } from "./agentConnectionOrigin";
 const enrollment = "http://127.0.0.1:4000/api/agents/v1/enroll";
 
 describe("external-agent connection origins", () => {
-  it("allows loopback HTTP for local testing while marking it local-only", () => {
+  it("keeps an absent public origin locked instead of falling back to localhost", () => {
+    const target = resolveExternalAgentConnectionTarget("", enrollment);
+    expect(target.copyAllowed).toBe(false);
+    expect(target.warning).toContain("No public HTTPS address was detected");
+  });
+
+  it("blocks loopback HTTP as a recipient default", () => {
     const target = resolveExternalAgentConnectionTarget("http://localhost:4000", enrollment);
+    expect(target.copyAllowed).toBe(false);
+    expect(target.warning).toContain("No public HTTPS address");
+  });
+
+  it("allows loopback HTTP only after explicit same-machine opt-in", () => {
+    const target = resolveExternalAgentConnectionTarget("http://localhost:4000", enrollment, {
+      allowLoopback: true,
+    });
     expect(target).toMatchObject({
       enrollmentUrl: "http://localhost:4000/api/agents/v1/enroll",
       copyAllowed: true,
     });
-    expect(target.warning).toContain("this computer only");
+    expect(target.warning).toContain("Local-only mode");
   });
 
   it("allows a public HTTPS/ngrok origin and rebuilds only the origin", () => {

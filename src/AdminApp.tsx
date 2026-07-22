@@ -62,7 +62,10 @@ import {
   externalAgentConnectionGuide,
   externalAgentEnrollmentBriefText,
 } from "./agentBrief";
-import { resolveExternalAgentConnectionTarget } from "./agentConnectionOrigin";
+import {
+  isLoopbackConnectionOrigin,
+  resolveExternalAgentConnectionTarget,
+} from "./agentConnectionOrigin";
 import {
   adminLlmProviderReady,
   codexStatusLabel,
@@ -442,14 +445,21 @@ function AgentInvitationDialog({
   const originalEnrollmentUrl = resolvedEnrollmentUrl(issued.enrollmentUrl);
   const [connectionOrigin, setConnectionOrigin] = useState(() => {
     try {
-      return new URL(originalEnrollmentUrl).origin;
+      const suggestedOrigin = new URL(originalEnrollmentUrl).origin;
+      return resolveExternalAgentConnectionTarget(suggestedOrigin, originalEnrollmentUrl).copyAllowed
+        ? suggestedOrigin
+        : "";
     } catch {
-      return window.location.origin;
+      return "";
     }
   });
+  const [allowLoopback, setAllowLoopback] = useState(false);
+  const localPageOrigin = isLoopbackConnectionOrigin(window.location.origin)
+    ? window.location.origin
+    : undefined;
   const connectionTarget = useMemo(
-    () => resolveExternalAgentConnectionTarget(connectionOrigin, originalEnrollmentUrl),
-    [connectionOrigin, originalEnrollmentUrl],
+    () => resolveExternalAgentConnectionTarget(connectionOrigin, originalEnrollmentUrl, { allowLoopback }),
+    [allowLoopback, connectionOrigin, originalEnrollmentUrl],
   );
   const { copyAllowed: connectionCopyAllowed, enrollmentUrl, warning: connectionWarning } = connectionTarget;
   const exampleMessageId = useMemo(() => crypto.randomUUID(), [issued.invitation.id]);
@@ -511,13 +521,15 @@ function AgentInvitationDialog({
         </div>
         <label className="admin-agent-origin-field">
           <span>Connection origin</span>
-          <small>For friends, paste the current public HTTPS/ngrok origin. Paths are added automatically.</small>
+          <small>An active local tunnel is detected automatically. Otherwise paste its public HTTPS origin; paths are added automatically.</small>
           <input
             aria-label="External agent connection origin"
             onChange={(event) => {
               setConnectionOrigin(event.target.value);
+              setAllowLoopback(false);
               onCopied(null);
             }}
+            placeholder="https://your-active-tunnel.example"
             spellCheck={false}
             value={connectionOrigin}
           />
@@ -525,10 +537,19 @@ function AgentInvitationDialog({
         {connectionWarning && <div className="admin-security-callout warning admin-agent-origin-warning">
           <strong>{connectionCopyAllowed ? "Local-only origin" : "Fix connection origin"}</strong>
           <span>{connectionWarning}</span>
+          {!connectionCopyAllowed && localPageOrigin && <button
+            className="admin-button subtle compact"
+            onClick={() => {
+              setConnectionOrigin(localPageOrigin);
+              setAllowLoopback(true);
+              onCopied(null);
+            }}
+            type="button"
+          >Use localhost on this computer only</button>}
         </div>}
         <dl className="admin-agent-connection-facts">
-          <div><dt>Connection origin</dt><dd>{connectionGuide.publicBaseUrl}</dd></div>
-          <div><dt>API base URL</dt><dd>{connectionGuide.apiBaseUrl}</dd></div>
+          <div><dt>Connection origin</dt><dd>{connectionCopyAllowed ? connectionGuide.publicBaseUrl : "Not configured"}</dd></div>
+          <div><dt>API base URL</dt><dd>{connectionCopyAllowed ? connectionGuide.apiBaseUrl : "Not configured"}</dd></div>
           <div><dt>Expires</dt><dd>{new Date(issued.invitation.expiresAt).toLocaleString()}</dd></div>
           <div><dt>Rooms</dt><dd>{issued.invitation.channelIds.map((id) => `#${id}`).join(", ")}</dd></div>
           <div><dt>Scopes</dt><dd>{issued.invitation.scopes.join(", ")}</dd></div>
@@ -543,12 +564,12 @@ function AgentInvitationDialog({
         </div>
         <div className="admin-agent-secret-block">
           <div><strong>Enrollment endpoint</strong><small>The invitation secret is deliberately not included in this URL</small></div>
-          <code>{enrollmentUrl}</code>
+          <code>{connectionCopyAllowed ? enrollmentUrl : "Waiting for a public HTTPS origin"}</code>
           <button className="admin-button subtle compact" disabled={!connectionCopyAllowed} onClick={() => { void copy("enrollment", enrollmentUrl); }} type="button">
             {issued.copied === "enrollment" ? "Copied" : "Copy URL"}
           </button>
         </div>
-        <section className="admin-agent-command-guide" aria-labelledby="admin-agent-command-guide-title">
+        {connectionCopyAllowed ? <><section className="admin-agent-command-guide" aria-labelledby="admin-agent-command-guide-title">
           <div className="admin-agent-command-guide-heading">
             <div>
               <strong id="admin-agent-command-guide-title">Exact connection commands</strong>
@@ -591,7 +612,10 @@ function AgentInvitationDialog({
             The owner's existing personality stays primary; the bootstrapped community contract is additive.
           </p>
           <textarea aria-label="External agent connection guide without credentials" readOnly rows={12} value={connectionGuide.handoffText} />
-        </div>
+        </div></> : <div className="admin-security-callout warning admin-agent-package-locked">
+          <strong>Recipient package locked</strong>
+          <span>Add a public HTTPS address before the curl commands and owner handoff can be copied.</span>
+        </div>}
         <div className="admin-dialog-actions">
           <button className="admin-button subtle" disabled={!connectionCopyAllowed} onClick={() => { void copy("brief", agentBrief); }} type="button">
             {issued.copied === "brief" ? "Agent brief copied" : "Copy agent brief"}
