@@ -33,6 +33,7 @@ import {
   FOOTBALL_COMPETITION_IDS,
   FOOTBALL_DATA_VIEWS,
 } from "./footballData/catalog.js";
+import { AMBIENT_ACTION_KINDS } from "./ambientActionPlanner.js";
 
 /** Includes queueing headroom; compact Gemma 4 routing is normally ~5–9s locally. */
 export const TURN_ANALYSIS_TIMEOUT_MS = 20_000;
@@ -1165,6 +1166,10 @@ export const projectTrustedTurnAnalysis = (
   knownHumanIds: readonly string[] = [],
   knownCurrentParticipantIds: readonly string[] = [],
   knownCurrentMessageIds: readonly string[] = [],
+  knownCurrentParticipantAnchors: readonly {
+    id: string;
+    recentMessageIds: readonly string[];
+  }[] = [],
 ): TrustedTurnProjection => {
   if (analysis?.source !== "lm") {
     return {
@@ -1261,19 +1266,57 @@ export const projectTrustedTurnAnalysis = (
   const currentContextTrusted = currentContext.confidence >= TURN_TRUST_THRESHOLDS.currentReference;
   const knownCurrentParticipants = new Set(knownCurrentParticipantIds);
   const knownCurrentMessages = new Set(knownCurrentMessageIds);
-  const currentParticipantResolution = currentContextTrusted
+  let currentParticipantResolution = currentContextTrusted
     ? currentContext.resolution
     : "none";
-  const referencedParticipantIds = currentContextTrusted && currentParticipantResolution !== "ambiguous"
+  let referencedParticipantIds = currentContextTrusted && currentParticipantResolution !== "ambiguous"
     ? [...new Set(currentContext.referencedParticipantIds)]
       .filter((id) => knownCurrentParticipants.has(id))
       .slice(0, 2)
     : [];
-  const focusMessageIds = currentContextTrusted
+  let focusMessageIds = currentContextTrusted
     ? [...new Set(currentContext.focusMessageIds)]
       .filter((id) => knownCurrentMessages.has(id))
       .slice(0, 3)
     : [];
+  // Current-focus metadata is optional routing help, not authority over the
+  // independently valid intent/relevance result. Gemma may bind the current
+  // speaker while correctly anchoring the preceding resident message. Keep
+  // that exact focus row, but discard only participant bindings that do not
+  // own any supplied focus row. This prevents one malformed optional tuple
+  // from erasing an otherwise valid expected human turn.
+  if (knownCurrentParticipantAnchors.length > 0 && referencedParticipantIds.length > 0) {
+    const anchorByParticipantId = new Map(
+      knownCurrentParticipantAnchors.map((candidate) => [
+        candidate.id,
+        new Set(candidate.recentMessageIds),
+      ] as const),
+    );
+    const focused = new Set(focusMessageIds);
+    referencedParticipantIds = referencedParticipantIds.filter((participantId) => {
+      const anchors = anchorByParticipantId.get(participantId);
+      return Boolean(anchors && [...anchors].some((messageId) => focused.has(messageId)));
+    });
+  }
+  if (currentParticipantResolution === "none") {
+    referencedParticipantIds = [];
+    focusMessageIds = [];
+  } else if (
+    currentParticipantResolution === "current_context" &&
+    focusMessageIds.length === 0
+  ) {
+    currentParticipantResolution = "none";
+    referencedParticipantIds = [];
+  } else if (currentParticipantResolution === "ambiguous") {
+    referencedParticipantIds = [];
+    if (focusMessageIds.length === 0) currentParticipantResolution = "none";
+  } else if (
+    currentParticipantResolution === "history_needed" &&
+    referencedParticipantIds.length === 0
+  ) {
+    currentParticipantResolution = "none";
+    focusMessageIds = [];
+  }
   const historyRecallTrusted = Boolean(
     analysis.historyRecall &&
     analysis.historyRecall.need !== "none" &&
@@ -2135,6 +2178,104 @@ const normalizeOrdinaryCommunityReaction = (
 const normalizeCommunityReaction = (analysis: TurnAnalysisModelOutput): TurnAnalysisModelOutput =>
   normalizeOrdinaryCommunityReaction(normalizeRequiredCommunityReaction(analysis));
 
+const projectOptionalCurrentContext = (
+  value: {
+    r: "none" | "current_context" | "history_needed" | "ambiguous";
+    p: readonly string[];
+    m: readonly string[];
+    x: number;
+  },
+  input: NormalizedTurnAnalysisInput,
+): TurnAnalysisModelOutput["currentContext"] => {
+  const focusMessageIds = [...new Set(value.m)];
+  const focused = new Set(focusMessageIds);
+  const participantById = new Map(
+    input.currentParticipantCandidates.map((candidate) => [candidate.id, candidate] as const),
+  );
+  const anchoredParticipantIds = [...new Set(value.p)].filter((participantId) =>
+    participantById.get(participantId)?.recentMessageIds.some((messageId) => focused.has(messageId))
+  );
+  const none = {
+    resolution: "none" as const,
+    referencedParticipantIds: [],
+    focusMessageIds: [],
+    confidence: 0,
+  };
+  if (value.r === "none") return none;
+  if (value.r === "current_context") {
+    return focusMessageIds.length > 0
+      ? {
+          resolution: value.r,
+          referencedParticipantIds: anchoredParticipantIds,
+          focusMessageIds,
+          confidence: value.x,
+        }
+      : none;
+  }
+  if (value.r === "ambiguous") {
+    return focusMessageIds.length > 0
+      ? {
+          resolution: value.r,
+          referencedParticipantIds: [],
+          focusMessageIds,
+          confidence: value.x,
+        }
+      : none;
+  }
+  return anchoredParticipantIds.length > 0
+    ? {
+        resolution: value.r,
+        referencedParticipantIds: anchoredParticipantIds,
+        focusMessageIds,
+        confidence: value.x,
+      }
+    : none;
+};
+
+const descriptiveCurrentContextShapeSchema = z.object({
+  resolution: z.enum(["none", "current_context", "history_needed", "ambiguous"]),
+  referencedParticipantIds: z.array(z.string()).max(2)
+    .refine((ids) => new Set(ids).size === ids.length),
+  focusMessageIds: z.array(z.string()).max(3)
+    .refine((ids) => new Set(ids).size === ids.length),
+  confidence: confidenceSchema,
+}).strict();
+
+/**
+ * Descriptive output is replay compatibility rather than the live Gemma wire,
+ * but optional focus metadata must have the same failure boundary. Unknown or
+ * structurally malformed IDs still fail closed; a known-but-misbound optional
+ * participant loses only that binding, never the independent turn analysis.
+ */
+const normalizeDescriptiveCurrentContext = (
+  raw: unknown,
+  input: NormalizedTurnAnalysisInput,
+): unknown => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const record = raw as Record<string, unknown>;
+  if (record.currentContext === undefined) return raw;
+  const parsed = descriptiveCurrentContextShapeSchema.safeParse(record.currentContext);
+  if (!parsed.success) return raw;
+  const knownParticipantIds = new Set(input.currentParticipantCandidates.map((candidate) => candidate.id));
+  const knownMessageIds = new Set(
+    [input.latestMessage, ...input.recentMessages].flatMap((message) => message.id ? [message.id] : []),
+  );
+  if (
+    parsed.data.referencedParticipantIds.some((id) => !knownParticipantIds.has(id)) ||
+    parsed.data.focusMessageIds.some((id) => !knownMessageIds.has(id))
+  ) return raw;
+  const projected = projectOptionalCurrentContext({
+    r: parsed.data.resolution,
+    p: parsed.data.referencedParticipantIds,
+    m: parsed.data.focusMessageIds,
+    x: parsed.data.confidence,
+  }, input);
+  return {
+    ...record,
+    currentContext: projected,
+  };
+};
+
 export const parseTurnAnalysisContent = (
   content: string,
   input: NormalizedTurnAnalysisInput,
@@ -2148,7 +2289,7 @@ export const parseTurnAnalysisContent = (
   const descriptiveSchema = createTurnAnalysisModelSchema(input);
   // Accept the descriptive v1 shape when replaying old fixtures or queued
   // completions, but production response_format requests only compact v2.
-  const descriptive = descriptiveSchema.safeParse(raw);
+  const descriptive = descriptiveSchema.safeParse(normalizeDescriptiveCurrentContext(raw, input));
   if (descriptive.success) {
     return { ...normalizeCommunityReaction(descriptive.data), source: "lm", failureReason: null };
   }
@@ -2170,6 +2311,7 @@ export const parseTurnAnalysisContent = (
     return undefined;
   }
   const value = wire.data;
+  const currentContext = projectOptionalCurrentContext(value.f, input);
   const addressedIds = value.p.x >= 0.8 ? value.p.a : [];
   const addressedSet = new Set(addressedIds);
   // Requested replies are only meaningful inside a confidently inferred
@@ -2214,12 +2356,7 @@ export const parseTurnAnalysisContent = (
     },
     referencedHumanIds: value.p.h,
     referencedHumanConfidence: value.p.z,
-    currentContext: {
-      resolution: value.f.r,
-      referencedParticipantIds: value.f.p,
-      focusMessageIds: value.f.m,
-      confidence: value.f.x,
-    },
+    currentContext,
     social: {
       warmth: value.s.w,
       hostility: value.s.h,
@@ -3201,31 +3338,11 @@ export const candidateReviewInputSchema = z.object({
     episodeId: safeId,
     causalRootId: safeId,
     semanticFamily: boundedText(80),
-    kind: z.enum([
-      "open_topic",
-      "advance_claim",
-      "specific_example",
-      "countertake",
-      "hidden_cost",
-      "pointed_question",
-      "practical_consequence",
-      "playful_tangent",
-      "source_followup",
-    ]),
+    kind: z.enum(AMBIENT_ACTION_KINDS),
     turnIndex: z.number().int().min(0).max(8),
     targetMessageId: safeId.nullable(),
     openHook: z.boolean(),
-    previousActions: z.array(z.enum([
-      "open_topic",
-      "advance_claim",
-      "specific_example",
-      "countertake",
-      "hidden_cost",
-      "pointed_question",
-      "practical_consequence",
-      "playful_tangent",
-      "source_followup",
-    ])).max(8),
+    previousActions: z.array(z.enum(AMBIENT_ACTION_KINDS)).max(8),
   }).strict().nullable().default(null),
   urlPublicationPolicy: z.enum(["allow_supplied", "server_card"]).nullable().default(null),
   semanticContext: z.object({
@@ -4219,7 +4336,7 @@ Use only these publication issues:
 - behavior_intensity_violation: the candidate expresses intensity in a way forbidden by its trusted target: it turns a coarse/strong target into a gratuitous jab at the person instead of non-targeted emphasis, explicitnessTarget clean gratuitously adds profanity, a restrained stance manufactures combative language, a blunt/forceful stance attacks the person rather than the claim/taste/choice/behavior, or relationshipStyle becomes a theatrical stack, invented shared history, pet-name gimmick, cruelty or relationship monologue that displaces the real answer. One assigned relationship move is the maximum. Judge pragmatic meaning across languages and scripts, never keyword or swear-word lists. Severe threats, slurs, dehumanization, sexualized abuse or pile-ons still use their dedicated high-severity issues. This is repairable medium severity, but its original line is never safe fallback material.
 - unsafe_retaliation: the candidate escalates beyond a proportionate peer response into a threat, protected-class slur or dehumanization, sexualized abuse, encouragement of self-harm, disclosure of private information, or another severe personal attack. Ordinary profanity, a blunt refusal, a dry comeback, and sharp sarcasm are allowed when the trusted context supports them.
 - conflict_pile_on: it joins or amplifies a coordinated attack when trusted pileOnRisk is high or another designated actor already handles the conflict. Do not flag one required actor's proportionate response, a moderator's concise boundary, or unrelated emoji-level surprise.
-- ambient_action_mismatch: use only when ambientAction is present. The candidate clearly fails its one assigned move: it restarts the seed instead of continuing the committed target, jumps to another topic, merely paraphrases or broadly agrees with the latest line, substitutes generic room chatter, or closes an open hook without adding the required example, countertake, consequence, question or source follow-up. Judge semantic movement in any language, never keywords or length. A terse fragment, joke, dry disagreement or pointed question is clean when it actually advances the live episode. Do not demand an essay, a second actor, a forced resolution or explicit mention of the internal action label.
+- ambient_action_mismatch: use only when ambientAction is present. The candidate clearly fails its one assigned move: it restarts the seed instead of continuing the committed target, jumps to another topic, merely paraphrases or broadly agrees with the latest line, substitutes generic room chatter, or closes an open hook without making the assigned move. For respond_to_hook, directly answering the target's question or taking up its unresolved claim, setup or invitation with one specific reaction is clean; never demand a different example, countertake or question merely because another move might also advance the thread. Judge semantic movement in any language, never keywords or length. A terse fragment, joke, dry disagreement or pointed question is clean when it actually advances the live episode. Do not demand an essay, a second actor, a forced resolution or explicit mention of the internal action label.
 - self_repetition: semantic repetition or near-paraphrase of that actor's recent lines, including that actor's own recalled historical lines supplied in recentOwnTexts.
 - peer_echo: high-severity pure semantic duplication of a substantive claim, fact, advice, reason, example, factual conclusion, distinctive comparison or punchline already made by priorAcceptedSiblingDrafts or another current candidate. For equivalent current candidates preserve one stable otherwise-clean anchor by trusted delivery priority: mustFulfillRequest first, then mustReply, then lower selectionOrder; flag only the lower-priority/later duplicate. If a prior accepted sibling is the duplicated source, flag the current candidate. Do not flag brief shared laughter, surprise, sympathy, encouragement, greetings, cheers, toasts or playful banter merely because their sentiment overlaps: an occasional believable short group chorus may be clean when each line remains an in-character social reaction. This exemption is decisive for bare assent, commiseration, shared encouragement and any other terse social chorus in any language, even when wording and meaning closely overlap; flag only when the line also repeats substantive propositional content. Ordinary agreement with an older transcript peer is not by itself this issue. Judge semantic function in any language, never surface overlap or length alone.
 - output_language_mismatch: semanticContext.languageTag is the trusted required response language, while outputLanguage is the language actually written. Emit this issue exactly when both tags are determined with output confidence at least ${CANDIDATE_OUTPUT_LANGUAGE_TRUST_CONFIDENCE} and their primary languages differ. Locale variants of the same primary language are compatible. An und or low-confidence output language is not a mismatch. This is always high severity; regenerate in the required language without unnecessarily translating names or genuinely quoted fragments.

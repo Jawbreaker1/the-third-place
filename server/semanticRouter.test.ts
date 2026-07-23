@@ -706,7 +706,15 @@ describe("multilingual semantic router contract", () => {
         focusMessageIds: ["message-question"],
         confidence: 0.98,
       },
-    }), routedInput)).toBeUndefined();
+    }), routedInput)).toMatchObject({
+      source: "lm",
+      intent: { kind: "question", replyExpected: "expected" },
+      currentContext: {
+        resolution: "current_context",
+        referencedParticipantIds: [],
+        focusMessageIds: ["message-question"],
+      },
+    });
     expect(parseTurnAnalysisContent(JSON.stringify({
       ...routed,
       currentContext: {
@@ -716,7 +724,105 @@ describe("multilingual semantic router contract", () => {
         confidence: 0.98,
       },
       historyRecall: { need: "required", query: "Codex", confidence: 0.98 },
+    }), routedInput)).toMatchObject({
+      source: "lm",
+      currentContext: {
+        resolution: "none",
+        referencedParticipantIds: [],
+        focusMessageIds: [],
+      },
+      historyRecall: { need: "required", query: "Codex" },
+    });
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...routed,
+      currentContext: {
+        resolution: "current_context",
+        referencedParticipantIds: ["agent-unknown"],
+        focusMessageIds: ["message-agent-intro"],
+        confidence: 0.98,
+      },
     }), routedInput)).toBeUndefined();
+  });
+
+  it("preserves trusted intent and resident relevance when compact focus is valid but its participant binding is not", () => {
+    const routedInput = input({
+      latestMessage: {
+        id: "message-cai-answer",
+        authorId: "human-cai",
+        authorName: "Cai",
+        authorKind: "human",
+        content: "En karta?",
+        createdAt: "2026-07-23T10:01:00.000Z",
+      },
+      recentMessages: [{
+        id: "message-mira-riddle",
+        authorId: "ai-mira",
+        authorName: "Mira",
+        authorKind: "ai",
+        content: "Jag har städer men inga hus och vatten men inga fiskar. Vad är jag?",
+        createdAt: "2026-07-23T10:00:00.000Z",
+      }],
+      currentParticipantCandidates: [
+        {
+          id: "human-cai",
+          displayLabel: "Cai",
+          kind: "human",
+          publicBio: null,
+          recentMessageIds: ["message-cai-answer"],
+        },
+        {
+          id: "ai-mira",
+          displayLabel: "Mira",
+          kind: "ai",
+          publicBio: null,
+          recentMessageIds: ["message-mira-riddle"],
+        },
+      ],
+    });
+    const compact = compactWeatherOutput({
+      i: { k: "answer", q: false, r: "expected", d: "brief", o: "general", j: 0.99, x: 0.99 },
+      p: { a: [], r: [], v: ["ai-mira"], x: 0, y: 0.99, h: [], z: 0 },
+      // The focus row is right, but the model mistakenly binds the current
+      // speaker to Mira's row. Only this optional binding should be revoked.
+      f: {
+        r: "current_context",
+        p: ["human-cai"],
+        m: ["message-mira-riddle"],
+        x: 0.99,
+      },
+      e: {
+        a: "none", x: 0.99, g: null, q: null, u: null, m: null,
+        z: null, k: null, l: null, c: null, w: null, f: null,
+      },
+      c: { d: [], r: "none", a: false, i: false, l: false, x: 0.99 },
+      h: { n: "none", q: null, x: 0.99 },
+    });
+
+    const parsed = parseTurnAnalysisContent(JSON.stringify(compact), routedInput);
+    expect(parsed).toMatchObject({
+      source: "lm",
+      intent: { kind: "answer", replyExpected: "expected" },
+      personas: { relevantIds: ["ai-mira"], relevanceConfidence: 0.99 },
+      currentContext: {
+        resolution: "current_context",
+        referencedParticipantIds: [],
+        focusMessageIds: ["message-mira-riddle"],
+      },
+    });
+    expect(projectTrustedTurnAnalysis(
+      parsed,
+      [],
+      ["human-cai", "ai-mira"],
+      ["message-cai-answer", "message-mira-riddle"],
+      routedInput.currentParticipantCandidates,
+    )).toMatchObject({
+      intentTrusted: true,
+      replyExpected: "expected",
+      relevantIds: ["ai-mira"],
+      currentParticipantResolution: "current_context",
+      referencedParticipantIds: [],
+      focusMessageIds: ["message-mira-riddle"],
+    });
   });
 
   it("rejects caseless-colliding human catalogs before they reach the model", () => {

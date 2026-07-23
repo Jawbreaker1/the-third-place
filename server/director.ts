@@ -374,6 +374,41 @@ export function addressedPersonaIds(
   return [...new Set([...mentionedIds, ...(replyTargetId ? [replyTargetId] : [])])];
 }
 
+/**
+ * Finds a single accountable resident only from trusted semantic relevance
+ * plus an exact server-owned active-focus row. This is a general conversation
+ * handoff (answers, follow-ups, corrections, reactions), not a text or
+ * language heuristic. Ambiguous/multi-resident focus deliberately has no
+ * forced owner.
+ */
+export function focusedRelevantResidentOwnerId(
+  trusted: Pick<
+    TrustedTurnProjection,
+    "currentParticipantResolution" | "focusMessageIds" | "relevantIds"
+  >,
+  messages: readonly Pick<ChatMessage, "id" | "authorId" | "system">[],
+  residentIds: readonly string[],
+): string | undefined {
+  if (
+    trusted.currentParticipantResolution !== "current_context" ||
+    trusted.focusMessageIds.length === 0
+  ) return undefined;
+  const focusedIds = new Set(trusted.focusMessageIds);
+  const relevantIds = new Set(trusted.relevantIds);
+  const eligibleResidents = new Set(residentIds);
+  const focusedResidents = new Set(
+    messages.flatMap((message) =>
+      !message.system &&
+      focusedIds.has(message.id) &&
+      relevantIds.has(message.authorId) &&
+      eligibleResidents.has(message.authorId)
+        ? [message.authorId]
+        : []
+    ),
+  );
+  return focusedResidents.size === 1 ? [...focusedResidents][0] : undefined;
+}
+
 const MODERATOR_ACTIONS: ReadonlySet<SocialSignals["moderationAction"]> = new Set([
   "deescalate",
   "report",
@@ -3839,6 +3874,7 @@ export class SocialDirector {
     humanCandidates?: NonNullable<TurnAnalysisInput["humanCandidates"]>;
     mechanicalAddressedPersonaIdsOverride?: readonly string[];
     durableDelivery?: boolean;
+    supersessionProtected?: boolean;
   }): Promise<TurnAnalysis> {
     const channel = getChannelProfile(input.channelId);
     const uniqueRecentMessages = this.activeTurnContextMessages(input);
@@ -3888,7 +3924,10 @@ export class SocialDirector {
           : undefined,
         historyRecallAvailable: input.medium === "public",
       };
-      const execution = { durableDelivery: input.durableDelivery };
+      const execution = {
+        durableDelivery: input.durableDelivery,
+        supersessionProtected: input.supersessionProtected,
+      };
       const first = await this.lm.analyzeTurn(request, execution);
       const transientFailure = first.source !== "lm" && [
         "queue_full",
@@ -4255,6 +4294,7 @@ export class SocialDirector {
       [],
       currentParticipantCandidates.map((candidate) => candidate.id),
       [latest, ...activeContextMessages].map((message) => message.id),
+      currentParticipantCandidates,
     );
     const currentDiscourseContext = this.sceneCurrentDiscourseContext(
       trustedDmTurn,
@@ -4487,6 +4527,11 @@ export class SocialDirector {
         .map((claim) => claim.personaId),
     )];
     const firstArrival = firstArrivalPersonaIds.length > 0;
+    // Delivery durability and conversational supersession are separate:
+    // every claimed outbox obligation must survive unrelated queue pressure,
+    // while only exact direct/first-arrival work survives a newer turn from
+    // the same participant in this room.
+    let deliveryProtected = preclaimedDeliveries.length > 0;
     let supersessionProtected = preclaimedDeliveries.some(
       (claim) => claim.deliveryKind === "direct" || claim.deliveryKind === "first_arrival",
     );
@@ -4557,7 +4602,8 @@ export class SocialDirector {
       candidateSet,
       allowSearch: true,
       humanCandidates,
-      durableDelivery: supersessionProtected,
+      durableDelivery: deliveryProtected,
+      supersessionProtected,
       ...(routedPreclaimedPersonaIds.length > 0
         ? { mechanicalAddressedPersonaIdsOverride: routedPreclaimedPersonaIds }
         : {}),
@@ -4633,6 +4679,7 @@ export class SocialDirector {
       humanCandidates.map((candidate) => candidate.id),
       currentParticipantCandidates.map((candidate) => candidate.id),
       [trigger, ...activeContextMessages].map((message) => message.id),
+      currentParticipantCandidates,
     );
     const participantRecallSubjects = trustedTurn.currentParticipantResolution === "history_needed"
       ? trustedTurn.referencedParticipantIds.flatMap((participantId) => {
@@ -4683,6 +4730,16 @@ export class SocialDirector {
       };
     };
     const responseExpected = trustedTurn.intentTrusted && trustedTurn.replyExpected === "expected";
+    const focusedOwnerId = responseExpected && deterministicAddressedIds.length === 0 && !firstArrival
+      ? focusedRelevantResidentOwnerId(
+          trustedTurn,
+          [trigger, ...activeContextMessages],
+          candidates.map((persona) => persona.id),
+        )
+      : undefined;
+    const focusedOwner = focusedOwnerId
+      ? candidates.find((persona) => persona.id === focusedOwnerId)
+      : undefined;
     const historyResponseRequired = trustedTurn.historyRecallTrusted && (
       trustedTurn.historyRecall.need === "required" || trustedTurn.isQuestion
     );
@@ -4728,6 +4785,12 @@ export class SocialDirector {
       now: this.now(),
     });
     selected = detailedExpertPlan.selected;
+    if (focusedOwner) {
+      selected = [
+        focusedOwner,
+        ...selected.filter((persona) => persona.id !== focusedOwner.id),
+      ].slice(0, 3);
+    }
     if (visualEvidence.length > 0 && selected.length === 0) {
       const mostRelevant = [...candidates].sort(
         (a, b) =>
@@ -4830,6 +4893,7 @@ export class SocialDirector {
               turn.messageId,
             );
             if (modelInferredDelivery) claimedRequestOwnerAuthoritative = true;
+            deliveryProtected = true;
             if (turn.deliveryKind === "direct") supersessionProtected = true;
             break claimLoop;
           }
@@ -4951,6 +5015,8 @@ export class SocialDirector {
     const requestOwner = responseExpected || evidenceMustAnswer || Boolean(durableRequestOwner)
       ? durableRequestOwner ?? (evidenceRequested && evidenceResponder
         ? evidenceResponder
+        : focusedOwner && selected.some((persona) => persona.id === focusedOwner.id)
+          ? focusedOwner
         : referencedHumanMemoryOwner && (historyResponseRequired || trustedTurn.isQuestion)
           ? referencedHumanMemoryOwner
         : signals.mentionedIds.length === 0 && recallResponder
@@ -4984,6 +5050,7 @@ export class SocialDirector {
           personaId: requestOwner.id,
           attempt: claim.target.attempts,
         });
+        deliveryProtected = true;
         this.pendingPublicTurnActorScopesInFlight.set(expectedActorScope, trigger.id);
       }
     }
@@ -5198,7 +5265,8 @@ export class SocialDirector {
         signals.mentionedIds.length ? 0 : 2,
         undefined,
         {
-          durableDelivery: supersessionProtected,
+          durableDelivery: deliveryProtected,
+          supersessionProtected,
           continuationOf: textActorModelWorkScope("public", trigger.channelId, human.id),
         },
       );
@@ -5317,7 +5385,7 @@ export class SocialDirector {
           },
           0,
           undefined,
-          { durableDelivery: supersessionProtected },
+          { durableDelivery: deliveryProtected, supersessionProtected },
         );
         if (focused[0]) lines.push(focused[0]);
       } catch (error) {
@@ -7369,7 +7437,12 @@ export class SocialDirector {
             ? "pointed_question"
             : pendingBeat
               ? "specific_example"
-              : undefined;
+              : thread.messageCount > 0 &&
+                  thread.hasOpenHook &&
+                  ["human_topic", "external_agent_topic"].includes(ambientThreadOrigin(thread)) &&
+                  !thread.actionHistory.includes("respond_to_hook")
+                ? "respond_to_hook"
+                : undefined;
       const action: AmbientActionDecision = pendingKind
         ? {
             kind: pendingKind,

@@ -1,5 +1,6 @@
 export const AMBIENT_ACTION_KINDS = [
   "open_topic",
+  "respond_to_hook",
   "advance_claim",
   "specific_example",
   "countertake",
@@ -229,6 +230,7 @@ export function ambientActionInstruction(
   const common = "Make exactly one conversational move and leave the result chat-shaped; do not summarize the whole thread or invite the room to perform.";
   const instruction: Record<AmbientActionKind, string> = {
     open_topic: "Open with one concrete claim, preference, problem, recommendation or joke-shaped hook that another person could answer specifically.",
+    respond_to_hook: "Respond directly to the newest concrete hook in the live thread: answer its question when it asks one, otherwise take up its unresolved claim, setup or invitation with one specific reaction. Do not replace it with a different assigned move.",
     advance_claim: "Advance the live subject with one new concrete reason or distinction; never restate the setup.",
     specific_example: "Add one recognizable example or specific case that changes how the preceding point lands.",
     countertake: "Give one genuinely incompatible countertake aimed at the claim or taste, not the person; do not soften it into agreement.",

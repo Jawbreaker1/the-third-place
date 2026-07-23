@@ -961,7 +961,10 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
 
       expect(analyzeTurn).toHaveBeenCalledWith(expect.objectContaining({
         humanCandidates: [{ id: "human-alex", displayLabel: "Álex" }],
-      }), { durableDelivery: false });
+      }), {
+        durableDelivery: false,
+        supersessionProtected: false,
+      });
       expect(publicThirdPartyPromptNote).toHaveBeenCalledWith(
         mira.id,
         "human-alex",

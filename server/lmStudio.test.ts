@@ -231,7 +231,13 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
         author: `Human ${index + 1}`,
         content: "answer me",
       },
-    }, 1, undefined, { durableDelivery: index === 0 }));
+    }, 1, undefined, {
+      durableDelivery: index === 0,
+      // The first item models an ordinary expected reply: it is protected
+      // from unrelated voice pressure but may still yield to a newer turn from
+      // its own author.
+      supersessionProtected: false,
+    }));
     publicWork.forEach((pending) => void pending.catch(() => undefined));
     await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(4));
 
@@ -241,13 +247,77 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
     await vi.waitFor(() => expect(voiceCalls).toBe(1));
 
     // Call 0 belongs to the durable public reply. The oldest eligible call is
-    // call 1, so voice gains a lane without discarding the direct obligation.
+    // call 1, so voice gains a lane without discarding the expected obligation.
     expect(abortedCallIds).toEqual([1]);
     expect(lm.health()).toMatchObject({ activePredictions: 4, maxConcurrentPredictions: 4 });
 
     lm.cancelPending("elastic voice reservation test complete");
     await Promise.allSettled([...publicWork, voice]);
     await vi.waitFor(() => expect(lm.health().queueDepth).toBe(0));
+  });
+
+  it("displaces optional queued work instead of a delivery-protected expected reply at the queue edge", async () => {
+    const blockerController = new AbortController();
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      const body = JSON.parse(String(init?.body));
+      const system = String(body.messages?.[0]?.content ?? "");
+      if (completionCalls === 1) {
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      if (system.includes("semantic router")) return turnAnalysisCompletion();
+      const room = JSON.parse(String(body.messages?.[1]?.content ?? "{}")).room ?? "queued";
+      return completionResponse([{
+        personaId: "ai-sana",
+        content: `completed ${room}`,
+      }]);
+    }));
+
+    const lm = new LmStudioClient({ maxConcurrentPredictions: 1 });
+    const blocker = lm.generateScene(
+      sceneFor("public", "queue-edge-blocker"),
+      1,
+      blockerController.signal,
+    );
+    void blocker.catch(() => undefined);
+    await vi.waitFor(() => expect(completionCalls).toBe(1));
+
+    let expectedSettled = false;
+    const expected = lm.generateScene({
+      ...sceneFor("public", "lobby"),
+      trigger: {
+        authorId: "human-nadia",
+        author: "Nadia",
+        content: "an ordinary expected request",
+      },
+    }, 2, undefined, {
+      durableDelivery: true,
+      supersessionProtected: false,
+    });
+    void expected.finally(() => { expectedSettled = true; });
+    const optional = Array.from({ length: 7 }, (_, index) =>
+      lm.generateScene(sceneFor("public", `queue-edge-optional-${index}`), 1));
+    optional.forEach((pending) => void pending.catch(() => undefined));
+    expect(lm.health().queueDepth).toBe(9);
+
+    const incoming = lm.analyzeTurn(turnInput("queue-edge-live-router"));
+    expect(expectedSettled).toBe(false);
+    blockerController.abort(new Error("release queue-edge blocker"));
+
+    await expect(blocker).rejects.toThrow("release queue-edge blocker");
+    await expect(incoming).resolves.toMatchObject({ source: "lm", failureReason: null });
+    await expect(expected).resolves.toEqual([
+      expect.objectContaining({ content: "completed lobby" }),
+    ]);
+    const optionalResults = await Promise.allSettled(optional);
+    expect(optionalResults.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(lm.health().queueDepth).toBe(0);
   });
 
   it("keeps Codex single-flight even when LM Studio parallelism is configured", async () => {
@@ -2387,7 +2457,11 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       channelName: "lobby",
       selected: [sana],
       history: [],
-    }, 0, undefined, { durableDelivery: true });
+      trigger: { authorId: "human-jaw-b", author: "Jaw_B", content: "older direct turn" },
+    }, 0, undefined, {
+      durableDelivery: true,
+      supersessionProtected: true,
+    });
     await vi.waitFor(() => expect(completionCalls).toBe(1));
 
     const newerTurn = lm.analyzeTurn(turnInput("same-channel-after-active-durable-scene"));
@@ -2410,6 +2484,49 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       evidence: { action: "read_url" },
     });
     expect(activeSceneAborted).toBe(false);
+    expect(completionCalls).toBe(2);
+  });
+
+  it("lets a newer same-actor turn supersede an otherwise delivery-protected expected scene", async () => {
+    let startedScene: (() => void) | undefined;
+    const sceneStarted = new Promise<void>((resolve) => { startedScene = resolve; });
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      if (completionCalls === 1) {
+        startedScene?.();
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(init?.signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return turnAnalysisCompletion();
+    }));
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const lm = new LmStudioClient();
+    const expectedScene = lm.generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [sana],
+      history: [],
+      trigger: { authorId: "human-jaw-b", author: "Jaw_B", content: "older expected turn" },
+    }, 0, undefined, {
+      durableDelivery: true,
+      supersessionProtected: false,
+    });
+    await sceneStarted;
+
+    const newerTurn = lm.analyzeTurn(turnInput("same-channel-after-active-expected-scene"));
+
+    await expect(expectedScene).rejects.toThrow("newer turn from the same actor in this channel");
+    await expect(newerTurn).resolves.toMatchObject({
+      source: "lm",
+      failureReason: null,
+      evidence: { action: "read_url" },
+    });
     expect(completionCalls).toBe(2);
   });
 
@@ -2701,7 +2818,11 @@ describe("LM Studio one-pass semantic turn analysis", () => {
       channelName: "lobby",
       selected: [sana],
       history: [],
-    }, 2, undefined, { durableDelivery: true });
+      trigger: { authorId: "human-jaw-b", author: "Jaw_B", content: "older queued direct turn" },
+    }, 2, undefined, {
+      durableDelivery: true,
+      supersessionProtected: true,
+    });
     void durableScene.then(
       () => { durableSettled = true; },
       () => { durableSettled = true; },
@@ -6639,6 +6760,78 @@ describe("LM Studio multilingual batch candidate review", () => {
     expect(bodies[2].messages[1].content).toContain("typed channel-feed contribution did not survive review");
     expect(bodies[2].messages[1].content).toContain("sourceIds as []");
     expect(bodies[2].messages[1].content).not.toContain("attach supporting source IDs");
+  });
+
+  it("reviews a direct answer as a valid respond-to-hook ambient move", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const vale = PERSONAS.find((persona) => persona.id === "ai-vale")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{
+            personaId: vale.id,
+            content: "Jag lägger fram kaffet kvällen innan. Löjligt litet, men morgonen blir faktiskt enklare.",
+          }])
+        : candidateReviewCompletion([{
+            personaId: vale.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            outputLanguage: { tag: "sv", confidence: 0.99 },
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "ambient",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [vale],
+      history: [{
+        author: "Mira",
+        kind: "ai",
+        content: "Vilken liten vana gör faktiskt vardagen lättare?",
+        createdAt: "2026-07-23T10:00:00.000Z",
+      }],
+      ambientAction: {
+        episodeId: "episode-respond-to-hook",
+        causalRootId: "human-topic-root",
+        semanticFamily: "human-started-topic",
+        kind: "respond_to_hook",
+        turnIndex: 1,
+        targetMessageId: "hook-message-1",
+        openHook: true,
+        previousActions: [],
+      },
+      mustReplyIds: [vale.id],
+      semanticContext: {
+        languageTag: "sv",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: vale.id,
+      content: expect.stringContaining("kaffet kvällen innan"),
+    })]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].messages[0].content).toContain(
+      "Respond directly to the newest concrete hook",
+    );
+    expect(JSON.parse(bodies[1].messages[1].content)).toMatchObject({
+      ambientAction: {
+        kind: "respond_to_hook",
+        targetMessageId: "hook-message-1",
+      },
+    });
+    expect(bodies[1].messages[0].content).toContain(
+      "For respond_to_hook, directly answering the target's question",
+    );
   });
 
   it("recovers a multilingual false voice-chat denial from structured community capability truth", async () => {

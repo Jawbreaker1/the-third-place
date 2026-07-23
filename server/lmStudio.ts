@@ -35,7 +35,10 @@ import {
 } from "./humanizer.js";
 import type { Persona } from "./personas.js";
 import type { RelationshipStylePlan } from "./relationshipBehavior.js";
-import type { AmbientActionContract } from "./ambientActionPlanner.js";
+import {
+  ambientActionInstruction,
+  type AmbientActionContract,
+} from "./ambientActionPlanner.js";
 import { LmStudioBackend } from "./lmStudioBackend.js";
 import type { ModelBackend } from "./modelBackend.js";
 import { ModelBackendError } from "./modelBackend.js";
@@ -820,8 +823,10 @@ interface SceneQueueItem {
   enqueuedAt: number;
   request: SceneRequest;
   continuationOf?: ModelWorkScope;
-  /** Durable human delivery may queue behind newer work, but is never stale. */
+  /** Protected delivery may wait behind newer work, but unrelated admission/preemption cannot drop it. */
   durableDelivery: boolean;
+  /** A newer text turn from the same actor and room may not cancel this exact obligation. */
+  supersessionProtected: boolean;
   /** Optional scene work that must yield immediately to any live human turn. */
   preemptibleBackground: boolean;
   externalSignal?: AbortSignal;
@@ -846,8 +851,10 @@ interface TurnAnalysisQueueItem {
   priority: number;
   input: NormalizedTurnAnalysisInput;
   supersessionScope?: ModelWorkScope;
-  /** Durable human delivery may queue behind newer work, but is never stale. */
+  /** Protected delivery may wait behind newer work, but unrelated admission/preemption cannot drop it. */
   durableDelivery: boolean;
+  /** A newer text turn from the same actor and room may not cancel this exact obligation. */
+  supersessionProtected: boolean;
   externalSignal?: AbortSignal;
   stopWatchingExternalAbort?: () => void;
   deadlineAt: number;
@@ -927,8 +934,13 @@ export interface TurnAnalysisExecutionOptions {
   supersessionScope?: ModelWorkScope;
   /** Cancels this caller's queued or in-flight analysis immediately. */
   signal?: AbortSignal;
-  /** Prevent newer text turns from the same actor and room from discarding this durable obligation. */
+  /** Protect this claimed delivery from unrelated queue admission and voice preemption. */
   durableDelivery?: boolean;
+  /**
+   * Prevent a newer text turn from the same actor and room from cancelling this
+   * exact obligation. Defaults to durableDelivery for existing callers.
+   */
+  supersessionProtected?: boolean;
 }
 
 export interface SceneGenerationExecutionOptions {
@@ -938,8 +950,13 @@ export interface SceneGenerationExecutionOptions {
    * preempts an already running call.
    */
   continuationOf?: ModelWorkScope;
-  /** Prevent newer text routing from the same actor and room from discarding this durable obligation. */
+  /** Protect this claimed delivery from unrelated queue admission and voice preemption. */
   durableDelivery?: boolean;
+  /**
+   * Prevent a newer text turn from the same actor and room from cancelling this
+   * exact obligation. Defaults to durableDelivery for existing callers.
+   */
+  supersessionProtected?: boolean;
   /** Marks optional generated texture that may be dropped to protect live human latency. */
   preemptibleBackground?: boolean;
 }
@@ -2032,6 +2049,16 @@ export const buildSceneSystemPrompt = (request: SceneRequest): string => {
     ? `
 - This generation is one atomic ambient action, not a complete multi-person scene. Only the selected resident may speak.
 - trustedAmbientAction.kind is the exact conversational move to perform against the live episode. Follow its target and keep the semantic family; do not restart the setup, jump to an unrelated topic, paraphrase the previous line or close an open hook with generic agreement.
+- ${request.ambientAction.kind === "respond_to_hook"
+    ? ambientActionInstruction(
+        request.ambientAction.kind,
+        profile?.conversationRegister === "banter"
+          ? "banter"
+          : ["everyday", "fandom"].includes(profile?.conversationRegister ?? "")
+            ? "casual"
+            : "discussion",
+      )
+    : "Perform the exact typed move without substituting another ambient action."}
 - A short fragment, blunt countertake or pointed question is valid when it genuinely performs the move. Do not pad it into an explanation merely to sound substantive.`
     : "";
 
@@ -3049,7 +3076,7 @@ export class LmStudioClient {
         item.request.kind === kind &&
         item.request.channelId === channelId &&
         item.request.trigger?.authorId === authorId &&
-        !item.durableDelivery
+        !item.supersessionProtected
       ) {
         item.reject(new Error(reason));
       } else {
@@ -3072,7 +3099,7 @@ export class LmStudioClient {
         item.input.medium === medium &&
         item.input.channel.id === channelId &&
         item.input.latestMessage.authorId === authorId &&
-        !item.durableDelivery
+        !item.supersessionProtected
       ) item.reject(new Error(reason));
       else retained.push(item);
     }
@@ -3103,6 +3130,10 @@ export class LmStudioClient {
         ? textActorModelWorkScope(input.medium, input.channel.id, input.latestMessage.authorId)
         : undefined;
     const durableDelivery = Boolean(execution.durableDelivery && input.medium === "public");
+    const supersessionProtected = Boolean(
+      (execution.supersessionProtected ?? execution.durableDelivery) &&
+      input.medium === "public",
+    );
     if (execution.signal?.aborted) {
       return Promise.resolve(createFailClosedTurnAnalysis("transport_error"));
     }
@@ -3133,7 +3164,7 @@ export class LmStudioClient {
           work.item.request.kind === liveTextMedium &&
           work.item.request.channelId === input.channel.id &&
           work.item.request.trigger?.authorId === liveTextAuthorId &&
-          !work.item.durableDelivery
+          !work.item.supersessionProtected
         ) {
           // The newer turn advances the director's per-channel epoch, so this
           // exact active scene can no longer be published.
@@ -3145,7 +3176,7 @@ export class LmStudioClient {
           work.item.input.medium === liveTextMedium &&
           work.item.input.channel.id === input.channel.id &&
           work.item.input.latestMessage.authorId === liveTextAuthorId &&
-          !work.item.durableDelivery
+          !work.item.supersessionProtected
         ) work.abort?.abort(new Error(staleLiveReason));
       }
     }
@@ -3199,6 +3230,7 @@ export class LmStudioClient {
         input,
         supersessionScope,
         durableDelivery,
+        supersessionProtected,
         externalSignal: execution.signal,
         deadlineAt: startedAt + TURN_ANALYSIS_TIMEOUT_MS,
         settled: false,
@@ -3333,6 +3365,10 @@ export class LmStudioClient {
         request,
         continuationOf,
         durableDelivery: Boolean(execution.durableDelivery && request.kind === "public"),
+        supersessionProtected: Boolean(
+          (execution.supersessionProtected ?? execution.durableDelivery) &&
+          request.kind === "public",
+        ),
         preemptibleBackground: execution.preemptibleBackground === true,
         externalSignal: signal,
         resolve: (value) => {
