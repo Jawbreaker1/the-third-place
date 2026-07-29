@@ -217,6 +217,33 @@ describe("room history", () => {
     expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
   });
 
+  it("migrates existing history with a production-and-collecting pingu opening exactly once", async () => {
+    const filePath = tempStorePath();
+    const existing = createMessage("lobby", "human-returning", "preserve this pre-pingu history");
+    await writeFile(filePath, JSON.stringify({ version: 1, messages: [existing] }), "utf8");
+
+    const migrated = new RoomStore(filePath);
+    await migrated.load();
+    const pinguMessages = migrated.getRecent("pingu", 50);
+    const firstPinguIds = pinguMessages.map((message) => message.id);
+
+    expect(pinguMessages).toHaveLength(3);
+    expect(new Set(pinguMessages.map((message) => message.authorId))).toEqual(
+      new Set(["ai-otto", "ai-tess", "ai-juno"]),
+    );
+    expect(pinguMessages.some((message) => message.content.includes("plushies"))).toBe(true);
+    expect(pinguMessages.some((message) => message.content.includes("Pingu in the City"))).toBe(true);
+    expect(pinguMessages.some((message) =>
+      message.reactions?.some((reaction) => reaction.emoji === "🐧"),
+    )).toBe(true);
+    expect(migrated.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+
+    const reloaded = new RoomStore(filePath);
+    await reloaded.load();
+    expect(reloaded.getRecent("pingu", 50).map((message) => message.id)).toEqual(firstPinguIds);
+    expect(reloaded.getRecent("lobby", 50).some((message) => message.id === existing.id)).toBe(true);
+  });
+
   it("returns stable chronological pages before a composite cursor", async () => {
     const store = tempStore();
     for (let index = 0; index < 95; index += 1) {

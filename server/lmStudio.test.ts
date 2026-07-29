@@ -1077,6 +1077,22 @@ const candidateReviewCompletion = (reviews: Array<{
   }],
 });
 
+const canonicalNarrativeReviewCompletion = (
+  reviews: Array<{
+    personaId: string;
+    verdict:
+      | "clean_no_real_canon_assertion"
+      | "clean_source_entailed"
+      | "unsupported_real_canon_assertion";
+  }>,
+) => jsonResponse({
+  choices: [{
+    message: {
+      content: JSON.stringify({ reviews }),
+    },
+  }],
+});
+
 const voiceCandidateReviewCompletion = (
   reviews: Parameters<typeof candidateReviewCompletion>[0],
   outputLanguage = { tag: "sv", confidence: 0.99 },
@@ -4669,7 +4685,105 @@ describe("LM Studio multilingual batch candidate review", () => {
         ],
       },
       evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
       urlPublicationPolicy: "server_card",
+    });
+
+    expect(lines).toEqual([expect.objectContaining({ content: gap, sourceIds: ["S1", "S2"] })]);
+    expect(bodies).toHaveLength(4);
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    expect(firstReview.candidates[0]).toMatchObject({
+      personaId: mira.id,
+      mustReply: true,
+      mustFulfillRequest: true,
+      mustReportCapabilityFailure: false,
+    });
+    const retryScene = JSON.parse(bodies[2].messages[1].content);
+    expect(retryScene.premise).toContain("earlier draft failed the evidence contract");
+    expect(bodies[2].messages[0].content).toContain("Never write any source identifier in visible message content");
+  });
+
+  it("keeps successful typed evidence under owner delivery and retries an omitted requested dimension", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const partial = "Northbridge vann finalen med 2–1.";
+    const complete = "Northbridge vann med 2–1, och Mara Vale gjorde segermålet.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: partial,
+          sourceIds: ["S1"],
+        }]);
+      }
+      if (bodies.length === 2) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["unfulfilled_explicit_request"],
+          rewriteInstruction: "Answer both requested dimensions: winner and winning scorer, using S1.",
+        }]);
+      }
+      if (bodies.length === 3) {
+        return completionResponse([{
+          personaId: mira.id,
+          content: complete,
+          sourceIds: ["S1"],
+        }]);
+      }
+      return candidateReviewCompletion([{
+        personaId: mira.id,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Vem vann finalen, och vem gjorde segermålet?",
+        messageId: "successful-capability-multipart",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: false,
+        replyExpected: "optional",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "search",
+        query: "final result and winning scorer",
+        retrievedAt: "2026-07-29T12:00:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Final report",
+          url: "https://example.com/final-report",
+          snippet: "Northbridge defeated Easton 2–1. Mara Vale scored the winning goal.",
+        }],
+      },
+      evidenceOutcome: "succeeded",
       capabilityContext: {
         available: ["web_search"],
         requestKind: "execute",
@@ -4680,17 +4794,219 @@ describe("LM Studio multilingual batch candidate review", () => {
       },
     });
 
-    expect(lines).toEqual([expect.objectContaining({ content: gap, sourceIds: ["S1", "S2"] })]);
-    expect(bodies).toHaveLength(4);
-    const firstReview = JSON.parse(bodies[1].messages[1].content);
-    expect(firstReview.candidates[0]).toMatchObject({
+    expect(lines).toEqual([expect.objectContaining({
       personaId: mira.id,
-      mustReply: true,
-      mustFulfillRequest: false,
+      content: complete,
+      sourceIds: ["S1"],
+    })]);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[0].messages[0].content).toContain(
+      "Cover every explicit core dimension and preserve its role, timeframe, comparison and scope",
+    );
+    expect(bodies[0].messages[0].content).toContain(
+      "a related fact from another role or era is not a substitute",
+    );
+    const firstReview = JSON.parse(bodies[1].messages[1].content);
+    expect(firstReview).toMatchObject({
+      evidence: { outcome: "succeeded", results: [{ id: "S1" }] },
+      capabilityContext: {
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+      },
+      semanticContext: {
+        intentTrusted: false,
+        replyExpected: "optional",
+      },
+      candidates: [{
+        personaId: mira.id,
+        sourceIds: ["S1"],
+        mustReply: true,
+        mustFulfillRequest: true,
+        mustReportCapabilityFailure: false,
+      }],
     });
+    const allowedIssues =
+      bodies[1].response_format.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
+    expect(allowedIssues).toContain("unfulfilled_explicit_request");
     const retryScene = JSON.parse(bodies[2].messages[1].content);
-    expect(retryScene.premise).toContain("earlier draft failed the evidence contract");
-    expect(bodies[2].messages[0].content).toContain("Never write any source identifier in visible message content");
+    expect(retryScene.explicitRequestOwnerIds).toEqual([mira.id]);
+    expect(retryScene.premise).toContain('"unfulfilled_explicit_request"');
+    expect(retryScene.premise).toContain(
+      "Deliver the requested answer or self-contained artifact now",
+    );
+    const retryReview = JSON.parse(bodies[3].messages[1].content);
+    expect(retryReview.candidates).toEqual([
+      expect.objectContaining({
+        personaId: mira.id,
+        mustFulfillRequest: true,
+        mustReportCapabilityFailure: false,
+      }),
+    ]);
+  });
+
+  it("never turns two source-bound research voice misses into silence", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const first = "I checked the sources, but they do not explain the reason.";
+    const second = "The supplied source does not give an official reason.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([{ personaId: mira.id, content: first, sourceIds: ["S1"] }]);
+      }
+      if (bodies.length === 2 || bodies.length === 4) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "high",
+          issues: ["assistant_register"],
+          rewriteInstruction: "Lead with the exact boundary and answer in a natural peer voice.",
+          outputLanguage: { tag: "en", confidence: 0.99 },
+        }]);
+      }
+      return completionResponse([{ personaId: mira.id, content: second, sourceIds: ["S1"] }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Why do the two siblings keep arguing?",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "expected",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "character relationship",
+        retrievedAt: "2026-07-29T12:40:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Character relationships",
+          url: "https://example.com/characters",
+          snippet: "The two characters are siblings. No recurring official cause is stated.",
+        }],
+      },
+      evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+      urlPublicationPolicy: "server_card",
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      content: second,
+      sourceIds: ["S1"],
+    })]);
+    expect(bodies).toHaveLength(4);
+    expect(JSON.parse(bodies[2].messages[1].content).premise).toContain(
+      "natural peer voice",
+    );
+  });
+
+  it("accepts a compact entailed single-fact answer after successful typed evidence", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const compact = "Northbridge.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([{
+            personaId: mira.id,
+            content: compact,
+            sourceIds: ["S1"],
+          }])
+        : candidateReviewCompletion([{
+            personaId: mira.id,
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "lobby",
+      channelName: "lobby",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Vem vann finalen?",
+        messageId: "successful-capability-single-fact",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        answerDepth: "brief",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "search",
+        query: "final winner",
+        retrievedAt: "2026-07-29T12:00:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Final report",
+          url: "https://example.com/final-report",
+          snippet: "Northbridge won the final.",
+        }],
+      },
+      evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      content: compact,
+      sourceIds: ["S1"],
+    })]);
+    expect(bodies).toHaveLength(2);
+    const review = JSON.parse(bodies[1].messages[1].content);
+    expect(review.candidates).toEqual([
+      expect.objectContaining({
+        personaId: mira.id,
+        sourceIds: ["S1"],
+        mustReply: true,
+        mustFulfillRequest: true,
+        mustReportCapabilityFailure: false,
+      }),
+    ]);
   });
 
   it("reclassifies two explicit packet-not-answer-bearing verdicts into one final reviewed failure report", async () => {
@@ -5996,7 +6312,13 @@ describe("LM Studio multilingual batch candidate review", () => {
         plannedAction: "weather_forecast",
         executionStatus: "succeeded",
       },
-      candidates: [{ personaId: mira.id, sourceIds: ["S1"] }],
+      candidates: [{
+        personaId: mira.id,
+        sourceIds: ["S1"],
+        mustReply: true,
+        mustFulfillRequest: true,
+        mustReportCapabilityFailure: false,
+      }],
     });
   });
 
@@ -6060,7 +6382,13 @@ describe("LM Studio multilingual batch candidate review", () => {
         plannedAction: "weather_forecast",
         executionStatus: "failed_temporary",
       },
-      candidates: [{ personaId: mira.id, sourceIds: [] }],
+      candidates: [{
+        personaId: mira.id,
+        sourceIds: [],
+        mustReply: true,
+        mustFulfillRequest: false,
+        mustReportCapabilityFailure: true,
+      }],
     });
   });
 
@@ -8089,6 +8417,186 @@ describe("LM Studio room prompt", () => {
     }
   });
 
+  it("lets a human-triggered server-rendered card retain the model-selected supporting source", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return completionResponse([{
+        personaId: mira.id,
+        content: "Något officiellt varför verkar saknas. min gissning är vanlig syskonfriktion.",
+        sourceIds: ["S2"],
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "arbitrary-fandom-room",
+      channelName: "arbitrary-fandom-room",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Varför bråkar de så ofta?",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      research: {
+        kind: "page",
+        query: "character relationship",
+        retrievedAt: "2026-07-29T12:40:00.000Z",
+        results: [
+          {
+            id: "S1",
+            title: "Broad series page",
+            url: "https://example.com/series",
+            snippet: "A general series introduction.",
+          },
+          {
+            id: "S2",
+            title: "Character relationships",
+            url: "https://example.com/characters",
+            snippet: "The characters are siblings. No recurring official cause for their arguments is stated.",
+          },
+        ],
+      },
+      evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+      urlPublicationPolicy: "server_card",
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      sourceIds: ["S2"],
+    })]);
+    expect(bodies).toHaveLength(1);
+    expect(String(bodies[0]?.messages?.[0]?.content ?? "")).toContain(
+      "human-triggered server-rendered card",
+    );
+    expect(String(bodies[0]?.messages?.[0]?.content ?? "")).not.toContain(
+      "For this server-owned card sourceIds must be []",
+    );
+    expect(
+      bodies[0].response_format.json_schema.schema.properties.messages.items.properties.sourceIds,
+    ).toMatchObject({
+      minItems: 1,
+      maxItems: 2,
+      items: { enum: ["S1", "S2"] },
+    });
+    const sceneData = JSON.parse(bodies[0].messages[1].content);
+    expect(sceneData.freshResearch.results).toEqual([
+      expect.objectContaining({ id: "S1" }),
+      expect.objectContaining({ id: "S2" }),
+    ]);
+    expect(sceneData.freshResearch.results[0]).not.toHaveProperty("url");
+    expect(sceneData.freshResearch.results[1]).not.toHaveProperty("url");
+  });
+
+  it("recovers a successful research owner who omits provenance in a mixed actor batch", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "false";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return bodies.length === 1
+        ? completionResponse([
+            {
+              personaId: mira.id,
+              content: "I checked the sources, but they do not explain the reason.",
+              sourceIds: [],
+            },
+            {
+              personaId: sana.id,
+              content: "That dynamic is funny, honestly.",
+              sourceIds: [],
+            },
+          ])
+        : completionResponse([{
+            personaId: mira.id,
+            content: "No official reason is given. my read? ordinary sibling friction.",
+            sourceIds: ["S1"],
+          }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "arbitrary-fandom-room",
+      channelName: "arbitrary-fandom-room",
+      selected: [mira, sana],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Why do the two siblings keep arguing?",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "en",
+        intentTrusted: true,
+        replyExpected: "expected",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "fictional character relationship",
+        retrievedAt: "2026-07-29T12:40:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Character relationships",
+          url: "https://example.com/characters",
+          snippet: "The two characters are siblings. No recurring official cause for their arguments is stated.",
+        }],
+      },
+      evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+      urlPublicationPolicy: "server_card",
+    });
+
+    expect(lines).toEqual([
+      expect.objectContaining({
+        personaId: sana.id,
+        sourceIds: [],
+      }),
+      expect.objectContaining({
+        personaId: mira.id,
+        sourceIds: ["S1"],
+        content: "No official reason is given. my read? ordinary sibling friction.",
+      }),
+    ]);
+    expect(bodies).toHaveLength(2);
+    expect(
+      bodies[0].response_format.json_schema.schema.properties.messages.items.properties.sourceIds,
+    ).toMatchObject({ minItems: 0, maxItems: 1 });
+    expect(
+      bodies[1].response_format.json_schema.schema.properties.messages.items.properties.sourceIds,
+    ).toMatchObject({ minItems: 1, maxItems: 1 });
+    expect(JSON.parse(bodies[1].messages[1].content).premise).toContain(
+      "one bounded full-scene retry",
+    );
+  });
+
   it.each([
     ["inline code", "Källan är `https://example.com/article` och poängen håller."],
     ["fenced code", "Källan är här:\n```text\nhttps://example.com/article\n```"],
@@ -8349,6 +8857,534 @@ describe("LM Studio room prompt", () => {
     expect(prompt).toContain("animatronic silhouettes");
     expect(prompt).toContain("plush design");
     expect(prompt).toContain("Room register changes formality, not personality");
+  });
+
+  it("places the pingu episode, production, Japan and collecting contract in the trusted prompt", () => {
+    const runtime = new ActorChannelRuntime();
+    const tess = PERSONAS.find((persona) => persona.id === "ai-tess")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "public",
+      channelId: "pingu",
+      channelName: "pingu",
+      selected: [tess],
+      history: [],
+      actorExpertiseNotes: runtime.expertiseNotes([tess], "pingu"),
+    });
+
+    expect(prompt).toContain("deeply informed Pingu fan room");
+    expect(prompt).toContain("not a 'noot noot' soundboard");
+    expect(prompt).toContain("not a hidden serialized mythology");
+    expect(prompt).toContain("Japan is a first-class part of the fandom");
+    expect(prompt).toContain("Plushies, prize items, figures");
+    expect(prompt).toContain("precision-sensitive");
+    expect(prompt).toContain("repeat only the participant's clues");
+    expect(prompt).toContain("never complete a plausible gap as fact");
+    expect(prompt).toContain("a lead, not verification");
+    expect(prompt).toContain("require supplied fresh evidence");
+    expect(prompt).toContain("private competence level here is specialist");
+    expect(prompt).toContain("plushies and soft-toy construction");
+    expect(prompt).toContain("collecting, condition and display choices");
+    expect(prompt).toContain("Room register changes formality, not personality");
+    expect(prompt).toContain("Evidence controls what residents may assert as fact");
+    expect(prompt).toContain("it does not turn them into search reports");
+    expect(prompt).toContain("one clearly signposted, explicitly speaker-owned low-stakes reading, guess, opinion or emotional reaction");
+    expect(prompt).toContain("An authorless conclusion equivalent to “it just seems to be their dynamic”");
+    expect(prompt).toContain("never by copying or matching the English examples");
+  });
+
+  it("keeps a sourced premise separate from a clearly framed everyday interpretation", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const draft =
+      "Något officiellt varför verkar inte finnas, men min gissning är helt vanlig syskonfriktion.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      const systemPrompt = String(body.messages?.[0]?.content ?? "");
+      if (systemPrompt.includes("narrow multilingual entailment gate")) {
+        return canonicalNarrativeReviewCompletion([
+          { personaId: mira.id, verdict: "clean_source_entailed" },
+        ]);
+      }
+      if (systemPrompt.includes("strict multilingual publication reviewer")) {
+        return candidateReviewCompletion([{
+          personaId: mira.id,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        }]);
+      }
+      return completionResponse([{
+        personaId: mira.id,
+        content: draft,
+        sourceIds: ["S1"],
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "pingu",
+      channelName: "pingu",
+      selected: [mira],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Varför bråkar Pingu och Pinga alltid?",
+      },
+      mustReplyIds: [mira.id],
+      requestOwnerIds: [mira.id],
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "expected",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "Pingu Pinga relationship",
+        retrievedAt: "2026-07-29T12:40:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Pingu characters",
+          url: "https://example.com/pingu-characters",
+          snippet: "Pinga is Pingu's little sister. No official recurring cause for their arguments is stated.",
+        }],
+      },
+      evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+      capabilityGroundingInstruction:
+        "State the supported relationship and exact knowledge gap; a clearly framed low-stakes interpretation may follow without becoming canon.",
+      urlPublicationPolicy: "server_card",
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: mira.id,
+      content: draft,
+      sourceIds: ["S1"],
+    })]);
+    expect(bodies).toHaveLength(3);
+    expect(
+      bodies[0].response_format.json_schema.schema.properties.messages.items.properties.sourceIds,
+    ).toMatchObject({ minItems: 1, maxItems: 1 });
+    expect(String(bodies[0]?.messages?.[0]?.content ?? "")).toContain(
+      "it does not turn them into search reports",
+    );
+    expect(String(bodies[0]?.messages?.[0]?.content ?? "")).toContain(
+      "human-triggered server-rendered card",
+    );
+  });
+
+  it("drops a fabricated exact Pingu episode while preserving natural uncertainty and fandom opinion", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const otto = PERSONAS.find((persona) => persona.id === "ai-otto")!;
+    const tess = PERSONAS.find((persona) => persona.id === "ai-tess")!;
+    const fabricated = "Det är säsong 3, avsnitt 17, Pingu and the Purple Submarine. Där gömmer de ubåten bakom glassfabriken.";
+    const cautious = "Jag känner inte igen avsnittet säkert. Minns du om Robby var med? Den sortens skuldvändning hade passat seriens fysiska komik.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([
+          { personaId: otto.id, content: fabricated },
+          { personaId: tess.id, content: cautious },
+        ]);
+      }
+      const systemPrompt = String(body.messages?.[0]?.content ?? "");
+      if (systemPrompt.includes("narrow multilingual entailment gate")) {
+        return canonicalNarrativeReviewCompletion([
+          { personaId: otto.id, verdict: "unsupported_real_canon_assertion" },
+          { personaId: tess.id, verdict: "clean_no_real_canon_assertion" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        {
+          personaId: otto.id,
+          severity: "high",
+          issues: ["evidence_ungrounded"],
+          rewriteInstruction: "Do not invent an exact episode title or number; preserve only supported scene details or bounded uncertainty.",
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        },
+        {
+          personaId: tess.id,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "pingu",
+      channelName: "pingu",
+      selected: [otto, tess],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Vilket avsnitt är det där Pingu och Pinga hittar en lila ubåt bakom glassfabriken?",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "optional",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: tess.id,
+      content: cautious,
+    })]);
+    const generalReviewBody = bodies.find((body) =>
+      String(body.messages?.[0]?.content ?? "").includes("strict multilingual publication reviewer")
+    );
+    const reviewInput = JSON.parse(generalReviewBody.messages[1].content);
+    expect(reviewInput).toMatchObject({
+      room: {
+        id: "pingu",
+        freshnessRule: expect.stringContaining("never complete a plausible gap as fact"),
+        groundingPolicy: {
+          sourceRequiredFor: expect.arrayContaining([
+            "exact_catalog_identity",
+            "canonical_narrative_detail",
+            "attribution_or_provenance",
+            "authenticity_or_valuation",
+          ]),
+        },
+        conversationGuidance: expect.stringContaining("a lead, not verification"),
+      },
+      evidence: { outcome: "none", results: [] },
+    });
+    const canonicalReviewBody = bodies.find((body) =>
+      String(body.messages?.[0]?.content ?? "").includes("narrow multilingual entailment gate")
+    );
+    expect(JSON.parse(canonicalReviewBody.messages[1].content)).toMatchObject({
+      policy: "canonical_narrative_detail",
+      latestTrigger: {
+        content: expect.stringContaining("lila ubåt"),
+      },
+      candidates: expect.arrayContaining([
+        expect.objectContaining({ personaId: otto.id, sourceIds: [] }),
+        expect.objectContaining({ personaId: tess.id, sourceIds: [] }),
+      ]),
+    });
+    expect(bodies.indexOf(canonicalReviewBody)).toBeLessThan(
+      bodies.indexOf(generalReviewBody),
+    );
+  });
+
+  it("blocks a modified canonical aside even when an unrelated cited source could launder it", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const tess = PERSONAS.find((persona) => persona.id === "ai-tess")!;
+    const leakedAside =
+      "Jag känner inte igen den lila ubåten, men Robby brukar köra en röd miniubåt i flera avsnitt.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      const systemPrompt = String(body.messages?.[0]?.content ?? "");
+      if (bodies.length === 1) {
+        return completionResponse([{
+          personaId: tess.id,
+          content: leakedAside,
+          sourceIds: ["S1"],
+        }]);
+      }
+      if (systemPrompt.includes("narrow multilingual entailment gate")) {
+        return canonicalNarrativeReviewCompletion([
+          { personaId: tess.id, verdict: "unsupported_real_canon_assertion" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        {
+          personaId: tess.id,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "pingu",
+      channelName: "pingu",
+      selected: [tess],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Jag minns en lila ubåt, vilket avsnitt var det?",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "optional",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "page",
+        query: "official Pingu episode",
+        retrievedAt: "2026-07-29T09:30:00.000Z",
+        results: [{
+          id: "S1",
+          title: "Official episode guide",
+          url: "https://www.pingu.jp/film/original01.html",
+          snippet: "Pingu has dinner with his parents, goes outside to play ball and is upset when a friend bursts it.",
+        }],
+      },
+      evidenceOutcome: "succeeded",
+    });
+
+    expect(lines).toEqual([]);
+    expect(bodies).toHaveLength(2);
+    expect(String(bodies[1]?.messages?.[0]?.content ?? "")).toContain(
+      "narrow multilingual entailment gate",
+    );
+    expect(bodies.some((body) =>
+      String(body.messages?.[0]?.content ?? "").includes(
+        "strict multilingual publication reviewer",
+      )
+    )).toBe(false);
+    expect(JSON.parse(bodies[1].messages[1].content)).toMatchObject({
+      evidence: {
+        outcome: "succeeded",
+        results: [{ id: "S1" }],
+      },
+      candidates: [{ personaId: tess.id, sourceIds: ["S1"] }],
+    });
+  });
+
+  it("fails closed when the required canonical preflight is malformed", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const tess = PERSONAS.find((persona) => persona.id === "ai-tess")!;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      const systemPrompt = String(body.messages?.[0]?.content ?? "");
+      if (systemPrompt.includes("narrow multilingual entailment gate")) {
+        return jsonResponse({ choices: [{ message: { content: "{\"reviews\":[]" } }] });
+      }
+      if (systemPrompt.includes("strict multilingual publication reviewer")) {
+        return candidateReviewCompletion([{
+          personaId: tess.id,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        }]);
+      }
+      return completionResponse([{
+        personaId: tess.id,
+        content: "Jag är osäker; minns du om Robby var med?",
+      }]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "pingu",
+      channelName: "pingu",
+      selected: [tess],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "Minns du scenen med ubåten?",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "optional",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+    });
+
+    expect(lines).toEqual([]);
+  });
+
+  it("keeps source-bounded Pingu production and merchandise facts while rejecting current overclaims", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const linnea = PERSONAS.find((persona) => persona.id === "ai-linnea")!;
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    const grounded = "Aardman och Mattel meddelade samutveckling 2024, men källan ger inget premiärdatum. Postman-plushen annonserades i Japan; den sidan bevisar inte att den finns i lager nu.";
+    const overclaim = "Serien har premiär 14 november 2026 och Postman-plushen är slutsåld och värd minst 8 000 kronor.";
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return completionResponse([
+          { personaId: linnea.id, content: grounded, sourceIds: ["S1", "S2"] },
+          { personaId: juno.id, content: overclaim, sourceIds: ["S1", "S2"] },
+        ]);
+      }
+      const systemPrompt = String(body.messages?.[0]?.content ?? "");
+      if (systemPrompt.includes("narrow multilingual entailment gate")) {
+        return canonicalNarrativeReviewCompletion([
+          { personaId: linnea.id, verdict: "clean_no_real_canon_assertion" },
+          { personaId: juno.id, verdict: "clean_no_real_canon_assertion" },
+        ]);
+      }
+      return candidateReviewCompletion([
+        {
+          personaId: linnea.id,
+          severity: "none",
+          issues: [],
+          rewriteInstruction: null,
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        },
+        {
+          personaId: juno.id,
+          severity: "high",
+          issues: ["evidence_ungrounded"],
+          rewriteInstruction: "Remove the unsupported premiere date, stock state and valuation; state only what the supplied sources establish.",
+          outputLanguage: { tag: "sv", confidence: 0.99 },
+        },
+      ]);
+    }));
+
+    const lines = await new LmStudioClient().generateScene({
+      kind: "public",
+      channelId: "pingu",
+      channelName: "pingu",
+      selected: [linnea, juno],
+      history: [],
+      trigger: {
+        author: "Guest",
+        content: "När kommer nya serien, och går Postman-Pingu-plushen fortfarande att köpa?",
+      },
+      semanticContext: {
+        languageTag: "sv",
+        intentTrusted: true,
+        replyExpected: "optional",
+        answerDepth: "normal",
+        asksForList: false,
+        asksAboutAiIdentity: false,
+        asksAboutAcoustics: false,
+      },
+      research: {
+        kind: "search",
+        query: "official Pingu series and Postman plush status",
+        retrievedAt: "2026-07-29T09:30:00.000Z",
+        results: [
+          {
+            id: "S1",
+            title: "Aardman and Mattel to co-develop Pingu animated TV series",
+            url: "https://www.aardman.com/latest-news/2024/october/aardman-and-mattel-to-co-develop-pingu-animated-tv-series/",
+            snippet: "Published 21 October 2024. Aardman and Mattel are co-developing a new stop-motion 3D animated television series. No premiere date is stated.",
+            sourceAuthority: {
+              preference: "prefer_primary",
+              tier: "preferred",
+              meaning: "discovery_preference_not_claim_support",
+              matchedCanonicalHost: "aardman.com",
+            },
+          },
+          {
+            id: "S2",
+            title: "Postman Pingu plush announcement",
+            url: "https://www.pingu.jp/news/3181",
+            snippet: "A dated official Japanese product announcement for a Postman Pingu plush. It does not report current stock, rarity or resale value.",
+            sourceAuthority: {
+              preference: "prefer_primary",
+              tier: "preferred",
+              meaning: "discovery_preference_not_claim_support",
+              matchedCanonicalHost: "pingu.jp",
+            },
+          },
+        ],
+      },
+      evidenceOutcome: "succeeded",
+      capabilityContext: {
+        available: ["web_search"],
+        requestKind: "execute",
+        discussed: ["web_search"],
+        plannedAction: "web_search",
+        executionStatus: "succeeded",
+        externalEvidenceAvailable: true,
+      },
+    });
+
+    expect(lines).toEqual([expect.objectContaining({
+      personaId: linnea.id,
+      content: grounded,
+      sourceIds: ["S1", "S2"],
+    })]);
+    const generalReviewBody = bodies.find((body) =>
+      String(body.messages?.[0]?.content ?? "").includes(
+        "strict multilingual publication reviewer",
+      )
+    );
+    const reviewInput = JSON.parse(generalReviewBody.messages[1].content);
+    expect(reviewInput).toMatchObject({
+      room: {
+        id: "pingu",
+        freshnessRule: expect.stringContaining("production credits, makers, editions and provenance"),
+        groundingPolicy: {
+          sourceRequiredFor: expect.arrayContaining([
+            "current_dynamic",
+            "exact_catalog_identity",
+            "canonical_narrative_detail",
+            "attribution_or_provenance",
+            "authenticity_or_valuation",
+          ]),
+        },
+      },
+      evidence: {
+        outcome: "succeeded",
+        results: [
+          {
+            id: "S1",
+            title: expect.stringContaining("Aardman"),
+            sourceAuthority: {
+              preference: "prefer_primary",
+              tier: "preferred",
+              meaning: "discovery_preference_not_claim_support",
+              matchedCanonicalHost: "aardman.com",
+            },
+          },
+          {
+            id: "S2",
+            title: expect.stringContaining("Postman Pingu"),
+            sourceAuthority: {
+              preference: "prefer_primary",
+              tier: "preferred",
+              meaning: "discovery_preference_not_claim_support",
+              matchedCanonicalHost: "pingu.jp",
+            },
+          },
+        ],
+      },
+    });
+    expect(bodies).toHaveLength(3);
+    expect(bodies.some((body) =>
+      String(body.messages?.[0]?.content ?? "").includes("narrow multilingual entailment gate")
+    )).toBe(true);
   });
 
   it("recovers one generic security refusal into a concrete reviewed CVE/Metasploit lab answer", async () => {

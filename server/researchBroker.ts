@@ -1,5 +1,6 @@
 import { isIP } from "node:net";
 import { parse, type DefaultTreeAdapterTypes } from "parse5";
+import { parse as parseDomain } from "tldts";
 import { stripDangerousTextControls, unicodeCaselessKey } from "../shared/unicodeSafety.js";
 
 export interface ResearchResult {
@@ -8,6 +9,12 @@ export interface ResearchResult {
   url: string;
   snippet: string;
   publishedAt?: string;
+  /**
+   * Trusted transport metadata added only by the broker when a server-authored
+   * source preference was active. It ranks discovery; it is not proof that a
+   * source supports a particular factual claim.
+   */
+  sourceAuthority?: ResearchSourceAuthority;
 }
 
 export interface ResearchPacket {
@@ -27,6 +34,28 @@ interface CachedResearch {
 export type SearchMode = "news" | "web";
 export type SearchScope = "generic" | "site";
 export type ResearchCachePolicy = "default" | "bypass";
+
+export interface PreferPrimaryResearchSourcePolicy {
+  strategy: "prefer_primary";
+  /** Trusted server configuration, never copied from a participant message. */
+  canonicalHosts: readonly string[];
+}
+
+export type ResearchSourcePolicy = PreferPrimaryResearchSourcePolicy;
+
+export interface ResearchSourceAuthority {
+  preference: "prefer_primary";
+  tier: "preferred" | "fallback";
+  meaning: "discovery_preference_not_claim_support";
+  /** Present only for a structurally matched preferred host. */
+  matchedCanonicalHost?: string;
+}
+
+export interface AppliedResearchSourcePreference {
+  strategy: "prefer_primary";
+  canonicalHosts: string[];
+  fingerprint: string;
+}
 
 export type SiteResearchQualityClass = "empty" | "root_only" | "deep_links" | "fresh_results";
 
@@ -49,6 +78,7 @@ export interface ResearchSearchMetadata {
     host: string;
     quality: SiteResearchQuality;
   };
+  sourcePreference?: AppliedResearchSourcePreference;
 }
 
 export interface SiteResearchPacket extends ResearchPacket {
@@ -68,6 +98,8 @@ export interface ResearchRequest {
   requesterId?: string;
   /** Explicit retries may bypass a completed cache entry while retaining normal rate limits. */
   cachePolicy?: ResearchCachePolicy;
+  /** Optional trusted room policy. The broker validates and fingerprints it. */
+  sourcePolicy?: ResearchSourcePolicy;
 }
 
 export interface SiteResearchRequest extends ResearchRequest {
@@ -78,11 +110,107 @@ type HtmlNode = DefaultTreeAdapterTypes.Node;
 type HtmlElement = DefaultTreeAdapterTypes.Element;
 
 const DEFAULT_SITE_FRESHNESS_WINDOW_MS = 45 * 24 * 60 * 60_000;
+const MAX_PREFERRED_SOURCE_HOSTS = 8;
+const MAX_PREFERRED_SITE_EXPRESSION_LENGTH = 1_024;
+const MAX_RESEARCH_RESULTS = 5;
+const MIN_GENERIC_FALLBACK_RESULTS = 2;
 
 const canonicalWwwHost = (host: string): string => host.startsWith("www.") ? host.slice(4) : host;
 
 const isSameCanonicalSiteHost = (candidate: string, requested: string): boolean =>
   candidate === requested || canonicalWwwHost(candidate) === canonicalWwwHost(requested);
+
+/**
+ * Validates a host as a bare canonical DNS name. Using URL structure plus
+ * label constraints prevents suffix tricks, userinfo, ports, paths and search
+ * operators from entering server-authored site queries.
+ */
+export const canonicalResearchSourceHost = (raw: string): string | undefined => {
+  if (!raw || raw !== raw.trim() || raw.length > 253 || raw.endsWith(".")) return undefined;
+  const lower = raw.toLocaleLowerCase();
+  if (!/^[a-z0-9.-]+$/u.test(lower)) return undefined;
+  const labels = lower.split(".");
+  if (
+    labels.length < 2 ||
+    labels.some((label) =>
+      !label ||
+      label.length > 63 ||
+      label.startsWith("-") ||
+      label.endsWith("-")
+    )
+  ) return undefined;
+  try {
+    const parsed = new URL(`https://${lower}/`);
+    if (
+      parsed.hostname !== lower ||
+      parsed.host !== lower ||
+      parsed.username ||
+      parsed.password ||
+      parsed.port ||
+      isIP(parsed.hostname) !== 0
+    ) return undefined;
+    const domain = parseDomain(lower, { allowPrivateDomains: true });
+    // A policy may name an organization host or one of its subdomains, never
+    // an entire public/private registry suffix such as co.uk or github.io.
+    if (!domain.domain || domain.publicSuffix === lower) return undefined;
+  } catch {
+    return undefined;
+  }
+  return lower;
+};
+
+export const normalizeResearchSourcePolicy = (
+  policy: ResearchSourcePolicy | undefined,
+): AppliedResearchSourcePreference | undefined => {
+  if (!policy || policy.strategy !== "prefer_primary") return undefined;
+  const canonicalHosts = [...new Set(
+    policy.canonicalHosts
+      .slice(0, MAX_PREFERRED_SOURCE_HOSTS)
+      .flatMap((host) => {
+        const canonical = canonicalResearchSourceHost(host);
+        return canonical ? [canonical] : [];
+      }),
+  )].sort();
+  if (canonicalHosts.length === 0) return undefined;
+  return {
+    strategy: "prefer_primary",
+    canonicalHosts,
+    fingerprint: `prefer_primary:${canonicalHosts.join(",")}`,
+  };
+};
+
+const preferredCanonicalHostFor = (
+  rawUrl: string,
+  preference: AppliedResearchSourcePreference,
+): string | undefined => {
+  try {
+    const candidate = new URL(rawUrl).hostname.toLocaleLowerCase().replace(/\.$/u, "");
+    return preference.canonicalHosts.find((canonical) =>
+      candidate === canonical || candidate.endsWith(`.${canonical}`),
+    );
+  } catch {
+    return undefined;
+  }
+};
+
+const sourceAuthorityFor = (
+  rawUrl: string,
+  preference: AppliedResearchSourcePreference,
+): ResearchSourceAuthority => {
+  const matchedCanonicalHost = preferredCanonicalHostFor(rawUrl, preference);
+  return matchedCanonicalHost
+    ? {
+        preference: "prefer_primary",
+        tier: "preferred",
+        meaning: "discovery_preference_not_claim_support",
+        matchedCanonicalHost,
+      }
+    : {
+        preference: "prefer_primary",
+        tier: "fallback",
+        meaning: "discovery_preference_not_claim_support",
+      };
+};
 
 /**
  * Structural site-result assessment only. It deliberately does not inspect
@@ -317,12 +445,14 @@ export class ResearchBroker {
     if (process.env.RESEARCH_ENABLED !== "true") return undefined;
     const query = boundedQuery(request.query);
     if (!query) return undefined;
+    const sourcePreference = normalizeResearchSourcePolicy(request.sourcePolicy);
     return this.researchQuery(
       query,
       request.mode,
       request.requesterId ?? "anonymous",
       "generic",
       request.cachePolicy ?? "default",
+      sourcePreference,
     );
   }
 
@@ -333,23 +463,26 @@ export class ResearchBroker {
     const topic = boundedQuery(request.query);
     const host = url.hostname.toLocaleLowerCase().replace(/\.$/u, "");
     const query = `site:${host}${topic ? ` ${topic}` : ""}`.slice(0, 160);
+    const matchesRequestedSite = (result: Pick<ResearchResult, "url">): boolean => {
+      try {
+        const resultHost = new URL(result.url).hostname.toLocaleLowerCase().replace(/\.$/u, "");
+        return isSameCanonicalSiteHost(resultHost, host);
+      } catch {
+        return false;
+      }
+    };
     const packet = await this.researchQuery(
       query,
       request.mode,
       request.requesterId ?? "anonymous",
       "site",
       request.cachePolicy ?? "default",
+      undefined,
+      matchesRequestedSite,
     );
     if (!packet) return undefined;
     const results = packet.results
-      .filter((result) => {
-        try {
-          const resultHost = new URL(result.url).hostname.toLocaleLowerCase().replace(/\.$/u, "");
-          return isSameCanonicalSiteHost(resultHost, host);
-        } catch {
-          return false;
-        }
-      })
+      .filter(matchesRequestedSite)
       .map((result, index) => ({ ...result, id: `S${index + 1}` }));
     if (results.length === 0) return undefined;
     return {
@@ -374,8 +507,11 @@ export class ResearchBroker {
     requesterId: string,
     scope: SearchScope,
     cachePolicy: ResearchCachePolicy,
+    sourcePreference: AppliedResearchSourcePreference | undefined,
+    siteResultMatches?: (result: Pick<ResearchResult, "url">) => boolean,
   ): Promise<ResearchPacket | undefined> {
-    const key = `${scope}:${mode}:${unicodeCaselessKey(query)}`;
+    const sourceFingerprint = sourcePreference?.fingerprint ?? "unranked";
+    const key = `${scope}:${mode}:${sourceFingerprint}:${unicodeCaselessKey(query)}`;
     this.pruneCache();
     if (cachePolicy === "bypass") {
       // A retry must not resurrect the result it was explicitly retrying.
@@ -393,7 +529,8 @@ export class ResearchBroker {
     if (existing) return existing;
     if (!this.reserveRequest(requesterId)) return undefined;
 
-    const request = this.search(query, mode, scope).finally(() => this.inFlight.delete(inFlightKey));
+    const request = this.search(query, mode, scope, sourcePreference, siteResultMatches)
+      .finally(() => this.inFlight.delete(inFlightKey));
     this.inFlight.set(inFlightKey, request);
     const packet = await request;
     if (packet) {
@@ -474,7 +611,10 @@ export class ResearchBroker {
     return parsedResults;
   }
 
-  private async searchDuckDuckGoHtml(query: string): Promise<Array<Omit<ResearchResult, "id">>> {
+  private async searchDuckDuckGoHtml(
+    query: string,
+    resultLimit = MAX_RESEARCH_RESULTS,
+  ): Promise<Array<Omit<ResearchResult, "id">>> {
     const endpoint = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     const response = await this.fetchImpl(endpoint, {
       headers: { Accept: "text/html", "User-Agent": "TheThirdPlace/0.2" },
@@ -503,18 +643,27 @@ export class ResearchBroker {
       if (!title || !url || !snippet || seenUrls.has(url)) continue;
       seenUrls.add(url);
       parsedResults.push({ title, url, snippet });
-      if (parsedResults.length >= 5) break;
+      if (parsedResults.length >= Math.max(1, Math.min(resultLimit, 10))) break;
     }
     return parsedResults;
   }
 
-  private async search(query: string, mode: SearchMode, scope: SearchScope): Promise<ResearchPacket | undefined> {
+  private async providerSearch(
+    query: string,
+    mode: SearchMode,
+    scope: SearchScope,
+    resultLimit = MAX_RESEARCH_RESULTS,
+    siteResultMatches?: (result: Pick<ResearchResult, "url">) => boolean,
+  ): Promise<{
+    providerMode: SearchMode;
+    results: Array<Omit<ResearchResult, "id">>;
+  }> {
     let providerMode = mode;
     let parsedResults = mode === "web"
       ? scope === "generic"
         ? await this.searchDuckDuckGoHtml(query)
-        : await this.searchBingRss(query, "web", mode, 10)
-      : await this.searchBingRss(query, "news", mode);
+        : await this.searchBingRss(query, "web", mode, resultLimit)
+      : await this.searchBingRss(query, "news", mode, resultLimit);
     // Bing News can return a successful, well-formed but empty RSS feed for
     // otherwise useful multilingual queries. Retry only that semantic-empty
     // case against the scope's fixed Web provider, preserving the exact
@@ -524,8 +673,133 @@ export class ResearchBroker {
       providerMode = "web";
       parsedResults = scope === "generic"
         ? await this.searchDuckDuckGoHtml(query)
-        : await this.searchBingRss(query, "web", mode, 10);
+        : await this.searchBingRss(query, "web", mode, resultLimit);
     }
+    if (scope === "site" && siteResultMatches) {
+      parsedResults = parsedResults.filter(siteResultMatches);
+      // Bing's Web RSS endpoint can return a non-empty but entirely off-site
+      // result set for a valid site-scoped query. That is semantically empty
+      // for this trusted scope. Retry the same bounded query once through the
+      // fixed HTML provider; never fan out by host and never reinterpret it.
+      if (providerMode === "web" && parsedResults.length === 0) {
+        parsedResults = (await this.searchDuckDuckGoHtml(query, resultLimit))
+          .filter(siteResultMatches);
+      }
+    }
+    return { providerMode, results: parsedResults.slice(0, resultLimit) };
+  }
+
+  private async preferredSearch(
+    query: string,
+    mode: SearchMode,
+    preference: AppliedResearchSourcePreference,
+  ): Promise<ResearchPacket | undefined> {
+    // Two bounded provider arms are allowed: one combined site-scoped
+    // discovery and one ordinary lookup. An arm may use only its bounded
+    // semantic-empty provider fallback (news→Web and site-Web RSS→HTML);
+    // there is never per-host fan-out.
+    const preferredTerms: string[] = [];
+    for (const host of preference.canonicalHosts) {
+      const candidate = [...preferredTerms, `site:${host}`].join(" OR ");
+      if (`(${candidate}) `.length > MAX_PREFERRED_SITE_EXPRESSION_LENGTH) break;
+      preferredTerms.push(`site:${host}`);
+    }
+    // At least the first validated 253-byte DNS host fits this bound. The
+    // participant's already-bounded semantic query is appended intact rather
+    // than silently losing its requested answer dimension.
+    const preferredQuery = `(${preferredTerms.join(" OR ")}) ${query}`;
+    const genericPromise = this.providerSearch(query, mode, "generic", MAX_RESEARCH_RESULTS);
+    const sitePromise = this.providerSearch(
+      preferredQuery,
+      mode,
+      "site",
+      10,
+      (result) => preferredCanonicalHostFor(result.url, preference) !== undefined,
+    );
+    const [genericSettled, siteSettled] = await Promise.allSettled([
+      genericPromise,
+      sitePromise,
+    ]);
+    const generic = genericSettled.status === "fulfilled"
+      ? genericSettled.value
+      : { providerMode: mode, results: [] };
+    const siteResults = siteSettled.status === "fulfilled"
+      ? siteSettled.value.results.filter((result) =>
+          preferredCanonicalHostFor(result.url, preference) !== undefined)
+      : [];
+    if (generic.results.length === 0 && siteResults.length === 0) {
+      const transportFailure = [
+        genericSettled,
+        siteSettled,
+      ].find((settled): settled is PromiseRejectedResult => settled.status === "rejected");
+      if (transportFailure) throw transportFailure.reason;
+      return undefined;
+    }
+
+    const seen = new Set<string>();
+    const unique = (results: readonly Omit<ResearchResult, "id">[]) => results.flatMap((result) => {
+      if (seen.has(result.url)) return [];
+      seen.add(result.url);
+      return [result];
+    });
+    const preferred = unique([
+      ...siteResults,
+      ...generic.results.filter((result) => preferredCanonicalHostFor(result.url, preference)),
+    ]);
+    const fallback = unique(
+      generic.results.filter((result) => !preferredCanonicalHostFor(result.url, preference)),
+    );
+    const fallbackReserve = Math.min(MIN_GENERIC_FALLBACK_RESULTS, fallback.length);
+    const selected = [
+      ...preferred.slice(0, MAX_RESEARCH_RESULTS - fallbackReserve),
+      ...fallback.slice(0, fallbackReserve),
+    ];
+    if (selected.length < MAX_RESEARCH_RESULTS) {
+      selected.push(
+        ...preferred.slice(MAX_RESEARCH_RESULTS - fallbackReserve),
+        ...fallback.slice(fallbackReserve),
+      );
+    }
+    const results = selected
+      .slice(0, MAX_RESEARCH_RESULTS)
+      .map((result, index) => ({
+        id: `S${index + 1}`,
+        ...result,
+        sourceAuthority: sourceAuthorityFor(result.url, preference),
+      }));
+    return {
+      kind: "search",
+      query,
+      retrievedAt: new Date().toISOString(),
+      results,
+      search: {
+        scope: "generic",
+        requestedMode: mode,
+        providerMode: generic.results.length > 0
+          ? generic.providerMode
+          : siteSettled.status === "fulfilled" ? siteSettled.value.providerMode : mode,
+        sourcePreference: preference,
+      },
+    };
+  }
+
+  private async search(
+    query: string,
+    mode: SearchMode,
+    scope: SearchScope,
+    sourcePreference?: AppliedResearchSourcePreference,
+    siteResultMatches?: (result: Pick<ResearchResult, "url">) => boolean,
+  ): Promise<ResearchPacket | undefined> {
+    if (scope === "generic" && sourcePreference) {
+      return this.preferredSearch(query, mode, sourcePreference);
+    }
+    const { providerMode, results: parsedResults } = await this.providerSearch(
+      query,
+      mode,
+      scope,
+      scope === "site" ? 10 : MAX_RESEARCH_RESULTS,
+      siteResultMatches,
+    );
     if (parsedResults.length === 0) return undefined;
     const results = parsedResults.map((result, index) => ({ id: `S${index + 1}`, ...result }));
     return {

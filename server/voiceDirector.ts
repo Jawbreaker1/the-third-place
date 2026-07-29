@@ -310,6 +310,13 @@ const analysisInputFor = (
       id: room.channelId,
       name: channel?.public.name ?? room.channelId,
       ...(channel?.topic.brief ? { topic: channel.topic.brief.slice(0, 500) } : {}),
+      ...(channel?.groundingPolicy
+        ? {
+            groundingPolicy: {
+              sourceRequiredFor: [...channel.groundingPolicy.sourceRequiredFor],
+            },
+          }
+        : {}),
     },
     latestMessage: {
       id: entry.id,
@@ -758,6 +765,9 @@ export class VoiceDirector {
       inventory: VOICE_CAPABILITY_INVENTORY,
       intent: entry.text,
       requesterId: entry.speakerId,
+      ...(getChannelProfile(room.channelId)?.researchSourcePolicy
+        ? { researchSourcePolicy: getChannelProfile(room.channelId)!.researchSourcePolicy }
+        : {}),
     };
     const availableCapabilities = this.options.capabilityRegistry.available(capabilityContext);
     let analysis: TurnAnalysis | undefined;

@@ -19,6 +19,7 @@ import { ActorChannelRuntime } from "./actorChannels.js";
 import {
   CHANNELS,
   CONVERSATION_REGISTERS,
+  ambientPremiseCanOpenWithoutResearch,
   consideredLeadWordRange,
   getChannelProfile,
   type AmbientMode,
@@ -1823,6 +1824,7 @@ export function boundedThreadResearch(
       ...(Number.isFinite(publishedAtMs) && publishedAtMs <= now + 5 * 60_000
         ? { publishedAt: new Date(publishedAtMs).toISOString() }
         : {}),
+      ...(result.sourceAuthority ? { sourceAuthority: { ...result.sourceAuthority } } : {}),
     }];
   }).slice(0, 3);
   if (results.length === 0) return undefined;
@@ -3903,6 +3905,13 @@ export class SocialDirector {
           id: input.channelId,
           name: channel?.public.name ?? input.channelId,
           topic: channel?.topic.brief,
+          ...(channel?.groundingPolicy
+            ? {
+                groundingPolicy: {
+                  sourceRequiredFor: [...channel.groundingPolicy.sourceRequiredFor],
+                },
+              }
+            : {}),
         },
         latestMessage: latest,
         recentMessages: uniqueRecent,
@@ -4001,13 +4010,18 @@ export class SocialDirector {
     requesterId: string,
     allowSearch: boolean,
     medium: "public" | "dm",
+    channelId?: string,
   ): CapabilityInvocation | undefined {
+    const researchSourcePolicy = channelId
+      ? getChannelProfile(channelId)?.researchSourcePolicy
+      : undefined;
     return this.capabilityRegistry.compile(analysis, {
       medium,
       candidateSet,
       allowSearch,
       intent,
       requesterId,
+      ...(researchSourcePolicy ? { researchSourcePolicy } : {}),
     });
   }
 
@@ -4308,6 +4322,7 @@ export class SocialDirector {
       human.id,
       Boolean(persona.canResearch),
       "dm",
+      latest.channelId,
     );
     const evidenceExecutionRequested = Boolean(invocation);
     const dmRequestOwnerIds = (
@@ -4806,6 +4821,7 @@ export class SocialDirector {
       human.id,
       true,
       "public",
+      trigger.channelId,
     );
     let invocation = classifiedInvocation;
     let autoSharedLinkAttempt: AutoSharedLinkAttempt | undefined;
@@ -5027,11 +5043,15 @@ export class SocialDirector {
             ? detailedExpertPlan.preferredOwner
             : selected[0])
       : undefined;
-    if (responseExpected && requestOwner && claimedDeliveries.length === 0) {
+    if ((responseExpected || evidenceMustAnswer) && requestOwner && claimedDeliveries.length === 0) {
       // A successful multilingual semantic classification is the durability
-      // barrier for ordinary questions too. Persist the chosen accountable
-      // resident before generation so provider/reviewer failure or restart
-      // cannot turn an expected answer into unexplained silence.
+      // barrier for ordinary questions. A trusted typed evidence execution is
+      // an equally strong server-owned delivery contract even when the model's
+      // independent intent tuple is under-confident or internally inconsistent.
+      // Persist the chosen accountable resident before generation so provider,
+      // retrieval or reviewer failure cannot turn either request into
+      // unexplained silence. Passive automatic-link reads remain excluded by
+      // evidenceMustAnswer above.
       const registeredExpectedTurn = this.store.registerPendingPublicTurn(trigger.id, {
         targetPersonaIds: [requestOwner.id],
         deliveryKind: "expected",
@@ -6297,7 +6317,8 @@ export class SocialDirector {
     if (!profile || profile.ambientPremises.length === 0) return undefined;
     const recentSeeds = this.recentAmbientSeedsByChannel.get(channelId) ?? [];
     const persistedCurrent = this.ambientEpisodeLedger?.current(channelId);
-    const rotationCandidates = profile.ambientPremises.map((premise, index) => {
+    const rotationCandidates = profile.ambientPremises.flatMap((premise, index) => {
+      if (!ambientPremiseCanOpenWithoutResearch(profile, index)) return [];
       const semanticKey = ambientSeedKey(channelId, premise);
       const semanticFamily = profile.ambientPremiseFamilies?.[index] ?? `unclassified-${semanticKey.slice(-16)}`;
       const sameAsPersistedCurrent = Boolean(
@@ -6310,7 +6331,7 @@ export class SocialDirector {
         semanticKey,
         semanticFamily,
       }) ?? false;
-      return {
+      return [{
         premise,
         semanticKey,
         semanticFamily,
@@ -6322,7 +6343,7 @@ export class SocialDirector {
         lastFamilyUsedAt: this.ambientEpisodeLedger?.semanticLastUsedAt(channelId, {
           semanticFamily,
         }),
-      };
+      }];
     });
     const eligibleSeeds = ambientSeedRotationPool(rotationCandidates, recentSeeds, now);
     if (eligibleSeeds.length === 0) return undefined;
@@ -6765,6 +6786,9 @@ export class SocialDirector {
       query: seed.query,
       mode: seed.mode,
       requesterId,
+      ...(getChannelProfile(channelId)?.researchSourcePolicy
+        ? { sourcePolicy: getChannelProfile(channelId)!.researchSourcePolicy }
+        : {}),
     }).catch((error) => {
       console.warn("Autonomous research lookup failed safely:", error instanceof Error ? error.message : error);
       return undefined;
@@ -6836,6 +6860,7 @@ export class SocialDirector {
         ...pageResult,
         id: `S${safelyReadResults.length + 1}`,
         ...(publishedAt ? { publishedAt } : {}),
+        ...(result.sourceAuthority ? { sourceAuthority: result.sourceAuthority } : {}),
       });
       // Keep a tiny provider-ranked fallback pool, but never expose the pool
       // to one generation. runAutonomousResearchConversation tries each page

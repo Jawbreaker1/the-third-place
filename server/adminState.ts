@@ -487,9 +487,11 @@ const runtimeChannelFromConfig = (
   profile.ambientMode = config.mode;
   profile.ambientPremises = [...config.seeds];
   if (seedsReplaced) {
-    // Families are index-aligned with the built-in seed list. Retaining them
-    // after an admin replacement would attach stale semantic identities.
+    // Families and grounding are index-aligned with the built-in seed list.
+    // Retaining either after an Admin replacement would attach stale semantic
+    // identity or a source requirement to unrelated custom text.
     delete profile.ambientPremiseFamilies;
+    delete profile.ambientPremiseGrounding;
   }
   // A built-in research lookup is trusted configuration for its original
   // topic. Reusing it after a complete topic replacement would silently post

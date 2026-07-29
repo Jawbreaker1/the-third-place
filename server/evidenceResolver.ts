@@ -1,9 +1,11 @@
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
 import type { PageReadRequest } from "./pageReader.js";
 import type {
+  AppliedResearchSourcePreference,
   ResearchPacket,
   ResearchResult,
   ResearchSearchMetadata,
+  ResearchSourceAuthority,
 } from "./researchBroker.js";
 import { validatePublicHttpsUrl } from "./safeHttpsFetch.js";
 
@@ -46,6 +48,7 @@ export interface ResolvedSearchEvidence {
 interface ReadCandidate {
   url: URL;
   publishedAt?: string;
+  sourceAuthority?: ResearchSourceAuthority;
 }
 
 interface AcceptedPage {
@@ -76,10 +79,12 @@ const boundedSearchMetadata = (
 ): ResearchSearchMetadata | undefined => {
   if (!search) return undefined;
   if (search.scope === "generic") {
+    const sourcePreference = boundedSourcePreference(search.sourcePreference);
     return {
       scope: "generic",
       requestedMode: search.requestedMode,
       providerMode: search.providerMode,
+      ...(sourcePreference ? { sourcePreference } : {}),
     };
   }
   const host = boundedText(search.site?.host ?? "", 253);
@@ -95,6 +100,62 @@ const boundedSearchMetadata = (
   };
 };
 
+const boundedCanonicalHost = (value: string): string | undefined => {
+  const host = boundedText(value, 253).toLocaleLowerCase();
+  if (!host || host !== value || !/^[a-z0-9.-]+$/u.test(host)) return undefined;
+  try {
+    const parsed = new URL(`https://${host}/`);
+    return parsed.hostname === host && parsed.host === host ? host : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const boundedSourcePreference = (
+  value: AppliedResearchSourcePreference | undefined,
+): AppliedResearchSourcePreference | undefined => {
+  if (!value || value.strategy !== "prefer_primary") return undefined;
+  const canonicalHosts = value.canonicalHosts
+    .slice(0, 8)
+    .flatMap((host) => {
+      const bounded = boundedCanonicalHost(host);
+      return bounded ? [bounded] : [];
+    });
+  if (
+    canonicalHosts.length === 0 ||
+    value.fingerprint !== `prefer_primary:${canonicalHosts.join(",")}`
+  ) return undefined;
+  return { strategy: "prefer_primary", canonicalHosts, fingerprint: value.fingerprint };
+};
+
+const boundedSourceAuthority = (
+  value: ResearchSourceAuthority | undefined,
+): ResearchSourceAuthority | undefined => {
+  if (
+    !value ||
+    value.preference !== "prefer_primary" ||
+    value.meaning !== "discovery_preference_not_claim_support"
+  ) return undefined;
+  if (value.tier === "fallback") {
+    return {
+      preference: "prefer_primary",
+      tier: "fallback",
+      meaning: "discovery_preference_not_claim_support",
+    };
+  }
+  const matchedCanonicalHost = value.matchedCanonicalHost
+    ? boundedCanonicalHost(value.matchedCanonicalHost)
+    : undefined;
+  return matchedCanonicalHost
+    ? {
+        preference: "prefer_primary",
+        tier: "preferred",
+        meaning: "discovery_preference_not_claim_support",
+        matchedCanonicalHost,
+      }
+    : undefined;
+};
+
 const boundedPacket = (packet: ResearchPacket, now: number): ResearchPacket => {
   const results = packet.results.flatMap((result) => {
     const url = validatePublicHttpsUrl(result.url);
@@ -102,12 +163,14 @@ const boundedPacket = (packet: ResearchPacket, now: number): ResearchPacket => {
     const id = boundedText(result.id, MAX_RESULT_ID_LENGTH);
     if (!id) return [];
     const publishedAt = safeInstant(result.publishedAt, now);
+    const sourceAuthority = boundedSourceAuthority(result.sourceAuthority);
     return [{
       id,
       title: boundedText(result.title, MAX_RESULT_TITLE_LENGTH),
       url: url.toString(),
       snippet: boundedText(result.snippet, MAX_RESULT_SNIPPET_LENGTH),
       ...(publishedAt ? { publishedAt } : {}),
+      ...(sourceAuthority ? { sourceAuthority } : {}),
     }];
   }).slice(0, MAX_SEARCH_RESULTS);
   const retrievedAt = safeInstant(packet.retrievedAt, now) ?? requestedAtFor(now);
@@ -133,9 +196,35 @@ const genericReadCandidates = (
     candidates.push({
       url,
       ...(result.publishedAt ? { publishedAt: result.publishedAt } : {}),
+      ...(result.sourceAuthority ? { sourceAuthority: result.sourceAuthority } : {}),
     });
   }
-  return candidates.slice(0, MAX_EXPANSION_ATTEMPTS);
+
+  const hasTrustedPreference = packet.search?.scope === "generic"
+    && packet.search.sourcePreference?.strategy === "prefer_primary";
+  if (!hasTrustedPreference) return candidates.slice(0, MAX_EXPANSION_ATTEMPTS);
+
+  const preferred = candidates.filter((candidate) => candidate.sourceAuthority?.tier === "preferred");
+  const fallback = candidates.filter((candidate) => candidate.sourceAuthority?.tier === "fallback");
+  if (preferred.length === 0 || fallback.length === 0) {
+    return candidates.slice(0, MAX_EXPANSION_ATTEMPTS);
+  }
+
+  // Preferred discovery results may all be broadly relevant landing pages.
+  // Keep their authority advantage, but reserve up to half of the bounded read
+  // window for generic fallbacks that may carry the specific answer.
+  const fallbackReserve = Math.min(2, fallback.length);
+  const selected = new Set<ReadCandidate>([
+    ...preferred.slice(0, MAX_EXPANSION_ATTEMPTS - fallbackReserve),
+    ...fallback.slice(0, fallbackReserve),
+  ]);
+  for (const candidate of candidates) {
+    if (selected.size >= MAX_EXPANSION_ATTEMPTS) break;
+    selected.add(candidate);
+  }
+  return candidates
+    .filter((candidate) => selected.has(candidate))
+    .slice(0, MAX_EXPANSION_ATTEMPTS);
 };
 
 const readCandidate = async (
@@ -163,6 +252,7 @@ const readCandidate = async (
         url: candidate.url.toString(),
         snippet,
         ...(publishedAt ? { publishedAt } : {}),
+        ...(candidate.sourceAuthority ? { sourceAuthority: candidate.sourceAuthority } : {}),
       },
     };
   } catch {
@@ -192,7 +282,9 @@ export const resolveSearchEvidence = async (
     return { packet: bounded, readiness: "retrieved", attemptedPages: 0, readPages: 0 };
   }
 
-  const candidates = genericReadCandidates(input.packet);
+  // Candidate balancing only acts on source-preference metadata after the
+  // packet and its authority annotations have passed the trust boundary.
+  const candidates = genericReadCandidates(bounded);
   if (candidates.length === 0) {
     return { packet: bounded, readiness: "retrieved", attemptedPages: 0, readPages: 0 };
   }

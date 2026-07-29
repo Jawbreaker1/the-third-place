@@ -2807,6 +2807,76 @@ describe("social director", () => {
     }));
   });
 
+  it("projects an optional room-grounding policy into Director turn analysis without changing other rooms", async () => {
+    const human = {
+      id: "guest-grounding-router",
+      name: "Sam",
+      kind: "human" as const,
+      status: "online" as const,
+      avatar: { color: "#345", accent: "#789", glyph: "S" },
+    };
+    const analyzeTurn = vi.fn(async () => classifiedTurn());
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore("/tmp/director-room-grounding-unused.json"),
+      { analyzeTurn, rememberDeliveredLine: vi.fn() } as never,
+      new ActorChannelRuntime(),
+      {} as never,
+      {
+        getRelation: vi.fn(() => undefined),
+        updateRelation: vi.fn(),
+        promptNote: vi.fn(() => undefined),
+        noteClassifiedMemoryFact: vi.fn(),
+      } as never,
+      () => [human, ...PERSONAS],
+      () => 1,
+    );
+    const analyze = async (channelId: "pingu" | "lobby") => {
+      const latest = createMessage(channelId, human.id, "Kan någon reda ut exakt vilken titel det är?");
+      return (director as unknown as {
+        analyzeHumanTurn: (input: {
+          medium: "public";
+          turnId: string;
+          channelId: string;
+          latest: typeof latest;
+          burst: Array<typeof latest>;
+          recent: Array<typeof latest>;
+          personas: typeof PERSONAS;
+          candidateSet: { requestedAt: string; candidates: never[] };
+          allowSearch: boolean;
+        }) => Promise<TurnAnalysis>;
+      }).analyzeHumanTurn({
+        medium: "public",
+        turnId: `public:${latest.id}`,
+        channelId,
+        latest,
+        burst: [latest],
+        recent: [],
+        personas: PERSONAS,
+        candidateSet: { requestedAt: latest.createdAt, candidates: [] },
+        allowSearch: false,
+      });
+    };
+
+    await analyze("pingu");
+    await analyze("lobby");
+    director.stop();
+
+    expect(analyzeTurn.mock.calls[0]?.[0].channel).toMatchObject({
+      id: "pingu",
+      groundingPolicy: {
+        sourceRequiredFor: [
+          "current_dynamic",
+          "exact_catalog_identity",
+          "canonical_narrative_detail",
+          "attribution_or_provenance",
+          "authenticity_or_valuation",
+        ],
+      },
+    });
+    expect(analyzeTurn.mock.calls[1]?.[0].channel).not.toHaveProperty("groundingPolicy");
+  });
+
   it("recalls an exact older public episode and appoints a real witness to answer", async () => {
     vi.useFakeTimers();
     const now = Date.parse("2026-07-14T14:00:00.000Z");
@@ -7143,6 +7213,83 @@ describe("social director", () => {
     expect(canonicalAutonomousResearchUrl("not a url")).toBeUndefined();
   });
 
+  it("applies the room-owned source preference to autonomous research and retains authority metadata", async () => {
+    const now = Date.parse("2026-07-29T12:00:00.000Z");
+    const sourceUrl = "https://www.pingu.jp/about/history";
+    const research = vi.fn(async () => ({
+      kind: "search" as const,
+      query: "official Pingu production history",
+      retrievedAt: new Date(now).toISOString(),
+      results: [{
+        id: "S1",
+        title: "Official history",
+        url: sourceUrl,
+        snippet: "A bounded official search result.",
+        sourceAuthority: {
+          preference: "prefer_primary" as const,
+          tier: "preferred" as const,
+          meaning: "discovery_preference_not_claim_support" as const,
+          matchedCanonicalHost: "pingu.jp",
+        },
+      }],
+    }));
+    const read = vi.fn(async () => ({
+      kind: "page" as const,
+      query: "official history",
+      retrievedAt: new Date(now).toISOString(),
+      results: [{
+        id: "S1",
+        title: "Official history",
+        url: sourceUrl,
+        snippet: "Bounded primary-source page evidence.",
+      }],
+    }));
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-pingu-source-policy-${process.pid}.json`),
+      {} as never,
+      new ActorChannelRuntime(),
+      { research } as never,
+      {} as never,
+      () => PERSONAS,
+      () => 1,
+      { now: () => now, pageReader: { read } as never, autonomousResearchEnabled: true },
+    );
+    const outcome = await (director as unknown as {
+      safelyReadAutonomousResult: (
+        channelId: string,
+        seed: AutonomousResearchSeed,
+      ) => Promise<{ research?: { results: Array<{ sourceAuthority?: unknown }> } }>;
+    }).safelyReadAutonomousResult("pingu", {
+      id: "pingu-history",
+      query: "official Pingu production history",
+      mode: "web",
+      discussionAngle: "Discuss one documented milestone.",
+    });
+
+    expect(research).toHaveBeenCalledWith({
+      query: "official Pingu production history",
+      mode: "web",
+      requesterId: "ambient-research:pingu",
+      sourcePolicy: {
+        strategy: "prefer_primary",
+        canonicalHosts: [
+          "pingu.jp",
+          "aardman.com",
+          "srf.ch",
+          "corporate.mattel.com",
+          "ppi.co.jp",
+        ],
+      },
+    });
+    expect(outcome.research?.results[0]?.sourceAuthority).toEqual({
+      preference: "prefer_primary",
+      tier: "preferred",
+      meaning: "discovery_preference_not_claim_support",
+      matchedCanonicalHost: "pingu.jp",
+    });
+  });
+
   it("retains source and preview URL dedupe after more than 160 newer room messages", () => {
     const store = new RoomStore(`/tmp/director-autonomous-url-history-${process.pid}.json`);
     const sourced = createMessage("lobby", "ai-mira", "an old sourced post");
@@ -11025,6 +11172,156 @@ describe("social director", () => {
         sources: [],
       });
       expect(replies[0]?.linkPreview).toBeUndefined();
+    } finally {
+      if (previousResearchEnabled === undefined) delete process.env.RESEARCH_ENABLED;
+      else process.env.RESEARCH_ENABLED = previousResearchEnabled;
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("durably retries a trusted evidence request when the independent intent tuple is under-confident", async () => {
+    vi.useFakeTimers();
+    const previousResearchEnabled = process.env.RESEARCH_ENABLED;
+    process.env.RESEARCH_ENABLED = "true";
+    const fixedNow = Date.parse("2026-07-15T12:40:00.000Z");
+    try {
+      const human = {
+        id: "guest-evidence-intent-gap",
+        name: "Guest",
+        kind: "human" as const,
+        status: "online" as const,
+        avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const store = new RoomStore(
+        `/tmp/director-evidence-intent-gap-${process.pid}-${Math.random()}.json`,
+        { now: () => fixedNow },
+      );
+      const incoming = createMessage(
+        "fnaf",
+        human.id,
+        "I may be mixing up the characters. Who actually says the quoted line?",
+        {
+          createdAt: new Date(fixedNow).toISOString(),
+          authorSnapshot: { ...human, status: "offline" },
+        },
+      );
+      store.addPublicMessage(incoming);
+      const query = "character who says the quoted line";
+      const analyzeTurn = vi.fn(async () => classifiedTurn({
+        // The live regression had a fully trusted evidence plan paired with
+        // this fail-closed intent tuple. Typed execution remains a stronger
+        // server-owned reply contract than the inconsistent optional label.
+        intent: {
+          kind: "other",
+          isQuestion: false,
+          replyExpected: "optional",
+          answerDepth: "normal",
+          confidence: 0,
+        },
+        evidence: {
+          need: "required",
+          action: "web_search",
+          confidence: 0.99,
+          goal: "identify the character who says the quoted line",
+          query,
+          urlRef: null,
+          searchMode: "web",
+          timeZone: null,
+          timeKind: null,
+          locationLabel: null,
+        },
+        capabilities: {
+          discussed: ["web_search"],
+          requestKind: "execute",
+          asksAboutAcoustics: false,
+          asksAboutAiIdentity: false,
+          asksForList: false,
+          confidence: 0.99,
+        },
+      }));
+      const research = vi.fn(async () => undefined);
+      let generationAttempt = 0;
+      const generateScene = vi.fn(async (request: {
+        requestOwnerIds: string[];
+        mustReplyIds: string[];
+        evidenceOutcome?: string;
+      }) => {
+        generationAttempt += 1;
+        // Primary generation and its bounded in-scene recovery both fail as
+        // they did in the live run. The durable recovery must still own the
+        // exact turn and eventually publish a reviewed failure report.
+        if (generationAttempt <= 2) return [];
+        const ownerId = request.requestOwnerIds[0]!;
+        expect(request.mustReplyIds).toContain(ownerId);
+        expect(request.evidenceOutcome).toBe("failed");
+        return [{
+          personaId: ownerId,
+          content: "That lookup did not give me a readable answer this time.",
+          source: "lm" as const,
+          sourceIds: [],
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        {
+          analyzeTurn,
+          generateScene,
+          rememberDeliveredLine: vi.fn(),
+          health: vi.fn(() => ({ queueDepth: 0 })),
+        } as never,
+        new ActorChannelRuntime(),
+        { research, researchSite: vi.fn(async () => undefined) } as never,
+        {
+          listProfiles: vi.fn(() => []),
+          getRelation: vi.fn(() => undefined),
+          updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined),
+          noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS],
+        () => 1,
+        {
+          now: () => fixedNow,
+          rng: () => 0.99,
+          weatherForecastProvider: null,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({
+              requestedAt: new Date(fixedNow).toISOString(),
+              candidates: [],
+            })),
+            read: vi.fn(async () => undefined),
+          } as never,
+        },
+      );
+
+      await (director as unknown as {
+        handleHumanBurst: (messages: Array<typeof incoming>, member: typeof human) => Promise<void>;
+      }).handleHumanBurst([incoming], human);
+
+      expect(generateScene).toHaveBeenCalledTimes(2);
+      expect(store.getAllMessages().filter((message) => message.replyToId === incoming.id)).toEqual([]);
+      expect(store.getPendingPublicTurns()).toEqual([
+        expect.objectContaining({
+          messageId: incoming.id,
+          deliveryKind: "expected",
+          targets: [expect.objectContaining({ attempts: 1 })],
+        }),
+      ]);
+
+      expect(director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true })).toBe(1);
+      await vi.runAllTimersAsync();
+      director.stop();
+
+      expect(generateScene).toHaveBeenCalledTimes(3);
+      expect(store.getAllMessages().filter((message) => message.replyToId === incoming.id)).toEqual([
+        expect.objectContaining({
+          content: "That lookup did not give me a readable answer this time.",
+          generation: "lm",
+        }),
+      ]);
+      expect(store.getPendingPublicTurns()).toEqual([]);
     } finally {
       if (previousResearchEnabled === undefined) delete process.env.RESEARCH_ENABLED;
       else process.env.RESEARCH_ENABLED = previousResearchEnabled;

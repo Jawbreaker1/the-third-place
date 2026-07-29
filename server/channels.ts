@@ -1,5 +1,6 @@
 import type { Channel } from "../shared/types.js";
 import type { PersonaStyleFingerprint } from "./personaStyle.js";
+import type { ResearchSourcePolicy } from "./researchBroker.js";
 
 export type ExpertiseLevel = "basic" | "casual" | "competent" | "advanced" | "specialist";
 
@@ -17,6 +18,7 @@ export type ExpertiseDomainId =
   | "financial-markets"
   | "football"
   | "fnaf"
+  | "pingu"
   | "warcraft"
   | "visualisation-3d"
   | "hobbies";
@@ -71,6 +73,26 @@ export interface ActiveRoomSocialMode {
 }
 
 export type AmbientMode = "discussion" | "casual" | "banter";
+export type AmbientPremiseGrounding = "none" | "fresh_research";
+
+/**
+ * Semantic claim classes for rooms where a requested factual answer should
+ * be grounded before a resident states it. These are intentionally about the
+ * requested answer dimension, not room names, subjects, languages or words.
+ */
+export const ROOM_GROUNDING_CLAIM_CLASSES = [
+  "current_dynamic",
+  "exact_catalog_identity",
+  "canonical_narrative_detail",
+  "attribution_or_provenance",
+  "authenticity_or_valuation",
+] as const;
+
+export type RoomGroundingClaimClass = (typeof ROOM_GROUNDING_CLAIM_CLASSES)[number];
+
+export interface RoomGroundingPolicy {
+  sourceRequiredFor: readonly RoomGroundingClaimClass[];
+}
 
 export type ConversationRegister =
   | "everyday"
@@ -161,6 +183,23 @@ export interface ChannelProfile {
    * may omit the projection when they provide unclassified custom premises.
    */
   ambientPremiseFamilies?: string[];
+  /**
+   * Grounding requirement parallel to `ambientPremises`. A fresh-research
+   * premise may enter only through the autonomous research path, never as an
+   * ordinary unsourced idle opening.
+   */
+  ambientPremiseGrounding?: AmbientPremiseGrounding[];
+  /**
+   * Optional room-owned evidence policy for factual answers requested by a
+   * participant. The multilingual semantic router applies these claim classes
+   * from meaning, never from room IDs or phrase matching.
+   */
+  groundingPolicy?: RoomGroundingPolicy;
+  /**
+   * Optional server-authored discovery preference. It changes result ranking,
+   * never the semantic truth of a source or the requirement for review.
+   */
+  researchSourcePolicy?: ResearchSourcePolicy;
   autonomousResearchSeeds?: AutonomousResearchSeed[];
   /**
    * Trusted scheduling preference for source-backed ambient threads. This is
@@ -224,6 +263,7 @@ export const scheduledRoomSocialModeAt = (
 export type AmbientPremiseCatalogEntry = readonly [
   familyId: string,
   premise: string,
+  grounding?: AmbientPremiseGrounding,
 ];
 
 /**
@@ -326,6 +366,17 @@ const AMBIENT_PREMISE_FAMILY_GROUPS = {
   "fnaf-fan-media": ["fnaf-theory-video-evidence", "fnaf-lets-play-performance", "fnaf-fan-song-afterlife", "fnaf-fan-animation-design"],
   "fnaf-origin-legacy": ["fnaf-indie-constraints", "fnaf-creator-decisions", "fnaf-mascot-horror-influence", "fnaf-episodic-discovery"],
 
+  "pingu-production-history": ["pingu-origin-dates", "pingu-production-roles", "pingu-era-signatures", "pingu-rights-revivals"],
+  "pingu-character-relationships": ["pingu-pinga-siblings", "pingu-robby-friendship", "pingu-pingi-affection", "pingu-family-boundaries"],
+  "pingu-episode-detective": ["pingu-scene-identification", "pingu-consequence-chain", "pingu-localized-titles", "pingu-prop-memory"],
+  "pingu-penguinese-performance": ["pingu-language-without-words", "pingu-beak-expression", "pingu-vocal-rhythm", "pingu-physical-acting"],
+  "pingu-merch-formats": ["pingu-retail-prize-format", "pingu-tags-provenance", "pingu-packaging-choice", "pingu-collaboration-merch"],
+  "pingu-plush-design": ["pingu-plush-silhouette", "pingu-clay-to-soft", "pingu-plush-material", "pingu-character-plush-fit"],
+  "pingu-collecting-culture": ["pingu-vintage-condition", "pingu-authenticity-evidence", "pingu-collection-boundaries", "pingu-display-cuddle"],
+  "pingu-japan-phenomenon": ["pingu-japan-broadcast", "pingu-city-shift", "pingu-japan-merch-ecosystem", "pingu-collaboration-design"],
+  "pingu-meme-afterlife": ["pingu-noot-reduction", "pingu-reaction-faces", "pingu-meme-entrypoint", "pingu-irony-sincerity"],
+  "pingu-adaptation-future": ["pingu-clay-cg-comparison", "pingu-aardman-fit", "pingu-modern-format", "pingu-continuity-setting"],
+
   "visual-lighting-material": ["lighting-materials", "denoising-detail", "material-response", "procedural-materials"],
   "visual-camera-composition": ["camera-pipeline", "art-direction", "lens-distortion", "depth-of-field"],
   "visual-realtime-performance": ["realtime-constraints", "instancing-memory", "lod-transitions", "silhouette-priority"],
@@ -357,11 +408,17 @@ for (const [family, keys] of Object.entries(AMBIENT_PREMISE_FAMILY_GROUPS)) {
 
 export const defineAmbientPremiseCatalog = (
   entries: readonly AmbientPremiseCatalogEntry[],
-): Pick<ChannelProfile, "ambientPremises" | "ambientPremiseFamilies"> => ({
+): Pick<ChannelProfile, "ambientPremises" | "ambientPremiseFamilies" | "ambientPremiseGrounding"> => ({
   ambientPremiseFamilies: entries.map(([familyId]) =>
     AMBIENT_PREMISE_FAMILY_BY_KEY.get(familyId) ?? familyId),
   ambientPremises: entries.map(([, premise]) => premise),
+  ambientPremiseGrounding: entries.map(([, , grounding]) => grounding ?? "none"),
 });
+
+export const ambientPremiseCanOpenWithoutResearch = (
+  profile: Pick<ChannelProfile, "ambientPremiseGrounding">,
+  index: number,
+): boolean => (profile.ambientPremiseGrounding?.[index] ?? "none") === "none";
 
 const AUTHORED_CHANNEL_PROFILES: ChannelProfile[] = [
   {
@@ -1543,6 +1600,188 @@ const AUTHORED_CHANNEL_PROFILES: ChannelProfile[] = [
   },
   {
     public: {
+      id: "pingu",
+      name: "pingu",
+      description: "Episodes, clay craft, character lore, memes and an alarmingly serious plushie archive.",
+      icon: "🐧",
+    },
+    expertiseDomain: "pingu",
+    topic: {
+      brief: "Pingu: the Swiss stop-motion television series, its production history and creators, characters and relationships, episode events, Penguinese performance, physical comedy, Pingu in the City, Japan, memes, plushies, merchandise and collecting",
+      tags: [
+        "Pingu",
+        "Pinga",
+        "Robby the Seal",
+        "Pingi",
+        "Mother and Father",
+        "Grandfather",
+        "character relationships",
+        "episodes",
+        "Swiss television",
+        "stop-motion",
+        "clay animation",
+        "plasticine puppets",
+        "Otmar Gutmann",
+        "Harald Muecke",
+        "Penguinese",
+        "physical comedy",
+        "Pingu in the City",
+        "Polygon Pictures",
+        "Aardman",
+        "Mattel",
+        "Japan",
+        "memes",
+        "noot noot",
+        "plushies",
+        "merchandise",
+        "collectibles",
+        "vintage toys",
+      ],
+      freshnessRule: "Current releases, Aardman/Mattel status, streaming, Japan events/collabs, products, licensing, availability, prices, rarity, authenticity and value require supplied fresh evidence. Distinguish the 1980 test, 1986 pilot, 1987 Berlin screening, 1990 Swiss TV debut, original Swiss clay, later British production, 2017 Japanese CG series and any future series. Episode identity, events, titles, numbers, translations, production credits, makers, editions and provenance are precision-sensitive. Without supplied evidence, repeat only the participant's clues, state uncertainty or ask one discriminating question; never add a scene or object detail as support; never complete a plausible gap as fact. Fan edits, memes and fan labels are fandom, not episodes or canon; Penguinese is not all 'noot noot'.",
+    },
+    groundingPolicy: {
+      sourceRequiredFor: [
+        "current_dynamic",
+        "exact_catalog_identity",
+        "canonical_narrative_detail",
+        "attribution_or_provenance",
+        "authenticity_or_valuation",
+      ],
+    },
+    researchSourcePolicy: {
+      strategy: "prefer_primary",
+      canonicalHosts: [
+        "pingu.jp",
+        "aardman.com",
+        "srf.ch",
+        "corporate.mattel.com",
+        "ppi.co.jp",
+      ],
+    },
+    conversationRegister: "fandom",
+    ambientMode: "casual",
+    ambientReactionPalette: ["🐧", "👀", "😭", "✨", "😂", "🧊"],
+    conversationGuidance: "This is a deeply informed Pingu fan room, not generic children's-TV nostalgia and not a 'noot noot' soundboard. Residents can identify and argue about concrete episode scenes, trace how Pingu, Pinga, Robby, Pingi, the parents and recurring friends treat one another, compare production eras, notice tiny puppet and sound details, and discuss the surprisingly emotional or unsettling moments alongside the physical comedy. Pingu has meaningful everyday continuity and recurring relationships, but not a hidden serialized mythology: never manufacture secret lore, a rigid timeline or unsupported family trees merely because another fandom room has them. Production history should distinguish documented creator and collaborator roles rather than claiming one person made everything. Japan is a first-class part of the fandom through its broadcast history, Pingu in the City, exhibitions, collaborations and extensive merchandise culture; avoid stereotypes and require supplied evidence for current claims. Plushies, prize items, figures, tags, manufacturers, packaging, condition and display choices are first-class conversation topics rather than an afterthought. A collector question may earn a longer answer that separates retail, crane-game, lottery, popup and exhibition items, while a joke or favourite-character reaction should remain quick. Help identify an episode or object from concrete visible or remembered clues, but state uncertainty when the title, maker, year, authenticity or market value is not established. Another participant's confident claim is a lead, not verification: correct it naturally when supplied evidence disagrees and never let repeated chat turn it into fact. Never invent owning a collection, buying a rare item, watching the original broadcast, visiting an exhibition or meeting the creators. Let residents have peculiar favourites and real disagreements about character behaviour, adaptations and plush design without forcing every thread back to the same meme.",
+    expertiseOverrides: {
+      "ai-tess": { level: "specialist", specialties: ["plushies and soft-toy construction", "licensed merchandise formats", "collecting, condition and display choices"] },
+      "ai-otto": { level: "advanced", specialties: ["Swiss production history", "original television eras", "creator and collaborator context", "episode legacy"] },
+      "ai-juno": { level: "advanced", specialties: ["Japanese fandom", "memes and internet afterlife", "adaptations", "pop-culture context"] },
+      "ai-pixel": { level: "competent", specialties: ["stop-motion craft", "puppet silhouettes", "props and sets", "character design"] },
+      "ai-mira": { level: "competent", specialties: ["character relationships", "episode identification", "emotional beats", "newcomer-friendly explanations"] },
+      "ai-bosse": { level: "competent", specialties: ["physical-comedy arguments", "memes", "odd episode moments", "character favourites"] },
+      "ai-linnea": { level: "competent", specialties: ["source verification", "production-era boundaries", "current releases and merchandise evidence"] },
+      "ai-nox": { level: "competent", specialties: ["wordless storytelling", "sound and vocal performance", "strange or unsettling scenes"] },
+    },
+    ...defineAmbientPremiseCatalog([
+      ["pingu-origin-dates", "Pingu can plausibly have an origin year, a pilot anniversary and a television-series anniversary without any of them being fake. Separate only the supplied documented milestones and argue which one a fan celebration should foreground.", "fresh_research"],
+      ["pingu-production-roles", "Otmar Gutmann is the central creator credit, but animation is collaborative. Take one supplied production credit or role and discuss what it contributed without turning the history into a one-person legend.", "fresh_research"],
+      ["pingu-era-signatures", "Which kinds of evidence—image texture, materials, setting or credits—would you check to distinguish Pingu production periods? Debate the method without asserting an unsupplied period detail."],
+      ["pingu-rights-revivals", "A character can pass between studios and owners while still feeling recognizable. Debate which creative trait Pingu must retain across a revival and which part is allowed to change."],
+
+      ["pingu-pinga-siblings", "Pingu being the older sibling gives him responsibility but not automatic moral victory. Debate what generally makes their sibling friction feel fair, funny or painfully familiar without inventing a particular episode."],
+      ["pingu-robby-friendship", "Pingu and Robby can cooperate, show off, annoy each other and repair their friendship. Debate which kinds of body-language cue make that friendship convincing without claiming a specific unsupplied scene."],
+      ["pingu-pingi-affection", "Pingu's affection for Pingi is often expressed through performance and embarrassment rather than dialogue. Discuss one kind of action that communicates the feeling without flattening Pingi into a prize."],
+      ["pingu-family-boundaries", "Imagine a clearly hypothetical everyday family rule that Pingu breaks. Debate which consequence would feel fair, funny or surprisingly intense without presenting the setup as a real episode."],
+
+      ["pingu-scene-identification", "When somebody remembers one strange Pingu image but not the title, which clues narrow it best: setting, characters, prop or consequence? Debate the method and never invent the missing image or answer."],
+      ["pingu-consequence-chain", "Invent an explicitly hypothetical Pingu-shaped setup where one tiny act of impatience becomes escalating chaos. Mark it as a thought experiment, then debate where he could still have stopped it."],
+      ["pingu-localized-titles", "The same episode may have different translated titles or catalogue numbers. Debate whether fans should identify it by official local title, memorable scene or production order without inventing a universal answer."],
+      ["pingu-prop-memory", "Why can a simple prop carry an almost wordless comedy and stay in memory longer than a title? Discuss the mechanism generally; name a real Pingu prop only when the conversation or supplied evidence establishes it."],
+
+      ["pingu-language-without-words", "Penguinese communicates story without ordinary vocabulary. Choose whether pitch, rhythm, repetition, gesture or another character's reaction is doing most of the semantic work in one kind of scene."],
+      ["pingu-beak-expression", "Pingu's trumpet-shaped beak can signal excitement, outrage or pure comic distortion. Debate where expressive animation ends and the later 'noot noot' meme begins."],
+      ["pingu-vocal-rhythm", "Two characters can sound as if they are having a precise argument even when no words translate. Describe the turn-taking cue that lets the audience follow who is accusing, denying or conceding."],
+      ["pingu-physical-acting", "A puppet's pause, lean, flipper movement or whole-body collapse can land harder than dialogue. Pick one physical-comedy beat and let another resident read a different emotion into it."],
+
+      ["pingu-retail-prize-format", "If the same character were released as an ordinary retail plush, crane prize, lottery reward or popup exclusive, how might each format change design and collecting appeal? Keep it hypothetical unless a supplied product establishes otherwise."],
+      ["pingu-tags-provenance", "Manufacturer tags, copyright lines, dates and distribution marks can tell a richer story than a seller's title. Pick the provenance clue worth checking first and explain what it still cannot prove."],
+      ["pingu-packaging-choice", "A Pingu figure or mascot can be helped by packaging that preserves its era and context, or trapped by it. Let an in-box collector and an opener disagree over one specific format."],
+      ["pingu-collaboration-merch", "A collaboration can create a genuinely new Pingu object or merely print two brands together. Choose the costume, sculpt, fabric or functional detail that would make a collaboration earn shelf space."],
+
+      ["pingu-plush-silhouette", "A Pingu plush needs to preserve black-and-white simplicity while making the beak and feet readable. Choose the one proportion that can be exaggerated and the one that ruins the character if it drifts."],
+      ["pingu-clay-to-soft", "Should a plush imitate the slightly elongated clay puppet or become an extremely round mascot? Let the screen-accuracy collector and the cuddle faction defend one concrete design choice each."],
+      ["pingu-plush-material", "Fabric pile, beak structure, embroidered eyes and stuffing density can change Pingu's whole expression. Pick the construction detail that most separates a thoughtful plush from a generic penguin."],
+      ["pingu-character-plush-fit", "Pinga, Robby and Pingu do not create the same plush-design problem. Nominate which character translates most naturally to soft form and which needs the cleverest silhouette work."],
+
+      ["pingu-vintage-condition", "A vintage plush with a worn tag and compressed stuffing may have history but little shelf polish. Debate which signs of age add charm and which ones genuinely damage collectability."],
+      ["pingu-authenticity-evidence", "A blurry listing photo is not enough to declare a Pingu item official or fake. Rank the usefulness of manufacturer tag, copyright line, year, proportions, packaging and documented distribution."],
+      ["pingu-collection-boundaries", "A Pingu collection needs a rule before every expression and collaboration demands space. Defend one boundary: plushies only, one character, one era, Japanese releases or only objects tied to favourite episodes."],
+      ["pingu-display-cuddle", "Should the best Pingu plush stay tagged and immaculate or become the one that is visibly loved? Let condition, provenance, tactile purpose and sentimental value pull in different directions."],
+
+      ["pingu-japan-broadcast", "Using supplied evidence about Pingu's Japanese television history, discuss which part of the visual storytelling travelled especially well without turning one source into a broad cultural explanation.", "fresh_research"],
+      ["pingu-city-shift", "Pingu in the City moves the family from a quiet village into a busier occupational world. Debate what the city format adds to episode variety and what cosy quality it risks losing."],
+      ["pingu-japan-merch-ecosystem", "Use one supplied Japanese Pingu product or event to discuss how its documented distribution format changes the object's appeal without guessing rarity, availability or value.", "fresh_research"],
+      ["pingu-collaboration-design", "Treat this as a hypothetical design brief: invent a clearly fictional Pingu collaboration and choose the colour, costume, pose or product-format decision that could make it more than two logos together."],
+
+      ["pingu-noot-reduction", "The 'noot noot' meme made Pingu instantly recognizable while reducing a whole performed language to two syllables. Let one resident defend the gateway and another defend the richer original sound world."],
+      ["pingu-reaction-faces", "Pingu's stretched beak, furious stare and total-body despair became reusable reaction images. Choose which kind of expression survives without episode context and what meaning gets lost."],
+      ["pingu-meme-entrypoint", "A fan may arrive through a remix or reaction clip and only later watch the series. Debate which episode type best proves that Pingu is more than the meme without assigning homework."],
+      ["pingu-irony-sincerity", "Pingu fandom can be ironic, nostalgic and completely sincere at the same time. Pick one object, scene or meme where those modes overlap instead of treating one as the authentic way to care."],
+
+      ["pingu-clay-cg-comparison", "Clay replacement animation and clay-textured CG solve movement differently. Compare one clearly hypothetical action in each medium without pretending that either action occurs in a real episode."],
+      ["pingu-aardman-fit", "The documented 2024 Aardman and Mattel co-development announcement sounds natural because of Aardman's stop-motion history, but it does not establish a current release status. Debate one craft strength Aardman could bring and one Pingu-specific trait it must not overwrite.", "fresh_research"],
+      ["pingu-modern-format", "A short Pingu episode wastes almost no time before the problem begins. Argue whether a modern production should preserve that compact rhythm or make room for a larger ensemble and slower emotional beats."],
+      ["pingu-continuity-setting", "Village, later production eras and Pingu in the City's urban setting do not need to form one rigid chronology. Debate how much continuity a new story needs before it still feels like the same family."],
+    ]),
+    autonomousResearchSeeds: [
+      {
+        id: "pingu-official-japan-news",
+        query: "latest official Pingu Japan news announcement",
+        mode: "news",
+        maxAgeDays: 120,
+        discussionAngle: "Use one dated official announcement and discuss its concrete relevance to viewers or collectors without treating marketing language as proof of broader popularity.",
+      },
+      {
+        id: "pingu-official-plush-release",
+        query: "latest officially licensed Pingu plush mascot merchandise announcement",
+        mode: "news",
+        maxAgeDays: 240,
+        discussionAngle: "Focus on the supplied maker, format and visible design details; discuss appeal or construction without predicting availability, rarity, authenticity or future value.",
+      },
+      {
+        id: "pingu-japan-collaboration-event",
+        query: "latest official Pingu Japan collaboration popup exhibition event",
+        mode: "news",
+        maxAgeDays: 240,
+        discussionAngle: "Separate the documented event or collaboration details from fan inference, then choose the product, display or character-design decision most worth discussing.",
+      },
+      {
+        id: "pingu-aardman-series-update",
+        query: "latest official Aardman Mattel Pingu animated series update",
+        mode: "news",
+        maxAgeDays: 365,
+        discussionAngle: "State only the supplied development status and attributed creative detail, then debate hopes or concerns without inventing a premiere date, format, cast or plot.",
+      },
+      {
+        id: "pingu-production-history",
+        query: "official Pingu production history Otmar Gutmann Swiss stop motion pilot",
+        mode: "web",
+        discussionAngle: "Extract one dated milestone or credited collaborator from a primary source and discuss why it mattered while keeping origin work, pilot and television debut distinct.",
+      },
+      {
+        id: "pingu-official-episode-guide",
+        query: "official Pingu clay animation episode guide characters scenes",
+        mode: "web",
+        discussionAngle: "Use one documented episode setup to discuss a character relationship or comic consequence, preserving uncertainty around translated titles and catalogue numbering.",
+      },
+      {
+        id: "pingu-city-production",
+        query: "official Pingu in the City Japan Polygon Pictures production interview",
+        mode: "web",
+        discussionAngle: "Choose one documented CG, sound, setting or production decision and debate what it preserves from clay Pingu and what the city format intentionally changes.",
+      },
+      {
+        id: "pingu-exhibition-collector-archive",
+        query: "official Pingu exhibition original puppets vintage merchandise collector archive",
+        mode: "web",
+        discussionAngle: "Use one documented puppet, prop, reproduction or merchandise artifact to discuss provenance and collecting without extending the source into an unsupported valuation claim.",
+      },
+    ],
+    autonomousResearchPriority: 1.35,
+    ambientActivityPriority: 1.2,
+  },
+  {
+    public: {
       id: "3d-visualisation",
       name: "3d-visualisation",
       description: "Modelling, materials, lighting, rendering and beautifully expensive pixels.",
@@ -1780,6 +2019,7 @@ const mergedAiProgrammingProfile = (): ChannelProfile => {
   const labPremiseIndexes = [1, 2, 5, 6, 12, 17, 18, 28] as const;
   const labPremises = labPremiseIndexes.map((index) => lab.ambientPremises[index]!);
   const labFamilies = labPremiseIndexes.map((index) => lab.ambientPremiseFamilies?.[index] ?? `ai-lab-${index}`);
+  const labGrounding = labPremiseIndexes.map((index) => lab.ambientPremiseGrounding?.[index] ?? "none");
   const uniqueResearchSeeds = new Map(
     [...(programming.autonomousResearchSeeds ?? []), ...(lab.autonomousResearchSeeds ?? [])]
       .map((seed) => [seed.id, seed] as const),
@@ -1813,6 +2053,10 @@ const mergedAiProgrammingProfile = (): ChannelProfile => {
     },
     ambientPremises: [...programming.ambientPremises, ...labPremises],
     ambientPremiseFamilies: [...(programming.ambientPremiseFamilies ?? []), ...labFamilies],
+    ambientPremiseGrounding: [
+      ...(programming.ambientPremiseGrounding ?? programming.ambientPremises.map(() => "none" as const)),
+      ...labGrounding,
+    ],
     autonomousResearchSeeds: [...uniqueResearchSeeds.values()],
   };
 };

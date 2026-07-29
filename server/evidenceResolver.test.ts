@@ -121,6 +121,118 @@ describe("search evidence resolver", () => {
     ]);
   });
 
+  it("preserves broker authority ranking metadata through safe page expansion", async () => {
+    const preferredUrl = "https://www.pingu.jp/about/history";
+    const fallbackUrl = "https://animation.example/pingu";
+    const packet = searchPacket([preferredUrl, fallbackUrl]);
+    packet.search = {
+      scope: "generic",
+      requestedMode: "web",
+      providerMode: "web",
+      sourcePreference: {
+        strategy: "prefer_primary",
+        canonicalHosts: ["pingu.jp"],
+        fingerprint: "prefer_primary:pingu.jp",
+      },
+    };
+    packet.results[0]!.sourceAuthority = {
+      preference: "prefer_primary",
+      tier: "preferred",
+      meaning: "discovery_preference_not_claim_support",
+      matchedCanonicalHost: "pingu.jp",
+    };
+    packet.results[1]!.sourceAuthority = {
+      preference: "prefer_primary",
+      tier: "fallback",
+      meaning: "discovery_preference_not_claim_support",
+    };
+    const reader: EvidencePageReader = {
+      read: vi.fn(async (request, _requesterId) =>
+        pagePacket(request.url!.toString(), request.url!.toString() === preferredUrl ? 1 : 2)),
+    };
+
+    const resolved = await resolve(packet, reader, "Identify the documented production milestone");
+
+    expect(resolved.packet.results).toEqual([
+      expect.objectContaining({
+        url: preferredUrl,
+        sourceAuthority: {
+          preference: "prefer_primary",
+          tier: "preferred",
+          meaning: "discovery_preference_not_claim_support",
+          matchedCanonicalHost: "pingu.jp",
+        },
+      }),
+      expect.objectContaining({
+        url: fallbackUrl,
+        sourceAuthority: {
+          preference: "prefer_primary",
+          tier: "fallback",
+          meaning: "discovery_preference_not_claim_support",
+        },
+      }),
+    ]);
+  });
+
+  it("reserves two bounded reads for fallback results when preferred discovery is crowded", async () => {
+    const urls = [
+      "https://pingu.jp/about/one",
+      "https://pingu.jp/about/two",
+      "https://pingu.jp/about/three",
+      "https://animation.example/pingu/four",
+      "https://encyclopedia.example/pingu/five",
+    ];
+    const packet = searchPacket(urls);
+    packet.search = {
+      scope: "generic",
+      requestedMode: "web",
+      providerMode: "web",
+      sourcePreference: {
+        strategy: "prefer_primary",
+        canonicalHosts: ["pingu.jp"],
+        fingerprint: "prefer_primary:pingu.jp",
+      },
+    };
+    for (const result of packet.results.slice(0, 3)) {
+      result.sourceAuthority = {
+        preference: "prefer_primary",
+        tier: "preferred",
+        meaning: "discovery_preference_not_claim_support",
+        matchedCanonicalHost: "pingu.jp",
+      };
+    }
+    for (const result of packet.results.slice(3)) {
+      result.sourceAuthority = {
+        preference: "prefer_primary",
+        tier: "fallback",
+        meaning: "discovery_preference_not_claim_support",
+      };
+    }
+    const requested: string[] = [];
+    const reader: EvidencePageReader = {
+      read: vi.fn(async (request) => {
+        requested.push(request.url!.toString());
+        return pagePacket(request.url!.toString(), requested.length);
+      }),
+    };
+
+    const result = await resolve(packet, reader, "Who shaped the production in its early years?");
+
+    expect(result).toMatchObject({
+      readiness: "grounding_available",
+      attemptedPages: 4,
+      readPages: 4,
+    });
+    expect(requested).toEqual([urls[0], urls[1], urls[3], urls[4]]);
+    expect(requested).toHaveLength(4);
+    expect(result.packet.results.map(({ sourceAuthority }) => sourceAuthority?.tier)).toEqual([
+      "preferred",
+      "preferred",
+      "fallback",
+      "fallback",
+    ]);
+  });
+
   it("keeps one successful read and renumbers it as S1", async () => {
     const reader: EvidencePageReader = {
       read: vi.fn(async (request) => request.url?.pathname === "/two"

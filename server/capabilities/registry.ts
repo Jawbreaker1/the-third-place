@@ -3,6 +3,7 @@ import {
   type ResearchBroker,
   type ResearchPacket,
   type ResearchRequest,
+  type ResearchSourcePolicy,
   type SearchMode,
 } from "../researchBroker.js";
 import {
@@ -179,6 +180,8 @@ export interface CapabilityAvailabilityContext {
 export interface CapabilityCompileContext extends CapabilityAvailabilityContext {
   intent: string;
   requesterId: string;
+  /** Trusted room-owned source ranking; never derived from message text. */
+  researchSourcePolicy?: ResearchSourcePolicy;
 }
 
 interface CapabilityRuntimeDependencies {
@@ -650,6 +653,9 @@ const webSearchAdapter: CapabilityAdapter<WebSearchInvocation> = {
         mode: analysis.evidence.searchMode,
         requesterId: context.requesterId,
         ...(base.requestKind === "execute" ? {} : { cachePolicy: "bypass" as const }),
+        ...(context.researchSourcePolicy
+          ? { sourcePolicy: context.researchSourcePolicy }
+          : {}),
       },
     };
   },
@@ -676,7 +682,7 @@ const webSearchAdapter: CapabilityAdapter<WebSearchInvocation> = {
   },
   scene: (invocation, resolution, context) => {
     const success = resolution.state === "grounding_available" && resolution.research;
-    const groundingInstruction = "Answer the classified external-information request only from freshResearch and attach only source IDs that support each claim. Search rank, title or search snippet alone is never evidence. If the readable supplied pages genuinely omit the requested fact, name that exact missing datum naturally, attach the source IDs for the inspected pages that establish the gap, and stop there; do not broaden it into a permanent or generic no-live-data claim and do not substitute unrelated background.";
+    const groundingInstruction = "Answer the classified external-information request only from freshResearch and attach only source IDs that support each factual claim. Search rank, title or search snippet alone is never evidence. Lead with the most useful supported answer or premise, never with the act of searching. If the readable supplied pages genuinely omit the requested fact, name that exact missing datum naturally and attach the source IDs for the inspected pages that establish the gap. Describe the knowledge boundary itself rather than narrating the lookup, provider or what a named site failed to say, unless provenance was actually requested. Every successful answer still needs ordinary conversational uptake in the resident's own voice rather than ending as a retrieval report. When the question invites a cause, motive, reading or judgement that the evidence does not settle, add one clearly framed, explicitly speaker-owned low-stakes interpretation, opinion or reaction whenever it can follow only from supported premises or the participant's exact clue. Make the boundary between sourced knowledge and the resident's take unmistakable; an authorless conclusion equivalent to “it just seems to be their dynamic” can still sound like sourced canon and does not count. A move equivalent to “my guess is ordinary friction” clearly owns the interpretation. Apply that semantic distinction in the conversation's language rather than matching these English example phrases. Never present the take as sourced fact, canonical cause, exact event, current prediction or private biography, and never substitute unrelated background or a permanent generic no-live-data claim.";
     const premise = success
       ? `${context.actorName} ran the classified fresh lookup and is responsible for the sourced answer. ${groundingInstruction}`
       : `${context.actorName} alone reports in the human's classified language that this specific lookup did not yield readable material for the requested answer this time. Describe only that temporary human-visible result, without search-system or implementation jargon, and invent no current facts.`;

@@ -2,7 +2,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   ResearchBroker,
   assessSiteResearchQuality,
+  canonicalResearchSourceHost,
   hasSpecificSiteResearchResults,
+  normalizeResearchSourcePolicy,
 } from "./researchBroker.js";
 
 const duckRedirect = (target: string): string =>
@@ -64,6 +66,250 @@ describe("research broker", () => {
     expect(requested[0]?.searchParams.get("q")).toBe("日本の現在時刻");
     expect(packet?.query).toBe("日本の現在時刻");
     expect(packet?.results[0]).toMatchObject({ title: "結果", url: "https://example.com/story" });
+  });
+
+  it("ranks structurally matched preferred hosts first while retaining generic fallback diversity", async () => {
+    const requested: URL[] = [];
+    const generic = duckHtml(
+      duckResult({
+        title: "Generic duplicate of official",
+        url: "https://www.pingu.jp/about/history",
+        snippet: "The generic provider also found this official page.",
+      }),
+      duckResult({
+        title: "Independent archive",
+        url: "https://animation.example/archive",
+        snippet: "Independent historical context.",
+      }),
+      duckResult({
+        title: "Collector reference",
+        url: "https://collecting.example/pingu",
+        snippet: "Independent collector context.",
+      }),
+      duckResult({
+        title: "Suffix lookalike",
+        url: "https://pingu.jp.evil.example/fake",
+        snippet: "This is not a preferred host.",
+      }),
+    );
+    const official = `<?xml version="1.0"?><rss><channel>
+      <item><title>Official Pingu history</title><link>https://www.pingu.jp/about/history</link>
+        <description>Primary production-history material.</description></item>
+      <item><title>Injected suffix</title><link>https://pingu.jp.evil.example/fake</link>
+        <description>Must not pass site filtering.</description></item>
+    </channel></rss>`;
+    const empty = `<?xml version="1.0"?><rss><channel></channel></rss>`;
+    const broker = new ResearchBroker((async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      requested.push(url);
+      if (url.hostname === "html.duckduckgo.com") {
+        return new Response(generic, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      return new Response(
+        url.searchParams.get("q")?.includes("site:pingu.jp") ? official : empty,
+        { status: 200, headers: { "content-type": "application/rss+xml" } },
+      );
+    }) as typeof fetch);
+
+    const packet = await broker.research({
+      query: "Pingu production history",
+      mode: "web",
+      requesterId: "preferred-ranking",
+      sourcePolicy: {
+        strategy: "prefer_primary",
+        canonicalHosts: ["pingu.jp", "aardman.com", "srf.ch"],
+      },
+    });
+
+    expect(requested).toHaveLength(2);
+    expect(requested.filter((url) => url.hostname === "html.duckduckgo.com")).toHaveLength(1);
+    expect(requested.filter((url) => url.hostname === "www.bing.com")).toHaveLength(1);
+    expect(requested.find((url) => url.hostname === "www.bing.com")?.searchParams.get("q"))
+      .toBe("(site:aardman.com OR site:pingu.jp OR site:srf.ch) Pingu production history");
+    expect(packet?.results[0]).toMatchObject({
+      title: "Official Pingu history",
+      url: "https://www.pingu.jp/about/history",
+      sourceAuthority: {
+        preference: "prefer_primary",
+        tier: "preferred",
+        meaning: "discovery_preference_not_claim_support",
+        matchedCanonicalHost: "pingu.jp",
+      },
+    });
+    expect(packet?.results.filter((result) => result.sourceAuthority?.tier === "fallback").length)
+      .toBeGreaterThanOrEqual(2);
+    expect(packet?.results.find((result) => result.url.includes("evil.example"))?.sourceAuthority)
+      .toEqual({
+        preference: "prefer_primary",
+        tier: "fallback",
+        meaning: "discovery_preference_not_claim_support",
+      });
+    expect(packet?.search?.sourcePreference).toEqual({
+      strategy: "prefer_primary",
+      canonicalHosts: ["aardman.com", "pingu.jp", "srf.ch"],
+      fingerprint: "prefer_primary:aardman.com,pingu.jp,srf.ch",
+    });
+  });
+
+  it("falls back once to HTML for a semantically empty preferred site-Web arm without per-host fan-out", async () => {
+    const requested: URL[] = [];
+    const query = "who shaped the original production";
+    const preferredQuery =
+      "(site:aardman.com OR site:pingu.jp OR site:srf.ch) who shaped the original production";
+    const generic = duckHtml(
+      duckResult({
+        title: "Independent production archive",
+        url: "https://animation.example/archive",
+        snippet: "Independent historical context.",
+      }),
+      duckResult({
+        title: "Collector chronology",
+        url: "https://collecting.example/chronology",
+        snippet: "A separate chronology.",
+      }),
+      duckResult({
+        title: "Broadcast reference",
+        url: "https://broadcast.example/reference",
+        snippet: "A third generic source.",
+      }),
+    );
+    const preferred = duckHtml(
+      duckResult({
+        title: "Official production history",
+        url: "https://www.pingu.jp/biz/about/",
+        snippet: "The official production-history page.",
+      }),
+      duckResult({
+        title: "Off-site noise",
+        url: "https://irrelevant.example/noise",
+        snippet: "The site-scoped provider result must still be structurally filtered.",
+      }),
+    );
+    // A non-empty RSS response can still be semantically empty for a trusted
+    // site scope when every result is outside the configured hosts.
+    const offSiteRss = `<?xml version="1.0"?><rss><channel><item>
+      <title>Unrelated result</title><link>https://irrelevant.example/result</link>
+      <description>Not a result from any preferred host.</description>
+    </item></channel></rss>`;
+    const broker = new ResearchBroker((async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      requested.push(url);
+      if (url.hostname === "www.bing.com") {
+        return new Response(offSiteRss, {
+          status: 200,
+          headers: { "content-type": "application/rss+xml" },
+        });
+      }
+      const requestedQuery = url.searchParams.get("q");
+      return new Response(requestedQuery === preferredQuery ? preferred : generic, {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    }) as typeof fetch);
+
+    const packet = await broker.research({
+      query,
+      mode: "web",
+      requesterId: "preferred-site-html-fallback",
+      sourcePolicy: {
+        strategy: "prefer_primary",
+        canonicalHosts: ["pingu.jp", "aardman.com", "srf.ch"],
+      },
+    });
+
+    expect(requested).toHaveLength(3);
+    const bing = requested.filter((url) => url.hostname === "www.bing.com");
+    const duck = requested.filter((url) => url.hostname === "html.duckduckgo.com");
+    expect(bing).toHaveLength(1);
+    expect(duck).toHaveLength(2);
+    expect(bing[0]?.searchParams.get("q")).toBe(preferredQuery);
+    expect(duck.map((url) => url.searchParams.get("q"))).toEqual(
+      expect.arrayContaining([query, preferredQuery]),
+    );
+    expect(
+      requested.filter((url) => {
+        const requestedQuery = url.searchParams.get("q") ?? "";
+        return requestedQuery.startsWith("site:") && requestedQuery !== preferredQuery;
+      }),
+    ).toHaveLength(0);
+    expect(packet?.query).toBe(query);
+    expect(packet?.results[0]).toMatchObject({
+      title: "Official production history",
+      url: "https://www.pingu.jp/biz/about/",
+      sourceAuthority: {
+        preference: "prefer_primary",
+        tier: "preferred",
+        meaning: "discovery_preference_not_claim_support",
+        matchedCanonicalHost: "pingu.jp",
+      },
+    });
+    expect(packet?.results.filter((result) => result.sourceAuthority?.tier === "fallback"))
+      .toHaveLength(3);
+  });
+
+  it("validates canonical policy hosts structurally and rejects host/query injection shapes", () => {
+    expect(canonicalResearchSourceHost("pingu.jp")).toBe("pingu.jp");
+    expect(canonicalResearchSourceHost("CORPORATE.MATTEL.COM")).toBe("corporate.mattel.com");
+    for (const unsafe of [
+      "pingu.jp.evil.example/path",
+      "pingu.jp@evil.example",
+      "pingu.jp:443",
+      "pingu.jp site:evil.example",
+      " pingu.jp",
+      "localhost",
+      "127.0.0.1",
+      "-pingu.jp",
+      "co.uk",
+      "github.io",
+    ]) {
+      expect(canonicalResearchSourceHost(unsafe), unsafe).toBeUndefined();
+    }
+    expect(normalizeResearchSourcePolicy({
+      strategy: "prefer_primary",
+      canonicalHosts: ["pingu.jp", "pingu.jp@evil.example", "pingu.jp", "srf.ch"],
+    })).toEqual({
+      strategy: "prefer_primary",
+      canonicalHosts: ["pingu.jp", "srf.ch"],
+      fingerprint: "prefer_primary:pingu.jp,srf.ch",
+    });
+  });
+
+  it("isolates preferred and unranked cache entries with a normalized policy fingerprint", async () => {
+    let fetches = 0;
+    const generic = duckHtml(duckResult({
+      title: "Generic result",
+      url: "https://example.com/general",
+      snippet: "Generic context.",
+    }));
+    const official = `<?xml version="1.0"?><rss><channel><item>
+      <title>Official result</title><link>https://pingu.jp/about/</link>
+      <description>Official context.</description></item></channel></rss>`;
+    const broker = new ResearchBroker((async (input: string | URL | Request) => {
+      fetches += 1;
+      const url = new URL(String(input));
+      return url.hostname === "html.duckduckgo.com"
+        ? new Response(generic, { status: 200, headers: { "content-type": "text/html" } })
+        : new Response(official, { status: 200, headers: { "content-type": "application/rss+xml" } });
+    }) as typeof fetch);
+    const base = { query: "same source question", mode: "web" as const, requesterId: "cache-policy" };
+    const policy = {
+      strategy: "prefer_primary" as const,
+      canonicalHosts: ["pingu.jp"],
+    };
+
+    const unranked = await broker.research(base);
+    const preferred = await broker.research({ ...base, sourcePolicy: policy });
+    const preferredCached = await broker.research({
+      ...base,
+      sourcePolicy: { ...policy, canonicalHosts: ["PINGU.JP", "pingu.jp"] },
+    });
+    const unrankedCached = await broker.research(base);
+
+    expect(fetches).toBe(3);
+    expect(preferredCached).toBe(preferred);
+    expect(unrankedCached).toBe(unranked);
+    expect(unranked?.results[0]).not.toHaveProperty("sourceAuthority");
+    expect(preferred?.results[0]?.sourceAuthority?.tier).toBe("preferred");
   });
 
   it("uses the requested search mode and unwraps validated news source links", async () => {
@@ -391,6 +637,50 @@ describe("research broker", () => {
     expect(requested?.hostname).toBe("www.bing.com");
     expect(requested?.pathname).toBe("/search");
     expect(requested?.searchParams.get("format")).toBe("rss");
+  });
+
+  it("uses the same bounded site query for one HTML fallback when Bing returns only off-site Web results", async () => {
+    const requested: URL[] = [];
+    const rss = `<?xml version="1.0"?><rss><channel><item>
+      <title>Off-site result</title><link>https://unrelated.example/story</link>
+      <description>Bing ignored the site scope.</description>
+    </item></channel></rss>`;
+    const html = duckHtml(
+      duckResult({
+        title: "Exact-site result",
+        url: "https://docs.example.com/releases/42",
+        snippet: "A concrete release page.",
+      }),
+      duckResult({
+        title: "Suffix lookalike",
+        url: "https://docs.example.com.evil.example/fake",
+        snippet: "Must remain outside the trusted site scope.",
+      }),
+    );
+    const broker = new ResearchBroker((async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      requested.push(url);
+      return url.hostname === "www.bing.com"
+        ? new Response(rss, { status: 200, headers: { "content-type": "application/rss+xml" } })
+        : new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+    }) as typeof fetch);
+
+    const packet = await broker.researchSite({
+      query: "release chronology",
+      mode: "web",
+      url: new URL("https://docs.example.com/"),
+      requesterId: "site-html-fallback",
+    });
+
+    expect(requested.map((url) => [url.hostname, url.searchParams.get("q")])).toEqual([
+      ["www.bing.com", "site:docs.example.com release chronology"],
+      ["html.duckduckgo.com", "site:docs.example.com release chronology"],
+    ]);
+    expect(packet?.results).toEqual([expect.objectContaining({
+      id: "S1",
+      title: "Exact-site result",
+      url: "https://docs.example.com/releases/42",
+    })]);
   });
 
   it("accepts only the canonical www host variant for same-site results", async () => {

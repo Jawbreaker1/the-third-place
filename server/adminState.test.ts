@@ -137,6 +137,7 @@ describe("persistent admin overlay state", () => {
     expect(initial.automation.autonomousLinkChannelIds).toContain("football-talk");
     expect(initial.automation.autonomousLinkChannelIds).toContain("ai-hacking");
     expect(initial.automation.autonomousLinkChannelIds).toContain("fnaf");
+    expect(initial.automation.autonomousLinkChannelIds).toContain("pingu");
     expect(initial.channels.some((channel) => channel.id === "lobby")).toBe(true);
     expect(initial.personas.every((persona) => persona.fictionalAdult)).toBe(true);
     expect(store.isRomanceEligibleResident("ai-mira")).toBe(true);
@@ -157,6 +158,16 @@ describe("persistent admin overlay state", () => {
       register: "fandom",
       mode: "casual",
       seeds: expect.arrayContaining([expect.stringContaining("plush")]),
+    });
+    expect(initial.channels.find((channel) => channel.id === "pingu")).toMatchObject({
+      name: "pingu",
+      register: "fandom",
+      mode: "casual",
+      seeds: expect.arrayContaining([
+        expect.stringContaining("Penguinese"),
+        expect.stringContaining("plush"),
+        expect.stringContaining("Pingu in the City"),
+      ]),
     });
 
     await store.createChannel(customChannel());
@@ -198,11 +209,12 @@ describe("persistent admin overlay state", () => {
     expect(PERSONAS.find((persona) => persona.id === "ai-mira")?.style).toBeDefined();
   });
 
-  it("clears stale index-aligned premise families when an admin replaces seeds", async () => {
+  it("clears stale index-aligned premise families and grounding when an admin replaces seeds", async () => {
     const store = makeStore();
     await store.load();
     const current = store.snapshot().channels.find((channel) => channel.id === "ai-programming")!;
     expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")?.ambientPremiseFamilies?.length).toBeGreaterThan(0);
+    expect(CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")?.ambientPremiseGrounding?.length).toBeGreaterThan(0);
     await store.updateChannel("ai-programming", {
       ...current,
       seeds: ["A replacement seed must not inherit a semantic family from the old list."],
@@ -210,6 +222,7 @@ describe("persistent admin overlay state", () => {
     const runtime = CHANNEL_PROFILES.find((profile) => profile.public.id === "ai-programming")!;
     expect(runtime.ambientPremises).toEqual(["A replacement seed must not inherit a semantic family from the old list."]);
     expect(runtime.ambientPremiseFamilies).toBeUndefined();
+    expect(runtime.ambientPremiseGrounding).toBeUndefined();
   });
 
   it("marks a room's link-frequency control unavailable when its trusted research topic is replaced", async () => {

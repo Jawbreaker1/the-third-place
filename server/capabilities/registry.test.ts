@@ -975,8 +975,31 @@ describe("capability registry contract", () => {
       kind: "page",
       results: [{ id: "S1", url: sourceUrl, snippet: "Concrete evidence from S1" }],
     });
-    expect(registry.sceneContract(invocation, answer, { actorName: "Mira" }).groundingInstruction)
-      .toContain("name that exact missing datum naturally");
+    const scene = registry.sceneContract(invocation, answer, { actorName: "Mira" });
+    expect(scene.groundingInstruction).toContain("name that exact missing datum naturally");
+    expect(scene.groundingInstruction).toContain(
+      "one clearly framed, explicitly speaker-owned low-stakes interpretation, opinion or reaction",
+    );
+    expect(scene.groundingInstruction).toContain(
+      "an authorless conclusion equivalent to “it just seems to be their dynamic”",
+    );
+    expect(scene.groundingInstruction).toContain("rather than matching these English example phrases");
+    expect(scene.groundingInstruction).toContain(
+      "Lead with the most useful supported answer or premise",
+    );
+    expect(scene.groundingInstruction).toContain(
+      "ordinary conversational uptake",
+    );
+    expect(scene.groundingInstruction).toContain(
+      "whenever it can follow only from supported premises or the participant's exact clue",
+    );
+    expect(scene.groundingInstruction).toContain(
+      "Describe the knowledge boundary itself rather than narrating the lookup",
+    );
+    expect(scene.groundingInstruction).toContain(
+      "Never present the take as sourced fact, canonical cause, exact event, current prediction or private biography",
+    );
+    expect(scene.groundingInstruction).not.toContain("and stop there");
     expect(metadataOnly).toMatchObject({
       invocation,
       state: "retrieved_only",
@@ -984,6 +1007,42 @@ describe("capability registry contract", () => {
       detail: "retrieved_without_grounding",
     });
     expect(metadataOnly).not.toHaveProperty("research");
+  });
+
+  it("passes a trusted room source preference through the human web-search pathway", async () => {
+    vi.stubEnv("RESEARCH_ENABLED", "true");
+    const sourceUrl = "https://www.pingu.jp/about/history";
+    const { registry, pageReader, researchBroker } = createHarness();
+    const packet = searchPacket(sourceUrl);
+    packet.results[0]!.sourceAuthority = {
+      preference: "prefer_primary",
+      tier: "preferred",
+      meaning: "discovery_preference_not_claim_support",
+      matchedCanonicalHost: "pingu.jp",
+    };
+    researchBroker.research.mockResolvedValue(packet);
+    pageReader.read.mockResolvedValue(pagePacket(sourceUrl));
+    const context: CapabilityCompileContext = {
+      ...compileContext(),
+      researchSourcePolicy: {
+        strategy: "prefer_primary",
+        canonicalHosts: ["pingu.jp", "aardman.com"],
+      },
+    };
+    const invocation = registry.compile(analysisFor("web_search"), context)!;
+
+    await expect(registry.execute(invocation, "runtime-requester")).resolves.toMatchObject({
+      state: "grounding_available",
+    });
+    expect(researchBroker.research).toHaveBeenCalledWith({
+      query: "färska externa fakta",
+      mode: "web",
+      requesterId: "runtime-requester",
+      sourcePolicy: {
+        strategy: "prefer_primary",
+        canonicalHosts: ["pingu.jp", "aardman.com"],
+      },
+    });
   });
 
   it("propagates retry intent through both search metadata and page expansion caches", async () => {

@@ -3,6 +3,9 @@ import {
   buildCandidateReviewResponseFormat,
   buildCandidateReviewSystemPrompt,
   buildCandidateReviewUserData,
+  buildCanonicalNarrativeReviewResponseFormat,
+  buildCanonicalNarrativeReviewSystemPrompt,
+  buildCanonicalNarrativeReviewUserData,
   buildChannelFeedCoverageResponseFormat,
   buildChannelFeedCoverageSystemPrompt,
   buildChannelFeedCoverageUserData,
@@ -27,6 +30,7 @@ import {
   createFailClosedTurnAnalysis,
   memoryAnalysisInputSchema,
   parseCandidateReviewContent,
+  parseCanonicalNarrativeReviewContent,
   parseChannelFeedCoverageContent,
   parseEvidencePlanVerifierContent,
   parseMemoryAnalysisContent,
@@ -35,6 +39,7 @@ import {
   projectEvidencePlanVerification,
   projectTrustedTurnAnalysis,
   shouldVerifyEvidencePlan,
+  shouldRunCanonicalNarrativeReview,
   summarizeInvalidPrimaryEvidenceContent,
   turnAnalysisInputSchema,
   VOICE_CANDIDATE_REVIEW_ISSUES,
@@ -208,6 +213,69 @@ describe("multilingual semantic router contract", () => {
       ...parsed,
       channelFeedContext: { ...channelFeedContext, updatedAt: "not-a-date" },
     }).success).toBe(false);
+  });
+
+  it("carries an optional typed room-grounding policy through both multilingual routing passes", () => {
+    const groundingPolicy = {
+      sourceRequiredFor: [
+        "current_dynamic",
+        "exact_catalog_identity",
+        "canonical_narrative_detail",
+        "attribution_or_provenance",
+        "authenticity_or_valuation",
+      ],
+    } as const;
+    const parsed = input({
+      channel: {
+        id: "collector-room",
+        name: "collector-room",
+        topic: "A multilingual collector community",
+        groundingPolicy,
+      },
+    });
+
+    expect(buildTurnAnalysisUserData(parsed)).toMatchObject({
+      channel: { groundingPolicy },
+    });
+    expect(buildTurnAnalysisUserData(input())).not.toHaveProperty("channel.groundingPolicy");
+    expect(turnAnalysisInputSchema.safeParse({
+      ...parsed,
+      channel: {
+        ...parsed.channel,
+        groundingPolicy: {
+          sourceRequiredFor: ["exact_catalog_identity", "exact_catalog_identity"],
+        },
+      },
+    }).success).toBe(false);
+    expect(turnAnalysisInputSchema.safeParse({
+      ...parsed,
+      channel: {
+        ...parsed.channel,
+        groundingPolicy: { sourceRequiredFor: ["room-name-specific-special-case"] },
+      },
+    }).success).toBe(false);
+
+    const primaryPrompt = buildTurnAnalysisSystemPrompt();
+    expect(primaryPrompt).toContain("channel.groundingPolicy is trusted evidence-routing metadata");
+    expect(primaryPrompt).toContain("Room grounding is a narrow semantic override");
+    expect(primaryPrompt).toContain("exact_catalog_identity");
+    expect(primaryPrompt).toContain("canonical_narrative_detail");
+    expect(primaryPrompt).toContain("never by keywords, names, room IDs, topic labels, regular expressions");
+    expect(primaryPrompt).toContain("select web_search when available even if the guest did not explicitly ask");
+
+    const verifierInput = createEvidencePlanVerifierInput(parsed, {
+      ...createFailClosedTurnAnalysis("disabled"),
+      language: { tag: "sv", confidence: 0.9 },
+      responseLanguage: { tag: "sv", confidence: 0.9 },
+    });
+    expect(buildEvidencePlanVerifierUserData(verifierInput)).toMatchObject({
+      turn: { channel: { groundingPolicy } },
+    });
+    const verifierPrompt = buildEvidencePlanVerifierSystemPrompt(["web_search"]);
+    expect(verifierPrompt).toContain("Room-grounding invariant");
+    expect(verifierPrompt).toContain("narrow semantic override to the self-contained-knowledge default");
+    expect(verifierPrompt).toContain("never from keywords, names, room IDs, topic labels, regular expressions");
+    expect(verifierPrompt).toContain("use web_search when available even without an explicit search request");
   });
 
   it("defines a focused feed-coverage arbiter without exposing the capability catalog", () => {
@@ -3265,6 +3333,48 @@ const explicitRequestReviewInput = (options: {
   });
 };
 
+const successfulCapabilityReviewInput = (options: {
+  trigger?: string;
+  candidate?: string;
+} = {}): NormalizedCandidateReviewInput => {
+  const base = explicitRequestReviewInput({
+    trigger: options.trigger ?? "¿Quién ganó la final y cuál fue el marcador?",
+    candidate: options.candidate ?? "Northbridge ganó.",
+  });
+  return candidateReviewInputSchema.parse({
+    ...base,
+    semanticContext: {
+      ...base.semanticContext,
+      languageTag: "es",
+      answerDepth: "normal",
+    },
+    evidence: {
+      outcome: "succeeded",
+      kind: "search",
+      query: "resultado de la final",
+      results: [{
+        id: "S1",
+        title: "Final report",
+        snippet: "Northbridge won the final against Easton by 2–1.",
+      }],
+    },
+    capabilityContext: {
+      available: ["web_search"],
+      externalEvidenceAvailable: true,
+      requestKind: "execute",
+      discussed: ["web_search"],
+      plannedAction: "web_search",
+      executionStatus: "succeeded",
+    },
+    candidates: [{
+      ...base.candidates[0],
+      sourceIds: ["S1"],
+      mustFulfillRequest: true,
+      mustReportCapabilityFailure: false,
+    }],
+  });
+};
+
 const failedCapabilityReviewInput = (): NormalizedCandidateReviewInput => {
   const base = explicitRequestReviewInput({
     trigger: "Kannst du diese Seite lesen?",
@@ -3868,6 +3978,14 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain("both its trusted roomTopic and discussionAngle");
     expect(prompt).toContain("never keyword, token or domain overlap");
     expect(prompt).toContain("never proves that evidence matches them");
+    expect(prompt).toMatch(/^SOURCE ENTAILMENT — PRIORITY ZERO\./u);
+    expect(prompt.indexOf("SOURCE ENTAILMENT — PRIORITY ZERO"))
+      .toBeLessThan(prompt.indexOf("OPERATIONAL BOUNDARY IS PRIORITY ZERO"));
+    expect(prompt).toContain("Review every candidate independently");
+    expect(prompt).toContain("each essential claim must be explicitly entailed by a result named in that candidate's sourceIds");
+    expect(prompt).toContain("plausibility and model memory never count as support");
+    expect(prompt).toContain("one candidate's sources never support another");
+    expect(prompt).toContain("EACH OF THESE ISSUES MUST USE severity high");
   });
 
   it("carries trusted capability execution state and rejects impossible combinations", () => {
@@ -4029,6 +4147,36 @@ describe("multilingual batch candidate-review contract", () => {
     const explicitFormat = buildCandidateReviewResponseFormat(explicitRequestReviewInput()) as any;
     const explicitIssues = explicitFormat.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
     expect(explicitIssues).toContain("unfulfilled_explicit_request");
+
+    const successfulCapabilityFormat =
+      buildCandidateReviewResponseFormat(successfulCapabilityReviewInput()) as any;
+    const successfulCapabilityIssues =
+      successfulCapabilityFormat.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
+    expect(successfulCapabilityIssues).toContain("unfulfilled_explicit_request");
+
+    const lookupReport = successfulCapabilityReviewInput({
+      trigger: "Why do the two siblings keep arguing?",
+      candidate: "I checked the sources, but they do not explain the reason.",
+    });
+    const highAssistantRegister = {
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "high",
+        issues: ["assistant_register"],
+        rewriteInstruction: "Lead with the exact boundary and answer as a peer, with one bounded take.",
+        outputLanguage: { tag: "es", confidence: 0.99 },
+      }],
+    };
+    expect(parseCandidateReviewContent(
+      JSON.stringify(highAssistantRegister),
+      lookupReport,
+    )).toEqual(highAssistantRegister);
+    expect(parseCandidateReviewContent(JSON.stringify({
+      reviews: [{
+        ...highAssistantRegister.reviews[0],
+        severity: "medium",
+      }],
+    }), lookupReport)).toBeUndefined();
   });
 
   it("activates operational review only for trusted or fail-closed guarded contracts", () => {
@@ -4191,9 +4339,211 @@ describe("multilingual batch candidate-review contract", () => {
     }), failed)).toBeUndefined();
 
     const prompt = buildCandidateReviewSystemPrompt();
-    expect(prompt).toContain("complete supplied evidence packet itself lacks the exact datum");
+    expect(prompt).toContain(
+      "complete supplied evidence packet provides neither the exact requested datum",
+    );
+    expect(prompt).toContain(
+      "packet remains answer-bearing when it supports a relevant premise",
+    );
     expect(prompt).toContain("This judges packet adequacy, not candidate quality");
-    expect(prompt).toContain("Never emit it merely because the candidate chose the wrong source");
+    expect(prompt).toContain("Never emit this issue merely because the candidate chose the wrong source");
+  });
+
+  it("requires every irrelevant or ungrounded evidence verdict to block publication at high severity", () => {
+    const input = reviewInput();
+    for (const issue of ["evidence_irrelevant", "evidence_ungrounded"] as const) {
+      const review = {
+        reviews: [
+          {
+            personaId: "ai-mira",
+            severity: "high",
+            issues: [issue],
+            rewriteInstruction: "Remove the assertion that the cited evidence does not entail.",
+            ...undeterminedOutputLanguage,
+          },
+          {
+            personaId: "ai-sana",
+            severity: "none",
+            issues: [],
+            rewriteInstruction: null,
+            ...undeterminedOutputLanguage,
+          },
+        ],
+      };
+      expect(parseCandidateReviewContent(JSON.stringify(review), input)).toEqual(review);
+      expect(parseCandidateReviewContent(JSON.stringify({
+        reviews: [
+          { ...review.reviews[0], severity: "medium" },
+          review.reviews[1],
+        ],
+      }), input)).toBeUndefined();
+    }
+  });
+
+  it("carries typed room grounding into fail-closed multilingual publication review", () => {
+    const base = reviewInput();
+    const groundedRoom = candidateReviewInputSchema.parse({
+      ...base,
+      room: {
+        ...base.room,
+        groundingPolicy: {
+          sourceRequiredFor: [
+            "current_dynamic",
+            "exact_catalog_identity",
+            "canonical_narrative_detail",
+            "attribution_or_provenance",
+            "authenticity_or_valuation",
+          ],
+        },
+      },
+      evidence: { outcome: "none", kind: null, query: null, results: [] },
+      candidates: base.candidates.map((candidate) => ({
+        ...candidate,
+        sourceIds: [],
+      })),
+    });
+
+    expect(groundedRoom.room.groundingPolicy?.sourceRequiredFor).toEqual([
+      "current_dynamic",
+      "exact_catalog_identity",
+      "canonical_narrative_detail",
+      "attribution_or_provenance",
+      "authenticity_or_valuation",
+    ]);
+    expect(candidateReviewInputSchema.safeParse({
+      ...groundedRoom,
+      room: {
+        ...groundedRoom.room,
+        groundingPolicy: {
+          sourceRequiredFor: ["exact_catalog_identity", "exact_catalog_identity"],
+        },
+      },
+    }).success).toBe(false);
+    const prompt = buildCandidateReviewSystemPrompt();
+    expect(prompt).toContain("room.groundingPolicy lists the semantic class of the answer");
+    expect(prompt).toContain("must not fill the gap with a plausible canonical title");
+    expect(prompt).toContain("this gate applies to EVERY candidate in EVERY scene kind");
+    expect(prompt).toContain("public, DM, voice and ambient");
+    expect(prompt).toContain("uncertainty in one clause never grounds a different factual clause");
+    expect(prompt).toContain("A participant clue grounds only its exact semantic proposition");
+    expect(prompt).toContain("new quantifier or frequency, generalization, occurrence elsewhere");
+    expect(prompt).toContain("purported real canonical story, episode, scene, event, action, prop");
+    expect(prompt).toContain("clearly signposted low-stakes interpretation, guess, opinion or emotional reaction");
+    expect(prompt).toContain("softening an invented canonical cause or motive with uncertainty words is not clean");
+    expect(prompt).toContain("retrieval report");
+    expect(prompt).toContain("successful evidence owner");
+    expect(prompt).toContain("include ordinary conversational uptake");
+    expect(prompt).toContain("visibly owned by the resident as a take, guess or hypothesis");
+    expect(prompt).toContain("it just seems to be their dynamic");
+    expect(prompt).toContain("Apply this distinction by meaning in every language");
+    expect(prompt).toContain("Outside successful evidence-owner delivery, use medium");
+    expect(prompt).toContain(
+      "neither the exact requested fact nor directly relevant readable material",
+    );
+    expect(prompt).toContain(
+      "relevant premise plus the precise unresolved dimension",
+    );
+    expect(prompt).toContain("discovery_preference_not_claim_support");
+    expect(prompt).toContain("never by keywords, word overlap, room IDs, domain lists, regular expressions or translated phrases");
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain(
+      "room.groundingPolicy is policy, not evidence",
+    );
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain(
+      "exact completion is evidence_ungrounded",
+    );
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain(
+      "canonical_narrative_detail",
+    );
+  });
+
+  it("uses a narrow typed fail-closed canon gate for every protected candidate without room-name routing", () => {
+    const base = reviewInput();
+    const input = candidateReviewInputSchema.parse({
+      ...base,
+      sceneKind: "public",
+      room: {
+        ...base.room,
+        id: "arbitrary-fandom-room",
+        name: "arbitrary-fandom-room",
+        groundingPolicy: {
+          sourceRequiredFor: ["canonical_narrative_detail"],
+        },
+      },
+      trigger: {
+        author: "Guest",
+        content: "Jag minns en lila ubåt, men är inte säker.",
+        createdAt: "2026-07-14T11:59:55.000Z",
+        ageSeconds: 5,
+      },
+      evidence: { outcome: "none", kind: null, query: null, results: [] },
+      candidates: base.candidates.map((candidate, index) => ({
+        ...candidate,
+        content: index === 0
+          ? "Jag känner inte igen den lila ubåten, men figuren kör en röd miniubåt i flera avsnitt."
+          : "Jag vet inte säkert; menar du ubåten du nämnde?",
+        sourceIds: [],
+      })),
+    });
+
+    expect(shouldRunCanonicalNarrativeReview(input)).toBe(true);
+    const userData = buildCanonicalNarrativeReviewUserData(input) as any;
+    expect(userData).toMatchObject({
+      sceneKind: "public",
+      policy: "canonical_narrative_detail",
+      latestTrigger: {
+        author: "Guest",
+        content: "Jag minns en lila ubåt, men är inte säker.",
+      },
+      evidence: { outcome: "none", results: [] },
+    });
+    expect(userData).not.toHaveProperty("room");
+    expect(buildCanonicalNarrativeReviewSystemPrompt()).toContain(
+      "A candidate may explicitly attribute or uncertainty-frame that exact clue",
+    );
+    expect(buildCanonicalNarrativeReviewSystemPrompt()).toContain(
+      "new quantity or frequency, generalization, occurrence elsewhere",
+    );
+    expect(buildCanonicalNarrativeReviewSystemPrompt()).toContain(
+      "An explicitly signposted low-stakes interpretation, guess, opinion or emotional reaction",
+    );
+    expect(buildCanonicalNarrativeReviewSystemPrompt()).toContain(
+      "my guess is ordinary sibling friction",
+    );
+    expect(buildCanonicalNarrativeReviewSystemPrompt()).toContain(
+      "She starts those fights because she is secretly jealous",
+    );
+    const format = buildCanonicalNarrativeReviewResponseFormat(input) as any;
+    expect(format.json_schema.strict).toBe(true);
+    expect(format.json_schema.schema.properties.reviews.items.properties.personaId.enum)
+      .toEqual(["ai-mira", "ai-sana"]);
+
+    expect(parseCanonicalNarrativeReviewContent(JSON.stringify({
+      reviews: [
+        { personaId: "ai-mira", verdict: "unsupported_real_canon_assertion" },
+        { personaId: "ai-sana", verdict: "clean_no_real_canon_assertion" },
+      ],
+    }), input)).toEqual({
+      reviews: [
+        { personaId: "ai-mira", verdict: "unsupported_real_canon_assertion" },
+        { personaId: "ai-sana", verdict: "clean_no_real_canon_assertion" },
+      ],
+    });
+    expect(parseCanonicalNarrativeReviewContent(JSON.stringify({
+      reviews: [
+        { personaId: "ai-mira", verdict: "clean_no_real_canon_assertion" },
+        { personaId: "ai-mira", verdict: "unsupported_real_canon_assertion" },
+      ],
+    }), input)).toBeUndefined();
+
+    const fullySourced = candidateReviewInputSchema.parse({
+      ...input,
+      evidence: base.evidence,
+      candidates: input.candidates.map((candidate) => ({
+        ...candidate,
+        sourceIds: ["S1"],
+      })),
+    });
+    expect(shouldRunCanonicalNarrativeReview(fullySourced)).toBe(true);
   });
 
   it("treats structured community capability truth as a high-severity multilingual publication contract", () => {
@@ -4469,6 +4819,78 @@ describe("multilingual batch candidate-review contract", () => {
     expect(parseCandidateReviewContent(JSON.stringify({
       reviews: [{ ...blocked.reviews[0], severity: "medium" }],
     }), request)).toBeUndefined();
+  });
+
+  it("keeps successful typed evidence under the owner's complete-request contract without over-demanding detail", () => {
+    const omittedDimension = successfulCapabilityReviewInput();
+    const blocked = {
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "high",
+        issues: ["unfulfilled_explicit_request"],
+        rewriteInstruction: "Incluye también el marcador solicitado que ya consta en S1.",
+        ...undeterminedOutputLanguage,
+      }],
+    };
+    expect(omittedDimension.candidates[0]).toMatchObject({
+      mustReply: true,
+      mustFulfillRequest: true,
+      mustReportCapabilityFailure: false,
+      sourceIds: ["S1"],
+    });
+    expect(parseCandidateReviewContent(
+      JSON.stringify(blocked),
+      omittedDimension,
+    )).toEqual(blocked);
+
+    const underConfidentIntent = candidateReviewInputSchema.parse({
+      ...omittedDimension,
+      semanticContext: {
+        ...omittedDimension.semanticContext,
+        intentTrusted: false,
+        replyExpected: "optional",
+      },
+    });
+    expect(parseCandidateReviewContent(
+      JSON.stringify(blocked),
+      underConfidentIntent,
+    )).toEqual(blocked);
+
+    const singleFact = successfulCapabilityReviewInput({
+      trigger: "¿Quién ganó la final?",
+      candidate: "Northbridge.",
+    });
+    const clean = {
+      reviews: [{
+        personaId: "ai-mira",
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+        ...undeterminedOutputLanguage,
+      }],
+    };
+    expect(parseCandidateReviewContent(JSON.stringify(clean), singleFact)).toEqual(clean);
+
+    for (const prompt of [
+      buildCandidateReviewSystemPrompt(),
+      buildVoiceCandidateReviewSystemPrompt(),
+    ]) {
+      expect(prompt).toContain(
+        "A successful typed capability is evidence and a means of fulfilment, never a substitute",
+      );
+      expect(prompt).toContain("every expressly requested core dimension");
+      expect(prompt).toContain("A compact");
+      expect(prompt).toContain("single-fact request is complete");
+    }
+    expect(buildCandidateReviewSystemPrompt()).toContain(
+      "Preserve each requested role, timeframe and scope",
+    );
+    expect(buildVoiceCandidateReviewSystemPrompt()).toContain(
+      "with its role/timeframe/scope; adjacent facts do not count",
+    );
+    expect(buildCandidateReviewSystemPrompt()).toContain(
+      "independent of an under-confident intent tuple",
+    );
   });
 
   it("normalizes impossible failed-capability review issues without hiding valid blockers", () => {

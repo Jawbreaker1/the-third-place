@@ -72,6 +72,7 @@ describe("actor channel runtime", () => {
       "football-talk",
       "world-of-warcraft",
       "fnaf",
+      "pingu",
       "3d-visualisation",
     ];
 
@@ -129,8 +130,10 @@ describe("actor channel runtime", () => {
 
     pixel.channelAffinity.fnaf = 0.1;
     runtime.reconcileCatalog();
-    expect(runtime.snapshot(pixel.id)?.subscribedChannels).not.toContain("fnaf");
-    expect(runtime.snapshot(pixel.id)?.focusChannelId).toBe("lobby");
+    const reconciled = runtime.snapshot(pixel.id)!;
+    expect(reconciled.subscribedChannels).not.toContain("fnaf");
+    expect(reconciled.focusChannelId).not.toBe("fnaf");
+    expect(reconciled.subscribedChannels).toContain(reconciled.focusChannelId);
   });
 
   it("mixes talkative regulars, contrarians and quiet lurkers in the pub", () => {
@@ -240,6 +243,40 @@ describe("actor channel runtime", () => {
     expect(runtime.expertise("ai-juno", "fnaf").level).toBe("advanced");
     expect(runtime.expertise("ai-tess", "fnaf").level).toBe("advanced");
     expect(runtime.expertise("ai-nox", "fnaf").level).toBe("competent");
+  });
+
+  it("builds a selective pingu roster with production, episode, Japan and collecting specialists", () => {
+    const runtime = new ActorChannelRuntime();
+    const candidates = runtime.candidatesFor("pingu");
+    const ids = candidates.map((persona) => persona.id);
+
+    expect(ids).toEqual(expect.arrayContaining([
+      "ai-runa",
+      "ai-mira",
+      "ai-bosse",
+      "ai-nox",
+      "ai-linnea",
+      "ai-pixel",
+      "ai-otto",
+      "ai-juno",
+      "ai-tess",
+    ]));
+    expect(candidates.length).toBeGreaterThanOrEqual(9);
+    expect(candidates.length).toBeLessThan(PERSONAS.length);
+    expect(candidates.filter((persona) => persona.canResearch).map((persona) => persona.id)).toEqual(
+      expect.arrayContaining(["ai-mira", "ai-linnea"]),
+    );
+    expect(candidates.some((persona) => persona.talkativeness >= 0.8)).toBe(true);
+    expect(candidates.some((persona) => persona.talkativeness <= 0.2)).toBe(true);
+    expect(candidates.some((persona) => persona.disagreement >= 0.75)).toBe(true);
+
+    expect(runtime.expertise("ai-tess", "pingu")).toMatchObject({
+      level: "specialist",
+      specialties: expect.arrayContaining(["plushies and soft-toy construction", "collecting, condition and display choices"]),
+    });
+    expect(runtime.expertise("ai-otto", "pingu").level).toBe("advanced");
+    expect(runtime.expertise("ai-juno", "pingu").level).toBe("advanced");
+    expect(runtime.expertise("ai-pixel", "pingu").level).toBe("competent");
   });
 
   it("restores an actor's last channel focus from persisted history", () => {

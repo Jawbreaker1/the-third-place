@@ -10,7 +10,7 @@ export const PUBLIC_REACTION_EMOJIS = [
   "❌", "⚽", "🍿", "🎉", "🥂", "🍻", "🌿", "🧠",
   "🎵", "🎬", "🐐", "🧂", "🤡", "🙄", "🫠", "🥹",
   "😍", "🤨", "🛠️", "📉", "⚡", "⚔️", "🤫", "🛑", "🙃",
-  "🛡️", "⚠️", "🧪", "🔍",
+  "🛡️", "⚠️", "🧪", "🔍", "🐧", "🧊",
 ] as const;
 
 export type PublicReactionEmoji = (typeof PUBLIC_REACTION_EMOJIS)[number];
@@ -30,7 +30,7 @@ export const PUBLIC_REACTION_LABELS: Record<PublicReactionEmoji, string> = {
   "😍": "Heart eyes", "🤨": "Raised eyebrow", "🛠️": "Tools", "📉": "Chart falling",
   "⚡": "Lightning", "⚔️": "Crossed swords", "🤫": "Quiet", "🛑": "Stop",
   "🙃": "Upside-down face", "🛡️": "Shield", "⚠️": "Warning",
-  "🧪": "Lab", "🔍": "Search",
+  "🧪": "Lab", "🔍": "Search", "🐧": "Penguin", "🧊": "Ice",
 };
 
 const PUBLIC_REACTION_SET: ReadonlySet<string> = new Set(PUBLIC_REACTION_EMOJIS);

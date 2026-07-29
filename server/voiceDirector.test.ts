@@ -80,6 +80,7 @@ const languageAnalysis = (
 }) as TurnAnalysis;
 
 interface LanguageTurnOptions {
+  channelId?: string;
   analysis: TurnAnalysis;
   utterance: string;
   utteranceOrigin?: "microphone-stt" | "typed-voice-fallback";
@@ -111,8 +112,9 @@ interface LanguageTurnOptions {
 }
 
 const runLanguageTurn = async (options: LanguageTurnOptions) => {
-  const runtime = new VoiceRoomRuntime(["lobby"]);
-  const created = runtime.createRoom("lobby", {
+  const channelId = options.channelId ?? "lobby";
+  const runtime = new VoiceRoomRuntime([channelId]);
+  const created = runtime.createRoom(channelId, {
     socketId: "socket-language-anchor",
     memberId: "human-language-anchor",
     name: "Alex",
@@ -2213,6 +2215,27 @@ describe("VoiceDirector", () => {
     expect(analysisInput?.transportLanguageHint).toBe("zh-Hant-TW");
     expect(speeches).toEqual([expect.objectContaining({ language: "ja-JP" })]);
     expect(runtime.getTranscript(created.room.id).at(-1)?.language).toBe("ja-JP");
+  });
+
+  it("projects room grounding policy into voice routing while exact unsupported answers remain fail-closed", async () => {
+    const result = await runLanguageTurn({
+      channelId: "pingu",
+      analysis: routedAnalysis("sv-SE"),
+      utterance: "Vilket avsnitt har den där lila ubåten bakom glassfabriken?",
+    });
+
+    expect(result.analysisInput?.channel).toMatchObject({
+      id: "pingu",
+      groundingPolicy: {
+        sourceRequiredFor: expect.arrayContaining([
+          "current_dynamic",
+          "exact_catalog_identity",
+          "canonical_narrative_detail",
+          "attribution_or_provenance",
+          "authenticity_or_valuation",
+        ]),
+      },
+    });
   });
 
   it("uses a generic provider's configured default voice, never a Piper persona alias", async () => {

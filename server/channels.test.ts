@@ -3,7 +3,9 @@ import {
   CHANNEL_PROFILES,
   CHANNELS,
   CONVERSATION_REGISTERS,
+  ambientPremiseCanOpenWithoutResearch,
   defineAmbientPremiseCatalog,
+  ROOM_GROUNDING_CLAIM_CLASSES,
   ROOM_SOCIAL_MOVES,
   scheduledRoomSocialModeAt,
   type ChannelProfile,
@@ -19,6 +21,7 @@ const NEW_ROOM_IDS = [
   "football-talk",
   "world-of-warcraft",
   "fnaf",
+  "pingu",
   "3d-visualisation",
 ];
 const RESEARCH_ROOM_IDS = [
@@ -30,6 +33,7 @@ const RESEARCH_ROOM_IDS = [
   "football-talk",
   "world-of-warcraft",
   "fnaf",
+  "pingu",
   "3d-visualisation",
 ];
 const EXPECTED_AMBIENT_COUNTS: Record<string, number> = {
@@ -41,6 +45,7 @@ const EXPECTED_AMBIENT_COUNTS: Record<string, number> = {
   "football-talk": 40,
   "world-of-warcraft": 32,
   fnaf: 40,
+  pingu: 40,
   "3d-visualisation": 32,
 };
 const EXPECTED_AMBIENT_FAMILY_COUNTS: Record<string, number> = {
@@ -52,18 +57,50 @@ const EXPECTED_AMBIENT_FAMILY_COUNTS: Record<string, number> = {
   "football-talk": 10,
   "world-of-warcraft": 8,
   fnaf: 10,
+  pingu: 10,
   "3d-visualisation": 8,
 };
 
 const normalizedContentKey = (value: string): string => value.normalize("NFKC").trim().toLocaleLowerCase("und");
 
 describe("channel profiles", () => {
+  it("defines bounded semantic claim classes for optional room grounding", () => {
+    expect(ROOM_GROUNDING_CLAIM_CLASSES).toEqual([
+      "current_dynamic",
+      "exact_catalog_identity",
+      "canonical_narrative_detail",
+      "attribution_or_provenance",
+      "authenticity_or_valuation",
+    ]);
+
+    const allowedClasses = new Set(ROOM_GROUNDING_CLAIM_CLASSES);
+    for (const profile of CHANNEL_PROFILES) {
+      const sourceRequiredFor = profile.groundingPolicy?.sourceRequiredFor;
+      if (!sourceRequiredFor) continue;
+      expect(new Set(sourceRequiredFor).size, profile.public.id).toBe(sourceRequiredFor.length);
+      expect(sourceRequiredFor.every((claimClass) => allowedClasses.has(claimClass)), profile.public.id)
+        .toBe(true);
+    }
+  });
+
   it("defines a single scalable profile for every public room", () => {
     const ids = CHANNEL_PROFILES.map((profile) => profile.public.id);
     const personaIds = new Set(PERSONAS.map((persona) => persona.id));
-    expect(ids).toHaveLength(9);
+    expect(ids).toHaveLength(10);
     expect(ids).not.toEqual(expect.arrayContaining(["ai-lab", "side-quests"]));
     expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual([
+      "lobby",
+      "the-pub",
+      "ai-programming",
+      "ai-hacking",
+      "stock-market",
+      "football-talk",
+      "world-of-warcraft",
+      "fnaf",
+      "pingu",
+      "3d-visualisation",
+    ]);
     expect(ids).toEqual(expect.arrayContaining(NEW_ROOM_IDS));
     expect(CHANNELS.map((channel) => channel.id)).toEqual(ids);
     for (const profile of CHANNEL_PROFILES) {
@@ -74,6 +111,10 @@ describe("channel profiles", () => {
       expect(profile.ambientPremiseFamilies, profile.public.id).toBeDefined();
       const premiseFamilies = profile.ambientPremiseFamilies!;
       expect(premiseFamilies, profile.public.id).toHaveLength(profile.ambientPremises.length);
+      expect(profile.ambientPremiseGrounding, profile.public.id).toHaveLength(profile.ambientPremises.length);
+      expect(profile.ambientPremiseGrounding?.every((grounding) =>
+        grounding === "none" || grounding === "fresh_research"
+      ), profile.public.id).toBe(true);
       expect(premiseFamilies.every((family) => /^[a-z0-9-]{3,48}$/.test(family)), profile.public.id).toBe(true);
       const familyCounts = new Map<string, number>();
       for (const family of premiseFamilies) {
@@ -91,6 +132,11 @@ describe("channel profiles", () => {
         expect(profile.ambientActivityPriority, profile.public.id).toBeGreaterThanOrEqual(0.25);
         expect(profile.ambientActivityPriority, profile.public.id).toBeLessThanOrEqual(4);
       }
+      // The semantic publication reviewer receives these trusted room
+      // contracts at the same bounded sizes. Fail here rather than silently
+      // truncating the part that may contain a room's factuality boundary.
+      expect(profile.topic.freshnessRule?.length ?? 0, profile.public.id).toBeLessThanOrEqual(800);
+      expect(profile.conversationGuidance?.length ?? 0, profile.public.id).toBeLessThanOrEqual(2_000);
       for (const mode of profile.scheduledSocialModes ?? []) {
         expect(mode.id, profile.public.id).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u);
         expect(mode.startWeekdays.length, mode.id).toBeGreaterThan(0);
@@ -110,20 +156,23 @@ describe("channel profiles", () => {
       expect(Object.keys(profile.expertiseOverrides ?? {}).every((personaId) => personaIds.has(personaId))).toBe(true);
     }
     const allPremises = CHANNEL_PROFILES.flatMap((profile) => profile.ambientPremises.map(normalizedContentKey));
-    expect(allPremises).toHaveLength(328);
+    expect(allPremises).toHaveLength(368);
     expect(new Set(allPremises).size).toBe(allPremises.length);
   });
 
   it("projects atomic ambient catalogue entries without losing their association", () => {
     const catalogue = defineAmbientPremiseCatalog([
       ["first-family", "First premise"],
-      ["second-family", "Second premise"],
+      ["second-family", "Second premise", "fresh_research"],
     ]);
 
     expect(catalogue).toEqual({
       ambientPremiseFamilies: ["first-family", "second-family"],
       ambientPremises: ["First premise", "Second premise"],
+      ambientPremiseGrounding: ["none", "fresh_research"],
     });
+    expect(ambientPremiseCanOpenWithoutResearch(catalogue, 0)).toBe(true);
+    expect(ambientPremiseCanOpenWithoutResearch(catalogue, 1)).toBe(false);
   });
 
   it("defines bounded, stable and non-repeating autonomous research starters", () => {
@@ -190,6 +239,7 @@ describe("channel profiles", () => {
     expect(profile("football-talk")).toMatchObject({ ambientMode: "banter", conversationRegister: "banter" });
     expect(profile("world-of-warcraft")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
     expect(profile("fnaf")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
+    expect(profile("pingu")).toMatchObject({ ambientMode: "casual", conversationRegister: "fandom" });
     expect(profile("ai-programming").conversationRegister).toBe("technical");
     expect(profile("ai-hacking").conversationRegister).toBe("technical");
     expect(profile("stock-market").conversationRegister).toBe("analytical");
@@ -270,6 +320,9 @@ describe("channel profiles", () => {
     expect(matrix.get("fnaf")?.get("ai-pixel")?.level).toBe("specialist");
     expect(matrix.get("fnaf")?.get("ai-juno")?.level).toBe("advanced");
     expect(matrix.get("fnaf")?.get("ai-tess")?.level).toBe("advanced");
+    expect(matrix.get("pingu")?.get("ai-tess")?.level).toBe("specialist");
+    expect(matrix.get("pingu")?.get("ai-otto")?.level).toBe("advanced");
+    expect(matrix.get("pingu")?.get("ai-juno")?.level).toBe("advanced");
     expect(matrix.get("3d-visualisation")?.get("ai-pixel")?.level).toBe("specialist");
     expect(matrix.get("the-pub")?.get("ai-juno")?.level).toBe("specialist");
   });
@@ -504,6 +557,101 @@ describe("channel profiles", () => {
     expect(fnaf.autonomousResearchPriority).toBeLessThanOrEqual(4);
     expect(fnaf.ambientActivityPriority).toBeGreaterThan(1);
     expect(fnaf.ambientActivityPriority).toBeLessThanOrEqual(4);
+  });
+
+  it("gives pingu deep episode, production, Japan and collecting coverage without inventing lore", () => {
+    const pingu = CHANNEL_PROFILES.find((profile) => profile.public.id === "pingu")!;
+
+    expect(pingu).toMatchObject({
+      public: { name: "pingu", icon: "🐧" },
+      expertiseDomain: "pingu",
+      ambientMode: "casual",
+      conversationRegister: "fandom",
+      groundingPolicy: {
+        sourceRequiredFor: [
+          "current_dynamic",
+          "exact_catalog_identity",
+          "canonical_narrative_detail",
+          "attribution_or_provenance",
+          "authenticity_or_valuation",
+        ],
+      },
+      expertiseOverrides: {
+        "ai-tess": { level: "specialist" },
+        "ai-otto": { level: "advanced" },
+        "ai-juno": { level: "advanced" },
+      },
+    });
+    expect(pingu.topic.tags).toEqual(expect.arrayContaining([
+      "Pingu",
+      "Pinga",
+      "Robby the Seal",
+      "stop-motion",
+      "Penguinese",
+      "Pingu in the City",
+      "Japan",
+      "memes",
+      "plushies",
+      "collectibles",
+    ]));
+    expect(pingu.topic.freshnessRule).toContain("require supplied fresh evidence");
+    expect(pingu.topic.freshnessRule).toContain("precision-sensitive");
+    expect(pingu.topic.freshnessRule).toContain("repeat only the participant's clues");
+    expect(pingu.topic.freshnessRule).toContain("never complete a plausible gap as fact");
+    expect(pingu.topic.freshnessRule).toContain("Penguinese is not all");
+    expect(pingu.conversationGuidance).toContain("not a 'noot noot' soundboard");
+    expect(pingu.conversationGuidance).toContain("not a hidden serialized mythology");
+    expect(pingu.conversationGuidance).toContain("Japan is a first-class part of the fandom");
+    expect(pingu.conversationGuidance).toContain("Plushies, prize items, figures");
+    expect(pingu.conversationGuidance).toContain("a lead, not verification");
+    expect(pingu.conversationGuidance).toContain("Never invent owning a collection");
+
+    expect(pingu.ambientPremises).toHaveLength(40);
+    expect(pingu.ambientPremiseFamilies).toHaveLength(40);
+    expect(pingu.ambientPremiseGrounding).toHaveLength(40);
+    const sourceBoundPremises = pingu.ambientPremises.filter((_premise, index) =>
+      pingu.ambientPremiseGrounding?.[index] === "fresh_research"
+    );
+    expect(sourceBoundPremises).toHaveLength(5);
+    expect(sourceBoundPremises.join("\n")).toContain("supplied documented milestones");
+    expect(sourceBoundPremises.join("\n")).toContain("supplied production credit");
+    expect(sourceBoundPremises.join("\n")).toContain("Japanese television history");
+    expect(sourceBoundPremises.join("\n")).toContain("supplied Japanese Pingu product or event");
+    expect(sourceBoundPremises.join("\n")).toContain("documented 2024 Aardman and Mattel");
+    expect(new Set(pingu.ambientPremiseFamilies).size).toBe(10);
+    const collectingPremises = pingu.ambientPremiseFamilies.filter((family) =>
+      ["pingu-merch-formats", "pingu-plush-design", "pingu-collecting-culture"].includes(family),
+    );
+    expect(collectingPremises).toHaveLength(12);
+    expect(pingu.ambientPremiseFamilies).toEqual(expect.arrayContaining([
+      "pingu-production-history",
+      "pingu-character-relationships",
+      "pingu-episode-detective",
+      "pingu-penguinese-performance",
+      "pingu-japan-phenomenon",
+      "pingu-meme-afterlife",
+      "pingu-adaptation-future",
+    ]));
+    const aardmanPremiseIndex = pingu.ambientPremises.findIndex((premise) =>
+      premise.includes("documented 2024 Aardman and Mattel co-development announcement")
+    );
+    expect(aardmanPremiseIndex).toBeGreaterThanOrEqual(0);
+    expect(pingu.ambientPremiseGrounding?.[aardmanPremiseIndex]).toBe("fresh_research");
+    expect(ambientPremiseCanOpenWithoutResearch(pingu, aardmanPremiseIndex)).toBe(false);
+
+    expect(pingu.autonomousResearchSeeds).toHaveLength(8);
+    expect(pingu.autonomousResearchSeeds?.every((seed) => seed.query.includes("Pingu"))).toBe(true);
+    expect(pingu.autonomousResearchSeeds).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "pingu-official-japan-news", mode: "news" }),
+      expect.objectContaining({ id: "pingu-official-plush-release", mode: "news" }),
+      expect.objectContaining({ id: "pingu-aardman-series-update", mode: "news" }),
+      expect.objectContaining({ id: "pingu-production-history", mode: "web" }),
+      expect.objectContaining({ id: "pingu-official-episode-guide", mode: "web" }),
+    ]));
+    expect(pingu.autonomousResearchPriority).toBeGreaterThan(1);
+    expect(pingu.autonomousResearchPriority).toBeLessThanOrEqual(1.5);
+    expect(pingu.ambientActivityPriority).toBeGreaterThan(1);
+    expect(pingu.ambientActivityPriority).toBeLessThanOrEqual(1.3);
   });
 
   it("keeps stock-market discussion concrete and informal without weakening evidence boundaries", () => {
