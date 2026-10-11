@@ -765,6 +765,21 @@ describe("multilingual semantic router contract", () => {
       referencedParticipantIds: ["agent-codex"],
       focusMessageIds: ["message-agent-intro"],
     });
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...compact,
+      // The exact recent row already resolves the reference. A local model
+      // may still fill the now-inactive retained-history branch; that branch
+      // must be revoked without losing the independently valid reply intent.
+      h: { n: "helpful", q: "Codex", x: 0.99 },
+    }), routedInput)).toMatchObject({
+      source: "lm",
+      intent: { kind: "question", replyExpected: "expected" },
+      currentContext: {
+        resolution: "current_context",
+        focusMessageIds: ["message-agent-intro"],
+      },
+      historyRecall: { need: "none", query: null, confidence: 0.99 },
+    });
 
     expect(parseTurnAnalysisContent(JSON.stringify({
       ...routed,
@@ -2072,11 +2087,21 @@ describe("multilingual semantic router contract", () => {
 
   it("instructs one multilingual pass without keyword-list routing", () => {
     const prompt = buildTurnAnalysisSystemPrompt();
+    const responseFormat = JSON.stringify(buildTurnAnalysisResponseFormat(input()));
     expect(prompt).toContain("single multilingual semantic router");
     expect(prompt).toContain("Never rely on a fixed vocabulary");
     expect(prompt).toContain("Never use length, vocabulary lists or a hard-coded language pair");
     expect(prompt).toContain("keep l as the expression's actual language but keep rl as the established response language");
-    expect(prompt).toContain("A genuine non-rhetorical question addressed to the room normally has reply expectation expected");
+    expect(prompt).toContain("Classify i.r by conversational function in context, not grammar");
+    expect(prompt).toContain("A room-directed follow-up that challenges earlier silence or a missed reaction normally expects a reply");
+    expect(prompt).toContain("Do not infer expected merely because a turn is rhetorical, emotional, profane or comments on the recent conversation");
+    expect(prompt).toContain("Use recentMessages to distinguish these acts semantically in every language and script");
+    expect(prompt).toContain("FINAL INTENT CROSS-CHECK");
+    expect(prompt).toContain("i.r MUST be expected");
+    expect(prompt).toContain("Never downgrade that request to optional merely because its surface is playful, annoyed, indirect, rhetorical, negative-framed or complaint-shaped");
+    expect(prompt).toContain("keep i.r optional/none for a standalone observation, joke, emotional flourish or explicit topic close");
+    expect(responseFormat).toContain("Pragmatic delivery contract, independent of question grammar");
+    expect(responseFormat).toContain("Emotion, profanity or rhetoric alone never implies expected");
     expect(prompt).toContain("reactionNeed is separate from i.r");
     expect(prompt).toContain("classify the pragmatic act in context, never a token");
     expect(prompt).toContain("Quoted, reported, negated, rejected, corrected or reclaimed language");

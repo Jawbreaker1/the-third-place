@@ -12,6 +12,97 @@ const hasTrustedEvidencePlan = (value) =>
 
 const cases = [
   {
+    id: "sv-pragmatic-reaction-followup",
+    text: "Inte ens en rolig kommentar på det?",
+    channel: { id: "the-pub", name: "the-pub", topic: "Relaxed Friday-night pub chat, jokes, music, films and everyday life." },
+    recentMessages: [
+      { id: "sv-pub-1", authorId: "live-eval-human", authorName: "EvalGuest", authorKind: "human", content: "Fan trött idag :(", createdAt: "2026-07-29T14:35:39.422Z" },
+      { id: "sv-pub-2", authorId: "ai-pixel", authorName: "Pixel", authorKind: "ai", content: "Kaffe eller en jävla tupplur?", createdAt: "2026-07-29T14:35:49.723Z" },
+      { id: "sv-pub-3", authorId: "ai-juno", authorName: "Juno", authorKind: "ai", content: "Kör en dubbel espresso eller en jävla tupplur så det blir något av det.", createdAt: "2026-07-29T14:35:50.458Z" },
+      { id: "sv-pub-4", authorId: "live-eval-human", authorName: "EvalGuest", authorKind: "human", content: "fan vad alla svär", createdAt: "2026-07-29T14:36:02.160Z" },
+    ],
+    latestMessageId: "sv-pub-5",
+    currentParticipantCandidates: [
+      {
+        id: "live-eval-human",
+        displayLabel: "EvalGuest",
+        kind: "human",
+        publicBio: null,
+        recentMessageIds: ["sv-pub-1", "sv-pub-4", "sv-pub-5"],
+      },
+      {
+        id: "ai-pixel",
+        displayLabel: "Pixel",
+        kind: "ai",
+        publicBio: null,
+        recentMessageIds: ["sv-pub-2"],
+      },
+      {
+        id: "ai-juno",
+        displayLabel: "Juno",
+        kind: "ai",
+        publicBio: null,
+        recentMessageIds: ["sv-pub-3"],
+      },
+    ],
+    capabilities: [],
+    historyRecallAvailable: true,
+    check: (value) => value.intent.replyExpected === "expected" &&
+      value.intent.confidence >= 0.75 &&
+      value.evidence.action === "none",
+  },
+  {
+    id: "en-pragmatic-silence-challenge",
+    text: "Seriously, not one of you is going to react to that?",
+    channel: { id: "the-pub", name: "the-pub", topic: "Relaxed Friday-night pub chat, jokes, music, films and everyday life." },
+    recentMessages: [
+      { id: "en-uptake-1", authorId: "live-eval-human", authorName: "EvalGuest", authorKind: "human", content: "That might be the worst joke I've ever told." },
+      { id: "en-uptake-2", authorId: "ai-sana", authorName: "Sana", authorKind: "ai", content: "Anyway, back to the build." },
+    ],
+    capabilities: [],
+    check: (value) => value.intent.replyExpected === "expected" &&
+      value.intent.confidence >= 0.75 &&
+      value.evidence.action === "none",
+  },
+  {
+    id: "ja-pragmatic-missed-reaction",
+    text: "本当に誰もそれに反応してくれないの？",
+    channel: { id: "the-pub", name: "the-pub", topic: "Relaxed Friday-night pub chat, jokes, music, films and everyday life." },
+    recentMessages: [
+      { id: "ja-uptake-1", authorId: "live-eval-human", authorName: "EvalGuest", authorKind: "human", content: "今のは冗談だったんだけど。" },
+      { id: "ja-uptake-2", authorId: "ai-mira", authorName: "Mira", authorKind: "ai", content: "さて、次の話題は？" },
+    ],
+    capabilities: [],
+    check: (value) => value.intent.replyExpected === "expected" &&
+      value.intent.confidence >= 0.75 &&
+      value.evidence.action === "none",
+  },
+  {
+    id: "es-pragmatic-silence-challenge",
+    text: "¿En serio nadie va a decir nada sobre eso?",
+    channel: { id: "the-pub", name: "the-pub", topic: "Relaxed Friday-night pub chat, jokes, music, films and everyday life." },
+    recentMessages: [
+      { id: "es-uptake-1", authorId: "live-eval-human", authorName: "EvalGuest", authorKind: "human", content: "Era una broma, por cierto." },
+      { id: "es-uptake-2", authorId: "ai-linnea", authorName: "Linnea", authorKind: "ai", content: "Bueno, cambiando de tema." },
+    ],
+    capabilities: [],
+    check: (value) => value.intent.replyExpected === "expected" &&
+      value.intent.confidence >= 0.75 &&
+      value.evidence.action === "none",
+  },
+  {
+    id: "sv-observation-does-not-force-reply",
+    text: "Haha, fan vad alla svär här.",
+    capabilities: [],
+    check: (value) => value.intent.replyExpected !== "expected",
+  },
+  {
+    id: "en-explicit-rhetorical-close",
+    text: "That was rhetorical, no need to answer. Anyway, I'm off.",
+    capabilities: [],
+    check: (value) => value.intent.replyExpected === "none",
+  },
+  {
     id: "sv-clock-regression",
     text: "Tss, ja men jag frågade ju här i kanalen.Ingen som vet vad klockan är i Sverige just nu?",
     capabilities: ["web_search", "local_datetime"],
@@ -641,12 +732,13 @@ for (const [index, test] of selectedCases.entries()) {
       medium: "public",
       channel: test.channel ?? { id: "lobby", name: "lobby", topic: "open multilingual community conversation" },
       latestMessage: {
-        id: `message-${index}`,
+        id: test.latestMessageId ?? `message-${index}`,
         authorId: "live-eval-human",
         authorName: "EvalGuest",
         content: test.text,
       },
       recentMessages: test.recentMessages ?? [],
+      currentParticipantCandidates: test.currentParticipantCandidates ?? [],
       personaCandidates: personas,
       mechanicalAddressedPersonaIds: test.mechanicalAddressedPersonaIds ?? [],
       urlCandidates: test.urlCandidates ?? [],
