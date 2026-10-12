@@ -27,6 +27,20 @@ import {
 } from "./semanticRouter.js";
 import { resolveLocalDateTime } from "./timeResolver.js";
 import type { ModelBackend } from "./modelBackend.js";
+import type { RequestDeliveryAssessment } from "./requestDeliveryReview.js";
+
+// Explicit semantic fixtures for tests that exercise production request owners.
+// The excerpt only anchors the supplied verdict to its own candidate; this
+// helper does not infer delivery from prose or manufacture a default approval.
+const deliveryAssessment = (
+  status: Exclude<RequestDeliveryAssessment["status"], "not_due">,
+  resolvedOutcome: string,
+  candidateText?: string,
+): RequestDeliveryAssessment => ({
+  status,
+  resolvedOutcome,
+  deliveredExcerpt: candidateText?.slice(0, 300) ?? null,
+});
 
 const jsonResponse = (payload: unknown) =>
   new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -1098,6 +1112,7 @@ const candidateReviewCompletion = (reviews: Array<{
   severity: "none" | "low" | "medium" | "high";
   issues: string[];
   rewriteInstruction: string | null;
+  requestDelivery?: RequestDeliveryAssessment;
   sameSceneOverlap?: "none" | "brief_social_chorus" | "substantive_overlap" | "pure_duplicate";
   outputLanguage?: { tag: string; confidence: number };
 }>) => jsonResponse({
@@ -4692,6 +4707,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["diegetic_identity_break"],
           rewriteInstruction: "Drop the out-of-character self-disclosure.",
+          requestDelivery: deliveryAssessment("delivered", "Respond to the identity question.", "Jag är en AI-modell, inte en människa."),
         }]);
       }
       if (call === 3) {
@@ -4705,6 +4721,7 @@ describe("LM Studio multilingual batch candidate review", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("delivered", "Respond to the identity question.", "Nä, jag är Sana. Du låter mer som en bot just nu 😄"),
       }]);
     }));
 
@@ -4753,6 +4770,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["evidence_ungrounded"],
           rewriteInstruction: "Name the exact missing values and cite the inspected sources.",
+          requestDelivery: deliveryAssessment("constrained", "Report global index levels and percentage changes.", "Jag får inte fram någon live-data."),
         }]);
       }
       if (bodies.length === 3) {
@@ -4763,6 +4781,7 @@ describe("LM Studio multilingual batch candidate review", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("constrained", "Report global index levels and percentage changes.", gap),
       }]);
     }));
 
@@ -4841,6 +4860,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["unfulfilled_explicit_request"],
           rewriteInstruction: "Answer both requested dimensions: winner and winning scorer, using S1.",
+          requestDelivery: deliveryAssessment("missing", "Report the final winner and winning scorer."),
         }]);
       }
       if (bodies.length === 3) {
@@ -4855,6 +4875,7 @@ describe("LM Studio multilingual batch candidate review", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("delivered", "Report the final winner and winning scorer.", complete),
       }]);
     }));
 
@@ -4971,6 +4992,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["assistant_register"],
           rewriteInstruction: "Lead with the exact boundary and answer in a natural peer voice.",
+          requestDelivery: deliveryAssessment("constrained", "Explain the siblings' recurring arguments.", bodies.length === 2 ? first : second),
           outputLanguage: { tag: "en", confidence: 0.99 },
         }]);
       }
@@ -5052,6 +5074,7 @@ describe("LM Studio multilingual batch candidate review", () => {
             severity: "none",
             issues: [],
             rewriteInstruction: null,
+            requestDelivery: deliveryAssessment("delivered", "Name the final winner.", compact),
           }]);
     }));
 
@@ -5139,6 +5162,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["evidence_not_answer_bearing"],
           rewriteInstruction: "The complete supplied packet lacks the requested Investor AB datum.",
+          requestDelivery: deliveryAssessment("delivered", "Report current information about Investor AB.", "Investor ser billig ut jämfört med substansvärdet."),
         }]);
       }
       if (bodies.length === 3) {
@@ -5154,6 +5178,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["evidence_not_answer_bearing"],
           rewriteInstruction: "The complete supplied packet still lacks the requested Investor AB datum.",
+          requestDelivery: deliveryAssessment("delivered", "Report current information about Investor AB.", "OMXS30-sidan visar att Investor har gått starkt idag."),
         }]);
       }
       if (bodies.length === 5) {
@@ -5274,6 +5299,9 @@ describe("LM Studio multilingual batch candidate review", () => {
         rewriteInstruction: call === 2
           ? "Attach the supplied source ID to the claimed report lookup."
           : "Use the packet's stated 12 percent discount rather than inventing 20 percent.",
+        requestDelivery: deliveryAssessment("delivered", "Report Investor's net asset value discount.", call === 2
+          ? "Jag kollade rapporten: Investor handlas med 12 procents rabatt."
+          : "Investor handlas med 20 procents rabatt enligt rapporten."),
         outputLanguage: { tag: "sv", confidence: 0.99 },
       }]);
     }));
@@ -5337,6 +5365,9 @@ describe("LM Studio multilingual batch candidate review", () => {
         severity: "high",
         issues: call === 6 ? ["irrelevant_to_turn"] : ["evidence_not_answer_bearing"],
         rewriteInstruction: "Reject this candidate.",
+        ...(call === 6 ? {} : {
+          requestDelivery: deliveryAssessment("delivered", "Report information about the company.", "Unsupported company claim."),
+        }),
       }]);
     }));
 
@@ -5412,6 +5443,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["unfulfilled_explicit_request"],
           rewriteInstruction,
+          requestDelivery: deliveryAssessment("missing", "Express the trusted present refusal without claiming execution or future work."),
           outputLanguage: { tag: "sv", confidence: 0.99 },
         }]);
       }
@@ -5423,6 +5455,7 @@ describe("LM Studio multilingual batch candidate review", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("constrained", "Express present unwillingness to perform the optional lookup.", recovered),
         outputLanguage: { tag: "sv", confidence: 0.99 },
       }]);
     }));
@@ -5704,6 +5737,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["unfulfilled_explicit_request"],
           rewriteInstruction: "Ge den efterfrågade gåtan nu.",
+          requestDelivery: deliveryAssessment("missing", "Give the requested riddle now."),
         }]);
       }
       if (bodies.length === 3) return completionResponse([{ personaId: mira.id, content: fulfilled }]);
@@ -5712,6 +5746,7 @@ describe("LM Studio multilingual batch candidate review", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("delivered", "Give the requested riddle now.", fulfilled),
       }]);
     }));
 
@@ -6351,6 +6386,7 @@ describe("LM Studio multilingual batch candidate review", () => {
             severity: "none",
             issues: [],
             rewriteInstruction: null,
+            requestDelivery: deliveryAssessment("delivered", "Report Göteborg's forecast and whether it gets colder.", grounded),
           }]);
     }));
 
@@ -6755,6 +6791,7 @@ describe("LM Studio multilingual batch candidate review", () => {
           severity: "high",
           issues: ["unsupported_room_recall"],
           rewriteInstruction: "Do not claim personal presence and use only the retained excerpt.",
+          requestDelivery: deliveryAssessment("delivered", "Recall what Per discussed in the room.", unsupported),
         }]);
       }
       if (bodies.length === 3) return completionResponse([{ personaId: mira.id, content: grounded }]);
@@ -6763,6 +6800,7 @@ describe("LM Studio multilingual batch candidate review", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("delivered", "Recall what Per discussed in the room.", grounded),
       }]);
     }));
 
@@ -9143,6 +9181,7 @@ describe("LM Studio room prompt", () => {
               severity: "high",
               issues: ["unfulfilled_explicit_request"],
               rewriteInstruction: "Give the requested riddle now.",
+              requestDelivery: deliveryAssessment("missing", "Give the requested riddle now."),
             },
           ] as Parameters<typeof candidateReviewCompletion>[0];
           return kind === "voice"
@@ -9153,7 +9192,8 @@ describe("LM Studio room prompt", () => {
           return completionResponse([{ personaId: mira.id, content: fulfilled }]);
         }
         const reviews = [
-          { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null },
+          { personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null,
+            requestDelivery: deliveryAssessment("delivered", "Give the requested riddle now.", fulfilled) },
         ] as Parameters<typeof candidateReviewCompletion>[0];
         return kind === "voice"
           ? voiceCandidateReviewCompletion(reviews, { tag: "en", confidence: 0.99 })
@@ -9396,6 +9436,7 @@ describe("LM Studio room prompt", () => {
           severity: "none",
           issues: [],
           rewriteInstruction: null,
+          requestDelivery: deliveryAssessment("constrained", "Explain the siblings' recurring arguments within available evidence.", draft),
           outputLanguage: { tag: "sv", confidence: 0.99 },
         }]);
       }
@@ -9888,6 +9929,7 @@ describe("LM Studio room prompt", () => {
           severity: "high",
           issues: ["assistant_register", "unfulfilled_explicit_request", "operational_scope_mismatch"],
           rewriteInstruction: "Answer the authorized isolated-lab CVE validation question directly with the controlled topology, observable signals and cleanup boundary.",
+          requestDelivery: deliveryAssessment("missing", "Give a concrete controlled lab validation method."),
         }]);
       }
       if (bodies.length === 3) {
@@ -9898,6 +9940,7 @@ describe("LM Studio room prompt", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("delivered", "Give a concrete controlled lab validation method.", concrete),
       }]);
     }));
 
@@ -9975,6 +10018,7 @@ describe("LM Studio room prompt", () => {
             severity: "none",
             issues: [],
             rewriteInstruction: null,
+            requestDelivery: deliveryAssessment("delivered", "Give a worked least-privilege tool-server design and complete control flow.", workedDesign),
           }]);
     }));
 
@@ -10043,6 +10087,7 @@ describe("LM Studio room prompt", () => {
           severity: "high",
           issues: ["unfulfilled_explicit_request", "operational_scope_mismatch"],
           rewriteInstruction: "Supply the requested inert worked specimen, its expected vulnerable effect and its control case.",
+          requestDelivery: deliveryAssessment("missing", "Supply the requested inert worked specimen, its expected effect and its control case."),
         }]);
       }
       if (bodies.length === 3) {
@@ -10053,6 +10098,7 @@ describe("LM Studio room prompt", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("delivered", "Supply the requested inert worked specimen, its expected effect and its control case.", concrete),
       }]);
     }));
 
@@ -10144,6 +10190,7 @@ describe("LM Studio room prompt", () => {
           severity: "high",
           issues: ["operational_scope_mismatch"],
           rewriteInstruction: "Exclude the harmful real-target step and deliver a same-depth isolated detection and incident-response path.",
+          requestDelivery: deliveryAssessment("missing", "Give the permitted isolated detection and incident-response alternative."),
         }]);
       }
       if (bodies.length === 3) return completionResponse([{ personaId: aya.id, content: safe }]);
@@ -10152,6 +10199,7 @@ describe("LM Studio room prompt", () => {
         severity: "none",
         issues: [],
         rewriteInstruction: null,
+        requestDelivery: deliveryAssessment("delivered", "Give the permitted isolated detection and incident-response alternative.", safe),
       }]);
     }));
 
@@ -10568,6 +10616,7 @@ describe("LM Studio room prompt", () => {
           severity: "none" as const,
           issues: [],
           rewriteInstruction: null,
+          requestDelivery: deliveryAssessment("delivered", "Explain the difference from an ordinary group chat.", "Det är stökigare här, fast på ett bra sätt."),
         })));
       }
       return completionResponse([{

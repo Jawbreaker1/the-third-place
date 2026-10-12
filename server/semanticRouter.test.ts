@@ -4167,7 +4167,7 @@ describe("multilingual batch candidate-review contract", () => {
       "When capabilityContext.executionStatus is declined",
     );
     expect(buildVoiceCandidateReviewSystemPrompt()).toContain(
-      "A declined execution is fulfilled by one visible in-character refusal",
+      "Declined execution needs a visible refusal",
     );
 
     expect(candidateReviewInputSchema.safeParse({
@@ -5027,16 +5027,17 @@ describe("multilingual batch candidate-review contract", () => {
     };
     expect(parseCandidateReviewContent(JSON.stringify(clean), singleFact)).toEqual(clean);
 
-    for (const prompt of [
-      buildCandidateReviewSystemPrompt(),
-      buildVoiceCandidateReviewSystemPrompt(),
-    ]) {
-      expect(prompt).toContain(
-        "A successful typed capability is evidence and a means of fulfilment, never a substitute",
-      );
+    const fullPrompt = buildCandidateReviewSystemPrompt();
+    const voicePrompt = buildVoiceCandidateReviewSystemPrompt();
+    expect(fullPrompt).toContain(
+      "A successful typed capability is evidence and a means of fulfilment, never a substitute",
+    );
+    expect(fullPrompt).toContain("single-fact request is complete");
+    expect(voicePrompt).toContain("Evidence aids delivery, never replaces it");
+    expect(voicePrompt).toContain("A compact entailed single-fact answer suffices");
+    for (const prompt of [fullPrompt, voicePrompt]) {
       expect(prompt).toContain("every expressly requested core dimension");
       expect(prompt).toContain("A compact");
-      expect(prompt).toContain("single-fact request is complete");
     }
     expect(buildCandidateReviewSystemPrompt()).toContain(
       "Preserve each requested role, timeframe and scope",
