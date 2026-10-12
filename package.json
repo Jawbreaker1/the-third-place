@@ -36,6 +36,8 @@
     "eval:relationships": "node --import tsx scripts/relationship-live-eval.mjs",
     "eval:memory": "node --env-file=.env --import tsx scripts/memory-context-live-eval.mjs",
     "eval:commitments": "node --env-file=.env --import tsx scripts/commitment-live-eval.mjs",
+    "eval:parked:factual-shadow": "node --env-file=.env --import tsx scripts/factual-shadow-live-eval.mjs",
+    "test:parked:factual-shadow": "tsc -p tsconfig.experiments.json && vitest run scripts/experiments/factualShadowReview.test.ts && node --import tsx --test scripts/factual-shadow-live-eval.node-test.mjs",
     "eval:semantics": "node --import tsx scripts/semantic-router-live-eval.mjs",
     "eval:security": "node --import tsx scripts/security-room-live-eval.mjs",
     "test:audit:humanity": "node --test scripts/humanity-audit.node-test.mjs",
