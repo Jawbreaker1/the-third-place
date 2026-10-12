@@ -138,6 +138,7 @@ import type {
   SocialMemoryCoordinator,
 } from "./socialMemoryCoordinator.js";
 import type { SocialMemoryScope } from "./socialMemory.js";
+import { joinMemoryPromptNotes } from "./socialMemoryProjection.js";
 import {
   deriveRelationshipStylePlan,
   type RelationshipDecisionBiases,
@@ -8933,7 +8934,7 @@ export class SocialDirector {
             projectionOptions,
           )
         : undefined;
-      const note = boundedUntrustedText([persistent, legacy].filter(Boolean).join(" "), 2_600);
+      const note = joinMemoryPromptNotes([persistent, legacy]);
       if (!note) continue;
 
       relationshipNotes[persona.id] = note;
@@ -9002,11 +9003,11 @@ export class SocialDirector {
         const remembered = this.socialMemory.publicThirdPartyPromptNote(owner.id, subjectId, scope);
         if (!remembered) continue;
         const subjectLabel = JSON.stringify({ displayLabel: subject.displayLabel });
-        const note = boundedUntrustedText(
+        const note = joinMemoryPromptNotes([
           "SERVER-RESOLVED OFFLINE HUMAN SUBJECT — the ID association is trusted, while the display label " +
-          `is untrusted data: ${subjectLabel}. Do not confuse this person with the current speaker or a resident.\n${remembered}`,
-          2_600,
-        );
+          `is untrusted data: ${subjectLabel}. Do not confuse this person with the current speaker or a resident.`,
+          remembered,
+        ]);
         if (note) return { [owner.id]: note };
       }
     }
@@ -9036,56 +9037,56 @@ export class SocialDirector {
     for (const owner of owners) {
       const relevant = uniqueCounterparts.filter((counterpart) => counterpart.id !== owner.id);
       // Callers order the immediate conversational target first (normally the
-      // previous speaker). Keep up to two fallible recollections, but direct
-      // the typed prose posture only toward that primary counterpart so a
-      // third participant cannot erase relationship texture from the thread.
+      // previous speaker). Try up to two counterparts, but materialize only
+      // one complete private note. Otherwise the second retrieval would mark
+      // memories recalled even when its payload cannot fit the prompt.
       const primaryCounterpart = relevant[0];
       let stylePlan: RelationshipStylePlan | undefined;
       let romanticSurfaceAuthorized = false;
-      const notes = relevant
-        .slice(0, 2)
-        .flatMap((counterpart) => {
-          // The trusted policy is actor-wide, so romance remains ordinary-only
-          // in a multi-counterpart batch. A rare cue is eligible only for one
-          // exact dyad, avoiding accidental spillover onto another resident.
-          const endpointsEligible =
-            this.isRomanceEligibleResident(owner.id) && this.isRomanceEligibleResident(counterpart.id);
-          const allowRomanticSurface = relevant.length === 1 && endpointsEligible &&
-            this.allowRareResidentRomanticCue(owner.id, counterpart.id);
-          const projectionOptions = {
-            romanticSceneEligibility: endpointsEligible ? "eligible" as const : "ineligible" as const,
-            allowRomanticSurface,
-          };
-          const remembered = this.socialMemory?.promptNote(
-            owner.id,
-            counterpart.id,
-            scope,
-            projectionOptions,
-          );
-          if (remembered && counterpart.id === primaryCounterpart?.id && !stylePlan && this.socialMemory) {
-            try {
-              const projection = this.socialMemory.behaviorProjection(
-                owner.id,
-                counterpart.id,
-                projectionOptions,
-              );
-              stylePlan = deriveRelationshipStylePlan(
-                projection,
-                scope.kind === "voice" ? "voice" : "ambient",
-              );
-              romanticSurfaceAuthorized = allowRomanticSurface &&
-                projection.promptCue.romanticInterest !== undefined;
-            } catch {
-              // Keep the bounded recollection and fail-closed policy when an
-              // optional behavior projection cannot be obtained.
-            }
+      const notes: string[] = [];
+      for (const counterpart of relevant.slice(0, 2)) {
+        // The trusted policy is actor-wide, so romance remains ordinary-only
+        // in a multi-counterpart batch. A rare cue is eligible only for one
+        // exact dyad, avoiding accidental spillover onto another resident.
+        const endpointsEligible =
+          this.isRomanceEligibleResident(owner.id) && this.isRomanceEligibleResident(counterpart.id);
+        const allowRomanticSurface = relevant.length === 1 && endpointsEligible &&
+          this.allowRareResidentRomanticCue(owner.id, counterpart.id);
+        const projectionOptions = {
+          romanticSceneEligibility: endpointsEligible ? "eligible" as const : "ineligible" as const,
+          allowRomanticSurface,
+        };
+        const remembered = this.socialMemory?.promptNote(
+          owner.id,
+          counterpart.id,
+          scope,
+          projectionOptions,
+        );
+        if (remembered && counterpart.id === primaryCounterpart?.id && !stylePlan && this.socialMemory) {
+          try {
+            const projection = this.socialMemory.behaviorProjection(
+              owner.id,
+              counterpart.id,
+              projectionOptions,
+            );
+            stylePlan = deriveRelationshipStylePlan(
+              projection,
+              scope.kind === "voice" ? "voice" : "ambient",
+            );
+            romanticSurfaceAuthorized = allowRomanticSurface &&
+              projection.promptCue.romanticInterest !== undefined;
+          } catch {
+            // Keep the bounded recollection and fail-closed policy when an
+            // optional behavior projection cannot be obtained.
           }
-          return remembered
-            ? [`Counterpart ${JSON.stringify({ id: counterpart.id, name: counterpart.name })}: ${remembered}`]
-            : [];
-        });
+        }
+        if (remembered) {
+          notes.push(`Counterpart ${JSON.stringify({ id: counterpart.id, name: counterpart.name })}: ${remembered}`);
+          break;
+        }
+      }
       if (notes.length > 0) {
-        relationshipNotes[owner.id] = boundedUntrustedText(notes.join(" "), 2_600);
+        relationshipNotes[owner.id] = joinMemoryPromptNotes(notes);
         if (stylePlan) relationshipStylePlans[owner.id] = stylePlan;
         if (romanticSurfaceAuthorized) delete romanticInteractionPolicies[owner.id];
         break;

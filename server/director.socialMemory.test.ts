@@ -432,7 +432,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       { kind: "public", channelId: "the-pub" },
     );
     expect(Object.keys(residentNotes)).toEqual([mira!.id]);
-    expect(promptNote).toHaveBeenCalledTimes(2);
+    expect(promptNote).toHaveBeenCalledTimes(1);
     expect(promptNote).not.toHaveBeenCalledWith(sana!.id, expect.anything(), expect.anything());
     director.stop();
   });
@@ -710,7 +710,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     director.stop();
   });
 
-  it("retrieves at most the two AI-to-AI notes that can actually reach the scene prompt", () => {
+  it("retrieves only the first AI-to-AI note that can actually reach the scene prompt", () => {
     const promptNote = vi.fn((ownerId: string, subjectId: string) =>
       `DIRECTED MEMORY ${ownerId} -> ${subjectId}`
     );
@@ -740,7 +740,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       { kind: "public", channelId: "lobby" },
     );
 
-    expect(promptNote).toHaveBeenCalledTimes(2);
+    expect(promptNote).toHaveBeenCalledTimes(1);
     expect(promptNote).toHaveBeenNthCalledWith(1, owner!.id, first!.id, {
       kind: "public",
       channelId: "lobby",
@@ -748,16 +748,10 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       romanticSceneEligibility: "eligible",
       allowRomanticSurface: false,
     });
-    expect(promptNote).toHaveBeenNthCalledWith(2, owner!.id, second!.id, {
-      kind: "public",
-      channelId: "lobby",
-    }, {
-      romanticSceneEligibility: "eligible",
-      allowRomanticSurface: false,
-    });
-    expect(promptNote).not.toHaveBeenCalledWith(owner!.id, omitted!.id, expect.anything());
+    expect(promptNote).not.toHaveBeenCalledWith(owner!.id, second!.id, expect.anything(), expect.anything());
+    expect(promptNote).not.toHaveBeenCalledWith(owner!.id, omitted!.id, expect.anything(), expect.anything());
     expect(notes[owner!.id]).toContain(first!.name);
-    expect(notes[owner!.id]).toContain(second!.name);
+    expect(notes[owner!.id]).not.toContain(second!.name);
     expect(notes[owner!.id]).not.toContain(omitted!.name);
     director.stop();
   });
@@ -813,7 +807,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     );
 
     expect(context.relationshipNotes[owner!.id]).toContain(immediate!.name);
-    expect(context.relationshipNotes[owner!.id]).toContain(second!.name);
+    expect(context.relationshipNotes[owner!.id]).not.toContain(second!.name);
     expect(context.relationshipNotes[owner!.id]).not.toContain(third!.name);
     expect(context.relationshipStylePlans[owner!.id]).toMatchObject({
       move: "assume_goodwill",

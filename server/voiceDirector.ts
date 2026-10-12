@@ -29,6 +29,7 @@ import { CapabilityRegistry } from "./capabilities/registry.js";
 import { capabilitiesForMedium, type TurnCapability } from "./capabilities/catalog.js";
 import type { SocialMemoryCoordinator } from "./socialMemoryCoordinator.js";
 import type { SocialMemoryScope } from "./socialMemory.js";
+import { joinMemoryPromptNotes } from "./socialMemoryProjection.js";
 import {
   deriveRelationshipStylePlan,
   RELATIONSHIP_DECISION_BIAS_LIMITS,
@@ -133,7 +134,9 @@ const sanitizeSpokenLine = (value: string, language?: string): string => {
 };
 
 const combinedRelationshipNote = (...notes: Array<string | undefined>): string | undefined => {
-  const combined = notes.filter((note): note is string => Boolean(note?.trim())).join("\n").slice(0, 1_200);
+  // Persistent context is supplied last; keep its complete scoped payload
+  // before optional legacy/session notes. Generation and review share 2,600.
+  const combined = joinMemoryPromptNotes([...notes].reverse());
   return combined || undefined;
 };
 
@@ -334,7 +337,7 @@ const analysisInputFor = (
         ? {
             voiceReplyProfile: soleDraftContext.replyProfile,
             ...(soleDraftContext.relationshipContext
-              ? { voiceRelationshipContext: soleDraftContext.relationshipContext.slice(0, 600) }
+              ? { voiceRelationshipContext: soleDraftContext.relationshipContext }
               : {}),
           }
         : {}),

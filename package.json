@@ -34,6 +34,7 @@
     "eval:director": "node --env-file=.env --import tsx scripts/director-live-smoke.mjs",
     "eval:pub": "node --import tsx scripts/pub-live-eval.mjs",
     "eval:relationships": "node --import tsx scripts/relationship-live-eval.mjs",
+    "eval:memory": "node --env-file=.env --import tsx scripts/memory-context-live-eval.mjs",
     "eval:semantics": "node --import tsx scripts/semantic-router-live-eval.mjs",
     "eval:security": "node --import tsx scripts/security-room-live-eval.mjs",
     "test:audit:humanity": "node --test scripts/humanity-audit.node-test.mjs",
