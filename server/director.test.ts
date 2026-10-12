@@ -3006,12 +3006,14 @@ describe("social director", () => {
       expect(scene.history.some((line) => line.content === oldHuman.content)).toBe(false);
       expect(scene.roomRecall?.transcript).toEqual([
         {
+          messageId: oldHuman.id,
           author: "Περικλής",
           kind: "human",
           content: oldHuman.content,
           createdAt: oldHuman.createdAt,
         },
         {
+          messageId: oldWitness.id,
           author: "Mira",
           kind: "ai",
           content: oldWitness.content,
@@ -3023,7 +3025,8 @@ describe("social director", () => {
       expect(scene.selected.map((persona) => persona.id)).toContain("ai-mira");
       expect(scene.requestOwnerIds).toEqual(["ai-mira"]);
       expect(scene.mustReplyIds).toContain("ai-mira");
-      expect(scene.premise).toContain("Mira is the server-observed witness");
+      expect(scene.premise).toContain("Mira is a server-observed witness");
+      expect(scene.premise).toContain("supplements the recent conversation; it does not replace it");
     } finally {
       vi.useRealTimers();
     }
@@ -3154,7 +3157,8 @@ describe("social director", () => {
         expect(scene.premise ?? "", testCase.label).not.toContain("retained public-room excerpt");
         if (testCase.label === "trusted-no-source") {
           expect(scene.mustReplyIds.length).toBeGreaterThan(0);
-          expect(scene.premise).toContain("no matching retained public excerpt was found");
+          expect(scene.premise).toContain("no matching retained public excerpt");
+          expect(scene.premise).toContain("does not erase the supplied recent conversation");
         }
       }
     } finally {

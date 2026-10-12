@@ -1273,7 +1273,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
     expect(completionBody.messages[1].content).toContain('"ref":"latest:0"');
     expect(completionBody.messages[1].content).toContain('"communityClock":{"timeZone":"Europe/Stockholm","locationLabel":"The Third Place"}');
     expect(completionBody.messages[1].content).not.toContain('"url":');
-    expect(completionBody.messages[0].content).toBe(buildTurnAnalysisSystemPrompt());
+    expect(completionBody.messages[0].content).toBe(buildTurnAnalysisSystemPrompt(turnInput("same-turn").availableCapabilities));
   });
 
   it("lets the semantic router keep external capability work off when trusted room-feed facts answer the turn", async () => {

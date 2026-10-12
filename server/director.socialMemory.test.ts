@@ -1159,7 +1159,8 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       expect(scene.relationshipNotes).not.toEqual(expect.objectContaining({
         [mira.id]: expect.stringContaining("SHOULD NOT BE READ"),
       }));
-      expect(scene.premise).toContain("exact retained public-room excerpt");
+      expect(scene.premise).toContain("supplied older public-room excerpt");
+      expect(scene.premise).toContain("supplements the recent conversation");
       director.stop();
     } finally {
       vi.clearAllTimers();

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { recordTurnDiagnostic } from "./turnDiagnostics.js";
 import type { Server } from "socket.io";
 import type {
   ChatMessage,
@@ -4300,8 +4301,22 @@ export class SocialDirector {
     turn: DmTurn<CoordinatedDmInput>,
   ): Promise<CoordinatedDmReply | undefined> {
     const foreground = this.lm.acquireForegroundDemand?.();
+    const latest = turn.messages.at(-1)?.message;
+    const diagnostic = { kind: "dm", channelId: latest?.channelId, trigger: { messageId: latest?.id } };
+    const started = performance.now();
+    recordTurnDiagnostic(diagnostic, { stage: "turn", outcome: "started" });
     try {
-      return await this.generateDirectTurnWithForeground(turn);
+      const result = await this.generateDirectTurnWithForeground(turn);
+      recordTurnDiagnostic(diagnostic, {
+        stage: "turn", outcome: !turn.isCurrent() ? "superseded" : result ? "completed" : "empty",
+        durationMs: performance.now() - started,
+      });
+      return result;
+    } catch (error) {
+      recordTurnDiagnostic(diagnostic, {
+        stage: "turn", outcome: turn.signal.aborted ? "cancelled" : "failed", durationMs: performance.now() - started,
+      });
+      throw error;
     } finally {
       foreground?.release();
     }
@@ -4359,6 +4374,11 @@ export class SocialDirector {
       candidateSet,
       allowSearch: Boolean(persona.canResearch),
       signal: turn.signal,
+    });
+    recordTurnDiagnostic({ kind: "dm", channelId: latest.channelId, trigger: { messageId: latest.id } }, {
+      stage: "routing", outcome: analysis.source === "lm" ? "completed" : "unavailable",
+      analysisSource: analysis.source, evidenceAction: analysis.evidence.action,
+      replyExpected: analysis.intent.replyExpected,
     });
     if (!turn.isCurrent()) return undefined;
 
@@ -4539,6 +4559,9 @@ export class SocialDirector {
       for (const input of turn.messages) this.admittedDirectMessageIds.delete(input.message.id);
       const thread = this.store.getDmThread(result.human.id, result.persona.id);
       if (thread) this.io.to(`user:${result.human.id}`).emit("dm:update", { thread, message: reply });
+      recordTurnDiagnostic({ kind: "dm", channelId: result.threadId, trigger: { messageId: result.replyToId } }, {
+        stage: "publication", outcome: "published", publishedCount: 1,
+      });
       this.lm.rememberDeliveredLine(result.persona.id, result.content, {
         kind: "dm",
         channelId: result.threadId,
@@ -4574,6 +4597,10 @@ export class SocialDirector {
     recovering = false,
   ): Promise<void> {
     const foreground = this.lm.acquireForegroundDemand?.();
+    const trigger = messages.at(-1);
+    const diagnostic = { kind: "public", channelId: trigger?.channelId, trigger: { messageId: trigger?.id } };
+    const started = performance.now();
+    recordTurnDiagnostic(diagnostic, { stage: "turn", outcome: "started" });
     try {
       await this.handleHumanBurstWithForeground(
         messages,
@@ -4583,6 +4610,10 @@ export class SocialDirector {
         actorWorkEpoch,
         recovering,
       );
+      recordTurnDiagnostic(diagnostic, { stage: "turn", outcome: "completed", durationMs: performance.now() - started });
+    } catch (error) {
+      recordTurnDiagnostic(diagnostic, { stage: "turn", outcome: "failed", durationMs: performance.now() - started });
+      throw error;
     } finally {
       foreground?.release();
     }
@@ -4598,6 +4629,7 @@ export class SocialDirector {
   ): Promise<void> {
     const trigger = messages.at(-1);
     if (!trigger) return;
+    const diagnostic = { kind: "public", channelId: trigger.channelId, trigger: { messageId: trigger.id } };
     const firstArrivalPersonaIds = [...new Set(
       preclaimedDeliveries
         .filter((claim) => claim.deliveryKind === "first_arrival")
@@ -4632,6 +4664,7 @@ export class SocialDirector {
       this.humanActorWorkIsCurrent(human.id, actorWorkEpoch) &&
       (supersessionProtected || burstEpoch === (this.humanTurnEpochByActorScope.get(actorScope) ?? 0));
     if (!burstIsCurrent()) {
+      recordTurnDiagnostic(diagnostic, { stage: "selection", outcome: "superseded" });
       this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
@@ -4675,6 +4708,7 @@ export class SocialDirector {
     const triggerParticipantBinding = firstArrival
       ? this.sceneTriggerParticipantBinding(trigger, currentParticipantCandidates)
       : undefined;
+    const routingStarted = performance.now();
     const analysis = await this.analyzeHumanTurn({
       medium: "public",
       turnId: `public:${trigger.id}`,
@@ -4693,8 +4727,14 @@ export class SocialDirector {
         ? { mechanicalAddressedPersonaIdsOverride: routedPreclaimedPersonaIds }
         : {}),
     });
+    recordTurnDiagnostic(diagnostic, {
+      stage: "routing", outcome: analysis.source === "lm" ? "completed" : "unavailable",
+      durationMs: performance.now() - routingStarted, analysisSource: analysis.source,
+      evidenceAction: analysis.evidence.action, replyExpected: analysis.intent.replyExpected,
+    });
     const availableCapabilities = this.availableTurnCapabilities(candidateSet, true, "public");
     if (!burstIsCurrent()) {
+      recordTurnDiagnostic(diagnostic, { stage: "selection", outcome: "superseded" });
       this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
@@ -4899,6 +4939,7 @@ export class SocialDirector {
       // A claimed passive link never falls through into an ungrounded normal
       // scene, even when a duplicate delivery or hard pacing gate rejects it.
       if (!this.claimAutoSharedLinkMessage(trigger.id)) {
+        recordTurnDiagnostic(diagnostic, { stage: "capability", outcome: "suppressed" });
         this.schedulePersistentMemory(messages, human, actorWorkEpoch);
         return;
       }
@@ -4912,6 +4953,7 @@ export class SocialDirector {
         ? { ...resolvedPageReadRequest, initiator: "automatic" as const }
         : undefined;
       if (!pageReadRequest?.url) {
+        recordTurnDiagnostic(diagnostic, { stage: "capability", outcome: "unavailable" });
         this.schedulePersistentMemory(messages, human, actorWorkEpoch);
         return;
       }
@@ -4921,6 +4963,7 @@ export class SocialDirector {
         url: pageReadRequest.url,
       });
       if (!autoSharedLinkAttempt) {
+        recordTurnDiagnostic(diagnostic, { stage: "capability", outcome: "deferred" });
         this.schedulePersistentMemory(messages, human, actorWorkEpoch);
         return;
       }
@@ -4953,6 +4996,7 @@ export class SocialDirector {
       const actorScope = publicTurnActorScopeKey(trigger.channelId, human.id);
       if (pendingForBurst.length > 0 &&
           !this.pendingPublicTurnActorScopeAvailable(actorScope, trigger.id)) {
+        recordTurnDiagnostic(diagnostic, { stage: "selection", outcome: "deferred" });
         return;
       }
       claimLoop: for (const turn of pendingForBurst) {
@@ -4987,7 +5031,10 @@ export class SocialDirector {
       }
       // Another live/recovery episode already owns every exact direct target.
       // Do not spend a second model call or publish a duplicate response.
-      if (pendingForBurst.length > 0 && claimedDeliveries.length === 0) return;
+      if (pendingForBurst.length > 0 && claimedDeliveries.length === 0) {
+        recordTurnDiagnostic(diagnostic, { stage: "selection", outcome: "deferred" });
+        return;
+      }
     }
     const settledDeliveryKeys = new Set<string>();
     const deliveryKey = (claim: ClaimedPublicTurnTarget): string =>
@@ -5129,9 +5176,15 @@ export class SocialDirector {
       if (registeredExpectedTurn) {
         await this.store.flush();
         const expectedActorScope = publicTurnActorScopeKey(trigger.channelId, human.id);
-        if (!this.pendingPublicTurnActorScopeAvailable(expectedActorScope, trigger.id)) return;
+        if (!this.pendingPublicTurnActorScopeAvailable(expectedActorScope, trigger.id)) {
+          recordTurnDiagnostic(diagnostic, { stage: "selection", outcome: "deferred" });
+          return;
+        }
         const claim = this.store.claimPendingPublicTurnTarget(trigger.id, requestOwner.id);
-        if (!claim) return;
+        if (!claim) {
+          recordTurnDiagnostic(diagnostic, { stage: "selection", outcome: "deferred" });
+          return;
+        }
         claimedDeliveries.push({
           messageId: trigger.id,
           channelId: trigger.channelId,
@@ -5189,6 +5242,7 @@ export class SocialDirector {
       : signals.mentionedIds.length ? "mention" : "message";
 
     if (selected.length === 0) {
+      recordTurnDiagnostic(diagnostic, { stage: "selection", outcome: "abstained", selectedCount: 0 });
       this.publishDirectorEvent({
         trigger: triggerType,
         summary: "The room noticed, but nobody forced a reply.",
@@ -5224,6 +5278,9 @@ export class SocialDirector {
     const accountablePrimary = requestOwner
       ?? selected.find((persona) => requiredIds.includes(persona.id));
     const firstCandidate = accountablePrimary ?? selected[0]!;
+    recordTurnDiagnostic(diagnostic, {
+      stage: "selection", outcome: "selected", selectedCount: selected.length, requiredCount: requiredIds.length,
+    });
     const continuationCandidates = selected.filter((persona) => persona.id !== firstCandidate.id);
     primaryTypingLease = autoSharedLinkAttempt || !accountablePrimary
       ? undefined
@@ -5236,6 +5293,7 @@ export class SocialDirector {
     let publicScene: SceneRequest | undefined;
     try {
       if (invocation) {
+        const capabilityStarted = performance.now();
         if (capabilityParticipation === "decline") {
           const actorName = evidenceResponder?.name ?? "The designated resident";
           capabilityScene = {
@@ -5254,6 +5312,12 @@ export class SocialDirector {
           });
         }
         research = capabilityScene.research;
+        recordTurnDiagnostic(diagnostic, {
+          stage: "capability", outcome: capabilityScene.suppressResponse ? "suppressed" : "completed",
+          durationMs: performance.now() - capabilityStarted,
+          candidateCount: research?.results.length ?? 0,
+          capabilityState: capabilityParticipation === "decline" ? "declined" : capabilityResolution?.state,
+        });
         evidencePremise = capabilityScene.premise;
         if (capabilityScene.suppressResponse) {
           // Passive-link failures are intentionally silent. They never turn
@@ -5265,6 +5329,9 @@ export class SocialDirector {
           autoSharedLinkAttempt &&
           (!burstIsCurrent() || (!this.canSpeak() && !automaticReadResponseRequired))
         ) {
+          recordTurnDiagnostic(diagnostic, {
+            stage: "publication", outcome: !burstIsCurrent() ? "superseded" : "capacity_limited",
+          });
           this.schedulePersistentMemory(messages, human, actorWorkEpoch);
           return;
         }
@@ -5289,12 +5356,12 @@ export class SocialDirector {
         evidencePremise,
         roomRecall
           ? recallResponder
-            ? `${recallResponder.name} is the server-observed witness designated to answer from the exact retained public-room excerpt. Give one compact concrete supported detail when the triggering participant asks about the past; use no historical detail beyond that excerpt.`
-            : "The selected residents may read the exact retained public-room excerpt. Give one compact concrete supported detail when the triggering participant asks about the past. They must not claim personal memory unless their ID is listed as a witness, and must add no historical detail beyond the excerpt."
+            ? `${recallResponder.name} is a server-observed witness to the supplied older public-room excerpt. That excerpt supplements the recent conversation; it does not replace it. Use only relevant, supported details from either supplied timeline and preserve which time and speaker they belong to. Do not invent events or turn an old similar question into an answer to the current one.`
+            : "The selected residents may read the exact older public-room excerpt as a supplement to the recent conversation, not its replacement. Use only relevant, supported details from either supplied timeline, preserving time and attribution. They must not claim personal memory of the older episode unless their ID is listed as a witness, and must not invent events or answers to an old question."
           : trustedTurn.historyRecallTrusted
             ? referencedHumanMemoryOwnerId
               ? "No matching exact retained public transcript excerpt was found. One selected resident instead has a fallible, owner-subjective public recollection about the server-resolved offline human. Only that resident may use it, must frame it as uncertain personal recollection, and must not turn it into an exact quote or add private detail."
-              : "The latest turn depends on older room history, but no matching retained public excerpt was found and no fallible public resident recollection is available. Do not invent a memory or historical detail; say only what the available context supports."
+              : "Older-room retrieval found no matching retained public excerpt or fallible public resident recollection. This does not erase the supplied recent conversation: answer from it when it supports the actual turn. Do not invent a missing older event or personal memory."
             : "",
       ]
         .filter(Boolean)
@@ -5362,6 +5429,7 @@ export class SocialDirector {
     }
 
     if (!burstIsCurrent()) {
+      recordTurnDiagnostic(diagnostic, { stage: "publication", outcome: "superseded" });
       this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
@@ -5462,11 +5530,11 @@ export class SocialDirector {
                   : recallAnswerer?.id === persona.id
                     ? roomRecall
                       ? roomRecall.witnessPersonaIds.includes(persona.id)
-                        ? `${persona.name} is the server-observed witness responsible for answering from recalledRoomEvidence without inventing any extra historical detail.`
-                        : `${persona.name} must answer by reading recalledRoomEvidence, without claiming personal memory or inventing any extra historical detail.`
+                        ? `${persona.name} may use relevant supplied recent conversation and recalledRoomEvidence, preserving time and attribution without inventing historical detail. The witness binding applies only to the recalled episode.`
+                        : `${persona.name} may answer from relevant supplied recent conversation and read recalledRoomEvidence, without claiming personal memory of the older episode or inventing historical detail.`
                       : referencedHumanMemoryOwnerId === persona.id
                         ? `${persona.name} has only the supplied fallible public recollection about the server-resolved offline human, not an exact retained transcript. Answer from it cautiously without claiming an exact quote, importing private context, or inventing another detail.`
-                        : `${persona.name} must answer honestly that no matching retained room evidence is available to them, without inventing a memory or historical detail.`
+                        : `${persona.name} should use any relevant supplied recent conversation; if the requested older fact is still missing, acknowledge that specific gap without inventing a memory or historical detail.`
                   : "Answer the triggering message in your assigned conversational role without inventing a linked-page request.",
             ].filter(Boolean).join(" "),
           },
@@ -5482,6 +5550,7 @@ export class SocialDirector {
       }
     }
     if (!burstIsCurrent()) {
+      recordTurnDiagnostic(diagnostic, { stage: "publication", outcome: "superseded" });
       this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
@@ -5525,6 +5594,7 @@ export class SocialDirector {
       Number(required.has(b.personaId)) - Number(required.has(a.personaId)),
     );
     if (this.now() - generatedAt > 45_000 && required.size === 0) {
+      recordTurnDiagnostic(diagnostic, { stage: "publication", outcome: "expired" });
       this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
@@ -5637,7 +5707,13 @@ export class SocialDirector {
           (index > 0 && !requiredReply &&
             this.store.getRecent(trigger.channelId, 1)[0]?.id !== replyToId) ||
           (!ordinarySlotAvailable && !prioritySlotAvailable && !externalAgentPrioritySlotAvailable)
-        ) break;
+        ) {
+          recordTurnDiagnostic(diagnostic, {
+            stage: "publication", outcome: !burstIsCurrent() ? "superseded"
+              : (!ordinarySlotAvailable && !prioritySlotAvailable && !externalAgentPrioritySlotAvailable) ? "capacity_limited" : "superseded",
+          });
+          break;
+        }
         const publishedSourceIds = this.capabilityRegistry.sourceIds(
           capabilityResolution,
           line.sourceIds,
@@ -5664,6 +5740,7 @@ export class SocialDirector {
             await this.flushDurablePublicMessageBeforeBroadcast(posted);
           }
           publishedResponses.push(posted);
+          recordTurnDiagnostic(diagnostic, { stage: "publication", outcome: "published", publishedCount: publishedResponses.length });
           settleClaimedDeliveries(persona.id);
           if (human.kind === "human") this.updateRelationship(persona.id, human.id, signals, 0.04);
           if (prioritySlotAvailable || externalAgentPrioritySlotAvailable) {
@@ -5692,6 +5769,7 @@ export class SocialDirector {
                 await this.flushDurablePublicMessageBeforeBroadcast(fallbackMessage);
               }
               publishedResponses.push(fallbackMessage);
+              recordTurnDiagnostic(diagnostic, { stage: "publication", outcome: "published", publishedCount: publishedResponses.length });
               settleClaimedDeliveries(persona.id);
               if (human.kind === "human") this.updateRelationship(persona.id, human.id, signals, 0.04);
               if (prioritySlotAvailable || externalAgentPrioritySlotAvailable) {
@@ -5713,6 +5791,9 @@ export class SocialDirector {
     const actualSpeakers = publishedResponses
       .map((message) => selected.find((persona) => persona.id === message.authorId))
       .filter((persona): persona is Persona => Boolean(persona));
+    recordTurnDiagnostic(diagnostic, {
+      stage: "publication", outcome: publishedResponses.length ? "completed" : "empty", publishedCount: publishedResponses.length,
+    });
     this.publishDirectorEvent({
       trigger: triggerType,
       summary: actualSpeakers.length
@@ -8511,6 +8592,7 @@ export class SocialDirector {
     const members = new Map(this.getMembers().map((member) => [member.id, member]));
     for (const persona of PERSONAS) members.set(persona.id, persona);
     return messages.map((message) => ({
+      messageId: message.id,
       author: members.get(message.authorId)?.name ?? message.authorSnapshot?.name ?? (message.system ? "room" : "unknown"),
       kind: message.system ? "system" : members.get(message.authorId)?.kind ?? message.authorSnapshot?.kind ?? "human",
       content: this.transcriptContent(message),
@@ -8605,6 +8687,7 @@ export class SocialDirector {
     const members = new Map(this.getMembers().map((member) => [member.id, member]));
     for (const persona of PERSONAS) members.set(persona.id, persona);
     return this.store.getDmMessages(threadId).slice(-24).map((message) => ({
+      messageId: message.id,
       author: members.get(message.authorId)?.name ?? "guest",
       kind: members.get(message.authorId)?.kind ?? "human",
       content: this.transcriptContent(message),

@@ -5320,7 +5320,7 @@ describe("multilingual batch candidate-review contract", () => {
     expect(prompt).toContain(
       "This exemption is decisive for bare assent, commiseration, shared encouragement and any other terse social chorus in any language",
     );
-    expect(prompt).toContain("flag only when the line also repeats substantive propositional content");
+    expect(prompt).toContain("flag only when the line also redundantly repeats substantive propositional content");
     expect(prompt).toContain("diegetic_identity_break");
     expect(prompt).toContain("residents are diegetically unaware of the product implementation");
     expect(prompt).toContain("in-character denial, disbelief, joke, deflection, human self-identification");
