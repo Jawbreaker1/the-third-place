@@ -5,15 +5,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import {
-  AMBIENT_ACTION_KINDS,
-  decideAmbientAction,
-  sampleAmbientEpisodeShape,
-} from "../server/ambientActionPlanner.ts";
+  CONVERSATION_MAX_PUBLICATIONS,
+  conversationOpportunity,
+} from "../server/conversationScheduling.ts";
 
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_DIRECTOR_PATH = resolve(SCRIPT_DIRECTORY, "../server/director.ts");
-const DEFAULT_EPISODES_PER_SCENARIO = 240;
-
 const round = (value, digits = 4) => Number(value.toFixed(digits));
 
 /** A tiny reproducible PRNG; it is test machinery, never production pacing. */
@@ -37,108 +34,114 @@ const frequencyReport = (values) => {
 };
 
 /**
- * Exercises the deterministic transport/action policy over every room mode,
- * origin and debate setting. No model text, language heuristic or network is
- * involved: this audit is specifically about shape and scheduling signatures.
+ * Feed explicitly fake model decisions into the production opportunity policy.
+ * It is the supplied model stream, not a sampled rhetorical move or target
+ * length, that decides whether anyone speaks. This proves scheduling bounds;
+ * it cannot establish real-model interest, language or conversation quality.
  */
-export const simulateAmbientEngine = ({
+export const simulateAmbientScenario = ({
+  decisions,
+  eligibleIds = ["mira", "bosse", "juno", "sana"],
   seed = 0xa11d1e,
-  episodesPerScenario = DEFAULT_EPISODES_PER_SCENARIO,
-} = {}) => {
+}) => {
   const rng = seededRandom(seed);
-  const lengths = [];
-  const actions = [];
-  const scenarios = [];
-  let hardCapStops = 0;
-  let naturalStops = 0;
-  let immediateActionRepeats = 0;
-  let hardCapViolations = 0;
-
-  const modes = ["discussion", "casual", "banter"];
-  const origins = ["room_seed", "human_topic", "autonomous_research"];
-  for (const mode of modes) {
-    for (const origin of origins) {
-      for (const debateBeat of [false, true]) {
-        const scenarioLengths = [];
-        for (let episodeIndex = 0; episodeIndex < episodesPerScenario; episodeIndex += 1) {
-          const shape = sampleAmbientEpisodeShape({ origin, mode, debateBeat, rng });
-          const previousActions = [];
-          let messageCount = 0;
-          for (let guard = 0; guard < 16; guard += 1) {
-            const decision = decideAmbientAction({
-              messageCount,
-              shape,
-              origin,
-              mode,
-              debateBeat,
-              hasResearch: origin === "autonomous_research",
-              hasOpenHook: messageCount < shape.minimumMessages || rng() < 0.22,
-              previousActions,
-              rng,
-            });
-            if (!decision.continueEpisode) {
-              if (messageCount >= shape.hardMaximumMessages) hardCapStops += 1;
-              else naturalStops += 1;
-              break;
-            }
-            if (previousActions.at(-1) === decision.kind) immediateActionRepeats += 1;
-            previousActions.push(decision.kind);
-            actions.push(decision.kind);
-            messageCount += 1;
-            if (messageCount > shape.hardMaximumMessages) {
-              hardCapViolations += 1;
-              break;
-            }
-          }
-          lengths.push(messageCount);
-          scenarioLengths.push(messageCount);
-        }
-        scenarios.push({
-          mode,
-          origin,
-          debateBeat,
-          uniqueLengths: new Set(scenarioLengths).size,
-          dominantLengthShare: frequencyReport(scenarioLengths)[0]?.share ?? 0,
-          meanLength: round(scenarioLengths.reduce((sum, value) => sum + value, 0) / scenarioLengths.length),
-        });
-      }
+  const ledger = [];
+  const attempts = [];
+  let quietCandidateIds = [];
+  let lastAuthorId;
+  let stop = "stream_exhausted";
+  for (const decision of decisions) {
+    const opportunity = conversationOpportunity({
+      publishedCount: ledger.length,
+      lastAuthorId,
+      quietCandidateIds,
+      eligibleIds,
+    });
+    if (opportunity.status !== "ready") {
+      stop = opportunity.status;
+      break;
     }
+    const candidateId = opportunity.candidateIds[Math.floor(rng() * opportunity.candidateIds.length)];
+    attempts.push({ candidateId, kind: decision.kind, publishedBefore: ledger.length });
+    if (decision.kind === "abstain") {
+      quietCandidateIds = [...new Set([...quietCandidateIds, candidateId])];
+      // Production abandons an empty opening; nothing was ever published.
+      if (!ledger.length) { stop = "empty_opening"; break; }
+      continue;
+    }
+    if (decision.kind !== "speak") throw new Error(`Unknown fake model decision: ${decision.kind}`);
+    if (decision.publicationSucceeded === false) { stop = "publication_failed"; break; }
+    ledger.push({ messageId: `published-${ledger.length + 1}`, authorId: candidateId, content: decision.content });
+    lastAuthorId = candidateId;
+    quietCandidateIds = [];
   }
+  if (stop === "stream_exhausted") {
+    const final = conversationOpportunity({ publishedCount: ledger.length, lastAuthorId, quietCandidateIds, eligibleIds });
+    if (final.status !== "ready") stop = final.status;
+  }
+  return { stop, attempts, ledger };
+};
 
-  const lengthFrequency = frequencyReport(lengths);
-  const actionFrequency = frequencyReport(actions);
-  const actionKindsSeen = new Set(actions);
+export const simulateAmbientEngine = ({ seed = 0xa11d1e } = {}) => {
+  const speak = (content, extra = {}) => ({ kind: "speak", content, ...extra });
+  const abstain = { kind: "abstain" };
+  const fixtures = [
+    { name: "empty opening", decisions: [abstain], expectedCount: 0, expectedStop: "empty_opening" },
+    ...[1, 2, 4, 7].map((count) => ({
+      name: `model supplies ${count} contributions then silence`,
+      decisions: [...Array.from({ length: count }, (_, index) => speak(`Source contribution ${index + 1}`)), abstain, abstain],
+      expectedCount: count,
+      expectedStop: "quiet",
+    })),
+    {
+      name: "another candidate can speak after abstention",
+      decisions: [speak("An actual opening"), abstain, speak("Another resident has something to add"), abstain, abstain],
+      expectedCount: 2,
+      expectedStop: "quiet",
+    },
+    {
+      name: "fairness hard cap",
+      decisions: Array.from({ length: 12 }, (_, index) => speak(`Long fake discussion ${index + 1}`)),
+      expectedCount: CONVERSATION_MAX_PUBLICATIONS,
+      expectedStop: "budget",
+    },
+    {
+      name: "failed publication never enters public ledger",
+      decisions: [speak("Actually published"), speak("A draft that must stay absent", { publicationSucceeded: false })],
+      expectedCount: 1,
+      expectedStop: "publication_failed",
+    },
+    { name: "no eligible speaker waits", decisions: [speak("Not published")], eligibleIds: [], expectedCount: 0, expectedStop: "wait" },
+  ];
   const issues = [];
-  if (hardCapViolations > 0) issues.push(`${hardCapViolations} simulated episodes exceeded their hard maximum`);
-  if (immediateActionRepeats > 0) issues.push(`${immediateActionRepeats} immediate action repetitions survived planning`);
-  const seenLengths = new Set(lengths);
-  const unreachableLengths = Array.from({ length: 8 }, (_, index) => index + 1)
-    .filter((length) => !seenLengths.has(length));
-  if (unreachableLengths.length > 0) {
-    issues.push(`published lengths were unreachable in this sample: ${unreachableLengths.join(", ")}`);
-  }
-  if ((lengthFrequency[0]?.share ?? 1) > 0.34) {
-    issues.push(`one thread length dominates ${(100 * lengthFrequency[0].share).toFixed(1)}% of episodes`);
-  }
-  if (scenarios.some((scenario) => scenario.uniqueLengths < 4)) {
-    issues.push("at least one mode/origin/debate scenario collapsed below four distinct lengths");
-  }
-  if (naturalStops === 0 || hardCapStops === 0) {
-    issues.push("the simulation did not exercise both natural silence and hard-cap closure");
-  }
-  const missingActionKinds = AMBIENT_ACTION_KINDS.filter((kind) => !actionKindsSeen.has(kind));
-  if (missingActionKinds.length > 0) issues.push(`action kinds never selected: ${missingActionKinds.join(", ")}`);
-
+  const scenarios = fixtures.map(({ name, expectedCount, expectedStop, ...input }, index) => {
+    const result = simulateAmbientScenario({ ...input, seed: seed + index });
+    if (result.ledger.length !== expectedCount) issues.push(`${name}: published ${result.ledger.length}, expected ${expectedCount}`);
+    if (result.stop !== expectedStop) issues.push(`${name}: stopped as ${result.stop}, expected ${expectedStop}`);
+    if (result.ledger.some((entry, position) => entry.authorId === result.ledger[position - 1]?.authorId)) {
+      issues.push(`${name}: a resident replied to themselves consecutively`);
+    }
+    for (let position = 1; position < result.attempts.length; position += 1) {
+      const previous = result.attempts[position - 1];
+      const current = result.attempts[position];
+      if (previous.kind === "abstain" && previous.candidateId === current.candidateId) issues.push(`${name}: abstention retried the same candidate`);
+    }
+    const acceptedContents = input.decisions.filter((decision) => decision.kind === "speak" && decision.publicationSucceeded !== false)
+      .slice(0, expectedCount).map((decision) => decision.content);
+    if (JSON.stringify(result.ledger.map((entry) => entry.content)) !== JSON.stringify(acceptedContents)) {
+      issues.push(`${name}: the public ledger differs from successful publications`);
+    }
+    return { name, ...result };
+  });
   return {
     seed,
-    episodes: lengths.length,
-    lengthFrequency,
-    actionFrequency,
+    scope: "Fake model streams exercising production scheduling; not an LLM quality evaluation",
+    episodes: scenarios.length,
+    lengthFrequency: frequencyReport(scenarios.map((scenario) => scenario.ledger.length)),
     scenarios,
-    naturalStops,
-    hardCapStops,
-    hardCapViolations,
-    immediateActionRepeats,
+    naturalStops: scenarios.filter((scenario) => ["quiet", "empty_opening"].includes(scenario.stop)).length,
+    hardCapStops: scenarios.filter((scenario) => scenario.stop === "budget").length,
+    hardCapViolations: scenarios.filter((scenario) => scenario.ledger.length > CONVERSATION_MAX_PUBLICATIONS).length,
     passed: issues.length === 0,
     issues,
   };
@@ -222,6 +225,12 @@ export const auditPublicationBoundarySource = (source, fileName = "director.ts")
   if (issues.length > 0) return { passed: false, issues, callSites: {} };
 
   const runCalls = callsIn(methods.get("runAmbient").body);
+  if (!runCalls.some((call) => call.name === "conversationOpportunity")) {
+    issues.push("runAmbient does not use the audited production conversation-opportunity policy");
+  }
+  if (runCalls.some((call) => ["decideAmbientAction", "sampleAmbientEpisodeShape"].includes(call.name))) {
+    issues.push("runAmbient still prescribes semantic moves or sampled episode targets");
+  }
   const postPositions = runCalls.filter((call) => call.name === "postPublic").map((call) => call.position);
   const recordPositions = runCalls.filter((call) => call.name === "recordAmbientPost").map((call) => call.position);
   if (postPositions.length === 0) issues.push("runAmbient has no public-message publication call");
@@ -276,7 +285,7 @@ export const runAmbientAudit = async ({ directorPath = DEFAULT_DIRECTOR_PATH, se
     directorPath,
   );
   const issues = [
-    ...simulation.issues.map((issue) => `shape: ${issue}`),
+    ...simulation.issues.map((issue) => `scheduling: ${issue}`),
     ...publicationBoundary.issues.map((issue) => `publication: ${issue}`),
   ];
   return {
@@ -288,17 +297,12 @@ export const runAmbientAudit = async ({ directorPath = DEFAULT_DIRECTOR_PATH, se
 };
 
 export const renderAmbientAudit = (report) => {
-  const dominant = report.simulation.lengthFrequency[0];
-  const actions = report.simulation.actionFrequency
-    .map((entry) => `${entry.value}:${entry.count}`)
-    .join(" ");
   return [
-    "Ambient engine deterministic audit",
-    `Episodes: ${report.simulation.episodes}`,
-    `Lengths: ${report.simulation.lengthFrequency.map((entry) => `${entry.value}:${entry.count}`).join(" ")}`,
-    `Dominant length: ${dominant?.value ?? "none"} (${((dominant?.share ?? 0) * 100).toFixed(1)}%)`,
+    "Ambient scheduling deterministic audit",
+    report.simulation.scope,
+    `Scripted test scenarios: ${report.simulation.episodes}`,
+    `Supplied-stream publication counts: ${report.simulation.lengthFrequency.map((entry) => `${entry.value}:${entry.count}`).join(" ")}`,
     `Natural/hard-cap stops: ${report.simulation.naturalStops}/${report.simulation.hardCapStops}`,
-    `Actions: ${actions}`,
     `Publication boundary: ${report.publicationBoundary.passed ? "PASS" : "FAIL"}`,
     report.passed ? "Result: PASS" : `Result: FAIL\n- ${report.issues.join("\n- ")}`,
   ].join("\n");

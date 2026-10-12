@@ -414,7 +414,7 @@ describe("local account store", () => {
     expect(await store.revokeAllSessions(registration.account.id)).toBe(0);
   });
 
-  it("caps active device sessions per account and evicts the oldest one", async () => {
+  it.each([1, 2])("caps active device sessions at %i per account and evicts the oldest ones", async (maxSessionsPerAccount) => {
     const path = await makePath();
     const tokens = [
       "capped_session_token_aaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -423,7 +423,7 @@ describe("local account store", () => {
     ];
     const store = new AccountStore(path, {
       scrypt: fastScrypt,
-      maxSessionsPerAccount: 2,
+      maxSessionsPerAccount,
       randomToken: () => tokens.shift()!,
     });
     await store.load();
@@ -442,7 +442,7 @@ describe("local account store", () => {
     expect(first.ok && second.ok && third.ok).toBe(true);
     if (!first.ok || !second.ok || !third.ok) return;
     expect(store.authenticateSession(first.token)).toBeUndefined();
-    expect(store.authenticateSession(second.token)).toBeDefined();
+    expect(Boolean(store.authenticateSession(second.token))).toBe(maxSessionsPerAccount > 1);
     expect(store.authenticateSession(third.token)).toBeDefined();
   });
 

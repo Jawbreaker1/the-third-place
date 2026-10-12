@@ -101,18 +101,21 @@ print_public_url() {
 }
 
 ensure_build() {
-  if [[ -f "${SERVER_ENTRY}" && -f "${WEB_BUILD}" ]]; then
+  local node_bin
+  node_bin="$(command -v node || true)"
+  if [[ -n "${node_bin}" && -f "${SERVER_ENTRY}" && -f "${WEB_BUILD}" ]] && \
+      "${node_bin}" "${ROOT_DIR}/scripts/build-freshness.mjs" check; then
     return
   fi
 
   local npm_bin
   npm_bin="$(command -v npm || true)"
   if [[ -z "${npm_bin}" ]]; then
-    echo "npm was not found, so the missing production build cannot be created." >&2
+    echo "npm was not found, so the missing or outdated production build cannot be created." >&2
     return 1
   fi
 
-  echo "Production build is missing; building it now..."
+  echo "Production build is missing or outdated; building it now..."
   (cd "${ROOT_DIR}" && "${npm_bin}" run build)
 }
 

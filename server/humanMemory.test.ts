@@ -504,6 +504,26 @@ describe("persistent human memory", () => {
     expect(restarted.findByTokenHash(tokenHash)).toBeUndefined();
   });
 
+  it("durably resets only one resident's rapport while preserving facts and other relationships", async () => {
+    const now = 10_000;
+    const { filePath, store } = await tempStore({ now: () => now });
+    store.upsertSession({ tokenHash: hash("relation-reset"), member: member(), seenAt: now });
+    remember(store, "human-one", "lobby", "likes", "Blender", now);
+    store.updateRelation("human-one", "ai-mira", { familiarity: 0.8, affinity: 0.7 }, now);
+    store.updateRelation("human-one", "ai-sana", { familiarity: 0.4, irritation: 0.3 }, now);
+
+    expect(store.resetRelation("human-one", "ai-mira")).toBe(true);
+    expect(store.resetRelation("human-one", "ai-mira")).toBe(false);
+    expect(store.resetRelation("missing", "ai-sana")).toBe(false);
+    await store.flush();
+    const restarted = new HumanMemoryStore({ filePath, now: () => now, persistDelayMs: 60_000 });
+    await restarted.load();
+    expect(restarted.getRelation("human-one", "ai-mira")).toBeUndefined();
+    expect(restarted.getRelation("human-one", "ai-sana")).toMatchObject({ familiarity: 0.4, irritation: 0.3 });
+    expect(restarted.findByHumanId("human-one")?.facts).toEqual([expect.objectContaining({ value: "Blender" })]);
+    expect(restarted.findByTokenHash(hash("relation-reset"))?.member.id).toBe("human-one");
+  });
+
   it("prunes facts around 45 days and profiles around 90 days", async () => {
     let now = 100 * day;
     const { store } = await tempStore({ now: () => now, retentionMs: 90 * day, factRetentionMs: 45 * day });

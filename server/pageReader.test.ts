@@ -5,6 +5,7 @@ import {
   extractReadablePage,
   htmlWithinParseBudget,
   PageReader,
+  PageReadBusyError,
   resolvePageReadTarget,
 } from "./pageReader.js";
 import { PageProviderRegistry, type PageProviderAdapter } from "./pageProviders/index.js";
@@ -492,7 +493,7 @@ describe("page reader broker", () => {
 
       const explicit = reader.read(request, "guest-1");
       const automatic = reader.read({ ...request, initiator: "automatic" }, "guest-1");
-      expect(observedPolicies).toHaveLength(2);
+      await vi.waitFor(() => expect(observedPolicies).toHaveLength(2));
       expect(observedPolicies[0]?.sameOriginRedirectsOnly).toBeUndefined();
       expect(observedPolicies[1]?.sameOriginRedirectsOnly).toBe(true);
       expect(observedPolicies[1]?.allowCanonicalWwwRedirect).toBe(true);
@@ -598,7 +599,7 @@ describe("page reader broker", () => {
       content: "https://source-9.example/report",
       requesterId: "follow-up-guest",
     })!;
-    await reader.read(overBudget, "follow-up-guest");
+    await expect(reader.read(overBudget, "follow-up-guest")).rejects.toMatchObject({ reason: "rate_limit" });
 
     expect(fetches).toBe(8);
   });
@@ -636,4 +637,89 @@ describe("page reader broker", () => {
     expect(a?.results).toEqual(b?.results);
   });
 
+});
+
+describe("bounded page-reader admission", () => {
+  const request = (index: number) => classifiedRequest({
+    content: `https://source-${index}.example/article`, requesterId: "queue-guest",
+  })!;
+  const gatedFetcher = () => {
+    const releases: Array<() => void> = [];
+    const started: string[] = [];
+    const fetcher = vi.fn(async (url: string | URL) => {
+      started.push(String(url));
+      await new Promise<void>((resolve) => releases.push(resolve));
+      return {
+        finalUrl: new URL(String(url)), mediaType: "text/html", contentType: "text/html",
+        body: Buffer.from(`<article><h1>Useful evidence</h1><p>${"A concrete published observation. ".repeat(8)}</p></article>`),
+      };
+    });
+    return { fetcher, releases, started };
+  };
+
+  it("queues concurrent readers FIFO and never reports contention as an inaccessible page", async () => {
+    const { fetcher, releases, started } = gatedFetcher();
+    const reader = new PageReader(fetcher);
+    const pending = [1, 2, 3, 4].map((id) => reader.read(request(id), `guest-${id}`));
+    await vi.waitFor(() => expect(started).toHaveLength(2));
+    releases[0]!();
+    await vi.waitFor(() => expect(started).toHaveLength(3));
+    expect(started[2]).toContain("source-3.example");
+    releases[1]!();
+    await vi.waitFor(() => expect(started).toHaveLength(4));
+    releases[2]!(); releases[3]!();
+    const packets = await Promise.all(pending);
+    expect(packets.every((packet) => packet?.kind === "page")).toBe(true);
+  });
+
+  it("removes cancelled queue work without wasting fetch or rate allowance", async () => {
+    const { fetcher, releases, started } = gatedFetcher();
+    const reader = new PageReader(fetcher, undefined, { maxQueuedRequests: 1 });
+    const active = [reader.read(request(1), "guest-a"), reader.read(request(2), "guest-b")];
+    await vi.waitFor(() => expect(started).toHaveLength(2));
+    const controller = new AbortController();
+    const abandoned = reader.read(request(3), "guest-c", controller.signal);
+    const rejected = expect(abandoned).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await rejected;
+    const replacement = reader.read(request(4), "guest-d");
+    releases[0]!();
+    await vi.waitFor(() => expect(started).toHaveLength(3));
+    expect(started[2]).toContain("source-4.example");
+    expect(started.some((url) => url.includes("source-3"))).toBe(false);
+    releases[1]!(); releases[2]!();
+    await Promise.all([...active, replacement]);
+  });
+
+  it("does not cancel a coalesced page while another consumer still needs it", async () => {
+    const { fetcher, releases, started } = gatedFetcher();
+    const reader = new PageReader(fetcher);
+    const controller = new AbortController();
+    const first = reader.read(request(1), "same-guest", controller.signal);
+    const second = reader.read(request(1), "same-guest");
+    const rejected = expect(first).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await rejected;
+    await vi.waitFor(() => expect(started).toHaveLength(1));
+    releases[0]!();
+    await expect(second).resolves.toMatchObject({ kind: "page" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("reports bounded queue overflow and expiry as busy without negative-caching the target", async () => {
+    const { fetcher, releases, started } = gatedFetcher();
+    const reader = new PageReader(fetcher, undefined, { maxQueuedRequests: 1, maxQueueWaitMs: 15 });
+    const active = [reader.read(request(1), "guest-a"), reader.read(request(2), "guest-b")];
+    await vi.waitFor(() => expect(started).toHaveLength(2));
+    const queued = reader.read(request(3), "guest-c");
+    const expired = expect(queued).rejects.toMatchObject({ reason: "queue_timeout" });
+    await expect(reader.read(request(4), "guest-d")).rejects.toBeInstanceOf(PageReadBusyError);
+    await expired;
+    releases[0]!(); releases[1]!();
+    await Promise.all(active);
+    const retry = reader.read(request(3), "guest-c");
+    await vi.waitFor(() => expect(started).toHaveLength(3));
+    releases[2]!();
+    await expect(retry).resolves.toMatchObject({ kind: "page" });
+  });
 });

@@ -868,8 +868,9 @@ export class AccountStore {
     const sameAccount = active
       .filter((candidate) => candidate.accountId === session.accountId)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    const retainedCount = Math.max(0, this.maxSessionsPerAccount - 1);
     const retainedIds = new Set(
-      sameAccount.slice(-Math.max(0, this.maxSessionsPerAccount - 1)).map((candidate) => candidate.id),
+      (retainedCount === 0 ? [] : sameAccount.slice(-retainedCount)).map((candidate) => candidate.id),
     );
     return [
       ...active.filter((candidate) => candidate.accountId !== session.accountId || retainedIds.has(candidate.id)),

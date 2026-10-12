@@ -153,7 +153,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
     }
   });
 
-  it("invalidates one actor's late public reply and memory without disturbing another actor's burst", async () => {
+  it.each(["retirement", "memory reset", "catalog change"])("invalidates late public output after %s", async (change) => {
     vi.useFakeTimers();
     try {
       const otherHuman = {
@@ -169,7 +169,8 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
           generateScene: vi.fn((request: {
             trigger: { author: string };
             selected: Array<(typeof PERSONAS)[number]>;
-          }) => new Promise<Line[]>((resolve) => {
+            conversationContext?: unknown;
+          }) => request.conversationContext ? Promise.resolve([]) : new Promise<Line[]>((resolve) => {
             pendingScenes.set(request.trigger.author, {
               selectedId: request.selected[0]!.id,
               resolve,
@@ -189,7 +190,9 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       await vi.waitFor(() => expect([...pendingScenes.keys()]).toEqual(
         expect.arrayContaining([human.name, otherHuman.name]),
       ));
-      director.invalidatePublicWorkForHumanActor(human.id);
+      if (change === "memory reset") director.resetHumanMemoryWork(human.id);
+      else if (change === "catalog change") director.reconcileCatalog();
+      else director.invalidatePublicWorkForHumanActor(human.id);
       const forgottenScene = pendingScenes.get(human.name)!;
       const survivingScene = pendingScenes.get(otherHuman.name)!;
       forgottenScene.resolve([{
@@ -208,13 +211,19 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       await Promise.all([forgottenPending, survivingPending]);
 
       const aiMessages = store.getRecent("lobby", 20).filter((message) => message.authorId.startsWith("ai-"));
-      expect(aiMessages).toEqual([
+      expect(aiMessages).toEqual(change === "catalog change" ? [] : [
         expect.objectContaining({ content: "det här samtidiga svaret ska levereras", replyToId: survivingMessage.id }),
       ]);
-      expect(enqueueDeliveredEpisode).toHaveBeenCalledTimes(1);
-      const episode = enqueueDeliveredEpisode.mock.calls[0]![0] as DeliveredSocialEpisode;
-      expect(episode.participants.map((participant) => participant.id)).toContain(otherHuman.id);
-      expect(episode.participants.map((participant) => participant.id)).not.toContain(human.id);
+      expect(enqueueDeliveredEpisode).toHaveBeenCalledTimes(change === "catalog change" ? 0 : 1);
+      if (change !== "catalog change") {
+        const episode = enqueueDeliveredEpisode.mock.calls[0]![0] as DeliveredSocialEpisode;
+        expect(episode.participants.map((participant) => participant.id)).toContain(otherHuman.id);
+        expect(episode.participants.map((participant) => participant.id)).not.toContain(human.id);
+      }
+      if (change === "memory reset") {
+        const gate = director as unknown as { humanActorWorkIsCurrent: (id: string) => boolean };
+        expect(gate.humanActorWorkIsCurrent(human.id)).toBe(true);
+      }
       director.stop();
     } finally {
       vi.clearAllTimers();
@@ -922,7 +931,7 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
         referencedHumanConfidence: 0.98,
         historyRecall: { need: "required" as const, query: "Álex", confidence: 0.97 },
       }));
-      const generateScene = vi.fn(async (scene: any) => [{
+      const generateScene = vi.fn(async (scene: any) => scene.conversationContext ? [] : [{
         personaId: mira.id,
         content: "jaa, jag minns Álex lite från förut",
         source: "lm" as const,
@@ -961,10 +970,11 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
 
       expect(analyzeTurn).toHaveBeenCalledWith(expect.objectContaining({
         humanCandidates: [{ id: "human-alex", displayLabel: "Álex" }],
-      }), {
+      }), expect.objectContaining({
         durableDelivery: false,
         supersessionProtected: false,
-      });
+        contextFingerprint: expect.any(String),
+      }));
       expect(publicThirdPartyPromptNote).toHaveBeenCalledWith(
         mira.id,
         "human-alex",
@@ -981,7 +991,14 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       );
       expect(scene.requestOwnerIds).toEqual([mira.id]);
       expect(scene.premise).toContain("fallible, owner-subjective public recollection");
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(generateScene.mock.calls.filter(([request]) => !request.conversationContext)).toHaveLength(1);
+      for (const [continuation] of generateScene.mock.calls.slice(1)) {
+        expect(continuation.requestOwnerIds).toEqual([]);
+        expect(continuation.mustReplyIds).toEqual([]);
+        expect(continuation.history).toEqual(expect.arrayContaining([
+          expect.objectContaining({ content: "jaa, jag minns Álex lite från förut" }),
+        ]));
+      }
       director.stop();
     } finally {
       vi.clearAllTimers();
@@ -1051,7 +1068,22 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       expect(publicThirdPartyPromptNote.mock.calls.length).toBeLessThanOrEqual(12);
       expect(Object.keys(scene.relationshipNotes)).toEqual([sana.id]);
       expect(scene.requestOwnerIds).toEqual([sana.id]);
-      expect(scene.mustReplyIds).toEqual(expect.arrayContaining([mira.id, sana.id]));
+      expect(scene.selected.map((persona: { id: string }) => persona.id)).toEqual([sana.id]);
+      expect(scene.mustReplyIds).toEqual([sana.id]);
+      const continuation = generateScene.mock.calls[1]?.[0] as any;
+      expect(continuation).toMatchObject({
+        selected: [expect.objectContaining({ id: mira.id })],
+        mustReplyIds: [mira.id],
+        conversationContext: expect.any(Object),
+      });
+      expect(continuation.history).toEqual(expect.arrayContaining([
+        expect.objectContaining({ content: "jo, lite faktiskt" }),
+      ]));
+      expect(store.getRecent("lobby", 20).filter((message) => message.authorId.startsWith("ai-")))
+        .toEqual([
+          expect.objectContaining({ authorId: sana.id }),
+          expect.objectContaining({ authorId: mira.id }),
+        ]);
       director.stop();
     } finally {
       vi.clearAllTimers();
@@ -1238,11 +1270,11 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       expect(publicThirdPartyPromptNote).not.toHaveBeenCalled();
       const scene = generateScene.mock.calls[0]![0] as any;
       const selectedIds = new Set(scene.selected.map((persona: typeof PERSONAS[number]) => persona.id));
-      expect(scene.selected).toHaveLength(3);
+      expect(scene.selected).toHaveLength(1);
       expect(scene.requestOwnerIds).toHaveLength(1);
       expect(scene.requestOwnerIds.every((id: string) => selectedIds.has(id))).toBe(true);
       expect(scene.mustReplyIds.every((id: string) => selectedIds.has(id))).toBe(true);
-      expect(JSON.stringify(scene.relationshipNotes)).not.toContain("FALLIBLE NOTE MUST NOT RECRUIT");
+      expect(JSON.stringify(scene.relationshipNotes ?? {})).not.toContain("FALLIBLE NOTE MUST NOT RECRUIT");
       director.stop();
     } finally {
       vi.clearAllTimers();

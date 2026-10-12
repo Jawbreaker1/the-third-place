@@ -174,7 +174,7 @@ describe("admin HTTP API", () => {
           memoryMutations.push(`delete:${id}`);
           return id === "memory-1";
         },
-        resetRelationship: (ownerId, subjectId) => {
+        resetRelationship: async (ownerId, subjectId) => {
           memoryMutations.push(`reset:${ownerId}:${subjectId}`);
           return ownerId === "ai-mira" && subjectId === "human-1";
         },

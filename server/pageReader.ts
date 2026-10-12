@@ -88,6 +88,29 @@ interface CachedRead {
   evidence?: PageProviderEvidence;
 }
 
+/** Admission pressure says nothing about whether the remote page is readable. */
+export class PageReadBusyError extends Error {
+  constructor(readonly reason: "queue_full" | "queue_timeout" | "rate_limit") {
+    super(`Page reader is temporarily busy (${reason})`);
+    this.name = "PageReadBusyError";
+  }
+}
+
+export interface PageReaderOptions {
+  maxQueuedRequests?: number;
+  maxQueueWaitMs?: number;
+}
+
+interface InFlightRead {
+  promise: Promise<PageProviderEvidence | undefined>;
+  controller: AbortController;
+  consumers: number;
+}
+
+interface WaitingRead {
+  admit: () => void;
+}
+
 const MAX_RECENT_LINK_AGE_MS = 5 * 60_000;
 const MAX_ARTICLE_TEXT = 10_000;
 const MAX_ARTICLE_BLOCKS = 96;
@@ -748,7 +771,8 @@ const readerPolicy: SafeHttpsFetchPolicy = {
 
 export class PageReader {
   private readonly cache = new Map<string, CachedRead>();
-  private readonly inFlight = new Map<string, Promise<PageProviderEvidence | undefined>>();
+  private readonly inFlight = new Map<string, InFlightRead>();
+  private readonly waitingReads: WaitingRead[] = [];
   private readonly globalTimestamps: number[] = [];
   private readonly requesterTimestamps = new Map<string, number[]>();
   private readonly originTimestamps = new Map<string, number[]>();
@@ -757,6 +781,7 @@ export class PageReader {
   constructor(
     private readonly fetcher: PageProviderFetcher = fetchPublicHttps,
     private readonly providers: PageProviderRegistry = defaultPageProviderRegistry,
+    private readonly options: PageReaderOptions = {},
   ) {}
 
   collectCandidates(input: CollectPageReadCandidatesInput): PageReadCandidateSet {
@@ -771,7 +796,8 @@ export class PageReader {
     return resolvePageReadTarget(input);
   }
 
-  async read(request: PageReadRequest, requesterId: string): Promise<ResearchPacket | undefined> {
+  async read(request: PageReadRequest, requesterId: string, signal?: AbortSignal): Promise<ResearchPacket | undefined> {
+    if (signal?.aborted) throw new DOMException("Page read cancelled", "AbortError");
     if (process.env.LINK_READER_ENABLED === "false" || !request.url) return undefined;
     const requestedUrl = request.url;
     const initiator = request.initiator ?? "explicit";
@@ -788,9 +814,9 @@ export class PageReader {
       this.cache.delete(key);
     }
     const existing = this.inFlight.get(key);
-    if (existing) return existing.then((evidence) => this.packetFor(request, evidence));
-    if (this.activeRequests >= MAX_ACTIVE_PAGE_READS || !this.reserve(requesterId, requestedUrl.origin)) return undefined;
-    this.activeRequests += 1;
+    if (existing && !existing.controller.signal.aborted) return this.consume(existing, request, signal);
+    const controller = new AbortController();
+    const entry: InFlightRead = { controller, consumers: 0, promise: Promise.resolve(undefined) };
     const fetcher: PageProviderFetcher = initiator === "automatic"
       ? (rawUrl, policy) => this.fetcher(rawUrl, {
           ...policy,
@@ -798,36 +824,107 @@ export class PageReader {
           allowCanonicalWwwRedirect: true,
         })
       : this.fetcher;
-    const evidenceRequest: Promise<PageProviderEvidence | undefined> = provider
-      ? provider.read({ fetcher, requestedUrl })
-      : fetcher(requestedUrl, readerPolicy).then((result) => {
-        if (!result) return undefined;
-        const extracted = extractReadablePage(result.body, result.mediaType, result.finalUrl, result.contentType);
-        if (!extracted) return undefined;
-        return {
-          retrievedAt: new Date().toISOString(),
-          result: {
-            id: "S1",
-            title: extracted.title,
-            url: requestedUrl.toString(),
-            snippet: extracted.text,
-            ...(extracted.publishedAt ? { publishedAt: extracted.publishedAt } : {}),
-          },
-        };
-      });
-    const pending = evidenceRequest
-      .catch(() => undefined)
-      .then((evidence) => {
+    const pending = this.acquire(controller.signal).then(async (release) => {
+      try {
+        if (controller.signal.aborted) throw new DOMException("Page read cancelled", "AbortError");
+        // Reserve actual I/O, not waiting jobs. Queue contention must not burn
+        // through a person's allowance without ever attempting their page.
+        if (!this.reserve(requesterId, requestedUrl.origin)) throw new PageReadBusyError("rate_limit");
+        const evidenceRequest: Promise<PageProviderEvidence | undefined> = provider
+          ? provider.read({ fetcher, requestedUrl })
+          : fetcher(requestedUrl, readerPolicy).then((result) => {
+            if (!result) return undefined;
+            const extracted = extractReadablePage(result.body, result.mediaType, result.finalUrl, result.contentType);
+            if (!extracted) return undefined;
+            return {
+              retrievedAt: new Date().toISOString(),
+              result: {
+                id: "S1",
+                title: extracted.title,
+                url: requestedUrl.toString(),
+                snippet: extracted.text,
+                ...(extracted.publishedAt ? { publishedAt: extracted.publishedAt } : {}),
+              },
+            };
+          });
+        const evidence = await evidenceRequest.catch(() => undefined);
+        if (controller.signal.aborted) return undefined;
         this.cache.set(key, { evidence, expiresAt: Date.now() + (evidence?.cacheTtlMs ?? (evidence ? 20 * 60_000 : 90_000)) });
         return evidence;
-      })
-      .finally(() => {
+      } finally {
+        release();
+      }
+    }).finally(() => {
+      if (this.inFlight.get(key) === entry) this.inFlight.delete(key);
+      this.prune();
+    });
+    entry.promise = pending;
+    this.inFlight.set(key, entry);
+    return this.consume(entry, request, signal);
+  }
+
+  private consume(entry: InFlightRead, request: PageReadRequest, signal?: AbortSignal): Promise<ResearchPacket | undefined> {
+    entry.consumers += 1;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: unknown, evidence?: PageProviderEvidence): void => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", abort);
+        entry.consumers -= 1;
+        if (error) reject(error);
+        else resolve(this.packetFor(request, evidence));
+      };
+      const abort = (): void => {
+        finish(new DOMException("Page read cancelled", "AbortError"));
+        // Another caller sharing public evidence must not be cancelled. If
+        // nobody still needs it, remove queued work; active HTTPS is already
+        // bounded by its transport deadline and retains its slot until done.
+        if (entry.consumers === 0) entry.controller.abort();
+      };
+      entry.promise.then((evidence) => finish(undefined, evidence), (error) => finish(error));
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  private acquire(signal: AbortSignal): Promise<() => void> {
+    const releaseForSlot = (): (() => void) => {
+      this.activeRequests += 1;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
         this.activeRequests -= 1;
-        this.inFlight.delete(key);
-        this.prune();
-      });
-    this.inFlight.set(key, pending);
-    return pending.then((evidence) => this.packetFor(request, evidence));
+        this.waitingReads.shift()?.admit();
+      };
+    };
+    if (signal.aborted) return Promise.reject(new DOMException("Page read cancelled", "AbortError"));
+    if (this.activeRequests < MAX_ACTIVE_PAGE_READS && this.waitingReads.length === 0) {
+      return Promise.resolve(releaseForSlot());
+    }
+    const queueLimit = Math.max(0, Math.min(32, this.options.maxQueuedRequests ?? 16));
+    if (this.waitingReads.length >= queueLimit) return Promise.reject(new PageReadBusyError("queue_full"));
+    return new Promise((resolve, reject) => {
+      const clean = (): void => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+        const index = this.waitingReads.indexOf(waiting);
+        if (index >= 0) this.waitingReads.splice(index, 1);
+      };
+      const abort = (): void => {
+        clean();
+        reject(new DOMException("Page read cancelled", "AbortError"));
+      };
+      const waiting: WaitingRead = { admit: () => { clean(); resolve(releaseForSlot()); } };
+      const timer = setTimeout(() => {
+        clean();
+        reject(new PageReadBusyError("queue_timeout"));
+      }, Math.max(1, Math.min(30_000, this.options.maxQueueWaitMs ?? 12_000)));
+      timer.unref?.();
+      this.waitingReads.push(waiting);
+      signal.addEventListener("abort", abort, { once: true });
+    });
   }
 
   private packetFor(request: PageReadRequest, evidence?: PageProviderEvidence): ResearchPacket | undefined {

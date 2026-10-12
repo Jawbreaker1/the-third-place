@@ -1,5 +1,5 @@
 import { stripDangerousTextControls } from "../shared/unicodeSafety.js";
-import type { PageReadRequest } from "./pageReader.js";
+import { PageReadBusyError, type PageReadRequest } from "./pageReader.js";
 import type {
   AppliedResearchSourcePreference,
   ResearchPacket,
@@ -25,7 +25,7 @@ export type EvidenceReadiness = "retrieved" | "grounding_available";
 
 /** The deliberately small surface needed from PageReader. */
 export interface EvidencePageReader {
-  read(request: PageReadRequest, requesterId: string): Promise<ResearchPacket | undefined>;
+  read(request: PageReadRequest, requesterId: string, signal?: AbortSignal): Promise<ResearchPacket | undefined>;
 }
 
 export interface ResolveSearchEvidenceInput {
@@ -36,6 +36,7 @@ export interface ResolveSearchEvidenceInput {
   pageReader: EvidencePageReader;
   /** Explicit human retry/correction; bypasses PageReader's negative cache. */
   retry?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface ResolvedSearchEvidence {
@@ -233,9 +234,13 @@ const readCandidate = async (
   requesterId: string,
   pageReader: EvidencePageReader,
   now: number,
-): Promise<AcceptedPage | undefined> => {
+  signal?: AbortSignal,
+): Promise<AcceptedPage | PageReadBusyError | undefined> => {
   try {
-    const page = await pageReader.read({ ...request, url: candidate.url }, requesterId);
+    const pageRequest = { ...request, url: candidate.url };
+    const page = signal
+      ? await pageReader.read(pageRequest, requesterId, signal)
+      : await pageReader.read(pageRequest, requesterId);
     if (page?.kind !== "page") return undefined;
     const source = page.results.find((result) => result.id === "S1");
     // PageReader binds evidence to the originally requested URL. Never accept
@@ -255,7 +260,9 @@ const readCandidate = async (
         ...(candidate.sourceAuthority ? { sourceAuthority: candidate.sourceAuthority } : {}),
       },
     };
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw new DOMException("Evidence lookup cancelled", "AbortError");
+    if (error instanceof PageReadBusyError) return error;
     return undefined;
   }
 };
@@ -300,15 +307,25 @@ export const resolveSearchEvidence = async (
     initiator: "automatic",
   };
   let attemptedPages = 0;
+  let busy: PageReadBusyError | undefined;
   const accepted: AcceptedPage[] = [];
   for (let offset = 0; offset < candidates.length; offset += EXPANSION_BATCH_SIZE) {
+    if (input.signal?.aborted) throw new DOMException("Evidence lookup cancelled", "AbortError");
     const batch = candidates.slice(offset, offset + EXPANSION_BATCH_SIZE);
     attemptedPages += batch.length;
     const reads = await Promise.all(batch.map((candidate) =>
-      readCandidate(candidate, request, input.requesterId, input.pageReader, input.now)));
-    accepted.push(...reads.filter((value): value is AcceptedPage => value !== undefined));
+      readCandidate(candidate, request, input.requesterId, input.pageReader, input.now, input.signal)));
+    for (const read of reads) {
+      if (read instanceof PageReadBusyError) busy ??= read;
+      else if (read) accepted.push(read);
+    }
+    // More speculative reads cannot improve a saturated local queue. Preserve
+    // any accepted page, otherwise report local pressure rather than blaming
+    // the search results or the publisher.
+    if (busy) break;
   }
   if (accepted.length === 0) {
+    if (busy) throw busy;
     return { packet: bounded, readiness: "retrieved", attemptedPages, readPages: 0 };
   }
 

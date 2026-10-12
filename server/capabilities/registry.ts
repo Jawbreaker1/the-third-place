@@ -7,6 +7,7 @@ import {
   type SearchMode,
 } from "../researchBroker.js";
 import {
+  PageReadBusyError,
   type PageReadCandidateSet,
   type PageReadRequest,
   type PageReader,
@@ -135,6 +136,7 @@ interface EvidenceResolutionBase {
     | "empty"
     | "retrieved_without_grounding"
     | "invalid_target"
+    | "busy"
     | "transport";
 }
 
@@ -604,6 +606,7 @@ const readUrlAdapter: CapabilityAdapter<ReadUrlInvocation> = {
       }
     }
     const page = await runtime.pageReader.read(invocation.pageReadRequest, requesterId).catch((error) => {
+      if (error instanceof PageReadBusyError) throw error;
       console.warn("Exact linked-page read failed safely:", error instanceof Error ? error.message : error);
       return undefined;
     });
@@ -620,7 +623,9 @@ const readUrlAdapter: CapabilityAdapter<ReadUrlInvocation> = {
       ? automatic
         ? `${context.actorName} opened the exact server-bound page that the human just shared and is solely responsible for one grounded response. ${groundingInstruction}`
         : `${context.actorName} opened the server-bound linked source and is solely responsible for answering from the supplied page evidence. ${groundingInstruction}`
-      : `${context.actorName} alone reports in the human's classified language that this specific linked-page attempt did not yield readable material for the requested answer this time. Describe only that temporary human-visible result, without implementation jargon; do not invent a cause or page contents.`;
+      : resolution.detail === "busy"
+        ? `${context.actorName} alone explains briefly in the human's classified language that the lookup is temporarily busy and has not completed. Do not say the page is inaccessible or unreadable, do not invent facts or promise an automatic later reply, and avoid implementation jargon.`
+        : `${context.actorName} alone reports in the human's classified language that this specific linked-page attempt did not yield readable material for the requested answer this time. Describe only that temporary human-visible result, without implementation jargon; do not invent a cause or page contents.`;
     return {
       ...(success ? { research: resolution.research } : {}),
       evidenceOutcome: success ? "succeeded" : "failed",
@@ -685,7 +690,9 @@ const webSearchAdapter: CapabilityAdapter<WebSearchInvocation> = {
     const groundingInstruction = "Answer the classified external-information request only from freshResearch and attach only source IDs that support each factual claim. Search rank, title or search snippet alone is never evidence. Lead with the most useful supported answer or premise, never with the act of searching. If the readable supplied pages genuinely omit the requested fact, name that exact missing datum naturally and attach the source IDs for the inspected pages that establish the gap. Describe the knowledge boundary itself rather than narrating the lookup, provider or what a named site failed to say, unless provenance was actually requested. Every successful answer still needs ordinary conversational uptake in the resident's own voice rather than ending as a retrieval report. When the question invites a cause, motive, reading or judgement that the evidence does not settle, add one clearly framed, explicitly speaker-owned low-stakes interpretation, opinion or reaction whenever it can follow only from supported premises or the participant's exact clue. Make the boundary between sourced knowledge and the resident's take unmistakable; an authorless conclusion equivalent to “it just seems to be their dynamic” can still sound like sourced canon and does not count. A move equivalent to “my guess is ordinary friction” clearly owns the interpretation. Apply that semantic distinction in the conversation's language rather than matching these English example phrases. Never present the take as sourced fact, canonical cause, exact event, current prediction or private biography, and never substitute unrelated background or a permanent generic no-live-data claim.";
     const premise = success
       ? `${context.actorName} ran the classified fresh lookup and is responsible for the sourced answer. ${groundingInstruction}`
-      : `${context.actorName} alone reports in the human's classified language that this specific lookup did not yield readable material for the requested answer this time. Describe only that temporary human-visible result, without search-system or implementation jargon, and invent no current facts.`;
+      : resolution.detail === "busy"
+        ? `${context.actorName} alone explains briefly in the human's classified language that the lookup is temporarily busy and has not completed. Do not claim the sources are inaccessible or unreadable, invent current facts, or promise an automatic later reply. Avoid search-system or implementation jargon.`
+        : `${context.actorName} alone reports in the human's classified language that this specific lookup did not yield readable material for the requested answer this time. Describe only that temporary human-visible result, without search-system or implementation jargon, and invent no current facts.`;
     return {
       ...(success ? { research: resolution.research } : {}),
       evidenceOutcome: success ? "succeeded" : "failed",
@@ -1099,6 +1106,7 @@ export class CapabilityRegistry {
     try {
       return await adapter.execute(invocation, requesterId, this.runtime);
     } catch (error) {
+      if (error instanceof PageReadBusyError) return failed(invocation, "busy");
       console.warn(
         `Capability ${invocation.capability} failed safely:`,
         error instanceof Error ? error.message : error,

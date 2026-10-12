@@ -1035,6 +1035,26 @@ describe("social-memory capture coordination", () => {
     ]);
   });
 
+  it("invalidates pre-reset captures without deleting existing factual memories", async () => {
+    const store = createStore();
+    recordMemory(store, "kept-fact", { kind: "public", channelId: "lobby" }, "A fact worth retaining.", 1_800_000_000_000);
+    const oldEpisode = publicEpisode("old-rapport-before-reset");
+    const laterEpisode = publicEpisode("new-rapport-after-reset");
+    let resolveOld!: (analysis: SocialMemoryAnalysis) => void;
+    const analyzer = new FakeAnalyzer((input) => input.episodeId === oldEpisode.episodeId
+      ? new Promise<SocialMemoryAnalysis>((resolve) => { resolveOld = resolve; })
+      : successful([supportEvent(laterEpisode)]));
+    const coordinator = new SocialMemoryCoordinator(analyzer, store);
+    const pending = coordinator.enqueueDeliveredEpisode(oldEpisode);
+    while (analyzer.calls.length === 0) await Promise.resolve();
+    coordinator.invalidatePendingActorWork("human-johan");
+    resolveOld(successful([supportEvent(oldEpisode)]));
+    await expect(pending).resolves.toMatchObject({ status: "failed", failureReason: "actor_erased" });
+    expect(store.overview().stats.events).toBe(1);
+    await expect(coordinator.enqueueDeliveredEpisode(laterEpisode)).resolves.toMatchObject({ status: "recorded" });
+    expect(store.overview().stats.events).toBe(2);
+  });
+
   it("waits for an active forget barrier during close and rejects new erase work afterwards", async () => {
     const store = createStore();
     const coordinator = new SocialMemoryCoordinator(new FakeAnalyzer(() => successful([])), store);

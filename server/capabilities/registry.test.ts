@@ -4,6 +4,7 @@ import type {
   PageReadRequest,
   PageReader,
 } from "../pageReader.js";
+import { PageReadBusyError } from "../pageReader.js";
 import type { ResearchBroker, ResearchPacket } from "../researchBroker.js";
 import { createFailClosedTurnAnalysis, type TurnAnalysis } from "../semanticRouter.js";
 import type { WeatherForecastResult } from "../weatherForecast.js";
@@ -855,6 +856,26 @@ describe("capability registry contract", () => {
       analysisFor("web_search", { requestKind: "availability" }),
       compileContext(),
     )).toBeUndefined();
+  });
+
+  it.each(["read_url", "web_search"] as const)("keeps %s admission pressure distinct from source failure and preserves a required reply", async (capability) => {
+    vi.stubEnv("LINK_READER_ENABLED", "true");
+    vi.stubEnv("RESEARCH_ENABLED", "true");
+    const request = pageRequest("https://example.com/articles/42");
+    const { registry, pageReader, researchBroker } = createHarness({ resolveTarget: request });
+    pageReader.read.mockRejectedValue(new PageReadBusyError("queue_timeout"));
+    researchBroker.research.mockResolvedValue(searchPacket(request.url!.href));
+    const invocation = registry.compile(analysisFor(capability), compileContext())!;
+    const resolution = await registry.execute(invocation, "guest-1");
+    expect(resolution).toMatchObject({ state: "failed_temporary", detail: "busy" });
+    const scene = registry.sceneContract(invocation, resolution, {
+      actorName: "Mira", failureReplyRequired: true,
+    });
+    expect(scene.suppressResponse).toBe(false);
+    expect(scene.premise).toContain("temporarily busy");
+    expect(scene.premise).toContain("has not completed");
+    expect(scene.premise).not.toContain("did not yield readable material");
+    expect(registry.requiresDesignatedResponder(resolution)).toBe(true);
   });
 
   it("reads a non-root exact URL directly and never turns it into site discovery", async () => {

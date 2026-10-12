@@ -145,7 +145,7 @@ describe("persistent admin overlay state", () => {
       name: "ai-hacking",
       register: "technical",
       mode: "discussion",
-      seeds: expect.arrayContaining([expect.stringContaining("Metasploit module")]),
+      seeds: expect.arrayContaining([expect.stringContaining("Metasploit lab")]),
     });
     expect(initial.channels.find((channel) => channel.id === "football-talk")).toMatchObject({
       name: "football-talk",

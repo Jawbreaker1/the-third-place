@@ -36,6 +36,8 @@ export interface SocialMemoryAdminOptions {
   getActors: () => readonly SocialMemoryAdminActor[];
   /** Invalidates process-local prompt projections after a durable mutation. */
   onStateChanged?: () => void;
+  /** Clears and persists any compatibility-store rapport before the SQLite reset. */
+  resetLegacyRelationship?: (ownerId: string, subjectId: string) => Promise<boolean>;
 }
 
 interface ActorProjection {
@@ -162,11 +164,13 @@ export class SocialMemoryAdmin {
   readonly #store: SocialMemoryStore;
   readonly #getActors: () => readonly SocialMemoryAdminActor[];
   readonly #onStateChanged?: () => void;
+  readonly #resetLegacyRelationship?: SocialMemoryAdminOptions["resetLegacyRelationship"];
 
   constructor(options: SocialMemoryAdminOptions) {
     this.#store = options.store;
     this.#getActors = options.getActors;
     this.#onStateChanged = options.onStateChanged;
+    this.#resetLegacyRelationship = options.resetLegacyRelationship;
   }
 
   getOverview(): AdminMemoryOverview {
@@ -256,11 +260,12 @@ export class SocialMemoryAdmin {
     return this.#mutated(this.#store.deleteMemory(memoryId, ADMIN_ACTOR_ID));
   }
 
-  resetRelationship(ownerId: string, subjectId: string): boolean {
+  async resetRelationship(ownerId: string, subjectId: string): Promise<boolean> {
     const owner = boundedId(ownerId);
     const subject = boundedId(subjectId);
     if (!owner || !subject) return false;
-    return this.#mutated(this.#store.resetRelationship(owner, subject, ADMIN_ACTOR_ID));
+    const legacyChanged = await this.#resetLegacyRelationship?.(owner, subject) ?? false;
+    return this.#mutated(this.#store.resetRelationship(owner, subject, ADMIN_ACTOR_ID) || legacyChanged);
   }
 
   #mutated(changed: boolean): boolean {

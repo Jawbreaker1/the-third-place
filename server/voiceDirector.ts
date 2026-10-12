@@ -471,6 +471,15 @@ export class VoiceDirector {
     }
   }
 
+  /** Cancels only rooms carrying an actor's pre-reset conversation context. */
+  invalidateActorWork(actorId: string): void {
+    for (const room of this.options.runtime.listRooms()) {
+      const witnessed = this.options.runtime.getTranscript(room.id).some((entry) => entry.speakerId === actorId);
+      if (!room.participants.some((participant) => participant.memberId === actorId) && !witnessed) continue;
+      this.invalidateRoom(room.id);
+    }
+  }
+
   forgetRoom(roomId: string): void {
     const pending = this.pendingResponseTimerByRoom.get(roomId);
     if (pending) clearTimeout(pending);

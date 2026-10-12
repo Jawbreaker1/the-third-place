@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import {
   BackgroundWorkPreemptedError,
+  actorSubsetSceneRequest,
   buildSceneSystemPrompt,
   MAX_VISUAL_EVIDENCE_ENTRIES,
   deriveActiveRoomSocialMode,
@@ -15,6 +16,7 @@ import {
   type SceneRequest,
 } from "./lmStudio.js";
 import { PERSONAS } from "./personas.js";
+import { buildConversationContext } from "./conversationFlow.js";
 import { ROOM_SOCIAL_MOVES } from "./channels.js";
 import {
   buildTurnAnalysisSystemPrompt,
@@ -29,7 +31,7 @@ import type { ModelBackend } from "./modelBackend.js";
 const jsonResponse = (payload: unknown) =>
   new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
 
-const completionResponse = (messages: Array<{ personaId: string; content: string; sourceIds?: string[] }>) =>
+const completionResponse = (messages: Array<{ personaId: string; content: string; sourceIds?: string[]; replyToMessageId?: unknown }>) =>
   jsonResponse({
     choices: [{
       message: {
@@ -72,7 +74,10 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
     history: [],
   });
 
-  it("temporarily trims two background lanes to one across overlapping foreground leases", async () => {
+  it.each([
+    { label: "default three", configured: undefined, lanes: 3 },
+    { label: "explicit two", configured: 2, lanes: 2 },
+  ])("uses $label background lanes while idle and trims to one across overlapping foreground leases", async ({ configured, lanes }) => {
     const startedRooms: string[] = [];
     const abortedRooms: string[] = [];
     const complete = vi.fn(async (body: Record<string, unknown>, signal: AbortSignal) => {
@@ -94,30 +99,47 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
       probe: async () => ({ connected: true, id: "test-model", label: "test model" }),
       complete,
     };
-    const lm = new LmStudioClient({
-      backend,
-      maxConcurrentPredictions: 4,
-      maxBackgroundPredictions: 2,
-    });
-    const background = [
-      lm.generateScene(sceneFor("ambient", "lease-ambient-a"), 4),
-      lm.generateScene(sceneFor("ambient", "lease-ambient-b"), 4),
-      lm.generateScene(sceneFor("ambient", "lease-ambient-c"), 4),
-    ];
+    const priorBackgroundLimit = process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS;
+    delete process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS;
+    let lm: LmStudioClient;
+    try {
+      lm = new LmStudioClient({
+        backend,
+        maxConcurrentPredictions: 4,
+        maxBackgroundPredictions: configured,
+      });
+    } finally {
+      if (priorBackgroundLimit !== undefined) {
+        process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS = priorBackgroundLimit;
+      }
+    }
+    const background = Array.from({ length: lanes + 1 }, (_, index) =>
+      lm.generateScene(sceneFor("ambient", `lease-ambient-${index}`), 4));
     background.forEach((pending) => void pending.catch(() => undefined));
-    await vi.waitFor(() => expect(startedRooms).toHaveLength(2));
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(lanes));
+    expect(lm.health()).toMatchObject({
+      activePredictions: lanes,
+      activeBackgroundPredictions: lanes,
+      maxConcurrentPredictions: 4,
+      maxBackgroundPredictions: lanes,
+    });
 
     const first = lm.acquireForegroundDemand();
     const second = lm.acquireForegroundDemand();
-    await vi.waitFor(() => expect(abortedRooms).toHaveLength(1));
-    await expect(background[2]).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
-    expect(startedRooms).not.toContain("lease-ambient-c");
+    await vi.waitFor(() => expect(abortedRooms).toHaveLength(lanes - 1));
+    await expect(background[lanes]).rejects.toBeInstanceOf(BackgroundWorkPreemptedError);
+    expect(startedRooms).not.toContain(`lease-ambient-${lanes}`);
     expect(lm.health()).toMatchObject({
       foregroundDemandCount: 2,
       effectiveMaxBackgroundPredictions: 1,
     });
 
-    const replacement = lm.generateScene(sceneFor("ambient", "lease-ambient-d"), 4);
+    const foreground = lm.generateScene(sceneFor("public", "lease-human-turn"), 1);
+    void foreground.catch(() => undefined);
+    await vi.waitFor(() => expect(startedRooms).toContain("lease-human-turn"));
+    expect(lm.health()).toMatchObject({ activePredictions: 2, activeBackgroundPredictions: 1 });
+
+    const replacement = lm.generateScene(sceneFor("ambient", "lease-ambient-replacement"), 4);
     void replacement.catch(() => undefined);
     first.release();
     first.release();
@@ -125,20 +147,37 @@ describe("LM Studio bounded parallel prediction scheduling", () => {
       foregroundDemandCount: 1,
       effectiveMaxBackgroundPredictions: 1,
     });
-    expect(abortedRooms).toHaveLength(1);
-    expect(startedRooms).not.toContain("lease-ambient-d");
+    expect(abortedRooms).toHaveLength(lanes - 1);
+    expect(startedRooms).not.toContain("lease-ambient-replacement");
 
     second.release();
-    await vi.waitFor(() => expect(startedRooms).toHaveLength(3));
-    expect(startedRooms).toContain("lease-ambient-d");
+    await vi.waitFor(() => expect(startedRooms).toHaveLength(lanes + 2));
+    expect(startedRooms).toContain("lease-ambient-replacement");
     expect(lm.health()).toMatchObject({
       foregroundDemandCount: 0,
-      effectiveMaxBackgroundPredictions: 2,
+      effectiveMaxBackgroundPredictions: lanes,
     });
 
     lm.cancelPending("foreground lease test complete");
-    await Promise.allSettled([...background, replacement]);
+    await Promise.allSettled([...background, foreground, replacement]);
     await vi.waitFor(() => expect(lm.health().queueDepth).toBe(0));
+  });
+
+  it("honors an explicit background environment limit and keeps a foreground lane reserved", () => {
+    const previous = process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS;
+    try {
+      process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS = "2";
+      expect(new LmStudioClient({ maxConcurrentPredictions: 4 }).health())
+        .toMatchObject({ maxConcurrentPredictions: 4, maxBackgroundPredictions: 2 });
+      process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS = "8";
+      expect(new LmStudioClient({ maxConcurrentPredictions: 4 }).health())
+        .toMatchObject({ maxConcurrentPredictions: 4, maxBackgroundPredictions: 3 });
+      expect(new LmStudioClient({ maxConcurrentPredictions: 2 }).health())
+        .toMatchObject({ maxConcurrentPredictions: 2, maxBackgroundPredictions: 1 });
+    } finally {
+      if (previous === undefined) delete process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS;
+      else process.env.LM_STUDIO_MAX_BACKGROUND_PREDICTIONS = previous;
+    }
   });
 
   it("uses all text lanes without voice demand and yields one background lane when voice arrives", async () => {
@@ -1112,6 +1151,75 @@ afterEach(() => {
 });
 
 describe("LM Studio one-pass semantic turn analysis", () => {
+  it("coalesces an in-flight failure but retries it and retains the later valid decision", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return completionCalls === 1
+        ? new Response("temporarily unavailable", { status: 503 })
+        : turnAnalysisCompletion();
+    }));
+    const lm = new LmStudioClient();
+    const input = turnInput("retry-same-durable-turn");
+    const first = lm.analyzeTurn(input);
+    expect(lm.analyzeTurn(input)).toBe(first);
+    await expect(first).resolves.toMatchObject({ source: "fallback", failureReason: "transport_error" });
+    const retry = lm.analyzeTurn(input);
+    expect(retry).not.toBe(first);
+    await expect(retry).resolves.toMatchObject({ source: "lm", failureReason: null });
+    expect(lm.analyzeTurn(input)).toBe(retry);
+    expect(completionCalls).toBe(2);
+  });
+
+  it("reclassifies changed URL bindings instead of replaying a successful positional target", async () => {
+    const inputs: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      inputs.push(JSON.parse(JSON.parse(String(init?.body)).messages[1].content));
+      return turnAnalysisCompletion({ evidence: {
+        need: "required", action: "read_url", confidence: 0.99,
+        goal: "Read the originally discussed article", query: null,
+        urlRef: inputs.length === 1 ? "U1" : "U2", searchMode: null,
+        timeZone: null, timeKind: null, locationLabel: null,
+      } });
+    }));
+    const lm = new LmStudioClient();
+    const original = turnAnalysisInputSchema.parse({
+      ...turnInput("same-replayed-turn"),
+      urlCandidates: [{ ref: "U1", source: "recent_same_author", context: "host=one.example; path=/article" }],
+    });
+    await expect(lm.analyzeTurn(original)).resolves.toMatchObject({ evidence: { urlRef: "U1" } });
+    const changed = turnAnalysisInputSchema.parse({
+      ...original,
+      urlCandidates: [
+        { ref: "U1", source: "recent_same_author", context: "host=two.example; path=/new" },
+        { ...original.urlCandidates[0], ref: "U2" },
+      ],
+    });
+    const replay = lm.analyzeTurn(changed);
+    await expect(replay).resolves.toMatchObject({ evidence: { urlRef: "U2" } });
+    expect(lm.analyzeTurn(changed)).toBe(replay);
+    expect(inputs).toHaveLength(2);
+  });
+
+  it("includes the server-only full URL binding in cache identity even when model-visible context is unchanged", async () => {
+    let completionCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      completionCalls += 1;
+      return turnAnalysisCompletion();
+    }));
+    const lm = new LmStudioClient();
+    const input = turnInput("same-path-different-query");
+    const first = lm.analyzeTurn(input, { contextFingerprint: "url=https://example.com/article?id=1" });
+    await first;
+    const changed = lm.analyzeTurn(input, { contextFingerprint: "url=https://example.com/article?id=2" });
+    expect(changed).not.toBe(first);
+    await changed;
+    expect(completionCalls).toBe(2);
+  });
+
   it("uses one strict temperature-zero call with dynamic target enums and deduplicates a turn", async () => {
     let completionCalls = 0;
     let completionBody: any;
@@ -5928,6 +6036,7 @@ describe("LM Studio multilingual batch candidate review", () => {
       claimStrength: 0.58,
     });
     expect(firstReview.candidates[0].surfaceStylePlan).toEqual({
+      selfDirected: false,
       visibleAffect: expect.any(Boolean),
       surfaceTexture: expect.toSatisfy((value: unknown) => value === null || typeof value === "string"),
       stanceIntensity: "gentle",
@@ -8078,6 +8187,379 @@ describe("LM Studio multilingual batch candidate review", () => {
 });
 
 describe("LM Studio room prompt", () => {
+  const publishedConversation = () => buildConversationContext({
+    phase: "continuation",
+    rootMessageId: "published-riddle",
+    messages: [
+      { messageId: "published-riddle", author: "Mira", kind: "ai", content: "What has keys but cannot open a door?", createdAt: "2026-10-11T12:00:00.000Z" },
+      { messageId: "published-answer", author: "Cai", kind: "agent", content: "A piano!", createdAt: "2026-10-11T12:00:02.000Z" },
+    ],
+  });
+
+  const peerConversation = () => buildConversationContext({
+    phase: "continuation",
+    messages: [
+      { messageId: "peer-earlier", authorId: "ai-sana", author: "Sana", kind: "ai", content: "That ending lets everyone off too easily.", createdAt: "2026-10-11T12:00:00.000Z" },
+      { messageId: "legacy-unbound", author: "Bosse.exe", kind: "ai", content: "I liked the ending.", createdAt: "2026-10-11T12:00:01.000Z" },
+      { messageId: "system-event", authorId: "system", author: "system", kind: "system", content: "A resident joined.", createdAt: "2026-10-11T12:00:02.000Z" },
+      { messageId: "own-latest", authorId: "ai-mira", author: "Mira", kind: "ai", content: "I would keep the awkward ending.", createdAt: "2026-10-11T12:00:03.000Z" },
+    ],
+  });
+
+  it("binds each autonomous actor's reply choices to committed, identified other-author turns", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return completionResponse([]);
+    }));
+    await new LmStudioClient().generateScene({
+      kind: "ambient", channelId: "the-pub", channelName: "the-pub", selected: [mira, sana], history: [],
+      conversationContext: peerConversation(),
+    });
+    const variants = bodies[0].response_format.json_schema.schema.properties.messages.items.anyOf;
+    expect(variants).toHaveLength(2);
+    expect(variants[0].properties.personaId.enum).toEqual([mira.id]);
+    expect(variants[0].properties.replyToMessageId.enum).toEqual(["peer-earlier", null]);
+    expect(variants[1].properties.personaId.enum).toEqual([sana.id]);
+    expect(variants[1].properties.replyToMessageId.enum).toEqual(["own-latest", null]);
+    expect(variants.every((variant: any) => variant.required.includes("replyToMessageId"))).toBe(true);
+    expect(bodies[0].messages[0].content).toContain("Neither agreement nor disagreement is a quota");
+  });
+
+  it.each([
+    { target: "peer-earlier", expected: "peer-earlier" },
+    { target: "own-latest", expected: undefined },
+    { target: "legacy-unbound", expected: undefined },
+    { target: "system-event", expected: undefined },
+    { target: "other-room-or-invented", expected: undefined },
+    { target: null, expected: undefined },
+    { target: undefined, expected: undefined },
+    { target: { messageId: "peer-earlier" }, expected: undefined },
+  ])("validates an optional autonomous reply reference without discarding valid text: $target", async ({ target, expected }) => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: "The uncomfortable bit was the whole point for me.", replyToMessageId: target }])
+        : candidateReviewCompletion([{ personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null }]);
+    }));
+    const result = await new LmStudioClient().generateScene({
+      kind: "ambient", channelId: "the-pub", channelName: "the-pub", selected: [mira], history: [],
+      conversationContext: peerConversation(), humanizerBudget: { repairsRemaining: 0 },
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.replyToMessageId).toBe(expected);
+    expect(JSON.parse(bodies[1].messages[1].content).candidates[0].replyToMessageId).toBe(expected ?? null);
+  });
+
+  it.each(["public", "dm", "voice"] as const)("does not add autonomous reply references to $kind scenes", async (kind) => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const sana = PERSONAS.find((persona) => persona.id === "ai-sana")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: "The uncomfortable bit was the point for me.", replyToMessageId: "peer-earlier" }])
+        : candidateReviewCompletion([{ personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null }]);
+    }));
+    const result = await new LmStudioClient().generateScene({
+      kind, channelId: "the-pub", channelName: "the-pub", selected: [mira, sana], history: [],
+      conversationContext: peerConversation(), humanizerBudget: { repairsRemaining: 0 },
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]).not.toHaveProperty("replyToMessageId");
+    const item = bodies[0].response_format.json_schema.schema.properties.messages.items;
+    expect(item.properties).not.toHaveProperty("replyToMessageId");
+    expect(item.required).toEqual(["personaId", "content", "sourceIds"]);
+    expect(item.properties.personaId.enum).toEqual([mira.id, sana.id]);
+  });
+
+  it("does not accept a reply reference excluded by the bounded published context", async () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const context = peerConversation();
+    context.publishedTurns = Array.from({ length: 20 }, (_, index) => ({
+      messageId: `published-${index}`, authorId: "ai-sana", author: "Sana", kind: "ai" as const,
+      content: `A different thought ${index}.`, createdAt: new Date(Date.UTC(2026, 9, 11, 12, 0, index)).toISOString(),
+    }));
+    const lines = (new LmStudioClient() as any).parseSceneLines(JSON.stringify({ messages: [{
+      personaId: mira.id, content: "I still disagree about the ending.", sourceIds: [], replyToMessageId: "published-0",
+    }] }), { kind: "ambient", selected: [mira], conversationContext: context });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toHaveProperty("replyToMessageId");
+  });
+
+  it("preserves the validated reply target through copy repair and a second semantic review", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      if (bodies.length === 1) return completionResponse([{
+        personaId: mira.id, content: "The ending made its point.", replyToMessageId: "peer-earlier",
+      }]);
+      if (bodies.length === 2) return candidateReviewCompletion([{
+        personaId: mira.id, severity: "high", issues: ["academic_register"],
+        rewriteInstruction: "Keep the opinion but express it in plain casual language.",
+      }]);
+      if (bodies.length === 3) return completionResponse([{
+        personaId: mira.id, content: "I liked that awkward ending.", replyToMessageId: "invented-during-edit",
+      }]);
+      return candidateReviewCompletion([{ personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null }]);
+    }));
+    const result = await new LmStudioClient().generateScene({
+      kind: "ambient", channelId: "the-pub", channelName: "the-pub", selected: [mira], history: [],
+      conversationContext: peerConversation(), humanizerBudget: { repairsRemaining: 1 },
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0]?.content).toBe("I liked that awkward ending.");
+    expect(result[0]?.replyToMessageId).toBe("peer-earlier");
+    expect(bodies).toHaveLength(4);
+    expect(JSON.parse(bodies[3].messages[1].content).candidates[0].replyToMessageId).toBe("peer-earlier");
+    expect(bodies[2].response_format.json_schema.schema.properties.messages.items.properties).not.toHaveProperty("replyToMessageId");
+  });
+
+  it("uses committed conversation in generation and review without leaking sibling drafts", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: "Yep, a piano! Got it immediately 😄" }])
+        : candidateReviewCompletion([{ personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null }]);
+    }));
+    const result = await new LmStudioClient().generateScene({
+      kind: "public", channelId: "lobby", channelName: "lobby", selected: [mira], history: [],
+      conversationContext: publishedConversation(),
+      publicSiblingDrafts: [{ personaId: "ai-sana", actorName: "Sana", content: "PRIVATE UNPUBLISHED DRAFT" }],
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+    expect(result).toHaveLength(1);
+    const generation = JSON.parse(bodies[0].messages[1].content);
+    expect(generation.trustedConversationContext.latestMessageId).toBe("published-answer");
+    expect(generation.trustedConversationContext.publishedTurns[1]).toMatchObject({ content: "A piano!", kind: "participant" });
+    expect(bodies[0].messages[1].content).not.toContain("PRIVATE UNPUBLISHED DRAFT");
+    const review = JSON.parse(bodies[1].messages[1].content);
+    expect(review.conversationContext.publishedTurns[1]).toMatchObject({ messageId: "published-answer", content: "A piano!", kind: "participant" });
+    expect(bodies[0].messages[0].content).toContain("Acknowledge a correct answer");
+    expect(bodies[1].messages[0].content).toContain("Genuine brief feeling, laughter, agreement");
+  });
+
+  it("accepts optional abstention as a complete decision without review or a forced rescue", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    let calls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      calls += 1;
+      return completionResponse([]);
+    }));
+    const result = await new LmStudioClient().generateScene({
+      kind: "ambient", channelId: "lobby", channelName: "lobby", selected: [PERSONAS[0]!], history: [],
+      conversationContext: publishedConversation(), mustReplyIds: [], responseRecoveryIds: [], requestOwnerIds: [],
+    });
+    expect(result).toEqual([]);
+    expect(calls).toBe(1);
+  });
+
+  it.each(["ordinary", "detailed", "considered"] as const)(
+    "requests direct completion for short conversations without reducing %s reasoning policy",
+    async (mode) => {
+      const bodies: any[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+        bodies.push(JSON.parse(String(init?.body)));
+        return completionResponse([]);
+      }));
+      await new LmStudioClient().generateScene({
+        kind: "ambient", channelId: "lobby", channelName: "lobby", selected: [PERSONAS[0]!], history: [],
+        conversationContext: publishedConversation(), mustReplyIds: [],
+        ...(mode === "considered" ? { conversationMode: "considered", consideredRole: "lead" } : {}),
+        ...(mode === "detailed" ? { semanticContext: {
+          answerDepth: "detailed", asksForList: false, asksAboutAiIdentity: false, asksAboutAcoustics: false,
+        } } : {}),
+      });
+      expect(bodies).toHaveLength(1);
+      if (mode === "ordinary") expect(bodies[0].reasoning_effort).toBe("none");
+      else expect(bodies[0]).not.toHaveProperty("reasoning_effort");
+    },
+  );
+
+  it("drops unsupported optional conversation reasoning controls on the bounded compatibility retry", async () => {
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1 ? new Response("unsupported reasoning control", { status: 400 }) : completionResponse([]);
+    }));
+    await expect(new LmStudioClient().generateScene({
+      kind: "ambient", channelId: "lobby", channelName: "lobby", selected: [PERSONAS[0]!], history: [],
+      conversationContext: publishedConversation(), mustReplyIds: [],
+    })).resolves.toEqual([]);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toHaveProperty("reasoning_effort", "none");
+    expect(bodies[1]).not.toHaveProperty("reasoning_effort");
+    expect(bodies[1]).not.toHaveProperty("response_format");
+  });
+
+  it("occasionally permits a reviewed brief chorus of the newest committed turn but never clears older repetition", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const juno = PERSONAS.find((persona) => persona.id === "ai-juno")!;
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      const body = JSON.parse(String(init?.body));
+      return body.messages[0].content.includes("publication reviewer")
+        ? candidateReviewCompletion([{ personaId: juno.id, severity: "none", issues: [], rewriteInstruction: null, sameSceneOverlap: "brief_social_chorus" }])
+        : completionResponse([{ personaId: juno.id, content: "yeah exactly" }]);
+    }));
+    const run = async (index: number, olderDuplicate: boolean) => {
+      const latest = { messageId: `published-chorus-${index}`, author: "Mira", kind: "ai" as const,
+        content: "yeah exactly", createdAt: "2026-10-11T12:00:02.000Z" };
+      const history = [
+        ...(olderDuplicate ? [{ ...latest, messageId: "older-chorus", createdAt: "2026-10-11T11:40:00.000Z" }] : []),
+        latest,
+      ];
+      return new LmStudioClient().generateScene({
+        kind: "public", channelId: "lobby", channelName: "lobby", selected: [juno], history,
+        trigger: latest, conversationContext: buildConversationContext({ phase: "continuation", messages: history }),
+        semanticContext: { languageTag: "en", replyExpected: "optional", socialTrusted: true, moderationTrusted: true,
+          moderationRisk: "none", moderationAction: "none", moderationCategories: [], hostility: 0,
+          pileOnRisk: 0, playfulness: 0.8, energy: 0.8, asksForList: false, asksAboutAiIdentity: false, asksAboutAcoustics: false },
+        humanizerBudget: { repairsRemaining: 0 },
+      });
+    };
+    const results = [];
+    for (let index = 0; index < 20; index += 1) results.push(await run(index, false));
+    const accepted = results.flat().length;
+    expect(accepted).toBeGreaterThan(0);
+    expect(accepted).toBeLessThan(20);
+    const allowedIndex = results.findIndex((lines) => lines.length > 0);
+    await expect(run(allowedIndex, true)).resolves.toEqual([]);
+  });
+
+  it("lets real conversation override old scripted moves and fixed minimum lengths", () => {
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const prompt = buildSceneSystemPrompt({
+      kind: "ambient", channelId: "lobby", channelName: "lobby", selected: [mira], history: [],
+      conversationContext: publishedConversation(), conversationMode: "considered", consideredRole: "response",
+      consideredResponseRole: "challenge", wordLimits: { [mira.id]: { minimum: 35, maximum: 100 } },
+      ambientAction: { episodeId: "episode-1", causalRootId: "published-riddle", semanticFamily: "games",
+        kind: "hidden_cost", turnIndex: 1, targetMessageId: "published-answer", openHook: true, previousActions: ["open_topic"] },
+    });
+    expect(prompt).toContain("You are a candidate to participate, not a committed speaker");
+    expect(prompt).toContain("no target minimum");
+    expect(prompt).not.toContain("exact conversational move to perform");
+    expect(prompt).not.toContain("Required scene-role length: 35");
+    expect(prompt).not.toContain("the response phase of a rare deeper chat beat");
+  });
+
+  it.each([
+    { issues: [], accepted: true },
+    { issues: ["behavior_intensity_under_target", "evidence_ungrounded"], accepted: false },
+    { issues: ["behavior_intensity_violation"], accepted: false },
+  ])("passes self-directed style to review without clearing content/boundary issues: $issues", async ({ issues, accepted }) => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content: "I'd rather watch the weird little film nobody can agree on." }])
+        : candidateReviewCompletion([{ personaId: mira.id,
+            severity: !issues.length ? "none" : issues.length === 1 ? "medium" : "high",
+            issues, rewriteInstruction: issues.length ? "Change the flagged issue." : null }]);
+    }));
+    const result = await new LmStudioClient().generateScene({
+      kind: "ambient", channelId: "the-pub", channelName: "the-pub", selected: [mira], history: [],
+      conversationContext: buildConversationContext({ phase: "opening", messages: [] }),
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+    expect(result).toHaveLength(accepted ? 1 : 0);
+    expect(bodies).toHaveLength(2);
+    expect(JSON.parse(bodies[1].messages[1].content).candidates[0].surfaceStylePlan.selfDirected).toBe(true);
+  });
+
+  it.each(["ambient", "public"] as const)("expands thought length only for autonomous text, not $kind delivery", async (kind) => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const content = "I would keep the awkward ending. The whole film spends its time making that family look comfortable together, then nobody knows what to say when the brother finally asks for help. A neat reconciliation would let them off too easily. That does not mean every unfinished story is secretly brilliant, though. If the silence tells us nothing about the people, it is just a director hoping we will do the writing for them.";
+    expect(content.split(" ").length).toBeGreaterThan(mira.style.hardMaxWords);
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      return bodies.length === 1
+        ? completionResponse([{ personaId: mira.id, content }])
+        : candidateReviewCompletion([{ personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null }]);
+    }));
+    const result = await new LmStudioClient().generateScene({
+      kind, channelId: "the-pub", channelName: "the-pub", selected: [mira], history: [],
+      conversationContext: buildConversationContext({ phase: "opening", messages: [] }),
+      // The old minimum must not turn a complete shorter thought into padding.
+      wordLimits: { [mira.id]: { minimum: 95, maximum: 100 } },
+      humanizerBudget: { repairsRemaining: 0 },
+    });
+    expect(result).toHaveLength(kind === "ambient" ? 1 : 0);
+    if (kind === "ambient") expect(result[0]?.content).toBe(content);
+    expect(bodies).toHaveLength(2);
+  });
+
+  it("exports actor slicing without mixing another resident's private relation or channel context", () => {
+    const [mira, sana] = [PERSONAS.find((persona) => persona.id === "ai-mira")!, PERSONAS.find((persona) => persona.id === "ai-sana")!];
+    const context = publishedConversation();
+    const scoped = actorSubsetSceneRequest({
+      kind: "public", channelId: "lobby", channelName: "lobby", selected: [mira, sana], history: [],
+      conversationContext: context, mustReplyIds: [mira.id, sana.id], requestOwnerIds: [sana.id],
+      relationshipNotes: { [mira.id]: "Mira private", [sana.id]: "Sana private" },
+      actorChannelNotes: { [mira.id]: "Mira focus", [sana.id]: "Sana focus" },
+    }, [mira], true);
+    expect(scoped.relationshipNotes).toEqual({ [mira.id]: "Mira private" });
+    expect(scoped.actorChannelNotes).toEqual({ [mira.id]: "Mira focus" });
+    expect(scoped.requestOwnerIds).toEqual([]);
+    expect(scoped.mustReplyIds).toEqual([mira.id]);
+    expect(scoped.conversationContext).toBe(context);
+  });
+
+  it("does not reintroduce a compulsory pub social move during autonomous copy repair", async () => {
+    process.env.CANDIDATE_REVIEW_ENABLED = "true";
+    const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+      if (String(request).endsWith("/models")) return jsonResponse({ data: [{ id: "test-model" }] });
+      bodies.push(JSON.parse(String(init?.body)));
+      if (bodies.length === 1) return completionResponse([{ personaId: mira.id, content: "The ending made its point." }]);
+      if (bodies.length === 2) return candidateReviewCompletion([{
+        personaId: mira.id, severity: "high", issues: ["academic_register"],
+        rewriteInstruction: "Keep the opinion but express it in plain casual language.",
+      }]);
+      if (bodies.length === 3) return completionResponse([{ personaId: mira.id, content: "I liked that awkward ending." }]);
+      return candidateReviewCompletion([{ personaId: mira.id, severity: "none", issues: [], rewriteInstruction: null }]);
+    }));
+    const result = await new LmStudioClient().generateScene({
+      kind: "ambient", channelId: "the-pub", channelName: "the-pub", selected: [mira], history: [],
+      conversationContext: buildConversationContext({ phase: "opening", messages: [] }),
+      roomSocialMode: { id: "pub-late-table", guidance: "One resident may loosen up slightly.", surfaceActorId: mira.id, socialMove: "candid" },
+      humanizerBudget: { repairsRemaining: 1 },
+    });
+    expect(result).toHaveLength(1);
+    expect(bodies).toHaveLength(4);
+    const repair = JSON.parse(bodies[2].messages[1].content).candidates[0];
+    expect(repair.assignedSocialMove).toBeNull();
+    expect(repair.sceneRole).toContain("no minimum");
+    expect(repair.stableVoice).toContain("Context-led expression");
+    expect(repair.stableVoice).not.toContain("Turn policy / ending");
+  });
+
   it("treats a bound external participant as a person instead of exposing transport kind", () => {
     const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
     const prompt = buildSceneSystemPrompt({
@@ -8480,10 +8962,10 @@ describe("LM Studio room prompt", () => {
     })]);
     expect(bodies).toHaveLength(1);
     expect(String(bodies[0]?.messages?.[0]?.content ?? "")).toContain(
-      "human-triggered server-rendered card",
+      "include the supplied source IDs when reporting a detail from that evidence",
     );
     expect(String(bodies[0]?.messages?.[0]?.content ?? "")).not.toContain(
-      "For this server-owned card sourceIds must be []",
+      "For this autonomous server-owned card sourceIds must be []",
     );
     expect(
       bodies[0].response_format.json_schema.schema.properties.messages.items.properties.sourceIds,
@@ -8983,7 +9465,7 @@ describe("LM Studio room prompt", () => {
       "it does not turn them into search reports",
     );
     expect(String(bodies[0]?.messages?.[0]?.content ?? "")).toContain(
-      "human-triggered server-rendered card",
+      "include the supplied source IDs when reporting a detail from that evidence",
     );
   });
 

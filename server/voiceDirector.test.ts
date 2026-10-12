@@ -2879,11 +2879,13 @@ describe("VoiceDirector", () => {
     },
   );
 
-  it("aborts in-flight generation and resets thinking bots after a committed catalog edit", async () => {
-    const runtime = new VoiceRoomRuntime(["lobby"]);
+  it.each(["catalog edit", "actor memory reset", "actor memory reset with an uncancellable backend"])("aborts in-flight generation after %s without disconnecting callers", async (mutation) => {
+    const runtime = new VoiceRoomRuntime(["lobby", "the-pub"]);
     const created = runtime.createRoom("lobby", { socketId: "socket-catalog-generation", memberId: "human-catalog-generation", name: "Alex" });
     expect(created.ok).toBe(true);
     if (!created.ok) return;
+    const unrelated = runtime.createRoom("the-pub", { socketId: "socket-unrelated", memberId: "human-unrelated", name: "Sam" });
+    expect(unrelated.ok).toBe(true);
     expect(runtime.inviteBot(created.room.id, "socket-catalog-generation", { personaId: "ai-sana", name: "Sana" }).ok).toBe(true);
     runtime.setBotState(created.room.id, "ai-sana", "listening");
     const human = runtime.appendFinalTranscript(created.room.id, "human-catalog-generation", "Sana, vad tror du?");
@@ -2891,9 +2893,12 @@ describe("VoiceDirector", () => {
     if (!human.ok) return;
 
     let generationSignal: AbortSignal | undefined;
+    let releaseGeneration: (() => void) | undefined;
     let markStarted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => { markStarted = resolve; });
     const aiStops: string[] = [];
+    const capturedEpisodes = vi.fn();
+    const speeches = vi.fn();
     const director = new VoiceDirector({
       runtime,
       capabilityRegistry: voiceCapabilityRegistry(),
@@ -2903,6 +2908,10 @@ describe("VoiceDirector", () => {
           generationSignal = signal;
           markStarted?.();
           return await new Promise((resolve, reject) => {
+            if (mutation.endsWith("uncancellable backend")) {
+              releaseGeneration = () => resolve([{ personaId: "ai-sana", content: "An obsolete answer.", source: "lm", sourceIds: [] }]);
+              return;
+            }
             const fail = () => reject(signal?.reason ?? new Error("aborted"));
             if (signal?.aborted) fail();
             else signal?.addEventListener("abort", fail, { once: true });
@@ -2919,10 +2928,11 @@ describe("VoiceDirector", () => {
         synthesize: async () => { throw new Error("must not synthesize"); },
       },
       actorChannels: new ActorChannelRuntime(),
+      socialMemory: { promptNote: () => undefined, enqueueDeliveredEpisode: capturedEpisodes },
       events: {
         roomChanged: () => undefined,
         transcriptFinal: () => undefined,
-        aiSpeech: () => undefined,
+        aiSpeech: speeches,
         aiStop: ({ roomId }) => aiStops.push(roomId),
       },
     });
@@ -2932,12 +2942,18 @@ describe("VoiceDirector", () => {
     expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState).toBe("thinking");
     const stopCountBeforeCatalogEdit = aiStops.length;
 
-    director.onCatalogChanged([created.room.id, created.room.id]);
+    if (mutation === "catalog edit") director.onCatalogChanged([created.room.id, created.room.id]);
+    else director.invalidateActorWork("human-catalog-generation");
+    releaseGeneration?.();
     await settle();
 
     expect(generationSignal?.aborted).toBe(true);
     expect(runtime.getRoom(created.room.id)?.participants.find((participant) => participant.memberId === "ai-sana")?.botState).toBe("listening");
     expect(aiStops.slice(stopCountBeforeCatalogEdit)).toEqual([created.room.id]);
+    expect(speeches).not.toHaveBeenCalled();
+    expect(capturedEpisodes).not.toHaveBeenCalled();
+    expect(runtime.getRoom(created.room.id)?.participants.some((participant) => participant.memberId === "human-catalog-generation")).toBe(true);
+    if (unrelated.ok) expect(runtime.getRoom(unrelated.room.id)?.participants).toHaveLength(1);
   });
 
   it("aborts in-flight synthesis and resets thinking bots after a committed catalog edit", async () => {

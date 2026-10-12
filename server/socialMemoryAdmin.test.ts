@@ -250,7 +250,7 @@ describe("social-memory admin projection", () => {
     });
   });
 
-  it("projects romantic interest and endpoint-owned boundaries, then resets only the selected direction", () => {
+  it("projects romantic interest and endpoint-owned boundaries, then resets only the selected direction", async () => {
     const store = createStore();
     store.recordEvent(romanticRelationshipEvent(
       "romance-mira-to-johan",
@@ -298,7 +298,7 @@ describe("social-memory admin projection", () => {
     });
     expect(reverse?.romanticBoundary.state).not.toBe("open");
 
-    expect(admin.resetRelationship("ai-mira", "human-johan")).toBe(true);
+    expect(await admin.resetRelationship("ai-mira", "human-johan")).toBe(true);
     expect(store.getRelationship("ai-mira", "human-johan")).toBeUndefined();
     expect(store.getRomanticBoundary("ai-mira", "human-johan")).toMatchObject({
       closed: true,
@@ -329,7 +329,54 @@ describe("social-memory admin projection", () => {
     ]);
   });
 
-  it("records mutations as local-admin audit without exposing store metadata", () => {
+  it("waits for legacy rapport durability before resetting the visible relationship", async () => {
+    const store = createStore();
+    store.recordEvent(firstEvent());
+    let release!: (changed: boolean) => void;
+    const durableLegacyReset = new Promise<boolean>((resolve) => { release = resolve; });
+    const resetLegacyRelationship = vi.fn(() => durableLegacyReset);
+    const onStateChanged = vi.fn();
+    const admin = new SocialMemoryAdmin({ store, getActors: () => actors, resetLegacyRelationship, onStateChanged });
+
+    const resetting = admin.resetRelationship("ai-mira", "human-johan");
+    expect(resetLegacyRelationship).toHaveBeenCalledWith("ai-mira", "human-johan");
+    expect(store.getRelationship("ai-mira", "human-johan")).toBeDefined();
+    expect(onStateChanged).not.toHaveBeenCalled();
+    release(true);
+    await expect(resetting).resolves.toBe(true);
+    expect(store.getRelationship("ai-mira", "human-johan")).toBeUndefined();
+    expect(store.listMemories({ ownerId: "ai-mira", limit: 10 })).toHaveLength(1);
+    expect(onStateChanged).toHaveBeenCalledOnce();
+  });
+
+  it("does not report a neutral relationship if persisting the legacy reset fails", async () => {
+    const store = createStore();
+    store.recordEvent(firstEvent());
+    const onStateChanged = vi.fn();
+    const admin = new SocialMemoryAdmin({
+      store,
+      getActors: () => actors,
+      onStateChanged,
+      resetLegacyRelationship: async () => { throw new Error("disk full"); },
+    });
+    await expect(admin.resetRelationship("ai-mira", "human-johan")).rejects.toThrow("disk full");
+    expect(store.getRelationship("ai-mira", "human-johan")).toBeDefined();
+    expect(onStateChanged).not.toHaveBeenCalled();
+  });
+
+  it("can clear a legacy-only relationship without inventing a new SQLite edge", async () => {
+    const store = createStore();
+    const onStateChanged = vi.fn();
+    const resetLegacyRelationship = vi.fn(async () => true);
+    const admin = new SocialMemoryAdmin({ store, getActors: () => actors, resetLegacyRelationship, onStateChanged });
+    await expect(admin.resetRelationship("ai-mira", "human-johan")).resolves.toBe(true);
+    expect(store.getRelationship("ai-mira", "human-johan")).toBeUndefined();
+    expect(onStateChanged).toHaveBeenCalledOnce();
+    await expect(admin.resetRelationship("", "human-johan")).resolves.toBe(false);
+    expect(resetLegacyRelationship).toHaveBeenCalledOnce();
+  });
+
+  it("records mutations as local-admin audit without exposing store metadata", async () => {
     const store = createStore();
     store.recordEvent(firstEvent());
     const onStateChanged = vi.fn();
@@ -337,7 +384,7 @@ describe("social-memory admin projection", () => {
 
     expect(admin.setMemoryPinned("missing-memory", true)).toBe(false);
     expect(admin.deleteMemory("missing-memory")).toBe(false);
-    expect(admin.resetRelationship("ai-mira", "missing-human")).toBe(false);
+    expect(await admin.resetRelationship("ai-mira", "missing-human")).toBe(false);
     expect(onStateChanged).not.toHaveBeenCalled();
     expect(admin.setMemoryPinned("memory-mira-help", true)).toBe(true);
     expect(onStateChanged).toHaveBeenCalledTimes(1);

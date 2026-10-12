@@ -30,6 +30,7 @@ import { EXPERTISE_RANK } from "./roomExpertise.js";
 import { PERSONAS, type Persona } from "./personas.js";
 import {
   BackgroundWorkPreemptedError,
+  actorSubsetSceneRequest,
   diegeticIdentityTurnPremise,
   isBackgroundWorkPreemptedError,
   textActorModelWorkScope,
@@ -39,8 +40,12 @@ import {
   type SceneChannelFeedContext,
   type SceneCurrentDiscourseContext,
   type SceneTriggerParticipantBinding,
+  type SceneRequest,
   type TranscriptLine,
 } from "./lmStudio.js";
+import { autonomousConversationWordCeiling, autonomousOpeningPremise, AUTONOMOUS_CONTINUATION_PREMISE, buildConversationContext, conversationReplyTarget } from "./conversationFlow.js";
+import { conversationOpportunity, conversationReplyCandidatePool, CONVERSATION_MAX_PUBLICATIONS, CONVERSATION_MAX_QUIET_CANDIDATES, type ConversationReplyOpportunity } from "./conversationScheduling.js";
+import { ambientConversationTimingPolicy, ambientSchedulingPolicy } from "./ambientScheduling.js";
 import type { SocialModelClient } from "./switchableModel.js";
 import {
   createMessage,
@@ -51,6 +56,7 @@ import {
 import { ResearchBroker } from "./researchBroker.js";
 import {
   PageReader,
+  PageReadBusyError,
   type PageReadCandidate,
   type PageReadCandidateSet,
 } from "./pageReader.js";
@@ -74,10 +80,9 @@ import {
   ambientRoomSelectionWeight,
   autonomousActivityLimits,
   autonomousLinkPolicy,
-  hasUnattendedAmbientCapacity,
+  autonomousPublicationBudget,
   resolveBehaviorTuning,
   scaleAmbientDelay,
-  unattendedAmbientPolicy,
   type AutonomousLinkPolicy,
   type BehaviorTuningProvider,
 } from "./behaviorTuning.js";
@@ -114,7 +119,6 @@ import type {
 } from "./marketPulse.js";
 import {
   ambientActionInstruction,
-  decideAmbientAction,
   sampleAmbientEpisodeShape,
   type AmbientActionContract,
   type AmbientActionDecision,
@@ -207,10 +211,8 @@ const AUTONOMOUS_SOCIAL_MEMORY_MAX_MESSAGES = 8;
 export type AmbientAudienceMode = "engaged" | "connected_idle" | "unattended";
 
 /**
- * Presence alone never multiplies autonomous work. A real recent community
- * action unlocks the second ambient worker; an idle observer still sees a
- * living room through one worker, and a fully unattended server uses its
- * separately persisted slow budget.
+ * Audience affects accounting and contextual relevance, not whether a room
+ * deserves to live. Worker admission is based on the model queue's capacity.
  */
 export function deriveAmbientAudienceMode(input: {
   connectedHumans: number;
@@ -453,9 +455,7 @@ export function selectResponders(
     ? 1
     : direct.length > 0
       ? clamp(direct.length + 1, 1, 3)
-      : signals.absurdity > 0.45 || signals.energy > 0.72
-        ? 3
-        : 2;
+      : 3;
   const scored = personas
     .filter((persona) => !direct.includes(persona))
     .map((persona) => {
@@ -632,7 +632,6 @@ const stableUnitInterval = (value: string): number => {
 };
 
 const AMBIENT_THREAD_MAX_MESSAGES = 8;
-const AMBIENT_THREAD_COOLDOWN_MS = 8 * 60_000;
 const AMBIENT_THREAD_IDLE_EXPIRY_MS = 12 * 60_000;
 const AMBIENT_RECENT_SEED_WINDOW = 6;
 const AMBIENT_FAILURE_BACKOFF_MS = 60_000;
@@ -640,7 +639,7 @@ const AMBIENT_ALTERNATE_WAIT_MS = 30_000;
 // A live episode remains easier to resume than a fresh topic, but a bounded
 // pause between actions lets other rooms breathe instead of producing one
 // mechanically complete mini-scene at a time.
-const AMBIENT_THREAD_CONTINUITY_BONUS = 4.5;
+const AMBIENT_THREAD_CONTINUITY_BONUS = 2;
 
 export type AmbientTurnLength = "fragment" | "short" | "ordinary" | "expanded";
 
@@ -667,6 +666,10 @@ export interface AmbientThreadState {
     responseRole?: ConsideredResponseRole;
     attempts: number;
   };
+  /** Distinct optional candidates who declined since the last publication. */
+  quietCandidateIds?: string[];
+  /** Bound only to a new model-selected, validated and published reply target. */
+  replyOpportunity?: ConversationReplyOpportunity;
   closedAt?: number;
   closeReason?: "natural" | "budget" | "human_preempted" | "model_rejected" | "expired" | "catalog_changed" | "stopped";
   /** Chosen once for the whole thread so disagreement survives more than one scheduler tick. */
@@ -675,6 +678,9 @@ export interface AmbientThreadState {
   languageTag?: string;
   /** Bounded, server-read evidence retained only for this short-lived thread. */
   research?: ResearchPacket;
+  /** Bounds optional lookup decisions without assigning a semantic turn or topic. */
+  researchDecisionAtMessageCount?: number;
+  researchAttempted?: boolean;
   /** Trusted in-memory source-fit contract retained for later research beats. */
   autonomousResearchContext?: {
     seedId: string;
@@ -690,12 +696,6 @@ export interface AmbientThreadState {
 }
 
 const ambientThreadOrigin = (thread: AmbientThreadState) => thread.origin ?? "room_seed";
-
-const fallbackAmbientShape = (thread: AmbientThreadState): AmbientEpisodeShape => ({
-  minimumMessages: Math.min(3, Math.max(1, thread.messageCount + 1)),
-  softTargetMessages: Math.min(6, Math.max(2, thread.messageCount + 2)),
-  hardMaximumMessages: Math.min(8, Math.max(3, thread.messageCount + 3)),
-});
 
 const ambientThreadHardMaximum = (thread: AmbientThreadState): number =>
   thread.shape?.hardMaximumMessages ?? AMBIENT_THREAD_MAX_MESSAGES;
@@ -808,7 +808,7 @@ export function ambientChannelScore(input: {
   hasLiveThread: boolean;
   random: number;
 }): number {
-  return Math.min(Math.max(0, input.idleMinutes), 20) * 0.14
+  return Math.min(Math.max(0, input.idleMinutes), 30) * 0.4
     + (input.rotated ? 0.85 : 0)
     + (input.hasLiveThread ? AMBIENT_THREAD_CONTINUITY_BONUS : 0)
     + clamp(input.random, 0, 1) * 0.65;
@@ -1199,8 +1199,11 @@ export interface SocialDirectorOptions {
   /** Parallel ambient workers. Production defaults to two; tests default to one for determinism. */
   ambientConcurrency?: number;
   ambientHumanQuietMs?: number;
+  /** @deprecated Autonomous residents choose depth themselves; retained for caller compatibility. */
   consideredConversationChance?: number;
+  /** @deprecated Autonomous depth no longer has a separate global cooldown. */
   consideredConversationCooldownMs?: number;
+  /** @deprecated The ordinary room-local human quiet window applies to all autonomous turns. */
   consideredConversationHumanQuietMs?: number;
   welcomeTemporalCueChance?: number;
   ambientTemporalCueChance?: number;
@@ -1478,7 +1481,7 @@ export function shouldStartAutonomousResearch(gate: AutonomousResearchGate): boo
     !gate.freshThread ||
     gate.queueDepth > 0 ||
     gate.availableMessageSlots < 1 ||
-    gate.availableActors < 2 ||
+    gate.availableActors < 1 ||
     dailySuccesses >= gate.dailyCap
   ) return false;
   if (gate.globalRetryAfterAt !== undefined && gate.now < gate.globalRetryAfterAt) return false;
@@ -2352,7 +2355,11 @@ export class SocialDirector {
    * older completion from releasing a newer lease after actor-local preemption.
    */
   private readonly pendingPublicTurnActorScopesInFlight = new Map<string, string>();
-  private readonly deferredPublicMessageAppends = new Map<string, UncommittedPublicMessageAppend>();
+  private readonly admittedDirectMessageIds = new Set<string>();
+  private readonly deferredPublicMessageAppends = new Map<string, {
+    append: UncommittedPublicMessageAppend;
+    autonomousKind?: "ambient" | "research";
+  }>();
   private readonly pendingHumanReactions = new Map<string, PendingHumanReaction>();
   private readonly pendingCrowdReactionTimersByHuman = new Map<string, Set<NodeJS.Timeout>>();
   private readonly invalidatedHumanActorIds = new Set<string>();
@@ -2367,7 +2374,6 @@ export class SocialDirector {
   private readonly lastHumanReactionTurnAtByMessage = new Map<string, number>();
   private readonly directorEvents: DirectorEvent[] = [];
   private readonly aiTimestamps: number[] = [];
-  private readonly autonomousAiTimestamps: number[] = [];
   private readonly priorityHumanReplyTimestamps: number[] = [];
   /**
    * External agents may participate while the ordinary room pace is full, but
@@ -2427,20 +2433,15 @@ export class SocialDirector {
   private started = false;
   private stopped = false;
   private activeVoicePersonaIds = new Set<string>();
-  private lastUnattendedAmbientAttemptAt?: number;
-  private unattendedAmbientAttemptsInFlight = 0;
-  private consideredConversationLease?: symbol;
+  /** Reserve publication capacity before optional work, not after expensive generation. */
+  private ambientPublicationReservations = 0;
   private autoSharedLinkDiscussionInFlight = false;
-  private lastConsideredConversationAt?: number;
   private lastWelcomeTemporalCueAt?: number;
   private lastAmbientTemporalCueAt?: number;
   private readonly rng: () => number;
   private readonly now: () => number;
   private readonly ambientConcurrency: number;
   private readonly ambientHumanQuietMs: number;
-  private readonly consideredConversationChance: number;
-  private readonly consideredConversationCooldownMs: number;
-  private readonly consideredConversationHumanQuietMs: number;
   private readonly welcomeTemporalCueChance: number;
   private readonly ambientTemporalCueChance: number;
   private readonly welcomeTemporalCueCooldownMs: number;
@@ -2510,7 +2511,7 @@ export class SocialDirector {
   ) {
     this.rng = options.rng ?? Math.random;
     this.now = options.now ?? Date.now;
-    const defaultAmbientConcurrency = process.env.NODE_ENV === "test" ? 1 : 2;
+    const defaultAmbientConcurrency = process.env.NODE_ENV === "test" ? 1 : 3;
     const requestedAmbientConcurrency = options.ambientConcurrency ?? defaultAmbientConcurrency;
     this.ambientConcurrency = Math.min(CHANNELS.length, Math.max(
       1,
@@ -2589,24 +2590,14 @@ export class SocialDirector {
         console.warn("DM turn failed:", error instanceof Error ? error.message : error);
       },
       onCancelled: (messages) => {
-        for (const input of messages) input.settle();
+        for (const input of messages) {
+          this.admittedDirectMessageIds.delete(input.message.id);
+          this.store.releasePendingDirectTurn(input.message.id);
+          input.settle();
+        }
       },
     });
     this.ambientHumanQuietMs = Math.max(30_000, options.ambientHumanQuietMs ?? 90_000);
-    const envChance = Number.parseFloat(process.env.AI_CONSIDERED_CHANCE ?? "0.2");
-    this.consideredConversationChance = clamp(
-      options.consideredConversationChance ?? (Number.isFinite(envChance) ? envChance : 0.2),
-      0,
-      1,
-    );
-    this.consideredConversationCooldownMs = Math.max(
-      60_000,
-      options.consideredConversationCooldownMs ?? 6 * 60_000,
-    );
-    this.consideredConversationHumanQuietMs = Math.max(
-      15_000,
-      options.consideredConversationHumanQuietMs ?? 75_000,
-    );
     this.welcomeTemporalCueChance = clamp(options.welcomeTemporalCueChance ?? 0.32, 0, 1);
     this.ambientTemporalCueChance = clamp(options.ambientTemporalCueChance ?? 0.08, 0, 1);
     this.welcomeTemporalCueCooldownMs = Math.max(60_000, options.welcomeTemporalCueCooldownMs ?? 15 * 60_000);
@@ -2731,8 +2722,7 @@ export class SocialDirector {
     this.ambientPersonasInFlight.clear();
     this.autonomousResearchLease = undefined;
     this.channelFeedAdmissionLease = undefined;
-    this.consideredConversationLease = undefined;
-    this.unattendedAmbientAttemptsInFlight = 0;
+    this.ambientPublicationReservations = 0;
     this.dmTurns.dispose();
     this.clearTypingState();
     for (const thread of this.ambientThreads.values()) this.closeAmbientThread(thread, "stopped");
@@ -2881,6 +2871,7 @@ export class SocialDirector {
         undefined,
         claims,
         actorWorkEpoch,
+        true,
       )
         .catch((error) => {
           console.warn(
@@ -2936,9 +2927,52 @@ export class SocialDirector {
   cancelDirectTurnsForActor(actorId: string): number {
     let cancelled = 0;
     for (const thread of this.store.getDmThreads(actorId)) {
+      for (const message of this.store.getDmMessages(thread.id)) this.admittedDirectMessageIds.delete(message.id);
       if (this.dmTurns.cancel(thread.id)) cancelled += 1;
     }
+    this.store.cancelPendingDirectTurnsForActor(actorId);
     return cancelled;
+  }
+
+  /** Resume only explicitly durable DM obligations, never inferred old tails. */
+  recoverPendingDirectTurns(): number {
+    if (this.stopped) return 0;
+    const humans = new Map(this.getMembers().filter((member) => member.kind === "human")
+      .map((member) => [member.id, member]));
+    for (const profile of this.humanMemory.listProfiles?.() ?? []) {
+      if (!humans.has(profile.member.id)) humans.set(profile.member.id, profile.member);
+    }
+    let recovered = 0;
+    for (const pending of this.store.listPendingDirectTurns()) {
+      if (this.admittedDirectMessageIds.has(pending.messageId)) continue;
+      const human = humans.get(pending.authorId);
+      const persona = PERSONAS.find((candidate) => candidate.id === pending.personaId);
+      const message = this.store.getDmMessages(pending.threadId)
+        .find((candidate) => candidate.id === pending.messageId && candidate.authorId === pending.authorId);
+      const participants = this.store.getDmParticipants(pending.threadId) ?? [];
+      if (!human || !persona || !message || participants.length !== 2 ||
+          !participants.includes(human.id) || !participants.includes(persona.id)) {
+        this.store.completePendingDirectTurns([pending.messageId], pending.personaId);
+        continue;
+      }
+      if (!this.humanActorWorkIsCurrent(human.id) ||
+          message.attachments?.some((attachment) => attachment.analysis.status === "pending")) continue;
+      if (!this.store.claimPendingDirectTurn(pending.messageId)) continue;
+      recovered += 1;
+      // Enqueue synchronously: the coordinator batches all pending rows for a
+      // thread before its debounce timer fires. No public presence is created.
+      void this.enqueueDirectMessage(message, { ...human, status: "offline" }, persona);
+    }
+    return recovered;
+  }
+
+  /** Reset memory without retiring the identity or admitting pre-reset results. */
+  resetHumanMemoryWork(actorId: string): void {
+    this.cancelDirectTurnsForActor(actorId);
+    this.invalidatePublicWorkForHumanActor(actorId);
+    // The monotonically advanced epoch remains the barrier for old work.
+    // New messages from the same still-valid identity may proceed normally.
+    this.invalidatedHumanActorIds.delete(actorId);
   }
 
   /**
@@ -3877,6 +3911,7 @@ export class SocialDirector {
     mechanicalAddressedPersonaIdsOverride?: readonly string[];
     durableDelivery?: boolean;
     supersessionProtected?: boolean;
+    signal?: AbortSignal;
   }): Promise<TurnAnalysis> {
     const channel = getChannelProfile(input.channelId);
     const uniqueRecentMessages = this.activeTurnContextMessages(input);
@@ -3936,6 +3971,15 @@ export class SocialDirector {
       const execution = {
         durableDelivery: input.durableDelivery,
         supersessionProtected: input.supersessionProtected,
+        signal: input.signal,
+        // Prompt-safe URL labels intentionally omit some URL details. Include
+        // the exact server-owned mapping so a replay can never reuse U1 for a
+        // different URL merely because its displayed label is unchanged.
+        contextFingerprint: createHash("sha256").update(JSON.stringify(
+          input.candidateSet.candidates.map((candidate) => [
+            candidate.id, candidate.raw, candidate.url?.href, candidate.messageId, candidate.source,
+          ]),
+        )).digest("hex"),
       };
       const first = await this.lm.analyzeTurn(request, execution);
       const transientFailure = first.source !== "lm" && [
@@ -4124,8 +4168,12 @@ export class SocialDirector {
     }
   }
 
-  private schedulePersistentMemory(messages: readonly ChatMessage[], human: Member): void {
-    if (!this.humanActorWorkIsCurrent(human.id)) return;
+  private schedulePersistentMemory(
+    messages: readonly ChatMessage[],
+    human: Member,
+    actorWorkEpoch = this.captureActorWorkEpoch(human.id),
+  ): void {
+    if (!this.humanActorWorkIsCurrent(human.id, actorWorkEpoch)) return;
     // The source-bound coordinator supersedes the old, human-fact-only model
     // pass. Keeping both would spend inference twice and could persist two
     // incompatible interpretations of the same delivered turn.
@@ -4138,7 +4186,7 @@ export class SocialDirector {
     // Defer the optional low-priority pass until the live reply generation has
     // entered the inference queue. Memory can never delay or decide the reply.
     setTimeout(() => {
-      if (!this.humanActorWorkIsCurrent(human.id)) return;
+      if (!this.humanActorWorkIsCurrent(human.id, actorWorkEpoch)) return;
       const recent = this.store.getRecent(latest.channelId, 40);
       const currentIds = new Set(currentBurst.map((message) => message.id));
       const firstCurrentIndex = recent.findIndex((candidate) => currentIds.has(candidate.id));
@@ -4168,7 +4216,7 @@ export class SocialDirector {
       });
       if (!request) return;
       void request.then((analysis) => {
-        if (!this.humanActorWorkIsCurrent(human.id)) return;
+        if (!this.humanActorWorkIsCurrent(human.id, actorWorkEpoch)) return;
         if (analysis.source !== "lm") return;
         this.applyClassifiedMemoryChanges(analysis.items, human.id, latest.channelId);
       }).catch((error) => {
@@ -4220,6 +4268,14 @@ export class SocialDirector {
     persona: Persona,
     visualAnalysisReady?: Promise<void>,
   ): Promise<void> {
+    if (this.admittedDirectMessageIds.has(message.id)) return;
+    this.admittedDirectMessageIds.add(message.id);
+    while (this.admittedDirectMessageIds.size > 4_000) {
+      const oldest = this.admittedDirectMessageIds.values().next().value;
+      if (oldest === undefined) break;
+      this.admittedDirectMessageIds.delete(oldest);
+    }
+    this.store.claimPendingDirectTurn(message.id);
     this.lastMeaningfulHumanActivityAt = this.now();
     return new Promise<void>((resolve) => {
       try {
@@ -4231,6 +4287,8 @@ export class SocialDirector {
           settle: resolve,
         });
       } catch (error) {
+        this.admittedDirectMessageIds.delete(message.id);
+        this.store.releasePendingDirectTurn(message.id);
         console.warn("DM turn could not be queued:", error instanceof Error ? error.message : error);
         resolve();
       }
@@ -4299,6 +4357,7 @@ export class SocialDirector {
       personas: [persona],
       candidateSet,
       allowSearch: Boolean(persona.canResearch),
+      signal: turn.signal,
     });
     if (!turn.isCurrent()) return undefined;
 
@@ -4473,6 +4532,10 @@ export class SocialDirector {
         result.linkPreview,
       );
       if (!reply) return;
+      // The reply and its outbox acknowledgement enter the same room-store
+      // snapshot synchronously, so a restart sees both or retries the source.
+      this.store.completePendingDirectTurns(turn.messages.map((input) => input.message.id), result.persona.id);
+      for (const input of turn.messages) this.admittedDirectMessageIds.delete(input.message.id);
       const thread = this.store.getDmThread(result.human.id, result.persona.id);
       if (thread) this.io.to(`user:${result.human.id}`).emit("dm:update", { thread, message: reply });
       this.lm.rememberDeliveredLine(result.persona.id, result.content, {
@@ -4507,6 +4570,7 @@ export class SocialDirector {
     visualObservation?: VisualObservation,
     preclaimedDeliveries: readonly ClaimedPublicTurnTarget[] = [],
     actorWorkEpoch = this.captureActorWorkEpoch(human.id),
+    recovering = false,
   ): Promise<void> {
     const foreground = this.lm.acquireForegroundDemand?.();
     try {
@@ -4516,6 +4580,7 @@ export class SocialDirector {
         visualObservation,
         preclaimedDeliveries,
         actorWorkEpoch,
+        recovering,
       );
     } finally {
       foreground?.release();
@@ -4528,6 +4593,7 @@ export class SocialDirector {
     visualObservation?: VisualObservation,
     preclaimedDeliveries: readonly ClaimedPublicTurnTarget[] = [],
     actorWorkEpoch = this.captureActorWorkEpoch(human.id),
+    recovering = false,
   ): Promise<void> {
     const trigger = messages.at(-1);
     if (!trigger) return;
@@ -4558,11 +4624,14 @@ export class SocialDirector {
     const actorScope = publicTurnActorScopeKey(trigger.channelId, human.id);
     const burstEpoch = this.humanMessageEpochById.get(trigger.id)
       ?? (this.humanTurnEpochByActorScope.get(actorScope) ?? 0);
+    const catalogEpoch = this.catalogEpoch;
+    const ambientContinuationEpoch = this.channelEpoch.get(trigger.channelId) ?? 0;
     const burstIsCurrent = (): boolean =>
+      catalogEpoch === this.catalogEpoch &&
       this.humanActorWorkIsCurrent(human.id, actorWorkEpoch) &&
       (supersessionProtected || burstEpoch === (this.humanTurnEpochByActorScope.get(actorScope) ?? 0));
     if (!burstIsCurrent()) {
-      this.schedulePersistentMemory(messages, human);
+      this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
     const hasImage = Boolean(trigger.attachments?.length);
@@ -4625,7 +4694,7 @@ export class SocialDirector {
     });
     const availableCapabilities = this.availableTurnCapabilities(candidateSet, true, "public");
     if (!burstIsCurrent()) {
-      this.schedulePersistentMemory(messages, human);
+      this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
     const trustedLanguage = classifiedLanguage(analysis);
@@ -4669,7 +4738,7 @@ export class SocialDirector {
         replied: 0,
         reacted: 0,
       });
-      this.schedulePersistentMemory(messages, human);
+      this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
     // The classifier sees human-authored chat text only. Visual observations
@@ -4829,7 +4898,7 @@ export class SocialDirector {
       // A claimed passive link never falls through into an ungrounded normal
       // scene, even when a duplicate delivery or hard pacing gate rejects it.
       if (!this.claimAutoSharedLinkMessage(trigger.id)) {
-        this.schedulePersistentMemory(messages, human);
+        this.schedulePersistentMemory(messages, human, actorWorkEpoch);
         return;
       }
       const resolvedPageReadRequest = this.pageReader.resolveTarget({
@@ -4842,7 +4911,7 @@ export class SocialDirector {
         ? { ...resolvedPageReadRequest, initiator: "automatic" as const }
         : undefined;
       if (!pageReadRequest?.url) {
-        this.schedulePersistentMemory(messages, human);
+        this.schedulePersistentMemory(messages, human, actorWorkEpoch);
         return;
       }
       autoSharedLinkAttempt = this.reserveAutoSharedLinkAttempt({
@@ -4851,7 +4920,7 @@ export class SocialDirector {
         url: pageReadRequest.url,
       });
       if (!autoSharedLinkAttempt) {
-        this.schedulePersistentMemory(messages, human);
+        this.schedulePersistentMemory(messages, human, actorWorkEpoch);
         return;
       }
       invocation = this.capabilityRegistry.planAutomaticRead(pageReadRequest, trigger.content);
@@ -5127,7 +5196,7 @@ export class SocialDirector {
         replied: 0,
         reacted: reactionCount,
       });
-      this.schedulePersistentMemory(messages, human);
+      this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
     const generatedAt = this.now();
@@ -5142,9 +5211,6 @@ export class SocialDirector {
         ...(historyResponseRequired && recallAnswerer ? [recallAnswerer.id] : []),
         ...requestOwnerIds,
         ...firstArrivalPersonaIds,
-        ...(signals.claimStrength > 0.28 && signals.reactionNeed !== "required"
-          ? selected.filter((persona) => (persona.disagreement ?? 0) >= 0.65).slice(0, 1).map((persona) => persona.id)
-          : []),
       ]),
     ];
     const responseRecoveryIds = firstArrivalPersonaIds.filter((id) =>
@@ -5156,6 +5222,8 @@ export class SocialDirector {
     // actually staged for publication.
     const accountablePrimary = requestOwner
       ?? selected.find((persona) => requiredIds.includes(persona.id));
+    const firstCandidate = accountablePrimary ?? selected[0]!;
+    const continuationCandidates = selected.filter((persona) => persona.id !== firstCandidate.id);
     primaryTypingLease = autoSharedLinkAttempt || !accountablePrimary
       ? undefined
       : this.acquireTyping(trigger.channelId, accountablePrimary.id);
@@ -5164,6 +5232,7 @@ export class SocialDirector {
     let capabilityResolution: EvidenceResolution | undefined;
     let capabilityScene: CapabilitySceneContract | undefined;
     let evidencePremise = "";
+    let publicScene: SceneRequest | undefined;
     try {
       if (invocation) {
         if (capabilityParticipation === "decline") {
@@ -5188,14 +5257,14 @@ export class SocialDirector {
         if (capabilityScene.suppressResponse) {
           // Passive-link failures are intentionally silent. They never turn
           // into a search, a capability apology or an ungrounded normal reply.
-          this.schedulePersistentMemory(messages, human);
+          this.schedulePersistentMemory(messages, human, actorWorkEpoch);
           return;
         }
         if (
           autoSharedLinkAttempt &&
           (!burstIsCurrent() || (!this.canSpeak() && !automaticReadResponseRequired))
         ) {
-          this.schedulePersistentMemory(messages, human);
+          this.schedulePersistentMemory(messages, human, actorWorkEpoch);
           return;
         }
         if (autoSharedLinkAttempt) {
@@ -5205,7 +5274,6 @@ export class SocialDirector {
         }
         if (research) triggerType = "research";
       }
-      const dissenter = selected.find((persona) => (persona.disagreement ?? 0) >= 0.65);
       const premise = [
         firstArrival
           ? "This is the triggering participant's first public appearance. The one selected resident must respond primarily to the actual message, with at most one light, character-specific acknowledgment that the participant is new here. Keep it natural: no welcome parade, no generic onboarding speech, do not call the participant an AI, agent, tool, API or model, do not describe how they connected, repeat their profile, or invent gender/pronouns."
@@ -5227,14 +5295,10 @@ export class SocialDirector {
               ? "No matching exact retained public transcript excerpt was found. One selected resident instead has a fallible, owner-subjective public recollection about the server-resolved offline human. Only that resident may use it, must frame it as uncertain personal recollection, and must not turn it into an exact quote or add private detail."
               : "The latest turn depends on older room history, but no matching retained public excerpt was found and no fallible public resident recollection is available. Do not invent a memory or historical detail; say only what the available context supports."
             : "",
-        signals.claimStrength > 0.28 && signals.reactionNeed !== "required" && dissenter
-          ? `${dissenter.name} should make one specific respectful disagreement, acknowledge any valid part, and avoid a pile-on. Other actors must add a different angle rather than echoing the challenge.`
-          : "",
       ]
         .filter(Boolean)
         .join(" ");
-      lines = await this.lm.generateScene(
-        {
+      publicScene = {
           kind: "public",
           humanizerBudget,
           responseRecoveryBudget,
@@ -5281,7 +5345,9 @@ export class SocialDirector {
           temporalPolicy: capabilityScene?.temporalPolicy ?? "reactive_only",
           temporalSurfaceActorId: capabilityScene?.temporalPolicy ? evidenceResponder?.id : undefined,
           premise: premise || undefined,
-        },
+        };
+      lines = await this.lm.generateScene(
+        actorSubsetSceneRequest(publicScene, [firstCandidate], true),
         signals.mentionedIds.length ? 0 : 2,
         undefined,
         {
@@ -5295,13 +5361,13 @@ export class SocialDirector {
     }
 
     if (!burstIsCurrent()) {
-      this.schedulePersistentMemory(messages, human);
+      this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
 
     const required = new Set(requiredIds);
     for (const requiredId of requiredIds.filter(
-      (id) => !lines.some((line) => line.personaId === id),
+      (id) => id === firstCandidate.id && !lines.some((line) => line.personaId === id),
     )) {
       if (!burstIsCurrent()) break;
       const persona = selected.find((candidate) => candidate.id === requiredId);
@@ -5415,7 +5481,7 @@ export class SocialDirector {
       }
     }
     if (!burstIsCurrent()) {
-      this.schedulePersistentMemory(messages, human);
+      this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
     const directlyAddressedOwnerIds = requestOwnerIds.filter((id) => signals.mentionedIds.includes(id));
@@ -5458,29 +5524,88 @@ export class SocialDirector {
       Number(required.has(b.personaId)) - Number(required.has(a.personaId)),
     );
     if (this.now() - generatedAt > 45_000 && required.size === 0) {
-      this.schedulePersistentMemory(messages, human);
+      this.schedulePersistentMemory(messages, human, actorWorkEpoch);
       return;
     }
 
-    const actualSpeakers = lines
-      .map((line) => selected.find((persona) => persona.id === line.personaId))
-      .filter((persona): persona is Persona => Boolean(persona));
-    this.publishDirectorEvent({
-      trigger: triggerType,
-      summary: actualSpeakers.length
-        ? `${actualSpeakers.map((persona) => persona.name).join(" + ")} took the floor in #${trigger.channelId}; ${PERSONAS.length - actualSpeakers.length} residents stayed quiet.`
-        : "The room noticed, but nobody forced a reply.",
-      considered: PERSONAS.length,
-      noticed: clamp(actualSpeakers.length + reactionCount, 0, PERSONAS.length),
-      replied: actualSpeakers.length,
-      reacted: reactionCount,
-    });
-
     let priorityReplyPublished = false;
-    for (const [index, line] of lines.slice(0, selected.length).entries()) {
+    const designatedOnly = capabilityParticipation === "decline" ||
+      this.capabilityRegistry.requiresDesignatedResponder(capabilityResolution);
+    for (const [index, persona] of [firstCandidate, ...continuationCandidates].entries()) {
       if (!burstIsCurrent()) break;
-      const persona = selected.find((candidate) => candidate.id === line.personaId);
-      if (!persona) continue;
+      if (designatedOnly && evidenceResponder?.id !== persona.id) continue;
+      let line = lines.find((candidate) => candidate.personaId === persona.id);
+      const requiredReply = required.has(persona.id);
+      const latestPublished = publishedResponses.at(-1);
+      let replyToId = trigger.id;
+      if (index > 0) {
+        // Being shortlisted is not a promise to speak. Optional residents are
+        // considered only after an actual publication, never from a peer's
+        // private draft. New channel traffic wins over this optional texture.
+        if (!publicScene || (!requiredReply && (
+          !latestPublished || !this.canSpeak() ||
+          recovering || responseRecoveryBudget.retriesRemaining <= 0 ||
+          trustedTurn.answerDepth === "detailed" ||
+          this.channelBehaviorTuning(trigger.channelId).activity === 0 ||
+          this.store.getRecent(trigger.channelId, 1)[0]?.id !== latestPublished.id
+        ))) continue;
+        const targetId = latestPublished?.id;
+        const continuationRequest = actorSubsetSceneRequest(publicScene, [persona], true);
+        continuationRequest.history = this.transcript(trigger.channelId, 26);
+        continuationRequest.conversationContext = this.publishedConversationContext(
+          trigger.channelId, trigger.id, latestPublished ? "continuation" : "opening",
+        );
+        continuationRequest.publicSiblingDrafts = undefined;
+        continuationRequest.responseRecoveryIds = requiredReply ? [persona.id] : [];
+        continuationRequest.premise = [
+          requiredReply ? publicScene.premise : evidencePremise,
+          requiredReply
+            ? "You were personally addressed. Answer the participant in your own voice, taking account of replies already published. Do not pretend a peer's answer was not said."
+            : "The participant has received a reply. Decide whether you personally have something to say in response to the actual published conversation now. Nobody requires you to speak. Empty messages is a valid decision, not a failure. Do not give the same answer again in different words; a genuine brief social reaction is still welcome.",
+        ].filter(Boolean).join(" ");
+        if (!requiredReply && latestPublished) {
+          const previousPersona = PERSONAS.find((candidate) => candidate.id === latestPublished.authorId);
+          continuationRequest.trigger = {
+            authorId: latestPublished.authorId,
+            authorKind: "ai",
+            author: previousPersona?.name ?? latestPublished.authorSnapshot?.name ?? "resident",
+            content: latestPublished.content,
+            messageId: latestPublished.id,
+            createdAt: latestPublished.createdAt,
+          };
+          continuationRequest.currentDiscourseContext = undefined;
+          continuationRequest.triggerParticipantBinding = undefined;
+          continuationRequest.semanticContext = {
+            ...publicScene.semanticContext!,
+            replyExpected: "optional",
+            answerDepth: "normal",
+            reactionNeed: "none",
+          };
+          replyToId = latestPublished.id;
+        }
+        const followupTyping = requiredReply ? this.acquireTyping(trigger.channelId, persona.id) : undefined;
+        try {
+          const followup = await this.lm.generateScene(
+            continuationRequest,
+            requiredReply ? 0 : 3,
+            undefined,
+            requiredReply
+              ? { durableDelivery: deliveryProtected, supersessionProtected }
+              : { preemptibleBackground: true },
+          );
+          if (!burstIsCurrent()) break;
+          if (!requiredReply && this.store.getRecent(trigger.channelId, 1)[0]?.id !== targetId) continue;
+          line = followup.find((candidate) => candidate.personaId === persona.id);
+          if (line) lines.push(line);
+        } catch (error) {
+          if (!isBackgroundWorkPreemptedError(error)) {
+            console.warn("Published-conversation follow-up skipped:", error instanceof Error ? error.message : error);
+          }
+        } finally {
+          followupTyping?.release();
+        }
+      }
+      if (!line) continue;
       const publicationTypingLease = this.acquireTyping(trigger.channelId, persona.id);
       try {
         if (index === 0 && accountablePrimary?.id !== persona.id) {
@@ -5508,6 +5633,8 @@ export class SocialDirector {
           this.canUsePriorityExternalAgentReply();
         if (
           !burstIsCurrent() ||
+          (index > 0 && !requiredReply &&
+            this.store.getRecent(trigger.channelId, 1)[0]?.id !== replyToId) ||
           (!ordinarySlotAvailable && !prioritySlotAvailable && !externalAgentPrioritySlotAvailable)
         ) break;
         const publishedSourceIds = this.capabilityRegistry.sourceIds(
@@ -5523,7 +5650,7 @@ export class SocialDirector {
           trigger.channelId,
           persona,
           line.content,
-          trigger.id,
+          replyToId,
           line.source,
           this.messageSources(research, publishedSourceIds),
           linkCardSourceId && research ? linkPreviewFromResearch(research, linkCardSourceId) : undefined,
@@ -5582,10 +5709,32 @@ export class SocialDirector {
         publicationTypingLease.release();
       }
     }
+    const actualSpeakers = publishedResponses
+      .map((message) => selected.find((persona) => persona.id === message.authorId))
+      .filter((persona): persona is Persona => Boolean(persona));
+    this.publishDirectorEvent({
+      trigger: triggerType,
+      summary: actualSpeakers.length
+        ? `${actualSpeakers.map((persona) => persona.name).join(" + ")} joined the published conversation in #${trigger.channelId}.`
+        : "The room noticed, but nobody forced a reply.",
+      considered: PERSONAS.length,
+      noticed: clamp(actualSpeakers.length + reactionCount, 0, PERSONAS.length),
+      replied: actualSpeakers.length,
+      reacted: reactionCount,
+    });
     if (autoSharedLinkAttempt && research && publishedResponses.length > 0) {
       this.recordSuccessfulAutoSharedLink(autoSharedLinkAttempt);
     }
-    if (burstIsCurrent()) {
+    const latestResponse = publishedResponses.at(-1);
+    if (
+      !recovering && burstIsCurrent() && latestResponse &&
+      ambientContinuationEpoch === (this.channelEpoch.get(trigger.channelId) ?? 0) &&
+      this.store.getRecent(trigger.channelId, 1)[0]?.id === latestResponse.id
+    ) {
+      // Required answers are actor-local and may still arrive after someone
+      // else speaks. Optional room bookkeeping must not revive that older
+      // topic or overwrite a newer participant's ambient continuation. A
+      // durable replay delivers its answer, not a fresh autonomous episode.
       this.rememberParticipantTopicForAmbientContinuation({
         trigger,
         participantKind: human.kind === "agent" ? "agent" : "human",
@@ -5595,7 +5744,7 @@ export class SocialDirector {
         research,
       });
     }
-    this.schedulePersistentMemory(messages, human);
+    this.schedulePersistentMemory(messages, human, actorWorkEpoch);
     } finally {
       // The accountable owner remains continuously composing from routing
       // through reviewed publication. Publication may hold an overlapping
@@ -5727,12 +5876,14 @@ export class SocialDirector {
     const existing = this.ambientTimers.get(workerId);
     if (existing) clearTimeout(existing);
     const pace = process.env.AI_PACE === "calm" || process.env.AI_PACE === "party" ? process.env.AI_PACE : "lively";
-    const ranges = { calm: [48_000, 82_000], lively: [26_000, 48_000], party: [18_000, 34_000] } as const;
-    const [min, max] = ranges[pace];
-    const wait = scaleAmbientDelay(
-      delayMs ?? min + this.rng() * (max - min),
-      this.globalBehaviorTuning().activity,
-    );
+    const activity = this.globalBehaviorTuning().activity;
+    const wait = delayMs !== undefined
+      ? scaleAmbientDelay(delayMs, activity)
+      : ambientSchedulingPolicy({
+          health: this.lm.health(), pace, activity,
+          configuredWorkers: this.ambientConcurrency, workerId, random: this.rng(),
+          ownedAmbientGenerations: this.ambientGenerationsInFlight,
+        }).delayMs;
     const timer = setTimeout(() => {
       if (this.ambientTimers.get(workerId) !== timer) return;
       this.ambientTimers.delete(workerId);
@@ -5874,7 +6025,7 @@ export class SocialDirector {
             !this.activeVoicePersonaIds.has(persona.id) &&
             now - (this.lastSpoke.get(persona.id) ?? 0) > persona.cooldownMs,
         );
-      if (available.length < 2 || !available.some((persona) => persona.canResearch)) return [];
+      if (available.length < 1 || !available.some((persona) => persona.canResearch)) return [];
 
       const basePriority = prioritizeAutonomousResearch(
         activityPolicy.chance,
@@ -6123,9 +6274,15 @@ export class SocialDirector {
       this.ambientBackoffUntilByChannel.delete(channelId);
     }
     const thread = this.ambientThreads.get(channelId);
+    // Stable midpoint for completed-room eligibility; never redraw a deadline
+    // on each scheduler poll. The room's activity setting remains authoritative.
+    const cooldownMs = ambientConversationTimingPolicy({
+      activity: this.channelBehaviorTuning(channelId).activity,
+      random: 0.5,
+    }).closedConversationCooldownMs;
     if (thread) {
       if (thread.closedAt !== undefined) {
-        if (now - thread.closedAt < AMBIENT_THREAD_COOLDOWN_MS) return false;
+        if (now - thread.closedAt < cooldownMs) return false;
         this.ambientThreads.delete(channelId);
       } else if (thread.nextEligibleAt !== undefined && now < thread.nextEligibleAt) {
         return false;
@@ -6134,7 +6291,7 @@ export class SocialDirector {
         this.closeAmbientThread(thread, "expired");
         this.ambientThreads.delete(channelId);
       }
-      if (now - thread.updatedAt < AMBIENT_THREAD_COOLDOWN_MS) return false;
+      if (now - thread.updatedAt < cooldownMs) return false;
       this.ambientThreads.delete(channelId);
     }
 
@@ -6150,7 +6307,7 @@ export class SocialDirector {
     if (trailingAiMessageCount(recent) === 0) return true;
     const latestNonSystem = [...recent].reverse().find((message) => !message.system);
     const latestAt = latestNonSystem ? Date.parse(latestNonSystem.createdAt) : Number.NaN;
-    return !Number.isFinite(latestAt) || now - latestAt >= AMBIENT_THREAD_COOLDOWN_MS;
+    return !Number.isFinite(latestAt) || now - latestAt >= cooldownMs;
   }
 
   /**
@@ -6505,6 +6662,7 @@ export class SocialDirector {
     thread: AmbientThreadState,
     message: ChatMessage,
     action?: AmbientActionDecision,
+    replyTarget?: ReturnType<typeof conversationReplyTarget>,
   ): void {
     const firstPublication = thread.messageCount === 0;
     thread.messageCount += 1;
@@ -6516,7 +6674,31 @@ export class SocialDirector {
       thread.hasOpenHook = action.keepsHookOpen;
     }
     thread.updatedAt = this.now();
-    thread.nextEligibleAt = thread.updatedAt + 24_000 + this.rng() * 52_000;
+    thread.quietCandidateIds = [];
+    // A committed exact @mention can address someone other than the author of
+    // the quoted reply. Reuse one bounded opportunity, never a required reply
+    // or a fan-out of jobs. Normal next-turn eligibility still applies.
+    const mentionedResidents = this.actorChannels.autonomousCandidatesFor(message.channelId)
+      .filter((persona) => persona.id !== message.authorId &&
+        persona.id !== "ai-runa" && persona.id !== "ai-robin" &&
+        PERSONAS.some((active) => active.id === persona.id) &&
+        !this.activeVoicePersonaIds.has(persona.id) &&
+        containsExactMention(message.content, persona.name));
+    const mentionedRecipient = mentionedResidents.length === 1
+      ? mentionedResidents[0]
+      : mentionedResidents.length > 1
+        ? mentionedResidents[Math.floor(this.rng() * mentionedResidents.length)]
+        : undefined;
+    const replyRecipientId = replyTarget?.authorId && PERSONAS.some((persona) => persona.id === replyTarget.authorId)
+      ? replyTarget.authorId : undefined;
+    const recipientId = mentionedRecipient?.id ?? replyRecipientId;
+    thread.replyOpportunity = recipientId
+      ? { afterMessageId: message.id, actorId: recipientId }
+      : undefined;
+    thread.nextEligibleAt = thread.updatedAt + ambientConversationTimingPolicy({
+      activity: this.channelBehaviorTuning(message.channelId).activity,
+      random: this.rng(),
+    }).activeConversationDelayMs;
     this.ambientBackoffUntilByChannel.delete(message.channelId);
     if (firstPublication && ambientThreadOrigin(thread) === "room_seed") {
       const recentSeeds = this.recentAmbientSeedsByChannel.get(message.channelId) ?? [];
@@ -6621,7 +6803,7 @@ export class SocialDirector {
       actionHistory: Array.from({ length: messageCount }, () => "advance_claim" as const),
       shape,
       hasOpenHook: true,
-      nextEligibleAt: now + 28_000 + this.rng() * 54_000,
+      nextEligibleAt: now + 10_000 + this.rng() * 25_000,
       debateBeat,
       languageHint: languageTag ?? (externalAgentStarted
         ? "the language used in the latest external-agent-authored message"
@@ -6643,6 +6825,7 @@ export class SocialDirector {
     epoch: number,
     actors: readonly Persona[],
     requiredSlots: number,
+    requireGenerationCapacity = true,
   ): boolean {
     const now = this.now();
     const globalTuning = this.globalBehaviorTuning();
@@ -6658,7 +6841,7 @@ export class SocialDirector {
       globalTuning.activity === 0 ||
       channelTuning.activity === 0 ||
       epoch !== (this.channelEpoch.get(channelId) ?? 0) ||
-      this.lm.health().queueDepth !== 0 ||
+      (requireGenerationCapacity && !ambientGenerationAdmission(this.lm.health(), this.ambientGenerationsInFlight).allowed) ||
       this.availableAutonomousMessageSlots(now, globalTuning.activity) < requiredSlots ||
       this.autonomousResearchSuccessTimestamps.length >= researchPolicy.dailyCap ||
       (lastChannelHumanActivityAt !== undefined &&
@@ -6777,10 +6960,102 @@ export class SocialDirector {
     }
   }
 
+  /**
+   * A resident may look up a missing public detail inside an existing exchange.
+   * This is optional curiosity, not a new episode, obligatory source or script.
+   * One actual lookup per thread and at most one decision per three new posts;
+   * the ordinary Admin research budget, foreground priority and global lease apply.
+   */
+  private async maybeResearchConversation(
+    channel: (typeof CHANNELS)[number],
+    thread: AmbientThreadState,
+    resident: Persona,
+    conversation: ReturnType<typeof buildConversationContext>,
+    epoch: number,
+    lifecycleGeneration: number,
+  ): Promise<{ research: ResearchPacket; seed: AutonomousResearchSeed; release: () => void } | undefined> {
+    if (!CHANNELS.some((candidate) => candidate.id === channel.id) ||
+        conversation.phase !== "continuation" || conversation.publishedTurns.length === 0 ||
+        !this.lm.planConversationResearch || !resident.canResearch || this.autonomousResearchLease ||
+        thread.research || thread.researchAttempted || thread.messageCount < 2 ||
+        thread.messageCount - (thread.researchDecisionAtMessageCount ?? -1) < 3) return;
+    const now = this.now();
+    const policy = autonomousResearchActivityPolicy(
+      this.autonomousResearchPolicy(channel.id), this.hasRecentHumanResearchActivity(channel.id, now),
+    );
+    const health = this.lm.health();
+    const waiting = typeof health.activePredictions === "number"
+      ? Math.max(0, health.queueDepth - health.activePredictions) : health.queueDepth;
+    if (!shouldStartAutonomousResearch({
+      ...policy, now,
+      lastGlobalSuccessAt: this.lastAutonomousResearchSuccessAt,
+      lastChannelSuccessAt: this.lastAutonomousResearchSuccessAtByChannel.get(channel.id),
+      globalRetryAfterAt: this.autonomousResearchGlobalRetryAfterAt,
+      channelRetryAfterAt: this.autonomousResearchFailureStateByChannel.get(channel.id)?.retryAfterAt,
+      lastChannelHumanActivityAt: this.lastHumanMessageAtByChannel.get(channel.id),
+      queueDepth: waiting,
+      availableMessageSlots: this.availableAutonomousMessageSlots(now, this.globalBehaviorTuning().activity),
+      dailySuccesses: this.autonomousResearchSuccessTimestamps.filter((at) => now - at < 24 * 60 * 60_000).length,
+      // Fresh research opportunity inside a committed thread, not a restart.
+      freshThread: true, availableActors: 1, rng: this.rng,
+    })) return;
+    const stillCurrent = () => this.ambientLifecycleIsCurrent(lifecycleGeneration) &&
+      this.ambientThreadIsCurrent(channel.id, thread) &&
+      this.autonomousResearchIsStillSafe(channel.id, epoch, [resident], 1, false);
+    if (!stillCurrent()) return;
+    const lease = Symbol("conversation-research");
+    this.autonomousResearchLease = lease;
+    let handedOff = false;
+    const release = () => {
+      if (this.autonomousResearchLease === lease) this.autonomousResearchLease = undefined;
+    };
+    thread.researchDecisionAtMessageCount = thread.messageCount;
+    try {
+      let choice;
+      this.ambientGenerationsInFlight += 1;
+      try {
+        choice = await this.lm.planConversationResearch({
+          channelId: channel.id, channelName: channel.name,
+          roomTopic: getChannelProfile(channel.id)?.topic.brief ?? channel.description,
+          resident: { id: resident.id, name: resident.name, interests: resident.interests },
+          conversation,
+        });
+      } finally { this.ambientGenerationsInFlight -= 1; }
+      if (!stillCurrent()) throw new AutonomousResearchDeferredError("Conversation lookup was superseded");
+      if (!choice || !conversation.publishedTurns.some((turn) => turn.messageId === choice.sourceMessageId)) return;
+      thread.researchAttempted = true;
+      const seed: AutonomousResearchSeed = {
+        id: `conversation:${thread.episodeId ?? thread.causalRootId}:${choice.sourceMessageId}`,
+        query: choice.query, mode: choice.mode, discussionAngle: choice.question,
+        ...(choice.mode === "news" ? { maxAgeDays: 7 } : {}),
+      };
+      this.beginAutonomousResearchAttempt();
+      const outcome = await this.safelyReadAutonomousResult(channel.id, seed, stillCurrent);
+      if (!stillCurrent()) throw new AutonomousResearchDeferredError("Conversation lookup was superseded");
+      if (!outcome.research) {
+        this.recordAutonomousResearchFailure(channel.id, seed, outcome.failureReason);
+        return;
+      }
+      // Keep source selection as small as ordinary autonomous research. Review
+      // still has to establish relevance/support; the query itself proves nothing.
+      handedOff = true;
+      return { research: { ...outcome.research, results: outcome.research.results.slice(0, 1) }, seed, release };
+    } catch (error) {
+      if (isBackgroundWorkPreemptedError(error) || error instanceof AutonomousResearchDeferredError) throw error;
+      console.warn("Optional conversation lookup skipped:", error instanceof Error ? error.message : error);
+      // A planner/transport outage is not a vote for silence or a dead room.
+      return;
+    } finally {
+      if (!handedOff) release();
+    }
+  }
+
   private async safelyReadAutonomousResult(
     channelId: string,
     seed: AutonomousResearchSeed,
+    isCurrent: () => boolean = () => true,
   ): Promise<AutonomousResearchReadOutcome> {
+    if (!isCurrent()) throw new AutonomousResearchDeferredError("Conversation changed before research");
     const requesterId = `ambient-research:${channelId}`;
     const search = await this.researchBroker.research({
       query: seed.query,
@@ -6794,6 +7069,7 @@ export class SocialDirector {
       return undefined;
     });
     if (!search) return { failureReason: "lookup_failed" };
+    if (!isCurrent()) throw new AutonomousResearchDeferredError("Conversation changed during discovery");
     const recentUrls = this.recentPublishedUrlKeys();
     const safelyReadResults: ResearchPacket["results"] = [];
     let retrievedAt: string | undefined;
@@ -6822,6 +7098,7 @@ export class SocialDirector {
       .slice(0, 4);
     if (eligibleResults.length === 0) return { failureReason: "no_candidate_after_filter" };
     for (const { candidate: result } of eligibleResults) {
+      if (!isCurrent()) throw new AutonomousResearchDeferredError("Conversation changed before source read");
       let url: URL;
       try {
         url = new URL(result.url);
@@ -6836,10 +7113,14 @@ export class SocialDirector {
         source: "message",
         initiator: "automatic",
       }, requesterId).catch((error) => {
+        if (error instanceof PageReadBusyError) {
+          throw new AutonomousResearchDeferredError("Page reader capacity is temporarily busy");
+        }
         console.warn("Autonomous source read failed safely:", error instanceof Error ? error.message : error);
         return undefined;
       });
       const pageResult = page?.results.find((candidate) => candidate.id === "S1");
+      if (!isCurrent()) throw new AutonomousResearchDeferredError("Conversation changed during source read");
       if (!page || !pageResult || pageResult.url !== url.toString()) continue;
       pageReadSucceeded = true;
       const candidatePublishedAt = result.publishedAt ?? pageResult.publishedAt;
@@ -6906,6 +7187,9 @@ export class SocialDirector {
       source: "message",
       initiator: "automatic",
     }, requesterId).catch((error) => {
+      if (error instanceof PageReadBusyError) {
+        throw new AutonomousResearchDeferredError("Page reader capacity is temporarily busy");
+      }
       console.warn("Official market source read failed safely:", error instanceof Error ? error.message : error);
       return undefined;
     });
@@ -6998,32 +7282,7 @@ export class SocialDirector {
     if (!personaLease) throw new AutonomousResearchDeferredError(
       "Autonomous research yielded because its resident is already speaking",
     );
-    let responderLease: symbol | undefined;
-    let responderId: string | undefined;
     try {
-    const allResponders = available.filter((persona) => persona.id !== lead.id);
-    const responderPool = allResponders.filter(
-      (persona) => !this.ambientPersonasInFlight.has(persona.id),
-    );
-    if (responderPool.length === 0) {
-      if (allResponders.length > 0) {
-        throw new AutonomousResearchDeferredError(
-          "Autonomous research yielded because every responder is already speaking",
-        );
-      }
-      return this.recordAutonomousResearchFailure(channel.id, seed, "no_responder");
-    }
-    const contrasting = responderPool.filter((persona) =>
-      (lead.disagreement ?? 0) >= 0.65
-        ? (persona.disagreement ?? 0) < 0.65
-        : (persona.disagreement ?? 0) >= 0.65,
-    );
-    const responder = choose(contrasting.length > 0 ? contrasting : responderPool, this.rng);
-    responderLease = this.acquireAmbientPersonaLease(responder.id);
-    responderId = responder.id;
-    if (!responderLease) throw new AutonomousResearchDeferredError(
-      "Autonomous research yielded because its responder is already speaking",
-    );
     const profile = getChannelProfile(channel.id);
     const mode = profile?.ambientMode ?? "discussion";
     thread.shape = sampleAmbientEpisodeShape({
@@ -7057,6 +7316,7 @@ export class SocialDirector {
 
     const leadGenerationTypingLease = this.acquireTyping(channel.id, lead.id);
     let research: ResearchPacket | undefined;
+    let conversationContext: ReturnType<typeof buildConversationContext> | undefined;
     let lines: GeneratedLine[] = [];
     try {
       const readOutcome = preparedOutcome ?? await this.safelyReadAutonomousResult(channel.id, seed);
@@ -7066,7 +7326,7 @@ export class SocialDirector {
       if (!readOutcome.research) {
         return this.recordAutonomousResearchFailure(channel.id, seed, readOutcome.failureReason);
       }
-      const limits = ambientSceneWordLimits(lead, undefined, false, mode);
+      const limits = { [lead.id]: { minimum: 1, maximum: autonomousConversationWordCeiling(lead.style) } };
       for (const result of readOutcome.research.results.slice(0, 2)) {
         if (!this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1)) {
           throw new AutonomousResearchDeferredError(
@@ -7083,9 +7343,11 @@ export class SocialDirector {
         this.ambientGenerationsInFlight += 1;
         let candidateLines: GeneratedLine[];
         try {
+          conversationContext = this.publishedConversationContext(channel.id, thread.causalRootId, "opening");
           candidateLines = await this.lm.generateScene({
             kind: "ambient",
             ambientAction,
+            conversationContext,
             channelId: channel.id,
             channelName: channel.name,
             selected: [lead],
@@ -7094,9 +7356,8 @@ export class SocialDirector {
             premise: [
               evidenceIntroduction,
               `${lead.name} uses the sole supplied source, shares one concrete supported detail from it and immediately adds a personal take; a title-only reaction, vague hype or capability statement is invalid. The server owns the destination card.`,
-              "This tick publishes only that source-backed opening. Leave one concrete implication, disagreement or question for another resident to pick up later from actual room history.",
+              "Choose what you personally find interesting, troubling, useful or funny in that supported detail. There is room to explain why, not merely repeat the title or announce your mood. No second speaker or particular reply is prescribed.",
               "Do not announce that a search happened, explain tooling, copy a URL, or invite the whole room to answer.",
-              ambientActionInstruction("open_topic", mode),
             ].join(" "),
             mustReplyIds: [lead.id],
             responseRecoveryIds: [lead.id],
@@ -7112,7 +7373,7 @@ export class SocialDirector {
             actorExpertiseNotes: this.actorChannels.expertiseNotes([lead], channel.id),
             ...this.residentRelationshipSceneContext(
               [lead],
-              [responder],
+              this.recentResidentCounterparts(channel.id, lead.id),
               { kind: "public", channelId: channel.id },
             ),
             research: candidateResearch,
@@ -7167,7 +7428,7 @@ export class SocialDirector {
     }
     if (
       !this.ambientLifecycleIsCurrent(lifecycleGeneration) ||
-      !this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1)
+      !this.autonomousResearchIsStillSafe(channel.id, epoch, [lead], 1, false)
     ) {
       if (this.ambientThreads.get(channel.id) === thread) {
         this.ambientThreads.delete(channel.id);
@@ -7184,6 +7445,7 @@ export class SocialDirector {
     if (!preview) return this.recordAutonomousResearchFailure(channel.id, seed, "missing_preview");
 
     const leadSources = this.messageSources(selectedResearch, [selectedSourceId]);
+    const replyTarget = this.publishedReplyTarget(channel.id, lead.id, conversationContext, leadLine.replyToMessageId);
     const leadPublicationTypingLease = this.acquireTyping(channel.id, lead.id);
     let leadMessage: ChatMessage | undefined;
     try {
@@ -7191,7 +7453,7 @@ export class SocialDirector {
         channel.id,
         lead,
         leadLine.content,
-        thread.lastMessageId,
+        replyTarget?.messageId,
         leadLine.source,
         leadSources,
         preview,
@@ -7225,16 +7487,15 @@ export class SocialDirector {
       roomTopic: profile?.topic.brief ?? channel.description,
       discussionAngle: seed.discussionAngle,
     };
-    this.recordAmbientPost(thread, leadMessage, openingAction);
+    this.recordAmbientPost(thread, leadMessage, openingAction, replyTarget);
     thread.pendingBeat = {
       kind: "research_response",
-      preferredActorId: responder.id,
       attempts: 0,
     };
     thread.hasOpenHook = true;
     this.publishDirectorEvent({
       trigger: "research",
-      summary: `${lead.name} shared one safely read source in #${channel.name}; a grounded follow-up was queued for a later room tick.`,
+      summary: `${lead.name} shared one safely read source in #${channel.name}; other residents may pick it up from the published conversation.`,
       considered: PERSONAS.length,
       noticed: 1,
       replied: 1,
@@ -7242,7 +7503,6 @@ export class SocialDirector {
     });
     return true;
     } finally {
-      if (responderLease && responderId) this.releaseAmbientPersonaLease(responderId, responderLease);
       this.releaseAmbientPersonaLease(lead.id, personaLease);
     }
   }
@@ -7251,52 +7511,40 @@ export class SocialDirector {
     workerId = 0,
     lifecycleGeneration = this.ambientLifecycleGeneration,
   ): Promise<void> {
-    let ownsConsideredLease: symbol | undefined;
     let ownsAmbientChannel: { channelId: string; token: symbol } | undefined;
     const ownsAmbientPersonas: Array<{ personaId: string; token: symbol }> = [];
-    let ownsUnattendedAttempt = false;
+    let releaseConversationResearch: (() => void) | undefined;
+    let ownsPublicationReservation = false;
     let nextScheduleDelayMs: number | undefined;
     try {
       if (!this.ambientLifecycleIsCurrent(lifecycleGeneration)) return;
       const now = this.now();
-      const audienceMode = deriveAmbientAudienceMode({
-        connectedHumans: this.getConnectedHumanCount(),
-        lastMeaningfulHumanActivityAt: this.lastMeaningfulHumanActivityAt,
-        now,
-      });
-      // A passive observer still gets a continuously living room, but a second
-      // expensive worker is unlocked only by real recent participation.
-      if (workerId > 0 && audienceMode !== "engaged") return;
       const lmHealth = this.lm.health();
       if (!lmHealth.connected) return;
+      const globalTuning = this.globalBehaviorTuning();
+      const capacity = ambientSchedulingPolicy({
+        health: lmHealth, activity: globalTuning.activity,
+        configuredWorkers: this.ambientConcurrency, workerId, random: this.rng(),
+        ownedAmbientGenerations: this.ambientGenerationsInFlight,
+      });
+      if (!capacity.allowed) return;
       const generationAdmission = ambientGenerationAdmission(
         lmHealth,
         this.ambientGenerationsInFlight,
       );
-      const externalQueueDepth = generationAdmission.externalQueueDepth;
+      const researchQueueDepth = typeof lmHealth.activePredictions === "number" && Number.isFinite(lmHealth.activePredictions)
+        ? Math.max(0, lmHealth.queueDepth - lmHealth.activePredictions)
+        : generationAdmission.externalQueueDepth;
       if (!generationAdmission.allowed) {
         nextScheduleDelayMs = this.ambientBusyRetryDelayMs();
         return;
       }
-      const globalTuning = this.globalBehaviorTuning();
       if (globalTuning.activity === 0) return;
-      if (audienceMode === "unattended") {
-        const policy = unattendedAmbientPolicy(globalTuning.activity);
-        const sinceLastAttempt = this.lastUnattendedAmbientAttemptAt === undefined
-          ? Number.POSITIVE_INFINITY
-          : now - this.lastUnattendedAmbientAttemptAt;
-        if (
-          !this.hasUnattendedAmbientCapacity(now, globalTuning.activity) ||
-          sinceLastAttempt < policy.attemptCooldownMs ||
-          this.unattendedAmbientAttemptsInFlight >= 1
-        ) return;
-        // Failed/rejected work does not consume the persisted publication
-        // quota, but it still receives a bounded retry cadence for model and
-        // network safety while nobody is present.
-        this.lastUnattendedAmbientAttemptAt = now;
-        this.unattendedAmbientAttemptsInFlight += 1;
-        ownsUnattendedAttempt = true;
-      }
+      // Attendance is metadata, not a cost ceiling. All rooms share a
+      // continuously refilling burst budget and the live model capacity.
+      if (this.availableAutonomousMessageSlots(now, globalTuning.activity) <= this.ambientPublicationReservations) return;
+      this.ambientPublicationReservations += 1;
+      ownsPublicationReservation = true;
       if (!this.autonomousResearchLease) {
         const researchLease = Symbol("autonomous-research");
         this.autonomousResearchLease = researchLease;
@@ -7304,7 +7552,7 @@ export class SocialDirector {
           if (await this.maybeRunAutonomousResearch(
             now,
             globalTuning,
-            externalQueueDepth,
+            researchQueueDepth,
             lifecycleGeneration,
           )) return;
         } finally {
@@ -7402,7 +7650,14 @@ export class SocialDirector {
       if (available.length < 1) return;
       const profile = getChannelProfile(channel.id);
       const ambientMode = profile?.ambientMode ?? "discussion";
-      thread.shape ??= fallbackAmbientShape(thread);
+      // The cap is a resource/fairness limit, not a sampled script length.
+      // Whether another line exists is decided by a resident reading the
+      // published conversation, not by a target-message counter.
+      thread.shape = {
+        minimumMessages: 1,
+        softTargetMessages: CONVERSATION_MAX_PUBLICATIONS,
+        hardMaximumMessages: CONVERSATION_MAX_PUBLICATIONS,
+      };
       thread.episodeId ??= randomUUID();
       thread.causalRootId ??= thread.episodeId;
       thread.semanticFamily ??= "legacy-thread";
@@ -7412,80 +7667,15 @@ export class SocialDirector {
         this.closeAmbientThread(thread, "model_rejected");
         return;
       }
-      const startConsidered = !thread.pendingBeat && thread.messageCount === 0 && available.length >= 2 &&
-        shouldStartConsideredConversation({
-          now,
-          lastStartedAt: this.lastConsideredConversationAt,
-          lastChannelHumanActivityAt: this.lastHumanMessageAtByChannel.get(channel.id),
-          cooldownMs: this.consideredConversationCooldownMs,
-          humanQuietMs: this.consideredConversationHumanQuietMs,
-          chance: this.consideredConversationChance,
-          queueDepth: externalQueueDepth,
-          availableMessageSlots: autonomousSlots,
-          alreadyInFlight: Boolean(this.consideredConversationLease),
-          rng: this.rng,
-        });
-      const consideredPlan = startConsidered
-        ? selectConsideredConversation(
-            available,
-            this.lastSpoke,
-            now,
-            (personaId) => this.actorChannels.affinity(personaId, channel.id),
-            this.rng,
-            (ownerId, subjectId) => this.relationshipDecisionBias(
-              ownerId,
-              subjectId,
-              "ambientContinuation",
-            ),
-          )
-        : undefined;
-      if (consideredPlan) {
-        thread.shape = {
-          minimumMessages: Math.max(2, thread.shape.minimumMessages),
-          softTargetMessages: Math.max(3, thread.shape.softTargetMessages),
-          hardMaximumMessages: Math.max(4, thread.shape.hardMaximumMessages),
-        };
-        thread.hasOpenHook = true;
-      }
+      // Every resident may develop a thought. No rare "considered scene"
+      // selects a response partner or reserves a cross-room conversation lane.
       const pendingBeat = thread.pendingBeat;
-      if (pendingBeat?.kind === "considered_response" && this.consideredConversationLease) return;
-      if (consideredPlan || pendingBeat?.kind === "considered_response") {
-        if (this.consideredConversationLease) return;
-        ownsConsideredLease = Symbol("considered-conversation");
-        this.consideredConversationLease = ownsConsideredLease;
-      }
-      const pendingKind: AmbientActionKind | undefined = pendingBeat?.kind === "research_response"
-        ? "source_followup"
-        : pendingBeat?.responseRole === "challenge"
-          ? "countertake"
-          : pendingBeat?.responseRole === "question"
-            ? "pointed_question"
-            : pendingBeat
-              ? "specific_example"
-              : thread.messageCount > 0 &&
-                  thread.hasOpenHook &&
-                  ["human_topic", "external_agent_topic"].includes(ambientThreadOrigin(thread)) &&
-                  !thread.actionHistory.includes("respond_to_hook")
-                ? "respond_to_hook"
-                : undefined;
-      const action: AmbientActionDecision = pendingKind
-        ? {
-            kind: pendingKind,
-            continueEpisode: true,
-            replyToLatest: true,
-            keepsHookOpen: true,
-          }
-        : decideAmbientAction({
-            messageCount: thread.messageCount,
-            shape: thread.shape,
-            origin: ambientThreadOrigin(thread),
-            mode: ambientMode,
-            debateBeat: thread.debateBeat,
-            hasResearch: Boolean(thread.research),
-            hasOpenHook: thread.hasOpenHook,
-            previousActions: thread.actionHistory,
-            rng: this.rng,
-          });
+      const action: AmbientActionDecision = {
+        kind: thread.messageCount === 0 ? "open_topic" : "respond_to_hook",
+        continueEpisode: thread.messageCount < thread.shape.hardMaximumMessages,
+        replyToLatest: thread.messageCount > 0,
+        keepsHookOpen: false,
+      };
       if (!action.continueEpisode) {
         this.closeAmbientThread(
           thread,
@@ -7493,27 +7683,42 @@ export class SocialDirector {
         );
         return;
       }
-      const withoutLastAuthor = available.filter((persona) => persona.id !== thread.lastAuthorId);
-      if (thread.lastAuthorId && withoutLastAuthor.length === 0) {
+      const opportunity = conversationOpportunity({
+        publishedCount: thread.messageCount,
+        lastAuthorId: thread.lastAuthorId,
+        quietCandidateIds: thread.quietCandidateIds ?? [],
+        eligibleIds: available.map((persona) => persona.id),
+      });
+      if (opportunity.status === "quiet" || opportunity.status === "budget") {
+        this.closeAmbientThread(thread, opportunity.status === "budget" ? "budget" : "natural");
+        return;
+      }
+      const withoutLastAuthor = available.filter((persona) => opportunity.candidateIds.includes(persona.id));
+      if (opportunity.status === "wait") {
         this.ambientBackoffUntilByChannel.set(channel.id, now + AMBIENT_ALTERNATE_WAIT_MS);
         return;
       }
       const alternatePool = withoutLastAuthor;
       const returningParticipants = alternatePool.filter((persona) => thread.participantIds.includes(persona.id));
-      const baseFirstPool = returningParticipants.length > 0 ? returningParticipants : alternatePool;
+      const baseFirstPool = returningParticipants.length > 0 && this.rng() < 0.7
+        ? returningParticipants
+        : alternatePool;
       const previousPersona = thread.lastAuthorId
         ? PERSONAS.find((persona) => persona.id === thread.lastAuthorId)
         : undefined;
-      const counterPool = action.kind === "countertake" && previousPersona
-        ? baseFirstPool.filter((persona) =>
-            ((persona.disagreement ?? 0) >= 0.65) !== ((previousPersona.disagreement ?? 0) >= 0.65)
-          )
-        : [];
-      const firstPool = counterPool.length > 0 ? counterPool : baseFirstPool;
+      const replyCandidateIds = conversationReplyCandidatePool({
+        latestMessageId: thread.lastMessageId,
+        opportunity: thread.replyOpportunity,
+        candidateIds: opportunity.candidateIds,
+        random: this.rng(),
+      });
+      const firstPool = replyCandidateIds
+        ? alternatePool.filter((persona) => replyCandidateIds.includes(persona.id))
+        : baseFirstPool;
       const preferredPendingActor = pendingBeat?.preferredActorId
         ? firstPool.find((persona) => persona.id === pendingBeat.preferredActorId)
         : undefined;
-      const first = consideredPlan?.lead ?? preferredPendingActor ?? selectAmbientLead(
+      const first = preferredPendingActor ?? selectAmbientLead(
           firstPool,
           (personaId) => this.actorChannels.affinity(personaId, channel.id),
           this.rng,
@@ -7530,65 +7735,12 @@ export class SocialDirector {
       const personaLease = this.acquireAmbientPersonaLease(first.id);
       if (!personaLease) return;
       ownsAmbientPersonas.push({ personaId: first.id, token: personaLease });
-      if (consideredPlan && consideredPlan.responder.id !== first.id) {
-        const responderLease = this.acquireAmbientPersonaLease(consideredPlan.responder.id);
-        if (!responderLease) return;
-        ownsAmbientPersonas.push({ personaId: consideredPlan.responder.id, token: responderLease });
-      }
       const selected = [first];
       const temporalCue = this.ambientTemporalCue(first.id);
-      const register = profile?.conversationRegister ?? "everyday";
-      const pendingConsideredPlan = pendingBeat?.kind === "considered_response" && previousPersona
-        ? {
-            lead: previousPersona,
-            responder: first,
-            responseRole: pendingBeat.responseRole ?? "example",
-          }
-        : undefined;
-      const consideredLimits = consideredPlan
-        ? consideredConversationWordLimits(consideredPlan, register)
-        : pendingConsideredPlan
-          ? consideredConversationWordLimits(pendingConsideredPlan, register)
-          : undefined;
-      const sampledOrdinaryLimit = consideredLimits
-        ? undefined
-        : sampleAmbientTurnWordLimit(first, {
-            mode: ambientMode,
-            continuation: thread.messageCount > 0,
-            action: action.kind,
-            rng: this.rng,
-          });
-      const wordLimits = consideredLimits
-        ? { [first.id]: consideredPlan ? consideredLimits.lead : consideredLimits.response }
-        : {
-            [first.id]: {
-              minimum: sampledOrdinaryLimit!.minimum,
-              maximum: sampledOrdinaryLimit!.maximum,
-            },
-          };
-      const premise = consideredPlan
-        ? consideredConversationLeadPremise(
-            consideredPlan,
-            thread.seed,
-            ambientMode,
-            consideredLimits?.lead,
-          )
-        : pendingConsideredPlan
-          ? `${consideredConversationResponsePremise(
-              pendingConsideredPlan,
-              ambientMode,
-              consideredLimits?.response,
-            )} ${ambientActionInstruction(action.kind, ambientMode)}`
-          : ambientConversationPremise(
-              thread.seed,
-              first,
-              undefined,
-              thread.messageCount > 0,
-              thread.debateBeat,
-              ambientMode,
-              action.kind,
-              wordLimits,
-            );
+      const wordLimits = { [first.id]: { minimum: 1, maximum: autonomousConversationWordCeiling(first.style) } };
+      const premise = thread.messageCount === 0
+        ? autonomousOpeningPremise(thread.seed)
+        : AUTONOMOUS_CONTINUATION_PREMISE;
       const ambientAction: AmbientActionContract = {
         episodeId: thread.episodeId,
         causalRootId: thread.causalRootId,
@@ -7600,28 +7752,39 @@ export class SocialDirector {
         previousActions: thread.actionHistory,
       };
       const socialCounterparts = [
-        ...(consideredPlan ? [consideredPlan.responder] : []),
         ...(previousPersona ? [previousPersona] : []),
         ...thread.participantIds.flatMap((id) => PERSONAS.find((persona) => persona.id === id) ?? []),
+        ...this.recentResidentCounterparts(channel.id, first.id),
       ];
+      const conversationContext = this.publishedConversationContext(
+        channel.id, thread.causalRootId, thread.messageCount === 0 ? "opening" : "continuation",
+      );
+      const conversationResearch = await this.maybeResearchConversation(
+        channel, thread, first, conversationContext, epoch, lifecycleGeneration,
+      );
+      releaseConversationResearch = conversationResearch?.release;
+      if (!this.ambientLifecycleIsCurrent(lifecycleGeneration) ||
+          epoch !== (this.channelEpoch.get(channel.id) ?? 0) ||
+          !this.ambientThreadIsCurrent(channel.id, thread)) return;
+      const sceneResearch = conversationResearch?.research ?? thread.research;
+      const sceneResearchContext = conversationResearch ? {
+        seedId: conversationResearch.seed.id,
+        roomTopic: profile?.topic.brief ?? channel.description,
+        discussionAngle: conversationResearch.seed.discussionAngle,
+      } : thread.autonomousResearchContext;
       const generationTypingLease = this.acquireTyping(channel.id, first.id);
       let lines: GeneratedLine[] = [];
       let backgroundPreempted = false;
+      let generationFailed = false;
       this.ambientGenerationsInFlight += 1;
       try {
         lines = await this.lm.generateScene(
           {
             kind: "ambient",
-            ambientAction,
-            ...(consideredPlan
-              ? { conversationMode: "considered" as const, consideredRole: "lead" as const }
-              : pendingConsideredPlan
-                ? {
-                    conversationMode: "considered" as const,
-                    consideredRole: "response" as const,
-                    consideredResponseRole: pendingConsideredPlan.responseRole,
-                  }
-                : {}),
+            // Openings retain only the source/publication contract. An
+            // ongoing conversation has no director-assigned rhetorical move.
+            ambientAction: thread.messageCount === 0 ? ambientAction : undefined,
+            conversationContext,
             humanizerBudget: { repairsRemaining: 1 },
             channelId: channel.id,
             channelName: channel.name,
@@ -7631,7 +7794,7 @@ export class SocialDirector {
             channelFeedDiscussion: Boolean(thread.channelFeedConversationCue),
             premise,
             wordLimits,
-            mustReplyIds: [first.id],
+            mustReplyIds: [],
             languageHint: thread.languageHint,
             semanticContext: thread.languageTag ? {
               languageTag: thread.languageTag,
@@ -7646,10 +7809,10 @@ export class SocialDirector {
               socialCounterparts,
               { kind: "public", channelId: channel.id },
             ),
-            research: thread.research,
-            evidenceOutcome: thread.research ? "succeeded" : undefined,
-            autonomousResearchContext: thread.autonomousResearchContext,
-            urlPublicationPolicy: thread.autonomousResearchContext ? "server_card" : undefined,
+            research: sceneResearch,
+            evidenceOutcome: sceneResearch ? "succeeded" : undefined,
+            autonomousResearchContext: sceneResearchContext,
+            urlPublicationPolicy: sceneResearchContext ? "server_card" : undefined,
             ...temporalCue,
           },
           4,
@@ -7659,6 +7822,7 @@ export class SocialDirector {
           backgroundPreempted = true;
           nextScheduleDelayMs = this.ambientBusyRetryDelayMs();
         } else {
+          generationFailed = true;
           console.warn("Ambient scene skipped:", error instanceof Error ? error.message : error);
         }
       } finally {
@@ -7671,17 +7835,26 @@ export class SocialDirector {
         !this.ambientThreadIsCurrent(channel.id, thread)
       ) return;
       if (backgroundPreempted) return;
+      if (generationFailed) {
+        // A failed execution is not a resident choosing silence. Retain the
+        // committed thread and existing quiet votes; a later normal tick may
+        // retry after the same bounded channel backoff used elsewhere.
+        const retryAt = Math.max(
+          thread.nextEligibleAt ?? 0,
+          this.ambientBackoffUntilByChannel.get(channel.id) ?? 0,
+          this.now() + AMBIENT_FAILURE_BACKOFF_MS,
+        );
+        thread.nextEligibleAt = retryAt;
+        this.ambientBackoffUntilByChannel.set(channel.id, retryAt);
+        return;
+      }
       const leadLine = lines.find((line) => line.personaId === first.id);
       if (!leadLine) {
-        if (pendingBeat) {
-          pendingBeat.attempts += 1;
-          if (pendingBeat.attempts >= 1) {
-            thread.pendingBeat = undefined;
-            this.closeAmbientThread(thread, "model_rejected");
-          }
-        }
+        thread.pendingBeat = undefined;
+        thread.quietCandidateIds = [...new Set([...(thread.quietCandidateIds ?? []), first.id])];
         if (thread.messageCount === 0) this.abandonAmbientThread(channel.id, thread);
-        else if (!pendingBeat) this.closeAmbientThread(thread, "model_rejected");
+        else if (thread.quietCandidateIds.length >= CONVERSATION_MAX_QUIET_CANDIDATES) this.closeAmbientThread(thread, "natural");
+        else thread.nextEligibleAt = this.now() + 4_000 + this.rng() * 8_000;
         return;
       }
       if (
@@ -7690,6 +7863,10 @@ export class SocialDirector {
         epoch !== (this.channelEpoch.get(channel.id) ?? 0) ||
         !this.ambientThreadIsCurrent(channel.id, thread)
       ) return;
+      // A source fetched before an Admin change is not permission to publish
+      // after research was disabled. Leave the live thread for an ordinary turn.
+      if (conversationResearch && !this.autonomousResearchIsStillSafe(channel.id, epoch, [first], 1, false)) return;
+      const replyTarget = this.publishedReplyTarget(channel.id, first.id, conversationContext, leadLine.replyToMessageId);
       const publicationTypingLease = this.acquireTyping(channel.id, first.id);
       let posted: ChatMessage | undefined;
       try {
@@ -7718,9 +7895,9 @@ export class SocialDirector {
           channel.id,
           first,
           leadLine.content,
-          action.replyToLatest ? thread.lastMessageId : undefined,
+          replyTarget?.messageId,
           leadLine.source,
-          this.messageSources(thread.research, leadLine.sourceIds),
+          this.messageSources(sceneResearch, leadLine.sourceIds),
           undefined,
           "ambient",
           false,
@@ -7749,7 +7926,12 @@ export class SocialDirector {
           }
         }
         this.lockAmbientThreadLanguage(channel.id, thread, leadLine, posted.createdAt);
-        this.recordAmbientPost(thread, posted, action);
+        if (conversationResearch && posted.sources?.length) {
+          thread.research = boundedThreadResearch(conversationResearch.research, this.now());
+          thread.autonomousResearchContext = sceneResearchContext;
+          this.recordAutonomousResearchSuccess(channel.id, conversationResearch.seed.id);
+        }
+        this.recordAmbientPost(thread, posted, action, replyTarget);
         if (
           firstPublication && thread.channelFeedConversationCue &&
           this.channelFeedConversationLedger
@@ -7772,16 +7954,6 @@ export class SocialDirector {
           }
         }
         if (pendingBeat && thread.pendingBeat === pendingBeat) thread.pendingBeat = undefined;
-        if (consideredPlan) {
-          thread.pendingBeat = {
-            kind: "considered_response",
-            preferredActorId: consideredPlan.responder.id,
-            responseRole: consideredPlan.responseRole,
-            attempts: 0,
-          };
-          thread.hasOpenHook = true;
-          this.lastConsideredConversationAt = this.now();
-        }
         if (thread.messageCount >= thread.shape.hardMaximumMessages) this.closeAmbientThread(thread, "budget");
       } finally {
         publicationTypingLease.release();
@@ -7827,7 +7999,7 @@ export class SocialDirector {
       }
       this.publishDirectorEvent({
         trigger: "ambient",
-        summary: `${first.name} performed one ${action.kind} action in #${channel.name}; the episode remains scheduler-owned.`,
+        summary: `${first.name} chose to ${thread.messageCount === 1 ? "open" : "continue"} the conversation in #${channel.name}.`,
         considered: PERSONAS.length,
         noticed: Math.min(PERSONAS.length, reactor ? 2 : 1),
         replied: 1,
@@ -7843,19 +8015,17 @@ export class SocialDirector {
         console.warn("Ambient scheduler skipped:", error instanceof Error ? error.message : error);
       }
     } finally {
-      if (ownsConsideredLease && this.consideredConversationLease === ownsConsideredLease) {
-        this.consideredConversationLease = undefined;
-      }
+      releaseConversationResearch?.();
       for (const lease of ownsAmbientPersonas) {
         this.releaseAmbientPersonaLease(lease.personaId, lease.token);
       }
       if (ownsAmbientChannel) {
         this.releaseAmbientChannelLease(ownsAmbientChannel.channelId, ownsAmbientChannel.token);
       }
-      if (ownsUnattendedAttempt && this.ambientLifecycleIsCurrent(lifecycleGeneration)) {
-        this.unattendedAmbientAttemptsInFlight = Math.max(
+      if (ownsPublicationReservation && this.ambientLifecycleIsCurrent(lifecycleGeneration)) {
+        this.ambientPublicationReservations = Math.max(
           0,
-          this.unattendedAmbientAttemptsInFlight - 1,
+          this.ambientPublicationReservations - 1,
         );
       }
       if (this.ambientLifecycleIsCurrent(lifecycleGeneration)) {
@@ -7927,9 +8097,17 @@ export class SocialDirector {
       attendance: this.getConnectedHumanCount() > 0 ? "attended" : "unattended",
       ...(channelFeedReceipt ? { channelFeedReceipt } : {}),
     } as const : undefined;
+    if (autonomousKind) {
+      const consumed = this.autonomousBudget(now).consumedState;
+      if (!consumed) return undefined;
+      // Debit in the same synchronous append path, including deferred feed
+      // publication. A failed/rolled-back append is conservatively charged;
+      // it must not mint tokens or overwrite a later publication's debit.
+      this.store.setAutonomousPublicationBudget(consumed);
+    }
     if (deferBroadcast) {
       const append = this.store.addUncommittedPublicMessage(message, autonomousPublication);
-      this.deferredPublicMessageAppends.set(message.id, append);
+      this.deferredPublicMessageAppends.set(message.id, { append, autonomousKind });
       return message;
     }
     this.store.addPublicMessage(message, autonomousPublication);
@@ -7943,7 +8121,6 @@ export class SocialDirector {
     publishedAt: number,
     autonomousKind?: "ambient" | "research",
   ): void {
-    if (autonomousKind) this.lastUnattendedAmbientAttemptAt = undefined;
     this.actorChannels.noteChannelEvent(message);
     this.actorChannels.markSpoke(persona.id, message.channelId, message.id);
     this.lm.rememberDeliveredLine(persona.id, message.content, {
@@ -7954,18 +8131,13 @@ export class SocialDirector {
     this.broadcastPublicMessage(message);
     if (autonomousKind) this.bufferAutonomousSocialMessage(message);
     this.lastSpoke.set(persona.id, publishedAt);
-    while (this.aiTimestamps[0] !== undefined && publishedAt - this.aiTimestamps[0] > 60_000) {
-      this.aiTimestamps.shift();
-    }
-    this.aiTimestamps.push(publishedAt);
-    if (autonomousKind) {
-      while (
-        this.autonomousAiTimestamps[0] !== undefined &&
-        publishedAt - this.autonomousAiTimestamps[0] > 60_000
-      ) {
-        this.autonomousAiTimestamps.shift();
+    // Background room life has its own publication budget and cannot consume
+    // the ordinary response capacity reserved for participant conversations.
+    if (!autonomousKind) {
+      while (this.aiTimestamps[0] !== undefined && publishedAt - this.aiTimestamps[0] > 60_000) {
+        this.aiTimestamps.shift();
       }
-      this.autonomousAiTimestamps.push(publishedAt);
+      this.aiTimestamps.push(publishedAt);
     }
   }
 
@@ -7983,9 +8155,9 @@ export class SocialDirector {
    * target pending; never show a reply that a restart cannot remember.
    */
   private async flushDurablePublicMessageBeforeBroadcast(message: ChatMessage): Promise<void> {
-    const append = this.deferredPublicMessageAppends.get(message.id);
+    const deferred = this.deferredPublicMessageAppends.get(message.id);
     const persona = PERSONAS.find((candidate) => candidate.id === message.authorId);
-    if (!append || !persona) {
+    if (!deferred || !persona) {
       throw new TypeError("A deferred public message is missing its publication transaction");
     }
     let lastError: unknown;
@@ -7993,16 +8165,16 @@ export class SocialDirector {
       try {
         await this.store.flush();
         this.deferredPublicMessageAppends.delete(message.id);
-        this.finalizePublicMessage(message, persona, Date.parse(message.createdAt));
+        this.finalizePublicMessage(message, persona, Date.parse(message.createdAt), deferred.autonomousKind);
         return;
       } catch (error) {
         lastError = error;
       }
     }
-    const rollback = this.store.rollbackUncommittedPublicMessage(append);
+    const rollback = this.store.rollbackUncommittedPublicMessage(deferred.append);
     this.deferredPublicMessageAppends.delete(message.id);
     if (rollback === "already_durable") {
-      this.finalizePublicMessage(message, persona, Date.parse(message.createdAt));
+      this.finalizePublicMessage(message, persona, Date.parse(message.createdAt), deferred.autonomousKind);
       return;
     }
     console.error(
@@ -8228,25 +8400,36 @@ export class SocialDirector {
     now = this.now(),
     activity = this.globalBehaviorTuning().activity,
   ): number {
-    while (
-      this.autonomousAiTimestamps[0] !== undefined &&
-      now - this.autonomousAiTimestamps[0] > 60_000
-    ) {
-      this.autonomousAiTimestamps.shift();
-    }
-    const recentTwelve = this.autonomousAiTimestamps
-      .filter((timestamp) => now - timestamp < 12_000)
-      .length;
+    return this.autonomousBudget(now, activity).slots;
+  }
+
+  private autonomousBudget(now = this.now(), activity = this.globalBehaviorTuning().activity) {
     const pace = process.env.AI_PACE;
     const basePerMinute = pace === "calm" ? 7 : pace === "party" ? 12 : 10;
     const limits = autonomousActivityLimits(basePerMinute, activity);
-    return Math.max(
-      0,
-      Math.min(
-        limits.perMinute - this.autonomousAiTimestamps.length,
-        limits.perTwelveSeconds - recentTwelve,
-      ),
-    );
+    let state = this.store.getAutonomousPublicationBudget();
+    if (!state) {
+      // Upgrade old room state without reconstructing a token bucket from a
+      // lossy attended-publication ledger. Start conservatively empty at its
+      // latest publication; an idle room refills within one short burst window.
+      const latest = this.store.getAutonomousPublicationHistory()
+        .map((publication) => Date.parse(publication.createdAt))
+        .filter((timestamp) => Number.isFinite(timestamp) && timestamp <= now)
+        .reduce<number | undefined>((last, timestamp) => last === undefined ? timestamp : Math.max(last, timestamp), undefined);
+      if (latest !== undefined && limits.perMinute > 0 && limits.perTwelveSeconds > 0) {
+        state = { tokens: 0, updatedAt: latest, refillPerMinute: limits.perMinute, burstCapacity: limits.perTwelveSeconds };
+      }
+    }
+    const decision = autonomousPublicationBudget({ now, limits, state });
+    if (state && decision.currentState && (
+      state.refillPerMinute !== decision.currentState.refillPerMinute ||
+      state.burstCapacity !== decision.currentState.burstCapacity
+    )) {
+      // Persist a policy transition once, not every scheduler poll. Subsequent
+      // accrual must use the new Admin rate even before the next publication.
+      this.store.setAutonomousPublicationBudget(decision.currentState);
+    }
+    return decision;
   }
 
   private canSpeak(): boolean {
@@ -8284,38 +8467,10 @@ export class SocialDirector {
     this.priorityExternalAgentReplyTimestamps.push(now);
   }
 
-  private hasUnattendedAmbientCapacity(
-    now = this.now(),
-    activity = this.globalBehaviorTuning().activity,
-  ): boolean {
-    const autonomousPublications = this.store.getAutonomousPublicationHistory()
-      .map((publication) => ({
-        publication,
-        timestamp: Date.parse(publication.createdAt),
-      }))
-      .filter((entry) => Number.isFinite(entry.timestamp) && entry.timestamp <= now);
-    const lastAutonomousPublicationAt = autonomousPublications.reduce<number | undefined>(
-      (latest, entry) => latest === undefined ? entry.timestamp : Math.max(latest, entry.timestamp),
-      undefined,
-    );
-    return hasUnattendedAmbientCapacity({
-      now,
-      policy: unattendedAmbientPolicy(activity),
-      lastAutonomousPublicationAt,
-      unattendedPublicationTimestamps: autonomousPublications
-        .filter((entry) => entry.publication.attendance === "unattended")
-        .map((entry) => entry.timestamp),
-    });
-  }
-
   private canSpeakAutonomously(channelId: string): boolean {
     const globalTuning = this.globalBehaviorTuning();
     if (globalTuning.activity === 0) return false;
     if (this.channelBehaviorTuning(channelId, globalTuning).activity === 0) return false;
-    if (
-      this.getConnectedHumanCount() < 1 &&
-      !this.hasUnattendedAmbientCapacity(this.now(), globalTuning.activity)
-    ) return false;
     return this.availableAutonomousMessageSlots(this.now(), globalTuning.activity) >= 1;
   }
 
@@ -8395,6 +8550,54 @@ export class SocialDirector {
           ? "[An image was shared privately; no AI visual analysis was requested.]"
         : "[An image was shared; visual details were unavailable.]";
     return [message.content, imageContext].filter(Boolean).join("\n").slice(0, 1_000);
+  }
+
+  /** Validate again at publication; generation-time identity alone cannot cross room or deletion boundaries. */
+  private publishedReplyTarget(
+    channelId: string,
+    speakerId: string,
+    context: ReturnType<typeof buildConversationContext> | undefined,
+    replyToMessageId: string | undefined,
+  ): ReturnType<typeof conversationReplyTarget> {
+    const target = conversationReplyTarget(context, speakerId, replyToMessageId);
+    const stored = target ? this.store.getMessage(target.messageId) : undefined;
+    return stored?.channelId === channelId && stored.authorId === target?.authorId ? target : undefined;
+  }
+
+  private publishedConversationContext(
+    channelId: string,
+    rootMessageId: string | undefined,
+    phase: "opening" | "continuation",
+  ): ReturnType<typeof buildConversationContext> {
+    const members = new Map(this.getMembers().map((member) => [member.id, member]));
+    for (const persona of PERSONAS) members.set(persona.id, persona);
+    const recent = this.store.getRecent(channelId, 26).filter((message) => !message.system);
+    const root = rootMessageId ? this.store.getMessage(rootMessageId) : undefined;
+    const messages = root?.channelId === channelId && !recent.some((message) => message.id === root.id)
+      ? [root, ...recent]
+      : recent;
+    return buildConversationContext({
+      phase,
+      rootMessageId,
+      messages: messages.map((message) => ({
+        messageId: message.id,
+        authorId: message.authorId,
+        ...(message.replyToId ? { replyToMessageId: message.replyToId } : {}),
+        author: members.get(message.authorId)?.name ?? message.authorSnapshot?.name ?? "participant",
+        kind: members.get(message.authorId)?.kind ?? message.authorSnapshot?.kind ?? "human",
+        content: message.content,
+        createdAt: message.createdAt,
+      })),
+    });
+  }
+
+  /** Relationship orientation only toward actual recent participants, never a reserved rhetorical partner. */
+  private recentResidentCounterparts(channelId: string, excludingId?: string): Persona[] {
+    const byId = new Map(PERSONAS.map((persona) => [persona.id, persona]));
+    return [...new Set(this.store.getRecent(channelId, 26).slice().reverse().map((message) => message.authorId))]
+      .filter((id) => id !== excludingId && byId.has(id))
+      .slice(0, 4)
+      .map((id) => byId.get(id)!);
   }
 
   private dmTranscript(threadId: string): TranscriptLine[] {

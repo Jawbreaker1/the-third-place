@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { io, type Socket } from "socket.io-client";
 import type {
   ActionResult,
@@ -52,6 +52,7 @@ import {
 } from "./voiceSensitivity";
 import { attachBrowserHumanPresenceActivity, HumanPresenceActivityReporter } from "./humanPresenceActivity";
 import { conversationEntryTarget, type ConversationViewport, type PendingConversationEntry } from "./chatScroll";
+import { emptyPublicHistory, reducePublicHistory } from "./publicHistoryWindow";
 import { formatSourceDate, linkPreviewAriaLabel, linkPreviewDomainLabel } from "./linkPreview";
 import { accountUpgradePrefill } from "./accountUpgradePrefill";
 import {
@@ -81,8 +82,6 @@ import {
   type RecoveryKeyResult,
   type SessionResult,
 } from "./returnIdentity";
-
-const CLIENT_CHANNEL_MESSAGE_LIMIT = 600;
 
 type ConnectionState = "preview" | "connecting" | "live" | "reconnecting" | "offline";
 type Panel = "rooms" | "people" | null;
@@ -417,21 +416,6 @@ const formatRelative = (iso: string) => {
   return formatTime(iso);
 };
 
-const compareMessages = (a: ChatMessage, b: ChatMessage) =>
-  a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
-
-const boundPublicMessages = (items: ChatMessage[]) => {
-  const byChannel = new Map<string, ChatMessage[]>();
-  for (const message of items) {
-    const channel = byChannel.get(message.channelId) ?? [];
-    channel.push(message);
-    byChannel.set(message.channelId, channel);
-  }
-  return [...byChannel.values()]
-    .flatMap((channel) => channel.sort(compareMessages).slice(-CLIENT_CHANNEL_MESSAGE_LIMIT))
-    .sort(compareMessages);
-};
-
 const MessageText = ({ content, members }: { content: string; members: Member[] }) => {
   const names = members.map((member) => member.name).sort((a, b) => b.length - a.length);
   const urls = findUrlTextCandidates(content, { allowHttp: true, allowWww: false, limit: 100 });
@@ -538,7 +522,12 @@ export default function App() {
   const [members, setMembers] = useState<Member[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [channelFeeds, setChannelFeeds] = useState<ChannelFeedCard[]>([]);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [publicHistory, dispatchPublicHistory] = useReducer(reducePublicHistory, undefined, emptyPublicHistory);
+  const messages = publicHistory.messages;
+  const historyPageInfo = publicHistory.pages;
+  const setMessages = useCallback((update: (messages: ChatMessage[]) => ChatMessage[]) => {
+    dispatchPublicHistory({ type: "transform", update });
+  }, []);
   const [dmThreads, setDmThreads] = useState<DmThread[]>([]);
   const [directorEvents, setDirectorEvents] = useState<DirectorEvent[]>([]);
   const [health, setHealth] = useState<ServerHealth | null>(null);
@@ -585,7 +574,6 @@ export default function App() {
   const [channelNotices, setChannelNotices] = useState<ChannelNotices>({});
   const [unreadDividers, setUnreadDividers] = useState<Record<string, string | undefined>>({});
   const [collapsedIntegrationChannels, setCollapsedIntegrationChannels] = useState<Record<string, boolean>>({});
-  const [historyPageInfo, setHistoryPageInfo] = useState<Record<string, { before?: string; hasMore: boolean }>>({});
   const [historyLoading, setHistoryLoading] = useState<Record<string, boolean>>({});
   const [historyError, setHistoryError] = useState<Record<string, string | undefined>>({});
   const [imageDrafts, setImageDrafts] = useState<Record<string, ImageDraft | undefined>>({});
@@ -639,6 +627,8 @@ export default function App() {
   const historyRequestGeneration = useRef<Record<string, number>>({});
   const historyLoadingChannels = useRef(new Set<string>());
   const historicalMessageIds = useRef(new Set<string>());
+  const historyDetachedRef = useRef(publicHistory.detached);
+  historyDetachedRef.current = publicHistory.detached;
   const toastId = useRef(1);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepth = useRef(0);
@@ -757,6 +747,11 @@ export default function App() {
   }, []);
 
   const clearPrivateSessionState = useCallback(() => {
+    for (const channelId of Object.keys(historyRequestGeneration.current)) {
+      historyRequestGeneration.current[channelId] += 1;
+    }
+    historyLoadingChannels.current.clear();
+    prependingHistoryChannels.current.clear();
     dmThreadsRef.current = [];
     setDmThreads([]);
     setReplyTo(null);
@@ -1029,6 +1024,14 @@ export default function App() {
   }, []);
 
   const applySnapshot = useCallback((snapshot: RoomSnapshot) => {
+    for (const channelId of Object.keys(historyRequestGeneration.current)) {
+      historyRequestGeneration.current[channelId] += 1;
+    }
+    historyLoadingChannels.current.clear();
+    prependingHistoryChannels.current.clear();
+    historicalMessageIds.current.clear();
+    setHistoryLoading({});
+    setHistoryError({});
     const previousActiveId = activeChannelRef.current;
     const nextActiveId = resolveSnapshotConversationId(
       previousActiveId,
@@ -1071,8 +1074,7 @@ export default function App() {
     channelsRef.current = snapshot.channels;
     setChannels(snapshot.channels);
     setChannelFeeds(snapshot.channelFeeds ?? []);
-    setMessages(snapshot.messages);
-    setHistoryPageInfo(snapshot.historyPageInfo ?? {});
+    dispatchPublicHistory({ type: "snapshot", messages: snapshot.messages, pages: snapshot.historyPageInfo });
     dmThreadsRef.current = snapshot.dmThreads;
     setDmThreads(snapshot.dmThreads);
     setHealth(snapshot.health);
@@ -1108,10 +1110,15 @@ export default function App() {
     });
     socket.on("message:new", (message: ChatMessage) => {
       const activeChannelId = activeChannelRef.current;
-      const activeChannelIsRead = message.channelId !== activeChannelId || shouldStickToBottom.current;
-      setMessages((current) =>
-        current.some((item) => item.id === message.id) ? current : boundPublicMessages([...current, message]),
-      );
+      const activeChannelIsRead = message.channelId !== activeChannelId ||
+        (shouldStickToBottom.current && !historyDetachedRef.current[message.channelId]);
+      dispatchPublicHistory({
+        type: "live",
+        message,
+        preserveWindow: message.channelId === activeChannelId
+          ? !shouldStickToBottom.current
+          : viewportByConversation.current.get(message.channelId)?.atBottom === false,
+      });
       setChannelNotices((current) => noteChannelMessage(
         current,
         message,
@@ -1438,12 +1445,7 @@ export default function App() {
       historyLoadingChannels.current.delete(threadId);
       prependingHistoryChannels.current.delete(threadId);
       for (const messageId of removedMessageIds) historicalMessageIds.current.delete(messageId);
-      setHistoryPageInfo((current) => {
-        if (!(threadId in current)) return current;
-        const next = { ...current };
-        delete next[threadId];
-        return next;
-      });
+      dispatchPublicHistory({ type: "remove-page", channelId: threadId });
       setHistoryLoading((current) => {
         if (!(threadId in current)) return current;
         const next = { ...current };
@@ -1640,7 +1642,7 @@ export default function App() {
         channelsRef.current = data.channels;
         setChannels(data.channels);
         setChannelFeeds(data.channelFeeds ?? []);
-        setMessages(data.messages);
+        dispatchPublicHistory({ type: "snapshot", messages: data.messages });
         setHealth(data.health);
       })
       .catch(() => setConnection("offline"));
@@ -1964,6 +1966,8 @@ export default function App() {
     historyRequestGeneration.current[channelId] = requestGeneration;
     historyLoadingChannels.current.add(channelId);
     prependingHistoryChannels.current.add(channelId);
+    dispatchPublicHistory({ type: "pause", channelId });
+    shouldStickToBottom.current = false;
     setHistoryLoading((current) => ({ ...current, [channelId]: true }));
     setHistoryError((current) => ({ ...current, [channelId]: undefined }));
 
@@ -1987,22 +1991,14 @@ export default function App() {
         | { ok: false; error?: string };
       if (!response.ok || !result.ok) throw new Error(!result.ok ? result.error ?? "History unavailable" : "History unavailable");
       if (historyRequestGeneration.current[channelId] !== requestGeneration) {
-        prependingHistoryChannels.current.delete(channelId);
         return;
       }
       for (const message of result.page.messages) historicalMessageIds.current.add(message.id);
-      setMessages((current) => {
-        const merged = new Map(current.map((message) => [message.id, message]));
-        for (const message of result.page.messages) merged.set(message.id, message);
-        return boundPublicMessages([...merged.values()]);
-      });
-      setHistoryPageInfo((current) => ({
-        ...current,
-        [channelId]: { before: result.page.before, hasMore: result.page.hasMore },
-      }));
+      dispatchPublicHistory({ type: "older", page: result.page });
 
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
+          if (historyRequestGeneration.current[channelId] !== requestGeneration) return;
           if (activeChannelRef.current === channelId && scrollRef.current) {
             const nextScroller = scrollRef.current;
             const nextAnchor = anchorId
@@ -2018,16 +2014,60 @@ export default function App() {
         });
       });
     } catch (error) {
+      if (historyRequestGeneration.current[channelId] !== requestGeneration) return;
       prependingHistoryChannels.current.delete(channelId);
       setHistoryError((current) => ({
         ...current,
         [channelId]: error instanceof Error ? error.message : "Could not load older messages.",
       }));
     } finally {
-      historyLoadingChannels.current.delete(channelId);
-      setHistoryLoading((current) => ({ ...current, [channelId]: false }));
+      if (historyRequestGeneration.current[channelId] === requestGeneration) {
+        historyLoadingChannels.current.delete(channelId);
+        setHistoryLoading((current) => ({ ...current, [channelId]: false }));
+      }
     }
   }, [activeChannelId, activeThread, historyPageInfo, me, search]);
+
+  const jumpToLatest = useCallback(async (channelId = activeChannelRef.current) => {
+    if (!meRef.current || !historyDetachedRef.current[channelId]) return;
+    const requestGeneration = (historyRequestGeneration.current[channelId] ?? 0) + 1;
+    historyRequestGeneration.current[channelId] = requestGeneration;
+    historyLoadingChannels.current.add(channelId);
+    prependingHistoryChannels.current.delete(channelId);
+    setHistoryLoading((current) => ({ ...current, [channelId]: true }));
+    setHistoryError((current) => ({ ...current, [channelId]: undefined }));
+    try {
+      const response = await fetch(`/api/channels/${encodeURIComponent(channelId)}/messages?limit=80`);
+      const result = await response.json() as { ok: true; page: HistoryPage } | { ok: false; error?: string };
+      if (!response.ok || !result.ok) throw new Error(!result.ok ? result.error ?? "History unavailable" : "History unavailable");
+      if (historyRequestGeneration.current[channelId] !== requestGeneration) return;
+      if (activeChannelRef.current === channelId) {
+        pendingConversationEntry.current = { channelId, kind: "bottom" };
+        shouldStickToBottom.current = true;
+        setChannelNotices((current) => clearChannelNotice(current, channelId));
+        setUnreadDividers((current) => ({ ...current, [channelId]: undefined }));
+      }
+      viewportByConversation.current.delete(channelId);
+      dispatchPublicHistory({ type: "latest", page: result.page });
+    } catch (error) {
+      if (historyRequestGeneration.current[channelId] !== requestGeneration) return;
+      setHistoryError((current) => ({
+        ...current, [channelId]: error instanceof Error ? error.message : "Could not load latest messages.",
+      }));
+    } finally {
+      if (historyRequestGeneration.current[channelId] === requestGeneration) {
+        historyLoadingChannels.current.delete(channelId);
+        setHistoryLoading((current) => ({ ...current, [channelId]: false }));
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const retainedIds = new Set(messages.map((message) => message.id));
+    for (const id of historicalMessageIds.current) {
+      if (!retainedIds.has(id)) historicalMessageIds.current.delete(id);
+    }
+  }, [messages]);
 
   useLayoutEffect(() => {
     const pending = pendingConversationEntry.current;
@@ -2049,14 +2089,14 @@ export default function App() {
 
     shouldStickToBottom.current = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 110;
     pendingConversationEntry.current = undefined;
-  }, [activeChannelId, activeMessages.length, foldedSearch]);
+  }, [activeChannelId, activeMessages, foldedSearch]);
 
   useEffect(() => {
     if (prependingHistoryChannels.current.has(activeChannelId)) return;
     if (foldedSearch) return;
     if (!shouldStickToBottom.current) return;
     requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }));
-  }, [activeMessages.length, activeChannelId, foldedSearch]);
+  }, [activeMessages, activeChannelId, foldedSearch]);
 
   useLayoutEffect(() => {
     autosizeComposerTextarea(composerInputRef.current);
@@ -2870,9 +2910,8 @@ export default function App() {
             return next;
           });
         } else {
-          setMessages((current) => current.some((message) => message.id === result.message.id)
-            ? current
-            : boundPublicMessages([...current, result.message]));
+          dispatchPublicHistory({ type: "live", message: result.message });
+          if (historyDetachedRef.current[channelId]) void jumpToLatest(channelId);
         }
         revokeDraftPreview(image);
         setImageDrafts((current) => current[channelId]?.id === image.id ? { ...current, [channelId]: undefined } : current);
@@ -2892,6 +2931,7 @@ export default function App() {
     if (!content) return;
     setComposer("");
     const previousReply = replyTo;
+    const channelId = activeChannelId;
     setReplyTo(null);
     socketRef.current.emit(
       "message:send",
@@ -2900,6 +2940,8 @@ export default function App() {
         if (!result.ok) {
           setComposer(content);
           pushToast({ tone: "warning", title: "Message not sent", message: result.error });
+        } else if (historyDetachedRef.current[channelId]) {
+          void jumpToLatest(channelId);
         }
       },
     );
@@ -3418,7 +3460,7 @@ export default function App() {
             const element = event.currentTarget;
             const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 110;
             shouldStickToBottom.current = atBottom;
-            if (atBottom) {
+            if (atBottom && !publicHistory.detached[activeChannelId]) {
               setChannelNotices((current) => clearChannelNotice(current, activeChannelId));
               const thread = dmThreadsRef.current.find((candidate) => candidate.id === activeChannelId);
               if (thread?.unread && document.visibilityState === "visible") {
@@ -3623,6 +3665,17 @@ export default function App() {
         </div>
 
         <div className="composer-wrap">
+          {!activeThread && publicHistory.detached[activeChannelId] && (
+            <button
+              type="button"
+              className="history-retry"
+              disabled={historyLoading[activeChannelId]}
+              onClick={() => void jumpToLatest()}
+            >
+              {historyLoading[activeChannelId] ? "Loading messages…" : "Viewing older messages · Jump to latest"}
+              {historyError[activeChannelId] ? ` · ${historyError[activeChannelId]}` : ""}
+            </button>
+          )}
           <div className={`typing-line ${typingMembers.length ? "visible" : ""}`}>
             <span className="typing-dots"><i /><i /><i /></span>
             {typingMembers.length > 0 && <span><span dir="auto">{typingMembers.slice(0, 2).map((member) => member.name).join(" and ")}</span>{typingMembers.length > 2 ? ` +${typingMembers.length - 2}` : ""} {typingMembers.length === 1 ? "is" : "are"} composing</span>}

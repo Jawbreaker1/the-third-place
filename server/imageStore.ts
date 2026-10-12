@@ -1,11 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { readdir, readFile, rename, unlink, writeFile, mkdir } from "node:fs/promises";
-import { request as httpsRequest } from "node:https";
 import { resolve } from "node:path";
-import ipaddr from "ipaddr.js";
 import sharp from "sharp";
 import type { ChatMessage, ImageAttachment } from "../shared/types.js";
-import { resolvePublicAddress, validatePublicHttpsUrl } from "./safeHttpsFetch.js";
+import { fetchPublicHttps, validatePublicHttpsUrl, type SafeHttpsFetchDependencies } from "./safeHttpsFetch.js";
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_INPUT_PIXELS = 20_000_000;
@@ -94,112 +92,23 @@ export const sanitizeImageBuffer = async (buffer: Buffer, declaredMimeType?: str
   }
 };
 
-const normalizedAddress = (raw: string): string => {
-  const parsed = ipaddr.parse(raw);
-  const ipv6 = parsed.kind() === "ipv6" ? (parsed as ipaddr.IPv6) : undefined;
-  return ipv6?.isIPv4MappedAddress() ? ipv6.toIPv4Address().toString() : parsed.toNormalizedString();
-};
-
-const requestPinnedImage = async (
-  url: URL,
-  deadline: number,
-): Promise<{ body?: Buffer; contentType?: string; redirect?: string }> => {
-  const address = await resolvePublicAddress(url.hostname, deadline);
-  if (!address || Date.now() >= deadline) return {};
-  return await new Promise((resolveRequest) => {
-    let settled = false;
-    const finish = (result: { body?: Buffer; contentType?: string; redirect?: string }): void => {
-      if (settled) return;
-      settled = true;
-      resolveRequest(result);
-    };
-    const request = httpsRequest(
-      {
-        protocol: "https:",
-        hostname: url.hostname,
-        port: 443,
-        path: `${url.pathname}${url.search}`,
-        method: "GET",
-        servername: url.hostname,
-        agent: false,
-        rejectUnauthorized: true,
-        maxHeaderSize: 16 * 1024,
-        timeout: Math.max(100, deadline - Date.now()),
-        lookup: (_hostname, options, callback) => {
-          if (typeof options === "object" && options.all) callback(null, [{ address: address.address, family: address.family }]);
-          else callback(null, address.address, address.family);
-        },
-        headers: {
-          Accept: "image/jpeg,image/png,image/webp",
-          "Accept-Encoding": "identity",
-          "Cache-Control": "no-cache",
-          "User-Agent": "TheThirdPlace-ImageIngest/1.0",
-        },
-      },
-      (response) => {
-        const status = response.statusCode ?? 0;
-        if ([301, 302, 303, 307, 308].includes(status) && response.headers.location) {
-          response.destroy();
-          finish({ redirect: response.headers.location });
-          return;
-        }
-        const contentType = response.headers["content-type"]?.split(";")[0]?.trim().toLocaleLowerCase();
-        const encoding = response.headers["content-encoding"]?.toLocaleLowerCase() ?? "identity";
-        const announcedLength = Number.parseInt(response.headers["content-length"] ?? "0", 10);
-        if (
-          status < 200 ||
-          status >= 300 ||
-          !contentType ||
-          !["image/jpeg", "image/png", "image/webp"].includes(contentType) ||
-          (encoding !== "identity" && encoding !== "") ||
-          (Number.isFinite(announcedLength) && announcedLength > MAX_INPUT_BYTES)
-        ) {
-          response.destroy();
-          finish({});
-          return;
-        }
-        const chunks: Buffer[] = [];
-        let total = 0;
-        response.on("data", (chunk: Buffer) => {
-          total += chunk.length;
-          if (total > MAX_INPUT_BYTES || Date.now() >= deadline) {
-            response.destroy();
-            finish({});
-            return;
-          }
-          chunks.push(chunk);
-        });
-        response.on("end", () => finish({ body: Buffer.concat(chunks), contentType }));
-        response.on("error", () => finish({}));
-      },
-    );
-    request.on("socket", (socket) => {
-      socket.once("secureConnect", () => {
-        const remote = socket.remoteAddress;
-        if (!remote || normalizedAddress(remote) !== normalizedAddress(address.address)) request.destroy();
-      });
-    });
-    request.on("timeout", () => request.destroy());
-    request.on("error", () => finish({}));
-    request.end();
-  });
-};
-
-export const fetchRemoteImage = async (rawUrl: string): Promise<{ body: Buffer; contentType: string }> => {
-  let current = validatePublicHttpsUrl(rawUrl);
+export const fetchRemoteImage = async (
+  rawUrl: string,
+  dependencies: SafeHttpsFetchDependencies = {},
+): Promise<{ body: Buffer; contentType: string }> => {
+  const current = validatePublicHttpsUrl(rawUrl);
   if (!current) throw new ImageStoreError("Use a direct public HTTPS image URL.");
-  const deadline = Date.now() + FETCH_TIMEOUT_MS;
-  const visited = new Set<string>();
-  for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
-    if (visited.has(current.toString())) break;
-    visited.add(current.toString());
-    const result = await requestPinnedImage(current, deadline);
-    if (result.body && result.contentType) return { body: result.body, contentType: result.contentType };
-    if (!result.redirect || redirects === MAX_REDIRECTS) break;
-    const next = validatePublicHttpsUrl(new URL(result.redirect, current).toString());
-    if (!next) break;
-    current = next;
-  }
+  // Share the DNS pinning, bounded buffer and wall-clock deadline used by page
+  // reads. A socket inactivity timeout alone does not bound TLS/header stalls.
+  const result = await fetchPublicHttps(current, {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    maxRedirects: MAX_REDIRECTS,
+    maxBodyBytes: MAX_INPUT_BYTES,
+    acceptedMediaTypes: ["image/jpeg", "image/png", "image/webp"],
+    acceptHeader: "image/jpeg,image/png,image/webp",
+    userAgent: "TheThirdPlace-ImageIngest/1.0",
+  }, dependencies);
+  if (result) return { body: result.body, contentType: result.mediaType };
   throw new ImageStoreError("That image URL could not be fetched safely.", 422);
 };
 

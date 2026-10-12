@@ -17,6 +17,10 @@ import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.j
 import { replacementPublicChannelId } from "../shared/channelLifecycle.js";
 import { canonicalRegisteredLanguageTag } from "./registeredLanguageTags.js";
 import { preservePreMigrationState } from "./persistenceMigrationBackup.js";
+import {
+  isAutonomousPublicationBudgetState,
+  type AutonomousPublicationBudgetState,
+} from "./behaviorTuning.js";
 
 export interface PendingPublicTurnTarget {
   personaId: string;
@@ -62,6 +66,23 @@ export interface PendingPublicTurnTargetClaim {
   target: PendingPublicTurnTarget;
 }
 
+export interface PendingDirectTurn {
+  messageId: string;
+  threadId: string;
+  authorId: string;
+  personaId: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+interface UncommittedDirectMessageState {
+  threadId: string;
+  thread: PrivateThread;
+  message: ChatMessage;
+  removedMessages: ChatMessage[];
+  previousMessageIds: string[];
+}
+
 /**
  * Opaque handle for a public row that must not become externally visible
  * until a room-state flush has committed it. Successful flushes commit these
@@ -77,18 +98,22 @@ export interface UncommittedPublicMessageAppend {
 export type PublicMessageRollbackResult = "rolled_back" | "already_durable" | "missing";
 
 interface PersistedState {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
   messages: ChatMessage[];
   /** Private conversations stay server-only and are never included in room snapshots. */
   privateThreads?: PrivateThread[];
   /** Server-only autonomous accounting; never serialized in public messages. */
   autonomousPublications?: AutonomousPublicationRecord[];
+  /** Optional version-8 checkpoint; server-only, never part of room snapshots. */
+  autonomousPublicationBudget?: AutonomousPublicationBudgetState;
   /** Server-owned room language observations; version 3+ requires this collection. */
   trustedChannelLanguages?: TrustedChannelLanguage[];
   /** Durable per-resident delivery outbox; version 4 requires this collection. */
   pendingPublicTurns?: PendingPublicTurn[];
   /** Stable external-agent identities that have made at least one durable public appearance. */
   seenExternalAgentIds?: string[];
+  /** Explicit private resident-response obligations, never inferred from chat tails. */
+  pendingDirectTurns?: PendingDirectTurn[];
 }
 
 export type TrustedChannelLanguageAuthority = "human" | "resident";
@@ -210,6 +235,9 @@ const MAX_PERSISTED_PRIVATE_MESSAGES_TOTAL = 200_000;
 const MAX_PERSISTED_AUTONOMOUS_PUBLICATIONS = 100_000;
 const MAX_PERSISTED_TRUSTED_CHANNEL_LANGUAGES = 10_000;
 const MAX_PERSISTED_PENDING_PUBLIC_TURNS = 2_000;
+const MAX_PERSISTED_PENDING_DIRECT_TURNS = 2_000;
+const MAX_PENDING_DIRECT_TURNS_PER_THREAD = 32;
+const PENDING_DIRECT_TURN_TTL_MS = 7 * 24 * 60 * 60_000;
 const MAX_PERSISTED_EXTERNAL_AGENT_IDS = 10_000;
 const MAX_PENDING_PUBLIC_TURN_TARGETS = 32;
 const MAX_PENDING_PUBLIC_TURN_ATTEMPTS = 1_000;
@@ -355,6 +383,12 @@ const PERSISTED_STATE_V7_KEYS = new Set([
   ...PERSISTED_STATE_V6_KEYS,
   "seenExternalAgentIds",
 ]);
+const PERSISTED_STATE_V8_KEYS = new Set([
+  ...PERSISTED_STATE_V7_KEYS,
+  "pendingDirectTurns",
+  "autonomousPublicationBudget",
+]);
+const PENDING_DIRECT_TURN_KEYS = new Set(["messageId", "threadId", "authorId", "personaId", "createdAt", "expiresAt"]);
 
 const externalAgentAuthorId = (message: ChatMessage): string | undefined =>
   message.authorSnapshot?.kind === "agent" && message.authorSnapshot.id === message.authorId
@@ -516,6 +550,15 @@ const isPendingPublicTurn = (value: unknown): value is PendingPublicTurn => {
   ));
 };
 
+const isPendingDirectTurn = (value: unknown): value is PendingDirectTurn => {
+  if (!isRecord(value) || !hasOnlyKeys(value, PENDING_DIRECT_TURN_KEYS)) return false;
+  return isBoundedIdentifier(value.messageId) && isBoundedChannelId(value.threadId) &&
+    isBoundedIdentifier(value.authorId) && isBoundedIdentifier(value.personaId) &&
+    value.authorId !== value.personaId && isCanonicalIsoTimestamp(value.createdAt) &&
+    isCanonicalIsoTimestamp(value.expiresAt) && Date.parse(value.expiresAt) > Date.parse(value.createdAt) &&
+    Date.parse(value.expiresAt) - Date.parse(value.createdAt) <= PENDING_DIRECT_TURN_TTL_MS;
+};
+
 const boundedLimit = (value: number | undefined, fallback: number, minimum: number, maximum: number): number =>
   Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, Math.floor(value!))) : fallback;
 
@@ -619,10 +662,10 @@ const parsePersistedState = (value: unknown): PersistedState => {
   }
   const state = value as Partial<PersistedState>;
   if (state.version !== 1 && state.version !== 2 && state.version !== 3 && state.version !== 4 &&
-      state.version !== 5 && state.version !== 6 && state.version !== 7) {
+      state.version !== 5 && state.version !== 6 && state.version !== 7 && state.version !== 8) {
     throw new TypeError("Room state version is unsupported.");
   }
-  const allowedKeys = state.version === 7
+  const allowedKeys = state.version === 8 ? PERSISTED_STATE_V8_KEYS : state.version === 7
     ? PERSISTED_STATE_V7_KEYS
     : state.version === 6
       ? PERSISTED_STATE_V6_KEYS
@@ -654,7 +697,7 @@ const parsePersistedState = (value: unknown): PersistedState => {
     throw new TypeError("Room state private history exceeds its retention envelope.");
   }
   if ((state.version === 2 || state.version === 3 || state.version === 4 || state.version === 5 ||
-      state.version === 6 || state.version === 7) && !Array.isArray(state.privateThreads)) {
+      state.version === 6 || state.version === 7 || state.version === 8) && !Array.isArray(state.privateThreads)) {
     throw new TypeError(`Version ${state.version} room state is missing its private-thread collection.`);
   }
   if (state.autonomousPublications !== undefined && (
@@ -664,12 +707,16 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state contains invalid autonomous-publication accounting.");
   }
-  if ((state.version === 4 || state.version === 5 || state.version === 6 || state.version === 7) &&
+  if (state.autonomousPublicationBudget !== undefined &&
+      !isAutonomousPublicationBudgetState(state.autonomousPublicationBudget)) {
+    throw new TypeError("Room state contains an invalid autonomous-publication budget.");
+  }
+  if ((state.version === 4 || state.version === 5 || state.version === 6 || state.version === 7 || state.version === 8) &&
       !Array.isArray(state.autonomousPublications)) {
     throw new TypeError(`Version ${state.version} room state is missing autonomous-publication accounting.`);
   }
   if ((state.version === 3 || state.version === 4 || state.version === 5 || state.version === 6 ||
-      state.version === 7) &&
+      state.version === 7 || state.version === 8) &&
       !Array.isArray(state.trustedChannelLanguages)) {
     throw new TypeError(`Version ${state.version} room state is missing its trusted channel-language collection.`);
   }
@@ -685,7 +732,7 @@ const parsePersistedState = (value: unknown): PersistedState => {
         state.trustedChannelLanguages.length) {
     throw new TypeError("Room state contains duplicate trusted channel-language observations.");
   }
-  if ((state.version === 4 || state.version === 5 || state.version === 6 || state.version === 7) &&
+  if ((state.version === 4 || state.version === 5 || state.version === 6 || state.version === 7 || state.version === 8) &&
       !Array.isArray(state.pendingPublicTurns)) {
     throw new TypeError(`Version ${state.version} room state is missing its pending public-turn collection.`);
   }
@@ -707,8 +754,8 @@ const parsePersistedState = (value: unknown): PersistedState => {
   })) {
     throw new TypeError("Room state contains a first-arrival turn without an external-agent trigger.");
   }
-  if (state.version === 7 && !Array.isArray(state.seenExternalAgentIds)) {
-    throw new TypeError("Version 7 room state is missing its external-agent appearance collection.");
+  if (state.version >= 7 && !Array.isArray(state.seenExternalAgentIds)) {
+    throw new TypeError(`Version ${state.version} room state is missing its external-agent appearance collection.`);
   }
   if (state.seenExternalAgentIds !== undefined && (
     !Array.isArray(state.seenExternalAgentIds) ||
@@ -720,7 +767,7 @@ const parsePersistedState = (value: unknown): PersistedState => {
   )) {
     throw new TypeError("Room state contains an invalid external-agent appearance collection.");
   }
-  if (state.version === 7) {
+  if (state.version >= 7) {
     const seen = new Set(state.seenExternalAgentIds);
     if (state.messages.some((message) => {
       const agentId = externalAgentAuthorId(message);
@@ -729,6 +776,14 @@ const parsePersistedState = (value: unknown): PersistedState => {
       throw new TypeError("Room state omits an external agent proven by public history.");
     }
   }
+  if (state.version === 8 && !Array.isArray(state.pendingDirectTurns)) {
+    throw new TypeError("Version 8 room state is missing its pending direct-turn collection.");
+  }
+  if (state.pendingDirectTurns !== undefined && (
+    !Array.isArray(state.pendingDirectTurns) || state.pendingDirectTurns.length > MAX_PERSISTED_PENDING_DIRECT_TURNS ||
+    !state.pendingDirectTurns.every(isPendingDirectTurn) ||
+    new Set(state.pendingDirectTurns.map((turn) => turn.messageId)).size !== state.pendingDirectTurns.length
+  )) throw new TypeError("Room state contains an invalid pending direct-turn collection.");
   return state as PersistedState;
 };
 
@@ -1070,9 +1125,13 @@ export class RoomStore {
   private readonly now: () => number;
   private messages: ChatMessage[] = [];
   private autonomousPublications: AutonomousPublicationRecord[] = [];
+  private autonomousPublicationBudget?: AutonomousPublicationBudgetState;
   private readonly privateThreads = new Map<string, PrivateThread>();
   private readonly trustedChannelLanguages = new Map<string, TrustedChannelLanguage>();
   private readonly pendingPublicTurns = new Map<string, PendingPublicTurn>();
+  private readonly pendingDirectTurns = new Map<string, PendingDirectTurn>();
+  private readonly claimedPendingDirectTurns = new Set<string>();
+  private readonly uncommittedDirectMessages = new Map<string, UncommittedDirectMessageState>();
   private readonly seenExternalAgentIds = new Set<string>();
   /** Claims are process-local leases; a restart intentionally makes work claimable again. */
   private readonly claimedPendingPublicTurnTargets = new Set<string>();
@@ -1121,7 +1180,7 @@ export class RoomStore {
     try {
       const raw = await readFile(this.filePath, "utf8");
       const parsed = parsePersistedState(JSON.parse(raw) as unknown);
-      const migrationSource = parsed.version === 7 ? undefined : { raw, version: parsed.version };
+      const migrationSource = parsed.version === 8 ? undefined : { raw, version: parsed.version };
       let channelLifecycleChanged = false;
       const migrateChannelId = (channelId: string): string => {
         const replacement = replacementPublicChannelId(channelId);
@@ -1139,6 +1198,9 @@ export class RoomStore {
             return channelId === record.channelId ? record : { ...record, channelId };
           })
         : [];
+      this.autonomousPublicationBudget = parsed.autonomousPublicationBudget
+        ? { ...parsed.autonomousPublicationBudget }
+        : undefined;
       this.trustedChannelLanguages.clear();
       for (const record of parsed.trustedChannelLanguages ?? []) {
         const channelId = migrateChannelId(record.channelId);
@@ -1158,7 +1220,7 @@ export class RoomStore {
         this.pendingPublicTurns.set(turn.messageId, this.copyPendingPublicTurn({ ...turn, channelId }));
       }
       this.seenExternalAgentIds.clear();
-      const restoredExternalAgentIds = parsed.version === 7
+      const restoredExternalAgentIds = parsed.version >= 7
         ? parsed.seenExternalAgentIds ?? []
         : this.messages.flatMap((message) => externalAgentAuthorId(message) ?? []);
       for (const agentId of restoredExternalAgentIds) this.seenExternalAgentIds.add(agentId);
@@ -1176,6 +1238,11 @@ export class RoomStore {
           messages: restored.messages.slice(-this.dmHistoryHardLimit),
         });
       }
+      this.pendingDirectTurns.clear();
+      this.claimedPendingDirectTurns.clear();
+      this.uncommittedDirectMessages.clear();
+      for (const turn of parsed.pendingDirectTurns ?? []) this.pendingDirectTurns.set(turn.messageId, { ...turn });
+      const pendingDirectTurnsChanged = this.reconcilePendingDirectTurns();
       this.pruneAutonomousPublications(this.nowMs());
       const pendingPublicTurnsChanged = this.reconcilePendingPublicTurns(this.nowMs(), false);
       const populatedChannels = new Set(this.messages.map((message) => message.channelId));
@@ -1187,9 +1254,9 @@ export class RoomStore {
       await chmod(this.filePath, 0o600).catch((error) => {
         console.warn("Could not restrict room-state file permissions.", error);
       });
-      if (missingChannelSeeds.length > 0 || pendingPublicTurnsChanged || channelLifecycleChanged || parsed.version !== 7) {
+      if (missingChannelSeeds.length > 0 || pendingPublicTurnsChanged || pendingDirectTurnsChanged || channelLifecycleChanged || parsed.version !== 8) {
         if (migrationSource) {
-          await preservePreMigrationState(this.filePath, migrationSource.raw, migrationSource.version, 7);
+          await preservePreMigrationState(this.filePath, migrationSource.raw, migrationSource.version, 8);
         }
         await this.flush();
       }
@@ -1198,9 +1265,13 @@ export class RoomStore {
       if (code !== "ENOENT") {
         this.messages = [];
         this.autonomousPublications = [];
+        this.autonomousPublicationBudget = undefined;
         this.privateThreads.clear();
         this.trustedChannelLanguages.clear();
         this.pendingPublicTurns.clear();
+        this.pendingDirectTurns.clear();
+        this.claimedPendingDirectTurns.clear();
+        this.uncommittedDirectMessages.clear();
         this.seenExternalAgentIds.clear();
         this.claimedPendingPublicTurnTargets.clear();
         this.uncommittedPublicMessageAppends.clear();
@@ -1208,9 +1279,13 @@ export class RoomStore {
       }
       this.messages = seedMessages();
       this.autonomousPublications = [];
+      this.autonomousPublicationBudget = undefined;
       this.privateThreads.clear();
       this.trustedChannelLanguages.clear();
       this.pendingPublicTurns.clear();
+      this.pendingDirectTurns.clear();
+      this.claimedPendingDirectTurns.clear();
+      this.uncommittedDirectMessages.clear();
       this.seenExternalAgentIds.clear();
       this.claimedPendingPublicTurnTargets.clear();
       this.uncommittedPublicMessageAppends.clear();
@@ -1237,6 +1312,24 @@ export class RoomStore {
         ? { channelFeedReceipt: { ...record.channelFeedReceipt } }
         : {}),
     }));
+  }
+
+  getAutonomousPublicationBudget(): AutonomousPublicationBudgetState | undefined {
+    return this.autonomousPublicationBudget ? { ...this.autonomousPublicationBudget } : undefined;
+  }
+
+  /**
+   * Set synchronously at the publication boundary before appending the row, so
+   * the same room-state flush includes the debit and publication. Rollback does
+   * not refund this checkpoint: a conservative lost token is preferable to
+   * restoring capacity already consumed by another concurrent publication.
+   */
+  setAutonomousPublicationBudget(state: AutonomousPublicationBudgetState): void {
+    if (!isAutonomousPublicationBudgetState(state)) {
+      throw new TypeError("Autonomous-publication budget is invalid.");
+    }
+    this.autonomousPublicationBudget = { ...state };
+    this.schedulePersist();
   }
 
   getDurableChannelFeedPublicationReceipts(): DurableChannelFeedPublicationReceipt[] {
@@ -2217,6 +2310,7 @@ export class RoomStore {
     linkPreview?: LinkPreview,
     attachments?: ImageAttachment[],
     authorSnapshot?: Member,
+    deferRemovalNotifications = false,
   ): ChatMessage | undefined {
     const thread = this.privateThreads.get(threadId);
     if (!thread || !thread.participantIds.includes(authorId)) return undefined;
@@ -2230,12 +2324,149 @@ export class RoomStore {
     });
     thread.messages.push(message);
     if (thread.messages.length > this.dmHistoryHardLimit) {
-      const removed = thread.messages.slice(0, -this.dmHistoryTrimTo);
-      thread.messages = thread.messages.slice(-this.dmHistoryTrimTo);
-      if (removed.length > 0) this.removalHandler?.(removed);
+      const retained = new Set([...this.pendingDirectTurns.values()]
+        .filter((turn) => turn.threadId === threadId).map((turn) => turn.messageId));
+      for (const candidate of [...thread.messages].reverse()) {
+        if (retained.size >= this.dmHistoryTrimTo) break;
+        retained.add(candidate.id);
+      }
+      const removed = thread.messages.filter((candidate) => !retained.has(candidate.id));
+      thread.messages = thread.messages.filter((candidate) => retained.has(candidate.id));
+      if (removed.length > 0 && !deferRemovalNotifications) this.removalHandler?.(removed);
     }
     this.schedulePersist();
     return message;
+  }
+
+  /** Persists the private row and explicit resident obligation before transport success. */
+  async addDmMessageDurably(
+    threadId: string,
+    authorId: string,
+    content: string,
+    options: {
+      replyToId?: string;
+      attachments?: ImageAttachment[];
+      authorSnapshot?: Member;
+      pendingResidentId?: string;
+    } = {},
+  ): Promise<ChatMessage | undefined> {
+    const thread = this.privateThreads.get(threadId);
+    if (!thread || !thread.participantIds.includes(authorId)) return undefined;
+    const personaId = options.pendingResidentId;
+    this.reconcilePendingDirectTurns();
+    if (personaId && (!thread.participantIds.includes(personaId) || personaId === authorId)) {
+      throw new TypeError("A pending DM reply must belong to the other thread participant.");
+    }
+    if (personaId && (this.pendingDirectTurns.size >= MAX_PERSISTED_PENDING_DIRECT_TURNS ||
+        [...this.pendingDirectTurns.values()].filter((turn) => turn.threadId === threadId).length >= MAX_PENDING_DIRECT_TURNS_PER_THREAD)) {
+      throw new Error("The private reply queue is full. Please try again later.");
+    }
+    const previous = [...thread.messages];
+    const message = this.addDmMessage(threadId, authorId, content, options.replyToId, undefined,
+      undefined, undefined, options.attachments, options.authorSnapshot, true);
+    if (!message) return undefined;
+    const retained = new Set(thread.messages.map((candidate) => candidate.id));
+    const state: UncommittedDirectMessageState = {
+      threadId,
+      thread,
+      message,
+      removedMessages: previous.filter((candidate) => !retained.has(candidate.id)),
+      previousMessageIds: previous.map((candidate) => candidate.id),
+    };
+    this.uncommittedDirectMessages.set(message.id, state);
+    if (personaId) this.pendingDirectTurns.set(message.id, {
+      messageId: message.id,
+      threadId,
+      authorId,
+      personaId,
+      createdAt: message.createdAt,
+      expiresAt: new Date(Date.parse(message.createdAt) + PENDING_DIRECT_TURN_TTL_MS).toISOString(),
+    });
+    try {
+      await this.flush();
+      if (this.privateThreads.get(threadId) !== thread || !thread.messages.some((candidate) => candidate.id === message.id)) {
+        this.uncommittedDirectMessages.delete(message.id);
+        return undefined;
+      }
+      return message;
+    } catch (error) {
+      // A different queued flush may have committed this exact append already.
+      if (this.uncommittedDirectMessages.get(message.id) !== state) {
+        return this.privateThreads.get(threadId) === thread && thread.messages.some((candidate) => candidate.id === message.id)
+          ? message : undefined;
+      }
+      this.uncommittedDirectMessages.delete(message.id);
+      this.pendingDirectTurns.delete(message.id);
+      this.claimedPendingDirectTurns.delete(message.id);
+      const current = this.privateThreads.get(threadId);
+      if (current === state.thread) {
+        const restored = new Map(current.messages.filter((candidate) => candidate.id !== message.id)
+          .map((candidate) => [candidate.id, candidate]));
+        for (const removed of state.removedMessages) restored.set(removed.id, removed);
+        const previousIds = new Set(state.previousMessageIds);
+        current.messages = [
+          ...state.previousMessageIds.flatMap((id) => restored.get(id) ?? []),
+          ...[...restored.values()].filter((candidate) => !previousIds.has(candidate.id)),
+        ];
+      }
+      this.schedulePersist();
+      throw error;
+    }
+  }
+
+  listPendingDirectTurns(): PendingDirectTurn[] {
+    if (this.reconcilePendingDirectTurns()) this.schedulePersist();
+    return [...this.pendingDirectTurns.values()].map((turn) => ({ ...turn }))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.messageId.localeCompare(right.messageId));
+  }
+
+  claimPendingDirectTurn(messageId: string): boolean {
+    if (!this.pendingDirectTurns.has(messageId) || this.claimedPendingDirectTurns.has(messageId) ||
+        this.uncommittedDirectMessages.has(messageId)) return false;
+    this.claimedPendingDirectTurns.add(messageId);
+    return true;
+  }
+
+  releasePendingDirectTurn(messageId: string): void {
+    this.claimedPendingDirectTurns.delete(messageId);
+  }
+
+  completePendingDirectTurns(messageIds: readonly string[], personaId: string): number {
+    let completed = 0;
+    for (const messageId of new Set(messageIds)) {
+      if (this.pendingDirectTurns.get(messageId)?.personaId !== personaId) continue;
+      this.pendingDirectTurns.delete(messageId);
+      this.claimedPendingDirectTurns.delete(messageId);
+      completed += 1;
+    }
+    if (completed) this.schedulePersist();
+    return completed;
+  }
+
+  cancelPendingDirectTurnsForActor(actorId: string): number {
+    let cancelled = 0;
+    for (const [messageId, turn] of this.pendingDirectTurns) {
+      if (turn.authorId !== actorId && turn.personaId !== actorId) continue;
+      this.pendingDirectTurns.delete(messageId);
+      this.claimedPendingDirectTurns.delete(messageId);
+      cancelled += 1;
+    }
+    if (cancelled) this.schedulePersist();
+    return cancelled;
+  }
+
+  private reconcilePendingDirectTurns(): boolean {
+    let changed = false;
+    for (const [messageId, turn] of this.pendingDirectTurns) {
+      const thread = this.privateThreads.get(turn.threadId);
+      const source = thread?.messages.find((message) => message.id === messageId);
+      if (thread?.participantIds.includes(turn.personaId) && source?.authorId === turn.authorId &&
+          source.createdAt === turn.createdAt && Date.parse(turn.expiresAt) > this.nowMs()) continue;
+      this.pendingDirectTurns.delete(messageId);
+      this.claimedPendingDirectTurns.delete(messageId);
+      changed = true;
+    }
+    return changed;
   }
 
   getDmParticipants(threadId: string): [string, string] | undefined {
@@ -2334,6 +2565,7 @@ export class RoomStore {
    * relying only on the best-effort retention callback.
    */
   forgetDmParticipant(memberId: string): RemovedPrivateThread[] {
+    this.cancelPendingDirectTurnsForActor(memberId);
     let changed = false;
     const removedThreads: RemovedPrivateThread[] = [];
     for (const [threadId, thread] of this.privateThreads) {
@@ -2364,28 +2596,41 @@ export class RoomStore {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
       await mkdir(dirname(this.filePath), { recursive: true });
       this.reconcilePendingPublicTurns(this.nowMs(), false);
+      this.reconcilePendingDirectTurns();
+      const includedDirectAppends = [...this.uncommittedDirectMessages.values()].filter((state) =>
+        this.privateThreads.get(state.threadId)?.messages.some((message) => message.id === state.message.id)
+      );
       const includedUncommittedAppends = [...this.uncommittedPublicMessageAppends.values()].filter((state) =>
         this.messages.some((message) =>
           message.id === state.handle.messageId && message.createdAt === state.handle.createdAt
         )
       );
       const payload: PersistedState = {
-        version: 7,
+        version: 8,
         messages: this.messages,
         privateThreads: [...this.privateThreads.values()],
         autonomousPublications: this.autonomousPublications,
+        ...(this.autonomousPublicationBudget
+          ? { autonomousPublicationBudget: { ...this.autonomousPublicationBudget } }
+          : {}),
         trustedChannelLanguages: this.getTrustedChannelLanguages(),
         pendingPublicTurns: [...this.pendingPublicTurns.values()]
           .map((turn) => this.copyPendingPublicTurn(turn))
           .sort((left, right) => left.createdAt.localeCompare(right.createdAt) ||
             left.messageId.localeCompare(right.messageId)),
         seenExternalAgentIds: [...this.seenExternalAgentIds].sort((left, right) => left.localeCompare(right)),
+        pendingDirectTurns: [...this.pendingDirectTurns.values()].map((turn) => ({ ...turn })),
       };
       const tempPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
       try {
         await writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
         await rename(tempPath, this.filePath);
         const committedRemovedMessages: ChatMessage[] = [];
+        for (const state of includedDirectAppends) {
+          if (this.uncommittedDirectMessages.get(state.message.id) !== state) continue;
+          this.uncommittedDirectMessages.delete(state.message.id);
+          committedRemovedMessages.push(...state.removedMessages);
+        }
         for (const state of includedUncommittedAppends) {
           if (this.uncommittedPublicMessageAppends.get(state.handle.messageId) !== state) continue;
           this.uncommittedPublicMessageAppends.delete(state.handle.messageId);

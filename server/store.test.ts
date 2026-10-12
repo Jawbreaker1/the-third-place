@@ -111,10 +111,10 @@ describe("room history", () => {
     ]);
 
     const firstMigratedBytes = await readFile(filePath, "utf8");
-    expect(JSON.parse(firstMigratedBytes)).toMatchObject({ version: 7, seenExternalAgentIds: [] });
+    expect(JSON.parse(firstMigratedBytes)).toMatchObject({ version: 8, seenExternalAgentIds: [], pendingDirectTurns: [] });
     expect(firstMigratedBytes).not.toContain('"channelId": "ai-lab"');
     const backupName = (await readdir(dirname(filePath))).find((name) =>
-      name.startsWith(`${basename(filePath)}.pre-v7-from-5-`)
+      name.startsWith(`${basename(filePath)}.pre-v8-from-5-`)
     );
     expect(backupName).toBeDefined();
     expect(await readFile(`${dirname(filePath)}/${backupName}`, "utf8")).toBe(originalBytes);
@@ -308,7 +308,7 @@ describe("room history", () => {
     ]);
     expect(restored.getAllMessages().some((message) => message.channelId === thread.id)).toBe(false);
     expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
-      version: 7,
+      version: 8,
       trustedChannelLanguages: [],
       pendingPublicTurns: [],
       seenExternalAgentIds: [],
@@ -362,10 +362,10 @@ describe("room history", () => {
       version: number;
       privateThreads: Array<{ readReceipts?: unknown[] }>;
     };
-    expect(persisted.version).toBe(7);
+    expect(persisted.version).toBe(8);
     expect(persisted.privateThreads[0]?.readReceipts).toHaveLength(2);
     const backupName = (await readdir(dirname(filePath))).find((name) =>
-      name.startsWith(`${basename(filePath)}.pre-v7-from-4-`)
+      name.startsWith(`${basename(filePath)}.pre-v8-from-4-`)
     );
     expect(backupName).toBeDefined();
     expect(await readFile(`${dirname(filePath)}/${backupName}`, "utf8")).toBe(legacyBytes);
@@ -577,7 +577,7 @@ describe("room history", () => {
       trustedChannelLanguages: unknown[];
     };
     expect(persisted).toMatchObject({
-      version: 7,
+      version: 8,
       trustedChannelLanguages: [{
         channelId: "lobby",
         languageTag: "sv",
@@ -1061,7 +1061,7 @@ describe("room history", () => {
       version: number;
       messages: Array<{ id: string }>;
     };
-    expect(persisted.version).toBe(7);
+    expect(persisted.version).toBe(8);
     expect(persisted.messages.map((message) => message.id)).toEqual(expectedIds);
 
     const temporaryPrefix = `${basename(filePath)}.`;
@@ -1089,7 +1089,7 @@ describe("room history", () => {
       messages: Array<{ id: string }>;
       pendingPublicTurns: Array<{ messageId: string; targets: Array<{ personaId: string }> }>;
     };
-    expect(persisted.version).toBe(7);
+    expect(persisted.version).toBe(8);
     expect(persisted.messages.some((message) => message.id === trigger.id)).toBe(true);
     expect(persisted.pendingPublicTurns).toEqual([expect.objectContaining({
       messageId: trigger.id,
@@ -1134,7 +1134,7 @@ describe("room history", () => {
       version: number;
       seenExternalAgentIds: string[];
     };
-    expect(persisted).toMatchObject({ version: 7, seenExternalAgentIds: [agent.id] });
+    expect(persisted).toMatchObject({ version: 8, seenExternalAgentIds: [agent.id] });
 
     const restarted = new RoomStore(filePath);
     await restarted.load();

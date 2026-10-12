@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { PageReadRequest } from "./pageReader.js";
+import { PageReadBusyError, PageReader, type PageReadRequest } from "./pageReader.js";
 import type { ResearchPacket } from "./researchBroker.js";
 import {
   resolveSearchEvidence,
@@ -59,6 +59,50 @@ const resolve = (
 });
 
 describe("search evidence resolver", () => {
+  it("allows two simultaneous searches to read their sources through the shared two-lane reader", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const reader = new PageReader(async (url) => {
+      calls += 1;
+      if (calls <= 2) await gate;
+      return {
+        finalUrl: new URL(String(url)), mediaType: "text/html", contentType: "text/html",
+        body: Buffer.from(`<article><h1>Source facts</h1><p>${"Some concrete facts supported by this primary document. ".repeat(5)}</p></article>`),
+      };
+    });
+    const first = resolveSearchEvidence({
+      packet: searchPacket(["https://one.example/a", "https://two.example/b"]),
+      semanticGoal: "first question", requesterId: "guest-a", now, pageReader: reader,
+    });
+    await vi.waitFor(() => expect(calls).toBe(2));
+    const second = resolveSearchEvidence({
+      packet: searchPacket(["https://three.example/c", "https://four.example/d"]),
+      semanticGoal: "second question", requesterId: "guest-b", now, pageReader: reader,
+    });
+    release();
+    const answers = await Promise.all([first, second]);
+    expect(answers.map((answer) => [answer.readiness, answer.readPages])).toEqual([
+      ["grounding_available", 2], ["grounding_available", 2],
+    ]);
+    expect(calls).toBe(4);
+  });
+
+  it("propagates local saturation without labeling unread sources as inaccessible", async () => {
+    const reader: EvidencePageReader = { read: vi.fn(async () => { throw new PageReadBusyError("queue_full"); }) };
+    await expect(resolve(searchPacket(["https://one.example/a", "https://two.example/b"]), reader))
+      .rejects.toMatchObject({ name: "PageReadBusyError", reason: "queue_full" });
+  });
+
+  it("keeps successfully read evidence when another candidate is deferred by local saturation", async () => {
+    const reader: EvidencePageReader = { read: vi.fn(async (request) => {
+      if (request.url!.hostname === "two.example") throw new PageReadBusyError("rate_limit");
+      return pagePacket(request.url!.href, 1);
+    }) };
+    await expect(resolve(searchPacket(["https://one.example/a", "https://two.example/b"]), reader))
+      .resolves.toMatchObject({ readiness: "grounding_available", readPages: 1 });
+  });
+
   it("reads and merges the first two safe results into bounded grounding evidence", async () => {
     const calls: Array<{ request: PageReadRequest; requesterId: string }> = [];
     const reader: EvidencePageReader = {

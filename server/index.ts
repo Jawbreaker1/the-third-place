@@ -32,6 +32,7 @@ import type {
   VoiceRoomView,
   VoiceTranscriptEntry,
 } from "../shared/types.js";
+import { encodeHistoryCursor } from "../shared/historyCursor.js";
 import { isPublicReactionEmoji } from "../shared/reactions.js";
 import type {
   AdminExternalAgent,
@@ -89,7 +90,6 @@ import {
   assertHumanMemoryContinuity,
   HUMAN_MEMORY_DEFAULTS,
   HumanMemoryStore,
-  reconcilePendingActorForgets,
 } from "./humanMemory.js";
 import {
   generateHumanIdentityRecoveryKey,
@@ -146,6 +146,7 @@ import { VoiceDirector } from "./voiceDirector.js";
 import { preferredRequestLanguage } from "./requestLanguage.js";
 import { SocialMemoryStore } from "./socialMemory.js";
 import { SocialMemoryAdmin } from "./socialMemoryAdmin.js";
+import { reconcileHumanActorErasure } from "./humanActorErasure.js";
 import { SocialMemoryCoordinator } from "./socialMemoryCoordinator.js";
 import { SocialMemoryLifecycleManager } from "./socialMemoryLifecycle.js";
 import { VoiceIngestGate, VoiceIngestGateError, type VoiceIngestRelease } from "./voiceIngestGate.js";
@@ -674,42 +675,22 @@ const isAdmittedHumanSession = (session: HumanSession): boolean =>
   isActiveHumanSession(session) && session.adultConfirmed;
 let actorForgetReconciliationTail: Promise<unknown> = Promise.resolve();
 const reconcilePendingHumanActorForgets = (): Promise<number> => {
-  const operation = actorForgetReconciliationTail.then(async () => {
-    const removedPrivateThreads: Array<{
-      id: string;
-      participantIds: [string, string];
-      forgottenActorId: string;
-    }> = [];
-    return await reconcilePendingActorForgets(
-      humanMemory,
-      humanMemory.listPendingActorForgets(),
-      {
-        forgetActor: async (actorId) => {
-          const account = accountStore.getAccountByActorId(actorId);
-          if (account) await accountStore.deleteAccount(account.id);
-          await socialMemory.forgetActor(actorId);
-          const removed = store.forgetDmParticipant(actorId);
-          removedPrivateThreads.push(...removed.map((thread) => ({
-            id: thread.id,
-            participantIds: thread.participantIds,
-            forgottenActorId: actorId,
-          })));
-          await Promise.all(removed.flatMap((thread) => thread.messages).flatMap((message) =>
-            (message.attachments ?? []).map((attachment) => imageStore.remove(attachment.id)),
-          ));
-        },
-        flushDownstream: async () => {
-          if (removedPrivateThreads.length > 0) await store.flush();
-          for (const thread of removedPrivateThreads) {
-            for (const participantId of thread.participantIds) {
-              if (participantId === thread.forgottenActorId) continue;
-              io.to(`user:${participantId}`).emit("dm:removed", { threadId: thread.id });
-            }
-          }
-        },
-      },
-    );
-  });
+  const operation = actorForgetReconciliationTail.then(() => reconcileHumanActorErasure({
+    memory: humanMemory,
+    rooms: store,
+    forgetIdentity: async (actorId) => {
+      const account = accountStore.getAccountByActorId(actorId);
+      if (account) await accountStore.deleteAccount(account.id);
+    },
+    forgetSocialMemory: (actorId) => socialMemory.forgetActor(actorId),
+    removeImage: (imageId) => imageStore.remove(imageId),
+    onThreadRemoved: (thread) => {
+      for (const participantId of thread.participantIds) {
+        if (participantId === thread.forgottenActorId) continue;
+        io.to(`user:${participantId}`).emit("dm:removed", { threadId: thread.id });
+      }
+    },
+  }));
   // Serialize callers without letting one transient failure poison every later
   // health-cycle retry. Tombstones remain durable until a full attempt succeeds.
   actorForgetReconciliationTail = operation.then(() => undefined, () => undefined);
@@ -793,9 +774,6 @@ const forgetVoiceIngestRoom = (roomId: string): void => {
     if (key.startsWith(`${roomId}:`)) completedVoiceTurns.delete(key);
   }
 };
-
-const encodeHistoryCursor = (message: Pick<ChatMessage, "createdAt" | "id">): string =>
-  Buffer.from(JSON.stringify({ v: 1, createdAt: message.createdAt, id: message.id }), "utf8").toString("base64url");
 
 const decodeHistoryCursor = (raw: string | undefined): HistoryPosition | undefined => {
   if (!raw) return undefined;
@@ -1753,6 +1731,21 @@ const externalAgentAdmin = {
 
 const socialMemoryAdmin = new SocialMemoryAdmin({
   store: socialMemoryStore,
+  resetLegacyRelationship: async (ownerId, subjectId) => {
+    socialMemory.invalidatePendingActorWork(ownerId);
+    socialMemory.invalidatePendingActorWork(subjectId);
+    const subjectIsHuman = Boolean(humanMemory.findByHumanId(subjectId));
+    if (!subjectIsHuman || !PERSONAS.some((persona) => persona.id === ownerId)) return false;
+    actorPublicationGate.invalidate(subjectId);
+    director.resetHumanMemoryWork(subjectId);
+    voiceDirector.invalidateActorWork(subjectId);
+    const changed = humanMemory.resetRelation(subjectId, ownerId);
+    // Persist the legacy reset before making the new-store reset visible. A
+    // failed write must never be reported as a completed neutral relationship.
+    await store.flush();
+    await humanMemory.flush();
+    return changed;
+  },
   onStateChanged: () => {
     socialMemory.invalidatePromptNotes();
     socialMemoryLifecycle.notifyMemoryChanged();
@@ -2668,6 +2661,9 @@ const handleImageMessageUpload = async (
       throw new ImageStoreError("Your session ended before the image could be shared.", 401);
     }
     if (destination.kind === "public") {
+      if (!CHANNELS.some((channel) => channel.id === destination.channelId)) {
+        throw new ImageStoreError("That channel is no longer available.", 404);
+      }
       const message = createMessage(destination.channelId, session.member.id, content, {
         replyToId: form.replyToId,
         ...(replied ? { replyPreview: replyPreviewFor(replied) } : {}),
@@ -2689,6 +2685,16 @@ const handleImageMessageUpload = async (
         store.addPublicMessage(message);
       }
       attachmentId = undefined;
+      if (!isActiveHumanSession(session) || !actorPublicationGate.isCurrent(publicationLease) ||
+          !CHANNELS.some((channel) => channel.id === destination.channelId)) {
+        // Accepted public history may survive account retirement, but it must
+        // not broadcast or start fresh resident/vision work after revocation.
+        store.cancelPendingPublicTurn(message.id);
+        const updated = store.setImageAnalysis(message.channelId, message.id, attachment.id, { status: "unavailable" });
+        if (updated) imageStore.update(updated);
+        await store.flush();
+        throw new ImageStoreError("Your session or channel changed before that image could be shared.", 409);
+      }
       io.to("public").emit("message:new", message);
       publishExternalAgentMessageActivity(message);
       channelFeedCoordinator?.noteHumanActivity(message.channelId);
@@ -2709,19 +2715,27 @@ const handleImageMessageUpload = async (
       new Set(PERSONAS.map((persona) => persona.id)),
     );
     attachment.analysis = visionPlan.initialAnalysis;
-    const message = store.addDmMessage(
-      destination.threadId,
-      session.member.id,
-      content,
-      form.replyToId,
-      undefined,
-      undefined,
-      undefined,
-      [attachment],
-      { ...session.member, status: "offline" },
-    );
+    const message = visionPlan.kind === "resident_vision"
+      ? await store.addDmMessageDurably(destination.threadId, session.member.id, content, {
+          replyToId: form.replyToId,
+          attachments: [attachment],
+          authorSnapshot: { ...session.member, status: "offline" },
+          pendingResidentId: visionPlan.residentId,
+        })
+      : store.addDmMessage(destination.threadId, session.member.id, content, form.replyToId,
+          undefined, undefined, undefined, [attachment], { ...session.member, status: "offline" });
     if (!message) throw new ImageStoreError("That private conversation is no longer available.", 404);
+    // The accepted row now owns the attachment, even if an authority change
+    // suppresses outward publication. Erasure/retention owns later cleanup.
     attachmentId = undefined;
+    if (!isActiveHumanSession(session) || !actorPublicationGate.isCurrent(publicationLease) ||
+        !store.getDmParticipants(destination.threadId)?.includes(session.member.id)) {
+      if (visionPlan.kind === "resident_vision") {
+        store.completePendingDirectTurns([message.id], visionPlan.residentId);
+        await store.flush();
+      }
+      throw new ImageStoreError("Your session changed before that image could be shared.", 409);
+    }
     emitDmUpdate(destination.participants, message);
     startPlannedDmImageVision(visionPlan, (residentId) => {
       const persona = PERSONAS.find((candidate) => candidate.id === residentId);
@@ -3454,8 +3468,14 @@ app.delete("/api/session/memory", async (request, response) => {
       return undefined;
     }
     authenticated.session.lastSeenAt = Date.now();
+    // Invalidate generation before deleting memory: otherwise a response
+    // started before this request could enqueue its old episode after erasure.
+    actorPublicationGate.invalidate(authenticated.session.member.id);
+    director.resetHumanMemoryWork(authenticated.session.member.id);
+    voiceDirector.invalidateActorWork(authenticated.session.member.id);
     humanMemory.resetRememberedDetails(authenticated.session.member.id, authenticated.session.lastSeenAt);
     await socialMemory.forgetActor(authenticated.session.member.id);
+    await store.flush();
     await humanMemory.flush();
     return humanMemory.clientSummary(authenticated.session.member.id);
   });
@@ -4144,13 +4164,36 @@ io.on("connection", (socket) => {
       acknowledge?.({ ok: false, error: "That person isn't available for a private message." });
       return;
     }
-    const message = store.addDmMessage(parsed.data.channelId, session.member.id, content, parsed.data.replyToId);
+    const persona = PERSONAS.find((candidate) => candidate.id === peerId);
+    const publicationLease = actorPublicationGate.capture(session.member.id);
+    let message: ChatMessage | undefined;
+    try {
+      message = persona
+        ? await store.addDmMessageDurably(parsed.data.channelId, session.member.id, content, {
+            replyToId: parsed.data.replyToId,
+            authorSnapshot: { ...session.member, status: "offline" },
+            pendingResidentId: persona.id,
+          })
+        : store.addDmMessage(parsed.data.channelId, session.member.id, content, parsed.data.replyToId);
+    } catch (error) {
+      console.error("Could not durably accept a private resident turn:", error instanceof Error ? error.message : error);
+      acknowledge?.({ ok: false, error: "That private message could not be saved safely. Please try again." });
+      return;
+    }
     if (!message) {
       acknowledge?.({ ok: false, error: "Could not send that private message." });
       return;
     }
+    if (!isActiveHumanSession(session) || !actorPublicationGate.isCurrent(publicationLease) ||
+        !store.getDmParticipants(message.channelId)?.includes(session.member.id)) {
+      if (persona) {
+        store.completePendingDirectTurns([message.id], persona.id);
+        await store.flush().catch((error) => console.error("Could not persist cancellation of an obsolete private turn:", error));
+      }
+      acknowledge?.({ ok: false, error: "Your session changed before that private message could be shared." });
+      return;
+    }
     emitDmUpdate(participants, message);
-    const persona = PERSONAS.find((candidate) => candidate.id === peerId);
     if (persona) void director.onDirectMessage(message, session.member, persona);
     acknowledge?.({ ok: true });
   });
@@ -4500,6 +4543,10 @@ director.start();
 const recoveredDirectTurns = director.recoverPendingPublicTurns({ ignoreAttemptCooldown: true });
 if (recoveredDirectTurns > 0) {
   console.info(`Recovered ${recoveredDirectTurns} durable unanswered direct human turn(s) after startup.`);
+}
+const recoveredPrivateTurns = director.recoverPendingDirectTurns();
+if (recoveredPrivateTurns > 0) {
+  console.info(`Recovered ${recoveredPrivateTurns} durable unanswered private resident turn(s) after startup.`);
 }
 
 const healthInterval = setInterval(async () => {

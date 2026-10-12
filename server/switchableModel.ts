@@ -1,4 +1,5 @@
 import type { ServerHealth, VisualObservation } from "../shared/types.js";
+import type { ConversationResearchChoice, ConversationResearchInput } from "./conversationResearch.js";
 import type {
   ForegroundDemandLease,
   GeneratedLine,
@@ -37,6 +38,8 @@ export interface SocialModelClient {
   cancelPending?(reason?: string): void;
   /** Optional on lightweight test doubles; production clients bind it to one provider. */
   acquireForegroundDemand?(): ForegroundDemandLease;
+  /** Optional for adapters/test doubles without autonomous lookup decisions. */
+  planConversationResearch?(input: ConversationResearchInput, signal?: AbortSignal): Promise<ConversationResearchChoice | null>;
 }
 
 export class SwitchableSocialModel implements SocialModelClient {
@@ -152,6 +155,10 @@ export class SwitchableSocialModel implements SocialModelClient {
     execution?: SceneGenerationExecutionOptions,
   ): Promise<GeneratedLine[]> {
     return await this.guarded((client) => client.generateScene(request, priority, signal, execution));
+  }
+
+  async planConversationResearch(input: ConversationResearchInput, signal?: AbortSignal): Promise<ConversationResearchChoice | null> {
+    return await this.guarded((client) => client.planConversationResearch(input, signal));
   }
 
   async analyzeImage(image: Buffer, caption = "", priority = 1): Promise<VisualObservation> {

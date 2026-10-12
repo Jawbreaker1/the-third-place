@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ActorChannelRuntime } from "./actorChannels.js";
 import { AmbientEpisodeLedger, MemoryAmbientEpisodePersistence } from "./ambientEpisodeLedger.js";
+import { ambientSchedulingPolicy } from "./ambientScheduling.js";
 import { PERSONAS } from "./personas.js";
 import { createMessage, RoomStore } from "./store.js";
 import {
@@ -1675,11 +1676,15 @@ describe("social director", () => {
         sourceIds: string[];
       }>>((resolve) => { resolveGeneration = resolve; });
       let generationSignal: AbortSignal | undefined;
+      let analysisSignal: AbortSignal | undefined;
       const director = new SocialDirector(
         { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
         store,
         {
-          analyzeTurn: vi.fn(async () => classifiedTurn()),
+          analyzeTurn: vi.fn(async (_request, execution) => {
+            analysisSignal = execution?.signal;
+            return classifiedTurn();
+          }),
           generateScene: vi.fn((_request, _priority, signal) => {
             generationSignal = signal;
             return delayedGeneration;
@@ -1707,8 +1712,10 @@ describe("social director", () => {
       const pending = director.onDirectMessage(incoming, human, persona);
       await vi.advanceTimersByTimeAsync(0);
       expect(generationSignal?.aborted).toBe(false);
+      expect(analysisSignal?.aborted).toBe(false);
       expect(director.cancelDirectTurnsForActor(human.id)).toBe(1);
       expect(generationSignal?.aborted).toBe(true);
+      expect(analysisSignal?.aborted).toBe(true);
       const removed = store.forgetDmParticipant(human.id);
       expect(removed.flatMap((removedThread) => removedThread.messages).map((message) => message.id))
         .toContain(incoming.id);
@@ -2231,10 +2238,10 @@ describe("social director", () => {
         urlPublicationPolicy: "server_card",
       });
       const explicitScene = generateScene.mock.calls[1]![0];
-      expect(explicitScene.selected.map((persona) => persona.id)).toEqual(expect.arrayContaining(["ai-mira", "ai-sana"]));
-      expect(explicitScene.mustReplyIds).toEqual(expect.arrayContaining(["ai-mira", "ai-sana"]));
+      expect(explicitScene.selected.map((persona) => persona.id)).toEqual(explicitScene.requestOwnerIds);
+      expect(explicitScene.mustReplyIds).toEqual(explicitScene.requestOwnerIds);
       expect(explicitScene.requestOwnerIds).toHaveLength(1);
-      expect(explicitScene.selected.length).toBeGreaterThan(1);
+      expect(explicitScene.selected).toHaveLength(1);
       const explicitReplies = store.getRecent("lobby", 20).filter((message) =>
         message.authorId !== human.id && message.replyToId === explicit.id,
       );
@@ -2952,7 +2959,8 @@ describe("social director", () => {
           transcript: Array<{ author: string; kind: string; content: string; createdAt: string }>;
         };
         premise?: string;
-      }) => [{
+        conversationContext?: unknown;
+      }) => request.conversationContext ? [] : [{
         personaId: request.requestOwnerIds[0] ?? request.selected[0]!.id,
         content: "Ναι, ήμουν εδώ όταν μπήκε ο Περικλής.",
         source: "lm" as const,
@@ -2992,7 +3000,7 @@ describe("social director", () => {
       expect(analyzeTurn.mock.calls[0]?.[0].recentMessages).not.toContainEqual(expect.objectContaining({
         id: oldHuman.id,
       }));
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(generateScene.mock.calls.filter(([request]) => !request.conversationContext)).toHaveLength(1);
       const scene = generateScene.mock.calls[0]![0];
       expect(scene.history).toHaveLength(26);
       expect(scene.history.some((line) => line.content === oldHuman.content)).toBe(false);
@@ -3103,7 +3111,8 @@ describe("social director", () => {
           mustReplyIds: string[];
           roomRecall?: unknown;
           premise?: string;
-        }) => [{
+          conversationContext?: unknown;
+        }) => request.conversationContext ? [] : [{
           personaId: request.selected[0]!.id,
           content: "短い返事です。",
           source: "lm" as const,
@@ -3139,7 +3148,7 @@ describe("social director", () => {
         await pending;
         director.stop();
 
-        expect(generateScene, testCase.label).toHaveBeenCalledTimes(1);
+        expect(generateScene.mock.calls.filter(([request]) => !request.conversationContext), testCase.label).toHaveLength(1);
         const scene = generateScene.mock.calls[0]![0];
         expect(scene.roomRecall, testCase.label).toBeUndefined();
         expect(scene.premise ?? "", testCase.label).not.toContain("retained public-room excerpt");
@@ -4171,7 +4180,9 @@ describe("social director", () => {
       const generateScene = vi.fn(async (request: {
         trigger: { messageId?: string };
         requestOwnerIds: string[];
+        conversationContext?: unknown;
       }) => {
+        if (request.conversationContext) return [];
         generatedParents.push(request.trigger.messageId!);
         return [{
           personaId: request.requestOwnerIds[0]!,
@@ -4911,9 +4922,13 @@ describe("social director", () => {
       const io = { to: vi.fn(() => ({ emit })) };
       const store = {
         getRecent: vi.fn(() => recentMessages),
+        getMessage: vi.fn(),
         getAllMessages: vi.fn(() => CHANNELS.flatMap((channel) =>
           recentMessages.map((message) => ({ ...message, channelId: channel.id })),
         )),
+        getAutonomousPublicationHistory: vi.fn(() => []),
+        getAutonomousPublicationBudget: vi.fn(() => undefined),
+        setAutonomousPublicationBudget: vi.fn(),
         addPublicMessage: vi.fn(),
       };
       const lm = {
@@ -5026,21 +5041,40 @@ describe("social director", () => {
 
     expect(new Set(requests.map((request) => request.channelId)).size).toBe(2);
     expect(new Set(requests.map((request) => request.personaId)).size).toBe(2);
-    expect(requests.filter((request) => request.conversationMode === "considered")).toHaveLength(1);
+    expect(requests.every((request) => request.conversationMode === undefined)).toBe(true);
 
     for (const resolve of pendingResolvers) resolve([]);
     await Promise.all([first, second]);
     director.stop();
   });
 
-  it("keeps the second ambient worker asleep for a connected but inactive audience", async () => {
+  it.each([
+    { audience: "connected but inactive", humans: 3 },
+    { audience: "unattended", humans: 0 },
+  ])("uses three ambient workers in different rooms for a $audience audience when capacity is available", async ({ humans }) => {
     const now = Date.parse("2026-07-19T12:15:00.000Z");
-    const generateScene = vi.fn(async () => []);
+    const releases: Array<() => void> = [];
+    let activePredictions = 0;
+    const generateScene = vi.fn((request: { channelId: string; selected: Array<{ id: string }> }) => {
+      activePredictions += 1;
+      return new Promise<[]>((resolve) => releases.push(() => {
+        activePredictions -= 1;
+        resolve([]);
+      }));
+    });
     const director = new SocialDirector(
       { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
       new RoomStore(`/tmp/director-connected-idle-${process.pid}-${Math.random()}.json`),
       {
-        health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+        health: vi.fn(() => ({
+          connected: true,
+          queueDepth: activePredictions,
+          activePredictions,
+          activeBackgroundPredictions: activePredictions,
+          maxConcurrentPredictions: 4,
+          maxBackgroundPredictions: 3,
+          effectiveMaxBackgroundPredictions: 3,
+        })),
         generateScene,
         rememberDeliveredLine: vi.fn(),
       } as never,
@@ -5048,16 +5082,16 @@ describe("social director", () => {
       {} as never,
       {} as never,
       () => PERSONAS,
-      () => 3,
+      () => humans,
       {
         now: () => now,
         rng: () => 0,
-        ambientConcurrency: 2,
+        ambientConcurrency: 3,
         consideredConversationChance: 0,
         autonomousResearchEnabled: false,
         ambientTemporalCueChance: 0,
         behaviorTuningProvider: (channelId) => ({
-          activity: channelId === undefined || ["ai-programming", "3d-visualisation"].includes(channelId)
+          activity: channelId === undefined || ["ai-programming", "3d-visualisation", "fnaf"].includes(channelId)
             ? 50
             : 0,
           autonomousLinkFrequency: 0,
@@ -5071,10 +5105,101 @@ describe("social director", () => {
       runAmbient: (workerId?: number) => Promise<void>;
     }).runAmbient.bind(director);
 
-    await Promise.all([runAmbient(0), runAmbient(1)]);
-
-    expect(generateScene).toHaveBeenCalledTimes(1);
+    const first = runAmbient(0);
+    await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(1));
+    // Presence does not add an artificial gap when another worker has capacity.
+    const second = runAmbient(1);
+    await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(2));
+    const third = runAmbient(2);
+    await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(3));
+    expect(new Set(generateScene.mock.calls.map(([request]) => request.channelId)).size).toBe(3);
+    expect(new Set(generateScene.mock.calls.map(([request]) => request.selected[0]!.id)).size).toBe(3);
+    expect(activePredictions).toBe(3);
+    for (const release of releases) release();
+    await Promise.all([first, second, third]);
     director.stop();
+  });
+
+  it("reserves the last shared publication token before admitting a concurrent worker", async () => {
+    vi.useFakeTimers();
+    let director: SocialDirector | undefined;
+    try {
+      let now = Date.parse("2026-10-11T15:00:00.000Z");
+      vi.setSystemTime(now);
+      const store = new RoomStore(`/tmp/director-unattended-spacing-${process.pid}-${Math.random()}.json`);
+      const releases: Array<() => void> = [];
+      let activePredictions = 0;
+      const generateScene = vi.fn((request: { channelId: string; selected: Array<{ id: string }> }) => {
+        activePredictions += 1;
+        return new Promise<Array<{ personaId: string; content: string; source: "lm"; sourceIds: string[] }>>((resolve) =>
+          releases.push(() => {
+            activePredictions -= 1;
+            resolve([{
+              personaId: request.selected[0]!.id,
+              content: `A concrete thought worth discussing in ${request.channelId}.`,
+              source: "lm", sourceIds: [],
+            }]);
+          }));
+      });
+      director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never, store,
+        {
+          health: vi.fn(() => ({
+            connected: true, queueDepth: activePredictions, activePredictions,
+            activeBackgroundPredictions: activePredictions,
+            maxConcurrentPredictions: 4, maxBackgroundPredictions: 2,
+            effectiveMaxBackgroundPredictions: 2,
+          })),
+          generateScene, rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(), {} as never, {} as never, () => PERSONAS, () => 0,
+        {
+          now: () => now, rng: () => 0, ambientConcurrency: 2,
+          autonomousResearchEnabled: false, ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || ["ai-programming", "3d-visualisation"].includes(channelId) ? 50 : 0,
+            autonomousLinkFrequency: 0, competence: 50, aggression: 25, explicitness: 50,
+          }),
+        },
+      );
+      const internals = director as unknown as {
+        runAmbient: (workerId: number) => Promise<void>;
+        ambientThreads: Map<string, AmbientThreadState>;
+      };
+      // The same attendance-independent burst allowance applies to every room.
+      store.setAutonomousPublicationBudget({
+        tokens: 1, updatedAt: now, refillPerMinute: 10, burstCapacity: 3,
+      });
+      const first = internals.runAmbient(0);
+      await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(1));
+      const firstRoom = generateScene.mock.calls[0]![0].channelId;
+      const firstEpisode = internals.ambientThreads.get(firstRoom)!;
+      await internals.runAmbient(1);
+      expect(generateScene).toHaveBeenCalledTimes(1);
+
+      releases[0]!();
+      await first;
+      expect(store.getAutonomousPublicationHistory()).toHaveLength(1);
+      expect(internals.ambientThreads.get(firstRoom)).toBe(firstEpisode);
+      expect(firstEpisode).toMatchObject({ messageCount: 1 });
+      expect(firstEpisode.closedAt).toBeUndefined();
+
+      // At ten publications per minute, one token refills after six seconds.
+      now += 6_000;
+      vi.setSystemTime(now);
+      const resumed = internals.runAmbient(1);
+      await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(2));
+      const resumedRoom = generateScene.mock.calls[1]![0].channelId;
+      expect(resumedRoom).not.toBe(firstRoom);
+      releases[1]!();
+      await resumed;
+      expect(store.getAutonomousPublicationHistory()).toHaveLength(2);
+      expect(internals.ambientThreads.get(resumedRoom)?.messageCount).toBe(1);
+    } finally {
+      director?.stop();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 
   it("never starts two concurrent ambient attempts in the same channel", async () => {
@@ -5232,7 +5357,7 @@ describe("social director", () => {
     director.stop();
   });
 
-  it("retries a busy shared model queue after four seconds instead of the normal ambient interval", async () => {
+  it("backs off a busy shared model queue and resumes at the next bounded capacity-aware opportunity", async () => {
     vi.useFakeTimers();
     try {
       const now = Date.parse("2026-07-16T08:30:00.000Z");
@@ -5267,15 +5392,19 @@ describe("social director", () => {
       const runAmbient = (director as unknown as { runAmbient: () => Promise<void> }).runAmbient.bind(director);
 
       await runAmbient();
-      expect(health).toHaveBeenCalledTimes(1);
       expect(generateScene).not.toHaveBeenCalled();
+      health.mockClear();
 
-      await vi.advanceTimersByTimeAsync(3_999);
-      expect(health).toHaveBeenCalledTimes(1);
+      const retryDelay = ambientSchedulingPolicy({
+        health: { connected: true, queueDepth: 1 }, pace: "lively", activity: 50,
+        configuredWorkers: 1, workerId: 0, random: 0,
+      }).delayMs;
+      await vi.advanceTimersByTimeAsync(retryDelay - 1);
+      expect(health).not.toHaveBeenCalled();
       queueDepth = 0;
       await vi.advanceTimersByTimeAsync(1);
 
-      expect(health).toHaveBeenCalledTimes(2);
+      expect(health).toHaveBeenCalled();
       expect(generateScene).toHaveBeenCalledTimes(1);
       director.stop();
     } finally {
@@ -5298,6 +5427,8 @@ describe("social director", () => {
           activeBackgroundPredictions: 0,
           maxConcurrentPredictions: 4,
           maxBackgroundPredictions: 2,
+          effectiveMaxBackgroundPredictions: 1,
+          foregroundDemandCount: 1,
         })),
         generateScene,
         rememberDeliveredLine: vi.fn(),
@@ -5325,6 +5456,44 @@ describe("social director", () => {
 
     await (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
 
+    expect(generateScene).toHaveBeenCalledTimes(1);
+    director.stop();
+  });
+
+  it("defers the extra ambient worker while foreground demand reserves its lane and resumes after release", async () => {
+    const now = Date.parse("2026-07-16T08:42:00.000Z");
+    let foregroundDemandCount = 1;
+    const generateScene = vi.fn(async () => []);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+      new RoomStore(`/tmp/director-foreground-ambient-lane-${process.pid}-${Math.random()}.json`),
+      {
+        health: vi.fn(() => ({
+          connected: true, queueDepth: foregroundDemandCount,
+          activePredictions: foregroundDemandCount, activeBackgroundPredictions: 0,
+          maxConcurrentPredictions: 4, maxBackgroundPredictions: 2,
+          effectiveMaxBackgroundPredictions: foregroundDemandCount ? 1 : 2,
+          foregroundDemandCount,
+        })),
+        generateScene, rememberDeliveredLine: vi.fn(),
+      } as never,
+      new ActorChannelRuntime(), {} as never, {} as never, () => PERSONAS, () => 1,
+      {
+        now: () => now, rng: () => 0, ambientConcurrency: 2,
+        consideredConversationChance: 0, autonomousResearchEnabled: false,
+        ambientTemporalCueChance: 0,
+        behaviorTuningProvider: (channelId) => ({
+          activity: channelId === undefined || channelId === "ai-programming" ? 50 : 0,
+          autonomousLinkFrequency: 0, competence: 50, aggression: 25, explicitness: 50,
+        }),
+      },
+    );
+    const runAmbient = (director as unknown as { runAmbient: (workerId?: number) => Promise<void> })
+      .runAmbient.bind(director);
+    await runAmbient(1);
+    expect(generateScene).not.toHaveBeenCalled();
+    foregroundDemandCount = 0;
+    await runAmbient(1);
     expect(generateScene).toHaveBeenCalledTimes(1);
     director.stop();
   });
@@ -5470,18 +5639,12 @@ describe("social director", () => {
         attendance: "unattended",
       })]);
 
-      // A fast scheduler tick cannot create an unattended burst.
-      await runAmbient();
-      expect(generateScene).toHaveBeenCalledTimes(1);
-
-      // The rolling gap expires and unattended life resumes.
-      now += 6 * 60_000;
-      vi.setSystemTime(now);
+      // An empty community can use a spare opportunity immediately in another room.
       await runAmbient();
       expect(generateScene).toHaveBeenCalledTimes(2);
 
-      // Even after another offline gap, actual queued voice/live model work wins.
-      now += 6 * 60_000;
+      // Actual queued voice/live model work still wins even as tokens refill.
+      now += 6_000;
       vi.setSystemTime(now);
       queueDepth = 1;
       await runAmbient();
@@ -5491,11 +5654,11 @@ describe("social director", () => {
       await runAmbient();
       expect(generateScene).toHaveBeenCalledTimes(3);
 
-      // Default Activity sustains three unattended publications per rolling hour.
-      now += 6 * 60_000;
+      // Continuous refill sustains discussion without an attendance-specific gap.
+      now += 6_000;
       vi.setSystemTime(now);
       await runAmbient();
-      expect(generateScene).toHaveBeenCalledTimes(3);
+      expect(generateScene).toHaveBeenCalledTimes(4);
       director.stop();
     } finally {
       vi.clearAllTimers();
@@ -5503,7 +5666,7 @@ describe("social director", () => {
     }
   });
 
-  it("restores the unattended publication budget from persisted room history", async () => {
+  it("does not stall an empty community after more than 120 older unattended publications", async () => {
     vi.useFakeTimers();
     try {
       let now = Date.parse("2026-07-16T10:00:00.000Z");
@@ -5540,6 +5703,14 @@ describe("social director", () => {
       const first = makeDirector(firstStore, generateFirst);
       await (first as unknown as { runAmbient: () => Promise<void> }).runAmbient();
       expect(generateFirst).toHaveBeenCalledTimes(1);
+      // Exceed the former server-wide hourly ceiling while leaving the short
+      // publication bucket fully refilled. Research and ordinary posts both
+      // used to contribute to that attendance-specific drought.
+      for (let index = 1; index <= 125; index += 1) {
+        firstStore.addPublicMessage(createMessage("lobby", "ai-mira", `Previous publication ${index}.`, {
+          createdAt: new Date(now - 120_000 - index * 15_000).toISOString(),
+        }), { kind: index % 10 === 0 ? "research" : "ambient", attendance: "unattended" });
+      }
       await firstStore.flush();
       first.stop();
 
@@ -5551,9 +5722,99 @@ describe("social director", () => {
       const restored = makeDirector(restoredStore, generateAfterRestart);
       restored.start();
       await (restored as unknown as { runAmbient: () => Promise<void> }).runAmbient();
-      expect(generateAfterRestart).not.toHaveBeenCalled();
+      expect(generateAfterRestart).toHaveBeenCalledTimes(1);
       restored.stop();
     } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { audience: "unattended", humans: 0 },
+    { audience: "attended", humans: 2 },
+  ])("persists the same continuously refilled publication budget for $audience conversations", async ({ humans }) => {
+    vi.useFakeTimers();
+    const directors: SocialDirector[] = [];
+    try {
+      let now = Date.parse("2026-10-11T16:00:00.000Z");
+      vi.setSystemTime(now);
+      const statePath = `/tmp/director-publication-refill-${process.pid}-${Math.random()}.json`;
+      const makeDirector = (store: RoomStore) => {
+        const director = new SocialDirector(
+          { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+          store,
+          {
+            health: vi.fn(() => ({ connected: true, queueDepth: 0 })),
+            generateScene: vi.fn(async () => []),
+            rememberDeliveredLine: vi.fn(),
+          } as never,
+          new ActorChannelRuntime(), {} as never, {} as never, () => PERSONAS, () => humans,
+          {
+            now: () => now, rng: () => 0, autonomousResearchEnabled: false,
+            ambientTemporalCueChance: 0,
+          },
+        );
+        directors.push(director);
+        return director;
+      };
+      const internals = (director: SocialDirector) => director as unknown as {
+        availableAutonomousMessageSlots: () => number;
+        postPublic: (
+          channelId: string, persona: (typeof PERSONAS)[number], content: string,
+          replyToId: undefined, generation: "lm", sources: [], linkPreview: undefined,
+          autonomousKind: "ambient",
+        ) => ReturnType<typeof createMessage> | undefined;
+      };
+      const firstStore = new RoomStore(statePath);
+      const first = makeDirector(firstStore);
+      first.start();
+      expect(internals(first).availableAutonomousMessageSlots()).toBe(3);
+      const openingTexts = [
+        "The cassette has a wobble that makes the piano sound haunted.",
+        "That goalkeeper saved three penalties with exactly the same feint.",
+        "I would split the migration into independent, reversible steps.",
+      ];
+      openingTexts.forEach((content, index) => {
+        expect(internals(first).postPublic(
+          ["the-pub", "football-talk", "ai-programming"][index]!, PERSONAS[index]!, content,
+          undefined, "lm", [], undefined, "ambient",
+        )).toBeDefined();
+      });
+      expect(internals(first).availableAutonomousMessageSlots()).toBe(0);
+      await firstStore.flush();
+      first.stop();
+
+      const restoredStore = new RoomStore(statePath);
+      await restoredStore.load();
+      const restored = makeDirector(restoredStore);
+      restored.start();
+      expect(internals(restored).availableAutonomousMessageSlots()).toBe(0);
+      now += 5_999;
+      vi.setSystemTime(now);
+      expect(internals(restored).availableAutonomousMessageSlots()).toBe(0);
+      now += 1;
+      vi.setSystemTime(now);
+      expect(internals(restored).availableAutonomousMessageSlots()).toBe(1);
+      expect(internals(restored).postPublic(
+        "world-of-warcraft", PERSONAS[3]!, "The healer cannot interrupt that cast while moving behind the pillar.",
+        undefined, "lm", [], undefined, "ambient",
+      )).toBeDefined();
+      expect(internals(restored).availableAutonomousMessageSlots()).toBe(0);
+      await restoredStore.flush();
+      restored.stop();
+
+      const twiceRestoredStore = new RoomStore(statePath);
+      await twiceRestoredStore.load();
+      const twiceRestored = makeDirector(twiceRestoredStore);
+      twiceRestored.start();
+      // Repeated restarts neither refill the burst nor restart a minute/hour timer.
+      expect(internals(twiceRestored).availableAutonomousMessageSlots()).toBe(0);
+      now += 6_000;
+      vi.setSystemTime(now);
+      expect(internals(twiceRestored).availableAutonomousMessageSlots()).toBe(1);
+    } finally {
+      for (const director of directors) director.stop();
       vi.clearAllTimers();
       vi.useRealTimers();
     }
@@ -5856,7 +6117,7 @@ describe("social director", () => {
     expect(rolls).toBe(0);
   });
 
-  it("keeps a considered idle conversation running in another room while a human writes in Lobby", async () => {
+  it("keeps self-directed room conversation running elsewhere while a human writes in Lobby", async () => {
     const now = Date.parse("2026-07-16T13:00:00.000Z");
     const generateScene = vi.fn(async () => []);
     const human = {
@@ -5906,8 +6167,11 @@ describe("social director", () => {
     expect(generateScene).toHaveBeenCalledTimes(1);
     expect(generateScene).toHaveBeenCalledWith(expect.objectContaining({
       channelId: "ai-programming",
+      kind: "ambient",
+      conversationContext: expect.objectContaining({ phase: "opening" }),
+    }), 4);
+    expect(generateScene).not.toHaveBeenCalledWith(expect.objectContaining({
       conversationMode: "considered",
-      consideredRole: "lead",
     }), 4);
     director.stop();
   });
@@ -6333,7 +6597,7 @@ describe("social director", () => {
       director.stop();
 
       expect(generateScene).toHaveBeenCalledTimes(1);
-      expect(selectedScenes).toEqual([[aya.id, mira.id]]);
+      expect(selectedScenes).toEqual([[aya.id]]);
       expect(store.getRecent("ai-hacking", 10)).toEqual([incoming]);
     } finally {
       vi.clearAllTimers();
@@ -6631,7 +6895,7 @@ describe("social director", () => {
     expect(banter).toContain("table-talk");
   });
 
-  it("finishes a live bounded thread before opening the stalest new room topic", () => {
+  it("gives fresh continuations a small preference without starving a much older quiet room", () => {
     const quietLiveThread = ambientChannelScore({
       idleMinutes: 0,
       rotated: false,
@@ -6644,7 +6908,11 @@ describe("social director", () => {
       hasLiveThread: false,
       random: 1,
     });
-    expect(quietLiveThread).toBeGreaterThan(stalestFreshRoom);
+    const equallyFreshRoom = ambientChannelScore({
+      idleMinutes: 0, rotated: true, hasLiveThread: false, random: 1,
+    });
+    expect(quietLiveThread).toBeGreaterThan(equallyFreshRoom);
+    expect(stalestFreshRoom).toBeGreaterThan(quietLiveThread);
   });
 
   it("starts autonomous research only behind every quiet-time, budget and cooldown gate", () => {
@@ -7831,9 +8099,9 @@ describe("social director", () => {
       availableMessageSlots: (at: number) => number;
       availableAutonomousMessageSlots: (at: number, activity: number) => number;
       aiTimestamps: number[];
-      autonomousAiTimestamps: number[];
     };
     const initialAutonomousSlots = internals.availableAutonomousMessageSlots(now, 50);
+    const initialBudget = store.getAutonomousPublicationBudget();
 
     expect(internals.postPublic(
       "lobby",
@@ -7842,7 +8110,7 @@ describe("social director", () => {
       incoming.id,
     )).toBeDefined();
     expect(internals.aiTimestamps).toEqual([now]);
-    expect(internals.autonomousAiTimestamps).toEqual([]);
+    expect(store.getAutonomousPublicationBudget()).toEqual(initialBudget);
     expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(initialAutonomousSlots);
 
     // Direct, human-triggered traffic may fill the ordinary public limiter,
@@ -7861,12 +8129,16 @@ describe("social director", () => {
       undefined,
       "ambient",
     )).toBeDefined();
-    expect(internals.aiTimestamps).toEqual([now, now, now, now]);
-    expect(internals.autonomousAiTimestamps).toEqual([now]);
+    expect(internals.aiTimestamps).toEqual([now, now, now]);
+    expect(store.getAutonomousPublicationBudget()).toMatchObject({
+      tokens: initialAutonomousSlots - 1, updatedAt: now,
+    });
     expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(initialAutonomousSlots - 1);
 
     // The autonomous limiter itself remains a hard cross-room spam bound.
-    internals.autonomousAiTimestamps.push(now, now);
+    store.setAutonomousPublicationBudget({
+      tokens: 0, updatedAt: now, refillPerMinute: 10, burstCapacity: 3,
+    });
     expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(0);
     expect(internals.postPublic(
       "lobby",
@@ -7878,8 +8150,143 @@ describe("social director", () => {
       undefined,
       "ambient",
     )).toBeUndefined();
-    expect(internals.aiTimestamps).toHaveLength(4);
+    expect(internals.aiTimestamps).toHaveLength(3);
     director.stop();
+  });
+
+  it("does not make a full minute of autonomous discussion consume ordinary human reply capacity", async () => {
+    vi.useFakeTimers();
+    let director: SocialDirector | undefined;
+    try {
+      let now = Date.parse("2026-10-11T17:00:00.000Z");
+      vi.setSystemTime(now);
+      const human = {
+        id: "human-ordinary-capacity", name: "Guest", kind: "human" as const,
+        status: "online" as const, avatar: { color: "#123", accent: "#456", glyph: "G" },
+      };
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const store = new RoomStore(`/tmp/director-independent-budgets-${process.pid}-${Math.random()}.json`);
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        conversationContext?: unknown;
+      }) => request.conversationContext ? [] : [{
+        personaId: request.selected[0]!.id,
+        content: "Yes, that reply should arrive through the ordinary conversation path.",
+        source: "lm" as const, sourceIds: [],
+      }]);
+      director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never, store,
+        {
+          analyzeTurn: vi.fn(async () => classifiedTurn({
+            personas: {
+              addressedIds: [mira.id], requestedReplyIds: [mira.id], relevantIds: [mira.id],
+              addressConfidence: 0.99, relevanceConfidence: 0.99,
+            },
+          })),
+          generateScene, rememberDeliveredLine: vi.fn(),
+        } as never,
+        new ActorChannelRuntime(), {} as never,
+        {
+          getRelation: vi.fn(() => undefined), updateRelation: vi.fn(),
+          promptNote: vi.fn(() => undefined), noteClassifiedMemoryFact: vi.fn(),
+        } as never,
+        () => [human, ...PERSONAS], () => 1,
+        {
+          now: () => now, rng: () => 0.99, autonomousResearchEnabled: false,
+          pageReader: {
+            collectCandidates: vi.fn(() => ({ requestedAt: new Date(now).toISOString(), candidates: [] })),
+          } as never,
+        },
+      );
+      const internals = director as unknown as {
+        postPublic: (
+          channelId: string, persona: (typeof PERSONAS)[number], content: string,
+          replyToId: undefined, generation: "lm", sources: [], preview: undefined,
+          autonomousKind: "ambient",
+        ) => ReturnType<typeof createMessage> | undefined;
+        availableMessageSlots: (at: number) => number;
+        aiTimestamps: number[];
+        priorityHumanReplyTimestamps: number[];
+        handleHumanBurst: (messages: Array<ReturnType<typeof createMessage>>, member: typeof human) => Promise<void>;
+      };
+      const thoughts = [
+        "The cassette wobble makes that piano sound haunted.",
+        "A shared database migration needs a reversible first step.",
+        "Their keeper waited until the last moment before moving.",
+        "The plush looks better with slightly uneven stitching.",
+        "I would put the sky behind the model on a separate layer.",
+        "That side quest should reward exploration instead of grinding.",
+        "The last scene works better without explaining the monster.",
+        "The synth envelope matters more here than the waveform.",
+        "A narrow counterexample is stronger than another broad slogan.",
+        "The pub sign could use a warmer light after sunset.",
+      ];
+      for (const [index, content] of thoughts.entries()) {
+        if (index > 0) now += 6_000;
+        vi.setSystemTime(now);
+        expect(internals.postPublic(
+          "the-pub", PERSONAS[index]!, content, undefined, "lm", [], undefined, "ambient",
+        )).toBeDefined();
+      }
+      expect(store.getRecent("the-pub", 20)).toHaveLength(10);
+      expect(internals.aiTimestamps).toEqual([]);
+      expect(internals.availableMessageSlots(now)).toBe(3);
+
+      const incoming = createMessage("lobby", human.id, "@Mira can you answer me?", {
+        createdAt: new Date(now).toISOString(),
+      });
+      store.addPublicMessage(incoming);
+      const pending = internals.handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync();
+      await pending;
+      expect(store.getRecent("lobby", 10).some((message) =>
+        message.authorId === mira.id && message.replyToId === incoming.id,
+      )).toBe(true);
+      expect(internals.priorityHumanReplyTimestamps).toEqual([]);
+      expect(internals.aiTimestamps).toHaveLength(1);
+    } finally {
+      director?.stop();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a durably deferred autonomous feed publication outside the human reply budget", async () => {
+    const now = Date.parse("2026-10-11T17:15:00.000Z");
+    const store = new RoomStore(`/tmp/director-deferred-autonomous-budget-${process.pid}-${Math.random()}.json`);
+    const director = new SocialDirector(
+      { to: vi.fn(() => ({ emit: vi.fn() })) } as never, store,
+      { rememberDeliveredLine: vi.fn() } as never,
+      new ActorChannelRuntime(), {} as never, {} as never, () => PERSONAS, () => 1,
+      { now: () => now },
+    );
+    const internals = director as unknown as {
+      postPublic: (
+        channelId: string, persona: (typeof PERSONAS)[number], content: string,
+        replyToId: undefined, generation: "lm", sources: [], preview: undefined,
+        autonomousKind: "ambient", requiredReply: boolean, deferBroadcast: boolean,
+      ) => ReturnType<typeof createMessage> | undefined;
+      flushDurablePublicMessageBeforeBroadcast: (message: ReturnType<typeof createMessage>) => Promise<void>;
+      availableAutonomousMessageSlots: (at: number, activity: number) => number;
+      aiTimestamps: number[];
+    };
+    try {
+      const posted = internals.postPublic(
+        "stock-market", PERSONAS[0]!, "The two reported sessions are moving in different directions.",
+        undefined, "lm", [], undefined, "ambient", false, true,
+      );
+      expect(posted).toBeDefined();
+      expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(2);
+      expect(internals.aiTimestamps).toEqual([]);
+      await internals.flushDurablePublicMessageBeforeBroadcast(posted!);
+      expect(internals.aiTimestamps).toEqual([]);
+      expect(internals.availableAutonomousMessageSlots(now, 50)).toBe(2);
+      expect(store.getAutonomousPublicationHistory()).toEqual([
+        expect.objectContaining({ messageId: posted!.id, kind: "ambient", attendance: "attended" }),
+      ]);
+    } finally {
+      director.stop();
+    }
   });
 
   it("assigns one accountable resident to an unaddressed expected request and requires completion now", async () => {
@@ -7900,7 +8307,8 @@ describe("social director", () => {
         mustReplyIds: string[];
         requestOwnerIds: string[];
         premise?: string;
-      }) => [{
+        conversationContext?: unknown;
+      }) => request.conversationContext ? [] : [{
         personaId: request.selected[0]!.id,
         content: "Jag har städer men inga hus, skogar men inga träd och vatten men inga fiskar. Vad är jag?",
         source: "lm" as const,
@@ -7939,7 +8347,7 @@ describe("social director", () => {
       await vi.runAllTimersAsync();
       await pending;
 
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(generateScene.mock.calls.filter(([request]) => !request.conversationContext)).toHaveLength(1);
       const request = generateScene.mock.calls[0]![0];
       expect(request.mustReplyIds).toContain(request.selected[0]?.id);
       expect(request.requestOwnerIds).toEqual([request.selected[0]?.id]);
@@ -7982,12 +8390,13 @@ describe("social director", () => {
         selected: Array<(typeof PERSONAS)[number]>;
         mustReplyIds: string[];
         requestOwnerIds: string[];
+        conversationContext?: unknown;
         currentDiscourseContext?: {
           resolution: string;
           participants: Array<{ id: string }>;
           focus: Array<{ messageId: string }>;
         };
-      }) => [{
+      }) => request.conversationContext ? [] : [{
         personaId: request.requestOwnerIds[0]!,
         content: "Japp! Exakt, det är en karta 😄",
         source: "lm" as const,
@@ -8042,7 +8451,7 @@ describe("social director", () => {
       await vi.runAllTimersAsync();
       await pending;
 
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(generateScene.mock.calls.filter(([request]) => !request.conversationContext)).toHaveLength(1);
       const request = generateScene.mock.calls[0]![0];
       expect(request.selected[0]?.id).toBe(mira.id);
       expect(request.requestOwnerIds).toEqual([mira.id]);
@@ -8088,7 +8497,8 @@ describe("social director", () => {
       const generateScene = vi.fn(async (request: {
         selected: Array<(typeof PERSONAS)[number]>;
         requestOwnerIds: string[];
-      }) => [{
+        conversationContext?: unknown;
+      }) => request.conversationContext ? [] : [{
         personaId: request.requestOwnerIds[0]!,
         content: "Okej, min take är att detaljerna måste gå att verifiera.",
         source: "lm" as const,
@@ -8159,7 +8569,7 @@ describe("social director", () => {
       await vi.runAllTimersAsync();
       await pending;
 
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(generateScene.mock.calls.filter(([request]) => !request.conversationContext)).toHaveLength(1);
       expect(generateScene.mock.calls[0]?.[0].requestOwnerIds).toEqual([sana.id]);
       expect(store.getRecent("lobby", 1)[0]).toMatchObject({
         authorId: sana.id,
@@ -8229,7 +8639,8 @@ describe("social director", () => {
       const generateScene = vi.fn(async (request: {
         selected: Array<(typeof PERSONAS)[number]>;
         trigger?: { authorKind?: string };
-      }) => [{
+        conversationContext?: unknown;
+      }) => request.conversationContext ? [] : [{
         personaId: request.selected[0]!.id,
         content: "Use a short lease plus an append-only decision log; either one alone leaves a nasty blind spot.",
         source: "lm" as const,
@@ -9146,8 +9557,12 @@ describe("social director", () => {
       const emitted: Array<{ event: string; payload: unknown }> = [];
       const emit = vi.fn((event: string, payload: unknown) => emitted.push({ event, payload }));
       let selectedIds: string[] = [];
-      const generateScene = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => {
-        selectedIds = request.selected.map((persona) => persona.id);
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        conversationContext?: unknown;
+      }) => {
+        selectedIds.push(...request.selected.map((persona) => persona.id));
+        if (request.conversationContext) return [];
         return [{
           personaId: request.selected[0]!.id,
           content: "Jag gillar riktningen, men den behöver ett konkret test först.",
@@ -9190,6 +9605,8 @@ describe("social director", () => {
       await pending;
 
       expect(selectedIds).toHaveLength(2);
+      expect(generateScene.mock.calls.map(([request]) => request.selected.length)).toEqual([1, 1]);
+      expect(generateScene.mock.calls[1]?.[0].conversationContext).toBeDefined();
       const typingEvents = emitted.filter((entry) => entry.event === "typing:member") as Array<{
         event: string;
         payload: { memberId: string; active: boolean };
@@ -9238,11 +9655,14 @@ describe("social director", () => {
       const emitted: Array<{ event: string; payload: unknown }> = [];
       const emit = vi.fn((event: string, payload: unknown) => emitted.push({ event, payload }));
       let selectedIds: string[] = [];
-      const generateScene = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => {
-        selectedIds = request.selected.map((persona) => persona.id);
-        return request.selected.map((persona, index) => ({
+      const generateScene = vi.fn(async (request: {
+        selected: Array<(typeof PERSONAS)[number]>;
+        conversationContext?: unknown;
+      }) => {
+        selectedIds.push(...request.selected.map((persona) => persona.id));
+        return request.selected.map((persona) => ({
           personaId: persona.id,
-          content: index === 0
+          content: !request.conversationContext
             ? "Jag gillar riktningen, särskilt om vi testar den på riktigt."
             : "Jag köper målet, men vad skulle faktiskt motbevisa idén?",
           source: "lm" as const,
@@ -9286,6 +9706,13 @@ describe("social director", () => {
       await pending;
 
       expect(selectedIds).toHaveLength(2);
+      expect(generateScene.mock.calls.map(([request]) => request.selected.length)).toEqual([1, 1]);
+      expect(generateScene.mock.calls[1]?.[0]).toMatchObject({
+        conversationContext: expect.any(Object),
+        history: expect.arrayContaining([
+          expect.objectContaining({ content: "Jag gillar riktningen, särskilt om vi testar den på riktigt." }),
+        ]),
+      });
       const publicEvents = emitted.filter((entry) =>
         entry.event === "typing:member" || entry.event === "message:new",
       );
@@ -9375,7 +9802,6 @@ describe("social director", () => {
       );
 
       const pending = (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
-      await vi.advanceTimersByTimeAsync(10_000);
       await pending;
 
       expect(selectedIds).toHaveLength(1);
@@ -9444,6 +9870,7 @@ describe("social director", () => {
             content: acceptedLines[tick]!,
             source: "lm" as const,
             sourceIds: [],
+            replyToMessageId: store.getRecent("lobby", 1)[0]?.id,
           },
           {
             personaId: unselected.id,
@@ -9522,9 +9949,14 @@ describe("social director", () => {
       expect(requests[1]?.selectedIds[0]).not.toBe(requests[0]?.selectedIds[0]);
       expect(requests[1]?.history.map((line) => line.content)).toContain(acceptedLines[0]);
       expect(requests[1]?.history.map((line) => line.content)).not.toContain(discardedDraft);
-      expect(requests[1]?.ambientAction).toMatchObject({
-        turnIndex: 1,
-        targetMessageId: messages[0]?.id,
+      expect(requests[1]?.ambientAction).toEqual({});
+      expect(generateScene.mock.calls[1]?.[0]).toMatchObject({
+        mustReplyIds: [],
+        conversationContext: {
+          phase: "continuation",
+          latestMessageId: messages[0]?.id,
+          publishedTurns: [expect.objectContaining({ messageId: messages[0]?.id, content: acceptedLines[0] })],
+        },
       });
       expect(messages[1]?.replyToId).toBe(messages[0]?.id);
 
@@ -9585,6 +10017,7 @@ describe("social director", () => {
         content: "Att lägga fram allt kvällen innan. Tråkigt svar, men det räddar min morgon varje gång.",
         source: "lm" as const,
         sourceIds: [],
+        replyToMessageId: hook.id,
       }]);
       const director = new SocialDirector(
         { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
@@ -9643,10 +10076,14 @@ describe("social director", () => {
       await internals.runAmbient();
 
       expect(generateScene).toHaveBeenCalledTimes(1);
-      expect(generateScene.mock.calls[0]?.[0].ambientAction).toMatchObject({
-        kind: "respond_to_hook",
-        turnIndex: 1,
-        targetMessageId: hook.id,
+      expect(generateScene.mock.calls[0]?.[0].ambientAction).toBeUndefined();
+      expect(generateScene.mock.calls[0]?.[0]).toMatchObject({
+        mustReplyIds: [],
+        conversationContext: {
+          phase: "continuation",
+          latestMessageId: hook.id,
+          publishedTurns: [expect.objectContaining({ messageId: hook.id, content: hook.content })],
+        },
       });
       expect(store.getRecent("lobby", 1)[0]).toMatchObject({
         replyToId: hook.id,
@@ -9814,10 +10251,10 @@ describe("social director", () => {
       expect(requests).toHaveLength(2);
       expect(requests[1]?.selectedIds).toHaveLength(1);
       expect(requests[1]?.selectedIds[0]).not.toBe(openingLeadId);
-      expect(requests[1]?.ambientAction).toMatchObject({
-        kind: "source_followup",
-        turnIndex: 1,
-        targetMessageId: lead.id,
+      expect(requests[1]?.ambientAction).toEqual({});
+      expect(generateScene.mock.calls[1]?.[0]).toMatchObject({
+        mustReplyIds: [],
+        conversationContext: { phase: "continuation", latestMessageId: lead.id },
       });
       expect(requests[1]?.history.map((line) => line.content)).toContain(lead.content);
       expect(requests[1]?.history.map((line) => line.content)).not.toContain(reviewedAwayDraft);
@@ -9826,14 +10263,22 @@ describe("social director", () => {
         results: [{ id: "S1", url: sourceUrl }],
       });
       expect(store.getRecent(channel.id, 10)).toEqual([lead]);
-      expect(thread).toMatchObject({ closeReason: "model_rejected", messageCount: 1 });
+      expect(thread).toMatchObject({ messageCount: 1 });
+      expect(thread.closeReason).toBeUndefined();
+      expect(thread.quietCandidateIds).toHaveLength(1);
       expect(thread.pendingBeat).toBeUndefined();
+      expect(ledger.current(channel.id)?.status).toBe("current");
+      now += 120_000;
+      vi.setSystemTime(now);
+      await internals.runAmbient();
+      expect(thread.quietCandidateIds).toHaveLength(2);
+      expect(thread.closeReason).toBe("natural");
       expect(ledger.current(channel.id)).toBeUndefined();
       expect(ledger.recent(channel.id, 1)[0]).toMatchObject({
         messageIds: [lead.id],
         sourceUrls: [sourceUrl],
         status: "closed",
-        closeReason: "model_rejected",
+        closeReason: "natural",
       });
       director.stop();
     } finally {
@@ -10007,6 +10452,124 @@ describe("social director", () => {
     }
   });
 
+  it("backs off repeated generation errors without voting quiet and resumes the committed conversation", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = Date.parse("2026-10-11T14:00:00.000Z");
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const bosse = PERSONAS.find((persona) => persona.id === "ai-bosse")!;
+      const store = new RoomStore("/tmp/director-ambient-execution-failure-unused.json");
+      const prior = createMessage("lobby", mira.id, "Which part of that experiment would you test first?", {
+        createdAt: new Date(now).toISOString(),
+      });
+      store.addPublicMessage(prior);
+      let attempts = 0;
+      const generateScene = vi.fn(async (request: { selected: Array<(typeof PERSONAS)[number]> }) => {
+        attempts += 1;
+        if (attempts <= 2) throw new Error("Model response was empty after its reasoning budget");
+        return [{
+          personaId: request.selected[0]!.id,
+          content: "I'd disconnect the network first. A clean recovery matters more than a perfect demo.",
+          source: "lm" as const,
+          sourceIds: [],
+          replyToMessageId: prior.id,
+        }];
+      });
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { health: vi.fn(() => ({ connected: true, queueDepth: 0 })), generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(), {} as never, {} as never, () => PERSONAS, () => 1,
+        {
+          now: () => now, rng: () => 0.99, consideredConversationChance: 0,
+          autonomousResearchEnabled: false, ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "lobby" ? 50 : 0,
+            competence: 50, aggression: 25, explicitness: 50,
+          }),
+        },
+      );
+      const thread: AmbientThreadState = {
+        seed: "Continue the published experiment discussion.", messageCount: 1,
+        lastMessageId: prior.id, lastAuthorId: mira.id, participantIds: [mira.id],
+        quietCandidateIds: [bosse.id], debateBeat: false, languageHint: "en",
+        origin: "human_topic", openedAt: now, updatedAt: now,
+      };
+      const internals = director as unknown as {
+        runAmbient: () => Promise<void>;
+        ambientThreads: Map<string, AmbientThreadState>;
+        ambientBackoffUntilByChannel: Map<string, number>;
+      };
+      internals.ambientThreads.set("lobby", thread);
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        await internals.runAmbient();
+        expect(generateScene).toHaveBeenCalledTimes(attempt);
+        expect(internals.ambientThreads.get("lobby")).toBe(thread);
+        expect(thread).toMatchObject({ messageCount: 1, lastMessageId: prior.id, quietCandidateIds: [bosse.id] });
+        expect(thread.closedAt).toBeUndefined();
+        expect(thread.nextEligibleAt).toBe(now + 60_000);
+        expect(internals.ambientBackoffUntilByChannel.get("lobby")).toBe(thread.nextEligibleAt);
+        expect(store.getRecent("lobby", 10)).toEqual([prior]);
+        await internals.runAmbient();
+        expect(generateScene).toHaveBeenCalledTimes(attempt);
+        now += 60_001;
+      }
+      await internals.runAmbient();
+      expect(generateScene).toHaveBeenCalledTimes(3);
+      expect(thread.messageCount).toBe(2);
+      expect(thread.quietCandidateIds).toEqual([]);
+      expect(thread.closedAt).toBeUndefined();
+      expect(internals.ambientBackoffUntilByChannel.has("lobby")).toBe(false);
+      expect(store.getRecent("lobby", 10).at(-1)).toMatchObject({ replyToId: prior.id });
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not back off a newer room event when an invalidated ambient generation rejects", async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.parse("2026-10-11T14:00:00.000Z");
+      let rejectGeneration: ((error: Error) => void) | undefined;
+      const generateScene = vi.fn(() => new Promise<never>((_resolve, reject) => { rejectGeneration = reject; }));
+      const store = new RoomStore("/tmp/director-ambient-failure-race-unused.json");
+      const director = new SocialDirector(
+        { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
+        store,
+        { health: vi.fn(() => ({ connected: true, queueDepth: 0 })), generateScene, rememberDeliveredLine: vi.fn() } as never,
+        new ActorChannelRuntime(), {} as never, {} as never, () => PERSONAS, () => 1,
+        {
+          now: () => now, rng: () => 0.99, consideredConversationChance: 0,
+          autonomousResearchEnabled: false, ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "lobby" ? 50 : 0,
+            competence: 50, aggression: 25, explicitness: 50,
+          }),
+        },
+      );
+      const internals = director as unknown as {
+        runAmbient: () => Promise<void>;
+        noteHumanChannelEvent: (message: ReturnType<typeof createMessage>) => void;
+        ambientBackoffUntilByChannel: Map<string, number>;
+      };
+      const pending = internals.runAmbient();
+      await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(1));
+      const incoming = createMessage("lobby", "human-newer", "A new question for the room.");
+      store.addPublicMessage(incoming);
+      internals.noteHumanChannelEvent(incoming);
+      rejectGeneration!(new Error("A late provider failure"));
+      await pending;
+      expect(internals.ambientBackoffUntilByChannel.has("lobby")).toBe(false);
+      expect(store.getRecent("lobby", 10)).toEqual([incoming]);
+      director.stop();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("waits instead of letting the same resident continue an autonomous thread alone", async () => {
     vi.useFakeTimers();
     try {
@@ -10035,6 +10598,10 @@ describe("social director", () => {
           consideredConversationChance: 0,
           autonomousResearchEnabled: false,
           ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "lobby" ? 50 : 0,
+            autonomousLinkFrequency: 0, competence: 50, aggression: 25, explicitness: 50,
+          }),
         },
       );
       const thread: AmbientThreadState = {
@@ -10121,6 +10688,10 @@ describe("social director", () => {
           consideredConversationChance: 0,
           autonomousResearchEnabled: false,
           ambientTemporalCueChance: 0,
+          behaviorTuningProvider: (channelId) => ({
+            activity: channelId === undefined || channelId === "lobby" ? 50 : 0,
+            autonomousLinkFrequency: 0, competence: 50, aggression: 25, explicitness: 50,
+          }),
         },
       );
       const thread: AmbientThreadState = {
@@ -10161,9 +10732,10 @@ describe("social director", () => {
     const runtime = new ActorChannelRuntime();
     const actor = runtime.candidatesFor("lobby").find((persona) => persona.id !== "ai-runa")!;
     let autonomousLinkFrequency = 60;
+    const store = new RoomStore("/tmp/director-autonomous-gates-unused.json");
     const director = new SocialDirector(
       { to: vi.fn(() => ({ emit: vi.fn() })) } as never,
-      new RoomStore("/tmp/director-autonomous-gates-unused.json"),
+      store,
       { health: vi.fn(() => ({ connected: true, queueDepth })) } as never,
       runtime,
       {} as never,
@@ -10198,7 +10770,6 @@ describe("social director", () => {
       };
       lastHumanMessageAtByChannel: Map<string, number>;
       lastSpoke: Map<string, number>;
-      autonomousAiTimestamps: number[];
       autonomousResearchSuccessTimestamps: number[];
     };
     const safe = () => internals.autonomousResearchIsStillSafe("lobby", 0, [actor], 1);
@@ -10231,9 +10802,13 @@ describe("social director", () => {
     internals.autonomousResearchSuccessTimestamps.push(...Array.from({ length: 24 }, () => now));
     expect(safe()).toBe(false);
     internals.autonomousResearchSuccessTimestamps.length = 0;
-    internals.autonomousAiTimestamps.push(now, now, now);
+    store.setAutonomousPublicationBudget({
+      tokens: 0, updatedAt: now, refillPerMinute: 10, burstCapacity: 3,
+    });
     expect(safe()).toBe(false);
-    internals.autonomousAiTimestamps.length = 0;
+    store.setAutonomousPublicationBudget({
+      tokens: 3, updatedAt: now, refillPerMinute: 10, burstCapacity: 3,
+    });
     internals.lastSpoke.set(actor.id, now);
     expect(safe()).toBe(false);
     internals.lastSpoke.delete(actor.id);
@@ -10386,8 +10961,7 @@ describe("social director", () => {
         ambientTimer?: NodeJS.Timeout;
       };
       const pending = internals.runAmbient();
-      await Promise.resolve();
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(1));
       director.stop();
       resolveScene?.([{
         personaId: selectedId,
@@ -10447,7 +11021,7 @@ describe("social director", () => {
         },
       );
       const pending = (director as unknown as { runAmbient: () => Promise<void> }).runAmbient();
-      await Promise.resolve();
+      await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(1));
       expect(selectedId).not.toBe("");
       director.setActiveVoicePersonaIds([selectedId]);
       resolveScene?.([{
@@ -10687,8 +11261,7 @@ describe("social director", () => {
         channelEpoch: Map<string, number>;
       };
       const pending = internals.runAmbient();
-      await Promise.resolve();
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(generateScene).toHaveBeenCalledTimes(1));
       expect(internals.ambientThreads.size).toBeGreaterThan(0);
       director.reconcileCatalog();
       expect(internals.ambientThreads.size).toBe(0);
@@ -11371,7 +11944,9 @@ describe("social director", () => {
         selected: Array<(typeof PERSONAS)[number]>;
         history: Array<{ author: string; kind: string; content: string }>;
         channelFeedContext?: { publisherName: string; content: string; updatedAt: string };
+        conversationContext?: unknown;
       }) => {
+        if (request.conversationContext) return [];
         sceneRequests.push({
           history: request.history.map((line) => ({ ...line })),
           channelFeedContext: request.channelFeedContext
@@ -11431,7 +12006,7 @@ describe("social director", () => {
       await vi.runAllTimersAsync();
       await pending;
 
-      expect(generateScene).toHaveBeenCalledTimes(1);
+      expect(generateScene.mock.calls.filter(([request]) => !request.conversationContext)).toHaveLength(1);
       expect(channelFeedFacts).toHaveBeenCalledWith("stock-market");
       expect(analyzeTurn).toHaveBeenCalledWith(
         expect.objectContaining({

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildConversationContext, CONVERSATION_PROGRESS_REVIEW_GUIDANCE } from "./conversationFlow.js";
 import {
   buildCandidateReviewResponseFormat,
   buildCandidateReviewSystemPrompt,
@@ -3169,6 +3170,135 @@ const reviewInput = (): NormalizedCandidateReviewInput => candidateReviewInputSc
   ],
 });
 
+describe("semantic progress across the committed exchange", () => {
+  const conversationInput = (
+    turns: string[],
+    candidates: string[],
+    languageTag = "es",
+  ): NormalizedCandidateReviewInput => {
+    const base = reviewInput();
+    return candidateReviewInputSchema.parse({
+      ...base,
+      sceneKind: "ambient",
+      trigger: null,
+      semanticContext: { ...base.semanticContext, languageTag },
+      evidence: { outcome: "none", kind: null, query: null, results: [] },
+      conversationContext: buildConversationContext({
+        phase: "continuation",
+        rootMessageId: turns.length ? "published-0" : undefined,
+        messages: turns.map((content, index) => ({
+          messageId: `published-${index}`,
+          authorId: `peer-${index % 2}`,
+          author: `Peer ${index % 2}`,
+          kind: "ai",
+          content,
+          createdAt: new Date(Date.UTC(2026, 6, 14, 11, 59, index)).toISOString(),
+        })),
+      }),
+      candidates: candidates.map((content, index) => ({
+        ...base.candidates[index % base.candidates.length],
+        content,
+        sourceIds: [],
+        selectionOrder: index,
+      })),
+    });
+  };
+
+  it("passes bounded, exact multi-turn context to the existing review without synthesizing a script", () => {
+    const turns = [
+      "El menú me muestra cinco tipos de suscripción y no sé cuál incluye las películas.",
+      "Al final la comodidad siempre tiene un coste.",
+      "Sí, es el equilibrio entre comodidad y control.",
+      "Lo importante es saber qué sacrificas por esa comodidad.",
+    ];
+    const input = conversationInput(turns, ["Hay que encontrar el balance entre facilidad y autonomía."]);
+    const projected = buildCandidateReviewUserData(input) as NormalizedCandidateReviewInput;
+    expect(projected.conversationContext?.publishedTurns.map((turn) => turn.content)).toEqual(turns);
+    expect(projected.conversationContext?.publishedTurns.map((turn) => turn.authorId)).toEqual([
+      "peer-0", "peer-1", "peer-0", "peer-1",
+    ]);
+    expect(buildCandidateReviewSystemPrompt()).toContain(CONVERSATION_PROGRESS_REVIEW_GUIDANCE);
+    expect(CONVERSATION_PROGRESS_REVIEW_GUIDANCE).toContain("not just a pair of adjacent sentences");
+    expect(CONVERSATION_PROGRESS_REVIEW_GUIDANCE).toContain("A new noun, metaphor or sentence shape does not by itself make a new contribution");
+    expect(CONVERSATION_PROGRESS_REVIEW_GUIDANCE).toContain("Bind that judgment to what supplied published turns actually say");
+    expect(CONVERSATION_PROGRESS_REVIEW_GUIDANCE).toContain("not words, length or a fixed number of turns");
+    expect(buildCandidateReviewSystemPrompt()).toContain("cuts off before conveying a recoverable conversational act");
+    expect(buildCandidateReviewSystemPrompt()).toContain("Informal fragments, expressive hesitation, playful suspense and incomplete grammar are clean");
+    expect(buildCandidateReviewSystemPrompt()).toContain("do not require a full sentence, terminal punctuation or a particular length");
+  });
+
+  it.each([
+    {
+      languageTag: "es",
+      turns: ["Todo es equilibrar comodidad y control.", "Exacto, siempre eliges entre libertad y facilidad."],
+      candidates: ["La clave es equilibrar autonomía y sencillez.", "La facilidad siempre implica ceder algo de control."],
+    },
+    {
+      languageTag: "ja",
+      turns: ["便利さを取ると自由が減るんだよね。", "結局、手軽さと自分で決めることの釣り合いだね。"],
+      candidates: ["大事なのは便利さと自由のバランスだと思う。", "楽になる分、自分で選べる範囲は狭くなるね。"],
+    },
+  ])("does not promote either draft when the reviewer flags two repetitions of published peers in $languageTag", ({
+    turns, candidates, languageTag,
+  }) => {
+    const input = conversationInput(turns, candidates, languageTag);
+    const verdict = {
+      reviews: input.candidates.map((candidate) => ({
+        personaId: candidate.personaId,
+        severity: "high",
+        issues: ["peer_echo"],
+        rewriteInstruction: "Respond to the particular unresolved situation rather than restating the shared verdict.",
+        sameSceneOverlap: "pure_duplicate",
+        ...undeterminedOutputLanguage,
+      })),
+    };
+    // Meaning is classified by Gemma, not by this fixture's text or any parser
+    // heuristic. This test ensures orchestration preserves that classification.
+    expect(parseCandidateReviewContent(JSON.stringify(verdict), input)).toEqual(verdict);
+  });
+
+  it("still retains a stable anchor for a duplicate pair when no committed peer exists", () => {
+    const input = conversationInput([], ["La comodidad tiene un coste.", "La facilidad siempre tiene un precio."]);
+    const verdict = {
+      reviews: input.candidates.map((candidate) => ({
+        personaId: candidate.personaId,
+        severity: "high",
+        issues: ["peer_echo"],
+        rewriteInstruction: "Make a different conversational contribution.",
+        sameSceneOverlap: "pure_duplicate",
+        ...undeterminedOutputLanguage,
+      })),
+    };
+    expect(parseCandidateReviewContent(JSON.stringify(verdict), input)?.reviews).toMatchObject([
+      { personaId: input.candidates[0].personaId, severity: "none", issues: [] },
+      { personaId: input.candidates[1].personaId, severity: "high", issues: ["peer_echo"] },
+    ]);
+  });
+
+  it.each([
+    { name: "brief chorus", turn: "Eso me agota también.", candidate: "uf, a mí también", overlap: "brief_social_chorus" },
+    { name: "specific concession", turn: "Sin la suscripción no puedes descargarla para el tren.", candidate: "Ah, tienes razón: para el tren sí me sirve pagarla.", overlap: "substantive_overlap" },
+    { name: "concrete progression", turn: "El menú mezcla alquileres y películas incluidas.", candidate: "Yo pondría un filtro de incluidas que se quede activado, no cinco pestañas nuevas.", overlap: "none" },
+    { name: "useful clarification", turn: "Me molesta que ya no se pueda elegir.", candidate: "¿Elegir el plan o la película?", overlap: "none" },
+  ])("preserves a clean semantic verdict for $name without requiring fresh evidence or a new topic", ({ turn, candidate, overlap }) => {
+    const input = conversationInput([turn], [candidate]);
+    const verdict = {
+      reviews: [{
+        personaId: input.candidates[0].personaId,
+        severity: "none",
+        issues: [],
+        rewriteInstruction: null,
+        sameSceneOverlap: overlap,
+        ...undeterminedOutputLanguage,
+      }],
+    };
+    expect(parseCandidateReviewContent(JSON.stringify(verdict), input)).toEqual(verdict);
+    expect(CONVERSATION_PROGRESS_REVIEW_GUIDANCE).toContain("Brief assent, shared amusement, emotional resonance and ordinary social chorus remain clean");
+    expect(CONVERSATION_PROGRESS_REVIEW_GUIDANCE).toContain("An abstract observation, first useful summary or necessary clarification is not inherently a defect");
+    expect(CONVERSATION_PROGRESS_REVIEW_GUIDANCE).toContain("never demand fabricated specifics");
+  });
+});
+
 describe("candidate review transcript participant kinds", () => {
   it("accepts an owner-operated external agent in recent and recalled room history", () => {
     const base = reviewInput();
@@ -4110,6 +4240,7 @@ describe("multilingual batch candidate-review contract", () => {
       claimStrength: 0.6,
     });
     expect(parsed.candidates[0].surfaceStylePlan).toEqual({
+      selfDirected: false,
       visibleAffect: true,
       surfaceTexture: "stretched-emphasis",
       stanceIntensity: "ordinary",

@@ -158,6 +158,14 @@ export type PersonaExplicitnessTarget = (typeof PERSONA_EXPLICITNESS_TARGETS)[nu
 
 export interface PersonaStylePromptOptions {
   medium?: "text" | "voice";
+  /**
+   * Opt-in for resident-led text conversation. Stable traits are preferences,
+   * while the actual exchange decides questions, emotion and surface texture.
+   * Ignores turnKey and the ending/affect/texture choreography overrides, but
+   * retains the supplied hard length ceiling and admin stance/explicitness.
+   * Voice always uses the existing spoken turn contract.
+   */
+  selfDirected?: boolean;
   /** Stable, scene-scoped key. Supplying it activates a deterministic per-turn budget. */
   turnKey?: string;
   /** Explicit scene roles may narrow the deterministic ending budget. */
@@ -334,6 +342,42 @@ const surfaceDistributionNote = (style: PersonaStyleFingerprint): string => {
   return `${affectFrequency} ${textureFrequency} Possible moves: ${palette}`;
 };
 
+const selfDirectedExplicitnessNote = (target: PersonaExplicitnessTarget): string => {
+  if (target === "clean") return explicitnessTargetNote(target);
+  if (target === "coarse" || target === "strong") {
+    return `The room permits ${target === "strong" ? "strong" : "coarse"} adult language as non-targeted emphasis when a real reaction calls for it. Let that permission affect the register without inventing anger or inserting a swear to satisfy a quota. Never force profanity, turn it into targeted abuse, or let it displace the point.`;
+  }
+  return explicitnessTargetNote(target);
+};
+
+const selfDirectedStyleNote = (
+  persona: StyledPersonaLike,
+  options: PersonaStylePromptOptions,
+): string => {
+  const style = persona.style;
+  const explicitness = options.explicitnessTarget ?? "persona";
+  const habits = style.conversationHabits.map((habit) => `“${habit}”`).join("; ");
+  const textures = style.surfaceTexturePalette
+    .filter((texture) => explicitness !== "clean" || texture !== "mild-profanity")
+    .map((texture) => surfaceTextureNotes[texture]).join(" ");
+  const avoid = style.avoidPhrases.map((phrase) => `“${phrase}”`).join(", ");
+  return `Stable voice for ${persona.name}:
+- Length preference: usually ${style.typicalWords[0]}–${Math.min(style.typicalWords[1], style.hardMaxWords)} words and ${style.typicalSentences[0]}–${style.typicalSentences[1]} sentence(s), not a compulsory range or shape. Let the actual thought be shorter or occasionally longer; do not pad a reaction or compress a developed point merely to hit the usual range. Hard maximum ${style.hardMaxWords} words.
+- Casing/punctuation: ${casingNotes[style.casing]} ${punctuationNotes[style.punctuation]}
+- Emoji: ${emojiNote(style)} These are long-run tendencies, never a quota or a per-turn lottery.
+- Thought density: ${complexityNote(style.complexityAppetite)}
+- Corrections: ${correctionNotes[style.correctionMode]}
+- Disagreement: ${disagreementNotes[style.disagreementMode]}
+- Context-led expression: choose whether to ask, react, show a feeling, reconsider or stay quiet from this actual exchange. A genuine question is allowed whenever curiosity or necessary clarification calls for it; never append one merely to keep chat going. If the scene does not require an answer and you have nothing worthwhile to add, silence is valid.
+- Affect and texture tendencies: visible affect ${Math.round(style.visibleAffectRate * 100)}%; informal texture ${Math.round(style.surfaceTextureRate * 100)}%. These describe this voice over time, not required features or bans on any single turn. Let a supported feeling show naturally without inventing emotion or biography. Possible texture: ${textures || "plain wording is natural for this voice."} Never force a typo, stretched spelling, gimmick or emotional performance.
+- Optional habits: ${habits || "none"}. They are tendencies, not assigned moves; do not select one just because it is listed or repeat it as a catchphrase.
+- Admin stance: ${stanceIntensityNote(options.stanceIntensity ?? "ordinary")}
+- Admin explicitness: ${selfDirectedExplicitnessNote(explicitness)}
+- Avoid generic service-assistant validation, recap and transition language in any language. Persona-specific crutches to avoid: ${avoid}.
+- Surface texture belongs only in ordinary prose. Never alter or misspell names, handles, code, URLs, source identifiers, numbers, quoted literals or technical tokens.
+- Do not perform every trait every time, announce the style, reuse the same opening, or copy another resident's rhythm.`;
+};
+
 /**
  * Produces a compact, stable writing contract for a local model. The final line is
  * deliberately anti-mimicry: traits are distributions, not boxes to tick in every turn.
@@ -342,6 +386,7 @@ export const buildPersonaStylePromptNote = (
   persona: StyledPersonaLike,
   options: PersonaStylePromptOptions = {},
 ): string => {
+  if (options.selfDirected && options.medium !== "voice") return selfDirectedStyleNote(persona, options);
   const style = persona.style;
   const maxWords = options.medium === "voice" ? Math.min(25, style.hardMaxWords) : style.hardMaxWords;
   const habits = style.conversationHabits.map((habit) => `“${habit}”`).join("; ");

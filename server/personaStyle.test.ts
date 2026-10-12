@@ -298,3 +298,92 @@ describe("persona style fingerprints", () => {
     expect(note).not.toContain("ask a sharp follow-up");
   });
 });
+
+describe("self-directed text style", () => {
+  const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+
+  it("uses stable preferences instead of opaque per-turn permission lotteries", () => {
+    const note = buildPersonaStylePromptNote(mira, { selfDirected: true, turnKey: "room:first" });
+    expect(note).toBe(buildPersonaStylePromptNote(mira, {
+      selfDirected: true,
+      turnKey: "room:unrelated-second",
+      endingOverride: "statement",
+      surfaceTextureOverride: "harmless-typo",
+      visibleAffectOverride: false,
+    }));
+    expect(note).toContain("A genuine question is allowed whenever curiosity");
+    expect(note).toContain("silence is valid");
+    expect(note).toContain("not required features or bans on any single turn");
+    expect(note).toContain("visible affect 62%; informal texture 30%");
+    expect(note).not.toContain("Turn policy /");
+    expect(note).not.toContain("do not ask a question in this message");
+    expect(note).not.toContain("Use no signature habit in this message");
+    for (const habit of mira.style.conversationHabits) expect(note).toContain(`“${habit}”`);
+  });
+
+  it("treats the normal range as preference but preserves the caller-supplied hard ceiling", () => {
+    const expanded = { ...mira, style: { ...mira.style, hardMaxWords: 120 } };
+    const note = buildPersonaStylePromptNote(expanded, { selfDirected: true });
+    expect(note).toContain("usually 5–26 words and 1–2 sentence(s), not a compulsory range or shape");
+    expect(note).toContain("Hard maximum 120 words");
+    expect(note).toContain("do not pad a reaction or compress a developed point");
+    expect(note).not.toContain("hard maximum 42 words");
+  });
+
+  it("preserves each resident's stable voice and never turns emoji-free into a random allowance", () => {
+    const notes = buildPersonaStylePromptNotes(PERSONAS, { selfDirected: true, turnKey: "same-room" });
+    for (const persona of PERSONAS) {
+      const note = notes[persona.id]!;
+      expect(note).toContain(`Stable voice for ${persona.name}`);
+      expect(note).toContain(`Hard maximum ${persona.style.hardMaxWords} words`);
+      expect(note).toContain("- Casing/punctuation:");
+      expect(note).toContain("- Corrections:");
+      expect(note).toContain("- Disagreement:");
+      expect(note).toContain("Never alter or misspell names, handles, code, URLs");
+      if (persona.style.emojiRate === 0) expect(note).toContain("- Emoji: Use no emoji.");
+      else expect(note).toContain("Emoji are genuinely rare");
+      for (const phrase of persona.style.avoidPhrases) expect(note).toContain(`“${phrase}”`);
+    }
+    expect(notes["ai-mira"]).toContain("Correct by asking one natural clarifying question");
+    expect(notes["ai-moss"]).toContain("Write lowercase");
+    expect(new Set(Object.values(notes)).size).toBe(PERSONAS.length);
+  });
+
+  it("preserves an explicit clean boundary even if a legacy override requests profanity", () => {
+    const note = buildPersonaStylePromptNote(mira, {
+      selfDirected: true,
+      explicitnessTarget: "clean",
+      surfaceTextureOverride: "strong-profanity",
+      stanceIntensity: "restrained",
+    });
+    expect(note).toContain("understand coarse language but do not add profanity");
+    expect(note).toContain("Keep any real disagreement calm and softly edged");
+    expect(note).not.toContain("One mild, non-targeted adult profanity may appear");
+    expect(note).not.toContain("strong adult profanity");
+    expect(note).toContain("A brief in-line self-correction or changed thought is permitted");
+  });
+
+  it.each(["coarse", "strong"] as const)("allows admin %s register without manufacturing an emotional or profanity performance", (target) => {
+    const note = buildPersonaStylePromptNote(mira, {
+      selfDirected: true,
+      explicitnessTarget: target,
+      stanceIntensity: "forceful",
+    });
+    expect(note).toContain(`The room permits ${target} adult language as non-targeted emphasis`);
+    expect(note).toContain("Never force profanity");
+    expect(note).toContain("Do not invent hostility, attack the speaker, threaten, slur or recruit a pile-on");
+    expect(note).toContain("Never force a typo, stretched spelling, gimmick or emotional performance");
+    expect(note).not.toContain("Make that intensity audible");
+  });
+
+  it("does not change unopted text or the spoken voice contract", () => {
+    const options = { turnKey: "legacy", endingOverride: "question-required" as const };
+    expect(buildPersonaStylePromptNote(mira, { ...options, selfDirected: false }))
+      .toBe(buildPersonaStylePromptNote(mira, options));
+    const voice = buildPersonaStylePromptNote(mira, { ...options, medium: "voice" });
+    expect(buildPersonaStylePromptNote(mira, { ...options, medium: "voice", selfDirected: true })).toBe(voice);
+    expect(voice).toContain("hard maximum 25 words");
+    expect(voice).toContain("Turn policy / emoji: Use no emoji");
+    expect(voice).toContain("End with exactly one precise, genuine question required by this scene role");
+  });
+});

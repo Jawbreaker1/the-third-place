@@ -453,6 +453,12 @@ export class SocialMemoryCoordinator {
     this.#promptNotes.clear();
   }
 
+  /** Prevents captures queued before an admin reset from restoring old rapport. */
+  invalidatePendingActorWork(actorId: string): void {
+    this.#actorEpochs.set(actorId, (this.#actorEpochs.get(actorId) ?? 0) + 1);
+    this.#promptNotes.clear();
+  }
+
   /**
    * Returns the current deterministic, coarse behavior projection. This read
    * is deliberately uncached: director scoring and consent boundaries must

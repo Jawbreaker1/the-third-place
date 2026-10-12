@@ -83,76 +83,98 @@ export const scaleAmbientDelay = (delayMs: number, activity: number): number => 
   return Math.max(1_000, Math.round(delayMs * factor));
 };
 
-export interface UnattendedAmbientPolicy {
-  enabled: boolean;
-  /** Minimum distance between successful autonomous publications, across the server. */
-  minimumGapMs: number;
-  /** Minimum distance between unattended work attempts, including rejected generations. */
-  attemptCooldownMs: number;
-  hourlyCap: number;
-  dailyCap: number;
+export interface AutonomousPublicationBudgetState {
+  tokens: number;
+  updatedAt: number;
+  refillPerMinute: number;
+  burstCapacity: number;
 }
 
-const interpolateAnchored = (
-  level: number,
-  low: number,
-  middle: number,
-  high: number,
-): number => level <= 50
-  ? interpolate(low, middle, (level - 1) / 49)
-  : interpolate(middle, high, (level - 50) / 50);
+export interface AutonomousPublicationBudgetDecision {
+  slots: number;
+  /** Time until one publication can be admitted; Infinity means disabled/invalid. */
+  nextSlotDelayMs: number;
+  currentState: AutonomousPublicationBudgetState | undefined;
+  /** Debit at a publication boundary, not for model attempts; failed commits may retain the debit. */
+  consumedState: AutonomousPublicationBudgetState | undefined;
+}
 
-/**
- * Maps the existing Activity control onto a deliberately slower, server-wide
- * zero-human budget. It is content- and language-blind: the ambient planner
- * still decides what happens, while this policy only bounds unattended cost
- * and publication volume.
- */
-export const unattendedAmbientPolicy = (activity: number): UnattendedAmbientPolicy => {
-  const level = percent(activity, DEFAULT_RUNTIME_BEHAVIOR_TUNING.activity);
-  if (level === 0) {
-    return {
-      enabled: false,
-      minimumGapMs: 20 * 60_000,
-      attemptCooldownMs: 10 * 60_000,
-      hourlyCap: 0,
-      dailyCap: 0,
-    };
-  }
-  const minimumGapMs = Math.round(interpolateAnchored(level, 20, 6, 3) * 60_000);
-  const hourlyCap = Math.max(1, Math.round(interpolateAnchored(level, 1, 3, 6)));
-  return {
-    enabled: true,
-    minimumGapMs,
-    attemptCooldownMs: Math.max(minimumGapMs, Math.round(60 * 60_000 / (hourlyCap * 2))),
-    hourlyCap,
-    // Match the sustained hourly rate so a healthy 24/7 room never spends the
-    // final hours of a day behind a prematurely exhausted daily bucket.
-    dailyCap: hourlyCap * 24,
-  };
+const finiteNonnegative = (value: number): boolean => Number.isFinite(value) && value >= 0;
+const TOKEN_EPSILON = 1e-9;
+
+export const isAutonomousPublicationBudgetState = (
+  value: unknown,
+): value is AutonomousPublicationBudgetState => {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Record<string, unknown>;
+  const keys = ["tokens", "updatedAt", "refillPerMinute", "burstCapacity"];
+  return Object.keys(state).length === keys.length && keys.every((key) => Object.hasOwn(state, key))
+    && [state.tokens, state.updatedAt, state.refillPerMinute, state.burstCapacity].every(
+    (entry) => typeof entry === "number" && finiteNonnegative(entry)
+      && entry <= Number.MAX_SAFE_INTEGER,
+  ) && Number.isInteger(state.burstCapacity)
+    && (state.tokens as number) <= (state.burstCapacity as number) + TOKEN_EPSILON;
 };
 
-export interface UnattendedAmbientCapacityGate {
+/**
+ * One continuously refilling publication budget, regardless of human presence.
+ * No hourly or daily windows can strand an otherwise healthy community.
+ *
+ * A checkpoint is necessary: replaying a sliding history window as a full
+ * bucket would invent burst tokens during continuous traffic. The caller owns
+ * persisting consumedState at the publication boundary. Retaining a debit
+ * after a failed commit is conservative; generation attempts do not consume
+ * it. Missing state is
+ * a new full bucket; migration from existing history should supply an empty
+ * checkpoint at the latest publication instead of claiming a fresh burst.
+ */
+export const autonomousPublicationBudget = (input: {
   now: number;
-  policy: UnattendedAmbientPolicy;
-  /** Latest successful autonomous text publication, attended or unattended. */
-  lastAutonomousPublicationAt?: number;
-  /** Successful unattended publication timestamps retained by the room store. */
-  unattendedPublicationTimestamps: readonly number[];
-}
+  limits: { perMinute: number; perTwelveSeconds: number };
+  state?: AutonomousPublicationBudgetState;
+}): AutonomousPublicationBudgetDecision => {
+  const invalid: AutonomousPublicationBudgetDecision = {
+    slots: 0,
+    nextSlotDelayMs: Infinity,
+    currentState: undefined,
+    consumedState: undefined,
+  };
+  if (!finiteNonnegative(input.now) || input.now > Number.MAX_SAFE_INTEGER) return invalid;
+  const refillPerMinute = input.limits.perMinute;
+  const burstCapacity = Math.floor(input.limits.perTwelveSeconds);
+  if (!finiteNonnegative(refillPerMinute) || !finiteNonnegative(burstCapacity)
+    || refillPerMinute > Number.MAX_SAFE_INTEGER || burstCapacity > Number.MAX_SAFE_INTEGER) return invalid;
+  if (refillPerMinute === 0 || burstCapacity === 0) {
+    return {
+      ...invalid,
+      currentState: { tokens: 0, updatedAt: input.now, refillPerMinute, burstCapacity },
+    };
+  }
 
-/** Pure rolling-window gate used both before work and immediately before commit. */
-export const hasUnattendedAmbientCapacity = (gate: UnattendedAmbientCapacityGate): boolean => {
-  if (!gate.policy.enabled) return false;
-  if (
-    gate.lastAutonomousPublicationAt !== undefined &&
-    gate.now - gate.lastAutonomousPublicationAt < gate.policy.minimumGapMs
-  ) return false;
-  const inDay = gate.unattendedPublicationTimestamps.filter(
-    (timestamp) => timestamp <= gate.now && gate.now - timestamp < 24 * 60 * 60_000,
-  );
-  if (inDay.length >= gate.policy.dailyCap) return false;
-  return inDay.filter((timestamp) => gate.now - timestamp < 60 * 60_000).length < gate.policy.hourlyCap;
+  const previous = input.state;
+  if (previous && !isAutonomousPublicationBudgetState(previous)) return invalid;
+  // A clock rollback must not manufacture a burst from a future checkpoint.
+  if (previous && previous.updatedAt > input.now) {
+    return {
+      ...invalid,
+      nextSlotDelayMs: Math.ceil(previous.updatedAt - input.now + 60_000 / refillPerMinute),
+    };
+  }
+
+  const accruedTokens = previous
+    ? Math.min(previous.burstCapacity,
+        Math.min(previous.tokens, previous.burstCapacity)
+          + (input.now - previous.updatedAt) * previous.refillPerMinute / 60_000)
+    : burstCapacity;
+  const tokens = Math.min(burstCapacity, Math.max(0, accruedTokens));
+  const slots = Math.min(burstCapacity, Math.floor(tokens + TOKEN_EPSILON));
+  const currentState = { tokens, updatedAt: input.now, refillPerMinute, burstCapacity };
+  return {
+    slots,
+    nextSlotDelayMs: slots > 0 ? 0 : Math.max(1, Math.ceil((1 - tokens) * 60_000 / refillPerMinute)),
+    currentState,
+    consumedState: slots > 0 ? { ...currentState, tokens: Math.max(0, tokens - 1) } : undefined,
+  };
 };
 
 export const ambientRoomSelectionWeight = (score: number, activity: number): number => {

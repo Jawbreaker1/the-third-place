@@ -671,7 +671,7 @@ describe("channel profiles", () => {
     expect(stock.autonomousResearchSeeds).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: "stock-capital-allocation-filing",
-        discussionAngle: expect.stringContaining("which choice they personally prefer"),
+        discussionAngle: expect.stringContaining("personal preferences need not become forecasts"),
       }),
     ]));
   });

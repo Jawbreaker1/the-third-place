@@ -636,7 +636,7 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
     }
   });
 
-  router.delete("/memory/relationships/:ownerId/:subjectId", (request, response, next) => {
+  router.delete("/memory/relationships/:ownerId/:subjectId", async (request, response, next) => {
     if (!dependencies.socialMemory) {
       response.status(503).json({ ok: false, error: "Social memory administration is unavailable." });
       return;
@@ -644,7 +644,7 @@ export const createAdminRouter = (dependencies: AdminRouterDependencies): Router
     try {
       const ownerId = idParam.parse(request.params.ownerId);
       const subjectId = idParam.parse(request.params.subjectId);
-      if (!dependencies.socialMemory.resetRelationship(ownerId, subjectId)) {
+      if (!await dependencies.socialMemory.resetRelationship(ownerId, subjectId)) {
         response.status(404).json({ ok: false, error: "That directed relationship was not found." });
         return;
       }

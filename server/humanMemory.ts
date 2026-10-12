@@ -255,6 +255,8 @@ export interface HumanMemory {
     at?: number,
   ): boolean;
   getRelation(humanId: string, personaId: string): HumanPersonaRelation | undefined;
+  /** Removes one resident's legacy rapport without deleting retained facts. */
+  resetRelation(humanId: string, personaId: string): boolean;
   updateRelation(
     humanId: string,
     personaId: string,
@@ -1137,6 +1139,13 @@ export class HumanMemoryStore implements HumanMemory {
     profile.lastSeenAt = Math.max(profile.lastSeenAt, relation.updatedAt);
     this.schedulePersist();
     return cloneRelation(relation);
+  }
+
+  resetRelation(humanId: string, personaId: string): boolean {
+    const profile = this.profilesByHumanId.get(humanId);
+    if (!profile?.relations.delete(personaId)) return false;
+    this.schedulePersist();
+    return true;
   }
 
   promptNote(humanId: string, personaId: string): string | undefined {
