@@ -1,0 +1,74 @@
+CONVERSATION EVIDENCE / RESEARCH ROUTING — 2026-10-12
+
+Baseline ecad97e already includes memory phase 1 and the earlier current-turn
+delivery fixes. This evaluation isolates the new shared transcript, semantic
+research-plan handling and operational diagnostics. Step 2 remains deferred.
+
+METHOD
+Frozen source copies; real google/gemma-4-26b-a4b via LmStudioBackend; production
+stopped; maximum 2 concurrent model calls. All fixtures/data are synthetic.
+V1: 72 cells, 116 calls. V2: 94 cells, 158 calls. Total: 166 cells, 274 calls.
+Both runs finished with unchanged source fingerprints and no active calls.
+Three repeats per routing/fixed-review probe, two per public conversational
+scenario. Real Director -> generation -> review -> durable-publication path.
+No production logins, room/message writes or memory changes. Public fixtures
+disable background extraction, autonomous continuation and delayed recovery;
+research execution deliberately fails rather than accessing the internet.
+Positive current-price/URL controls test routing, not external retrieval.
+
+V1 NEGATIVES RETAINED
+Shared context fixed the attributed-recap review control (3/3 accepted versus
+0/3 baseline), while all 9 adverse controls stayed blocked. However, explicit
+current-price routing chose an unavailable specialized capability 3/3 times.
+Only 4/6 public conversational cells published versus baseline 6/6: one recap
+was rejected twice as peer_echo and left pending recovery; one malformed
+research plan lost the otherwise valid social intent and left no pending turn.
+These findings prompted generic typed-plan validation/recovery and clearer
+requested-reuse versus duplicate-echo guidance, not topic/regex exceptions.
+
+FINAL V2 RESULTS
+Routing: candidate 18/18 valid expected actions; baseline 15/18 (3 URL misses).
+Both now correctly route all 3 explicit current-price requests to web search.
+Fixed supported recaps: candidate 6/6 accepted; baseline 0/6.
+Fabricated event, contradictory source value, private-note disclosure,
+same-trigger peer duplicate and unrequested peer loop: both block all 15/15.
+Fixed temperature-zero repetitions are diagnostics, not independent estimates
+of general factual accuracy. No publication blocker was bypassed.
+
+Both arms published in all 6/6 public question/correction cells. Both also gave
+brief voluntary Spanish goodbyes in 2/2 closure cells with intent=none, no
+required actor and no owner. Optionality does not require absolute silence.
+Successful publication latency (excluding closure controls and empty outcomes):
+                 Baseline      Candidate
+Median           16.009 s       16.745 s
+Maximum          22.242 s       20.306 s
+No V2 cell hit the 120-second deadline. This is not a general speedup claim.
+
+PUBLICATION IS NOT NECESSARILY A USEFUL ANSWER
+One candidate bird-correction turn still chose unnecessary research and only
+reported failure; the other answered naturally using ordinary knowledge.
+Unnecessary research in these public bird cells: old 2/2, candidate 1/2.
+The isolated routing controls alone would overstate real-flow reliability.
+Natural catch-ups stayed on the supplied topics without invented new events
+or stale memory callbacks, but usually used bare event wording rather than
+explicitly attributing claims to messages. One false peer_echo verdict still
+caused a bounded retry before publication. These remain explicit limitations.
+
+Independent unblinded content assessment, six conversational pairs: candidate
+preferred 1, baseline preferred 1, ties 4. Candidate substantive responses:
+5 useful, 1 unhelpful constraint report. Baseline: 4 useful, 1 partial, 1
+unhelpful constraint report. Two closure pairs tied. Not a broad quality claim.
+
+The accompanying .results.json preserves shared synthetic fixtures, all routing
+decisions, fixed verdicts, full public outputs/drafts, timing, compact diagnostic
+traces, and both assessments. No full prompts, raw reasoning, backend addresses,
+environment configuration, credentials or real-user data are included.
+V1 diagnostics distinguished review rejection with pending recovery from
+classification failure without generation. Real use can now expose these
+differences rather than treating all silence as intentional.
+
+CONCLUSION
+Supported incremental improvement in the targeted failure boundaries, with
+factual/privacy/duplicate controls intact. Not proof that all silence or
+unnecessary research is solved. No conclusions about voice, long-run autonomy,
+real research providers, multi-human load or universal reviewer accuracy.
