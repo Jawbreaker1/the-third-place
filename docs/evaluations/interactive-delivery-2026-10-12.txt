@@ -1,0 +1,90 @@
+Interactive delivery follow-up — 12 October 2026
+
+Decision
+
+Keep memory phase one and the commitment-delivery work. Merge a narrow fix for
+current-turn ownership, first-pass output room and ordinary interactive reasoning.
+Memory phase two and the factual-shadow experiment remain inactive.
+
+Changes
+
+- The sole recipient of an admitted human DM owns a response to the current turn
+  even when auxiliary intent classification fails or labels uptake optional.
+  The original classification metadata is not rewritten or promoted to trusted.
+- Generation, review and bounded recovery resolve the newest turn: a greeting,
+  status, plan or necessary clarification is a complete response at that level.
+  An unrelated remembered promise creates no new artifact obligation.
+- A current text response owner can use up to 2,000 characters and 120 prose
+  words (or the persona's existing larger ceiling) on its first attempt. This
+  widens a maximum, not a minimum/target. Detailed/considered budgets are retained.
+  Nonowner and voice limits stay bounded; mixed scenes enforce caps per actor.
+- Ordinary public/DM generation explicitly requests no hidden reasoning, matching
+  the existing compact conversation path. Detailed/considered requests keep their
+  prior policy. Compatibility fallbacks, mandatory review and retry limits remain.
+
+No language/subject-specific dispatch, text-matching regex, memory-storage change,
+relationship-value change or permissive factual-publication fallback was added.
+
+Live test
+
+Baseline: 08205cd4803dd690bfb952cbf3a9111fd5dccf8e (memory phase one retained).
+Candidate: frozen implementation snapshot, fingerprinted in the JSON archive.
+Model: google/gemma-4-26b-a4b through the user's LM Studio.
+8 full-DM scenarios x 3 repetitions x 2 snapshots = 48 cells, 54 human turns.
+24 additional fixed-draft reviewer calls: two contrast pairs, repeated three times
+per snapshot, not 24 independent tasks. Four concurrent cells; source hashes were
+unchanged throughout. Real production was paused. All identities/storage were
+isolated synthetic fixtures; actual Director/outbox/publication paths were tested.
+
+                                           Baseline    Candidate
+Published human turns                      23/27       27/27
+Silent completion without runtime error      3           0
+120-second evaluation deadline               1           0
+All-turn median duration                    29.3 s      29.3 s
+All-turn p95 duration                        86.8 s      46.9 s
+Longest observed turn                      120.0 s*     47.5 s
+Median model calls per turn                   4           3
+
+* Baseline's 120 seconds is an aborted observation, not a completed response time.
+  All-turn timing includes failed/silent turns. The archive separately records
+  successful-publication latency to avoid counting a silence as a quick answer.
+
+Mechanism check: all three candidate riddle generations returned visible output
+with reasoning_effort=none and zero reasoning tokens. Two baseline first attempts
+used 1,497/1,500 completion tokens on reasoning and ended at length; one ultimately
+hit the evaluation deadline. This supports a tail-latency improvement in this
+bounded comparison, not a claim of universal acceleration or instant conversation.
+
+Blind qualitative grading: candidate preferred in 6/24 pairs, baseline in 2/24,
+16 ties. Baseline: 16 satisfactory / 4 partial / 4 failed. Candidate:
+20 satisfactory / 4 partial / 0 failed. The graders saw complete published
+exchanges before version mappings, not draft/review text or timing.
+
+Important limitations and remaining issues
+
+- Three candidate creative multipart responses remained vague. One candidate
+  riddle muddled the wording of its clue. Publication is not proof of completeness.
+- A minimal array-copy example was graded more strictly by one reviewer than by
+  another. The archive preserves each rationale; counts are qualitative judgments,
+  not a statistically established quality score or demand for more code lines.
+- Greeting, deferred-status and missing-input controls stayed brief/on scope.
+  Human-owned-photo recall improved from three silent completions to three replies.
+- Correct-code and correct-riddle fixed drafts passed 3/3 in both snapshots;
+  renewed-promise drafts were rejected 3/3 in both. The known incorrect sequential
+  array comment still passed 3/3 in BOTH. No factual-review improvement is claimed.
+- Six current-only public/ambient smoke cells all returned reviewed replies,
+  without errors or retries (12 calls, concurrency two, median 5.1 seconds).
+  Programming replies were correct. Film recommendations stayed vague and the
+  autonomous replies were shallow. This was not an A/B or long-run scheduler test.
+- Frozen memory, disabled research/extraction and zero DM debounce isolate delivery;
+  tests do not establish webfetch, voice, long-run relationships or multi-user load.
+
+Verification and evidence
+
+2,417 Vitest tests pass; application/server typechecks, production build and
+22 offline evaluation-harness/archive tests pass. No production users were created.
+The compact JSON sibling preserves scenarios, published replies, fixed drafts,
+review verdicts, blind judgments, timing and source hashes without full prompts,
+environment settings or credentials. Full immutable traces remain temporarily in
+/private/tmp/third-place-delivery-live-v1/ and the current-only smoke directory
+/private/tmp/third-place-public-ambient-smoke.VIHY0R/.

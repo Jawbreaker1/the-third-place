@@ -168,6 +168,40 @@ describe("independent semantic request-delivery assessment", () => {
     expect(parse(input)).toBeDefined();
   });
 
+  it.each([
+    { trusted: true, expected: "optional" as const },
+    { trusted: false, expected: "none" as const },
+  ])("keeps the current DM response contract when auxiliary intent misses %j", (options) => {
+    const input = candidateReviewInputSchema.parse({ ...inputFor(options), sceneKind: "dm" });
+    expect(parse(input)).toBeUndefined();
+    expect(parse(input, [reviewFor(notDue)])).toBeUndefined();
+    expect(parse(input, [reviewFor(missing)])?.reviews[0]).toMatchObject({
+      severity: "high", issues: ["unfulfilled_explicit_request"],
+    });
+  });
+
+  it("a DM greeting is delivered by a greeting, not by a remembered artifact", () => {
+    const text = "Hey, have a good evening!";
+    const base = inputFor({ trusted: false, expected: "none", trigger: "Just saying hi before dinner.", content: text });
+    const input = candidateReviewInputSchema.parse({
+      ...base, sceneKind: "dm",
+      candidates: [{ ...base.candidates[0], privateRelationshipNote: "I once offered to explain array copying." }],
+    });
+    expect(parse(input, [reviewFor({
+      status: "delivered", resolvedOutcome: "Acknowledge the current greeting.", deliveredExcerpt: text,
+    })])?.reviews[0].severity).toBe("none");
+  });
+
+  it("DM scope alone creates no duty without a current trigger and designated owner", () => {
+    const base = inputFor({ trusted: false, expected: "none" });
+    const noTrigger = candidateReviewInputSchema.parse({ ...base, sceneKind: "dm", trigger: null });
+    const noOwner = candidateReviewInputSchema.parse({
+      ...base, sceneKind: "dm", candidates: [{ ...base.candidates[0], mustFulfillRequest: false }],
+    });
+    expect(parse(noTrigger, [reviewFor(notDue)])).toBeDefined();
+    expect(parse(noOwner, [reviewFor(notDue)])).toBeDefined();
+  });
+
   it("does not treat a friendly greeting as a missing artifact", () => {
     const input = inputFor({ owner: false, trigger: "Hej igen!", content: "Hej! Kul att se dig." });
     expect(parse(input, [reviewFor(notDue)])?.reviews[0]).toMatchObject({

@@ -108,7 +108,7 @@ describe("request-delivery review and bounded scene recovery", () => {
     expect(result).toEqual([expect.objectContaining({ personaId: sana.id, content: text })]);
     expect(result.some((line) => line.content === promise)).toBe(false);
     expect(bodies).toHaveLength(4);
-    expect(contentLimit(bodies[0])).toBe(360);
+    expect(contentLimit(bodies[0])).toBe(2_000);
     expect(contentLimit(bodies[2])).toBe(2_000);
     expect(sceneData(bodies[1]).candidates[0].mustFulfillRequest).toBe(true);
     expect(sceneData(bodies[2]).requestDeliveryRecovery).toEqual({ [sana.id]: { resolvedOutcome: outcome } });
@@ -150,6 +150,56 @@ describe("request-delivery review and bounded scene recovery", () => {
     expect(sceneData(bodies[0]).requestDeliveryRecovery).toEqual({});
   });
 
+  it("allows a complete first-pass owner answer without manufacturing a failed short draft first", async () => {
+    const outcome = "Explain when an array copy protects the original and when nested values stay shared.";
+    const { client, bodies } = scriptedClient([
+      candidate(completeExplanation), review(delivered(outcome, completeExplanation)),
+    ]);
+    expect(await client.generateScene(ownerRequest())).toEqual([
+      expect.objectContaining({ content: completeExplanation }),
+    ]);
+    expect(bodies).toHaveLength(2);
+    expect(contentLimit(bodies[0])).toBe(2_000);
+    expect(bodies[0].messages[0].content).toContain("no minimum or target length");
+    expect(sceneData(bodies[0]).requestDeliveryRecovery).toEqual({});
+  });
+
+  it("does not lend an owner's larger character ceiling to a non-owner in the same scene", async () => {
+    const ownerText = "Copying creates a new outer array; pushing into that copy leaves the original alone.";
+    const nonOwnerCode = `\`\`\`js\nconst labels = [${Array.from({ length: 60 }, (_, index) => `"item-${index}"`).join(", ")}];\n\`\`\``;
+    expect(nonOwnerCode.length).toBeGreaterThan(360);
+    const { client, bodies } = scriptedClient([
+      completion({ messages: [
+        { personaId: sana.id, content: ownerText, sourceIds: [] },
+        { personaId: mira.id, content: nonOwnerCode, sourceIds: [] },
+      ] }),
+      review(delivered("Explain array copying.", ownerText)),
+    ]);
+    expect(await client.generateScene(ownerRequest({ selected: [sana, mira] }))).toEqual([
+      expect.objectContaining({ personaId: sana.id, content: ownerText }),
+    ]);
+    expect(bodies).toHaveLength(2);
+    expect(sceneData(bodies[1]).candidates).toHaveLength(1);
+  });
+
+  it.each([
+    { intentTrusted: true, replyExpected: "optional" as const },
+    { intentTrusted: false, replyExpected: "none" as const },
+  ])("reviews current DM delivery despite an auxiliary intent miss %j", async (intent) => {
+    const text = "Here's the comparison: changing an alias changes the original; a new outer copy stays separate.";
+    const outcome = "Give the comparison the visitor just requested.";
+    const { client, bodies } = scriptedClient([
+      candidate("I can explain that when you're ready."), review(missing(outcome)),
+      candidate(text), review(delivered(outcome, text)),
+    ]);
+    expect(await client.generateScene(ownerRequest({
+      kind: "dm", semanticContext: { ...ownerRequest().semanticContext, ...intent },
+    }))).toEqual([expect.objectContaining({ content: text })]);
+    expect(bodies).toHaveLength(4);
+    expect(sceneData(bodies[1]).semanticContext).toMatchObject(intent);
+    expect(sceneData(bodies[1]).candidates[0].mustFulfillRequest).toBe(true);
+  });
+
   it("accepts a real missing-input constraint without forcing invented delivery", async () => {
     const text = "I don't have your paragraph yet. Paste it here and I can shorten that exact text.";
     const { client, bodies } = scriptedClient([
@@ -180,7 +230,7 @@ describe("request-delivery review and bounded scene recovery", () => {
     expect(contentLimit(bodies[0])).toBe(360);
   });
 
-  it("gives verified missing text delivery room for the whole result, then restores ordinary limits", async () => {
+  it("keeps delivery room across the bounded retry, then restores ordinary non-owner limits", async () => {
     const outcome = "Explain when an array copy protects the original and when nested values remain shared.";
     const later = "Exactly, that distinction is the useful bit.";
     const { client, bodies } = scriptedClient([
@@ -193,7 +243,7 @@ describe("request-delivery review and bounded scene recovery", () => {
     expect(completeExplanation.split(" ").length).toBeLessThanOrEqual(120);
     const result = await client.generateScene(ownerRequest());
     expect(result).toEqual([expect.objectContaining({ content: completeExplanation })]);
-    expect(contentLimit(bodies[0])).toBe(360);
+    expect(contentLimit(bodies[0])).toBe(2_000);
     expect(contentLimit(bodies[2])).toBe(2_000);
     expect(bodies[2].messages[0].content).toContain("hard maximum 120 words");
     expect(await client.generateScene(ownerRequest({

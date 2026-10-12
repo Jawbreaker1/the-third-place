@@ -4384,12 +4384,12 @@ export class SocialDirector {
       "dm",
       latest.channelId,
     );
-    const evidenceExecutionRequested = Boolean(invocation);
-    const dmRequestOwnerIds = (
-      trustedDmTurn.intentTrusted && trustedDmTurn.replyExpected === "expected"
-    ) || evidenceExecutionRequested
-      ? [persona.id]
-      : [];
+    // Admission to this one-recipient DM already establishes who owes the
+    // current turn a response, even when intent classification is unavailable
+    // or calls an imperative "optional". This is response ownership, not a
+    // declaration that an old promise must be fulfilled: generation/review
+    // still resolve the actual greeting, status question or request in context.
+    const dmRequestOwnerIds = [persona.id];
     const signals = socialSignalsFromTurnAnalysis(
       analysis,
       [],

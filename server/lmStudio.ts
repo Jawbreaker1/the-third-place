@@ -1146,19 +1146,22 @@ const TURN_ANALYSIS_SETTLE_MARGIN_MS = 750;
 const VOICE_DRAFT_TTL_MS = 60_000;
 const MAX_VOICE_DRAFTS = 64;
 const CONSIDERED_MAX_CONTENT_LENGTH = MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS;
-const DELIVERY_RECOVERY_MAX_WORDS = 120;
+const REQUEST_DELIVERY_MAX_WORDS = 120;
 
-// A verified missing result may need more room than an ordinary chat reaction.
-// This only widens the existing retry ceiling, never its minimum or call budget.
-const hasDeliveryRecovery = (request: SceneRequest, personaId?: string): boolean =>
+// Give a current response owner enough room on the FIRST attempt. Waiting for
+// an incomplete draft to fail review wastes a generation and can lose the turn.
+// This is a ceiling, not a target: greetings and ordinary chat stay brief. It is
+// derived from server-owned turn responsibility, never from topics or keywords.
+const hasRequestDeliveryRoom = (request: SceneRequest, personaId?: string): boolean =>
+  Boolean(request.trigger) &&
   request.kind !== "voice" && request.semanticContext?.answerDepth !== "detailed" &&
   request.conversationMode !== "considered" && explicitRequestOwnerIds(request).some((id) =>
-    (!personaId || id === personaId) && Boolean(request.requestDeliveryRecovery?.[id]));
+    !personaId || id === personaId);
 
-const sceneContentLengthLimit = (request: SceneRequest): number =>
+const sceneContentLengthLimit = (request: SceneRequest, personaId?: string): number =>
   request.conversationMode === "considered" || request.semanticContext?.answerDepth === "detailed"
     ? CONSIDERED_MAX_CONTENT_LENGTH
-    : (request.conversationContext && request.kind !== "voice") || hasDeliveryRecovery(request)
+    : (request.conversationContext && request.kind !== "voice") || hasRequestDeliveryRoom(request, personaId)
       ? 2_000
     : 360;
 
@@ -1777,8 +1780,8 @@ const scenePersonaStylePromptOptions = (
 
 const scenePersonaStyleNote = (request: SceneRequest, persona: Persona): string =>
   buildPersonaStylePromptNote(
-    hasDeliveryRecovery(request, persona.id)
-      ? { ...persona, style: { ...persona.style, hardMaxWords: Math.max(persona.style.hardMaxWords, DELIVERY_RECOVERY_MAX_WORDS) } }
+    hasRequestDeliveryRoom(request, persona.id)
+      ? { ...persona, style: { ...persona.style, hardMaxWords: Math.max(persona.style.hardMaxWords, REQUEST_DELIVERY_MAX_WORDS) } }
       : request.conversationContext && request.kind !== "voice"
       ? { ...persona, style: { ...persona.style, hardMaxWords: conversationWordCeiling(request, persona) } }
       : persona,
@@ -2128,7 +2131,9 @@ export const buildSceneSystemPrompt = (request: SceneRequest): string => {
       const expertise = request.actorExpertiseNotes?.[persona.id];
       const style = scenePersonaStyleNote(request, persona);
       const wordLimit = request.wordLimits?.[persona.id];
-      const wordLimitNote = wordLimit
+      const wordLimitNote = hasRequestDeliveryRoom(request, persona.id)
+        ? " Current-turn response: use only the length needed to deliver it; no minimum or target length. A greeting/status remains brief, and an example must include the example itself."
+        : wordLimit
         ? request.conversationContext && request.semanticContext?.answerDepth !== "detailed"
           ? ` Conversation length ceiling: ${conversationWordCeiling(request, persona)} words; no target minimum.`
           : ` Required scene-role length: ${wordLimit.minimum}–${wordLimit.maximum} words.`
@@ -2290,12 +2295,13 @@ ${temporalPolicyRule}`
         request.semanticContext?.intentTrusted &&
         request.semanticContext.replyExpected === "expected"
       ) ||
-      successfulTypedEvidenceOwnerContract
+      successfulTypedEvidenceOwnerContract ||
+      (request.kind === "dm" && Boolean(request.trigger))
     ) &&
     requestOwners.length > 0
     ? request.capabilityContext?.executionStatus === "declined"
       ? `- Only these server-designated owners speak for this declined external action: ${requestOwners.join(", ")}. Each must visibly decline once in their own concise peer voice. The action did not run; never disguise unwillingness as an outage, inability, completed lookup or offer to do it later.`
-      : `- Only these server-designated explicit-request owners must answer the real question or perform any feasible self-contained requested artifact now: ${requestOwners.join(", ")}. Cover every explicit core dimension and preserve its role, timeframe, comparison and scope; a related fact from another role or era is not a substitute. Other required actors answer only their assigned moderation, evidence, dissent or social role. Offering, promising, narrating progress, asking permission, or substituting a nearby activity does not complete the owner's request. If completion genuinely needs unavailable evidence, future/external action, or missing information, the owner names that concrete constraint without an unrelated factual substitute or asks for the necessary detail. A successful evidence owner must sound like a resident answering a peer, not like a retrieval log: lead with the supported answer or exact knowledge boundary, avoid search/source-process narration unless provenance was requested, and include one brief in-character conversational uptake. When the question invites a cause, motive, reading or judgement that the evidence does not settle, that uptake must be a clearly framed low-stakes interpretation or reaction whenever supported premises or the participant's exact clue make one possible; it never becomes the missing verified answer.`
+      : `- Only these server-designated current-turn response owners must answer the real question or perform any feasible self-contained requested artifact now: ${requestOwners.join(", ")}. Cover every explicit core dimension and preserve its role, timeframe, comparison and scope; a related fact from another role or era is not a substitute. Other required actors answer only their assigned moderation, evidence, dissent or social role. Offering, promising, narrating progress, asking permission, or substituting a nearby activity does not complete a feasible result requested now. In a DM, ownership survives an unavailable or optional intent classification: answer the actual newest turn, not a remembered task. A greeting, status/planning answer or needed clarification can be the complete current response. Do not manufacture an artifact from an unrelated old promise. If completion genuinely needs unavailable evidence, future/external action, or missing information, the owner names that concrete constraint without an unrelated factual substitute or asks for the necessary detail. A successful evidence owner must sound like a resident answering a peer, not like a retrieval log: lead with the supported answer or exact knowledge boundary, avoid search/source-process narration unless provenance was requested, and include one brief in-character conversational uptake. When the question invites a cause, motive, reading or judgement that the evidence does not settle, that uptake must be a clearly framed low-stakes interpretation or reaction whenever supported premises or the participant's exact clue make one possible; it never becomes the missing verified answer.`
     : "";
   const detailedResponseRule =
     request.semanticContext?.answerDepth === "detailed" && requestOwners.length > 0 &&
@@ -4638,9 +4644,9 @@ export class LmStudioClient {
           : "complete the actual triggering request in this message now";
       const completionFailureRule = operationalMode === "guarded_practical" || operationalMode === "defensive_pivot"
         ? "A refusal-only answer, promise, progress report or substitute outside that permitted continuation is not completion."
-        : "An offer, promise, progress report, permission request or adjacent substitute is not completion.";
+        : "An offer, promise, progress report, permission request or adjacent substitute is not completion of a feasible result requested now. Resolve the current turn first: an actual greeting, status, planning or permission question is answered at that level; missing input can require clarification. An unrelated old promise creates no task.";
       const completionPremise = retryOwnerIds.length > 0
-        ? `${actorNames || "The selected request owner"} owns the explicit expected response. This is the one bounded full-scene retry: ${boundedOperationalCompletion}. ${completionFailureRule} Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
+        ? `${actorNames || "The selected request owner"} owns the current-turn response. This is the one bounded full-scene retry: ${boundedOperationalCompletion}. ${completionFailureRule} Use the same supplied trigger, transcript and evidence; if a real missing fact or external constraint prevents completion, state only that concrete constraint.${reviewCorrection}`
         : recoversAutonomousResearchOpening
           ? `${actorNames || "The selected research lead"}'s first autonomous source-backed opening did not survive its typed source and review contract. This is the one bounded full-scene recovery: write one room-relevant opening for the same trusted autonomous research angle, grounded in the sole supplied evidence result. The server binds its destination card; return sourceIds as []. Preserve the ambient action and leave one concrete hook for another resident. Do not imply that a human asked, mention searching or tooling, write a URL, or change subject.${reviewCorrection}`
         : recoversChannelFeedDiscussion
@@ -4864,12 +4870,10 @@ export class LmStudioClient {
     const allowedSources = new Set(request.research?.results.map((result) => result.id) ?? []);
     const seen = new Set<string>();
     const lines: GeneratedLine[] = [];
-    const maxLength = sceneContentLengthLimit(request);
-
     for (const candidate of parsed.messages ?? []) {
       if (!candidate.personaId || !allowed.has(candidate.personaId) || seen.has(candidate.personaId)) continue;
       const text = compactChatWhitespace(candidate.content ?? "");
-      if (!text || text.length > maxLength) continue;
+      if (!text || text.length > sceneContentLengthLimit(request, candidate.personaId)) continue;
       seen.add(candidate.personaId);
       const serverOwnedSourceId = request.kind === "ambient" &&
         request.ambientAction?.kind === "open_topic" &&
@@ -5379,12 +5383,12 @@ export class LmStudioClient {
     let prose = protectedText.text;
     for (const fragment of protectedText.fragments) prose = prose.split(fragment.placeholder).join(" ");
     const wordCount = segmentWords(prose, request.semanticContext?.languageTag ?? request.languageHint).length;
-    const maximumCharacters = sceneContentLengthLimit(request);
+    const maximumCharacters = sceneContentLengthLimit(request, line.personaId);
     if (line.content.length > maximumCharacters) {
       return `Shorten the complete line to at most ${maximumCharacters} characters without cutting or changing any technical token; the rejected draft had ${line.content.length}.`;
     }
-    if (hasDeliveryRecovery(request, line.personaId)) {
-      const maximum = Math.max(persona.style.hardMaxWords, DELIVERY_RECOVERY_MAX_WORDS);
+    if (hasRequestDeliveryRoom(request, line.personaId)) {
+      const maximum = Math.max(persona.style.hardMaxWords, REQUEST_DELIVERY_MAX_WORDS);
       return wordCount > maximum
         ? `Deliver the complete requested result within ${maximum} prose words; omit optional elaboration, not the result.`
         : undefined;
@@ -5437,7 +5441,7 @@ export class LmStudioClient {
     // otherwise the chat-style humanizer can discard the exact substantive
     // answer that the request-delivery reviewer required. Ordinary chat still
     // gets the anti-template/list check.
-    const allowStructuredReply = hasDeliveryRecovery(request, line.personaId) ||
+    const allowStructuredReply = hasRequestDeliveryRoom(request, line.personaId) ||
       request.semanticContext?.asksForList === true ||
       request.semanticContext?.answerDepth === "detailed";
     let assessment = assessCandidate({
@@ -6008,7 +6012,9 @@ export class LmStudioClient {
                     instruction: roomSocialMoveInstruction(request.roomSocialMode),
                   }
                 : null,
-              sceneRole: request.conversationContext && request.kind !== "voice" && request.semanticContext?.answerDepth !== "detailed"
+              sceneRole: hasRequestDeliveryRoom(request, entry.reviewed.persona.id)
+                ? `current-turn response: no minimum, at most ${Math.max(entry.reviewed.persona.style.hardMaxWords, REQUEST_DELIVERY_MAX_WORDS)} prose words; preserve the complete requested result, not an announcement or substitute`
+                : request.conversationContext && request.kind !== "voice" && request.semanticContext?.answerDepth !== "detailed"
                 ? `self-chosen conversation contribution: no minimum, at most ${conversationWordCeiling(request, entry.reviewed.persona)} words; no assigned rhetorical move`
                 : request.wordLimits?.[entry.reviewed.line.personaId]
                 ? `scene contribution: ${request.wordLimits[entry.reviewed.line.personaId]!.minimum}–${request.wordLimits[entry.reviewed.line.personaId]!.maximum} words`
@@ -6218,13 +6224,14 @@ export class LmStudioClient {
       ),
     );
 
-    // A short conversational decision must leave room for its actual payload:
+    // A short interactive reply or conversational decision must leave room for
+    // its actual payload:
     // live Gemma runs can otherwise exhaust the whole budget in hidden thought.
     // Preserve the existing reasoning policy for detailed requests and the
     // occasional longer opening. Unsupported controls use the compatibility
     // retry above; this never bypasses parsing, review or publication gates.
     const directCompletion = request.kind === "voice" || Boolean(
-      request.conversationContext &&
+      (request.kind === "public" || request.kind === "dm" || request.conversationContext) &&
       request.semanticContext?.answerDepth !== "detailed" &&
       request.conversationMode !== "considered",
     );

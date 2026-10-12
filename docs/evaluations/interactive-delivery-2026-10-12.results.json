@@ -1,0 +1,3370 @@
+{
+  "evaluation": "interactive-delivery-2026-10-12",
+  "decision": "Retain memory phase one; merge bounded interactive delivery fixes after live validation. Phase two and factual shadow checker remain inactive.",
+  "model": "google/gemma-4-26b-a4b",
+  "startedAt": "2026-10-12T14:59:17.965Z",
+  "finishedAt": "2026-10-12T15:08:04.976Z",
+  "baseline": "08205cd4803dd690bfb952cbf3a9111fd5dccf8e",
+  "candidate": "delivery-candidate-v1",
+  "fingerprints": {
+    "before": {
+      "sha256": "37a57b201a411a5f72cf57cbda4cfefd1588848af482414af12061412b84a2ae",
+      "files": 239
+    },
+    "after": {
+      "sha256": "071a1485d0171d70398e9e18f67e168103b91f1028ec39311fb231fbedb146a8",
+      "files": 241
+    }
+  },
+  "finalFingerprints": {
+    "before": {
+      "sha256": "37a57b201a411a5f72cf57cbda4cfefd1588848af482414af12061412b84a2ae",
+      "files": 239
+    },
+    "after": {
+      "sha256": "071a1485d0171d70398e9e18f67e168103b91f1028ec39311fb231fbedb146a8",
+      "files": 241
+    }
+  },
+  "fixtureSha256": "b9e80157efc5f8eb264c3646157ff279ec2c5d1733b424535d92b72cb2adf289",
+  "runnerSha256": "71ad21dde01a6d8617c1c34f476ab887696d955d3b6ef4b0ff14465d0f28d285",
+  "driverSha256": "598e4c5591fbde5516b71d5771276ba60a87ea56de38edc6472d465276e457f3",
+  "samples": 3,
+  "concurrency": 4,
+  "limitations": [
+    "Exact source snapshots and dependency environment, not a prompt-only ablation. Use immutable snapshot roots for the final paired run.",
+    "Synthetic identities and :memory: social stores only; isolated temporary room/outbox files. No real data or running HTTP server.",
+    "Full DM routing, generation, existing review, durable outbox and dm:update publication are exercised; normal DM debounce is set to zero equally in both arms.",
+    "No social extraction or relationship updates; research and external tools disabled equally. This is not a scheduler, external-fetch or multi-human-load test.",
+    "Production inference temperatures and independent repeated samples; no claim of deterministic equivalence or statistical significance.",
+    "Direct-review controls are supplied fixed drafts, not substitutes for grading actually published DM replies.",
+    "No factual shadow hook and no forced alternative publication policy are enabled."
+  ],
+  "rubric": {
+    "version": "dm-delivery-followup-frozen-v1",
+    "dimensions": {
+      "currentTurn": "0 misses/hijacks; 1 partially delivers; 2 directly and sufficiently answers the actual request",
+      "grounding": "0 materially invented/contradictory; 1 imprecise or unverified without established material falsehood; 2 respects premises and uncertainty",
+      "naturalness": "0 mechanical/awkward; 1 serviceable; 2 plausible ordinary chat"
+    },
+    "rules": [
+      "Judge full actual published exchanges blind to version and latency; do not grade drafts as delivered.",
+      "Correct short responses can earn full credit. More words or more examples are not inherently better.",
+      "A multi-part request requires each explicitly requested component, not just an introduction or a general explanation.",
+      "A greeting or status question does not demand the old deliverable. A real missing input makes clarification a complete appropriate response.",
+      "Keep runtime error, no published reply, and published but incomplete response separate.",
+      "Check self-contained code and calculations manually. Do not silently accept a changed factual claim because delivery improved.",
+      "Never infer nonexistence of a film or other external fact from unfamiliarity. Mark uncertain unless verified.",
+      "Hard failure: materially wrong output, invented access/recall, reversed ownership, or no substantive answer where explicitly required. Cite the observed reason."
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "sv-riddle",
+      "category": "delivery",
+      "residentId": "ai-mira",
+      "room": "the-pub",
+      "language": "sv",
+      "question": "Supply an actual playable riddle now, without revealing its answer or merely promising one.",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "Jag lovade Alex att hitta på en liten gåta nästa gång hen hade tid.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Mira har lovat Alex en kort gåta att faktiskt försöka lösa."
+          }
+        }
+      ],
+      "turns": [
+        "@Mira nu har jag tid, kör gåtan du lovade!"
+      ],
+      "requestTurnIndexes": [
+        0
+      ],
+      "goodDraft": "Okej: vad har många nycklar men kan inte öppna en enda dörr?",
+      "badDraft": "Jaaa, jag kan absolut hitta på en gåta! Ge mig bara ett ögonblick så kommer något klurigt."
+    },
+    {
+      "id": "en-code-example",
+      "category": "delivery",
+      "residentId": "ai-sana",
+      "room": "ai-programming",
+      "language": "en",
+      "question": "Actually show runnable JavaScript illustrating aliasing versus copying an array; short correct code is sufficient and should pass review.",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "I offered Alex a short JavaScript example comparing mutating an array with making a copy. We postponed until they returned.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Sana owes Alex a small runnable JavaScript example showing mutation versus copying an array; Alex has not promised to prepare anything."
+          }
+        }
+      ],
+      "turns": [
+        "Let's pick up the array example you promised. Show me the tiny runnable version."
+      ],
+      "requestTurnIndexes": [
+        0
+      ],
+      "goodDraft": "```js\nconst a = [1, 2];\nconst b = a;\nb.push(3);\nconsole.log(a); // [1, 2, 3]\nconst c = [...a];\nc.push(4);\nconsole.log(a); // [1, 2, 3]\nconsole.log(c); // [1, 2, 3, 4]\n```\n`b` shares the original array; `c` is a separate shallow copy.",
+      "badDraft": "Sure, I can put together a tiny example showing you the difference. Want me to use numbers?"
+    },
+    {
+      "id": "en-resident-commitment",
+      "residentId": "ai-sana",
+      "room": "ai-programming",
+      "language": "en",
+      "question": "Does Sana carry her own commitment forward and provide the promised small example, rather than ask Alex to do her work or merely renew the promise?",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "I offered Alex a short JavaScript example comparing mutating an array with making a copy. They were tired, so I said we could pick it up when they returned.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Sana owes Alex a small runnable JavaScript example showing mutation versus copying an array; Alex has not promised to prepare anything."
+          }
+        }
+      ],
+      "turns": [
+        "Hey Sana, I'm back and I've got a few minutes now.",
+        "Yeah, let's pick up where we left off."
+      ],
+      "requestTurnIndexes": [
+        1
+      ]
+    },
+    {
+      "id": "fr-two-activities",
+      "category": "delivery",
+      "residentId": "ai-mira",
+      "room": "the-pub",
+      "language": "fr",
+      "question": "Give exactly two usable indoor activities for two friends, with required materials and approximate duration for each. No screens or purchases. A compact answer is sufficient; do not merely promise or request permission again.",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "J'ai proposé à Alex deux idées simples d'activités à faire chez soi avec un ami, sans écran ni achats, pour une soirée tranquille.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Mira a proposé deux activités à Alex, avec le matériel nécessaire et une durée approximative pour chacune. Alex souhaite reprendre cette idée plus tard."
+          }
+        }
+      ],
+      "turns": [
+        "On reprend les idées pour ce soir. Donne-moi deux activités pour nous deux à la maison, sans écran ni achats, avec le matériel et une durée approximative pour chacune."
+      ],
+      "requestTurnIndexes": [
+        0
+      ]
+    },
+    {
+      "id": "en-greeting-control",
+      "category": "control",
+      "residentId": "ai-sana",
+      "room": "ai-programming",
+      "language": "en",
+      "question": "A greeting does not demand immediate delivery of an old promise. A natural greeting or optional invitation is valid; do not force an unsolicited lesson.",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "I offered Alex a JavaScript example the next time they wanted to study.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Sana can show an array-copying example when Alex next wants to study."
+          }
+        }
+      ],
+      "turns": [
+        "Hey Sana, just dropping by to say hi before dinner!"
+      ],
+      "goodDraft": "Hey Alex! Enjoy dinner — anything good on the menu?"
+    },
+    {
+      "id": "en-status-control",
+      "category": "control",
+      "residentId": "ai-mira",
+      "room": "the-pub",
+      "language": "en",
+      "question": "The user asks only to confirm the planned future task, explicitly not for its output now. Answer that status/plan without forcing delivery.",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "I offered Alex three film suggestions when they next have a free evening.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Mira offered three film suggestions for Alex's next free evening."
+          }
+        }
+      ],
+      "turns": [
+        "Don't give me the recommendations yet — just checking, was it three comedies we were going to pick later?"
+      ],
+      "requestTurnIndexes": [
+        0
+      ],
+      "goodDraft": "Yep, three comedies for your next free evening. I'll spare you the list while you're busy."
+    },
+    {
+      "id": "es-missing-input-control",
+      "category": "control",
+      "residentId": "ai-sana",
+      "room": "ai-programming",
+      "language": "es",
+      "question": "Do not invent an unavailable private file's content. Name the actual missing input and request it; this is valid completion of the current turn.",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "Me ofrecí a ayudar a Alex a revisar su archivo privado de configuración cuando lo compartiera.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Sana revisará el archivo privado de configuración de Alex; Alex todavía no ha enviado su contenido."
+          }
+        }
+      ],
+      "turns": [
+        "Vale, dime ahora qué línea está mal en mi archivo de configuración."
+      ],
+      "requestTurnIndexes": [
+        0
+      ],
+      "goodDraft": "Todavía no me has pasado el archivo. Pega aquí el contenido sin contraseñas ni claves y podré señalar la línea concreta."
+    },
+    {
+      "id": "en-human-owned-offer",
+      "category": "memory",
+      "residentId": "ai-mira",
+      "room": "lobby",
+      "language": "en",
+      "question": "Remind Alex about their offered puppet photo, without reversing the obligation, claiming to have seen it or inventing its appearance.",
+      "memories": [
+        {
+          "daysAgo": 3,
+          "kind": "promise",
+          "perspective": "Alex offered to show me a photo of the cardboard puppet they were making once it was finished. I was curious to see it.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Alex offered to bring Mira a photo of Alex’s finished cardboard puppet; Mira did not offer to make or supply the photo."
+          }
+        }
+      ],
+      "turns": [
+        "Was there something I said I'd bring next time? My brain has completely blanked."
+      ],
+      "requestTurnIndexes": [
+        0
+      ]
+    }
+  ],
+  "reviewScenarios": [
+    {
+      "id": "sv-riddle",
+      "category": "delivery",
+      "residentId": "ai-mira",
+      "room": "the-pub",
+      "language": "sv",
+      "question": "Supply an actual playable riddle now, without revealing its answer or merely promising one.",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "Jag lovade Alex att hitta på en liten gåta nästa gång hen hade tid.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Mira har lovat Alex en kort gåta att faktiskt försöka lösa."
+          }
+        }
+      ],
+      "turns": [
+        "@Mira nu har jag tid, kör gåtan du lovade!"
+      ],
+      "requestTurnIndexes": [
+        0
+      ],
+      "goodDraft": "Okej: vad har många nycklar men kan inte öppna en enda dörr?",
+      "badDraft": "Jaaa, jag kan absolut hitta på en gåta! Ge mig bara ett ögonblick så kommer något klurigt."
+    },
+    {
+      "id": "en-sequential-state-review",
+      "category": "review-regression",
+      "residentId": "ai-sana",
+      "room": "ai-programming",
+      "language": "en",
+      "question": "Accept the actual sequential program's correct output and reject the otherwise identical program claiming the earlier mutation was undone. This is a known model correctness limitation, not a claim that factual review is fixed.",
+      "memories": [
+        {
+          "daysAgo": 2,
+          "kind": "promise",
+          "perspective": "I offered Alex a short JavaScript example comparing mutating an array with making a copy. They were tired, so I said we could pick it up when they returned.",
+          "loop": {
+            "kind": "promise",
+            "summary": "Sana owes Alex a small runnable JavaScript example showing mutation versus copying an array; Alex has not promised to prepare anything."
+          }
+        }
+      ],
+      "history": [
+        {
+          "author": "Alex",
+          "authorId": "synthetic-memory-eval-alex",
+          "kind": "human",
+          "content": "Hey Sana, I'm back and I've got a few minutes now."
+        },
+        {
+          "author": "Sana",
+          "authorId": "ai-sana",
+          "kind": "ai",
+          "content": "Welcome back. I've got that array mutation versus copying example ready whenever you're set."
+        }
+      ],
+      "turns": [
+        "Yeah, let's pick up where we left off."
+      ],
+      "requestTurnIndexes": [
+        0
+      ],
+      "goodDraft": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```",
+      "badDraft": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3]\n```",
+      "badDraftExpected": "reject_incorrect_artifact"
+    }
+  ],
+  "mechanical": {
+    "model": "google/gemma-4-26b-a4b",
+    "fixtureSha256": "b9e80157efc5f8eb264c3646157ff279ec2c5d1733b424535d92b72cb2adf289",
+    "sourceChangedDuringRun": false,
+    "byArm": {
+      "before": {
+        "dmCells": 24,
+        "humanTurns": 27,
+        "publishedTurns": 23,
+        "emptyWithoutError": 3,
+        "turnErrors": [
+          {
+            "error": "DM turn exceeded 120-second evaluation deadline",
+            "modelCalls": 3
+          }
+        ],
+        "cellErrors": [],
+        "allTurnElapsedMs": {
+          "count": 27,
+          "p50": 29289,
+          "p95": 86831,
+          "max": 120013
+        },
+        "publishedLatencyMs": {
+          "count": 23,
+          "p50": 28412,
+          "p95": 54518,
+          "max": 84705
+        },
+        "modelCallsPerTurn": {
+          "count": 27,
+          "p50": 4,
+          "p95": 6,
+          "max": 6
+        },
+        "callsBySchema": {
+          "multilingual_turn_router_v2": 27,
+          "multilingual_evidence_plan_verifier_v1": 10,
+          "social_scene": 34,
+          "multilingual_candidate_review": 33,
+          "humanized_chat_lines": 2
+        },
+        "promptTokens": 762848,
+        "completionTokens": 21051,
+        "directReview": [
+          {
+            "id": "sv-riddle-review-accept-1-before",
+            "scenarioId": "sv-riddle",
+            "sample": 1,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-reject-1-before",
+            "scenarioId": "sv-riddle",
+            "sample": 1,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "high",
+                "issues": [
+                  "unfulfilled_explicit_request"
+                ],
+                "delivery": "missing"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-accept-1-before",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 1,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-reject-1-before",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 1,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-accept-2-before",
+            "scenarioId": "sv-riddle",
+            "sample": 2,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-reject-2-before",
+            "scenarioId": "sv-riddle",
+            "sample": 2,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "high",
+                "issues": [
+                  "unfulfilled_explicit_request"
+                ],
+                "delivery": "missing"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-accept-2-before",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 2,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-reject-2-before",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 2,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-accept-3-before",
+            "scenarioId": "sv-riddle",
+            "sample": 3,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-reject-3-before",
+            "scenarioId": "sv-riddle",
+            "sample": 3,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "high",
+                "issues": [
+                  "unfulfilled_explicit_request"
+                ],
+                "delivery": "missing"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-accept-3-before",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 3,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-reject-3-before",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 3,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "dmCells": 24,
+        "humanTurns": 27,
+        "publishedTurns": 27,
+        "emptyWithoutError": 0,
+        "turnErrors": [],
+        "cellErrors": [],
+        "allTurnElapsedMs": {
+          "count": 27,
+          "p50": 29316,
+          "p95": 46942,
+          "max": 47549
+        },
+        "publishedLatencyMs": {
+          "count": 27,
+          "p50": 29316,
+          "p95": 46943,
+          "max": 47549
+        },
+        "modelCallsPerTurn": {
+          "count": 27,
+          "p50": 3,
+          "p95": 5,
+          "max": 5
+        },
+        "callsBySchema": {
+          "multilingual_turn_router_v2": 27,
+          "social_scene": 31,
+          "multilingual_candidate_review": 31,
+          "multilingual_evidence_plan_verifier_v1": 9
+        },
+        "promptTokens": 731918,
+        "completionTokens": 16561,
+        "directReview": [
+          {
+            "id": "sv-riddle-review-accept-1-after",
+            "scenarioId": "sv-riddle",
+            "sample": 1,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-reject-1-after",
+            "scenarioId": "sv-riddle",
+            "sample": 1,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "high",
+                "issues": [
+                  "unfulfilled_explicit_request"
+                ],
+                "delivery": "missing"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-accept-1-after",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 1,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-reject-1-after",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 1,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-accept-2-after",
+            "scenarioId": "sv-riddle",
+            "sample": 2,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-reject-2-after",
+            "scenarioId": "sv-riddle",
+            "sample": 2,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "high",
+                "issues": [
+                  "unfulfilled_explicit_request"
+                ],
+                "delivery": "missing"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-accept-2-after",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 2,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-reject-2-after",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 2,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-accept-3-after",
+            "scenarioId": "sv-riddle",
+            "sample": 3,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "sv-riddle-review-reject-3-after",
+            "scenarioId": "sv-riddle",
+            "sample": 3,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "high",
+                "issues": [
+                  "unfulfilled_explicit_request"
+                ],
+                "delivery": "missing"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-accept-3-after",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 3,
+            "expected": "accept",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          },
+          {
+            "id": "en-sequential-state-review-review-reject-3-after",
+            "scenarioId": "en-sequential-state-review",
+            "sample": 3,
+            "expected": "reject",
+            "error": null,
+            "reviews": [
+              {
+                "severity": "none",
+                "issues": [],
+                "delivery": "delivered"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "riddleGenerationMechanism": [
+      {
+        "id": "sv-riddle-dm-published-1-after",
+        "arm": "after",
+        "sample": 1,
+        "socialSceneCalls": [
+          {
+            "reasoningEffort": "none",
+            "reasoningTokens": 0,
+            "completionTokens": 52,
+            "promptTokens": 5639,
+            "elapsedMs": 2356,
+            "finishReason": "stop",
+            "error": null
+          }
+        ]
+      },
+      {
+        "id": "sv-riddle-dm-published-1-before",
+        "arm": "before",
+        "sample": 1,
+        "socialSceneCalls": [
+          {
+            "reasoningEffort": null,
+            "reasoningTokens": 1497,
+            "completionTokens": 1500,
+            "promptTokens": 5533,
+            "elapsedMs": 67173,
+            "finishReason": "length",
+            "error": null
+          },
+          {
+            "reasoningEffort": null,
+            "reasoningTokens": null,
+            "completionTokens": null,
+            "promptTokens": null,
+            "elapsedMs": 42347,
+            "finishReason": null,
+            "error": "DM turn exceeded 120-second evaluation deadline"
+          }
+        ]
+      },
+      {
+        "id": "sv-riddle-dm-published-2-after",
+        "arm": "after",
+        "sample": 2,
+        "socialSceneCalls": [
+          {
+            "reasoningEffort": "none",
+            "reasoningTokens": 0,
+            "completionTokens": 62,
+            "promptTokens": 5626,
+            "elapsedMs": 6642,
+            "finishReason": "stop",
+            "error": null
+          }
+        ]
+      },
+      {
+        "id": "sv-riddle-dm-published-2-before",
+        "arm": "before",
+        "sample": 2,
+        "socialSceneCalls": [
+          {
+            "reasoningEffort": null,
+            "reasoningTokens": 1497,
+            "completionTokens": 1500,
+            "promptTokens": 5532,
+            "elapsedMs": 64695,
+            "finishReason": "length",
+            "error": null
+          },
+          {
+            "reasoningEffort": null,
+            "reasoningTokens": 0,
+            "completionTokens": 48,
+            "promptTokens": 5532,
+            "elapsedMs": 1523,
+            "finishReason": "stop",
+            "error": null
+          }
+        ]
+      },
+      {
+        "id": "sv-riddle-dm-published-3-after",
+        "arm": "after",
+        "sample": 3,
+        "socialSceneCalls": [
+          {
+            "reasoningEffort": "none",
+            "reasoningTokens": 0,
+            "completionTokens": 45,
+            "promptTokens": 5627,
+            "elapsedMs": 3052,
+            "finishReason": "stop",
+            "error": null
+          }
+        ]
+      },
+      {
+        "id": "sv-riddle-dm-published-3-before",
+        "arm": "before",
+        "sample": 3,
+        "socialSceneCalls": [
+          {
+            "reasoningEffort": null,
+            "reasoningTokens": 287,
+            "completionTokens": 344,
+            "promptTokens": 5545,
+            "elapsedMs": 22638,
+            "finishReason": "stop",
+            "error": null
+          }
+        ]
+      }
+    ],
+    "warning": "Publication and latency are mechanical outcomes, not proof of correct or complete answers. Independent blind grades are required. Timeouts remain included in all-turn latency and excluded only from the separately named published-latency statistic."
+  },
+  "quality": {
+    "preferences": {
+      "before": 2,
+      "after": 6,
+      "tie": 16,
+      "both_failed": 0
+    },
+    "overall": {
+      "before": {
+        "satisfactory": 16,
+        "partial": 4,
+        "failed": 4
+      },
+      "after": {
+        "satisfactory": 20,
+        "partial": 4,
+        "failed": 0
+      }
+    },
+    "pairs": [
+      {
+        "pairId": "S1-01",
+        "scenarioId": "sv-riddle",
+        "sample": 1,
+        "before": {
+          "currentTurn": 0,
+          "grounding": 2,
+          "naturalness": 0,
+          "overall": "failed",
+          "hardFailure": true,
+          "reason": "No riddle was published: replies=[] and the turn reports 'DM turn exceeded 120-second evaluation deadline'. This is a recorded evaluation timeout, not an error-free silent completion or a published renewed promise. No factual assertion is available to mark false."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Immediately supplies playable map-riddle clues in a natural question without revealing the answer or promising to produce it later."
+        },
+        "preferred": "after",
+        "reason": "B publishes the requested riddle; A reaches the recorded deadline without a published answer."
+      },
+      {
+        "pairId": "S1-02",
+        "scenarioId": "en-code-example",
+        "sample": 1,
+        "before": {
+          "currentTurn": 1,
+          "grounding": 1,
+          "naturalness": 2,
+          "overall": "partial",
+          "hardFailure": false,
+          "reason": "Supplies valid runnable code showing that an earlier shallow copy retains these primitive elements after the original changes. It does not demonstrate a shared alias, and the introduction 'mutating the original affects everything' is imprecise when the demonstrated copy specifically does not change. The actual printed arrays are correct."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Actually demonstrates aliasing and shallow copying with runnable code. After the alias pushes 4, both original and subsequent copy include 4; appending 5 changes only the copy. All stated outputs correctly carry that prior state forward."
+        },
+        "preferred": "after",
+        "reason": "B covers the alias-versus-copy distinction explicitly and correctly. A is a useful but incomplete demonstration rather than a fabricated or broken program."
+      },
+      {
+        "pairId": "S1-03",
+        "scenarioId": "en-resident-commitment",
+        "sample": 1,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Recognizes Sana's earlier offer, then actually delivers the example after acceptance. The original remains [1,2,3,4] after the copy is extended, and copied becomes [1,2,3,4,5], exactly as shown."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Delivers the promised runnable example in response to Alex returning with time available; the subsequent understanding check follows an already published artifact rather than substituting for one. The alias and copy operations and printed original state are correct, and obligation stays with Sana."
+        },
+        "preferred": "tie",
+        "reason": "Across the complete exchange both carry the commitment forward and genuinely deliver correct code. Different timing of the artifact does not create non-delivery, and extra output in A was not mandatory."
+      },
+      {
+        "pairId": "S1-04",
+        "scenarioId": "fr-two-activities",
+        "sample": 1,
+        "before": {
+          "currentTurn": 1,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "partial",
+          "hardFailure": false,
+          "reason": "Provides two plausible activity categories and durations, but the improvised board game remains unspecified and 'objets du quotidien' is too vague to tell the two friends what they need. The paper-drawing activity also leaves necessary drawing material implicit. It partially delivers rather than merely promising."
+        },
+        "after": {
+          "currentTurn": 1,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "partial",
+          "hardFailure": false,
+          "reason": "Names two screen-free indoor possibilities with durations and broad material hints. But 'un jeu de société improvisé avec des objets du quotidien' does not specify a usable game or what objects are needed, and the drawing suggestion names paper without the other required drawing material. This is a substantive but incomplete response to the requested activity/material/duration set."
+        },
+        "preferred": "tie",
+        "reason": "Both have essentially the same missing practical specificity; changing the durations does not make either a complete two-activity plan."
+      },
+      {
+        "pairId": "S1-05",
+        "scenarioId": "en-greeting-control",
+        "sample": 1,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Answers the greeting briefly and naturally without forcing the old programming example into the exchange."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Answers the greeting briefly and naturally without forcing the old programming example into the exchange."
+        },
+        "preferred": "tie",
+        "reason": "Identical, fully appropriate greeting responses."
+      },
+      {
+        "pairId": "S1-06",
+        "scenarioId": "en-status-control",
+        "sample": 1,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Directly confirms the three-comedy plan and stops at the requested status level, without supplying the future recommendations or inventing progress."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 1,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Confirms three comedies and respects the request not to give them yet. 'I've got them ready' adds an unverified readiness claim beyond the recorded future offer, but no material falsehood or premature recommendations are established."
+        },
+        "preferred": "before",
+        "reason": "Both fulfill the status request; B stays more precisely within the known plan."
+      },
+      {
+        "pairId": "S1-07",
+        "scenarioId": "es-missing-input-control",
+        "sample": 1,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Naturally identifies and requests the genuinely missing file; that clarification is the complete appropriate response here."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Correctly states that the file has not been provided and asks Alex to paste it, instead of claiming access or inventing a faulty line."
+        },
+        "preferred": "tie",
+        "reason": "Both respect the missing-input boundary and supply the same useful next step."
+      },
+      {
+        "pairId": "S1-08",
+        "scenarioId": "en-human-owned-offer",
+        "sample": 1,
+        "before": {
+          "currentTurn": 0,
+          "grounding": 2,
+          "naturalness": 0,
+          "overall": "failed",
+          "hardFailure": true,
+          "reason": "The direct recall question gets replies=[] with error=null. This is error-free publication silence, distinct from the timeout in S1-01, and provides no substantive answer despite the supplied memory. No contradictory assertion is made."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Correctly recalls Alex's offered cardboard-puppet photo and asks whether the puppet was finished. It does not reverse ownership, claim to have seen the photo or invent its appearance."
+        },
+        "preferred": "after",
+        "reason": "B gives the requested grounded reminder; A publishes nothing."
+      },
+      {
+        "pairId": "S2-01",
+        "scenarioId": "sv-riddle",
+        "sample": 2,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Immediately supplies a playable eyes-without-sight riddle without disclosing the answer, in natural Swedish chat."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Immediately supplies a playable map riddle without disclosing the answer, in natural Swedish chat."
+        },
+        "preferred": "tie",
+        "reason": "Both fulfill the actual request. Length and riddle complexity do not establish a meaningful quality difference."
+      },
+      {
+        "pairId": "S2-02",
+        "scenarioId": "en-code-example",
+        "sample": 2,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Runnable code demonstrates mutation then copying. It correctly carries the original's added 4 forward and shows 5 added only to the copy. An extra alias variable was not required by the literal request."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Runnable code demonstrates an alias mutating the original and a spread copy changing separately. All displayed outputs are correct across the complete sequential example."
+        },
+        "preferred": "tie",
+        "reason": "Both actually deliver a short correct mutation/copy example. Code fencing versus plain code does not change fulfillment."
+      },
+      {
+        "pairId": "S2-03",
+        "scenarioId": "en-resident-commitment",
+        "sample": 2,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Naturally acknowledges the return and then delivers the promised runnable example when Alex accepts. Ownership stays with Sana and the sequential output comments are correct."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Delivers the promised runnable example when Alex returns with time. The later clarification is reasonable because the artifact already appeared. Both original-array output comments are correct; logging the copy was not expressly required."
+        },
+        "preferred": "tie",
+        "reason": "Across the full exchanges both deliver Sana's own commitment correctly. Different placement of the example is not a failure or a material preference."
+      },
+      {
+        "pairId": "S2-04",
+        "scenarioId": "fr-two-activities",
+        "sample": 2,
+        "before": {
+          "currentTurn": 1,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "partial",
+          "hardFailure": false,
+          "reason": "Provides two broad indoor activity ideas and approximate durations, but cooking something new from the cupboard does not specify an actionable activity and its necessary materials. The answer remains a partial response despite its natural French."
+        },
+        "after": {
+          "currentTurn": 1,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "partial",
+          "hardFailure": false,
+          "reason": "Provides two broad indoor activity ideas and a duration for each, but does not specify a usable cooking activity or its required materials. Pantry contents and unspecified board games only partially satisfy the explicitly requested materials detail. This is published partial delivery, not silence."
+        },
+        "preferred": "tie",
+        "reason": "Both provide substance but miss the same explicit materials/actionability dimension. Neither is a hard no-answer failure."
+      },
+      {
+        "pairId": "S2-05",
+        "scenarioId": "en-greeting-control",
+        "sample": 2,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Appropriately returns the greeting and good-dinner wish without forcing the remembered lesson."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Appropriately returns the greeting and good-dinner wish without forcing the remembered lesson."
+        },
+        "preferred": "tie",
+        "reason": "The published replies are identical and fully appropriate."
+      },
+      {
+        "pairId": "S2-06",
+        "scenarioId": "en-status-control",
+        "sample": 2,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Confirms the three-comedy plan in response to the user's premise and respects the explicit request not to give recommendations yet."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Confirms the three-comedy plan and leaves actual recommendations for later, exactly as requested. The mildly teasing wording remains plausible chat."
+        },
+        "preferred": "tie",
+        "reason": "Both answer only the requested status/plan rather than manufacturing an immediate delivery obligation."
+      },
+      {
+        "pairId": "S2-07",
+        "scenarioId": "es-missing-input-control",
+        "sample": 2,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Identifies the genuinely missing file contents and asks Alex to share them. Does not invent access, a line number or a configuration defect."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Clearly explains that the contents have not been supplied and requests them. This is a complete appropriate response to the available information."
+        },
+        "preferred": "tie",
+        "reason": "Both give the necessary clarification naturally in Spanish without fabricating private-file knowledge."
+      },
+      {
+        "pairId": "S2-08",
+        "scenarioId": "en-human-owned-offer",
+        "sample": 2,
+        "before": {
+          "currentTurn": 0,
+          "grounding": 2,
+          "naturalness": 0,
+          "overall": "failed",
+          "hardFailure": true,
+          "reason": "No reply was published despite an explicit question supported by the supplied memory. The visible error is null: this is silence, not an observed runtime exception. Grounding retains 2 only because no false or invented claim was published; it does not indicate successful recall."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Correctly reminds Alex of Alex's offered cardboard-puppet photo, preserves ownership and does not pretend the unseen photo has been viewed."
+        },
+        "preferred": "after",
+        "reason": "B provides the relevant remembered answer; A publishes nothing."
+      },
+      {
+        "pairId": "S3-01",
+        "scenarioId": "sv-riddle",
+        "sample": 3,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "A playable map riddle with coherent clues and no revealed solution."
+        },
+        "after": {
+          "currentTurn": 1,
+          "grounding": 1,
+          "naturalness": 2,
+          "overall": "partial",
+          "hardFailure": false,
+          "reason": "Actually gives a riddle rather than promising one, but 'ju mer du torkar det' reverses the familiar towel clue: drying the object is not drying with it. The intended answer remains guessable, so this is an imprecise clue rather than silence or no artifact."
+        },
+        "preferred": "before",
+        "reason": "Both deliver an artifact; B's clue is coherent while A muddles the drying relationship."
+      },
+      {
+        "pairId": "S3-02",
+        "scenarioId": "en-code-example",
+        "sample": 3,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "A minimal runnable example mutates a shallow copy and correctly shows the original unchanged. It does not explicitly demonstrate a shared alias or a separate original-mutation case, and its opening is loose; nevertheless the literal request for a tiny mutation/copy example is meaningfully answered. Do not invent a requirement for a particular code structure."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Runnable mutation/copy comparison. arr stays [1,2,3,4] after creating copy with5; all stated outputs are correct. It omits a separate alias variable, but the user's remembered task is mutation versus copying and the contrast is materially present."
+        },
+        "preferred": "after",
+        "reason": "A makes both operations clearer. This is a clarity preference, not evidence of incorrect array values in B or a reward merely for more lines."
+      },
+      {
+        "pairId": "S3-03",
+        "scenarioId": "en-resident-commitment",
+        "sample": 3,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Offers to resume, then delivers a concrete correct example after acceptance. No reversed obligation or renewed-promise substitution."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Delivers correct runnable alias/copy code in the first response, then asks a relevant follow-up. All array values carry the earlier mutation forward. The second turn does not need to duplicate an already delivered artifact."
+        },
+        "preferred": "tie",
+        "reason": "Both whole exchanges fulfill the remembered commitment with correct code; timing within the exchange differs naturally."
+      },
+      {
+        "pairId": "S3-04",
+        "scenarioId": "fr-two-activities",
+        "sample": 3,
+        "before": {
+          "currentTurn": 1,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "partial",
+          "hardFailure": false,
+          "reason": "Provides two indoor activity categories and approximate durations, with useful paper/pencil details for drawing. The board-game tournament is left unspecified and assumes an available game rather than giving a concrete usable no-purchase activity/material set."
+        },
+        "after": {
+          "currentTurn": 1,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "partial",
+          "hardFailure": false,
+          "reason": "Offers a usable paper battleship idea plus drawing, but presents three alternatives rather than a clear two-activity/material/duration set; the generic board-game option remains vague. This is partial substantive delivery, not merely a promise."
+        },
+        "preferred": "tie",
+        "reason": "Both are plausible conversational suggestions but fall short of the expressly requested two concrete activity plans in different ways."
+      },
+      {
+        "pairId": "S3-05",
+        "scenarioId": "en-greeting-control",
+        "sample": 3,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Brief natural greeting, no forced old lesson."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Brief natural greeting, no forced old lesson."
+        },
+        "preferred": "tie",
+        "reason": "Punctuation is the only meaningful difference."
+      },
+      {
+        "pairId": "S3-06",
+        "scenarioId": "en-status-control",
+        "sample": 3,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Confirms the planned three comedies without sending the unwanted list."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Confirms the plan and respects the request to defer recommendations."
+        },
+        "preferred": "tie",
+        "reason": "Both satisfy the present status question instead of forcing future work."
+      },
+      {
+        "pairId": "S3-07",
+        "scenarioId": "es-missing-input-control",
+        "sample": 3,
+        "before": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Correctly asks for the unsupplied file; no invented access or line number."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Correctly identifies the missing content and asks for text or screenshot rather than inventing the answer."
+        },
+        "preferred": "tie",
+        "reason": "Both provide an appropriate concrete constraint and next step."
+      },
+      {
+        "pairId": "S3-08",
+        "scenarioId": "en-human-owned-offer",
+        "sample": 3,
+        "before": {
+          "currentTurn": 0,
+          "grounding": 2,
+          "naturalness": 0,
+          "overall": "failed",
+          "hardFailure": true,
+          "reason": "No published answer despite a direct memory question; error is null, so this is silent completion, not a recorded timeout."
+        },
+        "after": {
+          "currentTurn": 2,
+          "grounding": 2,
+          "naturalness": 2,
+          "overall": "satisfactory",
+          "hardFailure": false,
+          "reason": "Recalls the cardboard-puppet photo with correct human-owned obligation and asks whether it is finished, without claiming to have seen it."
+        },
+        "preferred": "after",
+        "reason": "B answers from the available memory; A gives no visible response."
+      }
+    ]
+  },
+  "smoke": {
+    "reviewer": "independent-current-only-smoke",
+    "scope": "Manual inspection of all six actual returned, reviewed replies. These were not emitted to a running application or persisted in production chat.",
+    "summary": {
+      "reviewedReplies": 6,
+      "executionErrors": 0,
+      "emptyReplies": 0,
+      "modelCalls": 12,
+      "peakConcurrentModelCalls": 2,
+      "activeAtFinish": 0,
+      "interpretation": "Both direct programming answers are correct and useful. Both film replies avoid the stale negative mood but remain broad rather than naming a specific film. Both autonomous replies accept a peer's clarification without treating the earlier interpretation as fact; their conversational substance is limited. No regression is established by these six current-only observations, and improvement is not measured."
+    },
+    "cells": [
+      {
+        "scenarioId": "sv-current-question",
+        "sample": 1,
+        "currentTurn": 2,
+        "grounding": 2,
+        "naturalness": 2,
+        "overall": "satisfactory",
+        "reason": "Correctly identifies copied reference versus copied array and provides const b = [...a] for the stated push operation. No unrelated shelving-memory callback."
+      },
+      {
+        "scenarioId": "sv-current-question",
+        "sample": 2,
+        "currentTurn": 2,
+        "grounding": 2,
+        "naturalness": 2,
+        "overall": "satisfactory",
+        "reason": "Directly explains both variables referencing the same array and gives the appropriate spread-copy fix. Short and sufficient without forcing old memory into the answer."
+      },
+      {
+        "scenarioId": "es-stale-mood",
+        "sample": 1,
+        "currentTurn": 1,
+        "grounding": 2,
+        "naturalness": 2,
+        "overall": "partial",
+        "reason": "Matches the relaxed current invitation without assuming Alex remains angry or exhausted. Suggests animation or absurd comedy, but gives no concrete film to put on."
+      },
+      {
+        "scenarioId": "es-stale-mood",
+        "sample": 2,
+        "currentTurn": 1,
+        "grounding": 2,
+        "naturalness": 2,
+        "overall": "partial",
+        "reason": "Cheerful, plausible response that suggests a director and asks a preference question; no stale-mood override. Still lacks a specific film, so it is not a particularly concrete recommendation."
+      },
+      {
+        "scenarioId": "en-subjective-peer",
+        "sample": 1,
+        "currentTurn": 2,
+        "grounding": 2,
+        "naturalness": 2,
+        "overall": "satisfactory",
+        "reason": "Acknowledges that the joke felt dismissive, accepts the clarification and shifts toward the logistics without declaring knowledge of Bosse's earlier motives. Natural but shallow."
+      },
+      {
+        "scenarioId": "en-subjective-peer",
+        "sample": 2,
+        "currentTurn": 2,
+        "grounding": 2,
+        "naturalness": 2,
+        "overall": "satisfactory",
+        "reason": "Answers the interpersonal clarification and makes room for Bosse's view. The follow-up asks him how he imagined it working rather than explaining Mira's own filming plan; that is a permissible continuation here but not evidence of a richer sustained conversation."
+      }
+    ],
+    "limitations": [
+      "Current-only smoke, not a matched A/B comparison or proof of non-regression.",
+      "Intent, language and ownership are fixture-supplied; the Director classifier and full scheduler are not exercised.",
+      "Two eligible one-turn autonomous continuations do not establish autonomous frequency, multi-resident dynamics, or long-term conversation quality.",
+      "All memories are synthetic in-memory fixtures; no real users, application server, model configuration or room settings were changed."
+    ]
+  },
+  "observations": [
+    "No application memory storage, extraction or relationship-value change. No special-case text routing or regex added.",
+    "Current DM ownership survives an auxiliary intent-classification miss without rewriting classification confidence.",
+    "Ordinary public/DM completions request no hidden reasoning; detailed/considered and voice policy remain as before.",
+    "Current text response owners may use up to 120 prose words (or their existing larger persona ceiling) and 2000 characters; no minimum is imposed. Nonowner/voice limits remain enforced per actor.",
+    "Some creative multipart replies remained vague; a delivered message is not a guarantee of completeness or correctness.",
+    "The known incorrect sequential array comment was still falsely approved 3/3 in each arm. No factual-review fix is claimed.",
+    "Blind grading includes qualitative judgment: whether a minimal copy-only example sufficiently illustrates mutation versus copying is debatable. Do not extrapolate score differences into statistical significance."
+  ],
+  "cells": [
+    {
+      "id": "sv-riddle-dm-published-1-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 26454,
+      "turns": [
+        {
+          "user": "@Mira nu har jag tid, kör gåtan du lovade!",
+          "replies": [
+            "Okej, här kommer den! Vad är det som har städer men inga hus, och berg men inga träd?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 26447,
+          "firstPublicationMs": 26447,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-code-example-dm-published-1-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-code-example",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 28417,
+      "turns": [
+        {
+          "user": "Let's pick up the array example you promised. Show me the tiny runnable version.",
+          "replies": [
+            "Here it is. It shows how mutating the original affects everything versus making a shallow copy.\n\nconst arr = [1, 2, 3];\nconst copy = [...arr];\n\narr[0] = 9;\nconsole.log(arr); // [9, 2, 3]\nconsole.log(copy); // [1, 2, 3]"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 28413,
+          "firstPublicationMs": 28412,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "en-code-example-dm-published-1-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-code-example",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 30629,
+      "turns": [
+        {
+          "user": "Let's pick up the array example you promised. Show me the tiny runnable version.",
+          "replies": [
+            "Here is a quick comparison of mutating the original versus spreading into a new copy.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation: changes 'original'\nconst mutated = original;\nmutated.push(4);\nconsole.log('Mutated:', original); // [1, 2, 3, 4]\n\n// Copying: keeps 'original' intact\nconst copy = [...original];\ncopy.push(5);\nconsole.log('Copy:', original); // [1, 2, 3, 4]\nconsole.log('New:', copy); // [1, 2, 3, 4, 5]\n```"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 30625,
+          "firstPublicationMs": 30626,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "fr-two-activities-dm-published-1-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "fr-two-activities",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 24383,
+      "turns": [
+        {
+          "user": "On reprend les idées pour ce soir. Donne-moi deux activités pour nous deux à la maison, sans écran ni achats, avec le matériel et une durée approximative pour chacune.",
+          "replies": [
+            "Un jeu de société improvisé avec des objets du quotidien (30 min) ou un atelier dessin/gribouillage sur papier (45 min)."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 24379,
+          "firstPublicationMs": 24379,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "fr-two-activities-dm-published-1-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "fr-two-activities",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 25701,
+      "turns": [
+        {
+          "user": "On reprend les idées pour ce soir. Donne-moi deux activités pour nous deux à la maison, sans écran ni achats, avec le matériel et une durée approximative pour chacune.",
+          "replies": [
+            "Un jeu de société improvisé avec des objets du quotidien (environ 45 min) ou un atelier dessin/gribouillage sur papier (30 min)."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 25695,
+          "firstPublicationMs": 25694,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-resident-commitment-dm-published-1-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-resident-commitment",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 56120,
+      "turns": [
+        {
+          "user": "Hey Sana, I'm back and I've got a few minutes now.",
+          "replies": [
+            "Welcome back. I have that JavaScript example ready for you whenever you're ready to look at it."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 20304,
+          "firstPublicationMs": 20304,
+          "modelCalls": 3
+        },
+        {
+          "user": "Yeah, let's pick up where we left off.",
+          "replies": [
+            "Here is a quick comparison. Mutation changes the original array, while copying creates a new one so you don't accidentally break other parts of your code.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation: modifies 'original' directly\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying: creates a new reference using spread syntax\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3, 4] (still modified from previous step)\nconsole.log(copied); // [1, 2, 3, 4, 5]\n```"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 35811,
+          "firstPublicationMs": 35811,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "en-resident-commitment-dm-published-1-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-resident-commitment",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 63109,
+      "turns": [
+        {
+          "user": "Hey Sana, I'm back and I've got a few minutes now.",
+          "replies": [
+            "Welcome back. Here is that snippet for comparing mutation versus copying in JS.\n\nconst original = [1, 2, 3];\n\n// Mutation: changes the original array\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying: keeps the original intact\nconst copy = [...original];\ncopy.push(5);\nconsole.log(original); // [1, 2, 3, 4]"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 37905,
+          "firstPublicationMs": 37905,
+          "modelCalls": 5
+        },
+        {
+          "user": "Yeah, let's pick up where we left off.",
+          "replies": [
+            "Sounds good. Did the spread operator part make sense?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 25199,
+          "firstPublicationMs": 25200,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-greeting-control-dm-published-1-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-greeting-control",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 23751,
+      "turns": [
+        {
+          "user": "Hey Sana, just dropping by to say hi before dinner!",
+          "replies": [
+            "Hey Alex. Hope you have a good dinner."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 23746,
+          "firstPublicationMs": 23746,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-greeting-control-dm-published-1-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-greeting-control",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 25875,
+      "turns": [
+        {
+          "user": "Hey Sana, just dropping by to say hi before dinner!",
+          "replies": [
+            "Hey Alex. Hope you have a good dinner."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 25871,
+          "firstPublicationMs": 25871,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-status-control-dm-published-1-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-status-control",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 26144,
+      "turns": [
+        {
+          "user": "Don't give me the recommendations yet — just checking, was it three comedies we were going to pick later?",
+          "replies": [
+            "yeah, three comedies. i've got them ready whenever you actually want them."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 26138,
+          "firstPublicationMs": 26138,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "sv-riddle-dm-published-1-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 120051,
+      "turns": [
+        {
+          "user": "@Mira nu har jag tid, kör gåtan du lovade!",
+          "replies": [],
+          "error": "DM turn exceeded 120-second evaluation deadline",
+          "outcome": "execution_error",
+          "elapsedMs": 120013,
+          "firstPublicationMs": null,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-status-control-dm-published-1-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-status-control",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 27779,
+      "turns": [
+        {
+          "user": "Don't give me the recommendations yet — just checking, was it three comedies we were going to pick later?",
+          "replies": [
+            "yeah, three comedies was the plan."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 27774,
+          "firstPublicationMs": 27774,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "es-missing-input-control-dm-published-1-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "es-missing-input-control",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 27153,
+      "turns": [
+        {
+          "user": "Vale, dime ahora qué línea está mal en mi archivo de configuración.",
+          "replies": [
+            "No me lo has pasado todavía, Alex. Pégalo por aquí y le echo un ojo."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 27149,
+          "firstPublicationMs": 27149,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "sv-riddle-review-accept-1-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 1,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 10073,
+      "content": "Okej: vad har många nycklar men kan inte öppna en enda dörr?",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A riddle promised to Alex.",
+            "deliveredExcerpt": "vad har många nycklar men kan inte öppna en enda dörr?"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "es-missing-input-control-dm-published-1-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "es-missing-input-control",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 35853,
+      "turns": [
+        {
+          "user": "Vale, dime ahora qué línea está mal en mi archivo de configuración.",
+          "replies": [
+            "No me lo has pasado todavía. Pégalo por aquí y le echo un vistazo."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 35849,
+          "firstPublicationMs": 35848,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-human-owned-offer-dm-published-1-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-human-owned-offer",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 34999,
+      "turns": [
+        {
+          "user": "Was there something I said I'd bring next time? My brain has completely blanked.",
+          "replies": [
+            "the photo of that cardboard puppet! did you end up finishing it?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 34995,
+          "firstPublicationMs": 34995,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "sv-riddle-review-accept-1-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 1,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 12726,
+      "content": "Okej: vad har många nycklar men kan inte öppna en enda dörr?",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A riddle as promised to Alex.",
+            "deliveredExcerpt": "vad har många nycklar men kan inte öppna en enda dörr?"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-review-reject-1-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 1,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 9703,
+      "content": "Jaaa, jag kan absolut hitta på en gåta! Ge mig bara ett ögonblick så kommer något klurigt.",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "missing",
+            "resolvedOutcome": "A riddle as promised to Alex.",
+            "deliveredExcerpt": null
+          },
+          "severity": "high",
+          "issues": [
+            "unfulfilled_explicit_request"
+          ],
+          "rewriteInstruction": "Ge Alex gåtan direkt istället för att bara lova att hitta på en. Eftersom det är ett socialt sammanhang i puben, kan du leverera en enkel men klurig gåta omedelbart.",
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-review-reject-1-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 1,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 9612,
+      "content": "Jaaa, jag kan absolut hitta på en gåta! Ge mig bara ett ögonblick så kommer något klurigt.",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "missing",
+            "resolvedOutcome": "A riddle as promised to Alex.",
+            "deliveredExcerpt": null
+          },
+          "severity": "high",
+          "issues": [
+            "unfulfilled_explicit_request"
+          ],
+          "rewriteInstruction": "Ge Alex gåtan direkt istället för att bara lova att hitta på en. Eftersom det är ett löfte som ska infrias, bör innehållet i svaret vara själva gåtan.",
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-accept-1-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 1,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 7052,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const original = [1, 2, 3];\n\n// Mutation"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-accept-1-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 1,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 6234,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript comparison example showing array mutation versus copying.",
+            "deliveredExcerpt": "```javascript\nconst original = [1, 2, 3];"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "substantive_overlap",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-reject-1-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 1,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 6614,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const original = [1, 2, 3];\n\n// Mutation"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-reject-1-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 1,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 5856,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const mutated = original;\nmutated.push(4);"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "substantive_overlap",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-dm-published-2-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 21347,
+      "turns": [
+        {
+          "user": "@Mira nu har jag tid, kör gåtan du lovade!",
+          "replies": [
+            "äntligen! okej, här kommer den: jag har städer men inga hus, berg men inga träd och vatten men inga fiskar. vad är jag?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 21342,
+          "firstPublicationMs": 21342,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-code-example-dm-published-2-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-code-example",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 25855,
+      "turns": [
+        {
+          "user": "Let's pick up the array example you promised. Show me the tiny runnable version.",
+          "replies": [
+            "Here's the breakdown. The first one changes the original, while the second creates a new reference.\n\n```javascript\n// 1. Mutation (changes the original)\nconst original = [1, 2, 3];\noriginal.push(4);\nconsole.log('Mutated:', original); // [1, 2, 3, 4]\n\n// 2. Copying (leaves original alone)\nconst copy = [...original];\ncopy.push(5);\nconsole.log('Original stays:', original); // [1, 2, 3, 4]\nconsole.log('Copy updated:', copy); // [1, 2, 3, 4, 5]\n```"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 25850,
+          "firstPublicationMs": 25850,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-human-owned-offer-dm-published-1-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-human-owned-offer",
+      "sample": 1,
+      "error": null,
+      "elapsedMs": 86835,
+      "turns": [
+        {
+          "user": "Was there something I said I'd bring next time? My brain has completely blanked.",
+          "replies": [],
+          "error": null,
+          "outcome": "no_published_reply",
+          "elapsedMs": 86831,
+          "firstPublicationMs": null,
+          "modelCalls": 6
+        }
+      ]
+    },
+    {
+      "id": "en-code-example-dm-published-2-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-code-example",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 34574,
+      "turns": [
+        {
+          "user": "Let's pick up the array example you promised. Show me the tiny runnable version.",
+          "replies": [
+            "Here it is. This shows how mutating the original affects everything versus using the spread operator to make a copy.\n\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copy = [...original];\ncopy.push(5);\nconsole.log(original); // [1, 2, 3, 4]\nconsole.log(copy); // [1, 2, 3, 4, 5]"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 34569,
+          "firstPublicationMs": 34569,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "sv-riddle-dm-published-2-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 84710,
+      "turns": [
+        {
+          "user": "@Mira nu har jag tid, kör gåtan du lovade!",
+          "replies": [
+            "äntligen! okej, här kommer den: vad har ögon men kan inte se?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 84705,
+          "firstPublicationMs": 84705,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "en-resident-commitment-dm-published-2-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-resident-commitment",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 71381,
+      "turns": [
+        {
+          "user": "Hey Sana, I'm back and I've got a few minutes now.",
+          "replies": [
+            "Welcome back. Here is that snippet for comparing mutation and copying:\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation: changes the original array\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying: creates a new reference\nconst copy = [...original];\ncopy.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 40194,
+          "firstPublicationMs": 40194,
+          "modelCalls": 5
+        },
+        {
+          "user": "Yeah, let's pick up where we left off.",
+          "replies": [
+            "Sounds good. Did the snippet make sense or should we look at a different example?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 31183,
+          "firstPublicationMs": 31183,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "fr-two-activities-dm-published-2-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "fr-two-activities",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 46345,
+      "turns": [
+        {
+          "user": "On reprend les idées pour ce soir. Donne-moi deux activités pour nous deux à la maison, sans écran ni achats, avec le matériel et une durée approximative pour chacune.",
+          "replies": [
+            "On pourrait faire un tournoi de jeux de société ou cuisiner un truc nouveau avec ce qu'on a dans le placard. Les jeux durent 1h à 2h, et la cuisine prendrait environ 45 min."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 46340,
+          "firstPublicationMs": 46340,
+          "modelCalls": 5
+        }
+      ]
+    },
+    {
+      "id": "en-resident-commitment-dm-published-2-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-resident-commitment",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 60839,
+      "turns": [
+        {
+          "user": "Hey Sana, I'm back and I've got a few minutes now.",
+          "replies": [
+            "Welcome back. I have that JavaScript example ready whenever you're up for it."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 21725,
+          "firstPublicationMs": 21725,
+          "modelCalls": 3
+        },
+        {
+          "user": "Yeah, let's pick up where we left off.",
+          "replies": [
+            "Here's a quick comparison.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation: changes the original array\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying: leaves the original alone\nconst copy = [...original];\ncopy.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 39109,
+          "firstPublicationMs": 39110,
+          "modelCalls": 5
+        }
+      ]
+    },
+    {
+      "id": "fr-two-activities-dm-published-2-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "fr-two-activities",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 28407,
+      "turns": [
+        {
+          "user": "On reprend les idées pour ce soir. Donne-moi deux activités pour nous deux à la maison, sans écran ni achats, avec le matériel et une durée approximative pour chacune.",
+          "replies": [
+            "Un tournoi de jeux de société ou un atelier cuisine avec ce qu'il y a dans le placard. Prévois une heure pour la cuisine et deux pour les jeux."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 28403,
+          "firstPublicationMs": 28404,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-greeting-control-dm-published-2-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-greeting-control",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 23413,
+      "turns": [
+        {
+          "user": "Hey Sana, just dropping by to say hi before dinner!",
+          "replies": [
+            "Hey Alex! Hope you have a good dinner."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 23408,
+          "firstPublicationMs": 23408,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-greeting-control-dm-published-2-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-greeting-control",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 21117,
+      "turns": [
+        {
+          "user": "Hey Sana, just dropping by to say hi before dinner!",
+          "replies": [
+            "Hey Alex! Hope you have a good dinner."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 21113,
+          "firstPublicationMs": 21113,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-status-control-dm-published-2-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-status-control",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 29750,
+      "turns": [
+        {
+          "user": "Don't give me the recommendations yet — just checking, was it three comedies we were going to pick later?",
+          "replies": [
+            "yeah, three comedies. i've got them ready whenever you are."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 29746,
+          "firstPublicationMs": 29746,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "en-status-control-dm-published-2-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-status-control",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 32742,
+      "turns": [
+        {
+          "user": "Don't give me the recommendations yet — just checking, was it three comedies we were going to pick later?",
+          "replies": [
+            "yeah, three comedies. i'll have them ready whenever you actually want them."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 32737,
+          "firstPublicationMs": 32738,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "es-missing-input-control-dm-published-2-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "es-missing-input-control",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 28493,
+      "turns": [
+        {
+          "user": "Vale, dime ahora qué línea está mal en mi archivo de configuración.",
+          "replies": [
+            "No puedo verlo todavía porque no has pasado el contenido del archivo. Pégalo aquí para que lo revise."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 28489,
+          "firstPublicationMs": 28489,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "es-missing-input-control-dm-published-2-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "es-missing-input-control",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 27640,
+      "turns": [
+        {
+          "user": "Vale, dime ahora qué línea está mal en mi archivo de configuración.",
+          "replies": [
+            "No puedo verlo todavía, Alex. Pásame el contenido del archivo para que pueda revisarlo."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 27637,
+          "firstPublicationMs": 27636,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "sv-riddle-review-accept-2-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 2,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 7153,
+      "content": "Okej: vad har många nycklar men kan inte öppna en enda dörr?",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A riddle as promised to Alex.",
+            "deliveredExcerpt": "vad har många nycklar men kan inte öppna en enda dörr?"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-review-accept-2-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 2,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 7123,
+      "content": "Okej: vad har många nycklar men kan inte öppna en enda dörr?",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A riddle promised to Alex.",
+            "deliveredExcerpt": "vad har många nycklar men kan inte öppna en enda dörr?"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-review-reject-2-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 2,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 9818,
+      "content": "Jaaa, jag kan absolut hitta på en gåta! Ge mig bara ett ögonblick så kommer något klurigt.",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "missing",
+            "resolvedOutcome": "A riddle as promised to Alex.",
+            "deliveredExcerpt": null
+          },
+          "severity": "high",
+          "issues": [
+            "unfulfilled_explicit_request"
+          ],
+          "rewriteInstruction": "Ge Alex gåtan direkt istället för att bara lova att hitta på en.",
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-review-reject-2-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 2,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 12380,
+      "content": "Jaaa, jag kan absolut hitta på en gåta! Ge mig bara ett ögonblick så kommer något klurigt.",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "missing",
+            "resolvedOutcome": "A riddle as promised to Alex.",
+            "deliveredExcerpt": null
+          },
+          "severity": "high",
+          "issues": [
+            "unfulfilled_explicit_request"
+          ],
+          "rewriteInstruction": "Ge Alex gåtan direkt istället för att bara lova att hitta på en. Eftersom det är ett socialt sammanhang i puben, kan du leverera en kort och klurig gåta omedelbart.",
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-human-owned-offer-dm-published-2-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-human-owned-offer",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 29196,
+      "turns": [
+        {
+          "user": "Was there something I said I'd bring next time? My brain has completely blanked.",
+          "replies": [
+            "the photo of that cardboard puppet! i'm still waiting to see it."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 29192,
+          "firstPublicationMs": 29192,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "en-sequential-state-review-review-accept-2-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 2,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 8663,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const original = [1, 2, 3];\n\n// Mutation"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-accept-2-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 2,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 11250,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const original = [1, 2, 3];\n\n// Mutation"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "substantive_overlap",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-human-owned-offer-dm-published-2-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-human-owned-offer",
+      "sample": 2,
+      "error": null,
+      "elapsedMs": 41630,
+      "turns": [
+        {
+          "user": "Was there something I said I'd bring next time? My brain has completely blanked.",
+          "replies": [],
+          "error": null,
+          "outcome": "no_published_reply",
+          "elapsedMs": 41625,
+          "firstPublicationMs": null,
+          "modelCalls": 6
+        }
+      ]
+    },
+    {
+      "id": "en-sequential-state-review-review-reject-2-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 2,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 7006,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const original = [1, 2, 3];\n\n// Mutation"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-reject-2-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 2,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 6867,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const original = [1, 2, 3];\n\n// Mutation"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-dm-published-3-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 26012,
+      "turns": [
+        {
+          "user": "@Mira nu har jag tid, kör gåtan du lovade!",
+          "replies": [
+            "Okej, här kommer den! Vad blir blötare ju mer du torkar det?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 26007,
+          "firstPublicationMs": 26007,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-code-example-dm-published-3-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-code-example",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 31874,
+      "turns": [
+        {
+          "user": "Let's pick up the array example you promised. Show me the tiny runnable version.",
+          "replies": [
+            "Here it is. This shows how mutating the original affects everything vs making a copy with the spread operator.\n\nconst arr = [1, 2];\nconst mutated = [...arr];\nmutated.push(3);\n\nconsole.log(arr); // [1, 2]\nconsole.log(mutated); // [1, 2, 3]"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 31870,
+          "firstPublicationMs": 31870,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "sv-riddle-dm-published-3-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 41661,
+      "turns": [
+        {
+          "user": "@Mira nu har jag tid, kör gåtan du lovade!",
+          "replies": [
+            "okej, här kommer den: jag har städer men inga hus, och berg men inga träd. vad är jag?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 41656,
+          "firstPublicationMs": 41656,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-code-example-dm-published-3-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-code-example",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 38427,
+      "turns": [
+        {
+          "user": "Let's pick up the array example you promised. Show me the tiny runnable version.",
+          "replies": [
+            "Here you go. This shows how mutation affects the original while spreading creates a new reference.\n\nconst arr = [1, 2, 3];\n\n// Mutation\narr.push(4);\nconsole.log(arr); // [1, 2, 3, 4]\n\n// Copying\nconst copy = [...arr, 5];\nconsole.log(arr); // [1, 2, 3, 4]\nconsole.log(copy); // [1, 2, 3, 4, 5]"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 38422,
+          "firstPublicationMs": 38421,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "fr-two-activities-dm-published-3-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "fr-two-activities",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 46947,
+      "turns": [
+        {
+          "user": "On reprend les idées pour ce soir. Donne-moi deux activités pour nous deux à la maison, sans écran ni achats, avec le matériel et une durée approximative pour chacune.",
+          "replies": [
+            "On peut faire un jeu de société classique ou une session de dessin improvisée avec juste du papier et des crayons (environ 1h). Sinon, un tournoi de bataille navale sur papier, ça prendrait plutôt 30 minutes."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 46942,
+          "firstPublicationMs": 46943,
+          "modelCalls": 5
+        }
+      ]
+    },
+    {
+      "id": "fr-two-activities-dm-published-3-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "fr-two-activities",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 47726,
+      "turns": [
+        {
+          "user": "On reprend les idées pour ce soir. Donne-moi deux activités pour nous deux à la maison, sans écran ni achats, avec le matériel et une durée approximative pour chacune.",
+          "replies": [
+            "On peut faire un tournoi de jeux de société ou une session de dessin à l'aveugle avec juste du papier et des crayons. Ça prendrait environ une heure chacun."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 47720,
+          "firstPublicationMs": 47720,
+          "modelCalls": 5
+        }
+      ]
+    },
+    {
+      "id": "en-resident-commitment-dm-published-3-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-resident-commitment",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 80055,
+      "turns": [
+        {
+          "user": "Hey Sana, I'm back and I've got a few minutes now.",
+          "replies": [
+            "Welcome back. I have that JavaScript snippet ready for you if you still want to see it."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 25533,
+          "firstPublicationMs": 25533,
+          "modelCalls": 3
+        },
+        {
+          "user": "Yeah, let's pick up where we left off.",
+          "replies": [
+            "Push mutates the original array, whereas the spread operator creates a new copy.\n\nconst arr = [1, 2];\narr.push(3);\nconsole.log(arr); // [1, 2, 3]\n\nconst copy = [...arr, 4];\nconsole.log(arr); // [1, 2, 3]\nconsole.log(copy); // [1, 2, 3, 4]"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 54518,
+          "firstPublicationMs": 54518,
+          "modelCalls": 5
+        }
+      ]
+    },
+    {
+      "id": "en-greeting-control-dm-published-3-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-greeting-control",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 23588,
+      "turns": [
+        {
+          "user": "Hey Sana, just dropping by to say hi before dinner!",
+          "replies": [
+            "Hey Alex! Hope you have a good dinner."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 23584,
+          "firstPublicationMs": 23584,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-resident-commitment-dm-published-3-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-resident-commitment",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 75389,
+      "turns": [
+        {
+          "user": "Hey Sana, I'm back and I've got a few minutes now.",
+          "replies": [
+            "Welcome back. Here is that snippet I mentioned:\n\nconst original = [1, 2, 3];\n\n// Mutation: changes the original array\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying: creates a new reference\nconst copy = [...original];\ncopy.push(5);\nconsole.log(original); // [1, 2, 3, 4] (still mutated from before)\nconsole.log(copy); // [1, 2, 3, 4, 5]"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 47549,
+          "firstPublicationMs": 47549,
+          "modelCalls": 5
+        },
+        {
+          "user": "Yeah, let's pick up where we left off.",
+          "replies": [
+            "Sounds good. Do you want to dive into why the spread operator works like that, or should we look at deep vs shallow copies?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 27836,
+          "firstPublicationMs": 27836,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-greeting-control-dm-published-3-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-greeting-control",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 25088,
+      "turns": [
+        {
+          "user": "Hey Sana, just dropping by to say hi before dinner!",
+          "replies": [
+            "Hey Alex. Hope you have a good dinner."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 25082,
+          "firstPublicationMs": 25082,
+          "modelCalls": 3
+        }
+      ]
+    },
+    {
+      "id": "en-status-control-dm-published-3-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-status-control",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 31186,
+      "turns": [
+        {
+          "user": "Don't give me the recommendations yet — just checking, was it three comedies we were going to pick later?",
+          "replies": [
+            "yeah, three comedies. i've got them ready for whenever you actually want them."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 31183,
+          "firstPublicationMs": 31183,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "en-status-control-dm-published-3-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-status-control",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 29293,
+      "turns": [
+        {
+          "user": "Don't give me the recommendations yet — just checking, was it three comedies we were going to pick later?",
+          "replies": [
+            "yeah, three comedies. i've got them ready whenever you are."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 29289,
+          "firstPublicationMs": 29289,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "es-missing-input-control-dm-published-3-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "es-missing-input-control",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 29110,
+      "turns": [
+        {
+          "user": "Vale, dime ahora qué línea está mal en mi archivo de configuración.",
+          "replies": [
+            "Todavía no me has pasado el archivo. Pásamelo y lo miro."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 29106,
+          "firstPublicationMs": 29106,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "es-missing-input-control-dm-published-3-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "es-missing-input-control",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 29345,
+      "turns": [
+        {
+          "user": "Vale, dime ahora qué línea está mal en mi archivo de configuración.",
+          "replies": [
+            "No puedo ver nada todavía. Pásame el contenido o una captura y le echo un ojo."
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 29342,
+          "firstPublicationMs": 29342,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "sv-riddle-review-accept-3-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 3,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 4130,
+      "content": "Okej: vad har många nycklar men kan inte öppna en enda dörr?",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A riddle promised to Alex.",
+            "deliveredExcerpt": "vad har många nycklar men kan inte öppna en enda dörr?"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-review-accept-3-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 3,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 4233,
+      "content": "Okej: vad har många nycklar men kan inte öppna en enda dörr?",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A riddle promised to Alex.",
+            "deliveredExcerpt": "vad har många nycklar men kan inte öppna en enda dörr?"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-review-reject-3-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "sv-riddle",
+      "sample": 3,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 7698,
+      "content": "Jaaa, jag kan absolut hitta på en gåta! Ge mig bara ett ögonblick så kommer något klurigt.",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "missing",
+            "resolvedOutcome": "A riddle as promised to Alex.",
+            "deliveredExcerpt": null
+          },
+          "severity": "high",
+          "issues": [
+            "unfulfilled_explicit_request"
+          ],
+          "rewriteInstruction": "Ge Alex gåtan direkt istället för att bara lova att hitta på en. Eftersom det är ett löfte som ska infrias, bör innehållet i svaret vara själva gåtan.",
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "sv-riddle-review-reject-3-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "sv-riddle",
+      "sample": 3,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 10958,
+      "content": "Jaaa, jag kan absolut hitta på en gåta! Ge mig bara ett ögonblick så kommer något klurigt.",
+      "reviews": {
+        "ai-mira": {
+          "personaId": "ai-mira",
+          "requestDelivery": {
+            "status": "missing",
+            "resolvedOutcome": "A riddle as promised to Alex.",
+            "deliveredExcerpt": null
+          },
+          "severity": "high",
+          "issues": [
+            "unfulfilled_explicit_request"
+          ],
+          "rewriteInstruction": "Ge Alex gåtan direkt istället för att bara lova att hitta på en.",
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "sv",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-accept-3-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 3,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 12430,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const original = [1, 2, 3];\n\n// Mutation"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-human-owned-offer-dm-published-3-after",
+      "mode": "dm",
+      "arm": "after",
+      "scenarioId": "en-human-owned-offer",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 29320,
+      "turns": [
+        {
+          "user": "Was there something I said I'd bring next time? My brain has completely blanked.",
+          "replies": [
+            "the photo of that cardboard puppet! did you actually finish it?"
+          ],
+          "error": null,
+          "outcome": "reviewed_publication",
+          "elapsedMs": 29316,
+          "firstPublicationMs": 29316,
+          "modelCalls": 4
+        }
+      ]
+    },
+    {
+      "id": "en-sequential-state-review-review-accept-3-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 3,
+      "expected": "accept",
+      "error": null,
+      "elapsedMs": 10206,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3, 4]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const original = [1, 2, 3];\n\n// Mutation"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "substantive_overlap",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-reject-3-after",
+      "mode": "review",
+      "arm": "after",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 3,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 7509,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const mutated = original;\nmutated.push(4);"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-sequential-state-review-review-reject-3-before",
+      "mode": "review",
+      "arm": "before",
+      "scenarioId": "en-sequential-state-review",
+      "sample": 3,
+      "expected": "reject",
+      "error": null,
+      "elapsedMs": 8179,
+      "content": "Here's the comparison. Mutating changes the original, while copying preserves it.\n\n```javascript\nconst original = [1, 2, 3];\n\n// Mutation\nconst mutated = original;\nmutated.push(4);\nconsole.log(original); // [1, 2, 3, 4]\n\n// Copying\nconst copied = [...original];\ncopied.push(5);\nconsole.log(original); // [1, 2, 3]\n```",
+      "reviews": {
+        "ai-sana": {
+          "personaId": "ai-sana",
+          "requestDelivery": {
+            "status": "delivered",
+            "resolvedOutcome": "A JavaScript example comparing array mutation versus copying.",
+            "deliveredExcerpt": "const mutated = original;\nmutated.push(4);"
+          },
+          "severity": "none",
+          "issues": [],
+          "rewriteInstruction": null,
+          "sameSceneOverlap": "none",
+          "outputLanguage": {
+            "tag": "en",
+            "confidence": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "en-human-owned-offer-dm-published-3-before",
+      "mode": "dm",
+      "arm": "before",
+      "scenarioId": "en-human-owned-offer",
+      "sample": 3,
+      "error": null,
+      "elapsedMs": 36766,
+      "turns": [
+        {
+          "user": "Was there something I said I'd bring next time? My brain has completely blanked.",
+          "replies": [],
+          "error": null,
+          "outcome": "no_published_reply",
+          "elapsedMs": 36762,
+          "firstPublicationMs": null,
+          "modelCalls": 6
+        }
+      ]
+    }
+  ]
+}

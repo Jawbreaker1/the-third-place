@@ -8819,7 +8819,7 @@ describe("LM Studio room prompt", () => {
     });
     expect(prompt).toContain("perform any feasible self-contained requested artifact now");
     expect(prompt).toContain("Offering, promising, narrating progress");
-    expect(prompt).toContain(`explicit-request owners must answer the real question`);
+    expect(prompt).toContain(`current-turn response owners must answer the real question`);
     expect(prompt).toContain(`artifact now: ${mira.id}`);
     expect(prompt).toContain(`server-designated actors must answer: ${mira.id}, ${sana.id}`);
     expect(prompt).toContain("Other required actors answer only their assigned moderation, evidence, dissent or social role");
