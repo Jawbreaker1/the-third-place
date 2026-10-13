@@ -51,6 +51,104 @@ const trigger = (index: number, channelId = "lobby"): ChatMessage =>
   message(index, "Kommer ni ihåg det här?", { id: "trigger", channelId, authorId: "human-question" });
 
 describe("source-bound channel recall", () => {
+  it.each(["", "௰"])("uses the trusted author ID even when the retrieval label has no word tokens (%j)", (label) => {
+    const messages = [
+      message(1, "An exact retained public detail.", { authorId: "human-subject" }),
+      message(2, "I remember that exchange.", { authorId: "ai-mira" }),
+    ];
+    const input = {
+      messages, query: label,
+      participantSubjects: [{ id: "human-subject", displayLabel: label }],
+      trigger: trigger(30), recentMessageIds: [], allowedPersonaIds: ["ai-mira"],
+      selectionPolicy: "latest_witnessed" as const,
+    };
+    expect(channelRecallTokens(label)).toEqual([]);
+    const recalled = recallChannelHistory(input);
+    expect(recalled).toEqual(recallChannelHistory({
+      ...input, query: "Known Person", participantSubjects: [{ id: "human-subject", displayLabel: "Known Person" }],
+    }));
+    expect(recalled?.anchorMessageIds).toEqual([messages[0]!.id]);
+    expect(recalled?.witnessPersonaIds).toEqual(["ai-mira"]);
+    expect(recallChannelHistory({ ...input, participantSubjects: undefined })).toBeUndefined();
+    expect(recallChannelHistory({ ...input, participantSubjects: [{ id: "different-person", displayLabel: label }] })).toBeUndefined();
+    expect(recallChannelHistory({ ...input, messages: [messages[0]!] })).toBeUndefined();
+  });
+
+  it("opts into the latest witnessed window without changing the default relevance selection", () => {
+    const messages = Array.from({ length: 22 }, (_, index) => message(index, `Actual turn ${index}`, {
+      authorId: index < 8 || index === 20 ? "human-lumi" : index === 21 ? "ai-mira" : "human-other",
+    }));
+    const input = {
+      messages,
+      query: "Lumi",
+      participantSubjects: [{ id: "human-lumi", displayLabel: "Lumi" }],
+      trigger: trigger(30),
+      recentMessageIds: [],
+      allowedPersonaIds: ["ai-mira"],
+      maxMessages: 8,
+    };
+
+    const original = recallChannelHistory(input);
+    expect(original?.messages.map((row) => row.id)).toEqual(messages.slice(0, 8).map((row) => row.id));
+    expect(original?.witnessPersonaIds).toEqual([]);
+    const latest = recallChannelHistory({ ...input, selectionPolicy: "latest_witnessed" });
+    expect(latest?.messages).toHaveLength(8);
+    expect(latest?.anchorMessageIds).toContain(messages[20]!.id);
+    expect(latest?.messages.map((row) => row.id)).toContain(messages[21]!.id);
+    expect(latest?.witnessPersonaIds).toEqual(["ai-mira"]);
+    expect(recallChannelHistory({ ...input, messages: [...messages].reverse(), selectionPolicy: "latest_witnessed" })).toEqual(latest);
+  });
+
+  it("finds an older witnessed encounter when the latest anchor has no witness within the bounded window", () => {
+    const messages = Array.from({ length: 22 }, (_, index) => message(index, `Actual turn ${index}`, {
+      authorId: index === 0 || index === 20 ? "human-lumi" : index === 1 ? "ai-mira" : "human-other",
+    }));
+    const result = recallChannelHistory({
+      messages, query: "Lumi", participantSubjects: [{ id: "human-lumi", displayLabel: "Lumi" }],
+      trigger: trigger(30), recentMessageIds: [], allowedPersonaIds: ["ai-mira"], maxMessages: 8,
+      selectionPolicy: "latest_witnessed",
+    });
+    expect(result?.anchorMessageIds).toEqual([messages[0]!.id]);
+    expect(result?.witnessPersonaIds).toEqual(["ai-mira"]);
+    expect(result?.messages.map((row) => row.id)).not.toContain(messages[20]!.id);
+  });
+
+  it("requires an actual allowed author or reaction in opt-in witnessed selection", () => {
+    const source = message(0, "A public turn.", { authorId: "human-lumi" });
+    const input = {
+      messages: [source], query: "Lumi", participantSubjects: [{ id: "human-lumi", displayLabel: "Lumi" }],
+      trigger: trigger(30), recentMessageIds: [], allowedPersonaIds: ["ai-mira"],
+      selectionPolicy: "latest_witnessed" as const,
+    };
+    expect(recallChannelHistory(input)).toBeUndefined();
+    source.reactions = [{ emoji: "👀", memberIds: ["ai-other"] }];
+    expect(recallChannelHistory(input)).toBeUndefined();
+    source.reactions = [{ emoji: "👀", memberIds: ["ai-mira"] }];
+    expect(recallChannelHistory(input)?.witnessPersonaIds).toEqual(["ai-mira"]);
+    expect(recallChannelHistory({ ...input, allowedPersonaIds: [] })).toBeUndefined();
+  });
+
+  it("handles dense unwitnessed history without borrowing witnesses across episode gaps", () => {
+    const messages = Array.from({ length: 2_000 }, (_, index) => message(index, "An actual public message.", {
+      authorId: "human-lumi",
+      time: start + index * 1_000,
+    }));
+    const latest = message(3_000, "A private question.", { time: start + 60 * 60_000 });
+    const input = {
+      messages, query: "Lumi", participantSubjects: [{ id: "human-lumi", displayLabel: "Lumi" }],
+      trigger: latest, recentMessageIds: [], allowedPersonaIds: ["ai-mira"], maxMessages: 8,
+      selectionPolicy: "latest_witnessed" as const,
+    };
+    expect(recallChannelHistory(input)).toBeUndefined();
+    messages.push(message(2_001, "A later unrelated visit.", { authorId: "ai-mira", time: start + 50 * 60_000 }));
+    expect(recallChannelHistory(input)).toBeUndefined();
+    messages[0]!.reactions = [{ emoji: "👀", memberIds: ["ai-mira"] }];
+    const recalled = recallChannelHistory(input);
+    expect(recalled?.messages).toHaveLength(8);
+    expect(recalled?.messages.map((row) => row.id)).toEqual(messages.slice(0, 8).map((row) => row.id));
+    expect(recalled?.witnessPersonaIds).toEqual(["ai-mira"]);
+  });
+
   it("binds participant recall to stable author identity instead of a same-name product topic", () => {
     const productDiscussion = message(1, "Codex cache keys can go stale after a model update.", {
       id: "product-codex",

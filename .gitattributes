@@ -1,0 +1,3 @@
+# Parked unified diffs preserve whitespace-only context lines verbatim.
+# This does not relax whitespace checks on application or test source files.
+docs/evaluations/*.patch -whitespace

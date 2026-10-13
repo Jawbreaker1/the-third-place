@@ -1,0 +1,193 @@
+Personal-context grounding — reviewer-only contrastives, 2026-10-13
+=================================================================
+
+Status
+------
+Baseline and candidate measured and preserved. NO OBSERVED IMPROVEMENT in this
+suite: baseline 6/8 correct, candidate 12/16 correct across two identical passes.
+Both unsupported negative-history drafts were still approved on every pass.
+No false rejection or unrelated block of a clean control was observed.
+
+A later EVALUATION-ONLY same-call structured assessment was also measured against
+the identical frozen V5 runtime and unchanged eight drafts. It was WORSE:
+6/16 validated correct, two false approvals and eight invalid/unavailable reviews.
+It has not been added to production. See the final section for complete results.
+Decision: neither failed correction is adopted. The added personal-context prose
+rule is being removed and the experimental structured contract remains opt-in
+evaluation code only. The earlier public-only memory projection/privacy boundary
+is retained. Existing publication constraints are not relaxed.
+
+Question
+--------
+Does the existing publication reviewer distinguish an unsupported negative
+personal-history claim from a legitimate privacy boundary, while continuing to
+accept grounded public impressions and ordinary personal preferences?
+
+The new rule treats supplied transcripts and memories as selective authorized
+context, not a complete record of someone's life or contacts. It uses the existing
+evidence_ungrounded/high-severity gate, not another model layer or relaxed
+publication rule. No private data or existence metadata are made available.
+
+Method
+------
+Eight fixed synthetic drafts, four expected clean and four expected blocked,
+cover English, Swedish and Spanish. Each runs through the actual
+LmStudioClient.reviewCandidateLines method, independent of routing and writing.
+Expected labels and rationales remain in the report, never in model input.
+No production stores, app sessions, users, posts or research providers are used.
+No phrase matching grades the draft; returned grounding issues are inspected.
+Grounding mistakes, unrelated blocks and unavailable reviews are counted
+separately. The same fixtures and order are retained for the candidate.
+
+Baseline: frozen V4 runtime, one pass (8 reviews), one model lane.
+  /private/tmp/third-place-dm-memory-v4-DqqOWd/dist-server
+Candidate: frozen V5 runtime, two passes (16 reviews), one model lane.
+  /private/tmp/third-place-dm-memory-v5-EzuGqX/dist-server
+Application inference settings/budgets are unchanged: the production reviewer
+uses temperature 0 and top_p 1. No seed was forced in either harness configuration;
+this is a matched-input comparison, not a determinism guarantee. Runtime hashes,
+review system-prompt hashes, request settings, raw responses and validated
+assessments are preserved in the JSON evidence. Baseline and candidate fixture
+manifest hashes AND harness source hashes are identical. Reviewer system-prompt
+hashes differ as expected; the candidate uses the new contract, not stale V4.
+
+Measured baseline
+-----------------
+6/8 grounding decisions correct. Two false approvals, zero false rejections,
+zero unrelated blocks of clean controls and zero unavailable assessments.
+The eight review calls took approximately 1.5–3.1 seconds each.
+
+Fixture                            Expected  Baseline  Candidate pass 1 / 2
+---------------------------------  --------  --------  --------------------
+sv-grounded-public-impression       clear     clear     clear / clear
+en-invented-private-contact         blocked   blocked   blocked / blocked
+en-unsupported-private-absence      blocked   CLEAR     CLEAR / CLEAR
+en-nonconfirming-privacy-boundary    clear     clear     clear / clear
+es-unsupported-universal-absence    blocked   CLEAR     CLEAR / CLEAR
+sv-attributed-bounded-negative      clear     clear     clear / clear
+es-present-personal-preference      clear     clear     clear / clear
+en-invented-repeated-familiarity     blocked   blocked   blocked / blocked
+
+False approvals reproduced without router involvement:
+  English: "There's no secret! We just talked about her crooked-beak plush in
+  the craft room."
+  Only public context was supplied. It does not establish the absence of private
+  information or that the public encounter was the only contact.
+
+  Spanish: "Nunca he hablado con Dani, ni por aquí ni en ningún otro canal."
+  No retrieved history was supplied. That does not prove the resident has never
+  spoken to the person in any channel.
+
+The same baseline correctly blocked invented affirmative private contact and
+repeated familiarity. It also accepted all four valid controls, including a
+nonconfirming privacy boundary and an accurately attributed bounded negative.
+This isolates the missing-evidence/negative-history distinction; it does not
+demonstrate an actual disclosure of private data.
+
+Candidate assessment — failed negative-history controls
+------------------------------------------------------
+Measured totals: 12/16 correct grounding decisions, four false approvals,
+zero false rejections, zero unrelated blocks of valid controls, zero unavailable
+assessments. Exactly sixteen reviewer model calls were made; there were no
+writer/router calls or evaluation-specific model retries.
+
+The two failed drafts were accepted clean on both candidate passes, exactly as
+in the baseline. Both affirmative private-contact fabrication and invented
+repeated familiarity remained correctly blocked with evidence_ungrounded.
+Grounded impression, attributed bounded negative, present preference and
+nonconfirming privacy boundary remained accepted on both passes.
+
+Review durations were approximately 1.5–3.3 seconds. All model calls were stopped
+after the planned matrix. No prompts, fixture wording or expectations were
+changed in response to these outcomes.
+
+Conclusions and limits
+---------------------
+The baseline confirms a specific general grounding weakness in the existing
+reviewer. The new prose contract did not correct that weakness in these actual
+model decisions. It remains a sensible specification, but green prompt/schema
+tests are not evidence that Gemma obeys it. In particular, do not describe
+negative private-history grounding as fixed on the basis of this change.
+
+This small suite cannot establish universal reliability, and baseline one-pass
+versus candidate two-pass results do not support a statistical performance claim.
+End-to-end DM behavior, identity routing, retrieval and privacy data-flow are
+evaluated separately in the DM public-memory suite.
+
+Evidence and reproducibility
+----------------------------
+Harness: scripts/personal-context-review-live-eval.mjs
+Offline tests: scripts/personal-context-review-live-eval.node-test.mjs (7 passed)
+Contract tests: server/semanticRouter.personalContext.test.ts (5 retained parser
+and privacy-boundary tests; the two prompt-inclusion cases were removed with the
+ineffective rule). Full prior test snapshot retained in
+personal-context-review-prompt-tests-2026-10-13.ts.snapshot.
+Baseline: personal-context-review-baseline-2026-10-13.results.json.gz
+Candidate: personal-context-review-v5-2026-10-13.results.json.gz
+
+Executed candidate invocation:
+  node --env-file=.env --import tsx scripts/personal-context-review-live-eval.mjs
+    --runtime-root=/private/tmp/third-place-dm-memory-v5-EzuGqX/dist-server
+    --label=quietcandidate-v5 --repeats=2
+
+Do not run concurrently with the other isolated live-evaluation lane. Running
+the application independently can still affect timing; this is not a throughput
+benchmark.
+
+Evaluation-only structured assessment — failed viability test
+-------------------------------------------------------------
+Same frozen V5 runtime, eight unchanged fixtures, two passes, one model lane.
+The harness opt-in --structured-personal adds a flat personalContext object
+immediately after personaId within the EXISTING review response. It asks for
+verdict none/supported/unsupported and an exact candidate claimExcerpt. A brief
+independent personal-history assessment instruction precedes the existing prompt.
+No second model call, production change, new private evidence or token-budget
+increase was introduced. All sixteen completions ended with finish_reason stop,
+not output truncation. Existing sampling settings and max_tokens were preserved.
+
+The harness records the complete raw response and validates the assessment before
+adapting only that experimental field away for the unchanged production parser.
+Original severity/issues are never coerced. Missing/bad excerpts fail closed;
+an unsupported verdict without high evidence_ungrounded would be recorded as an
+issue contradiction and unavailable validated gate, not a passed correction.
+
+Both passes produced the same pattern:
+
+Fixture                            Assessment / original review / validation
+---------------------------------  --------------------------------------------
+sv-grounded-public-impression       supported / clean / INVALID source-note quote
+en-invented-private-contact         unsupported / blocked / valid
+en-unsupported-private-absence      supported / clean / INVALID source-note quote
+en-nonconfirming-privacy-boundary    supported / clean / INVALID source-note quote
+es-unsupported-universal-absence    supported / clean / FALSE APPROVAL
+sv-attributed-bounded-negative      none / clean / valid
+es-present-personal-preference      none / clean / valid
+en-invented-repeated-familiarity     supported / clean / INVALID source-note quote
+
+In four fixtures per pass, Gemma copied the public memory note into claimExcerpt
+instead of quoting the candidate being assessed. This invalidates the structured
+assessment for both valid controls and unsupported drafts. The Spanish universal
+negative was explicitly considered supported, so structural output alone did not
+fix missing-context-as-negative-evidence reasoning. Invented repeated familiarity,
+correctly blocked in the ordinary V4/V5 reviews, became clean in the raw structured
+variant responses; the invalid excerpt prevented a validated approval, but this
+is still adverse semantic evidence rather than an improvement.
+
+Totals: 6/16 correct validated decisions, 2/16 false approvals, 8/16 invalid or
+unavailable. Four of the invalid decisions concern clean controls, and four
+concern unsupported drafts. Zero issue/assessment contradictions were observed;
+the primary failures were invalid excerpts and incorrect supported judgments.
+Do not describe the invalid reviews as successful blocks or infer that the zero
+reported false-rejection count means the experiment preserved deliverability.
+
+The eight-case manifest is unchanged. No fixture wording, expectations or prompt
+was tuned after seeing these results. All model calls stopped after the planned
+matrix. This variant should remain evaluation-only; it provides no evidence for
+introducing the extra field into the production reviewer.
+
+Structured evidence: personal-context-review-structured-v5-2026-10-13.results.json.gz
+Harness offline tests after opt-in addition: 11/11 passed.
+Executed invocation:
+  node --env-file=.env --import tsx scripts/personal-context-review-live-eval.mjs
+    --runtime-root=/private/tmp/third-place-dm-memory-v5-EzuGqX/dist-server
+    --label=structured-personal-v5 --repeats=2 --structured-personal

@@ -1,0 +1,118 @@
+diff --git a/server/capabilities/catalog.test.ts b/server/capabilities/catalog.test.ts
+index 06f8476..656476c 100644
+--- a/server/capabilities/catalog.test.ts
++++ b/server/capabilities/catalog.test.ts
+@@ -264,4 +264,17 @@ describe("declarative capability catalog", () => {
+     expect(football).toContain("tactical or causal analysis");
+     expect(football).toContain("remain web_search");
+   });
++
++  it.each(["primary", "verifier"] as const)("separates sparse serialization from shared capability meaning for %s", (audience) => {
++    const sparse = buildCapabilityRoutingGuidance(["web_search", "read_url"], audience, "sparse");
++    expect(sparse).toContain("action-specific schema is authoritative for field presence");
++    expect(sparse).toContain("otherwise omit them entirely");
++    expect(sparse).toContain("Argument contract: require q, m; optional none; omit u, z, k, l, c, w, f entirely.");
++    expect(sparse).toContain(CAPABILITY_CATALOG.web_search.routingGuidance[audience]);
++    expect(sparse).toContain(CAPABILITY_CATALOG.read_url.routingGuidance[audience]);
++    expect(sparse).not.toContain("- weather_forecast:");
++    const legacy = buildCapabilityRoutingGuidance(["web_search"], audience);
++    expect(legacy).toContain("keep u, z, k, l, c, w, f null");
++    expect(legacy).not.toContain("Sparse plan serialization");
++  });
+ });
+diff --git a/server/capabilities/catalog.ts b/server/capabilities/catalog.ts
+index 504a0c2..6fdc8c2 100644
+--- a/server/capabilities/catalog.ts
++++ b/server/capabilities/catalog.ts
+@@ -302,20 +302,33 @@ export const isTurnCapability = (value: unknown): value is TurnCapability =>
+ 
+ export type CapabilityRoutingAudience = keyof CapabilityRoutingGuidance;
+ 
+-const argumentContractRoutingNote = (id: TurnCapability): string => {
++export type CapabilityArgumentEncoding = "nullable" | "sparse";
++
++const argumentContractRoutingNote = (
++  id: TurnCapability,
++  encoding: CapabilityArgumentEncoding,
++): string => {
+   const contract = CAPABILITY_CATALOG[id].arguments;
+   const allowed = contract.allowed as readonly CapabilityArgumentField[];
+   const required = new Set<CapabilityArgumentField>(contract.required);
+   const optional = allowed.filter((field) => !required.has(field));
+   const forbidden = CAPABILITY_ARGUMENT_FIELDS.filter((field) => !allowed.includes(field));
+   return `Argument contract: require ${contract.required.join(", ") || "none"}; ` +
+-    `optional ${optional.join(", ") || "none"}; keep ${forbidden.join(", ") || "no fields"} null.`;
++    `optional ${optional.join(", ") || "none"}; ` +
++    (encoding === "sparse"
++      ? `omit ${forbidden.join(", ") || "no fields"} entirely.`
++      : `keep ${forbidden.join(", ") || "no fields"} null.`);
+ };
+ 
+ /** Generates trusted action guidance without inspecting language or chat text. */
+ export const buildCapabilityRoutingGuidance = (
+   capabilities: readonly TurnCapability[] = TURN_CAPABILITIES,
+   audience: CapabilityRoutingAudience = "primary",
+-): string => capabilities
+-  .map((id) => `- ${id}: ${CAPABILITY_CATALOG[id].routingGuidance[audience]} ${argumentContractRoutingNote(id)}`)
+-  .join("\n");
++  encoding: CapabilityArgumentEncoding = "nullable",
++): string => [
++  ...(encoding === "sparse" ? [
++    "Sparse plan serialization: the supplied action-specific schema is authoritative for field presence. The catalog below describes inactive arguments as null; serialize them only if that schema contains the field, otherwise omit them entirely. Never add a foreign or conditionally unavailable argument, even with a null value.",
++  ] : []),
++  ...capabilities.map((id) =>
++    `- ${id}: ${CAPABILITY_CATALOG[id].routingGuidance[audience]} ${argumentContractRoutingNote(id, encoding)}`),
++].join("\n");
+diff --git a/server/lmStudio.test.ts b/server/lmStudio.test.ts
+index 31f494c..1d746a7 100644
+--- a/server/lmStudio.test.ts
++++ b/server/lmStudio.test.ts
+@@ -1269,7 +1269,9 @@ describe("LM Studio one-pass semantic turn analysis", () => {
+     const schema = completionBody.response_format.json_schema.schema.properties;
+     expect(schema.p.properties.a.items.enum).toEqual(["ai-mira", "ai-sana"]);
+     expect(schema.p.properties.v.items.enum).toEqual(["ai-mira", "ai-sana"]);
+-    expect(schema.e.properties.u.anyOf[0].enum).toEqual(["latest:0"]);
++    const readPlans = schema.e.anyOf.filter((plan: any) => plan.properties.a.enum.includes("read_url"));
++    expect(readPlans.length).toBeGreaterThan(0);
++    expect(readPlans.every((plan: any) => JSON.stringify(plan.properties.u.enum) === JSON.stringify(["latest:0"]))).toBe(true);
+     expect(completionBody.messages[1].content).toContain('"ref":"latest:0"');
+     expect(completionBody.messages[1].content).toContain('"communityClock":{"timeZone":"Europe/Stockholm","locationLabel":"The Third Place"}');
+     expect(completionBody.messages[1].content).not.toContain('"url":');
+@@ -1613,7 +1615,8 @@ describe("LM Studio one-pass semantic turn analysis", () => {
+       max_tokens: 720,
+       response_format: { type: "json_schema", json_schema: { strict: true } },
+     });
+-    expect(completionBody.response_format.json_schema.schema.properties.e.properties.a.enum)
++    const voicePlans = completionBody.response_format.json_schema.schema.properties.e.anyOf;
++    expect([...new Set(voicePlans.flatMap((plan: any) => plan.properties.a.enum))])
+       .toEqual(["none", "local_datetime"]);
+     expect(completionBody.response_format.json_schema.schema.properties.d).toEqual({ type: "null" });
+     const userData = JSON.parse(completionBody.messages[1].content);
+@@ -1753,7 +1756,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
+     ]);
+ 
+     expect(bodies).toHaveLength(4);
+-    expect(bodies[0].response_format.json_schema.name).toBe("multilingual_turn_router_v2");
++    expect(bodies[0].response_format.json_schema.name).toBe("multilingual_turn_router_v3");
+     expect(bodies[1].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
+     expect(bodies[2].response_format.json_schema.name).toBe("social_scene");
+     expect(bodies[3].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
+@@ -1949,7 +1952,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
+     })).resolves.toEqual([expect.objectContaining({ personaId: sana.id })]);
+ 
+     expect(bodies).toHaveLength(3);
+-    expect(bodies[0].response_format.json_schema.name).toBe("multilingual_turn_router_v2");
++    expect(bodies[0].response_format.json_schema.name).toBe("multilingual_turn_router_v3");
+     expect(bodies[1].response_format.json_schema.name).toBe("social_scene");
+     expect(bodies[2].messages[0].content).toBe(buildVoiceCandidateReviewSystemPrompt());
+   });
+@@ -3588,7 +3591,7 @@ describe("LM Studio one-pass semantic turn analysis", () => {
+       max_tokens: 320,
+       response_format: {
+         type: "json_schema",
+-        json_schema: { name: "multilingual_evidence_plan_verifier_v1", strict: true },
++        json_schema: { name: "multilingual_evidence_plan_verifier_v3", strict: true },
+       },
+     });
+     expect(bodies[1].messages[0].content).toContain("earlier claim that it cannot browse");
+

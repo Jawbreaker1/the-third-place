@@ -1,0 +1,59 @@
+--- /private/tmp/third-place-dm-binding-baseline-sFQPrt/director.ts	2026-10-13 13:42:11
++++ server/director.ts	2026-10-13 14:11:55
+@@ -91,6 +91,7 @@
+ import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
+ import { recallChannelHistory } from "./channelRecall.js";
+ import { recallWitnessedPublicConversation } from "./dmPublicContext.js";
++import { createUnavailableDmPersonBinding, type DmPersonBindingResult } from "./dmPersonBinding.js";
+ import {
+   DmTurnCoordinator,
+   type DmTurn,
+@@ -4411,6 +4412,21 @@
+     if (!turn.isCurrent()) return undefined;
+ 
+     const availableCapabilities = this.availableTurnCapabilities(candidateSet, Boolean(persona.canResearch), "dm");
++    // Person reference and conversational focus are different questions. The
++    // narrow DM contract distinguishes a real group from competing antecedents.
++    const personBindingStarted = performance.now();
++    let personBinding: DmPersonBindingResult = await this.lm.bindDmPersons?.({
++      speakerId: human.id,
++      residentId: persona.id,
++      latestMessage: { id: latest.id, authorId: human.id, content: this.transcriptContent(latest).slice(0, 4_000) },
++      recentMessages: activeContextMessages.filter((message) => message.id !== latest.id).map((message) => ({
++        id: message.id, authorId: message.authorId, content: this.transcriptContent(message).slice(0, 1_200),
++      })),
++      publicHumanCandidates: humanCandidates.map((candidate) => ({ id: candidate.id, displayLabel: candidate.displayLabel })),
++    }, { channelId: latest.channelId, signal: turn.signal }) ?? {
++      status: "unavailable", subjects: [], alternatives: [], confidence: 0,
++    };
++    if (!turn.isCurrent()) return undefined;
+     const trustedDmTurn = projectTrustedTurnAnalysis(
+       analysis,
+       humanCandidates.map((candidate) => candidate.id),
+@@ -4428,11 +4444,24 @@
+     const retainedCandidates = this.humanReferenceCandidates(human.id, {
+       includeOnline: true, eligibleIds: publicSubjectIds,
+     });
+-    const referencedSubjects = retainedCandidates.filter((candidate) =>
+-      trustedDmTurn.referencedHumanIds.includes(candidate.id) &&
++    let referencedSubjects = retainedCandidates.filter((candidate) =>
++      (personBinding.status === "single" || personBinding.status === "group") &&
++      personBinding.subjects.some((subject) => subject.personId === candidate.id) &&
+       candidateEpochs.has(candidate.id) &&
+       this.humanActorWorkIsCurrent(candidate.id, candidateEpochs.get(candidate.id))
+     ).slice(0, 2);
++    // A resolved group is atomic: a retired/reset member cannot silently
++    // become an incomplete group, nor remain selected without current authority.
++    const retainedSubjectIds = new Set(referencedSubjects.map((subject) => subject.id));
++    if (personBinding.subjects.some((subject) => !retainedSubjectIds.has(subject.personId))) {
++      personBinding = createUnavailableDmPersonBinding();
++      referencedSubjects = [];
++    }
++    recordTurnDiagnostic({ kind: "dm", channelId: latest.channelId, trigger: { messageId: latest.id } }, {
++      stage: "person_binding", outcome: personBinding.status === "unavailable" ? "unavailable" : "completed",
++      personBindingStatus: personBinding.status, durationMs: performance.now() - personBindingStarted,
++      candidateCount: humanCandidates.length, selectedCount: personBinding.subjects.length,
++    });
+     const publicSubjectEpochs = referencedSubjects.map((subject) => ({
+       id: subject.id, epoch: candidateEpochs.get(subject.id)!,
+     }));

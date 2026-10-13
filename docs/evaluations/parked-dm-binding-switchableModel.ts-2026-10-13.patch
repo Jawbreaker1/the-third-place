@@ -1,0 +1,31 @@
+diff --git a/server/switchableModel.ts b/server/switchableModel.ts
+index 5014089..959762c 100644
+--- a/server/switchableModel.ts
++++ b/server/switchableModel.ts
+@@ -1,5 +1,6 @@
+ import type { ServerHealth, VisualObservation } from "../shared/types.js";
+ import type { ConversationResearchChoice, ConversationResearchInput } from "./conversationResearch.js";
++import type { DmPersonBindingInput, DmPersonBindingResult } from "./dmPersonBinding.js";
+ import type {
+   ForegroundDemandLease,
+   GeneratedLine,
+@@ -20,6 +21,8 @@ export interface SocialModelClient {
+   probe(): Promise<ServerHealth["model"]>;
+   health(overrideLabel?: string): ServerHealth["model"];
+   analyzeTurn(input: TurnAnalysisInput, execution?: TurnAnalysisExecutionOptions): Promise<TurnAnalysis>;
++  /** Missing adapters fail closed: no fallback to the broader router's ambiguous person list. */
++  bindDmPersons?(input: DmPersonBindingInput, execution: { channelId: string; signal?: AbortSignal }): Promise<DmPersonBindingResult | undefined>;
+   analyzeMemoryTurn(input: MemoryAnalysisInput): Promise<MemoryAnalysis>;
+   analyzeSocialEpisode(input: SocialMemoryAnalysisInput): Promise<SocialMemoryAnalysis>;
+   consolidateSocialMemories(input: SocialMemoryConsolidationInput): Promise<SocialMemoryConsolidation>;
+@@ -138,6 +141,10 @@ export class SwitchableSocialModel implements SocialModelClient {
+     return await this.guarded((client) => client.analyzeMemoryTurn(input));
+   }
+ 
++  async bindDmPersons(input: DmPersonBindingInput, execution: { channelId: string; signal?: AbortSignal }): Promise<DmPersonBindingResult | undefined> {
++    return await this.guarded((client) => client.bindDmPersons(input, execution));
++  }
++
+   async analyzeSocialEpisode(input: SocialMemoryAnalysisInput): Promise<SocialMemoryAnalysis> {
+     return await this.guarded((client) => client.analyzeSocialEpisode(input));
+   }

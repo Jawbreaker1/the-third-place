@@ -1,0 +1,122 @@
+--- /private/tmp/third-place-dm-binding-baseline-sFQPrt/director.ts	2026-10-13 13:42:11
++++ /private/tmp/third-place-dm-binding-v2-BWygeH/director.ts	2026-10-13 14:07:22
+@@ -90,7 +90,8 @@
+ import type { AdminBehaviorTuning } from "../shared/adminTypes.js";
+ import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
+ import { recallChannelHistory } from "./channelRecall.js";
+-import { recallWitnessedPublicConversation } from "./dmPublicContext.js";
++import { buildDmPublicMemoryPackets } from "./dmPublicMemoryPackets.js";
++import { createUnavailableDmPersonBinding, type DmPersonBindingResult } from "./dmPersonBinding.js";
+ import {
+   DmTurnCoordinator,
+   type DmTurn,
+@@ -4411,6 +4412,26 @@
+     if (!turn.isCurrent()) return undefined;
+ 
+     const availableCapabilities = this.availableTurnCapabilities(candidateSet, Boolean(persona.canResearch), "dm");
++    // Person reference and conversational focus are different questions. The
++    // narrow DM contract distinguishes a real group from competing antecedents.
++    const personBindingStarted = performance.now();
++    let personBinding: DmPersonBindingResult = await this.lm.bindDmPersons?.({
++      speakerId: human.id,
++      residentId: persona.id,
++      latestMessage: { id: latest.id, authorId: human.id, content: this.transcriptContent(latest).slice(0, 4_000) },
++      recentMessages: activeContextMessages.filter((message) => message.id !== latest.id).map((message) => ({
++        id: message.id, authorId: message.authorId, content: this.transcriptContent(message).slice(0, 1_200),
++      })),
++      publicHumanCandidates: humanCandidates.map((candidate) => ({ id: candidate.id, displayLabel: candidate.displayLabel })),
++    }, { channelId: latest.channelId, signal: turn.signal }) ?? {
++      status: "unavailable", subjects: [], alternatives: [], confidence: 0,
++    };
++    recordTurnDiagnostic({ kind: "dm", channelId: latest.channelId, trigger: { messageId: latest.id } }, {
++      stage: "person_binding", outcome: personBinding.status === "unavailable" ? "unavailable" : "completed",
++      personBindingStatus: personBinding.status, durationMs: performance.now() - personBindingStarted,
++      candidateCount: humanCandidates.length, selectedCount: personBinding.subjects.length,
++    });
++    if (!turn.isCurrent()) return undefined;
+     const trustedDmTurn = projectTrustedTurnAnalysis(
+       analysis,
+       humanCandidates.map((candidate) => candidate.id),
+@@ -4428,11 +4449,19 @@
+     const retainedCandidates = this.humanReferenceCandidates(human.id, {
+       includeOnline: true, eligibleIds: publicSubjectIds,
+     });
+-    const referencedSubjects = retainedCandidates.filter((candidate) =>
+-      trustedDmTurn.referencedHumanIds.includes(candidate.id) &&
++    let referencedSubjects = retainedCandidates.filter((candidate) =>
++      (personBinding.status === "single" || personBinding.status === "group") &&
++      personBinding.subjects.some((subject) => subject.personId === candidate.id) &&
+       candidateEpochs.has(candidate.id) &&
+       this.humanActorWorkIsCurrent(candidate.id, candidateEpochs.get(candidate.id))
+     ).slice(0, 2);
++    // A resolved group is atomic: a retired/reset member cannot silently
++    // become an incomplete group, nor remain selected without current authority.
++    const retainedSubjectIds = new Set(referencedSubjects.map((subject) => subject.id));
++    if (personBinding.subjects.some((subject) => !retainedSubjectIds.has(subject.personId))) {
++      personBinding = createUnavailableDmPersonBinding();
++      referencedSubjects = [];
++    }
+     const publicSubjectEpochs = referencedSubjects.map((subject) => ({
+       id: subject.id, epoch: candidateEpochs.get(subject.id)!,
+     }));
+@@ -4440,7 +4469,8 @@
+       this.humanActorWorkIsCurrent(subject.id, subject.epoch)
+     );
+     const dmScope = { kind: "dm" as const, threadId: latest.channelId, participantIds: [human.id, persona.id] };
+-    const recalled = recallWitnessedPublicConversation({
++    const memoryErasureRevision = this.socialMemory?.erasureRevision;
++    const packets = buildDmPublicMemoryPackets({
+       // Do not retain a pre-classification copy after an erasure/moderation
+       // operation; the recall helper applies the exact trigger-time boundary.
+       messages: this.store.getAllMessages(),
+@@ -4448,26 +4478,19 @@
+       ownerId: persona.id,
+       subjects: referencedSubjects,
+       trigger: latest,
++      getPublicNote: (subjectId) => this.socialMemory?.publicThirdPartyPromptNote(persona.id, subjectId, dmScope),
++      toTranscript: (rows) => this.transcriptMessages([...rows]),
+     });
+-    const roomRecall: RoomRecallEvidence | undefined = recalled ? {
+-      sourceChannel: recalled.sourceChannel,
+-      witnessPersonaIds: [persona.id],
+-      transcript: this.transcriptMessages(recalled.recall.messages),
+-      provenance: recalled.recall.rows.map((row) => ({ ...row, generation: row.generation ?? null })),
+-    } : undefined;
+-    for (const row of recalled?.recall.rows ?? []) {
++    for (const row of packets.flatMap((packet) => packet.roomRecall?.provenance ?? [])) {
+       if (!publicSubjectEpochs.some((subject) => subject.id === row.authorId)) {
+         publicSubjectEpochs.push({ id: row.authorId, epoch: this.captureActorWorkEpoch(row.authorId) });
+       }
+     }
+-    const memoryErasureRevision = this.socialMemory?.erasureRevision;
+-    const publicParticipantNotes = this.publicReferencedHumanNotes(
+-      [persona], referencedSubjects.map((subject) => subject.id), retainedCandidates, dmScope,
+-    );
++    const dmPersonContext = { ownerId: persona.id, binding: personBinding, packets };
+     recordTurnDiagnostic({ kind: "dm", channelId: latest.channelId, trigger: { messageId: latest.id } }, {
+       stage: "selection", outcome: "completed",
+       candidateCount: humanCandidates.length, selectedCount: referencedSubjects.length,
+-      recallTurns: roomRecall?.transcript.length ?? 0,
++      recallTurns: packets.reduce((sum, packet) => sum + (packet.roomRecall?.transcript.length ?? 0), 0),
+     });
+     const invocation = this.classifiedCapabilityInvocation(
+       analysis,
+@@ -4504,7 +4527,7 @@
+       },
+     );
+     const carriesPersistentMemory = Boolean(this.socialMemory) && [
+-      ...Object.values(publicParticipantNotes), ...Object.values(relationshipContext.relationshipNotes),
++      ...packets.map((packet) => packet.publicMemoryNote ?? ""), ...Object.values(relationshipContext.relationshipNotes),
+     ].some((note) => note.trim().length > 0);
+     // A note can depend on an erased event participant beyond its named
+     // subject. Conservatively invalidate memory-bearing replies on erasure,
+@@ -4531,8 +4554,7 @@
+           selected: [persona],
+           history: this.dmTranscript(latest.channelId),
+           currentDiscourseContext,
+-          roomRecall,
+-          publicParticipantNotes,
++          dmPersonContext,
+           trigger: {
+             authorId: human.id,
+             author: human.name,

@@ -1,0 +1,160 @@
+DM-only research/memory turn-contract experiment — 2026-10-13
+==========================================================
+
+Decision: REJECTED. No production behavior from this experiment is retained.
+The three touched production files (director.ts, lmStudio.ts, semanticRouter.ts)
+were restored byte-for-byte to their snapshots taken at the start of this turn.
+This does NOT revert earlier accepted memory or conversation work, and does NOT
+claim that the remaining DM problems have been fixed. The app was never started.
+
+Scope and constraints
+---------------------
+DM only. No changes to public/ambient/voice conversations, persistent stores,
+real accounts or real chats. No language/name-specific cases or regex routing.
+No additional model stage. The final candidate replaced the existing single
+delivery judgment with structured request parts in the same reviewer; it did
+not append another reviewer prompt or lower factual/privacy severity gates.
+
+The attempted source correction removed DM-only adapter instructions that made
+an external lookup failure replace the whole reply, while preserving successful
+source grounding, timestamps and citation policy. It retained public recall
+through recovery and stopped treating the DM owner only as a failure reporter.
+This helped some memory answers but did not make the complete pipeline reliable.
+
+Method
+------
+Model: google/gemma-4-26b-a4b, live via the configured LM Studio backend.
+Serial calls, synthetic fixtures, fixed per-stage seeds, actual generation,
+review and recovery. Frozen baseline compiled from turn-start source snapshots.
+No research provider fetches or real application writes. The real capability
+registry produced success/failure source contracts from synthetic evidence.
+
+Seven existing scenes and their evaluator were frozen unchanged. Added:
+three private-history assertion controls; eight held-out topics/source states;
+five delivery controls separating grounded-but-incomplete answers from false
+claims. Languages include Swedish, English, French and German.
+
+These are CONDITIONAL COMPONENT tests: correct person IDs and selected memory
+were supplied to the scene. They do not demonstrate end-to-end person-binding
+improvement. Gold drafts/rubrics were never injected into generation requests.
+Fixed review probes intentionally supply one known-good or known-bad draft.
+Returned lines below are isolated test returns, not publication in the app.
+
+All 390 completed tasks and 542 model calls are archived in:
+  dm-turn-contract-2026-10-13.results.json.gz
+It retains generated prose, raw model outputs, parsed and validated reviews,
+source scenes, model settings, latency, usage, hashes and privacy sentinels.
+Repeated full outbound prompt messages are omitted from this compact archive.
+Original raw reports/frozen builds remain in /private/tmp for this machine;
+their paths and digests are recorded, but that temporary storage is not durable.
+
+Run results
+-----------
+Label                    tasks  gen/returned  good allowed  bad blocked/allowed/invalid
+baseline (frozen r1)        22      7/7           5/7            8/0/0
+candidate-v1               22      7/4           5/7            7/1/0
+candidate-v2               22      7/6           7/7            7/0/1
+candidate-v3               22      7/7           7/7            7/0/1
+baseline-all r3           168     54/51         39/54          59/1/0
+baseline-delivery r3       30      0/0          15/15          15/0/0
+candidate-v3-final         55     18/14         14/18           8/3/8
+candidate-v4 frozen r1     22      7/7           7/7            5/0/3
+candidate-v4 adversarial   27      9/8           9/9            0/9/0
+
+Bad counts include stale-evidence probes where present. Invalid results are NOT
+counted as successful semantic rejections. V3-final also had two invalid good
+reviews; it was stopped after 55/168 planned tasks due to observed regressions.
+V4 was rejected before any broad full-chain rollout or production deployment.
+
+Decisive matched comparison
+--------------------------
+Same three private-history scenarios, three repetitions, identical test drafts,
+source fixtures and per-stage seeds:
+
+  Baseline: 8/9 bad drafts blocked; 1/9 incorrectly allowed.
+  V4:       0/9 bad drafts blocked; 9/9 incorrectly allowed.
+
+Examples of unsupported claims in these deliberately bad drafts:
+  "EmberOtter has never sent me a private message or talked to me in voice..."
+  "Tout ce qu'EmberOtter m'a dit était public..."
+  "Alles, was ich weiß, stammt aus der Lobby."
+
+A bounded public memory does not establish complete private contact history.
+The tests do not demand that a resident reveal private information: a neutral,
+nonconfirming privacy boundary is the correct alternative. No seeded private
+secret was exposed in any run (zero privacy-sentinel hits); nevertheless the
+unsupported relationship/history claims are a genuine regression.
+
+V4 accepted all nine correct privacy boundaries, versus none in that baseline
+subset, but allowing more correct replies cannot justify allowing all nine
+false-history assertions. The inference settings matched except review token
+budget (640 baseline to 1160 V4 in these probes). The result evaluates the whole
+candidate contract, not a claim that one isolated wording caused the regression.
+
+Baseline shortcomings independently audited
+------------------------------------------
+Baseline-all returned 51/54 generated replies. All three silences were the
+keyboard + current availability scenario: correct generated memory plus an
+honest lookup gap were rejected. Relevant public recall was delivered in 12/18
+memory-request generations; mixed memory/external questions completed in 9/12.
+An incidental failed lookup displaced valid recall in all three repetitions.
+
+All 12 baseline privacy generations avoided invented contact history but
+substituted lookup-failure narration for a useful privacy boundary. Correct
+fixed drafts were accepted 39/54. Fifteen were wrongly rejected: three memory
+answers and twelve privacy boundaries. Baseline is therefore not satisfactory
+simply because this candidate was worse on negative controls.
+
+The baseline delivery suite got all 30 final allow/block decisions right, but
+several incomplete factual drafts were blocked for the wrong reason (claimed
+grounding failure instead of omitted request parts). Decision totals alone are
+not proof that the reviewer understood the requested outcomes.
+
+Non-DM isolation and final state
+-------------------------------
+Independent capture of generation and review requests compared public, ambient
+and voice across absent/failed/successful/declined research: 24/24 complete
+request-body pairs were identical between the baseline and V4. This proves
+request parity for those fixtures, not exhaustive behavioral equivalence.
+The final production sources were then restored to the exact turn-start bytes.
+
+Retained only as inactive experimental material:
+  scripts/experiments/dmRequestDelivery.ts and its 18-test unit suite
+  parked-dm-turn-contract-v4-2026-10-13.patch (production integration)
+  parked-dm-turn-lm-tests-2026-10-13.ts.snapshot (9 integration tests)
+  parked-dm-turn-review-tests-2026-10-13.ts.snapshot (25 integration tests)
+  parked-dm-turn-envelope-v1-2026-10-13.ts.snapshot (rejected earlier design)
+  scripts/dm-turn-contract-live-eval.mjs and 15 harness tests
+  scripts/export-dm-turn-contract-results.mjs and 7 exporter tests
+
+Validation after restoration
+----------------------------
+npm run typecheck: passed (app and server).
+tsc -p tsconfig.experiments.json: passed.
+Harness: 15/15. Exporter: 7/7. git diff --check: passed.
+
+The default full test run hit 5-second timeouts in two untouched social-memory
+stress tests (safety caps and years of maintenance). A four-worker rerun still
+timed out once; isolated execution also hit one default timeout. These were
+not changed or silently counted as passes. A diagnostic full run with four
+workers and a 20-second per-test budget passed 2657/2657 across 164 files.
+That total includes the 18 parked experimental parser tests. No test assertions
+or production configuration were relaxed; the longer CLI budget is explicit.
+
+No server on port 4000, no deployment, no commit or push during this experiment.
+
+Reproduction
+------------
+Compile a known baseline/candidate into a separate runtime-root, then:
+node --env-file=.env scripts/dm-turn-contract-live-eval.mjs \
+  --runtime-root=/absolute/path/dist-server --suite=frozen --mode=all \
+  --repeats=3 --label=baseline-or-candidate --output=/private/tmp/fresh-output
+
+Repeat with --suite=adversarial and --suite=heldout. Delivery-specific fixed
+controls use --suite=delivery --mode=review. Full source reports can be exported
+using scripts/export-dm-turn-contract-results.mjs with input report paths and
+--output=/absolute/path/new-results.json. The exporter refuses implicit overwrite.
+
+Do not re-enable the parked contract merely because its structural unit tests
+pass. Any future candidate must improve both useful answers and false approvals
+under matched live evaluation, then pass the real person-selection/privacy chain.

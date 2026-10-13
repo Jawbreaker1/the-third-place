@@ -1,0 +1,183 @@
+Isolated DM person-reference experiment — 2026-10-13
+===================================================
+
+Decision: PARKED, NOT ACTIVATED
+------------------------------
+The separate semantic person resolver did not demonstrate a robust improvement.
+V1 regressed; one generic prompt-only revision recovered aggregate accuracy but
+introduced new language/candidate-order failures. No production integration was
+made. The existing DM public-memory projection remains exactly as it was at the
+start of this experiment. Nothing in the broader router, memory retrieval,
+research selection, writer, reviewer, publication or queue was changed this turn.
+Server and ngrok remained stopped. No real accounts or messages were created.
+
+The candidate and its tests are retained only in:
+  scripts/experiments/dmPersonReference.ts
+  scripts/experiments/dmPersonReference.test.ts
+The dedicated evaluation harness is:
+  scripts/dm-person-reference-live-eval.mjs
+  scripts/dm-person-reference-live-eval.node-test.mjs
+No server module imports the experiment. The temporary compiled resolver was
+removed from dist-server after parking; production builds exclude experiments.
+
+Question and scope
+------------------
+Would separating third-person identity resolution from the existing broad DM
+classification reduce wrong or lost references, without changing other semantic
+decisions? The experiment deliberately stopped at identity selection. It did not
+claim to improve final replies or solve unsupported private-history assertions.
+
+The candidate accepts only the current DM pair's bounded message context and a
+public-only identity inventory. It returns matched/ambiguous/unknown/not_applicable.
+A match contains at most two supplied IDs, a literal source-message excerpt and
+a literal current-message excerpt. Existing 0.9 confidence threshold is retained.
+The parser validates data provenance, boundedness and membership, NOT semantic
+identity truth. Unit tests explicitly demonstrate that limitation. No natural-
+language regex, approximate-name algorithm or per-language/person rule was added.
+
+Fixed comparison
+----------------
+Model: google/gemma-4-26b-a4b through the configured LM Studio backend.
+One sequential evaluation lane; no concurrent app traffic from this project.
+
+29 fixed scenarios, twice per variant:
+  - The original eight DM-public-memory fixtures, with their archived router input.
+  - The original explicit external-lookup control.
+  - Ten previously held-out broad-classifier controls, unchanged.
+  - Ten predeclared identity controls: unknown/similar handles, candidate order,
+    contextual reference, correction, resident address, duplicate labels and Arabic.
+
+The baseline executes real LmStudioClient.analyzeTurn, including its existing
+verifier/recovery. The candidate executes only the narrow pure prompt/schema/parser
+through the production model backend. Expected labels and rationales never enter
+model input. No memory stores, web providers, writers or reviewers are invoked.
+
+Manifest SHA-256:
+  60a42db3fffb0d321f2490f9e16a91cbe62583e2e470312b31caefd5e9b9bea2
+Live harness SHA-256, before its source path was changed for parking:
+  2e97ff18072c0cc1667ca030b22b6a20d9bdf743114bd5fb51d7fe2e416e8362
+
+The archived transportLanguageHint:null is explicitly normalized to omission for
+replay, as required by the public input schema. Both variants use the same semantic
+input. The original ambiguous-Alex catalog stays filtered exactly as archived.
+The additional duplicate-label case is not baseline-supported: the old input schema
+rejects it. Its two repetitions are excluded from comparative accuracy, not counted
+as a baseline semantic failure. It remains reported separately.
+
+Temperature 0, top_p 1, reasoning_effort none, stream false. Primary-stage seeds
+match by fixture and repetition; optional verifier calls have independent seeds.
+The A/B candidate-order cases share identical message IDs and stage seeds, differing
+only in catalog order. The narrow call is capped at 384 output tokens; the existing
+broad router keeps its normal settings. Each isolated run has a 20-second deadline.
+
+Only the prompt changed between V1 and V2. Input, output schema, parser, threshold,
+token budget, fixtures, settings and expected outcomes remained unchanged. The
+revision frames identity linking independently of memory relevance/request intent
+and clarifies that community display names may be handles. It adds no named example
+or language exception. No further tuning was performed after V2.
+
+Results — common 56 supported inputs
+-----------------------------------
+                        Correct   Wrong identity sets   Missed matches
+Existing broad router     52              2                    2
+Separate resolver V1      47              0                    9
+Separate resolver V2      52              0                    4
+
+The wrong baseline cases retain both the mistaken and corrected person in the
+Japanese correction, twice. The two baseline omissions occur when broader evidence
+plan recovery loses the person in an explicit external-source request. Baseline
+still chooses web_search there; this table grades identity, not capability execution.
+
+V1 omissions: Swedish public reference once, Portuguese order A/B four times,
+Japanese correction twice, external attribution twice. Its total is 49/58 when
+including the two correctly abstained duplicate-label cases.
+
+V2 fixes the original Swedish miss, external-attribution omissions and Japanese
+correction. However, it misses a direct Arabic reference twice and the Portuguese
+order-A reference twice. Order B resolves the same Portuguese person correctly in
+both repetitions. Input/settings verification confirms that this difference is
+candidate-order sensitivity, not a different question or seed. Total including
+duplicate-label controls is 54/58. That must not be compared to baseline 52/56 as
+if the denominators were the same.
+
+V2 identity-only groups:
+  Original eight scenarios: 16/16 (baseline also 16/16).
+  Explicit external control: 2/2 (baseline 0/2 identity, 2/2 final web_search).
+  Existing nonidentity controls: 20/20 no unrelated IDs (baseline also 20/20).
+  Comparable new identity controls: 14/18 (baseline 16/18).
+
+All candidate outputs were complete, schema-valid and within deadline. Their
+misses are semantic abstentions, not truncation, timeout or parser failure.
+All 20 V2 matched resolutions were reparsed and their anchors manually inspected;
+they selected the expected identity. No private sentinels appeared in input/output,
+but this is NOT an end-to-end private-memory leakage test: there are no memory
+stores or publication stage in this narrow experiment.
+
+Mean/median isolated latency on the common inputs:
+  Baseline: 3,981 / 4,003.5 ms
+  V1:         571 /   444 ms
+  V2:         610 /   459 ms
+These are different-sized jobs. A future integrated resolver would run IN ADDITION
+to broad routing; the figures are not a claim of faster complete DM conversations.
+Two low-temperature repeats and duplicated order controls are a small diagnostic
+sample, not independent production accuracy estimates or a guarantee.
+
+Why not keep V2 active?
+----------------------
+Avoiding wrong identities is valuable. But equal aggregate accuracy hides four new
+omissions in cases the baseline handled, including sensitivity to arbitrary catalog
+order. That fails the requested non-regression bar. Do not patch these failures with
+specific handles, language branches, string matching or a fallback to old guesses.
+Keep the evaluation evidence; leave the application behavior unchanged.
+
+Provenance and excluded execution
+--------------------------------
+Baseline runtime:
+  /private/tmp/third-place-person-resolver-baseline-Fj4niJ/dist-server
+V1 runtime:
+  /private/tmp/third-place-person-resolver-candidate-ewbKmq/dist-server
+Verified V2 runtime:
+  /private/tmp/third-place-person-resolver-v2-verified-HD3qOI/dist-server
+All 94 existing server JavaScript modules (124 JavaScript modules recursively)
+were byte-identical between the frozen baseline and both candidates. Only the
+unused resolver module was added. Independent read-only review confirmed this.
+
+An attempted first V2 build used an incorrect npm-exec invocation. Compilation
+failed, but the shell continued and copied the old V1 build. That accidentally
+replayed V1 under a V2 label. Its raw artifact is explicitly EXCLUDED from every
+V2/comparative result above and retained for transparency as:
+  dm-person-reference-excluded-v1-replay-2026-10-13.results.json.gz
+Its internal original label remains unchanged; its prompt hash c5131f... and module
+hash 58ec64... verify that it was V1. The real V2 build used fail-fast execution and
+verified the compiled prompt before inference. V2 prompt hash:
+  5879e47a7c5a98dc3c067276f1997f0e2e73548fd02dbeb309af8d938a7a4da0
+
+Retained primary artifacts in this directory:
+  dm-person-reference-baseline-2026-10-13.results.json.gz
+  dm-person-reference-v1-2026-10-13.results.json.gz
+  dm-person-reference-v2-2026-10-13.results.json.gz
+  parked-dm-person-reference-v1-2026-10-13.ts.snapshot
+  parked-dm-person-reference-v1-tests-2026-10-13.ts.snapshot
+They include raw outputs, per-call settings/usage/timing, source anchors, hashes,
+input normalizations and separate primary/final baseline analysis. The source V2
+remains runnable in scripts/experiments; parking changed only import paths/comments.
+
+Validation and rerun
+--------------------
+All 2,583 repository tests passed, including the 15 resolver tests. The harness's
+10 Node tests pass, including after parking. App/server typecheck and production
+build passed; the experiments TypeScript check also passed. No commit, push, deploy
+or restart was performed. Earlier uncommitted application changes were preserved.
+
+Offline harness tests:
+  node --import tsx --test scripts/dm-person-reference-live-eval.node-test.mjs
+Parked contract tests:
+  npx vitest run scripts/experiments/dmPersonReference.test.ts
+Parked typecheck:
+  npx tsc -p tsconfig.experiments.json --noEmit
+Live (explicitly opt in; use a NEW temporary output directory):
+  node --env-file=.env --import tsx scripts/dm-person-reference-live-eval.mjs \
+    --mode=candidate --repeats=2 --output=/private/tmp/NEW-OUTPUT-DIRECTORY
+Use --mode=baseline for current broad routing, and --runtime-root=.../dist-server
+to reproduce a retained frozen runtime while it remains on disk. --dry-run lists
+the manifest without loading the runtime, invoking the model or writing a report.

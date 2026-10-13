@@ -1,0 +1,186 @@
+// PARKED REJECTED LIVE EXPERIMENT — NOT PRODUCTION. Original test content
+// follows unchanged; this snapshot requires the rejected implementation.
+import { describe, expect, it } from "vitest";
+import {
+  buildCandidateReviewResponseFormat,
+  buildCandidateReviewSystemPrompt,
+  candidateReviewInputSchema,
+  parseCandidateReviewContent,
+  type NormalizedCandidateReviewInput,
+} from "./semanticRouter.js";
+import { DM_REQUEST_DELIVERY_REVIEW_GUIDANCE, dmRequestDeliveryJsonSchema } from "./dmRequestDelivery.js";
+import { REQUEST_DELIVERY_REVIEW_GUIDANCE, requestDeliveryJsonSchema } from "./requestDeliveryReview.js";
+
+const candidateText = "They described a handmade toy in the public room. I couldn't obtain today's opening hours.";
+const inputFor = (options: {
+  kind?: "dm" | "public";
+  owner?: boolean;
+  trusted?: boolean;
+  expected?: "none" | "optional" | "expected";
+} = {}): NormalizedCandidateReviewInput => candidateReviewInputSchema.parse({
+  sceneKind: options.kind ?? "dm",
+  room: { id: "private-test", name: "Private test", register: "everyday" },
+  trigger: { author: "Sam", content: "What did they make, and when does the museum open today?", createdAt: "2026-10-13T10:00:00.000Z", ageSeconds: 0 },
+  premise: null,
+  semanticContext: {
+    languageTag: "en", intentTrusted: options.trusted ?? true, replyExpected: options.expected ?? "expected",
+    asksForList: false, asksAboutAiIdentity: false, asksAboutAcoustics: false,
+  },
+  voiceFacts: null,
+  temporalContext: {
+    sceneClock: { timeZone: "Europe/Stockholm", locationLabel: "Sweden", instant: "2026-10-13T10:00:00.000Z", localDate: "2026-10-13", localTime: "12:00:00", utcOffset: "GMT+02:00", weekday: "Tuesday", daypart: "afternoon" },
+    requestedClock: null, surfacePolicy: "reactive_only", surfaceActorId: null, recentTimeline: [],
+  },
+  evidence: { outcome: "failed", kind: null, query: null, results: [] },
+  capabilityContext: {
+    available: ["web_search"], requestKind: "execute", discussed: ["web_search"],
+    plannedAction: "web_search", executionStatus: "failed_temporary", externalEvidenceAvailable: true,
+  },
+  candidates: [{
+    personaId: "ai-mira", actorName: "Mira", content: candidateText, sourceIds: [],
+    mustReply: true, mustFulfillRequest: options.owner ?? true,
+    surfaceStylePlan: { visibleAffect: false, surfaceTexture: null }, recentOwnTexts: [], peerTexts: [],
+  }],
+});
+
+const memoryPart = {
+  requestedOutcome: "Recall what they made.", status: "delivered", deliveredExcerpt: "a handmade toy",
+};
+const externalPart = {
+  requestedOutcome: "Supply today's opening hours.", status: "constrained", deliveredExcerpt: "I couldn't obtain today's opening hours.",
+};
+const due = (parts: unknown[] = [memoryPart, externalPart]) => ({ parts });
+const notDue = () => due([]);
+const reviewFor = (delivery: unknown = due(), overrides: Record<string, unknown> = {}) => ({
+  personaId: "ai-mira", severity: "none", issues: [], rewriteInstruction: null,
+  sameSceneOverlap: "none", outputLanguage: { tag: "en", confidence: 1 },
+  requestDelivery: delivery, ...overrides,
+});
+const parse = (input: NormalizedCandidateReviewInput, reviews: unknown[] = [reviewFor()]) =>
+  parseCandidateReviewContent(JSON.stringify({ reviews }), input, { requireDeliveryAssessment: true });
+const schemaItem = (input: NormalizedCandidateReviewInput) =>
+  (buildCandidateReviewResponseFormat(input) as any).json_schema.schema.properties.reviews.items;
+
+describe("DM request-part integration in the existing reviewer", () => {
+  // The reviewer verdicts below are fixtures. These prove parser integrity,
+  // not that an LLM judges the underlying conversation or facts correctly.
+  it("accepts mixed supported recollection and a real external gap as constrained delivery", () => {
+    expect(parse(inputFor())?.reviews[0]).toMatchObject({
+      severity: "none", issues: [],
+      requestDelivery: { status: "constrained", deliveredExcerpt: "a handmade toy" },
+    });
+  });
+
+  it("does not replace the current DM duty with an optional auxiliary intent decision", () => {
+    expect(parse(inputFor({ trusted: false, expected: "none" }))?.reviews[0].requestDelivery?.status).toBe("constrained");
+    expect(parse(inputFor({ trusted: false, expected: "none" }), [reviewFor(notDue())])).toBeUndefined();
+  });
+
+  it.each([
+    due([memoryPart, { ...externalPart, status: "missing", deliveredExcerpt: null }]),
+    due([memoryPart, externalPart, { requestedOutcome: "Compare the two options.", status: "missing", deliveredExcerpt: null }]),
+    due([{ ...memoryPart, status: "missing", deliveredExcerpt: null }]),
+  ])("makes incomplete coverage block publication even if the reviewer claims no issue", (delivery) => {
+    expect(parse(inputFor(), [reviewFor(delivery)])?.reviews[0]).toMatchObject({
+      severity: "high", issues: ["unfulfilled_explicit_request"], requestDelivery: { status: "missing" },
+      rewriteInstruction: expect.any(String),
+    });
+  });
+
+  it.each(["evidence_ungrounded", "unsupported_room_recall"])("never clears %s because request parts were marked complete", (issue) => {
+    expect(parse(inputFor(), [reviewFor(due(), {
+      severity: "high", issues: [issue], rewriteInstruction: "Do not assert unsupported history or facts.",
+    })])?.reviews[0]).toMatchObject({ severity: "high", issues: [issue], requestDelivery: { status: "constrained" } });
+  });
+
+  it("adds a missing-part blocker without erasing the existing grounding blocker", () => {
+    const review = reviewFor(due([{ ...memoryPart, status: "missing", deliveredExcerpt: null }]), {
+      severity: "high", issues: ["evidence_ungrounded"], rewriteInstruction: "Keep to supported claims.",
+    });
+    expect(parse(inputFor(), [review])?.reviews[0]).toMatchObject({
+      severity: "high", issues: ["evidence_ungrounded", "unfulfilled_explicit_request"], requestDelivery: { status: "missing" },
+    });
+  });
+
+  it("does not use a complete assessment to erase an explicit conflicting missing-outcome verdict", () => {
+    const result = parse(inputFor(), [reviewFor(due(), {
+      severity: "high", issues: ["unfulfilled_explicit_request"], rewriteInstruction: "Supply the missing requested part.",
+    })]);
+    expect(result === undefined || result.reviews[0]!.severity === "high").toBe(true);
+  });
+
+  it.each(["guarded_practical", "defensive_pivot"] as const)("keeps missing safe delivery under the %s boundary", (mode) => {
+    const base = inputFor();
+    const input = candidateReviewInputSchema.parse({ ...base, semanticContext: {
+      ...base.semanticContext, operationalMode: mode, operationalModeTrusted: true,
+    } });
+    expect(parse(input, [reviewFor(due([{ ...memoryPart, status: "missing", deliveredExcerpt: null }]))])?.reviews[0]).toMatchObject({
+      severity: "high", issues: ["operational_scope_mismatch"], requestDelivery: { status: "missing" },
+    });
+  });
+
+  it("lets a mixed batch represent a nonowner without letting the owner opt out", () => {
+    const base = inputFor();
+    const input = candidateReviewInputSchema.parse({ ...base, candidates: [base.candidates[0], {
+      ...base.candidates[0], personaId: "ai-sana", actorName: "Sana", mustFulfillRequest: false, content: "Oh, neat.",
+    }] });
+    expect(parse(input, [reviewFor(), reviewFor(notDue(), { personaId: "ai-sana" })])?.reviews).toHaveLength(2);
+    expect(parse(input, [reviewFor(notDue()), reviewFor(notDue(), { personaId: "ai-sana" })])).toBeUndefined();
+    expect(parse(input, [reviewFor(), reviewFor(due([{ ...memoryPart, deliveredExcerpt: "neat" }]), { personaId: "ai-sana" })])).toBeUndefined();
+    expect(parse(input, [reviewFor(), reviewFor(undefined, { personaId: "ai-sana", requestDelivery: undefined })])).toBeUndefined();
+  });
+
+  it("does not require delivery metadata in a DM batch with no owner", () => {
+    const input = inputFor({ owner: false, trusted: false, expected: "none" });
+    expect(schemaItem(input).properties).not.toHaveProperty("requestDelivery");
+    expect(parse(input, [reviewFor(undefined, { requestDelivery: undefined })])).toBeDefined();
+  });
+
+  it.each([
+    due([]), { ...due([memoryPart]), coverage: "complete" },
+    due([memoryPart, memoryPart]), due([{ ...memoryPart, requestedOutcome: " " }]),
+    due([{ ...memoryPart, deliveredExcerpt: "another candidate's words" }]),
+    due([{ ...memoryPart, deliveredExcerpt: null }]),
+    { status: "delivered", resolvedOutcome: "An old format must not bypass the DM assessment.", deliveredExcerpt: "a handmade toy" },
+    undefined,
+  ])("rejects malformed or unverifiable per-part delivery metadata", (delivery) => {
+    expect(parse(inputFor(), [reviewFor(delivery, { requestDelivery: delivery })])).toBeUndefined();
+  });
+
+  it("rejects malformed JSON, unknown or duplicate actors, extra fields and incomplete review lists", () => {
+    const input = inputFor();
+    for (const content of ["not JSON", "null", "[]", '{"reviews":null}', '{"reviews":[null]}']) {
+      expect(parseCandidateReviewContent(content, input, { requireDeliveryAssessment: true })).toBeUndefined();
+    }
+    expect(parse(input, [])).toBeUndefined();
+    expect(parse(input, [reviewFor(), reviewFor()])).toBeUndefined();
+    expect(parse(input, [reviewFor(due(), { personaId: "unknown" })])).toBeUndefined();
+    expect(parse(input, [reviewFor(due(), { inventedField: true })])).toBeUndefined();
+  });
+
+  it("requires the DM parts shape only on the DM response schema", () => {
+    const dm = schemaItem(inputFor());
+    const publicScene = schemaItem(inputFor({ kind: "public" }));
+    expect(dm.required).toContain("requestDelivery");
+    expect(dm.properties.requestDelivery).toEqual(dmRequestDeliveryJsonSchema);
+    expect(publicScene.properties.requestDelivery).toEqual(requestDeliveryJsonSchema);
+    expect(publicScene.properties.requestDelivery.properties).not.toHaveProperty("parts");
+  });
+
+  it("leaves public parsing on its existing single-outcome contract", () => {
+    const input = inputFor({ kind: "public" });
+    const delivery = { status: "constrained", resolvedOutcome: "Recall the item and supply the available opening hours.", deliveredExcerpt: "a handmade toy" };
+    expect(parse(input, [reviewFor(delivery)])?.reviews[0].requestDelivery).toEqual(delivery);
+    expect(parse(input, [reviewFor(due())])).toBeUndefined();
+  });
+
+  it("changes only delivery guidance in the DM reviewer prompt, retaining every factual and privacy rule", () => {
+    const publicPrompt = buildCandidateReviewSystemPrompt();
+    const dmPrompt = buildCandidateReviewSystemPrompt(true);
+    expect(publicPrompt).toBe(buildCandidateReviewSystemPrompt(false));
+    expect(publicPrompt.split(REQUEST_DELIVERY_REVIEW_GUIDANCE)).toHaveLength(2);
+    expect(publicPrompt).not.toContain(DM_REQUEST_DELIVERY_REVIEW_GUIDANCE);
+    expect(dmPrompt).toBe(publicPrompt.replace(REQUEST_DELIVERY_REVIEW_GUIDANCE, DM_REQUEST_DELIVERY_REVIEW_GUIDANCE));
+    expect(dmPrompt).not.toContain(REQUEST_DELIVERY_REVIEW_GUIDANCE);
+  });
+});

@@ -1,0 +1,596 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-13",
+  "acceptanceDecision": "park_all_new_production_integration_including_binding",
+  "acceptanceRationale": "Identity selection improved, but consistently better complete DM replies were not demonstrated. Retain-only-improvements acceptance threshold was not met.",
+  "productionState": "Turn-start accepted memory, privacy and erasure fixes retained; all new binding/packet integration parked; production server remains off.",
+  "causalCaveat": "Four new silences replace previously unhelpful lookup-failure feedback, not previously correct factual answers. French correction drift occurred in unchanged broad routing and is not established as caused by binding.",
+  "reassessment": {
+    "script": "scripts/dm-public-memory-chain-live-eval.mjs",
+    "scriptSha256": "d4796bd934154cdd43350b78328cd51c84a05e74c6e90167cd95a313f37695c7",
+    "testSha256": "55596418b0585f8d254ae9ea1c4bc7c6aa6aeb71b397816443b8adbc400a9379",
+    "method": "assessTrace(scenario,result,{memoryPresentation})",
+    "rawReportsModified": false,
+    "modelCalls": 0,
+    "productionChanges": false
+  },
+  "manifestSha256": "d6b1f7f3cecca1777f0452d5ce771de5647fc3560ae340b0cbb35a36f38e247a",
+  "caseCount": 13,
+  "repetitions": 3,
+  "variants": [
+    {
+      "variant": "baseline",
+      "memoryPresentation": "legacy",
+      "source": "/private/tmp/third-place-dm-binding-before-r3-20261013/report.json",
+      "archive": "docs/evaluations/dm-person-binding-baseline-2026-10-13.results.json",
+      "rawSha256": "8dbc7670e845e800f424701aac5a987c37e73ff4779a8c3f84dbd582aa78bb79",
+      "rawBytes": 2129994,
+      "generatedAt": "2026-10-13T11:48:13.751Z",
+      "model": "google/gemma-4-26b-a4b",
+      "runtimeRoot": "/private/tmp/third-place-dm-binding-baseline-sFQPrt/dist-server",
+      "runtimeHashes": {
+        "actorChannels": "5d27828884f329a492d7d5aeb6298ef0fa21887a60519f5540b6106fe58c066e",
+        "director": "d64e3e34e1549a45a0251d548c947d50f7f35884c78236c00a81984b94ba05af",
+        "lmStudio": "0b6b9d1cb318d49654afb28124b660ec4a72140e4c3006ba859c1ce37395a777",
+        "lmStudioBackend": "98b17e58ed0035820fa00b89ecbefa91ea0ba9bb6eb66aecc53061c49926988d",
+        "personas": "1f070d0d78e7e8cc1ba4456ddb551fff7a168c00f5d11dce820046e48d5a9b89",
+        "socialMemory": "1781160bf1115ed6e7c5262a6e92764a14afb350f259463b9501a3a8d21ace8e",
+        "socialMemoryCoordinator": "805632bea8abfed3c36ab71ee2fdf61a363304b14b8c2777b8675c933f5994f7",
+        "socialMemoryProjection": "035d136a39e3b9793fd3b9494746e8065d442a4e9aff8eaef22c7e1494799fb7",
+        "semanticRouter": "4be6aad58e1677b80c59b5c0eb33c3b60168e1dd3dbe25d255b148facf972a5c",
+        "store": "11a7b18fb93a35ed0825bda3f7c32f8c1659d1f522ce60d860ac0021fccbbd99",
+        "dmPublicContext": "6febdb1fe2b7ff4750da7a9dd8480fde5017093b3c82d47290ec258c89e79a89"
+      },
+      "originalHarnessSha256": "892c16bf6ef6f926fded1bc3af9c5b7705ee954219a9fbf430cf053b627f3705",
+      "manifestSha256": "d6b1f7f3cecca1777f0452d5ce771de5647fc3560ae340b0cbb35a36f38e247a",
+      "sourceFixtureSha256": "f9148a9f92e6140e22935d5ed261d6f3a8c90ff230be8e070395e58658ab2538",
+      "metrics": {
+        "turns": 39,
+        "identitySelectionMatches": 31,
+        "published": 37,
+        "structuralPass": 28,
+        "medianElapsedMs": 7522,
+        "forbiddenResearchAttempts": 6,
+        "privateMarkerExposureTurns": 0,
+        "executionErrors": 0
+      },
+      "mechanicalFailureOccurrences": {
+        "identity_selection_mismatch": 8,
+        "wrong_public_projection": 2,
+        "wrong_marked_memory": 2,
+        "wrong_public_person_in_outbound_recall": 8,
+        "public_note_on_unresolved_person": 8,
+        "wrong_public_person_in_outbound_note": 8,
+        "expected_public_note_missing_at_writer": 9,
+        "expected_exact_public_episode_missing_at_writer": 6
+      },
+      "silentTurns": [
+        {
+          "id": "en-ambiguous-person",
+          "repetition": 1
+        },
+        {
+          "id": "en-ambiguous-person",
+          "repetition": 3
+        }
+      ],
+      "caseResults": [
+        {
+          "id": "sv-person-a",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-person-b",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-person-b-reversed-catalog",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-corrected-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "de-pronoun-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-ambiguous-person",
+          "identity": 1,
+          "published": 1,
+          "structuralPass": 1
+        },
+        {
+          "id": "fr-private-probe",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "de-pruned-public-history",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-unknown-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-two-person-group",
+          "identity": 0,
+          "published": 3,
+          "structuralPass": 0
+        },
+        {
+          "id": "fr-explicit-person-unrelated-focus",
+          "identity": 0,
+          "published": 3,
+          "structuralPass": 0
+        },
+        {
+          "id": "sv-current-interlocutor",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-pruned-two-person-group",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 0
+        }
+      ]
+    },
+    {
+      "variant": "full-v1",
+      "memoryPresentation": "packets",
+      "source": "/private/tmp/third-place-dm-binding-after-r3-20261013/report.json",
+      "archive": "docs/evaluations/dm-person-binding-full-v1-2026-10-13.results.json",
+      "rawSha256": "221183cb5c5aa69b7d01a11e9343716ecd34fad6aa7530db6942cf3a6bed57e8",
+      "rawBytes": 2857035,
+      "generatedAt": "2026-10-13T11:54:17.617Z",
+      "model": "google/gemma-4-26b-a4b",
+      "runtimeRoot": "/private/tmp/third-place-dm-binding-candidate-8kArXo/dist-server",
+      "runtimeHashes": {
+        "actorChannels": "5d27828884f329a492d7d5aeb6298ef0fa21887a60519f5540b6106fe58c066e",
+        "director": "29af4f1f13c2d2778da7415c3d14505db2228cc5823df335797ce45c58221531",
+        "lmStudio": "6f83c1b16170741049ca9c419d83fc981eb21bc11e21efe6ec9277f93a91a9a2",
+        "lmStudioBackend": "98b17e58ed0035820fa00b89ecbefa91ea0ba9bb6eb66aecc53061c49926988d",
+        "personas": "1f070d0d78e7e8cc1ba4456ddb551fff7a168c00f5d11dce820046e48d5a9b89",
+        "socialMemory": "1781160bf1115ed6e7c5262a6e92764a14afb350f259463b9501a3a8d21ace8e",
+        "socialMemoryCoordinator": "805632bea8abfed3c36ab71ee2fdf61a363304b14b8c2777b8675c933f5994f7",
+        "socialMemoryProjection": "035d136a39e3b9793fd3b9494746e8065d442a4e9aff8eaef22c7e1494799fb7",
+        "semanticRouter": "3b15e6c9161a9fd027c2d1e6835cfdf2c5eed6f3d8d64d27f446cff70cf2962d",
+        "store": "11a7b18fb93a35ed0825bda3f7c32f8c1659d1f522ce60d860ac0021fccbbd99",
+        "dmPublicContext": "6febdb1fe2b7ff4750da7a9dd8480fde5017093b3c82d47290ec258c89e79a89",
+        "dmPersonBinding": "18b75fe16329641a218a2131b45119ba0e3de9ff71449c3d86c8891964af0367",
+        "dmPersonContext": "e696bac9a94b386b515d114e627152978b083c86a0925b3b3242868ee6f557d6"
+      },
+      "originalHarnessSha256": "d3119687ba4b832bf9f2d69a65c6fe02dd9ce3470124acc83b3f59ce74589ade",
+      "manifestSha256": "d6b1f7f3cecca1777f0452d5ce771de5647fc3560ae340b0cbb35a36f38e247a",
+      "sourceFixtureSha256": "f9148a9f92e6140e22935d5ed261d6f3a8c90ff230be8e070395e58658ab2538",
+      "metrics": {
+        "turns": 39,
+        "identitySelectionMatches": 39,
+        "published": 33,
+        "structuralPass": 39,
+        "medianElapsedMs": 8390,
+        "forbiddenResearchAttempts": 6,
+        "privateMarkerExposureTurns": 0,
+        "executionErrors": 0
+      },
+      "mechanicalFailureOccurrences": {},
+      "silentTurns": [
+        {
+          "id": "en-person-b",
+          "repetition": 1
+        },
+        {
+          "id": "fr-corrected-person",
+          "repetition": 1
+        },
+        {
+          "id": "en-two-person-group",
+          "repetition": 1
+        },
+        {
+          "id": "en-two-person-group",
+          "repetition": 2
+        },
+        {
+          "id": "en-two-person-group",
+          "repetition": 3
+        },
+        {
+          "id": "fr-explicit-person-unrelated-focus",
+          "repetition": 3
+        }
+      ],
+      "caseResults": [
+        {
+          "id": "sv-person-a",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-person-b",
+          "identity": 3,
+          "published": 2,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-person-b-reversed-catalog",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-corrected-person",
+          "identity": 3,
+          "published": 2,
+          "structuralPass": 3
+        },
+        {
+          "id": "de-pronoun-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-ambiguous-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-private-probe",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "de-pruned-public-history",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-unknown-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-two-person-group",
+          "identity": 3,
+          "published": 0,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-explicit-person-unrelated-focus",
+          "identity": 3,
+          "published": 2,
+          "structuralPass": 3
+        },
+        {
+          "id": "sv-current-interlocutor",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-pruned-two-person-group",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        }
+      ]
+    },
+    {
+      "variant": "full-v2",
+      "memoryPresentation": "packets",
+      "source": "/private/tmp/third-place-dm-binding-v2-r3-20261013/report.json",
+      "archive": "docs/evaluations/dm-person-binding-full-v2-2026-10-13.results.json",
+      "rawSha256": "1196fb19a675fedd53861d13f186504995ddeb3634c964b24f7e3944f5129c7a",
+      "rawBytes": 2701554,
+      "generatedAt": "2026-10-13T12:02:19.469Z",
+      "model": "google/gemma-4-26b-a4b",
+      "runtimeRoot": "/private/tmp/third-place-dm-binding-v2-BWygeH/dist-server",
+      "runtimeHashes": {
+        "actorChannels": "5d27828884f329a492d7d5aeb6298ef0fa21887a60519f5540b6106fe58c066e",
+        "director": "ad68c8ace0bc085438e91e420be64e73f350920ff1cefd9832d214b8555d64ea",
+        "lmStudio": "6f83c1b16170741049ca9c419d83fc981eb21bc11e21efe6ec9277f93a91a9a2",
+        "lmStudioBackend": "98b17e58ed0035820fa00b89ecbefa91ea0ba9bb6eb66aecc53061c49926988d",
+        "personas": "1f070d0d78e7e8cc1ba4456ddb551fff7a168c00f5d11dce820046e48d5a9b89",
+        "socialMemory": "1781160bf1115ed6e7c5262a6e92764a14afb350f259463b9501a3a8d21ace8e",
+        "socialMemoryCoordinator": "805632bea8abfed3c36ab71ee2fdf61a363304b14b8c2777b8675c933f5994f7",
+        "socialMemoryProjection": "035d136a39e3b9793fd3b9494746e8065d442a4e9aff8eaef22c7e1494799fb7",
+        "semanticRouter": "3b15e6c9161a9fd027c2d1e6835cfdf2c5eed6f3d8d64d27f446cff70cf2962d",
+        "store": "11a7b18fb93a35ed0825bda3f7c32f8c1659d1f522ce60d860ac0021fccbbd99",
+        "dmPublicContext": "6febdb1fe2b7ff4750da7a9dd8480fde5017093b3c82d47290ec258c89e79a89",
+        "dmPersonBinding": "18b75fe16329641a218a2131b45119ba0e3de9ff71449c3d86c8891964af0367",
+        "dmPersonContext": "f881bb9e6fd63ad8bbbf0615be901737604d7db7cb079225b3a0066520f806b9"
+      },
+      "originalHarnessSha256": "d3119687ba4b832bf9f2d69a65c6fe02dd9ce3470124acc83b3f59ce74589ade",
+      "manifestSha256": "d6b1f7f3cecca1777f0452d5ce771de5647fc3560ae340b0cbb35a36f38e247a",
+      "sourceFixtureSha256": "f9148a9f92e6140e22935d5ed261d6f3a8c90ff230be8e070395e58658ab2538",
+      "metrics": {
+        "turns": 39,
+        "identitySelectionMatches": 39,
+        "published": 34,
+        "structuralPass": 39,
+        "medianElapsedMs": 8594,
+        "forbiddenResearchAttempts": 6,
+        "privateMarkerExposureTurns": 0,
+        "executionErrors": 0
+      },
+      "mechanicalFailureOccurrences": {},
+      "silentTurns": [
+        {
+          "id": "en-person-b",
+          "repetition": 1
+        },
+        {
+          "id": "en-person-b-reversed-catalog",
+          "repetition": 1
+        },
+        {
+          "id": "en-two-person-group",
+          "repetition": 1
+        },
+        {
+          "id": "en-two-person-group",
+          "repetition": 2
+        },
+        {
+          "id": "en-two-person-group",
+          "repetition": 3
+        }
+      ],
+      "caseResults": [
+        {
+          "id": "sv-person-a",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-person-b",
+          "identity": 3,
+          "published": 2,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-person-b-reversed-catalog",
+          "identity": 3,
+          "published": 2,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-corrected-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "de-pronoun-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-ambiguous-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-private-probe",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "de-pruned-public-history",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-unknown-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-two-person-group",
+          "identity": 3,
+          "published": 0,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-explicit-person-unrelated-focus",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "sv-current-interlocutor",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-pruned-two-person-group",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        }
+      ]
+    },
+    {
+      "variant": "binding-only",
+      "memoryPresentation": "legacy",
+      "source": "/private/tmp/third-place-dm-binding-only-r3-20261013/report.json",
+      "archive": "docs/evaluations/dm-person-binding-only-2026-10-13.results.json",
+      "rawSha256": "b4f935e87a92783867276bd9c88f33a873c28164b6a8753024a178fdf572acb0",
+      "rawBytes": 2408954,
+      "generatedAt": "2026-10-13T12:10:03.949Z",
+      "model": "google/gemma-4-26b-a4b",
+      "runtimeRoot": "/private/tmp/third-place-dm-binding-only-Io8b5H/dist-server",
+      "runtimeHashes": {
+        "actorChannels": "5d27828884f329a492d7d5aeb6298ef0fa21887a60519f5540b6106fe58c066e",
+        "director": "576a325162b490ae06adbe08c4280be042cdd9cae58e3b8834be9e85c3f46942",
+        "lmStudio": "eb9bbc6f3d45bb66dc02498eef32b316a204e151907ef7a9cc40b1211f9a415c",
+        "lmStudioBackend": "98b17e58ed0035820fa00b89ecbefa91ea0ba9bb6eb66aecc53061c49926988d",
+        "personas": "1f070d0d78e7e8cc1ba4456ddb551fff7a168c00f5d11dce820046e48d5a9b89",
+        "socialMemory": "1781160bf1115ed6e7c5262a6e92764a14afb350f259463b9501a3a8d21ace8e",
+        "socialMemoryCoordinator": "805632bea8abfed3c36ab71ee2fdf61a363304b14b8c2777b8675c933f5994f7",
+        "socialMemoryProjection": "035d136a39e3b9793fd3b9494746e8065d442a4e9aff8eaef22c7e1494799fb7",
+        "semanticRouter": "4be6aad58e1677b80c59b5c0eb33c3b60168e1dd3dbe25d255b148facf972a5c",
+        "store": "11a7b18fb93a35ed0825bda3f7c32f8c1659d1f522ce60d860ac0021fccbbd99",
+        "dmPublicContext": "6febdb1fe2b7ff4750da7a9dd8480fde5017093b3c82d47290ec258c89e79a89",
+        "dmPersonBinding": "18b75fe16329641a218a2131b45119ba0e3de9ff71449c3d86c8891964af0367",
+        "dmPersonContext": "f881bb9e6fd63ad8bbbf0615be901737604d7db7cb079225b3a0066520f806b9"
+      },
+      "originalHarnessSha256": "d3119687ba4b832bf9f2d69a65c6fe02dd9ce3470124acc83b3f59ce74589ade",
+      "manifestSha256": "d6b1f7f3cecca1777f0452d5ce771de5647fc3560ae340b0cbb35a36f38e247a",
+      "sourceFixtureSha256": "f9148a9f92e6140e22935d5ed261d6f3a8c90ff230be8e070395e58658ab2538",
+      "metrics": {
+        "turns": 39,
+        "identitySelectionMatches": 39,
+        "published": 35,
+        "structuralPass": 33,
+        "medianElapsedMs": 8830,
+        "forbiddenResearchAttempts": 7,
+        "privateMarkerExposureTurns": 0,
+        "executionErrors": 0
+      },
+      "mechanicalFailureOccurrences": {
+        "expected_public_note_missing_at_writer": 6,
+        "expected_exact_public_episode_missing_at_writer": 3
+      },
+      "silentTurns": [
+        {
+          "id": "en-two-person-group",
+          "repetition": 1
+        },
+        {
+          "id": "fr-explicit-person-unrelated-focus",
+          "repetition": 1
+        },
+        {
+          "id": "en-two-person-group",
+          "repetition": 3
+        },
+        {
+          "id": "fr-explicit-person-unrelated-focus",
+          "repetition": 3
+        }
+      ],
+      "caseResults": [
+        {
+          "id": "sv-person-a",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-person-b",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-person-b-reversed-catalog",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-corrected-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "de-pronoun-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-ambiguous-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "fr-private-probe",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "de-pruned-public-history",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-unknown-person",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-two-person-group",
+          "identity": 3,
+          "published": 1,
+          "structuralPass": 0
+        },
+        {
+          "id": "fr-explicit-person-unrelated-focus",
+          "identity": 3,
+          "published": 1,
+          "structuralPass": 3
+        },
+        {
+          "id": "sv-current-interlocutor",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 3
+        },
+        {
+          "id": "en-pruned-two-person-group",
+          "identity": 3,
+          "published": 3,
+          "structuralPass": 0
+        }
+      ]
+    }
+  ],
+  "caveats": [
+    "Semantic answer correctness is manually reviewed, not scored by phrase matching or model-generated verdicts.",
+    "Legacy mode does not require the deliberately parked dmPersonContext field; binding still controls identity whenever available. Any actual per-person packets remain fully checked.",
+    "The original binding-only raw assessment predates the explicit presentation option and reports missing dmPersonContext. The raw file is preserved; this separate audit corrects that evaluation contract without altering observations.",
+    "All runs are synthetic isolated Director/router/writer/reviewer chains, one model lane, no live users or application server. Research executors deliberately fail without reaching the web.",
+    "Identical stage seeds and inference settings do not ensure deterministic Gemma output. Classifier drift can change downstream request payloads.",
+    "Identity and structural passes do not establish complete replies, sound private-history claims, or absence of every possible privacy leak. Private/voice/other-owner sentinel exposure was checked in complete outbound requests and publications."
+  ]
+}

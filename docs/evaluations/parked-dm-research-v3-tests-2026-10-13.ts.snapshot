@@ -1,0 +1,273 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { scopeDmCapabilityScene } from "./dmEvidenceScope.js";
+import type { CapabilitySceneContract } from "./capabilities/registry.js";
+import { hasIndependentDmEvidence, LmStudioClient, type SceneRequest } from "./lmStudio.js";
+import type { ModelBackend } from "./modelBackend.js";
+import { PERSONAS } from "./personas.js";
+
+const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+type Body = Record<string, any>;
+const payload = (body: Body): Body => JSON.parse(body.messages.find((message: Body) => message.role === "user").content);
+const schemaName = (body: Body): string => body.response_format?.json_schema?.name;
+const completion = (value: unknown) => ({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(value) } }] });
+const expectNoExperimentalReviewGuidance = (bodies: Body[]) => {
+  for (const body of bodies) expect(body.messages[0].content).not.toContain("In a DM, assess the actual requested outcome before applying evidence rules.");
+};
+const publicNote = "An owner-subjective public recollection: Lea showed me her hand-sewn toy in the craft room and seemed patient.";
+const recall = (): NonNullable<SceneRequest["roomRecall"]> => ({
+  sourceChannel: { id: "public-crafts", name: "crafts" }, witnessPersonaIds: [mira.id],
+  transcript: [{ author: "Lea", kind: "human", content: "I stitched the beak myself.", createdAt: "2026-10-13T09:59:00.000Z" }],
+  provenance: [{ messageId: "public-lea", authorId: "person-lea", role: "anchor", anchorMatches: ["author_identity"], system: false, generation: null }],
+});
+const request = (overrides: Partial<SceneRequest> = {}): SceneRequest => ({
+  kind: "dm", channelId: "dm-test", channelName: "private chat with Sam", selected: [mira], history: [],
+  trigger: { author: "Sam", content: "What did Lea show you, and can you find a current price for it?", messageId: "turn" },
+  mustReplyIds: [mira.id], requestOwnerIds: [mira.id],
+  languageHint: "en", semanticContext: {
+    languageTag: "en", intentTrusted: true, replyExpected: "expected",
+    asksForList: false, asksAboutAiIdentity: false, asksAboutAcoustics: false,
+  },
+  evidenceOutcome: "failed", capabilityContext: {
+    available: ["web_search"], externalEvidenceAvailable: true, requestKind: "execute",
+    discussed: ["web_search"], plannedAction: "web_search", executionStatus: "failed_temporary",
+  },
+  publicParticipantNotes: { [mira.id]: publicNote }, roomRecall: recall(),
+  humanizerBudget: { repairsRemaining: 1 }, responseRecoveryBudget: { retriesRemaining: 0 },
+  ...overrides,
+});
+
+type ReviewFixture = {
+  issue?: "evidence_ungrounded" | "evidence_not_answer_bearing" | "unfulfilled_explicit_request" | "assistant_register";
+  delivery?: "delivered" | "constrained" | "missing";
+};
+const clients: LmStudioClient[] = [];
+const setup = (texts: string[], verdicts: ReviewFixture[] = [{}], sourceIds: string[] = []) => {
+  const bodies: Body[] = [];
+  let drafts = 0, reviews = 0;
+  const backend: ModelBackend = {
+    providerId: "lmstudio", configuredModel: "dm-evidence-scope-test",
+    probe: async () => ({ connected: true, id: "dm-evidence-scope-test", label: "Test" }),
+    complete: vi.fn(async (body: Body) => {
+      bodies.push(body);
+      if (bodies.length > 8) throw new Error("Unbounded scope test model calls");
+      const data = payload(body);
+      if (schemaName(body) === "social_scene" || schemaName(body) === "humanized_chat_lines") {
+        const content = texts[Math.min(drafts++, texts.length - 1)]!;
+        return completion({ messages: [{ personaId: mira.id, content, sourceIds }] });
+      }
+      if (schemaName(body) === "multilingual_candidate_review") {
+        const fixture = verdicts[Math.min(reviews++, verdicts.length - 1)]!;
+        return completion({ reviews: data.candidates.map((candidate: Body) => ({
+          personaId: candidate.personaId, severity: fixture.issue ? "high" : "none", issues: fixture.issue ? [fixture.issue] : [],
+          rewriteInstruction: fixture.issue ? "Address the actual request using only its supporting evidence." : null,
+          sameSceneOverlap: "none", outputLanguage: { tag: "en", confidence: 1 },
+          requestDelivery: candidate.mustFulfillRequest ? {
+            status: fixture.delivery ?? "constrained",
+            resolvedOutcome: "Answer the requested recollection and external lookup to the extent each has evidence.",
+            deliveredExcerpt: fixture.delivery === "missing" ? null : candidate.content.slice(0, 80),
+          } : { status: "not_due", resolvedOutcome: null, deliveredExcerpt: null },
+        })) });
+      }
+      throw new Error(`Unexpected schema ${schemaName(body)}`);
+    }),
+  };
+  const client = new LmStudioClient({ backend, now: () => Date.parse("2026-10-13T10:00:00.000Z") });
+  clients.push(client);
+  return { client, bodies };
+};
+
+beforeEach(() => {
+  vi.stubEnv("AI_ENABLED", "true"); vi.stubEnv("CANDIDATE_REVIEW_ENABLED", "true");
+  vi.stubEnv("HUMANIZER_REPAIR_ENABLED", "true");
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  vi.spyOn(console, "info").mockImplementation(() => undefined);
+});
+afterEach(() => {
+  for (const client of clients.splice(0)) client.cancelPending("scope test complete");
+  vi.unstubAllEnvs(); vi.restoreAllMocks();
+});
+
+describe("DM source scoping preserves existing review authority", () => {
+  it("keeps public recollection independent of failed external evidence in both writer and reviewer", async () => {
+    const text = "Lea showed me the toy beak she stitched herself. I couldn't get a current price from that search.";
+    const { client, bodies } = setup([text]);
+    expect(await client.generateScene(request())).toEqual([expect.objectContaining({ content: text })]);
+    expect(bodies.map(schemaName)).toEqual(["social_scene", "multilingual_candidate_review"]);
+    const writer = payload(bodies[0]!);
+    const review = payload(bodies[1]!);
+    expect(writer.publicParticipantNotes[mira.id]).toBe(publicNote);
+    expect(review.candidates[0].publicParticipantNote).toBe(publicNote);
+    expect(writer.recalledRoomEvidence.sourceChannel).toEqual(review.roomRecall.sourceChannel);
+    expect(writer.recalledRoomEvidence.witnessPersonaIds).toEqual(review.roomRecall.witnessPersonaIds);
+    expect(writer.recalledRoomEvidence.transcript[0].content).toBe(review.roomRecall.timeline[0].content);
+    expect(writer.freshResearch).toBeNull();
+    expect(review.evidence).toMatchObject({ outcome: "failed", results: [] });
+    expect(review.candidates[0]).toMatchObject({ mustReply: true, mustFulfillRequest: false, mustReportCapabilityFailure: true });
+    expectNoExperimentalReviewGuidance(bodies);
+    const issues = bodies[1]!.response_format.json_schema.schema.properties.reviews.items.properties.issues.items.enum;
+    expect(issues).not.toContain("unfulfilled_explicit_request");
+    expect(issues).toContain("evidence_ungrounded");
+  });
+
+  it("rejects an unsupported current fact after a pure failed lookup, without style-only repair", async () => {
+    const { client, bodies } = setup(["The toy costs exactly 49 euros today."], [{ issue: "evidence_ungrounded", delivery: "delivered" }]);
+    expect(await client.generateScene(request({
+      publicParticipantNotes: undefined, roomRecall: undefined,
+      trigger: { author: "Sam", content: "What is the current price of that toy?", messageId: "turn" },
+    }))).toEqual([]);
+    expect(bodies.map(schemaName)).toEqual(["social_scene", "multilingual_candidate_review"]);
+    expect(payload(bodies[1]!).candidates[0]).toMatchObject({ mustFulfillRequest: false, mustReportCapabilityFailure: true });
+    expectNoExperimentalReviewGuidance(bodies);
+  });
+
+  it("preserves the existing pure failed-lookup style repair and bounded fallback when no independent evidence is supplied", async () => {
+    const text = "I couldn't get a result from that search.";
+    const { client, bodies } = setup([text], [{ issue: "assistant_register", delivery: "constrained" }]);
+    expect(await client.generateScene(request({
+      publicParticipantNotes: undefined, roomRecall: undefined,
+      trigger: { author: "Sam", content: "Can you look up that toy's price?", messageId: "turn" },
+    }))).toEqual([expect.objectContaining({ content: text })]);
+    expect(bodies.map(schemaName)).toEqual(["social_scene", "multilingual_candidate_review", "humanized_chat_lines", "multilingual_candidate_review"]);
+    expectNoExperimentalReviewGuidance(bodies);
+    expect(payload(bodies[1]!).candidates[0]).toMatchObject({ mustFulfillRequest: false, mustReportCapabilityFailure: true });
+  });
+
+  it.each(["owned note", "public excerpt"])("does not treat an unrelated %s as support for an external current claim", async (source) => {
+    const input = request({
+      trigger: { author: "Sam", content: "What is the current price of the toy?", messageId: "turn" },
+      publicParticipantNotes: source === "owned note" ? { [mira.id]: publicNote } : undefined,
+      roomRecall: source === "public excerpt" ? recall() : undefined,
+    });
+    expect(hasIndependentDmEvidence(input)).toBe(true);
+    const { client, bodies } = setup(["It costs exactly 49 euros today."], [{ issue: "evidence_ungrounded", delivery: "delivered" }]);
+    expect(await client.generateScene(input)).toEqual([]);
+    expect(bodies.map(schemaName)).toEqual(["social_scene", "multilingual_candidate_review"]);
+    expect(payload(bodies[1]!).candidates[0]).toMatchObject({ mustFulfillRequest: false, mustReportCapabilityFailure: true });
+    expectNoExperimentalReviewGuidance(bodies);
+  });
+
+  it("retains scoped recollection and unchanged failed status through the ordinary reviewed recovery", async () => {
+    const complete = "Lea showed me the toy beak she stitched herself. I couldn't get a current price from that search.";
+    const { client, bodies } = setup(["The toy costs 49 euros today.", complete], [
+      { issue: "evidence_ungrounded", delivery: "delivered" }, { delivery: "constrained" },
+    ]);
+    const result = await client.generateScene(request({ responseRecoveryBudget: { retriesRemaining: 1 } }));
+    expect(result).toEqual([expect.objectContaining({ content: complete })]);
+    expect(bodies.map(schemaName)).toEqual(["social_scene", "multilingual_candidate_review", "social_scene", "multilingual_candidate_review"]);
+    const first = payload(bodies[0]!);
+    const recovery = payload(bodies[2]!);
+    expect(recovery.recalledRoomEvidence).toEqual(first.recalledRoomEvidence);
+    expect(recovery.publicParticipantNotes).toEqual(first.publicParticipantNotes);
+    expect(recovery.trustedCapabilityContext.executionStatus).toBe("failed_temporary");
+    expectNoExperimentalReviewGuidance(bodies);
+  });
+
+  it("preserves public evidence in an ordinary no-lookup style repair and its independent review", async () => {
+    const { client, bodies } = setup(["Lea showed me her handmade toy.", "She stitched that little beak herself, which I liked."], [
+      { issue: "assistant_register", delivery: "delivered" }, { delivery: "delivered" },
+    ]);
+    expect(await client.generateScene(request({ evidenceOutcome: undefined, capabilityContext: undefined }))).toHaveLength(1);
+    expect(bodies.map(schemaName)).toEqual(["social_scene", "multilingual_candidate_review", "humanized_chat_lines", "multilingual_candidate_review"]);
+    expectNoExperimentalReviewGuidance(bodies);
+    const repair = payload(bodies[2]!);
+    expect(repair.candidates[0].publicParticipantNote).toBe(publicNote);
+    expect(repair.roomRecall).toEqual(payload(bodies[1]!).roomRecall);
+  });
+
+  it("preserves witnessed public recall in the final reviewed not-answer-bearing fallback", async () => {
+    const final = "Lea showed me the toy beak she stitched herself. I couldn't verify its current price from those results.";
+    const { client, bodies } = setup([
+      "Lea made that beak herself; the toy costs 49 euros today.",
+      "Her handmade beak was lovely; the current price is 52 euros.",
+      final,
+    ], [
+      { issue: "evidence_not_answer_bearing", delivery: "delivered" },
+      { issue: "evidence_not_answer_bearing", delivery: "delivered" },
+      { delivery: "constrained" },
+    ], ["S1"]);
+    expect(await client.generateScene(request({
+      relationshipNotes: { "ai-sana": "OTHER_RESIDENT_PRIVATE_THREAD_SENTINEL" },
+      evidenceOutcome: "succeeded", urlPublicationPolicy: "server_card",
+      research: {
+        kind: "search", query: "handmade toy current price", retrievedAt: "2026-10-13T10:00:00.000Z",
+        results: [{ id: "S1", title: "Craft materials", url: "https://example.com/materials", snippet: "General craft materials, without a price for this toy." }],
+      },
+      capabilityContext: { ...request().capabilityContext!, executionStatus: "succeeded" },
+      responseRecoveryBudget: { retriesRemaining: 1 },
+    }))).toEqual([expect.objectContaining({ content: final, sourceIds: [] })]);
+    expect(bodies.map(schemaName)).toEqual([
+      "social_scene", "multilingual_candidate_review", "social_scene", "multilingual_candidate_review", "social_scene", "multilingual_candidate_review",
+    ]);
+    const initial = payload(bodies[0]!);
+    const fallback = payload(bodies[4]!);
+    expect(fallback.recalledRoomEvidence).toEqual(initial.recalledRoomEvidence);
+    expect(fallback.publicParticipantNotes).toEqual(initial.publicParticipantNotes);
+    expect(fallback.freshResearch).toBeNull();
+    expect(fallback.trustedCapabilityContext.executionStatus).toBe("failed_temporary");
+    const review = payload(bodies[5]!);
+    expect(review.roomRecall).toEqual(payload(bodies[1]!).roomRecall);
+    expect(review.candidates[0]).toMatchObject({
+      publicParticipantNote: publicNote, sourceIds: [], mustFulfillRequest: false, mustReportCapabilityFailure: true,
+    });
+    expect(bodies[5]!.response_format.json_schema.schema.properties.reviews.items.properties.issues.items.enum)
+      .toContain("evidence_ungrounded");
+    expect(bodies.map((body) => JSON.stringify(body).includes("OTHER_RESIDENT_PRIVATE_THREAD_SENTINEL")))
+      .toEqual(bodies.map(() => false));
+    expectNoExperimentalReviewGuidance(bodies);
+  });
+
+  it("scopes only failed external capability instructions without changing execution or citation policy", () => {
+    const original: CapabilitySceneContract = {
+      externalEvidence: true, evidenceOutcome: "failed", suppressResponse: false,
+      groundingInstruction: "Do not invent current prices.", premise: "Report only the failed lookup.",
+      responsePolicy: { owner: "designated_responder", citations: "none", linkCard: "none", maxSources: 0 },
+    };
+    const scoped = scopeDmCapabilityScene(original);
+    expect(scoped).not.toBe(original);
+    expect(scoped.groundingInstruction).toContain(original.groundingInstruction);
+    expect(scoped.groundingInstruction).toContain("external-information part");
+    expect(scoped.premise).toContain("separately supplied conversation or public-memory evidence");
+    expect(scoped).toMatchObject({
+      externalEvidence: true, evidenceOutcome: "failed", suppressResponse: false, responsePolicy: original.responsePolicy,
+    });
+    expect(original.premise).toBe("Report only the failed lookup.");
+    const success = { ...original, evidenceOutcome: "succeeded" as const, urlPublicationPolicy: "server_card" as const };
+    const local = { ...original, externalEvidence: false };
+    expect(scopeDmCapabilityScene(success)).toBe(success);
+    expect(scopeDmCapabilityScene(local)).toBe(local);
+  });
+
+  it("activates only for a selected resident's nonempty public note or structurally valid public-source excerpt", () => {
+    const empty = request({ publicParticipantNotes: undefined, roomRecall: undefined });
+    expect(hasIndependentDmEvidence(empty)).toBe(false);
+    expect(hasIndependentDmEvidence({ ...empty, publicParticipantNotes: { [mira.id]: publicNote } })).toBe(true);
+    expect(hasIndependentDmEvidence({ ...empty, roomRecall: recall() })).toBe(true);
+    expect(hasIndependentDmEvidence({ ...empty, publicParticipantNotes: { "ai-sana": publicNote } })).toBe(false);
+    expect(hasIndependentDmEvidence({ ...empty, publicParticipantNotes: { [mira.id]: " \n " } })).toBe(false);
+    expect(hasIndependentDmEvidence({ ...empty, selected: [], publicParticipantNotes: { [mira.id]: publicNote } })).toBe(false);
+    const privateOnly = { ...empty, relationshipNotes: { [mira.id]: "CURRENT_INTERLOCUTOR_PRIVATE_ORIENTATION" } };
+    expect(hasIndependentDmEvidence(privateOnly)).toBe(false);
+    for (const kind of ["public", "voice", "ambient"] as const) expect(hasIndependentDmEvidence(request({ kind }))).toBe(false);
+
+    const noSource = recall(); delete noSource.sourceChannel;
+    const emptySource = recall(); emptySource.sourceChannel = { id: " ", name: "crafts" };
+    const mismatched = recall(); mismatched.provenance = [];
+    const noRows = recall(); noRows.transcript = []; noRows.provenance = [];
+    const emptyContent = recall(); emptyContent.transcript[0]!.content = " \n ";
+    for (const roomRecall of [noSource, emptySource, mismatched, noRows, emptyContent]) {
+      expect(hasIndependentDmEvidence({ ...empty, roomRecall })).toBe(false);
+    }
+  });
+
+  it.each(["public", "voice"] as const)("leaves the existing %s temporary-failure contract unchanged", async (kind) => {
+    const text = "I couldn't get a result from that search.";
+    const { client, bodies } = setup([text]);
+    expect(await client.generateScene(request({
+      kind, publicParticipantNotes: undefined, roomRecall: undefined,
+      trigger: { author: "Sam", content: "Can you find the current price?", messageId: "turn" },
+    }))).toHaveLength(1);
+    const reviewBody = bodies.find((body) => schemaName(body) === "multilingual_candidate_review")!;
+    expect(payload(reviewBody).candidates[0]).toMatchObject({ mustReply: true, mustFulfillRequest: false, mustReportCapabilityFailure: true });
+    expectNoExperimentalReviewGuidance(bodies);
+  });
+});

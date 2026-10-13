@@ -1,0 +1,150 @@
+DM RESEARCH STATUS AND PUBLIC MEMORY — 2026-10-13
+
+Scope
+Only DM source authority and response ownership. The broad turn router,
+person selection, public/voice flow and successful-research citation rules are
+not changed. The parked person binder and multi-person memory packets remain
+parked. Tests use synthetic isolated data, not the running community.
+
+Initial candidate (V1, rejected after live evaluation)
+- A failed external lookup is a constraint on external claims, not proof that
+  the entire DM request or its supplied public recollections are unavailable.
+- DM response ownership remains active. A mixed request must cover supported
+  local recollection and honestly identify the unresolved external part.
+- The same source-scope guidance reaches generation, review and repair.
+- Reclassifying a non-answer-bearing external packet retains exact DM public
+  recall, with its original source, witnesses and chronology.
+- No failed review is automatically accepted; existing issue severities,
+  citation checks, review parser and grounding thresholds are unchanged.
+- V1 applied the guidance/ownership change to every DM, even without public
+  evidence. This caused new invented collections in all three mixed-request
+  runs and invented film-option references in three other runs. It is not kept.
+- An adversarial unit fixture exposed foreign-owner relationshipNotes at the
+  initial/recovery DM writer boundary. Those keys are now filtered to selected
+  actor IDs. Ordinary Director inputs already contain only the selected actor.
+
+Narrow candidate (V2, parked after production-contract comparison)
+- A shared availability predicate requires a selected DM resident and either
+  that resident's nonempty bounded public note or a nonempty, provenance-bound
+  public excerpt. The predicate does not infer topic, relevance or truth.
+- Only this source conflict receives the new scoping/ownership guidance.
+  Without that evidence the old failed-lookup behavior remains intact.
+- Relevance, identity attribution, chronology, fresh facts and private-history
+  claims still require review at existing severities. Evidence existence alone
+  cannot approve any line. Public/voice and the broad router are unchanged.
+- V2 initially inserted one extra blank prompt line even when the availability
+  predicate was false. The final snapshot removes only that whitespace:
+  memory-present prompts match V2; no-memory prompts match the baseline.
+
+Fixed acceptance rubric (written before candidate live results)
+1. A supplied, witnessed public recollection remains usable despite an
+   incidental failed lookup. Attribution is not verification of world facts.
+2. A mixed request delivers its supported local part and clearly bounds its
+   unresolved external part. Neither a generic failure nor unrelated memory
+   substitutes for the requested outcome.
+3. Explicit fresh/external-only questions still require fresh supporting
+   evidence. Old quotes cannot be promoted to today's facts; failed page
+   access cannot establish page contents or that a page omits a datum.
+4. Private-history probes maintain a nonconfirming boundary. Missing context
+   proves neither acquaintance nor absence of contact. No private, voice or
+   other-owner sentinel may reach an unauthorized model prompt/publication.
+5. Contrastive fixed drafts check false approvals as well as false rejections.
+   Count factual grounding separately from overall style/delivery acceptance.
+6. The original whole-chain fixtures remain unchanged; additional controls are
+   explicitly additive. Router drift is recorded, not attributed to this fix.
+7. Retain only demonstrated useful improvements. More published replies or
+   schema-valid output alone is not a success criterion. If a semantic change
+   fails acceptance, park it; structural context-isolation fixes can be judged
+   independently by their data-flow regression tests.
+
+Frozen runtimes
+Baseline: /private/tmp/third-place-dm-evidence-baseline-ZFHKuc/dist-server
+Rejected V1: /private/tmp/third-place-dm-evidence-candidate-5Xs9tT/dist-server
+V2: /private/tmp/third-place-dm-evidence-v2-es27ZH/dist-server
+Final whitespace-only V2 correction:
+/private/tmp/third-place-dm-evidence-final-VVVOTt/dist-server
+
+Whole-chain results (15 scenarios x 3 repetitions per version)
+- Baseline/V1/V2: 43/42/42 published replies; publication is not correctness.
+- Clear one-person public recollection remained useful in all 18 runs/version.
+- V2 removes V1's new stamps and film-option inventions, but mixed requests
+  still receive no public subject from the unchanged router and remain incomplete.
+- Group recollection, unsupported familiarity and some private-history claims
+  remain unreliable. No seeded private marker entered a prompt or publication.
+- Two ambiguity outcomes differ with upstream ID-selection drift despite exact
+  router-request parity; do not attribute them to the new source scoping alone.
+
+Frozen neutral SceneRequest comparison (7 scenarios x 3, plus fixed drafts)
+- Baseline and V2 both publish 20/21 generated replies. Mixed local/current
+  requests succeed 2/3 in each; one valid mixed answer is still falsely rejected.
+- Correct fixed drafts: 18/21 allowed before, 21/21 in V2. The three corrected
+  false rejections are a bounded missing-memory statement about person B when
+  only person A's memory is available.
+- Invalid fixed drafts: 19 blocked and 2 malformed reviews in each version;
+  all three stale-to-current fact probes blocked in each. Malformed reviews
+  fail closed but are not counted as successful semantic judgments.
+- V2 still produced a future-search promise in one fresh-information answer
+  and suggestive private-history wording in one boundary response. These are
+  not evidence of a general conversational improvement.
+- This fixture deliberately uses a neutral failure premise, so it does not
+  exercise replacement of the real registry's failure-only instruction. A
+  separately reported production-contract comparison fills that coverage gap
+  without changing questions, evidence, expected drafts or model settings.
+
+Production-contract comparison (same 7 scenarios x 3 and fixed drafts)
+- This additional harness reuses the original frozen evaluator, fixtures,
+  drafts and stage seeds. It calls the real runtime registry.sceneContract;
+  the candidate additionally calls its real availability/scoping functions.
+  Providers and routing are not executed. The condition being evaluated is
+  that public memory was actually supplied alongside a failed lookup.
+- Baseline/final V2: correct public recollection after failed lookup 0/3 ->
+  3/3. Mixed memory/current-information responses stay complete at 3/3 each.
+- Correct fixed drafts: 15/21 -> 21/21. All 21 fabricated drafts and all three
+  stale-to-current probes are rejected by validated reviews in both versions.
+- Nonetheless, final V2 generates unsupported negative/exclusive statements
+  about private knowledge in two of three privacy probes, and the reviewer
+  approves them. The third is closer to a boundary. Those generated statements
+  are not covered by the fixed positive-private-fabrication drafts; the perfect
+  fixed-probe score is therefore not proof of unchanged grounding quality.
+- All three unrelated-person outputs also append an unnecessary fact about
+  person A after admitting uncertainty about B. They do not swap identities,
+  but relevance is worse. Mechanical publication remains 21/21 in both.
+- V2 is parked despite its real targeted benefit. No additional exception,
+  relaxed threshold, issue filtering or forced publication was introduced.
+
+Minimal V3 (also parked)
+- Restored all writer/reviewer/repair guidance, failure-owner flags and the
+  final-failure premise to the starting baseline. Kept only the scoped initial
+  registry contract, retained fallback public rows and owner-note filtering.
+- Runtime: /private/tmp/third-place-dm-evidence-minimal-9Dx7F5/dist-server.
+- Same production-contract harness, all 66 tasks, three repetitions. The
+  failed-lookup recollection again improves 0/3 -> 3/3, but mixed-request
+  completion drops 3/3 -> 2/3; unrelated-person replies drop 3/3 -> 1/3.
+  Private probes again make unsupported negative/exclusive knowledge claims.
+- Fixed good drafts 18/21 allowed; bad drafts 20 blocked and one malformed;
+  all three stale-fact probes blocked. No fabricated fixed draft is approved.
+- This does not meet the user's no-regression retention criterion either.
+
+Final retained change and status
+- ONLY the defensive selected-owner relationshipNotes filter in DM sceneData
+  remains from this implementation attempt. Its two focused regression tests
+  cover the initial writer/reviewer and a full-scene recovery. No claim of an
+  observed real-user leak: ordinary Director requests already pass one owner.
+- All research-scoping guidance, role changes, capability rewording and public
+  fallback retention are parked. Director and semanticRouter match the exact
+  turn-start snapshots; lmStudio differs from its snapshot only by the filter.
+- Previously accepted changes already present at turn start are preserved.
+  The user-facing research/memory interaction is NOT fixed by this attempt.
+- Raw baseline and candidate results, hashes, harnesses, patches and test
+  snapshots are retained. No runtime classifier, name/language special case,
+  regex rule, extra judging call or permissive review fallback was added.
+- App server remained off throughout. Tests used synthetic data, no real
+  accounts, channel messages or third-party private conversations.
+- Final restored-state verification: 2,639 tests passed in 163 Vitest files,
+  including the two retained owner-isolation regressions; all 29 selected
+  evaluator Node tests passed. Server, app and experiments typechecks passed.
+  git diff --check passed. Exact baseline comparison confirmed unchanged
+  Director/router and only the selected-owner serializer filter in lmStudio.
+  No active source/build references to dmEvidenceScope remain; its two stale
+  generated build artifacts were removed. Port 4000 has no listener.
+- No commit, push, deployment or app-server start was performed in this turn.

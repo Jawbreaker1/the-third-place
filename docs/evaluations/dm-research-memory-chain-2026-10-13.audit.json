@@ -1,0 +1,243 @@
+{
+  "schemaVersion": 1,
+  "evaluation": "dm-research-memory-chain",
+  "evaluationDate": "2026-10-13",
+  "acceptanceDecision": "all_v1_v2_v3_source_scope_behavior_not_accepted_parked",
+  "retentionNote": "Root parked all V1, V2/final and minimal V3 source-scope behavior after the paired component comparisons. Source snapshots and raw evaluations remain available. The Director and broad semantic router are restored to the turn-start state; only the structural selected-owner DM relationship-note filter is retained. See the production-contract audit for V3 evidence and the final retention decision.",
+  "archivePolicy": "Raw reports were copied byte-for-byte. No raw result, model response, recorded assessment or runtime metadata was rewritten.",
+  "protocol": {
+    "model": "google/gemma-4-26b-a4b",
+    "environment": "Synthetic isolated whole-chain Director/router/writer/reviewer evaluation; no production server or live users.",
+    "concurrency": 1,
+    "repetitionsPerFixture": 3,
+    "fixtureCount": 15,
+    "memoryPresentation": "legacy",
+    "stageBasedSeeds": true,
+    "applicationBudgetsUnmodified": true,
+    "maxModelCallsPerTurn": 12,
+    "outerDeadlineMs": 150000,
+    "manifestSha256": "86b7f227103f949265cbcddebd63f80994b714fe6de702cdcc8fbb0909817c07",
+    "harnessSha256": "c9d9e2724380ebda66c798d94d8ed43b4bfeaa19568d13a4b3e1b2f49f5d29ea",
+    "sourceFixtureSha256": "f9148a9f92e6140e22935d5ed261d6f3a8c90ff230be8e070395e58658ab2538",
+    "fixtureIds": [
+      "sv-person-a",
+      "en-person-b",
+      "en-person-b-reversed-catalog",
+      "fr-corrected-person",
+      "de-pronoun-person",
+      "en-ambiguous-person",
+      "fr-private-probe",
+      "de-pruned-public-history",
+      "en-unknown-person",
+      "en-two-person-group",
+      "fr-explicit-person-unrelated-focus",
+      "sv-current-interlocutor",
+      "en-pruned-two-person-group",
+      "en-fresh-external-with-public-memory",
+      "fr-public-recall-and-fresh-external"
+    ],
+    "externalResearch": "Synthetic failure only. No website was fetched. The raw forbiddenLookups field records provider attempts, including the expected research attempts in explicit external controls."
+  },
+  "scalarDefinitions": {
+    "publishedTurns": "Number of scenarios with one or more final replies; not a correctness or usefulness score.",
+    "structuralPassTurns": "Count of raw assessment.structuralPass. These are mechanical routing/source/privacy/parity assertions, not final prose entailment.",
+    "identitySelectionMatchesTurns": "Count of raw assessment.identitySelectionMatches for expected or explicitly allowed subject sets.",
+    "privacyViolationCount": "Sum of exact private/voice/other-owner sentinel hits. Zero is not proof that all unsupported personal-history claims are absent.",
+    "researchAttemptTurns": "Turns with at least one recorded synthetic provider attempt; some are explicitly expected and some are irrelevant routing.",
+    "elapsedMs": "Per-turn observed wall-clock latency. Median is the middle of the 45 sorted values; timings are descriptive, not statistically controlled throughput claims.",
+    "modelCallCount": "Sum of recorded calls across all stages."
+  },
+  "commonRecordedRuntimeHashes": {
+    "actorChannels": "5d27828884f329a492d7d5aeb6298ef0fa21887a60519f5540b6106fe58c066e",
+    "lmStudioBackend": "98b17e58ed0035820fa00b89ecbefa91ea0ba9bb6eb66aecc53061c49926988d",
+    "personas": "1f070d0d78e7e8cc1ba4456ddb551fff7a168c00f5d11dce820046e48d5a9b89",
+    "socialMemory": "1781160bf1115ed6e7c5262a6e92764a14afb350f259463b9501a3a8d21ace8e",
+    "socialMemoryCoordinator": "805632bea8abfed3c36ab71ee2fdf61a363304b14b8c2777b8675c933f5994f7",
+    "socialMemoryProjection": "035d136a39e3b9793fd3b9494746e8065d442a4e9aff8eaef22c7e1494799fb7",
+    "semanticRouter": "4be6aad58e1677b80c59b5c0eb33c3b60168e1dd3dbe25d255b148facf972a5c",
+    "store": "11a7b18fb93a35ed0825bda3f7c32f8c1659d1f522ce60d860ac0021fccbbd99",
+    "dmPublicContext": "6febdb1fe2b7ff4750da7a9dd8480fde5017093b3c82d47290ec258c89e79a89",
+    "dmPersonBinding": "18b75fe16329641a218a2131b45119ba0e3de9ff71449c3d86c8891964af0367",
+    "dmPersonContext": "f881bb9e6fd63ad8bbbf0615be901737604d7db7cb079225b3a0066520f806b9"
+  },
+  "runtimeHashCaveats": [
+    "Binding/packet module files happen to be present in frozen runtime trees; presence is not activation. These runs use the legacy public-memory presentation and the existing broad router.",
+    "The whole-chain harness did not include dmEvidenceScope in its runtime hash catalog. This audit adds that module's file hash independently without changing the raw reports."
+  ],
+  "variants": [
+    {
+      "id": "baseline",
+      "sourcePath": "/private/tmp/third-place-dm-evidence-before-20261013/report.json",
+      "archivePath": "docs/evaluations/dm-research-memory-chain-baseline-2026-10-13.results.json",
+      "archiveSha256": "91fee9d34e7da6bd2db2721428c90f49264fd493c8a4539a52e8427e09221997",
+      "archiveByteLength": 2380105,
+      "byteIdenticalVerified": true,
+      "generatedAt": "2026-10-13T12:52:37.259Z",
+      "runtimeRoot": "/private/tmp/third-place-dm-evidence-baseline-ZFHKuc/dist-server",
+      "variantRuntimeHashes": {
+        "director": "d64e3e34e1549a45a0251d548c947d50f7f35884c78236c00a81984b94ba05af",
+        "lmStudio": "0b6b9d1cb318d49654afb28124b660ec4a72140e4c3006ba859c1ce37395a777"
+      },
+      "additionalDmEvidenceScopeSha256": null,
+      "rawScalars": {
+        "runs": 45,
+        "publishedTurns": 43,
+        "publishedLines": 43,
+        "structuralPassTurns": 32,
+        "identitySelectionMatchesTurns": 35,
+        "privacyViolationCount": 0,
+        "researchAttemptTurns": 12,
+        "medianElapsedMs": 7430,
+        "totalElapsedMs": 371668,
+        "modelCallCount": 180,
+        "noPublishedReplyTurns": 2
+      }
+    },
+    {
+      "id": "v1",
+      "sourcePath": "/private/tmp/third-place-dm-evidence-after-20261013/report.json",
+      "archivePath": "docs/evaluations/dm-research-memory-chain-v1-2026-10-13.results.json",
+      "archiveSha256": "f89cd5070f664f6ba8cc6a35f6f4234550edc31ea55facf5755682c07f5b0911",
+      "archiveByteLength": 2478399,
+      "byteIdenticalVerified": true,
+      "generatedAt": "2026-10-13T12:59:27.833Z",
+      "runtimeRoot": "/private/tmp/third-place-dm-evidence-candidate-5Xs9tT/dist-server",
+      "variantRuntimeHashes": {
+        "director": "93ce705c822e4cb844feb586fbfbe53b3c373df49cb89e743d4d49f502d4dafa",
+        "lmStudio": "033ccf6183a014662d771958db90573807bc465614c62491700f307107bc6b2c"
+      },
+      "additionalDmEvidenceScopeSha256": "320df2dd888c39bd002c39dfbb03ea5a1b01c3689abbde4d5ded7498b094f87a",
+      "rawScalars": {
+        "runs": 45,
+        "publishedTurns": 42,
+        "publishedLines": 42,
+        "structuralPassTurns": 30,
+        "identitySelectionMatchesTurns": 33,
+        "privacyViolationCount": 0,
+        "researchAttemptTurns": 12,
+        "medianElapsedMs": 7721,
+        "totalElapsedMs": 353784,
+        "modelCallCount": 183,
+        "noPublishedReplyTurns": 3
+      }
+    },
+    {
+      "id": "v2",
+      "sourcePath": "/private/tmp/third-place-dm-evidence-v2-20261013/report.json",
+      "archivePath": "docs/evaluations/dm-research-memory-chain-v2-2026-10-13.results.json",
+      "archiveSha256": "ec44ba7f54af3b9a328c82304d7adb0d2c4630e00e551aac68cb4fa98c03e628",
+      "archiveByteLength": 2470928,
+      "byteIdenticalVerified": true,
+      "generatedAt": "2026-10-13T13:07:47.041Z",
+      "runtimeRoot": "/private/tmp/third-place-dm-evidence-v2-es27ZH/dist-server",
+      "variantRuntimeHashes": {
+        "director": "eef3b11d8fbd4cb6f8f55b3175b44d2bdfaecc2d2a46cfe9d4a0f20cf9cb2a42",
+        "lmStudio": "e604d15126f2267972e54247035b2fc7de5809f0a0d60fffcbde6ffbf46643a9"
+      },
+      "additionalDmEvidenceScopeSha256": "320df2dd888c39bd002c39dfbb03ea5a1b01c3689abbde4d5ded7498b094f87a",
+      "rawScalars": {
+        "runs": 45,
+        "publishedTurns": 42,
+        "publishedLines": 42,
+        "structuralPassTurns": 30,
+        "identitySelectionMatchesTurns": 33,
+        "privacyViolationCount": 0,
+        "researchAttemptTurns": 12,
+        "medianElapsedMs": 7588,
+        "totalElapsedMs": 354970,
+        "modelCallCount": 184,
+        "noPublishedReplyTurns": 3
+      }
+    }
+  ],
+  "matchedContextAudit": {
+    "comparison": "baseline versus v2",
+    "primaryRouterRequestHashAndSettingsMatches": 45,
+    "trustedSubjectSetDifferences": [
+      {
+        "id": "en-ambiguous-person",
+        "repetition": 1,
+        "baseline": [],
+        "v2": [
+          "chain-human-a",
+          "chain-human-b"
+        ]
+      },
+      {
+        "id": "en-ambiguous-person",
+        "repetition": 3,
+        "baseline": [],
+        "v2": [
+          "chain-human-a",
+          "chain-human-b"
+        ]
+      }
+    ],
+    "exactProjectionAndEvidenceMatches": 37,
+    "exactProjectionAndEvidenceComparisonFields": [
+      "identitySelections[].selectedIds",
+      "scenes",
+      "analyses[].evidence",
+      "analyses[].capabilities.requestKind"
+    ],
+    "limitation": "Identical router inputs and seeded settings still produced output variation. The two ambiguity-related losses of clarification have upstream subject-selection drift and are not isolated causal evidence against the writer/reviewer change."
+  },
+  "noEvidenceSystemPromptDifference": {
+    "method": "Offline pure buildSceneSystemPrompt comparison of frozen baseline and V2 using en-fresh-only-no-public-memory; no model call.",
+    "hasIndependentDmEvidence": false,
+    "baselineCharacters": 20025,
+    "v2Characters": 20026,
+    "commonPrefixCharacters": 11952,
+    "commonSuffixCharacters": 8073,
+    "baselineChangedText": "",
+    "v2ChangedText": "\n",
+    "location": "The new conditional DM_EVIDENCE_SCOPE_GUIDANCE interpolation occupies its own line immediately before CONVERSATION_EVIDENCE_GUIDANCE. Its false branch is empty but the surrounding template-literal newline remains.",
+    "limitation": "No-evidence generator system prompts are not byte-identical, even though this observed change contains no additional instruction. This audit does not assume a newline cannot influence model output."
+  },
+  "finalRuntimeOfflineDelta": {
+    "runtimeRoot": "/private/tmp/third-place-dm-evidence-final-VVVOTt/dist-server",
+    "lmStudioSha256": "e2126e03e5981b2d873dc502858c042c25c756b546a9e01a356541af6c9c3e10",
+    "dmEvidenceScopeSha256": "320df2dd888c39bd002c39dfbb03ea5a1b01c3689abbde4d5ded7498b094f87a",
+    "change": "Removed the additional empty template-literal line from the no-independent-evidence path; no source-scope guidance text change.",
+    "verification": "Pure prompt builders across the seven frozen scene fixtures: all six memory-present final prompts are byte-identical to V2; the no-public-memory final prompt is byte-identical to baseline. The same no-memory parity holds after applying the real registry scene contract.",
+    "modelCallsForVerification": 0,
+    "rawReportStatus": "The archived whole-chain results remain V2, not final. No archived measurements are relabeled or rewritten. The upcoming final-runtime production-contract component test is separate."
+  },
+  "manualObservations": {
+    "method": "Manual reading of fixed scenario replies and actual source/routing/reviewer traces; not regex, keyword scoring, or an automated semantic oracle.",
+    "common": [
+      "All variants retained 18 useful clear single-person public recollections across six fixture types and three repetitions.",
+      "All variants reported the unavailable current museum hours in the fresh-only control without inventing those hours.",
+      "Named group queries still failed to retrieve public subjects and gave irrelevant failed-lookup feedback.",
+      "Pruned group replies that appeared recalled only EmberOtter; LindenFox's evidence was not supplied to the writer.",
+      "Unknown-person answers continued to assert lack of past contact without an exhaustive contact history.",
+      "Private-probe responses did not leak the hidden private/voice sentinels, but some still speculated about private interaction or absence."
+    ],
+    "baseline": [
+      "Mixed public recollection plus fresh lookup returned only lookup failure, with no delivered public memory.",
+      "Ambiguous-person control clarified twice and was silent once.",
+      "Pruned two-person control was silent once and partially answered about EmberOtter twice."
+    ],
+    "v1": [
+      "All three mixed-request replies invented that EmberOtter collected stamps, despite no subject retrieval or public evidence being supplied; the reviewer approved them.",
+      "All three unrelated-film-focus replies invented that Mira meant the first film option, although the supplied history did not disambiguate the options.",
+      "Ambiguous-person control was silent in all three repetitions; subject selection differed from baseline in two repetitions."
+    ],
+    "v2": [
+      "The three mixed-request stamp inventions and the three invented first-film-option claims from V1 disappeared; replies returned to incomplete baseline-style failure feedback.",
+      "The pruned group control produced three partial EmberOtter-only replies; this is not complete two-person recall.",
+      "Private probe repetition one added an unsupported claim of a casual exchange; repetitions two and three maintained a privacy boundary. The first resembles current-interlocutor context and must not be described as grounded third-person private history.",
+      "Unknown-person repetition one added that the name sounded familiar; negative contact-history claims remained in all three repetitions.",
+      "No newly invented collection attribution or current external fact was observed in this V2 whole-chain set."
+    ]
+  },
+  "limitations": [
+    "No acceptance or success conclusion is made here. Root will combine this record with the independent frozen-scene comparison.",
+    "Whole-chain mixed failed-research turns retrieved no public subject/evidence in any variant. They cannot demonstrate that the proposed source-conflict change uses genuinely supplied public memory better.",
+    "The frozen-scene matrix separately tests supplied relevant memory, no memory, wrong-person memory, failed external retrieval, stale external facts, and private boundaries.",
+    "Three repetitions per fixture are useful regression evidence, not proof of general reliability.",
+    "The fixed-seed comparison does not remove backend nondeterminism, routing drift, or timing variation.",
+    "Publication, structural assertions, and absence of sentinel leakage are separate from factual answer quality.",
+    "Raw reports retain complete per-stage settings, model output, source projections, reviewer decisions, and request hashes for independent reanalysis."
+  ]
+}

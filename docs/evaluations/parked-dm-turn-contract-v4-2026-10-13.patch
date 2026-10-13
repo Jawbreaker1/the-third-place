@@ -1,0 +1,158 @@
+# Parked DM-only turn-contract V4 integration; rejected by live Gemma tests.
+# Applies to the exact pre-turn source checkpoint, not necessarily Git HEAD.
+
+--- a/server/director.ts
++++ b/server/director.ts
+@@ -1,5 +1,6 @@
+ import { createHash, randomUUID } from "node:crypto";
+ import { recordTurnDiagnostic } from "./turnDiagnostics.js";
++import { dmCapabilitySceneRequest } from "./lmStudio.js";
+ import type { Server } from "socket.io";
+ import type {
+   ChatMessage,
+@@ -4523,7 +4524,7 @@
+     let generated: GeneratedLine[] = [];
+     try {
+       generated = await this.lm.generateScene(
+-        {
++        dmCapabilitySceneRequest({
+           kind: "dm",
+           responseRecoveryBudget: { retriesRemaining: 1 },
+           channelId: latest.channelId,
+@@ -4572,9 +4573,8 @@
+               ? "Recent images from this exact private thread are available as bounded visual evidence. Use them only when the latest turn actually refers back to an image; keep every message and attachment ID distinct and do not surface unrelated old image details."
+               : "",
+             semanticFlagsPremise(analysis),
+-            capabilityScene?.premise,
+-          ].filter(Boolean).join(" ") || undefined,
+-        },
++          ].filter(Boolean).join(" ") || undefined,
++        }, capabilityScene),
+         0,
+         turn.signal,
+         {
+
+--- a/server/lmStudio.ts
++++ b/server/lmStudio.ts
+@@ -1,6 +1,7 @@
+ import { createHash } from "node:crypto";
+ import { recordTurnDiagnostic } from "./turnDiagnostics.js";
+ import { z } from "zod";
++import type { CapabilitySceneContract } from "./capabilities/registry.js";
+ import {
+   CONVERSATION_RESEARCH_PROMPT,
+   conversationResearchResponseFormat,
+@@ -614,10 +615,30 @@
+ };
+ 
+ const failedCapabilityReporterIds = (request: SceneRequest): string[] =>
+-  request.evidenceOutcome === "failed" &&
++  request.kind !== "dm" && request.evidenceOutcome === "failed" &&
+   request.capabilityContext?.executionStatus === "failed_temporary"
+     ? explicitRequestOwnerIds(request)
+     : [];
++
++/** DM adapters supply source facts, never an instruction replacing the whole
++ * private question. Public/voice capability contracts are left unchanged. */
++export const dmCapabilitySceneRequest = (
++  request: SceneRequest,
++  capability: CapabilitySceneContract | undefined,
++): SceneRequest => {
++  if (request.kind !== "dm") throw new TypeError("DM source projection requires a DM scene");
++  if (!capability) return request;
++  return {
++    ...request,
++    research: capability.research,
++    evidenceOutcome: capability.evidenceOutcome,
++    capabilityGroundingInstruction: capability.research ? capability.groundingInstruction : undefined,
++    urlPublicationPolicy: capability.urlPublicationPolicy,
++    requestedClock: capability.requestedClock,
++    temporalPolicy: capability.temporalPolicy ?? "reactive_only",
++    temporalSurfaceActorId: capability.temporalPolicy ? request.selected[0]?.id : undefined,
++  };
++};
+ 
+ const EVIDENCE_ANSWERABILITY_REVIEW_ISSUES = new Set<CandidateReviewIssue>([
+   "evidence_not_answer_bearing",
+@@ -4837,7 +4858,7 @@
+       }
+     }
+ 
+-    const notAnswerBearingOwnerId = allowRequestOwnerRetry && ownerRecoveryAttempted && request.research &&
++    const notAnswerBearingOwnerId = request.kind !== "dm" && allowRequestOwnerRetry && ownerRecoveryAttempted && request.research &&
+       request.capabilityContext?.plannedAction && request.capabilityContext.executionStatus === "succeeded"
+       ? explicitOwnerIds.find((personaId) =>
+           !result.some((line) => line.personaId === personaId) &&
+@@ -5438,7 +5459,7 @@
+             role: "system",
+             content: (request.kind === "voice"
+               ? buildVoiceCandidateReviewSystemPrompt()
+-              : buildCandidateReviewSystemPrompt()) +
++              : buildCandidateReviewSystemPrompt(request.kind === "dm")) +
+               (input.candidates.some((candidate) => candidate.privateRelationshipNote)
+                 ? `\n\n${SOCIAL_MEMORY_REVIEW_GUIDANCE}` : "") +
+               (input.sceneKind === "dm" || input.candidates.some((candidate) => candidate.publicParticipantNote)
+@@ -5451,7 +5472,8 @@
+         top_p: 1,
+         reasoning_effort: "none",
+         max_tokens: clampTokenBudget(420 + input.candidates.length * 220 +
+-          input.candidates.filter((candidate) => requiresRequestDeliveryAssessment(input, candidate)).length * 140),
++          input.candidates.filter((candidate) => requiresRequestDeliveryAssessment(input, candidate)).length *
++            (request.kind === "dm" ? 520 : 140)),
+         stream: false,
+         response_format: buildCandidateReviewResponseFormat(input),
+       }, controller.signal);
+
+--- a/server/semanticRouter.ts
++++ b/server/semanticRouter.ts
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import { DM_REQUEST_DELIVERY_REVIEW_GUIDANCE, dmRequestDeliveryJsonSchema, normalizeDmRequestDelivery } from "./dmRequestDelivery.js";
+ import {
+   REQUEST_DELIVERY_REVIEW_GUIDANCE,
+   requestDeliveryFailureIssue,
+@@ -4571,7 +4572,7 @@
+               additionalProperties: false,
+               properties: {
+                 personaId: { type: "string", enum: personaIds },
+-                ...(assessDelivery ? { requestDelivery: requestDeliveryJsonSchema } : {}),
++                ...(assessDelivery ? { requestDelivery: input.sceneKind === "dm" ? dmRequestDeliveryJsonSchema : requestDeliveryJsonSchema } : {}),
+                 severity: { type: "string", enum: ["none", "low", "medium", "high"] },
+                 issues: {
+                   type: "array",
+@@ -4654,11 +4655,11 @@
+ 
+ High blocks factual/safety contracts and peer_echo. Standalone intensity is medium. Non-clean gets one concise same-language instruction preserving facts/intent; clean uses none, [], null.`;
+ 
+-export const buildCandidateReviewSystemPrompt = (): string => `SOURCE ENTAILMENT — PRIORITY ZERO. Review every candidate independently before all other judgments. Atomize its externally checkable exact/current assertions. If room.freshnessRule requires evidence or marks the class precision-sensitive, or room.groundingPolicy lists the semantic class of the answer, each essential claim must be explicitly entailed by a result named in that candidate's sourceIds. When no successful evidence is present for such a requested class, the candidate may preserve the participant's supplied clues, state bounded uncertainty or ask one useful discriminating question; it must not fill the gap with a plausible canonical title, event, credit, date, maker, origin, authenticity, rarity, price or value. A participant clue grounds only its exact semantic proposition: it never grounds a substituted or changed attribute, new quantifier or frequency, generalization, occurrence elsewhere, or a merely related fact. When canonical_narrative_detail is listed, this gate applies to EVERY candidate in EVERY scene kind—public, DM, voice and ambient—and to every purported real canonical story, episode, scene, event, action, prop, setting, relationship event or character behavior it asserts. Gate each clause even when it is a volunteered aside, does not answer the trigger, or follows uncertainty; uncertainty in one clause never grounds a different factual clause. Abstract identification methods and explicitly hypothetical or invented examples remain clean, but model memory is not evidence of canon. Official status, preferred discovery tier, rank, title, topical similarity, plausibility and model memory never count as support; sourceAuthority.meaning is literally discovery_preference_not_claim_support; one candidate's sources never support another. When evidence.outcome is succeeded, emit evidence_not_answer_bearing only if the complete packet provides neither the exact requested fact nor directly relevant readable material from which the resident can ground an honest exact knowledge boundary and useful bounded response. A packet that supports a relevant premise plus the precise unresolved dimension can still answer with that boundary and a clearly framed low-stakes interpretation; do not classify it as unusable merely because it cannot prove the interpretation as canon. When a candidate assertion is not entailed by its citations, or asserts an answer in a room-required class without successful supporting evidence, emit evidence_ungrounded or evidence_irrelevant. EACH OF THESE ISSUES MUST USE severity high. NEVER return severity none when issues is non-empty. Resolve claim classes from complete meaning in every language and script, never by keywords, word overlap, room IDs, domain lists, regular expressions or translated phrases.
++export const buildCandidateReviewSystemPrompt = (dmDelivery = false): string => `SOURCE ENTAILMENT — PRIORITY ZERO. Review every candidate independently before all other judgments. Atomize its externally checkable exact/current assertions. If room.freshnessRule requires evidence or marks the class precision-sensitive, or room.groundingPolicy lists the semantic class of the answer, each essential claim must be explicitly entailed by a result named in that candidate's sourceIds. When no successful evidence is present for such a requested class, the candidate may preserve the participant's supplied clues, state bounded uncertainty or ask one useful discriminating question; it must not fill the gap with a plausible canonical title, event, credit, date, maker, origin, authenticity, rarity, price or value. A participant clue grounds only its exact semantic proposition: it never grounds a substituted or changed attribute, new quantifier or frequency, generalization, occurrence elsewhere, or a merely related fact. When canonical_narrative_detail is listed, this gate applies to EVERY candidate in EVERY scene kind—public, DM, voice and ambient—and to every purported real canonical story, episode, scene, event, action, prop, setting, relationship event or character behavior it asserts. Gate each clause even when it is a volunteered aside, does not answer the trigger, or follows uncertainty; uncertainty in one clause never grounds a different factual clause. Abstract identification methods and explicitly hypothetical or invented examples remain clean, but model memory is not evidence of canon. Official status, preferred discovery tier, rank, title, topical similarity, plausibility and model memory never count as support; sourceAuthority.meaning is literally discovery_preference_not_claim_support; one candidate's sources never support another. When evidence.outcome is succeeded, emit evidence_not_answer_bearing only if the complete packet provides neither the exact requested fact nor directly relevant readable material from which the resident can ground an honest exact knowledge boundary and useful bounded response. A packet that supports a relevant premise plus the precise unresolved dimension can still answer with that boundary and a clearly framed low-stakes interpretation; do not classify it as unusable merely because it cannot prove the interpretation as canon. When a candidate assertion is not entailed by its citations, or asserts an answer in a room-required class without successful supporting evidence, emit evidence_ungrounded or evidence_irrelevant. EACH OF THESE ISSUES MUST USE severity high. NEVER return severity none when issues is non-empty. Resolve claim classes from complete meaning in every language and script, never by keywords, word overlap, room IDs, domain lists, regular expressions or translated phrases.
+ 
+ You are a strict multilingual publication reviewer for a lively peer-to-peer community. Review every candidate in one batch, directly in the language and cultural register of the turn. Do not use Swedish or English keyword lists and do not mistake unfamiliar phrasing for an error.
+ 
+-${REQUEST_DELIVERY_REVIEW_GUIDANCE}
++${dmDelivery ? DM_REQUEST_DELIVERY_REVIEW_GUIDANCE : REQUEST_DELIVERY_REVIEW_GUIDANCE}
+ 
+ ${CONVERSATION_EVIDENCE_GUIDANCE}
+ 
+@@ -4923,6 +4924,21 @@
+     raw = JSON.parse(content.trim());
+   } catch {
+     return undefined;
++  }
++  if (input.sceneKind === "dm" && input.candidates.some((candidate) => requiresRequestDeliveryAssessment(input, candidate))) {
++    if (!raw || typeof raw !== "object" || !("reviews" in raw) || !Array.isArray(raw.reviews)) return undefined;
++    const reviews = [];
++    for (const review of raw.reviews) {
++      if (!review || typeof review !== "object") return undefined;
++      const candidate = input.candidates.find((item) => item.personaId === review.personaId);
++      if (!candidate) return undefined;
++      const delivery = normalizeDmRequestDelivery(review.requestDelivery, candidate.content);
++      if (!delivery) return undefined;
++      // Only aggregate delivery. Factual/privacy issues are never removed or
++      // downgraded here; the existing fail-closed parser judges them unchanged.
++      reviews.push({ ...review, requestDelivery: delivery });
++    }
++    raw = { ...raw, reviews };
+   }
+   const normalized = normalizeImpossibleCandidateIssues(raw, input);
+   const parsed = createCandidateReviewOutputSchema(input, options).safeParse(normalized);

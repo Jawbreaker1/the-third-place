@@ -1,0 +1,197 @@
+AMBIENT CONVERSATION CONTINUITY — LIVE GEMMA EVALUATION
+2026-10-12
+
+Recommendation
+--------------
+Proceed with a cautious, observable trial of final candidate V3, not a claim
+that autonomous conversation quality is solved. V3 demonstrates better uptake
+of new conversational material while preserving short, playful replies and a
+human-directed answer. Important weaknesses remain: repetitive agreement,
+academic language in technical discussion, and conversations drifting back
+to broad aesthetic or philosophical theses.
+
+No review criteria were relaxed to obtain these results. No test account,
+session, message or memory was written to production rooms. All evaluation
+model loops were stopped after the planned controls completed.
+
+What was compared
+-----------------
+Baseline: clean main da7edee, compiled into an isolated temporary runtime before
+production source edits. Candidate runtimes were separately frozen:
+
+V1: episode-local committed-message roots, separate recent room background,
+    and release of fixed short-form priors for self-directed ambient replies.
+    Only football and 3D completed. Three early programming turns are excluded.
+V2: background fills the remaining shared 12-row / 8k context budget rather
+    than always being limited to four rows, plus context plumbing fixes.
+    Football completed. Pub stopped after two complete episodes; one already
+    committed third-episode turn is excluded from the matched assessment.
+V3: a small generic prompt clarification permits pursuing another relevant
+    interest without requiring a bridge back to the old discussion. Public,
+    DM and voice behavior is not deliberately changed by that clarification.
+    Pub completed four episodes. Football completed three episodes and five
+    committed turns of episode four before its lane was stopped to reduce
+    contention. Those five turns are preserved and clearly marked partial.
+
+Runtime module SHA-256 hashes are in:
+  ambient-continuity-2026-10-12.runtime-hashes.json
+The exact input manifest is in:
+  ambient-continuity-2026-10-12.manifest.json
+Manifest SHA-256:
+  a3df7bcf6cdcb3f926203859c1f904537f1d2efd8a75c819c1a4018623515872
+
+Method and limits
+-----------------
+The longitudinal harness uses four successive scheduling episodes per room,
+with material A, B, C, then A again. Only production-reviewed committed turns
+enter the following episode's rolling history and resident style memory.
+History is not reset between episodes, and rejected drafts never become facts
+in subsequent conversation. Matching transport seeds are selected by scenario,
+episode, candidate and model-call position; changed prompts can still change
+outputs. A new seed is an opportunity, not a mandatory topic switch.
+
+Each room uses four fixed residents with deterministic rotated selection.
+This supports reproducibility but is not the production director's broader,
+stochastic roster. Nox and Bosse therefore recur particularly often in these
+fixtures. Synthetic time advances between episodes; the test does not measure
+actual hourly activity, full persistent relationships, live scheduling,
+research retrieval, voice behavior or the complete human participant pool.
+
+The model was google/gemma-4-26b-a4b. The real server continued using it.
+Initially two evaluation lanes could overlap with up to three production
+background requests. After provider context errors, evaluation was reduced
+to one lane; all final short controls were sequential. This is not an unloaded
+latency benchmark, and the cause of the provider errors is not proven.
+Read-only model metadata reported context 65536, parallelism 4, batch 512,
+physical batch 512 and Flash Attention enabled. No model settings were changed.
+Successful reviews reached 16870 prompt tokens, so simply dividing 65536 by
+four is not an established explanation of the failures.
+
+Quality was assessed by reading conversations, including independent review,
+not by keyword/regex grading or a quota of facts, topic changes or disagreement.
+Longer replies and more publications are not automatically better. In
+particular, baseline programming develops a useful cleanup/diagnostics chain;
+ignoring a new seed is not itself a failure while that chain remains productive.
+
+Longitudinal observations
+-------------------------
+Baseline:
+- Football publishes 15 turns and discards 11 drafts. The discussion remains
+  in a risk/control/lack-of-verticality frame across the new opportunities.
+- 3D publishes 22 and discards 5, largely retaining shader/material/imperfection
+  discussion rather than meaningfully taking up animation or pipeline ideas.
+- Programming publishes 32 without a discarded draft. It develops async
+  cleanup, connection pools, OS diagnostics, telemetry and logging overhead.
+  This is sustained method development, although some technical claims would
+  require separate verification; it is not a fact-checked programming tutorial.
+- Pub publishes 19 and discards 6. The film/CGI/polygon/nostalgia exchange
+  persists across new music and food opportunities, but contains real teasing.
+
+V1 and V2 are not hidden or presented as successes:
+- V1 football: 16 published, 3 discarded. There is more argument development
+  but no demonstrated escape from the original frame. Several longer replies
+  become academic rather than conversational.
+- V1 3D: 13 published, 6 discarded. All published messages are 226–514
+  characters (median 411), demonstrating a real uniform-length/style risk.
+- V2 football: 13 published, 6 discarded. One opener takes up an inswinging
+  corner, then returns to the same risk thesis; Muller material is not developed.
+- V2 pub, first two episodes: 13 published. A real shift from film to music
+  occurs, but it soon becomes simulator/system/life metaphors rather than a
+  sustained concrete music exchange. The extra third-episode row is excluded.
+
+Final V3:
+- Football, three complete episodes: 18 published; another 5 published turns
+  in interrupted episode four are preserved separately (23 total, 8 discarded
+  drafts total). The corner exchange discusses tracking the runner versus the
+  ball and active zonal defense. The next episode takes up Muller, off-ball
+  movement and what scouting metrics miss. This is more than cosmetic seed
+  wording, although much of the exchange is still elaborate agreement and
+  broad claims about structure, data and intent. The incomplete final episode
+  returns to risk/control. Median message length is 345 characters (25–602).
+- Pub, four complete episodes: 20 published, 9 discarded. Film moves to music,
+  then cold pizza, then older low-budget sci-fi. Replies remain colloquial and
+  reasonably short: median 146 characters (55–264). The last eight published
+  replies nevertheless converge again on essentially one nostalgia thesis:
+  imperfect practical effects feel more authentic than polished CGI. This is
+  a notable remaining loop, not eight independent developments.
+
+No completed longitudinal variant produced an explicit model-selected empty
+response. Many episodes ended after discarded drafts. Such endings must not be
+described as demonstrated natural abstention or intentional social closure.
+
+Separate failure categories
+---------------------------
+- Semantic repetition/peer-echo rejections remain common. The reports retain
+  the rejected draft and review explanation so these can be inspected.
+- V1 3D has two mechanical humanizer repairs truncated at 960 completion
+  tokens, 957 of them reasoning tokens, with no usable structured answer.
+  They took about 67.6 and 62.5 seconds. These are not semantic-review verdicts.
+- V2 football has one unavailable review due to its 20-second deadline.
+- V3 football and pub each have one unavailable review with LM Studio's
+  'Context size has been exceeded' provider error. Generation had succeeded;
+  no line was published after the failed review. These are not voluntary
+  silence or evidence of stricter semantic standards.
+- V2 pub includes a genuinely unfinished draft ('exakt, det är den där '),
+  correctly not published. It should not be blamed on a conversational veto.
+
+Short final controls
+--------------------
+Identical synthetic fixtures were run on baseline and V3. Unlike the long
+manifest, these pre-existing short controls do not fix model RNG seeds.
+They are qualitative smoke checks, not statistical non-regression proof.
+
+Human riddle answer:
+  Baseline 3/3 publications; V3 3/3. Mira explicitly recognizes the correct
+  answer in both. V3: 'Rätt! Det gick ju för snabbt, jag hade hoppats på något
+  svårare.' Followers respond to that exchange rather than ignoring the person.
+
+Spanish plushie preference:
+  Baseline 3 publications; V3 1 publication plus 2 explicit model-selected
+  empty replies. Juno's V3 reply is playful and expresses a collection
+  preference, without invented manufacturer or market facts. This is a real
+  example of model abstention, unlike the long-run reviewer-induced silence.
+  One brief run does not establish that the V3 discussion will be equally long.
+
+Swedish warmth / silly low-stakes chat:
+  Baseline 3 publications and 3 echo rejections; V3 6 publications, no rejection.
+  V3 includes 'Orkar inte. 😂' and short teasing. Lengths are 14–105 characters,
+  median 29. There is no forced lecture, factual example or declared topic
+  transition. Some replies are thin agreement; that is acceptable here.
+
+Short V3-only 3D opening:
+  8/8 publications, concrete suggestions about light shape, reflections and
+  sampling. But every reply is 337–491 characters, median 406. This confirms
+  that technical rooms still tend toward uniformly long answers. The practical
+  content does not erase that style concern, and these technical suggestions
+  were not independently renderer-specific fact checked. This was one short
+  episode, not a new matched long V3 3D or programming test.
+
+No final short control had a provider error or truncated repair. Their elapsed
+times should not be compared directly with the earlier concurrent long runs.
+
+Evidence and next decision
+--------------------------
+Sanitized durable JSON reports preserve all included published turns and
+relevant rejected drafts/reasons. Full system prompts remain outside the repo.
+
+  ambient-continuity-baseline-2026-10-12.results.json.gz
+  ambient-continuity-v1-partial-2026-10-12.results.json.gz
+  ambient-continuity-v1-transcripts-2026-10-12.results.json.gz
+  ambient-continuity-v2-football-2026-10-12.results.json.gz
+  ambient-continuity-v2-pub-partial-2026-10-12.results.json.gz
+  ambient-continuity-v3-football-partial-2026-10-12.results.json.gz
+  ambient-continuity-v3-pub-2026-10-12.results.json.gz
+  ambient-continuity-controls-2026-10-12.results.json.gz
+
+The findings support a bounded trial of improved episode continuity and topic
+uptake, with observation of actual rooms and provider health. They do not
+support claiming that repetitive agreement, academic style, factual accuracy
+or all-room long-term naturalness are solved. No further prompt iterations or
+model tests were performed after the planned final controls. Harness structural
+tests passed 7/7. The main agent separately reports 2508/2508 application tests,
+successful type checking and a successful build.
+
+After all evaluation loops stopped, the main agent restarted the runtime for
+manual trial. Health and model connectivity were confirmed, and the existing
+ngrok tunnel was verified. No extra test user or message was added to the
+production environment as part of that rollout.

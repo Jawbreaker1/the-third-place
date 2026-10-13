@@ -155,7 +155,8 @@ describe("single-resident autonomous source openings", () => {
     harness.store.addPublicMessage(newer);
     expect(await harness.run()).toBe(true);
     const request = harness.generateScene.mock.calls[0]![0];
-    expect(request.conversationContext?.publishedTurns).toEqual(expect.arrayContaining([
+    expect(request.conversationContext?.publishedTurns).toEqual([]);
+    expect(request.conversationContext?.roomBackground).toEqual(expect.arrayContaining([
       expect.objectContaining({ messageId: older.id, authorId: peer.id }),
       expect.objectContaining({ messageId: newer.id, authorId: unrelated.id }),
     ]));
@@ -167,6 +168,7 @@ describe("single-resident autonomous source openings", () => {
     });
     expect(harness.thread.replyOpportunity).toEqual({ afterMessageId: published.id, actorId: peer.id });
     expect(harness.thread.lastMessageId).toBe(published.id);
+    expect(harness.thread.conversationRootMessageId).toBe(published.id);
   });
 
   it("does not substitute a thread's last message when the source opening omits or invents a reply target", async () => {

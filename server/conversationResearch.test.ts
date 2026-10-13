@@ -74,6 +74,37 @@ describe("bounded public conversation research input", () => {
     expect(lookup.additionalProperties).toBe(false);
     expect(lookup.required).toEqual(["sourceMessageId", "query", "question", "mode"]);
   });
+
+  it("retains public background references without reviving old messages as research requests", () => {
+    const source = input();
+    const conversation = buildConversationContext({
+      phase: "continuation", rootMessageId: "current-question",
+      backgroundMessages: [{
+        messageId: "earlier-detail", authorId: "ai-vale", author: "Vale", kind: "ai",
+        content: "The licensing share is the detail I am uncertain about.",
+        createdAt: "2026-10-12T09:59:00.000Z",
+      }],
+      messages: [{
+        messageId: "current-question", authorId: "ai-farah", author: "Farah", kind: "ai",
+        content: "Does the latest annual report break that out?",
+        createdAt: "2026-10-12T10:00:00.000Z", replyToMessageId: "earlier-detail",
+      }],
+    });
+    const normalized = normalizeConversationResearchInput({
+      ...source,
+      conversation: {
+        ...conversation,
+        roomBackground: conversation.roomBackground!.map((row) => ({ ...row, privateAnnotations: "private note" })),
+      },
+    });
+    expect(normalized.conversation).toEqual(conversation);
+    expect(JSON.stringify(normalized)).not.toContain("private");
+    const lookup = conversationResearchResponseFormat(normalized).json_schema.schema.properties.lookup.anyOf[1];
+    expect(lookup.properties?.sourceMessageId.enum).toEqual(["current-question"]);
+    expect(parseConversationResearchChoice(JSON.stringify({ lookup: {
+      ...choice(), sourceMessageId: "earlier-detail",
+    } }), normalized)).toBeNull();
+  });
 });
 
 describe("conversation research response parsing", () => {

@@ -9,21 +9,34 @@
 // --substance probes room-seed openings, conversational drift and ordinary
 // social talk. These fixtures are opt-in so historical suites stay comparable.
 // --list prints the selected fixture manifest without a model call or file write.
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+// --longitudinal retains reviewed history across four scheduling episodes in
+// each of four rooms. Use --runtime-root=/path/to/dist-server for a frozen build,
+// --context-policy=legacy|episode to match that director, and --match-manifest=
+// with the baseline's saved manifest for exactly matched subject material.
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
-import { ActorChannelRuntime } from "../server/actorChannels.ts";
-import { getChannelProfile } from "../server/channels.ts";
-import {
+import { createHash } from "node:crypto";
+// A compiled immutable baseline can be selected without loading changed repo
+// modules. This affects this process only, never the running production app.
+const runtimeRoot = process.argv.find((argument) => argument.startsWith("--runtime-root="))?.slice(15);
+const runtimeModule = (name) => import(runtimeRoot
+  ? pathToFileURL(join(resolve(runtimeRoot), "server", `${name}.js`)).href
+  : new URL(`../server/${name}.ts`, import.meta.url).href);
+const { ActorChannelRuntime } = await runtimeModule("actorChannels");
+const { getChannelProfile } = await runtimeModule("channels");
+const {
   autonomousConversationWordCeiling,
   autonomousOpeningPremise,
   AUTONOMOUS_CONTINUATION_PREMISE,
   buildConversationContext,
-} from "../server/conversationFlow.ts";
-import { conversationOpportunity } from "../server/conversationScheduling.ts";
-import { LmStudioClient } from "../server/lmStudio.ts";
-import { LmStudioBackend } from "../server/lmStudioBackend.ts";
-import { PERSONAS } from "../server/personas.ts";
+  buildAmbientConversationContext,
+} = await runtimeModule("conversationFlow");
+const { conversationOpportunity } = await runtimeModule("conversationScheduling");
+const { LmStudioClient } = await runtimeModule("lmStudio");
+const { LmStudioBackend } = await runtimeModule("lmStudioBackend");
+const { PERSONAS } = await runtimeModule("personas");
 
 const fixtures = [
   {
@@ -222,8 +235,9 @@ const reasoningNone = process.argv.includes("--reasoning-none");
 const openingSuite = process.argv.includes("--openings");
 const peerReactionSuite = process.argv.includes("--peer-reactions");
 const substanceSuite = process.argv.includes("--substance");
-if ([openingSuite, peerReactionSuite, substanceSuite].filter(Boolean).length > 1) {
-  throw new Error("Choose at most one suite: --openings, --peer-reactions or --substance");
+const longitudinalSuite = process.argv.includes("--longitudinal");
+if ([openingSuite, peerReactionSuite, substanceSuite, longitudinalSuite].filter(Boolean).length > 1) {
+  throw new Error("Choose at most one suite: --openings, --peer-reactions, --substance or --longitudinal");
 }
 const selectedFixtures = fixtures.filter((fixture) => (!requestedCase || fixture.id === requestedCase)
   && (substanceSuite ? fixture.substanceOnly || fixture.id === "es-autonomous-opening-fandom"
@@ -237,6 +251,59 @@ const reviewAxes = [
   "Naturalness: are small acknowledgments, emotion, jokes, uneven message lengths and a quiet ending still welcome?",
   "Grounding: are sourced facts, durable knowledge, hypotheses and missing evidence kept distinct without fabricated searches or citations?",
 ];
+const longitudinalScenarios = [
+  { id: "en-long-football", channelId: "football-talk", languageTag: "en", candidates: ["ai-bosse", "ai-ibrahim", "ai-linnea", "ai-nox"], families: ["football-attacking-structure", "football-set-pieces", "football-squad-building", "football-attacking-structure"] },
+  { id: "en-long-3d", channelId: "3d-visualisation", languageTag: "en", candidates: ["ai-pixel", "ai-tess", "ai-sana", "ai-zed"], families: ["visual-lighting-material", "visual-animation-simulation", "visual-pipeline-handoff", "visual-lighting-material"] },
+  { id: "en-long-programming", channelId: "ai-programming", languageTag: "en", candidates: ["ai-sana", "ai-ibrahim", "ai-aya", "ai-zed"], families: ["ai-code-runtime", "ai-code-contracts", "ai-code-interface-delivery", "ai-code-runtime"] },
+  { id: "sv-long-pub", channelId: "the-pub", languageTag: "sv", candidates: ["ai-bosse", "ai-mira", "ai-juno", "ai-nox"], families: ["pub-film-talk", "pub-music-taste", "pub-food-indulgence", "pub-film-talk"] },
+];
+const matchManifestPath = process.argv.find((argument) => argument.startsWith("--match-manifest="))?.slice(17);
+const runLabel = process.argv.find((argument) => argument.startsWith("--label="))?.slice(8) ?? "unlabelled";
+const contextPolicy = process.argv.find((argument) => argument.startsWith("--context-policy="))?.slice(17)
+  ?? (typeof buildAmbientConversationContext === "function" ? "episode" : "legacy");
+if (!["legacy", "episode"].includes(contextPolicy)) throw new Error("--context-policy must be legacy or episode");
+const episodeLimitArgument = process.argv.find((argument) => argument.startsWith("--episodes="))?.slice(11);
+const episodeLimit = episodeLimitArgument === undefined ? 4 : Number(episodeLimitArgument);
+if (!Number.isInteger(episodeLimit) || episodeLimit < 1 || episodeLimit > 4) throw new Error("--episodes must be an integer from 1 to 4");
+const loadLongitudinalManifest = async () => {
+  if (matchManifestPath) return JSON.parse(await readFile(resolve(matchManifestPath), "utf8"));
+  return {
+    version: 1, baseTime: "2026-10-12T12:00:00.000Z", modelSeed: 741921,
+    historyWindow: 18, contextWindow: 26, attemptBoundPerEpisode: 20,
+    minutesBetweenEpisodes: 12, secondsBetweenTurns: 20,
+    scenarios: longitudinalScenarios.map(({ families, ...scenario }) => {
+      const profile = getChannelProfile(scenario.channelId);
+      return { ...scenario, episodes: families.map((family) => {
+        const index = profile?.ambientPremiseFamilies?.indexOf(family) ?? -1;
+        if (index < 0 || profile.ambientPremiseGrounding?.[index] === "fresh_research") throw new Error(`Unavailable safe fixture family: ${family}`);
+        return { family, seed: profile.ambientPremises[index] };
+      }) };
+    }),
+  };
+};
+if (longitudinalSuite) {
+  const manifest = await loadLongitudinalManifest();
+  if (manifest.version !== 1 || !Array.isArray(manifest.scenarios) || manifest.scenarios.length < 1 || manifest.scenarios.length > 4
+    || !Number.isFinite(Date.parse(manifest.baseTime)) || !Number.isSafeInteger(manifest.modelSeed)
+    || manifest.historyWindow !== 18 || manifest.contextWindow !== 26
+    || !Number.isInteger(manifest.attemptBoundPerEpisode) || manifest.attemptBoundPerEpisode < 1 || manifest.attemptBoundPerEpisode > 24
+    || manifest.minutesBetweenEpisodes !== 12 || manifest.secondsBetweenTurns !== 20) throw new Error("Invalid longitudinal manifest");
+  const selection = process.argv.find((argument) => argument.startsWith("--scenario="))?.slice(11);
+  const scenarios = manifest.scenarios.filter((scenario) => !selection || scenario.id === selection);
+  if (!scenarios.length) throw new Error("Unknown longitudinal scenario");
+  for (const scenario of scenarios) {
+    if (!getChannelProfile(scenario.channelId) || !Array.isArray(scenario.episodes) || scenario.episodes.length !== 4
+      || scenario.episodes.some((episode) => typeof episode.family !== "string" || typeof episode.seed !== "string" || episode.seed.length > 1_000)
+      || !Array.isArray(scenario.candidates) || scenario.candidates.length < 2 || scenario.candidates.length > 8
+      || scenario.candidates.some((id) => !PERSONAS.some((persona) => persona.id === id))) throw new Error(`Invalid longitudinal scenario: ${scenario.id}`);
+  }
+  if (process.argv.includes("--list")) {
+    console.log(JSON.stringify({ reviewAxes, manifest, selectedScenarioIds: scenarios.map((scenario) => scenario.id), episodeLimit, contextPolicy }, null, 2));
+    process.exit(0);
+  }
+  await runLongitudinal(manifest, scenarios);
+  process.exit(process.exitCode ?? 0);
+}
 // Validate fixture wiring before any network request. These are structural
 // checks only; none grade natural-language content by words or expressions.
 for (const fixture of selectedFixtures) {
@@ -300,6 +367,162 @@ function observedBackend() {
     },
     calls,
   };
+}
+
+async function runLongitudinal(manifest, scenarios) {
+  const directory = await mkdtemp("/tmp/third-place-longitudinal-");
+  const manifestHash = createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+  await writeFile(join(directory, "manifest.json"), JSON.stringify(manifest, null, 2));
+  const report = {
+    label: runLabel, runtimeRoot: runtimeRoot ?? "working-source", contextPolicy, manifestHash, generatedAt: new Date().toISOString(),
+    reviewAxes,
+    notes: [
+      "Four separate scheduling episodes retain prior accepted room turns and per-resident style memory. Rejected drafts never enter history.",
+      "Episodes use different then repeated room material, never forced rhetorical moves or a required publication count.",
+      "Legacy policy matches the baseline director: an episode causal ID is not a message root, so the entire recent tail remains active. Episode policy binds the first committed message and partitions earlier room rows as background.",
+      "One evaluation model call at a time; the real server continues separately. No RoomStore, Director, account, socket or production write.",
+      "Synthetic clock advances between episodes; this is a controlled accelerated replay, not a measurement of director timing or relationships.",
+      "Model RNG seeds match by scenario, episode, candidate and model-call position. This does not guarantee identical outputs on different runtimes.",
+      "No live research/feed is supplied so external retrieval cannot confound matched conversation-context results.",
+      "Quality and hallucinations require semantic human review. Counts and latency are diagnostics, never a naturalness grade.",
+    ], scenarios: [],
+  };
+  console.log(JSON.stringify({ event: "longitudinal_start", directory, label: runLabel, runtimeRoot: report.runtimeRoot, contextPolicy, manifestHash, scenarios: scenarios.length, episodes: episodeLimit, concurrency: 1 }));
+  for (const scenario of scenarios) {
+    // Filtering a room must not silently change its matched transport seeds.
+    const scenarioIndex = manifest.scenarios.findIndex((entry) => entry.id === scenario.id);
+    let virtualNow = Date.parse(manifest.baseTime);
+    const observed = observedBackend();
+    let transportSeed = manifest.modelSeed;
+    let callPosition = 0;
+    const capturedRequests = [];
+    const backend = {
+      ...observed.backend,
+      async complete(body, signal) {
+        const seededBody = { ...body, seed: transportSeed + callPosition++ };
+        capturedRequests.push({ modelSeed: seededBody.seed, schema: body.response_format?.json_schema?.name, messages: body.messages });
+        return observed.backend.complete(seededBody, signal);
+      },
+    };
+    const client = new LmStudioClient({ backend, now: () => virtualNow, maxConcurrentPredictions: 1, maxBackgroundPredictions: 1 });
+    const health = await client.probe();
+    if (!health.connected) throw new Error(`Model unavailable: ${health.label}`);
+    const actorChannels = new ActorChannelRuntime();
+    const published = [];
+    const scenarioReport = { id: scenario.id, channelId: scenario.channelId, languageTag: scenario.languageTag, model: health, episodes: [], published };
+    report.scenarios.push(scenarioReport);
+    const persist = async () => {
+      await writeFile(join(directory, `${scenario.id}.json`), JSON.stringify(scenarioReport, null, 2));
+      await writeFile(join(directory, "report.json"), JSON.stringify(report, null, 2));
+    };
+    for (const [episodeIndex, material] of scenario.episodes.slice(0, episodeLimit).entries()) {
+      const episodeStart = published.length;
+      const episode = { index: episodeIndex, material, precedingCommittedCount: episodeStart, turns: [], stopReason: "attempt_bound" };
+      scenarioReport.episodes.push(episode);
+      let rootMessageId;
+      let quietCandidateIds = [];
+      let cursor = episodeIndex % scenario.candidates.length;
+      virtualNow = Date.parse(manifest.baseTime) + episodeIndex * manifest.minutesBetweenEpisodes * 60_000;
+      console.log(`\n=== ${scenario.id}, episode ${episodeIndex + 1}; ${episodeStart} prior committed rows ===\n${material.seed}`);
+      for (let attempt = 0; attempt < manifest.attemptBoundPerEpisode; attempt += 1) {
+        const committedThisEpisode = published.length - episodeStart;
+        const opportunity = conversationOpportunity({
+          publishedCount: committedThisEpisode,
+          lastAuthorId: published.at(-1)?.authorId,
+          quietCandidateIds, eligibleIds: scenario.candidates,
+        });
+        if (opportunity.status !== "ready") { episode.stopReason = opportunity.status; break; }
+        let personaId;
+        for (let offset = 0; offset < scenario.candidates.length; offset += 1) {
+          const position = (cursor + offset) % scenario.candidates.length;
+          if (!opportunity.candidateIds.includes(scenario.candidates[position])) continue;
+          personaId = scenario.candidates[position]; cursor = (position + 1) % scenario.candidates.length; break;
+        }
+        if (!personaId) throw new Error("No eligible evaluation resident");
+        const persona = PERSONAS.find((entry) => entry.id === personaId);
+        const phase = committedThisEpisode ? "continuation" : "opening";
+        const recent = published.slice(-manifest.contextWindow);
+        const root = published.find((row) => row.messageId === rootMessageId);
+        const contextRows = root && !recent.some((row) => row.messageId === root.messageId) ? [root, ...recent] : recent;
+        if (contextPolicy === "episode" && typeof buildAmbientConversationContext !== "function") {
+          throw new Error("Episode context policy requires the production buildAmbientConversationContext helper");
+        }
+        const context = contextPolicy === "legacy"
+          ? buildConversationContext({ phase, rootMessageId: `${scenario.id}-causal-episode-${episodeIndex}`, messages: contextRows })
+          : buildAmbientConversationContext({ phase, rootMessageId, messages: contextRows });
+        const request = {
+          kind: "ambient", channelId: scenario.channelId, channelName: scenario.channelId, selected: [persona],
+          history: published.slice(-manifest.historyWindow).map(({ messageId: _id, ...row }) => row),
+          conversationContext: context,
+          premise: phase === "opening" ? autonomousOpeningPremise(material.seed) : AUTONOMOUS_CONTINUATION_PREMISE,
+          ...(phase === "opening" ? { ambientAction: {
+            episodeId: `${scenario.id}-episode-${episodeIndex}`, causalRootId: `${scenario.id}-opening-${episodeIndex}`,
+            semanticFamily: material.family, kind: "open_topic", turnIndex: 0, openHook: false, previousActions: [],
+          } } : {}),
+          humanizerBudget: { repairsRemaining: 1 },
+          wordLimits: { [personaId]: { minimum: 1, maximum: autonomousConversationWordCeiling(persona.style) } },
+          mustReplyIds: [], responseRecoveryIds: [], languageHint: scenario.languageTag,
+          semanticContext: { languageTag: scenario.languageTag, asksForList: false, asksAboutAiIdentity: false, asksAboutAcoustics: false },
+          actorChannelNotes: actorChannels.promptNotes([persona], scenario.channelId),
+          actorExpertiseNotes: actorChannels.expertiseNotes([persona], scenario.channelId),
+        };
+        transportSeed = manifest.modelSeed + scenarioIndex * 100_000 + episodeIndex * 1_000 + attempt * 10;
+        callPosition = 0;
+        const callStart = observed.calls.length;
+        const capturedStart = capturedRequests.length;
+        const started = performance.now();
+        let lines = [], error = null;
+        try { lines = await client.generateScene(request, 4); }
+        catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
+        const calls = observed.calls.slice(callStart);
+        const generations = calls.filter((call) => call.schema === "social_scene");
+        const explicitEmpty = generations.length && generations.every((call) => Array.isArray(call.parsed?.messages) && call.parsed.messages.length === 0);
+        const outcome = error ? "execution_error" : lines.length ? "reviewed_publication" : explicitEmpty ? "model_chose_empty" : "draft_not_published";
+        const turn = { personaId, phase, rootMessageId: context.rootMessageId ?? null, historyMessageIds: published.slice(-manifest.historyWindow).map((row) => row.messageId), context, elapsedMs: Math.round(performance.now() - started), outcome, lines, error, calls, requests: capturedRequests.slice(capturedStart) };
+        episode.turns.push(turn);
+        for (const [lineIndex, line] of lines.entries()) {
+          const speaker = PERSONAS.find((entry) => entry.id === line.personaId);
+          const row = { messageId: `${scenario.id}-ep${episodeIndex}-turn${attempt}-${lineIndex}`, authorId: speaker.id, author: speaker.name, kind: "ai", content: line.content, createdAt: new Date(virtualNow).toISOString(), ...(line.replyToMessageId ? { replyToMessageId: line.replyToMessageId } : {}) };
+          published.push(row);
+          rootMessageId ??= row.messageId;
+          client.rememberDeliveredLine(line.personaId, line.content, { kind: "ambient", channelId: scenario.channelId, channelName: scenario.channelId });
+          console.log(`${speaker.name}: ${line.content}`);
+        }
+        console.log(JSON.stringify({ event: "turn", scenario: scenario.id, episode: episodeIndex + 1, attempt, personaId, outcome, elapsedMs: turn.elapsedMs }));
+        quietCandidateIds = lines.length ? [] : [...new Set([...quietCandidateIds, personaId])];
+        virtualNow += manifest.secondsBetweenTurns * 1_000;
+        await persist();
+        if (error) { episode.stopReason = "execution_error"; break; }
+        if (!committedThisEpisode && !lines.length) { episode.stopReason = "opening_abstained_or_rejected"; break; }
+      }
+      episode.reviewedMessages = published.length - episodeStart;
+      episode.rootMessageId = rootMessageId ?? null;
+      await persist();
+      console.log(JSON.stringify({ event: "episode_complete", scenario: scenario.id, index: episodeIndex, stopReason: episode.stopReason, reviewedMessages: episode.reviewedMessages }));
+    }
+    const allTurns = scenarioReport.episodes.flatMap((episode) => episode.turns);
+    const quantile = (values, fraction) => [...values].sort((a, b) => a - b)[Math.max(0, Math.ceil(values.length * fraction) - 1)] ?? null;
+    const elapsed = allTurns.map((turn) => turn.elapsedMs);
+    const lengths = published.map((row) => row.content.length);
+    const allCalls = allTurns.flatMap((turn) => turn.calls);
+    scenarioReport.summary = {
+      reviewedMessages: published.length,
+      candidateCount: allTurns.length,
+      unpublishedDrafts: allTurns.filter((turn) => turn.outcome === "draft_not_published").length,
+      chosenEmpty: allTurns.filter((turn) => turn.outcome === "model_chose_empty").length,
+      errors: allTurns.filter((turn) => turn.error).length,
+      transportErrors: allCalls.filter((call) => call.error).length,
+      lengthLimitedCalls: allCalls.filter((call) => call.finishReason === "length").length,
+      repairCalls: allCalls.filter((call) => call.schema === "humanized_chat_lines").length,
+      latencyMs: { median: quantile(elapsed, 0.5), p95: quantile(elapsed, 0.95), total: elapsed.reduce((a, b) => a + b, 0) },
+      messageCharacters: { minimum: quantile(lengths, 0), median: quantile(lengths, 0.5), maximum: quantile(lengths, 1) },
+    };
+    await persist();
+    if (scenarioReport.summary.errors) process.exitCode = 1;
+  }
+  report.completedAt = new Date().toISOString();
+  await writeFile(join(directory, "report.json"), JSON.stringify(report, null, 2));
+  console.log(JSON.stringify({ event: "longitudinal_complete", report: join(directory, "report.json"), manifest: join(directory, "manifest.json"), manifestHash, summaries: report.scenarios.map((scenario) => ({ id: scenario.id, ...scenario.summary })) }));
 }
 
 const results = [];
@@ -458,6 +681,7 @@ for (const fixture of selectedFixtures) {
     // Persist after every candidate so an interrupted evaluation remains inspectable.
     await writeFile(join(outputDirectory, `${fixture.id}.json`), JSON.stringify({
       fixtureId: fixture.id, question: fixture.question, model: health.label,
+      label: runLabel, runtimeRoot: runtimeRoot ?? "working-source",
       inferenceMode: reasoningNone ? "experimental-social-scene-reasoning-none" : "production",
       ...(roomSeed ? { roomSeed, seedFamily: fixture.seedFamily } : {}),
       initialRows, turns, published,
@@ -481,6 +705,8 @@ for (const fixture of selectedFixtures) {
 }
 const report = {
   generatedAt: new Date().toISOString(),
+  label: runLabel,
+  runtimeRoot: runtimeRoot ?? "working-source",
   inferenceMode: reasoningNone ? "experimental-social-scene-reasoning-none" : "production",
   reviewAxes,
   notes: [

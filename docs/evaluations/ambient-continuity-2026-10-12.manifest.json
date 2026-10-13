@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "baseTime": "2026-10-12T12:00:00.000Z",
+  "modelSeed": 741921,
+  "historyWindow": 18,
+  "contextWindow": 26,
+  "attemptBoundPerEpisode": 20,
+  "minutesBetweenEpisodes": 12,
+  "secondsBetweenTurns": 20,
+  "scenarios": [
+    {
+      "id": "en-long-football",
+      "channelId": "football-talk",
+      "languageTag": "en",
+      "candidates": [
+        "ai-bosse",
+        "ai-ibrahim",
+        "ai-linnea",
+        "ai-nox"
+      ],
+      "episodes": [
+        {
+          "family": "football-attacking-structure",
+          "seed": "Spain-style short passing around a compact midfield, with the useful pass forward still missing."
+        },
+        {
+          "family": "football-set-pieces",
+          "seed": "An inswinging corner, a near-post runner and the defender trying to watch both ball and opponent."
+        },
+        {
+          "family": "football-squad-building",
+          "seed": "Thomas Müller as a reference point for off-ball movement that is hard to reduce to a single position label."
+        },
+        {
+          "family": "football-attacking-structure",
+          "seed": "Spain-style short passing around a compact midfield, with the useful pass forward still missing."
+        }
+      ]
+    },
+    {
+      "id": "en-long-3d",
+      "channelId": "3d-visualisation",
+      "languageTag": "en",
+      "candidates": [
+        "ai-pixel",
+        "ai-tess",
+        "ai-sana",
+        "ai-zed"
+      ],
+      "episodes": [
+        {
+          "family": "visual-lighting-material",
+          "seed": "A ceramic mug rendered with careful reflections but a flat, directionless light."
+        },
+        {
+          "family": "visual-animation-simulation",
+          "seed": "A character lifting a heavy box while their hips and feet barely respond."
+        },
+        {
+          "family": "visual-pipeline-handoff",
+          "seed": "A modular street where the same window spacing appears on every building."
+        },
+        {
+          "family": "visual-lighting-material",
+          "seed": "A ceramic mug rendered with careful reflections but a flat, directionless light."
+        }
+      ]
+    },
+    {
+      "id": "en-long-programming",
+      "channelId": "ai-programming",
+      "languageTag": "en",
+      "candidates": [
+        "ai-sana",
+        "ai-ibrahim",
+        "ai-aya",
+        "ai-zed"
+      ],
+      "episodes": [
+        {
+          "family": "ai-code-runtime",
+          "seed": "A Python async task cancelled while its HTTP stream and socket are still open."
+        },
+        {
+          "family": "ai-code-contracts",
+          "seed": "A JSON response with a required field omitted versus a field present with the wrong type."
+        },
+        {
+          "family": "ai-code-interface-delivery",
+          "seed": "A streaming paragraph and a screen reader announcing every new token."
+        },
+        {
+          "family": "ai-code-runtime",
+          "seed": "A Python async task cancelled while its HTTP stream and socket are still open."
+        }
+      ]
+    },
+    {
+      "id": "sv-long-pub",
+      "channelId": "the-pub",
+      "languageTag": "sv",
+      "candidates": [
+        "ai-bosse",
+        "ai-mira",
+        "ai-juno",
+        "ai-nox"
+      ],
+      "episodes": [
+        {
+          "family": "pub-film-talk",
+          "seed": "The Mummy, Brendan Fraser's charm and the pleasure of an adventure film that does not take itself too seriously."
+        },
+        {
+          "family": "pub-music-taste",
+          "seed": "A late-evening music queue with ABBA, Massive Attack and one person reaching for the skip button."
+        },
+        {
+          "family": "pub-food-indulgence",
+          "seed": "Cold pizza, toasties and instant noodles as competing late-night comforts."
+        },
+        {
+          "family": "pub-film-talk",
+          "seed": "The Mummy, Brendan Fraser's charm and the pleasure of an adventure film that does not take itself too seriously."
+        }
+      ]
+    }
+  ]
+}

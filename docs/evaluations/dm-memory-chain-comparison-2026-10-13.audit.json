@@ -1,0 +1,288 @@
+{
+  "baselineManifest": "ac20bf5e8f57592b6fd50fc38a353214d3601741787f0285a786652dadaabf5d",
+  "candidateManifest": "ac20bf5e8f57592b6fd50fc38a353214d3601741787f0285a786652dadaabf5d",
+  "sameHarness": true,
+  "comparisons": [
+    {
+      "id": "sv-person-a",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-a"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-a"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "en-person-b",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": true,
+      "baselineSelectedIds": [
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "en-person-b-reversed-catalog",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "fr-corrected-person",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "de-pronoun-person",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "en-ambiguous-person",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-a",
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-a",
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": false,
+      "candidateStructuralPass": false
+    },
+    {
+      "id": "fr-private-probe",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-a"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-a"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "de-pruned-public-history",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-a"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-a"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "en-unknown-person",
+      "repetition": 1,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [],
+      "candidateSelectedIds": [],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "sv-person-a",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-a"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-a"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "en-person-b",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "en-person-b-reversed-catalog",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "fr-corrected-person",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": true,
+      "baselineSelectedIds": [
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "de-pronoun-person",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-b"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "en-ambiguous-person",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [],
+      "candidateSelectedIds": [
+        "chain-human-a",
+        "chain-human-b"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": false
+    },
+    {
+      "id": "fr-private-probe",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-a"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-a"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "de-pruned-public-history",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [
+        "chain-human-a"
+      ],
+      "candidateSelectedIds": [
+        "chain-human-a"
+      ],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    },
+    {
+      "id": "en-unknown-person",
+      "repetition": 2,
+      "sameRouterUserPayload": true,
+      "sameRouterSystem": true,
+      "sameRouterInferenceSettings": true,
+      "sameRawRouterResponse": false,
+      "baselineSelectedIds": [],
+      "candidateSelectedIds": [],
+      "baselineStructuralPass": true,
+      "candidateStructuralPass": true
+    }
+  ]
+}

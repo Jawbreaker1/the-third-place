@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "evaluation": "dm-research-memory-frozen-scenes",
+  "evaluationDate": "2026-10-13",
+  "acceptanceDecision": "all_v1_v2_v3_source_scope_behavior_not_accepted_parked",
+  "retentionNote": "Root parked all V1, V2/final and minimal V3 source-scope behavior after the production-contract comparisons. These neutral-scene raw reports remain unchanged. The final retention decision and V3 evidence are recorded separately in the production-contract audit.",
+  "archivePolicy": "Raw reports are byte-identical copies. No model output, assessment, scene or recorded setting was rewritten.",
+  "protocol": {
+    "model": "google/gemma-4-26b-a4b",
+    "repetitions": 3,
+    "concurrency": 1,
+    "cases": 7,
+    "generationTasksPerVariant": 21,
+    "fixedGoodReviewTasksPerVariant": 21,
+    "fixedBadReviewTasksPerVariant": 21,
+    "staleExternalReviewTasksPerVariant": 3,
+    "harnessSha256": "bbcba5b89324fa028fa28165f95818a291a68ee2e071c0fb45200e63b21ad020",
+    "manifestSha256": "d0e716c088346169137b0e9b7bc4f288a225cfee3ddee452192225b0a4f7aa50",
+    "stageBasedSeeds": true,
+    "maxModelCallsPerTask": 10,
+    "deadlineMs": 90000,
+    "environment": "Synthetic fixed SceneRequests; actual production generation/review/parser; no router, Director, store, live user, server or external provider execution.",
+    "premise": "The fixed neutral failed-lookup premise deliberately omits the actual registry/Director failure-only prose. This comparison isolates source/status interpretation, not the complete production scene contract."
+  },
+  "commonRuntimeHashes": {
+    "lmStudioBackend": "98b17e58ed0035820fa00b89ecbefa91ea0ba9bb6eb66aecc53061c49926988d",
+    "personas": "1f070d0d78e7e8cc1ba4456ddb551fff7a168c00f5d11dce820046e48d5a9b89",
+    "semanticRouter": "4be6aad58e1677b80c59b5c0eb33c3b60168e1dd3dbe25d255b148facf972a5c"
+  },
+  "variants": [
+    {
+      "id": "baseline",
+      "sourcePath": "/private/tmp/third-place-dm-scenes-baseline-20261013/report.json",
+      "archivePath": "docs/evaluations/dm-research-memory-scenes-baseline-2026-10-13.results.json",
+      "archiveSha256": "8a44ad5a612fcdbd147fadbff22749b2453470dbed5f908222212ce2910aeb68",
+      "archiveByteLength": 6114275,
+      "byteIdenticalVerified": true,
+      "generatedAt": "2026-10-13T13:14:32.044Z",
+      "runtimeRoot": "/private/tmp/third-place-dm-evidence-baseline-ZFHKuc/dist-server",
+      "variantRuntimeHashes": {
+        "lmStudio": "0b6b9d1cb318d49654afb28124b660ec4a72140e4c3006ba859c1ce37395a777",
+        "dmEvidenceScope": null
+      },
+      "rawScalars": {
+        "tasks": 66,
+        "generationWithReturnedLines": 20,
+        "validFixedDraftsAllowed": 18,
+        "validFixedDraftsBlocked": 3,
+        "invalidFixedDraftsBlockedByValidatedReview": 19,
+        "invalidFixedDraftsWithNoValidatedReview": 2,
+        "staleExternalDraftsBlockedByValidatedReview": 3,
+        "sentinelHits": 0,
+        "recordedModelCalls": 91
+      }
+    },
+    {
+      "id": "v2",
+      "sourcePath": "/private/tmp/third-place-dm-scenes-v2-20261013/report.json",
+      "archivePath": "docs/evaluations/dm-research-memory-scenes-v2-2026-10-13.results.json",
+      "archiveSha256": "a65b87f490b95e3dc0656ba450449f6fa8fddf9434c92a337b1da94b049869e9",
+      "archiveByteLength": 6339422,
+      "byteIdenticalVerified": true,
+      "generatedAt": "2026-10-13T13:17:44.317Z",
+      "runtimeRoot": "/private/tmp/third-place-dm-evidence-v2-es27ZH/dist-server",
+      "variantRuntimeHashes": {
+        "lmStudio": "e604d15126f2267972e54247035b2fc7de5809f0a0d60fffcbde6ffbf46643a9",
+        "dmEvidenceScope": "320df2dd888c39bd002c39dfbb03ea5a1b01c3689abbde4d5ded7498b094f87a"
+      },
+      "rawScalars": {
+        "tasks": 66,
+        "generationWithReturnedLines": 20,
+        "validFixedDraftsAllowed": 21,
+        "validFixedDraftsBlocked": 0,
+        "invalidFixedDraftsBlockedByValidatedReview": 19,
+        "invalidFixedDraftsWithNoValidatedReview": 2,
+        "staleExternalDraftsBlockedByValidatedReview": 3,
+        "sentinelHits": 0,
+        "recordedModelCalls": 91
+      }
+    }
+  ],
+  "manualObservations": {
+    "method": "Manual reading of generated lines, supplied scenes, exact outbound requests and production review decisions. This is separate from the raw scalar counts and uses no regex or phrase-based grading.",
+    "generation": [
+      "Public recollection with and without incidental failed lookup was grounded in all six corresponding generation tasks in each variant.",
+      "Mixed recollection plus fresh lookup returned two complete bounded replies out of three in each variant. The same first repetition remained silent after false rejection of a supplied postcard fact plus honest missing-current-hours report.",
+      "V2 changed the mixed-turn false rejection from unsupported_external_evidence_claim to unfulfilled_explicit_request, without reliably fixing the refusal.",
+      "Fresh-current-fact controls never fabricated current hours or promoted the old quoted admission price into a generated current fact. V2 fresh-only repetition two nevertheless added an unsupported future promise to search again later.",
+      "V2 private-boundary repetition one added the suggestive phrase 'On a ses petits secrets', whereas baseline maintained a nonconfirming generic privacy boundary. No actual hidden private material was supplied or leaked; this is a quality/grounding concern, not sentinel leakage.",
+      "Wrong-person memory did not become an attributed LindenFox collection in any generated answer. Both variants mostly narrated a failed lookup instead of expressing the narrower recollection gap.",
+      "Overall generated-answer usefulness was not demonstrated to improve consistently in this neutral-premise component comparison."
+    ],
+    "fixedReviewProbes": [
+      "The measurable valid-probe improvement is entirely the wrong-person honest-gap draft: baseline falsely rejected it in all three repetitions as an external-evidence claim; V2 correctly allowed all three.",
+      "Both variants blocked all three stale-to-current price claims with validated evidence_ungrounded reviews.",
+      "No invalid fixed draft received a validated clean approval. However, two wrong-person invalid drafts per variant produced no validated review and are not counted as successful semantic rejection.",
+      "Those malformed reviews finished normally rather than truncating. Gemma used an out-of-schema participant_identity_conflation issue alongside evidence_ungrounded. The parser rejected the whole result despite semantically recognizing the name swap."
+    ]
+  },
+  "limitations": [
+    "A returned line is not equivalent to a correct or natural reply, and an invalid review is not equivalent to a reliable rejection.",
+    "The neutral failure premise means that baseline already often used valid public memory successfully. The actual registry failure-only contract requires a separate, explicitly labeled conditional component comparison.",
+    "The seven cases and three repetitions constrain interpretation; no generalized reliability or deployment claim is made.",
+    "Gold drafts test fixed decisions, while generated lines test a different distribution. Better fixed-probe acceptance alone is insufficient to demonstrate better complete conversation.",
+    "Final runtime subsequently removed the no-evidence extra newline. These raw measurements remain explicitly labeled V2; see the whole-chain audit's finalRuntimeOfflineDelta for byte-parity verification."
+  ]
+}

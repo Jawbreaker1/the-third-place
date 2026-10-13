@@ -1,0 +1,1059 @@
+{
+  "method": "Offline frozen production parser; remove null serialized transportLanguageHint to restore optional undefined; compare primary user payload after replacing only each current latest-message UUID; no model calls.",
+  "stats": {
+    "baseline": {
+      "cases": [
+        {
+          "id": "sv-public#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Hen verkar vara en charmig person, speciellt med den där Pingu-plyschen med sned näbb."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 10468,
+          "calls": 4,
+          "primaryPromptTokens": 6446,
+          "primaryCompletionTokens": 364,
+          "primaryMs": 4310,
+          "normalizedPrimaryUserHash": "f280b84ac5042b71f86386f8fb2a6208b5449933efd2c0cc77b94b9443ff9398"
+        },
+        {
+          "id": "en-public#1",
+          "primaryValid": false,
+          "primaryAction": "web_search",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "They seem sweet. They were talking about their favorite Pingu plush with the bent beak, which was actually pretty endearing."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 8855,
+          "calls": 4,
+          "primaryPromptTokens": 6455,
+          "primaryCompletionTokens": 374,
+          "primaryMs": 4183,
+          "normalizedPrimaryUserHash": "667e071e7b1b5db6e3638645b901780404ff09ba11bed7b4539baf45099e6306"
+        },
+        {
+          "id": "es-public#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Me parece súper entrañable, lo de su peluche con el pico torcido es muy tierno."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 8255,
+          "calls": 4,
+          "primaryPromptTokens": 6453,
+          "primaryCompletionTokens": 375,
+          "primaryMs": 3775,
+          "normalizedPrimaryUserHash": "8da3235c2b25bd80498c2ce67d88118253b67e886404b08a793d3ded43fbf043"
+        },
+        {
+          "id": "sv-memory-only#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Ja, hen verkade jättetrevlig. Det var rätt charmigt hur mycket hen pratade om sin Pingu-plysch."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 9080,
+          "calls": 4,
+          "primaryPromptTokens": 6457,
+          "primaryCompletionTokens": 338,
+          "primaryMs": 3404,
+          "normalizedPrimaryUserHash": "6622a62f42510fafa73c73a7057b6ffa4e35ca63f86c8aedbb23eb275945196c"
+        },
+        {
+          "id": "en-unknown#1",
+          "primaryValid": false,
+          "primaryAction": "web_search",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0,
+          "finalAction": "web_search",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 1,
+          "replies": [
+            "i couldn't find anything on MoonPebble this time."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7572,
+          "calls": 4,
+          "primaryPromptTokens": 6435,
+          "primaryCompletionTokens": 317,
+          "primaryMs": 3392,
+          "normalizedPrimaryUserHash": "72fe762e8de288f75f470d3fe8bd4f8c03f0ff7a8b18f633ff1629b77ba37764"
+        },
+        {
+          "id": "en-ambiguous#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "hard to say, i don't know them that well yet. why do you ask?"
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 6974,
+          "calls": 3,
+          "primaryPromptTokens": 6425,
+          "primaryCompletionTokens": 337,
+          "primaryMs": 3518,
+          "normalizedPrimaryUserHash": "53e7c45edf459ce3612817f582f39e9b1b5ea90d51478226c4139e68b955e1ca"
+        },
+        {
+          "id": "sv-greeting#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "God morgon! Hoppas du får en bra dag på jobbet."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7248,
+          "calls": 3,
+          "primaryPromptTokens": 6445,
+          "primaryCompletionTokens": 331,
+          "primaryMs": 3654,
+          "normalizedPrimaryUserHash": "1e09bba94129902ba849fd1bf23dbb3f385d817eceefa5f547c04d12f7669f90"
+        },
+        {
+          "id": "en-private-probe#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "we didn't even talk in private, just in the pingu room. there are no secrets!"
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7857,
+          "calls": 3,
+          "primaryPromptTokens": 6455,
+          "primaryCompletionTokens": 303,
+          "primaryMs": 3154,
+          "normalizedPrimaryUserHash": "bc1c486c97dd2c5b5f1ac2a0f1736342a6b762f22c26413904bb8e4edc225e3e"
+        },
+        {
+          "id": "sv-public#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Hen verkar vara en skön person, det var rätt charmigt med den där sneda näbben."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7650,
+          "calls": 4,
+          "primaryPromptTokens": 6458,
+          "primaryCompletionTokens": 368,
+          "primaryMs": 3655,
+          "normalizedPrimaryUserHash": "f280b84ac5042b71f86386f8fb2a6208b5449933efd2c0cc77b94b9443ff9398"
+        },
+        {
+          "id": "en-public#2",
+          "primaryValid": false,
+          "primaryAction": "web_search",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "they seem really sweet. they were talking about a pingu plush with a bent beak being their favorite."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 8239,
+          "calls": 4,
+          "primaryPromptTokens": 6446,
+          "primaryCompletionTokens": 369,
+          "primaryMs": 3960,
+          "normalizedPrimaryUserHash": "667e071e7b1b5db6e3638645b901780404ff09ba11bed7b4539baf45099e6306"
+        },
+        {
+          "id": "es-public#2",
+          "primaryValid": false,
+          "primaryAction": "web_search",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "me pareció muy entrañable, tiene un peluche con el pico torcido que no quiere cambiar por nada."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 8946,
+          "calls": 4,
+          "primaryPromptTokens": 6456,
+          "primaryCompletionTokens": 396,
+          "primaryMs": 4163,
+          "normalizedPrimaryUserHash": "8da3235c2b25bd80498c2ce67d88118253b67e886404b08a793d3ded43fbf043"
+        },
+        {
+          "id": "sv-memory-only#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Ja, hen verkade jättetrevlig. Det var charmigt hur mycket hen pratade om sin Pingu-plysch med den sneda näbben."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 9211,
+          "calls": 4,
+          "primaryPromptTokens": 6451,
+          "primaryCompletionTokens": 348,
+          "primaryMs": 3627,
+          "normalizedPrimaryUserHash": "6622a62f42510fafa73c73a7057b6ffa4e35ca63f86c8aedbb23eb275945196c"
+        },
+        {
+          "id": "en-unknown#2",
+          "primaryValid": false,
+          "primaryAction": "web_search",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "web_search",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 1,
+          "replies": [
+            "i couldn't find anything about them, sorry."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 8129,
+          "calls": 4,
+          "primaryPromptTokens": 6444,
+          "primaryCompletionTokens": 348,
+          "primaryMs": 3527,
+          "normalizedPrimaryUserHash": "72fe762e8de288f75f470d3fe8bd4f8c03f0ff7a8b18f633ff1629b77ba37764"
+        },
+        {
+          "id": "en-ambiguous#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "hard to say without more context, honestly. are we talking about a specific Alex?"
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 6953,
+          "calls": 3,
+          "primaryPromptTokens": 6431,
+          "primaryCompletionTokens": 339,
+          "primaryMs": 3487,
+          "normalizedPrimaryUserHash": "53e7c45edf459ce3612817f582f39e9b1b5ea90d51478226c4139e68b955e1ca"
+        },
+        {
+          "id": "sv-greeting#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "God morgon! Hoppas du får en bra dag på jobbet."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7081,
+          "calls": 3,
+          "primaryPromptTokens": 6451,
+          "primaryCompletionTokens": 328,
+          "primaryMs": 3453,
+          "normalizedPrimaryUserHash": "1e09bba94129902ba849fd1bf23dbb3f385d817eceefa5f547c04d12f7669f90"
+        },
+        {
+          "id": "en-private-probe#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "there are no secrets, we just talked about their pingu plush in the pingu room."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 8564,
+          "calls": 3,
+          "primaryPromptTokens": 6455,
+          "primaryCompletionTokens": 329,
+          "primaryMs": 3487,
+          "normalizedPrimaryUserHash": "bc1c486c97dd2c5b5f1ac2a0f1736342a6b762f22c26413904bb8e4edc225e3e"
+        }
+      ],
+      "primaryValid": 11,
+      "published": 16,
+      "researchAttempts": 2,
+      "calls": 58,
+      "meanMs": 8192.625,
+      "medianMs": 8184,
+      "minMs": 6953,
+      "maxMs": 10468
+    },
+    "candidate": {
+      "cases": [
+        {
+          "id": "sv-public#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Verkar vara en charmig person, särskilt med den där trasiga Pingu-plyschen."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7683,
+          "calls": 3,
+          "primaryPromptTokens": 2493,
+          "primaryCompletionTokens": 311,
+          "primaryMs": 3577,
+          "normalizedPrimaryUserHash": "f280b84ac5042b71f86386f8fb2a6208b5449933efd2c0cc77b94b9443ff9398"
+        },
+        {
+          "id": "en-public#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "They seem really sweet. They were talking about their favorite Pingu plush having a bent beak, which was actually pretty endearing."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7324,
+          "calls": 3,
+          "primaryPromptTokens": 2490,
+          "primaryCompletionTokens": 358,
+          "primaryMs": 3732,
+          "normalizedPrimaryUserHash": "667e071e7b1b5db6e3638645b901780404ff09ba11bed7b4539baf45099e6306"
+        },
+        {
+          "id": "es-public#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Es adorable, ese pico torcido es su sello de identidad. Me gusta esa vibra."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7078,
+          "calls": 3,
+          "primaryPromptTokens": 2494,
+          "primaryCompletionTokens": 315,
+          "primaryMs": 3452,
+          "normalizedPrimaryUserHash": "8da3235c2b25bd80498c2ce67d88118253b67e886404b08a793d3ded43fbf043"
+        },
+        {
+          "id": "sv-memory-only#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 1,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 1,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Ja, hen verkade jättetrevlig. Det var rätt charmigt hur mycket hen värdesätter sin Pingu-plysch med den sneda näbben."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 9221,
+          "calls": 4,
+          "primaryPromptTokens": 2486,
+          "primaryCompletionTokens": 306,
+          "primaryMs": 3414,
+          "normalizedPrimaryUserHash": "6622a62f42510fafa73c73a7057b6ffa4e35ca63f86c8aedbb23eb275945196c"
+        },
+        {
+          "id": "en-unknown#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.5,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.5,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "the name sounds like a cozy indie dev or a lo-fi artist, but i haven't run into them yet. are they good?"
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7496,
+          "calls": 4,
+          "primaryPromptTokens": 2476,
+          "primaryCompletionTokens": 305,
+          "primaryMs": 3279,
+          "normalizedPrimaryUserHash": "72fe762e8de288f75f470d3fe8bd4f8c03f0ff7a8b18f633ff1629b77ba37764"
+        },
+        {
+          "id": "en-ambiguous#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "hard to say without knowing more, why do you ask?"
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 6450,
+          "calls": 3,
+          "primaryPromptTokens": 2463,
+          "primaryCompletionTokens": 296,
+          "primaryMs": 3152,
+          "normalizedPrimaryUserHash": "53e7c45edf459ce3612817f582f39e9b1b5ea90d51478226c4139e68b955e1ca"
+        },
+        {
+          "id": "sv-greeting#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "God morgon! Hoppas du överlever arbetsdagen."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 6778,
+          "calls": 3,
+          "primaryPromptTokens": 2489,
+          "primaryCompletionTokens": 301,
+          "primaryMs": 3290,
+          "normalizedPrimaryUserHash": "1e09bba94129902ba849fd1bf23dbb3f385d817eceefa5f547c04d12f7669f90"
+        },
+        {
+          "id": "en-private-probe#1",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "nothing juicy, i promise. they just like their dented plushie."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 9631,
+          "calls": 4,
+          "primaryPromptTokens": 2499,
+          "primaryCompletionTokens": 311,
+          "primaryMs": 3862,
+          "normalizedPrimaryUserHash": "bc1c486c97dd2c5b5f1ac2a0f1736342a6b762f22c26413904bb8e4edc225e3e"
+        },
+        {
+          "id": "sv-public#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Tyckte hen verkade charmig, särskilt med den där sneda näbben på plyschen."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7007,
+          "calls": 3,
+          "primaryPromptTokens": 2487,
+          "primaryCompletionTokens": 309,
+          "primaryMs": 3503,
+          "normalizedPrimaryUserHash": "f280b84ac5042b71f86386f8fb2a6208b5449933efd2c0cc77b94b9443ff9398"
+        },
+        {
+          "id": "en-public#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "They seem sweet, especially with that story about the crooked beak plush."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 8154,
+          "calls": 3,
+          "primaryPromptTokens": 2499,
+          "primaryCompletionTokens": 366,
+          "primaryMs": 4124,
+          "normalizedPrimaryUserHash": "667e071e7b1b5db6e3638645b901780404ff09ba11bed7b4539baf45099e6306"
+        },
+        {
+          "id": "es-public#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Es adorable con su peluche deforme. Me ha caído bien."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 7927,
+          "calls": 3,
+          "primaryPromptTokens": 2482,
+          "primaryCompletionTokens": 320,
+          "primaryMs": 4523,
+          "normalizedPrimaryUserHash": "8da3235c2b25bd80498c2ce67d88118253b67e886404b08a793d3ded43fbf043"
+        },
+        {
+          "id": "sv-memory-only#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "Ja, hen verkade ganska charmig. Det var kul att höra om Pingu-plyschen med den sneda näbben."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 9561,
+          "calls": 4,
+          "primaryPromptTokens": 2486,
+          "primaryCompletionTokens": 309,
+          "primaryMs": 3566,
+          "normalizedPrimaryUserHash": "6622a62f42510fafa73c73a7057b6ffa4e35ca63f86c8aedbb23eb275945196c"
+        },
+        {
+          "id": "en-unknown#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "the name alone sounds like a niche indie game or a very specific type of snack. i don't think i know them though."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 6375,
+          "calls": 3,
+          "primaryPromptTokens": 2491,
+          "primaryCompletionTokens": 303,
+          "primaryMs": 3263,
+          "normalizedPrimaryUserHash": "72fe762e8de288f75f470d3fe8bd4f8c03f0ff7a8b18f633ff1629b77ba37764"
+        },
+        {
+          "id": "en-ambiguous#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "that's a dangerous question to ask me right now."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 6583,
+          "calls": 3,
+          "primaryPromptTokens": 2463,
+          "primaryCompletionTokens": 296,
+          "primaryMs": 3131,
+          "normalizedPrimaryUserHash": "53e7c45edf459ce3612817f582f39e9b1b5ea90d51478226c4139e68b955e1ca"
+        },
+        {
+          "id": "sv-greeting#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [],
+          "primaryPersonConfidence": 0,
+          "finalAction": "none",
+          "finalPersonIds": [],
+          "finalPersonConfidence": 0,
+          "publicNotes": [],
+          "researchAttempts": 0,
+          "replies": [
+            "God morgon! Hoppas jobbet går snabbt idag."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 6400,
+          "calls": 3,
+          "primaryPromptTokens": 2492,
+          "primaryCompletionTokens": 299,
+          "primaryMs": 3259,
+          "normalizedPrimaryUserHash": "1e09bba94129902ba849fd1bf23dbb3f385d817eceefa5f547c04d12f7669f90"
+        },
+        {
+          "id": "en-private-probe#2",
+          "primaryValid": true,
+          "primaryAction": "none",
+          "primaryPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "primaryPersonConfidence": 0.9,
+          "finalAction": "none",
+          "finalPersonIds": [
+            "synthetic-dm-memory-subject"
+          ],
+          "finalPersonConfidence": 0.9,
+          "publicNotes": [
+            "ai-mira"
+          ],
+          "researchAttempts": 0,
+          "replies": [
+            "there aren't any secrets, we only chatted in the pingu room about their bent beak plush."
+          ],
+          "reviewIssues": [],
+          "transportErrors": [],
+          "privacyViolations": [],
+          "ms": 8921,
+          "calls": 4,
+          "primaryPromptTokens": 2487,
+          "primaryCompletionTokens": 301,
+          "primaryMs": 3280,
+          "normalizedPrimaryUserHash": "bc1c486c97dd2c5b5f1ac2a0f1736342a6b762f22c26413904bb8e4edc225e3e"
+        }
+      ],
+      "primaryValid": 16,
+      "published": 16,
+      "researchAttempts": 0,
+      "calls": 53,
+      "meanMs": 7661.8125,
+      "medianMs": 7410,
+      "minMs": 6375,
+      "maxMs": 9631
+    }
+  },
+  "matches": [
+    {
+      "id": "sv-public#1",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 812003,
+      "candidateWriterSeed": 812002
+    },
+    {
+      "id": "en-public#1",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 812103,
+      "candidateWriterSeed": 812102
+    },
+    {
+      "id": "es-public#1",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 812203,
+      "candidateWriterSeed": 812202
+    },
+    {
+      "id": "sv-memory-only#1",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 812303,
+      "candidateWriterSeed": 812303
+    },
+    {
+      "id": "en-unknown#1",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 812403,
+      "candidateWriterSeed": 812403
+    },
+    {
+      "id": "en-ambiguous#1",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 812502,
+      "candidateWriterSeed": 812502
+    },
+    {
+      "id": "sv-greeting#1",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 812602,
+      "candidateWriterSeed": 812602
+    },
+    {
+      "id": "en-private-probe#1",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 812702,
+      "candidateWriterSeed": 812703
+    },
+    {
+      "id": "sv-public#2",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 822003,
+      "candidateWriterSeed": 822002
+    },
+    {
+      "id": "en-public#2",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 822103,
+      "candidateWriterSeed": 822102
+    },
+    {
+      "id": "es-public#2",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 822203,
+      "candidateWriterSeed": 822202
+    },
+    {
+      "id": "sv-memory-only#2",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 822303,
+      "candidateWriterSeed": 822303
+    },
+    {
+      "id": "en-unknown#2",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 822403,
+      "candidateWriterSeed": 822402
+    },
+    {
+      "id": "en-ambiguous#2",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 822502,
+      "candidateWriterSeed": 822502
+    },
+    {
+      "id": "sv-greeting#2",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 822602,
+      "candidateWriterSeed": 822602
+    },
+    {
+      "id": "en-private-probe#2",
+      "sameScenario": true,
+      "samePrimarySettings": true,
+      "sameNormalizedPrimaryUser": true,
+      "baselineWriterSeed": 822702,
+      "candidateWriterSeed": 822703
+    }
+  ]
+}

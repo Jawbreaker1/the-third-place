@@ -1,0 +1,81 @@
+--- /private/tmp/third-place-dm-evidence-baseline-ZFHKuc/lmStudio.ts	2026-10-13 14:45:41
++++ server/lmStudio.ts	2026-10-13 15:41:57
+@@ -1837,7 +1837,7 @@
+   Object.values(request.publicParticipantNotes ?? {}).some((note) => note.trim().length > 0) ||
+   Object.keys(request.relationshipStylePlans ?? {}).length > 0;
+ 
+-const boundedPublicParticipantNotes = (request: SceneRequest): Record<string, string> =>
++const boundedPublicParticipantNotes = (request: Pick<SceneRequest, "selected" | "publicParticipantNotes">): Record<string, string> =>
+   Object.fromEntries(request.selected.flatMap((persona) => {
+     const note = request.publicParticipantNotes?.[persona.id]?.trim().slice(0, 2_600);
+     return note ? [[persona.id, note]] : [];
+@@ -1862,6 +1862,16 @@
+     })),
+     provenance: recall.provenance.slice(-8),
+   };
++};
++
++/** Availability only: relevance and claim entailment remain reviewer decisions. */
++export const hasIndependentDmEvidence = (
++  request: Pick<SceneRequest, "kind" | "selected" | "publicParticipantNotes" | "roomRecall">,
++): boolean => {
++  if (request.kind !== "dm" || request.selected.length === 0) return false;
++  if (Object.keys(boundedPublicParticipantNotes(request)).length > 0) return true;
++  const recall = boundedRoomRecallEvidence(request.roomRecall);
++  return Boolean(recall?.sourceChannel?.id.trim() && recall.transcript.some((row) => row.content.trim()));
+ };
+ 
+ const actorSubsetTemporalPolicy = (
+@@ -1958,7 +1968,9 @@
+     mustReplyIds: [owner.id],
+     responseRecoveryIds: [],
+     requestOwnerIds: [owner.id],
+-    roomRecall: undefined,
++    // Reclassifying an external packet cannot erase a DM's independent public
++    // transcript while leaving only its weaker public-memory summary behind.
++    roomRecall: hasIndependentDmEvidence(scoped) ? scoped.roomRecall : undefined,
+     visualEvidence: [],
+     research: undefined,
+     autonomousResearchContext: undefined,
+@@ -6560,7 +6572,9 @@
+         const recovery = request.requestDeliveryRecovery?.[id];
+         return recovery ? [[id, { resolvedOutcome: recovery.resolvedOutcome.slice(0, 220) }]] : [];
+       })),
+-      relationshipNotes: request.relationshipNotes ?? {},
++      relationshipNotes: request.kind === "dm"
++        ? actorSubsetRecord(request.relationshipNotes, request.selected.map((persona) => persona.id)) ?? {}
++        : request.relationshipNotes ?? {},
+       ...(Object.keys(boundedPublicParticipantNotes(request)).length ? {
+         publicParticipantNotes: boundedPublicParticipantNotes(request),
+       } : {}),
+--- /private/tmp/third-place-dm-evidence-baseline-ZFHKuc/director.ts	2026-10-13 14:45:41
++++ server/director.ts	2026-10-13 15:05:37
+@@ -32,6 +32,7 @@
+ import {
+   BackgroundWorkPreemptedError,
+   actorSubsetSceneRequest,
++  hasIndependentDmEvidence,
+   diegeticIdentityTurnPremise,
+   isBackgroundWorkPreemptedError,
+   textActorModelWorkScope,
+@@ -91,6 +92,7 @@
+ import { MAX_PERSISTED_CHAT_MESSAGE_CHARACTERS } from "../shared/messageLimits.js";
+ import { recallChannelHistory } from "./channelRecall.js";
+ import { recallWitnessedPublicConversation } from "./dmPublicContext.js";
++import { scopeDmCapabilityScene } from "./dmEvidenceScope.js";
+ import {
+   DmTurnCoordinator,
+   type DmTurn,
+@@ -4514,9 +4516,12 @@
+     const resolution = invocation
+       ? await this.capabilityRegistry.execute(invocation, human.id)
+       : undefined;
+-    const capabilityScene = invocation && resolution
++    const rawCapabilityScene = invocation && resolution
+       ? this.capabilityRegistry.sceneContract(invocation, resolution, { actorName: persona.name })
+       : undefined;
++    const capabilityScene = rawCapabilityScene && hasIndependentDmEvidence({
++      kind: "dm", selected: [persona], roomRecall, publicParticipantNotes,
++    }) ? scopeDmCapabilityScene(rawCapabilityScene) : rawCapabilityScene;
+     const research = capabilityScene?.research;
+     if (!turn.isCurrent() || !publicSubjectsCurrent() || !memoryProjectionIsCurrent()) return undefined;

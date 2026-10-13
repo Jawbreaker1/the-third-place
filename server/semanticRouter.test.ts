@@ -335,6 +335,7 @@ describe("multilingual semantic router contract", () => {
 
   it("builds strict dynamic persona, URL-reference and capability enums", () => {
     const routedInput = input({
+      historyRecallAvailable: true,
       humanCandidates: [
         { id: "human-kat", displayLabel: "Κατερίνα" },
         { id: "human-noor", displayLabel: "نور" },
@@ -641,6 +642,37 @@ describe("multilingual semantic router contract", () => {
       ],
     });
     expect(buildTurnAnalysisSystemPrompt()).toContain("clearly refers in the third person");
+  });
+
+  it.each(["public", "dm"] as const)("keeps catalog identity resolution independent of unavailable history and active speaker identity in %s", (medium) => {
+    const routedInput = input({
+      medium,
+      latestMessage: { id: "third-person-question", authorId: "human-1", authorName: "Hana", content: "¿Qué te parece Noor?" },
+      humanCandidates: [{ id: "human-noor", displayLabel: "Noor" }],
+      currentParticipantCandidates: [{ id: "human-1", displayLabel: "Hana", kind: "human", publicBio: null, recentMessageIds: ["third-person-question"] }],
+      historyRecallAvailable: false,
+    });
+    const output = compactWeatherOutput({
+      p: { a: ["ai-mira"], r: ["ai-mira"], v: ["ai-mira"], x: 0.99, y: 0.99, h: ["human-noor"], z: 0.97 },
+      f: { r: "none", p: [], m: [], x: 0.99 },
+      h: { n: "none", q: null, x: 1 },
+    });
+    const parsed = parseTurnAnalysisContent(JSON.stringify(output), routedInput);
+    expect(parsed).toBeDefined();
+    expect(projectTrustedTurnAnalysis(parsed, ["human-noor"], ["human-1"], ["third-person-question"], routedInput.currentParticipantCandidates))
+      .toMatchObject({ referencedHumanIds: ["human-noor"], currentParticipantResolution: "none", referencedParticipantIds: [], historyRecallTrusted: false });
+    expect(projectTrustedTurnAnalysis(parseTurnAnalysisContent(JSON.stringify({ ...output, p: { ...output.p, z: 0.89 } }), routedInput), ["human-noor"]).referencedHumanIds)
+      .toEqual([]);
+    expect(parseTurnAnalysisContent(JSON.stringify({ ...output, p: { ...output.p, h: ["not-in-catalog"] } }), routedInput)).toBeUndefined();
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...output,
+      f: { r: "history_needed", p: ["human-1"], m: [], x: 0.99 },
+      h: { n: "helpful", q: "Noor", x: 0.99 },
+    }), routedInput)).toBeUndefined();
+    const prompt = buildTurnAnalysisSystemPrompt();
+    expect(prompt).toContain("identity resolution is independent of active focus f and history recall h");
+    expect(prompt).toContain("Never substitute the current speaker's or resident's ID in f.p");
+    expect(prompt).toContain("Use history_needed only when historyRecallAvailable is true");
   });
 
   it("binds a current external participant to stable identity and exact active message anchors", () => {
@@ -1492,6 +1524,156 @@ describe("multilingual semantic router contract", () => {
       historyRecall: { need: "none", query: null },
     });
     expect(buildTurnAnalysisSystemPrompt()).toContain("A name, repeated word, quotation or ordinary follow-up alone is not a recall request");
+  });
+
+  it.each(["public", "dm", "voice"] as const)("excludes unavailable history actions from the generated %s response schema without removing catalog identity resolution", (medium) => {
+    const routedInput = input({
+      medium, availableCapabilities: ["local_datetime"], historyRecallAvailable: false,
+      humanCandidates: medium === "voice" ? [] : [{ id: "human-noor", displayLabel: "Noor" }],
+    });
+    const properties = (buildTurnAnalysisResponseFormat(routedInput) as any).json_schema.schema.properties;
+    expect(properties.h.properties.n).toEqual({ type: "string", enum: ["none"] });
+    expect(properties.h.properties.q).toEqual({ type: "null" });
+    if (medium === "voice") {
+      expect(properties.f).toBeUndefined();
+    } else {
+      expect(properties.f.anyOf.map((variant: any) => variant.properties.r.enum[0])).toEqual(["none", "current_context", "ambiguous"]);
+      expect(properties.p.properties.h.items.enum).toEqual(["human-noor"]);
+    }
+  });
+
+  it("keeps the enabled history response contract and fails closed when normalized input omits availability", () => {
+    const enabled = (buildTurnAnalysisResponseFormat(input({
+      historyRecallAvailable: true,
+      currentParticipantCandidates: [{ id: "human-1", displayLabel: "Hana", kind: "human", publicBio: null, recentMessageIds: ["message-1"] }],
+    })) as any).json_schema.schema.properties;
+    expect(enabled.h.properties.n.enum).toEqual(["none", "helpful", "required"]);
+    expect(enabled.h.properties.q).toEqual({ anyOf: [{ type: "string", minLength: 1, maxLength: 160 }, { type: "null" }] });
+    expect(enabled.f.anyOf.map((variant: any) => variant.properties.r.enum[0])).toEqual(["none", "current_context", "history_needed", "ambiguous"]);
+    const defaultInput = input();
+    expect(defaultInput.historyRecallAvailable).toBe(false);
+    const defaults = (buildTurnAnalysisResponseFormat(defaultInput) as any).json_schema.schema.properties;
+    expect(defaults.h.properties.n.enum).toEqual(["none"]);
+    expect(defaults.h.properties.q.type).toBe("null");
+    expect(defaults.f.anyOf.map((variant: any) => variant.properties.r.enum[0])).not.toContain("history_needed");
+  });
+
+  it("generates only coherent focus shapes while retaining local identity-to-anchor validation", () => {
+    const routedInput = input({
+      historyRecallAvailable: true,
+      currentParticipantCandidates: [{ id: "human-1", displayLabel: "Hana", kind: "human", publicBio: null, recentMessageIds: ["message-1"] }],
+      recentMessages: [{ id: "other-message", authorId: "human-other", authorName: "Lea", content: "hello" }],
+    });
+    const variants = (buildTurnAnalysisResponseFormat(routedInput) as any).json_schema.schema.properties.f.anyOf;
+    expect(variants).toHaveLength(4);
+    const byKind = Object.fromEntries(variants.map((variant: any) => [variant.properties.r.enum[0], variant]));
+    for (const variant of variants) {
+      expect(variant.type).toBe("object");
+      expect(variant.additionalProperties).toBe(false);
+      expect(variant.required).toEqual(["r", "p", "m", "x"]);
+      expect(variant.properties.r.enum).toHaveLength(1);
+    }
+    expect(byKind.none.properties.p.maxItems).toBe(0);
+    expect(byKind.none.properties.m.maxItems).toBe(0);
+    expect(byKind.ambiguous.properties.p.maxItems).toBe(0);
+    expect(byKind.ambiguous.properties.m.minItems).toBe(1);
+    expect(byKind.current_context.properties.m.minItems).toBe(1);
+    expect(byKind.current_context.properties.p.minItems).toBe(0);
+    expect(byKind.history_needed.properties.p.minItems).toBe(1);
+    expect(byKind.history_needed.properties.m.minItems).toBe(1);
+    expect(byKind.history_needed.properties.p.items.enum).toEqual(["human-1"]);
+    expect(byKind.history_needed.properties.m.items.enum).toEqual(["message-1", "other-message"]);
+    const wrongAnchor = compactWeatherOutput({
+      f: { r: "current_context", p: ["human-1"], m: ["other-message"], x: 0.99 },
+    });
+    // Existing local normalization preserves valid turn fields but removes
+    // this ungrounded binding rather than trusting a structurally valid ID.
+    const parsed = parseTurnAnalysisContent(JSON.stringify(wrongAnchor), routedInput);
+    expect(projectTrustedTurnAnalysis(parsed, [], ["human-1"], ["message-1", "other-message"], routedInput.currentParticipantCandidates).referencedParticipantIds).toEqual([]);
+    const unavailableCoupling = compactWeatherOutput({
+      f: { r: "history_needed", p: ["human-1"], m: ["message-1"], x: 0.99 },
+      h: { n: "none", q: null, x: 1 },
+    });
+    expect(parseTurnAnalysisContent(JSON.stringify(unavailableCoupling), routedInput)).toBeUndefined();
+  });
+
+  it("omits focus variants that cannot have required anchors or identified participants", () => {
+    const noAnchors = input({
+      latestMessage: { authorId: "human-1", authorName: "Hana", content: "Hello" },
+      historyRecallAvailable: true,
+    });
+    const kinds = (turn: NormalizedTurnAnalysisInput) => (buildTurnAnalysisResponseFormat(turn) as any)
+      .json_schema.schema.properties.f.anyOf.map((variant: any) => variant.properties.r.enum[0]);
+    expect(kinds(noAnchors)).toEqual(["none"]);
+    expect(kinds(input({ historyRecallAvailable: true }))).toEqual(["none", "current_context", "ambiguous"]);
+  });
+
+  it("distinguishes missing local acquaintance context from external research in both routing passes", () => {
+    for (const prompt of [buildTurnAnalysisSystemPrompt(), buildEvidencePlanVerifierSystemPrompt()]) {
+      expect(prompt).toContain("Missing local context does not create a web-search task");
+      expect(prompt).toContain("a local-person reference alone neither requires nor forbids that research");
+    }
+    const properties = (buildTurnAnalysisResponseFormat(input()) as any).json_schema.schema.properties;
+    expect(properties.e.properties.a.enum).toContain("web_search");
+  });
+
+  it("declares bounded public-participant recall independently of room-history and external capabilities in both routing payloads", () => {
+    const turn = input({
+      medium: "dm", publicParticipantRecallAvailable: true, historyRecallAvailable: false,
+      humanCandidates: [{ id: "human-noor", displayLabel: "Noor" }],
+    });
+    expect(input().publicParticipantRecallAvailable).toBe(false);
+    expect(turnAnalysisInputSchema.safeParse({ ...turn, publicParticipantRecallAvailable: "true" }).success).toBe(false);
+    expect(buildTurnAnalysisUserData(turn)).toMatchObject({
+      publicParticipantRecallAvailable: true, historyRecallAvailable: false,
+      humanCandidates: [{ id: "human-noor", displayLabel: "Noor" }],
+    });
+    const verifier = createEvidencePlanVerifierInput(turn, createFailClosedTurnAnalysis("invalid_output"));
+    expect(buildEvidencePlanVerifierUserData(verifier)).toMatchObject({
+      turn: { publicParticipantRecallAvailable: true, historyRecallAvailable: false },
+    });
+    const properties = (buildTurnAnalysisResponseFormat(turn) as any).json_schema.schema.properties;
+    expect(properties.h.properties.n.enum).toEqual(["none"]);
+    expect(properties.h.properties.q.type).toBe("null");
+    expect(properties.p.properties.h.items.enum).toEqual(["human-noor"]);
+    expect(properties.e.properties.a.enum).toEqual(["none", ...turn.availableCapabilities]);
+    for (const prompt of [buildTurnAnalysisSystemPrompt(), buildEvidencePlanVerifierSystemPrompt()]) {
+      expect(prompt).toContain("publicParticipantRecallAvailable is true");
+      expect(prompt).toContain("This is retrieval capacity, not proof of any encounter or a guarantee of a match");
+      expect(prompt).toContain("does not enable the separate h/historyRecallAvailable route");
+      expect(prompt).toContain("a local-person reference alone neither requires nor forbids that research");
+    }
+  });
+
+  it("still accepts explicit external research about a known local person's public work when public recall is available", () => {
+    const turn = input({
+      medium: "dm", publicParticipantRecallAvailable: true, historyRecallAvailable: false,
+      latestMessage: {
+        id: "public-work-question", authorId: "human-1", authorName: "Hana",
+        content: "Noor said she works at Acme. Can you search for Acme's latest public product announcement?",
+      },
+      humanCandidates: [{ id: "human-noor", displayLabel: "Noor" }],
+    });
+    const output = compactWeatherOutput({
+      l: "en", rl: "en",
+      p: { a: ["ai-mira"], r: ["ai-mira"], v: ["ai-mira"], x: 0.99, y: 0.99, h: ["human-noor"], z: 0.99 },
+      f: { r: "none", p: [], m: [], x: 0.99 },
+      e: { a: "web_search", x: 0.99, g: "Acme's latest public product announcement", q: "Acme latest product announcement", u: null, m: "news", z: null, k: null, l: null },
+      c: { d: ["web_search"], r: "execute", a: false, i: false, l: false, x: 0.99 },
+      h: { n: "none", q: null, x: 1 },
+    });
+    const parsed = parseTurnAnalysisContent(JSON.stringify(output), turn);
+    expect(parsed).toMatchObject({
+      referencedHumanIds: ["human-noor"],
+      evidence: { action: "web_search", query: "Acme latest product announcement", searchMode: "news" },
+      capabilities: { discussed: ["web_search"], requestKind: "execute" },
+    });
+    expect(projectTrustedTurnAnalysis(parsed, ["human-noor"]))
+      .toMatchObject({ referencedHumanIds: ["human-noor"], historyRecallTrusted: false });
+    // The availability flag does not salvage an incoherent evidence/action pair.
+    expect(parseTurnAnalysisContent(JSON.stringify({
+      ...output, c: { ...output.c, d: [], r: "none" },
+    }), turn)).toBeUndefined();
   });
 
   it("canonicalizes harmless model casing and aliases instead of dropping the whole turn", () => {
@@ -3300,6 +3482,24 @@ describe("semantic progress across the committed exchange", () => {
 });
 
 describe("candidate review transcript participant kinds", () => {
+  it("projects external-agent kinds in ambient background without changing internal identities", () => {
+    const conversation = buildConversationContext({
+      phase: "opening", messages: [],
+      backgroundMessages: [{
+        messageId: "agent-background", authorId: "agent-owner-scout", author: "Owner's Scout",
+        kind: "agent", content: "I would try a smaller comparison first.", createdAt: "2026-07-14T11:59:55.000Z",
+      }],
+    });
+    const parsed = candidateReviewInputSchema.parse({ ...reviewInput(), conversationContext: conversation });
+    const modelData = buildCandidateReviewUserData(parsed) as {
+      conversationContext: { roomBackground: Array<{ kind: string; authorId: string; messageId: string }> };
+    };
+    expect(modelData.conversationContext.roomBackground[0]).toMatchObject({
+      kind: "participant", authorId: "agent-owner-scout", messageId: "agent-background",
+    });
+    expect(parsed.conversationContext?.roomBackground?.[0].kind).toBe("agent");
+  });
+
   it("accepts an owner-operated external agent in recent and recalled room history", () => {
     const base = reviewInput();
     const externalAgentRow = {

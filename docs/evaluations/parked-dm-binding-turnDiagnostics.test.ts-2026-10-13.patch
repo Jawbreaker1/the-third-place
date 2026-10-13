@@ -1,0 +1,22 @@
+diff --git a/server/turnDiagnostics.test.ts b/server/turnDiagnostics.test.ts
+index e4f61ff..3934aa6 100644
+--- a/server/turnDiagnostics.test.ts
++++ b/server/turnDiagnostics.test.ts
+@@ -58,6 +58,17 @@ describe("privacy-bounded interactive turn diagnostics", () => {
+     expect(output).toEqual([]);
+   });
+ 
++  it("logs DM binding status without subject IDs, alternatives or quoted evidence", () => {
++    const output: string[] = [];
++    recordTurnDiagnostic({ ...context, kind: "dm" }, {
++      stage: "person_binding", outcome: "completed", personBindingStatus: "ambiguous", selectedCount: 0,
++      subjects: ["secret-person-id"], alternatives: ["another-private-id"], mentionExcerpt: "private text",
++    } as TurnDiagnosticEvent, (line) => output.push(line));
++    expect(JSON.parse(output[0]!)).toMatchObject({ stage: "person_binding", personBindingStatus: "ambiguous", selectedCount: 0 });
++    expect(output[0]).not.toContain("secret-person");
++    expect(output[0]).not.toContain("private");
++  });
++
+   it("never throws back into model routing or publication when a sink fails", () => {
+     expect(() => recordTurnDiagnostic(context, { stage: "turn", outcome: "started" }, () => {
+       throw new Error("unavailable log sink");

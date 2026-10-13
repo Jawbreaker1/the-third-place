@@ -54,6 +54,7 @@ const setup = (options: {
   now?: () => number;
   rng?: () => number;
   coordinator?: {
+    erasureRevision?: number;
     enqueueDeliveredEpisode: ReturnType<typeof vi.fn>;
     promptNote: ReturnType<typeof vi.fn>;
     publicThirdPartyPromptNote?: ReturnType<typeof vi.fn>;
@@ -101,6 +102,7 @@ const setup = (options: {
       now: options.now,
       rng: options.rng ?? (() => 0.5),
       socialMemory: {
+        get erasureRevision() { return options.coordinator?.erasureRevision ?? 0; },
         enqueueDeliveredEpisode,
         promptNote,
         publicThirdPartyPromptNote,
@@ -229,6 +231,94 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       vi.clearAllTimers();
       vi.useRealTimers();
     }
+  });
+
+  it.each(["retirement", "memory reset"])("fences an absent subject's copied public note after %s without cancelling another subject's reply", async (change) => {
+    vi.useFakeTimers();
+    try {
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const otherHuman = { ...human, id: "other-asker", name: "Other Asker" };
+      type Line = { personaId: string; content: string; source: "lm"; sourceIds: string[] };
+      const pending = new Map<string, { scene: any; resolve: (lines: Line[]) => void }>();
+      const { director, store } = setup({
+        model: {
+          analyzeTurn: vi.fn(async (input) => ({
+            ...analyzedTurn(),
+            personas: { addressedIds: [mira.id], requestedReplyIds: [mira.id], relevantIds: [mira.id], addressConfidence: 0.99, relevanceConfidence: 0.99 },
+            referencedHumanIds: [input.latestMessage.authorId === human.id ? "subject-erased" : "subject-retained"],
+            referencedHumanConfidence: 0.99,
+          })),
+          generateScene: vi.fn((scene) => scene.conversationContext ? Promise.resolve([]) : new Promise<Line[]>((resolve) => {
+            pending.set(scene.trigger.author, { scene, resolve });
+          })),
+        },
+        humanMemory: { listProfiles: vi.fn(() => [
+          knownHumanProfile("subject-erased", "Erased", 1_000),
+          knownHumanProfile("subject-retained", "Retained", 1_000),
+        ]) },
+        coordinator: {
+          enqueueDeliveredEpisode: vi.fn(async () => ({})), promptNote: vi.fn(() => undefined),
+          publicThirdPartyPromptNote: vi.fn((owner, subject) => owner === mira.id ? `PUBLIC NOTE ${subject}` : undefined),
+        },
+      });
+      const first = createMessage("lobby", human.id, "@Mira do you remember Erased?");
+      const second = createMessage("lobby", otherHuman.id, "@Mira do you remember Retained?");
+      store.addPublicMessage(first); store.addPublicMessage(second);
+      const handle = (message: typeof first, actor: typeof human) => (director as unknown as {
+        handleHumanBurst: (messages: typeof first[], member: typeof human) => Promise<void>;
+      }).handleHumanBurst([message], actor);
+      const firstWork = handle(first, human), secondWork = handle(second, otherHuman);
+      await vi.waitFor(() => expect(pending.size).toBe(2));
+      expect(pending.get(human.name)!.scene.relationshipNotes[mira.id]).toContain("subject-erased");
+      if (change === "memory reset") director.resetHumanMemoryWork("subject-erased");
+      else director.invalidatePublicWorkForHumanActor("subject-erased");
+      for (const [author, work] of pending) work.resolve([{
+        personaId: mira.id, content: `Reply for ${author}`, source: "lm", sourceIds: [],
+      }]);
+      await vi.runAllTimersAsync(); await Promise.all([firstWork, secondWork]);
+      expect(store.getRecent("lobby", 20).filter((message) => message.authorId === mira.id)).toEqual([
+        expect.objectContaining({ content: `Reply for ${otherHuman.name}`, replyToId: second.id }),
+      ]);
+      director.stop();
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it.each([true, false])("checks destructive erasure revision only for memory-bearing public replies (memory: %s)", async (withMemory) => {
+    vi.useFakeTimers();
+    try {
+      const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+      const coordinator = {
+        erasureRevision: 0,
+        enqueueDeliveredEpisode: vi.fn(async () => ({})),
+        promptNote: vi.fn(() => undefined),
+        publicThirdPartyPromptNote: vi.fn((owner, subject) => withMemory && owner === mira.id && subject === "subject-b"
+          ? "B's public memory also involves source actor C." : undefined),
+      };
+      const generateScene = vi.fn(async (scene) => {
+        if (scene.conversationContext) return [];
+        // The coordinator advances this value when erasing any source actor,
+        // including C, whose dependency is not the selected subject B.
+        coordinator.erasureRevision += 1;
+        return [{ personaId: mira.id, content: "A reviewed reply.", source: "lm" as const, sourceIds: [] }];
+      });
+      const { director, store } = setup({
+        model: { generateScene, analyzeTurn: vi.fn(async () => ({
+          ...analyzedTurn(),
+          personas: { addressedIds: [mira.id], requestedReplyIds: [mira.id], relevantIds: [mira.id], addressConfidence: 0.99, relevanceConfidence: 0.99 },
+          referencedHumanIds: withMemory ? ["subject-b"] : [], referencedHumanConfidence: 0.99,
+        })) },
+        humanMemory: { listProfiles: vi.fn(() => [knownHumanProfile("subject-b", "Subject B", 1_000)]) },
+        coordinator,
+      });
+      const incoming = createMessage("lobby", human.id, "@Mira hello again");
+      store.addPublicMessage(incoming);
+      const work = (director as unknown as { handleHumanBurst: (messages: typeof incoming[], actor: typeof human) => Promise<void> })
+        .handleHumanBurst([incoming], human);
+      await vi.runAllTimersAsync(); await work;
+      expect(generateScene).toHaveBeenCalled();
+      expect(store.getRecent("lobby", 20).filter((message) => message.authorId === mira.id)).toHaveLength(withMemory ? 0 : 1);
+      director.stop();
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
   });
 
   it("captures selected silent readers and never includes a rejected response candidate", () => {
@@ -842,10 +932,10 @@ describe("SocialDirector persistent social-memory delivery gates", () => {
       },
     });
     const internals = director as unknown as {
-      offlineHumanCandidates: (speakerId: string) => Array<{ id: string; displayLabel: string }>;
+      humanReferenceCandidates: (speakerId: string) => Array<{ id: string; displayLabel: string }>;
     };
 
-    const candidates = internals.offlineHumanCandidates(human.id);
+    const candidates = internals.humanReferenceCandidates(human.id);
     expect(candidates).toHaveLength(32);
     expect(candidates[0]).toEqual({ id: unique.member.id, displayLabel: unique.member.name });
     expect(candidates.map((candidate) => candidate.id)).not.toEqual(expect.arrayContaining([

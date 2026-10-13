@@ -1,0 +1,92 @@
+--- /private/tmp/third-place-dm-binding-baseline-sFQPrt/lmStudio.ts	2026-10-13 13:42:11
++++ server/lmStudio.ts	2026-10-13 14:07:29
+@@ -1,5 +1,9 @@
+ import { createHash } from "node:crypto";
+ import { recordTurnDiagnostic } from "./turnDiagnostics.js";
++import {
++  buildDmPersonBindingPrompt, dmPersonBindingJsonSchema, normalizeDmPersonBindingInput,
++  parseDmPersonBinding, type DmPersonBindingInput, type DmPersonBindingResult,
++} from "./dmPersonBinding.js";
+ import { z } from "zod";
+ import {
+   CONVERSATION_RESEARCH_PROMPT,
+@@ -879,6 +883,7 @@
+   request: SceneRequest;
+   /** Public-only optional lookup decision; uses the same preemptible background lane. */
+   researchDecision?: ConversationResearchDecisionJob;
++  dmPersonBinding?: { input: DmPersonBindingInput; result?: DmPersonBindingResult };
+   continuationOf?: ModelWorkScope;
+   /** Protected delivery may wait behind newer work, but unrelated admission/preemption cannot drop it. */
+   durableDelivery: boolean;
+@@ -3533,6 +3538,44 @@
+     return this.enqueueScene(request, priority, signal, execution);
+   }
+ 
++  /** Narrow DM reference binding; uses the shared live queue, never a second provider lane. */
++  async bindDmPersons(
++    input: DmPersonBindingInput,
++    execution: { channelId: string; signal?: AbortSignal },
++  ): Promise<DmPersonBindingResult | undefined> {
++    const normalized = normalizeDmPersonBindingInput(input);
++    if (!normalized) return undefined;
++    const job: NonNullable<SceneQueueItem["dmPersonBinding"]> = { input: normalized };
++    const deadline = AbortSignal.timeout(12_000);
++    const signal = execution.signal ? AbortSignal.any([execution.signal, deadline]) : deadline;
++    try {
++      await this.enqueueScene({
++        kind: "dm", channelId: execution.channelId, channelName: "private person reference",
++        selected: [], history: [],
++        trigger: { authorId: normalized.speakerId, author: "", content: "", messageId: normalized.latestMessage.id },
++      }, 1, signal, {}, undefined, job);
++      return signal.aborted ? undefined : job.result;
++    } catch {
++      return undefined;
++    }
++  }
++
++  private async performDmPersonBinding(input: DmPersonBindingInput, signal: AbortSignal): Promise<DmPersonBindingResult | undefined> {
++    if (signal.aborted) return undefined;
++    const model = await this.resolveModel(signal);
++    if (!model || signal.aborted) return undefined;
++    const prompt = buildDmPersonBindingPrompt(input);
++    const raw = await this.complete({
++      model,
++      messages: [{ role: "system", content: prompt.system }, { role: "user", content: JSON.stringify(prompt.user) }],
++      temperature: 0, top_p: 1, reasoning_effort: "none", max_tokens: 550, stream: false,
++      response_format: dmPersonBindingJsonSchema(input),
++    }, signal);
++    const completion = completionSchema.safeParse(raw);
++    const content = completion.success ? completion.data.choices[0]?.message.content : undefined;
++    return content && !signal.aborted ? parseDmPersonBinding(content, input) : undefined;
++  }
++
+   async planConversationResearch(
+     input: ConversationResearchInput,
+     signal?: AbortSignal,
+@@ -3555,6 +3598,7 @@
+     signal: AbortSignal | undefined,
+     execution: SceneGenerationExecutionOptions,
+     researchDecision?: ConversationResearchDecisionJob,
++    dmPersonBinding?: SceneQueueItem["dmPersonBinding"],
+   ): Promise<GeneratedLine[]> {
+     if (!this.enabled) {
+       recordTurnDiagnostic(request, { stage: "queue", outcome: "unavailable" });
+@@ -3650,6 +3694,7 @@
+         enqueuedAt: performance.now(),
+         request,
+         researchDecision,
++        dmPersonBinding,
+         continuationOf,
+         durableDelivery: Boolean(execution.durableDelivery && request.kind === "public"),
+         supersessionProtected: Boolean(
+@@ -3803,7 +3848,9 @@
+           }));
+         }
+         let result: GeneratedLine[] = [];
+-        if (item.researchDecision) {
++        if (item.dmPersonBinding) {
++          item.dmPersonBinding.result = await this.performDmPersonBinding(item.dmPersonBinding.input, abort.signal);
++        } else if (item.researchDecision) {
+           item.researchDecision.result = await this.performConversationResearchDecision(
+             item.researchDecision.input, abort.signal,
+           );

@@ -1,0 +1,55 @@
+{
+  "algorithm": "sha256",
+  "baselineCommit": "da7edee",
+  "manifestSha256": "a3df7bcf6cdcb3f926203859c1f904537f1d2efd8a75c819c1a4018623515872",
+  "variants": [
+    {
+      "label": "baseline-da7edee",
+      "runtimeRoot": "/private/tmp/third-place-baseline-da7edee-X0Fo3Z/dist-server",
+      "modules": {
+        "conversationFlow": "3002236905d074943462cce6324a24fd9f46f4efdd522178a33e5a10cc9eefec",
+        "personaStyle": "44f09852e6933525f12bfa6832b7514ce569f4c9246afcb756e1c1a29f16a473",
+        "lmStudio": "493c9e16298e38c642165a40a2decfad8b00d77c86a75f64efb3892cc5a4dbb1",
+        "semanticRouter": "2f469e50e5818cd26737969c2364b5ed6128b77b1cf74a8597c864f5f68cc9c0",
+        "director": "abcc638fc07dd4e16ab4af1c0e9dcc3bd3605b4725c0b3144244a2dfa27db897",
+        "conversationResearch": "a9357f55f9ba13d8ab12f669196b76baa44db0388954ce5e6b2a018137c632c9"
+      }
+    },
+    {
+      "label": "candidate-v1",
+      "runtimeRoot": "/private/tmp/third-place-candidate-continuity-Vq6JP4",
+      "modules": {
+        "conversationFlow": "74c602f6b74c09e03bbfcfcb5896a6fe425cf5aaec70b4adf79ac11751006f94",
+        "personaStyle": "22aec3f15431301e5f750f9143869f5f739b1b3a9739ef4d00f970bd56ba96b6",
+        "lmStudio": "e607c0e82b59c52a660f274863338db784b47dc520eae5cf3cd22e1e4d5be9fa",
+        "semanticRouter": "2f469e50e5818cd26737969c2364b5ed6128b77b1cf74a8597c864f5f68cc9c0",
+        "director": "4074087830248c512d3f9ae852e4821f5a29696e79ff54c43aa05617d034be9d",
+        "conversationResearch": "a9357f55f9ba13d8ab12f669196b76baa44db0388954ce5e6b2a018137c632c9"
+      }
+    },
+    {
+      "label": "candidate-v2",
+      "runtimeRoot": "/private/tmp/third-place-candidate-v2-nrE9bA",
+      "modules": {
+        "conversationFlow": "1564f324d28adb6aa290fbae529df11b5dd2cc3028ff6a40b453057bd9e5e3bb",
+        "personaStyle": "22aec3f15431301e5f750f9143869f5f739b1b3a9739ef4d00f970bd56ba96b6",
+        "lmStudio": "4b11b2a75ce7ba9e2c8418fdc94e8ebb289212b8fc002eb7e0108cf8638a6be1",
+        "semanticRouter": "5961c9515ed98804313f616f5e7bd42977eb6aff3e5b6a085eb28c8bf6b9d795",
+        "director": "86a17e12f72f5b8fe23f100fade8303f222b059edddc76d743f9827d3c70adc1",
+        "conversationResearch": "b55d8a1232de74c6c421f918e059abc7494f4ef841fedc1d74d67ac477073f1a"
+      }
+    },
+    {
+      "label": "candidate-v3",
+      "runtimeRoot": "/private/tmp/third-place-candidate-v3-iuT54o",
+      "modules": {
+        "conversationFlow": "fed5c3e06c685232b1111b6698842529837f6753a93b1519c61e4db06cd2996a",
+        "personaStyle": "22aec3f15431301e5f750f9143869f5f739b1b3a9739ef4d00f970bd56ba96b6",
+        "lmStudio": "1bec4f4d318742905942ddbc66b0f705a0af9131cd8ae5e8f674548b42ee2173",
+        "semanticRouter": "5961c9515ed98804313f616f5e7bd42977eb6aff3e5b6a085eb28c8bf6b9d795",
+        "director": "86a17e12f72f5b8fe23f100fade8303f222b059edddc76d743f9827d3c70adc1",
+        "conversationResearch": "b55d8a1232de74c6c421f918e059abc7494f4ef841fedc1d74d67ac477073f1a"
+      }
+    }
+  ]
+}

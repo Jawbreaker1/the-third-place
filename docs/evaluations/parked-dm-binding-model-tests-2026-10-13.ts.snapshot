@@ -1,0 +1,173 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { LmStudioClient } from "./lmStudio.js";
+import { normalizeDmPersonBindingInput, type DmPersonBindingInput } from "./dmPersonBinding.js";
+import type { ModelBackend } from "./modelBackend.js";
+import { PERSONAS } from "./personas.js";
+
+const clients: LmStudioClient[] = [];
+beforeEach(() => vi.stubEnv("AI_ENABLED", "true"));
+afterEach(async () => {
+  for (const client of clients.splice(0)) client.cancelPending("person-binding test complete");
+  await Promise.resolve();
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
+const input = (): DmPersonBindingInput => ({
+  speakerId: "asker", residentId: "ai-mira",
+  latestMessage: { id: "latest", authorId: "asker", content: "What do you think of Noor?" },
+  recentMessages: [{ id: "earlier", authorId: "ai-mira", content: "What would you like to talk about?" }],
+  publicHumanCandidates: [{ id: "person-noor", displayLabel: "Noor" }],
+});
+const single = {
+  status: "single", confidence: 0.96, alternatives: [],
+  subjects: [{ personId: "person-noor", sourceMessageId: "latest", mentionExcerpt: "Noor", latestTurnExcerpt: "Noor" }],
+};
+const completion = (value: unknown) => ({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(value) } }] });
+const makeClient = (complete: ModelBackend["complete"]) => {
+  const probe = vi.fn(async () => ({ connected: true, id: "test-model", label: "test model" }));
+  const backend: ModelBackend = { providerId: "lmstudio", configuredModel: "test-model", probe, complete };
+  const client = new LmStudioClient({ backend, maxConcurrentPredictions: 1, maxBackgroundPredictions: 1 });
+  clients.push(client);
+  return { client, probe };
+};
+const blockingBackend = () => {
+  const pending: Array<{ body: Record<string, unknown>; signal: AbortSignal; resolve: (value: unknown) => void }> = [];
+  const complete = vi.fn((body: Record<string, unknown>, signal: AbortSignal) => new Promise<unknown>((resolve, reject) => {
+    const abort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    const settle = (value: unknown) => { signal.removeEventListener("abort", abort); resolve(value); };
+    pending.push({ body, signal, resolve: settle });
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }));
+  return { complete, pending };
+};
+
+describe("LM Studio DM person binding", () => {
+  it("sends the narrow contract only and parses one bounded result without a scene or review call", async () => {
+    const complete = vi.fn(async () => completion(single));
+    const { client, probe } = makeClient(complete);
+    await expect(client.bindDmPersons(input(), { channelId: "dm:asker:ai-mira" })).resolves.toEqual(single);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(probe).not.toHaveBeenCalled();
+    const body = complete.mock.calls[0]![0] as Record<string, unknown>;
+    const messages = body.messages as Array<{ role: string; content: string }>;
+    expect(messages.map((message) => message.role)).toEqual(["system", "user"]);
+    expect(JSON.parse(messages[1]!.content)).toEqual(normalizeDmPersonBindingInput(input()));
+    expect(body).toMatchObject({
+      temperature: 0, reasoning_effort: "none", max_tokens: 550,
+      response_format: { type: "json_schema", json_schema: { name: "dm_person_binding_v1", strict: true } },
+    });
+    await vi.waitFor(() => expect(client.health()).toMatchObject({ activePredictions: 0, queueDepth: 0 }));
+  });
+
+  it("rejects extra private context and other-thread rows before any provider call", async () => {
+    const complete = vi.fn(async () => completion(single));
+    const { client, probe } = makeClient(complete);
+    const clean = input();
+    for (const dirty of [
+      { ...clean, memories: ["OTHER_PRIVATE_MEMORY"] },
+      { ...clean, otherDmExists: true },
+      { ...clean, recentMessages: [{ id: "other-dm", authorId: "another-human", content: "OTHER_PRIVATE_DM" }] },
+      { ...clean, publicHumanCandidates: [{ id: "person-noor", displayLabel: "Noor", privateBio: "OTHER_PRIVATE_BIO" }] },
+    ]) await expect(client.bindDmPersons(dirty, { channelId: "dm:asker:ai-mira" })).resolves.toBeUndefined();
+    expect(complete).not.toHaveBeenCalled();
+    expect(probe).not.toHaveBeenCalled();
+    expect(client.health().queueDepth).toBe(0);
+  });
+
+  it.each([
+    { ...single, confidence: 0.5 },
+    { ...single, subjects: [{ ...single.subjects[0], personId: "absent" }] },
+    { ...single, subjects: [{ ...single.subjects[0], sourceMessageId: "other-private-dm" }] },
+    { ...single, tool: "web_search" },
+  ])("fails closed for invalid output without a second generation (%#)", async (value) => {
+    const complete = vi.fn(async () => completion(value));
+    const { client } = makeClient(complete);
+    await expect(client.bindDmPersons(input(), { channelId: "dm:asker:ai-mira" })).resolves.toBeUndefined();
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not send an already cancelled turn", async () => {
+    const complete = vi.fn(async () => completion(single));
+    const { client } = makeClient(complete);
+    const abort = new AbortController();
+    abort.abort(new Error("turn replaced"));
+    await expect(client.bindDmPersons(input(), { channelId: "dm:asker:ai-mira", signal: abort.signal })).resolves.toBeUndefined();
+    expect(complete).not.toHaveBeenCalled();
+    expect(client.health().queueDepth).toBe(0);
+  });
+
+  it("cancels an active binding and releases its shared queue slot", async () => {
+    const { complete, pending } = blockingBackend();
+    const { client } = makeClient(complete);
+    const abort = new AbortController();
+    const result = client.bindDmPersons(input(), { channelId: "dm:asker:ai-mira", signal: abort.signal });
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    abort.abort(new Error("new human message"));
+    await expect(result).resolves.toBeUndefined();
+    expect(pending[0]!.signal.aborted).toBe(true);
+    await vi.waitFor(() => expect(client.health()).toMatchObject({ activePredictions: 0, queueDepth: 0 }));
+  });
+
+  it("serializes with an ordinary foreground scene at a single configured provider slot", async () => {
+    const { complete, pending } = blockingBackend();
+    const { client } = makeClient(complete);
+    const scene = client.generateScene({
+      kind: "public", channelId: "lobby", channelName: "lobby", selected: [PERSONAS[0]!], history: [],
+    }, 1);
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    const binding = client.bindDmPersons(input(), { channelId: "dm:asker:ai-mira" });
+    expect(client.health()).toMatchObject({ activePredictions: 1, queueDepth: 2, maxConcurrentPredictions: 1 });
+    expect(complete).toHaveBeenCalledTimes(1);
+    pending[0]!.resolve(completion({ messages: [] }));
+    await expect(scene).resolves.toEqual([]);
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    expect(pending[1]!.body).toMatchObject({ response_format: { json_schema: { name: "dm_person_binding_v1" } } });
+    expect(client.health()).toMatchObject({ activePredictions: 1, queueDepth: 1 });
+    pending[1]!.resolve(completion(single));
+    await expect(binding).resolves.toEqual(single);
+    await vi.waitFor(() => expect(client.health().queueDepth).toBe(0));
+  });
+
+  it("cancels a queued binding without starting its provider call", async () => {
+    const { complete, pending } = blockingBackend();
+    const { client } = makeClient(complete);
+    const first = client.bindDmPersons(input(), { channelId: "dm:first" });
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    const abort = new AbortController();
+    const second = client.bindDmPersons(input(), { channelId: "dm:second", signal: abort.signal });
+    abort.abort(new Error("queued turn replaced"));
+    await expect(second).resolves.toBeUndefined();
+    expect(complete).toHaveBeenCalledTimes(1);
+    pending[0]!.resolve(completion(single));
+    await expect(first).resolves.toEqual(single);
+    await vi.waitFor(() => expect(client.health().queueDepth).toBe(0));
+  });
+
+  it("a provider error returns unavailable and releases the next queued binding", async () => {
+    const complete = vi.fn<ModelBackend["complete"]>()
+      .mockRejectedValueOnce(new Error("provider offline"))
+      .mockResolvedValueOnce(completion(single));
+    const { client } = makeClient(complete);
+    const first = client.bindDmPersons(input(), { channelId: "dm:first" });
+    const second = client.bindDmPersons(input(), { channelId: "dm:second" });
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toEqual(single);
+    expect(complete).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(client.health().queueDepth).toBe(0));
+  });
+
+  it("includes queue and provider work in the bounded binding deadline", async () => {
+    const timeout = new AbortController();
+    const spy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+    const { complete, pending } = blockingBackend();
+    const { client } = makeClient(complete);
+    const result = client.bindDmPersons(input(), { channelId: "dm:asker:ai-mira" });
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    expect(spy).toHaveBeenCalledWith(12_000);
+    timeout.abort(new DOMException("binding timeout", "TimeoutError"));
+    await expect(result).resolves.toBeUndefined();
+    expect(pending[0]!.signal.aborted).toBe(true);
+    await vi.waitFor(() => expect(client.health().queueDepth).toBe(0));
+  });
+});

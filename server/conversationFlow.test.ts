@@ -3,10 +3,14 @@ import {
   AUTONOMOUS_CONTINUATION_PREMISE,
   autonomousOpeningPremise,
   autonomousConversationWordCeiling,
+  buildAmbientConversationContext,
   buildConversationContext,
   conversationReplyTarget,
   eligibleConversationReplyTargets,
   MAX_CONVERSATION_CONTEXT_CHARACTERS,
+  MAX_CONVERSATION_BACKGROUND_CHARACTERS,
+  MAX_CONVERSATION_BACKGROUND_TURNS,
+  MAX_CONVERSATION_TURNS,
   sceneConversationContextSchema,
   type SceneConversationTurn,
 } from "./conversationFlow.js";
@@ -23,6 +27,10 @@ describe("resident-owned conversational focus", () => {
     expect(premise).toContain("choose your own small instance");
     expect(premise).toContain("Let others choose whether and how to join");
     expect(premise).toContain("There is no compulsory question, argument or lesson");
+    expect(premise).toContain("not an automatic reply to the room's last line");
+    expect(premise).toContain("neither declares the exchange finished nor assigns an unanswered question");
+    expect(premise).toContain("You may continue a concrete unresolved point");
+    expect(premise).toContain("not a command to change topics");
     expect(premise).toContain("Informal fragments are fine when they deliver a complete conversational act");
     expect(premise).toContain("Do not invent an offline event, precise external fact or unsupplied source");
   });
@@ -92,7 +100,165 @@ const row = (index: number, content = `Published contribution ${index}`): SceneC
   createdAt: new Date(Date.UTC(2026, 9, 11, 12, index)).toISOString(),
 });
 
+describe("ambient committed-exchange partition", () => {
+  it.each(["opening", "continuation"] as const)("retains a real initiating message during %s", (phase) => {
+    const messages = Array.from({ length: 5 }, (_, index) => row(index));
+    const context = buildAmbientConversationContext({ phase, rootMessageId: "message-2", messages });
+    expect(context).toEqual(buildConversationContext({
+      phase, rootMessageId: "message-2", messages: messages.slice(2), backgroundMessages: messages.slice(0, 2),
+    }));
+    expect(context.rootMessageId).toBe("message-2");
+    expect(context.latestMessageId).toBe("message-4");
+    expect(sceneConversationContextSchema.safeParse(context).success).toBe(true);
+  });
+
+  it("treats an uncommitted episode identifier as background-only opportunity, not a fake root", () => {
+    const messages = [row(0), row(1)];
+    const context = buildAmbientConversationContext({ phase: "opening", rootMessageId: "episode-id", messages });
+    expect(context).toEqual({ phase: "opening", publishedTurns: [], roomBackground: messages });
+    expect(buildAmbientConversationContext({ phase: "opening", messages })).toEqual(context);
+  });
+
+  it("preserves legacy continuation history when its actual root is no longer available", () => {
+    const messages = [row(0), row(1)];
+    const context = buildAmbientConversationContext({ phase: "continuation", rootMessageId: "missing-root", messages });
+    expect(context).toEqual(buildConversationContext({ phase: "continuation", messages }));
+    expect(context.publishedTurns).toEqual(messages);
+    expect(context.rootMessageId).toBeUndefined();
+    expect(context.roomBackground).toBeUndefined();
+  });
+});
+
 describe("committed conversation context", () => {
+  it("keeps recent background separate when no new exchange has been published", () => {
+    const background = Array.from({ length: 20 }, (_, index) => ({ ...row(index), authorId: `resident-${index}` }));
+    const context = buildConversationContext({ phase: "opening", messages: [], backgroundMessages: background });
+    expect(context.publishedTurns).toEqual([]);
+    expect(context.roomBackground).toEqual(background.slice(-MAX_CONVERSATION_BACKGROUND_TURNS));
+    expect(context.rootMessageId).toBeUndefined();
+    expect(context.latestMessageId).toBeUndefined();
+    expect(context.roomBackground).toHaveLength(12);
+    expect(conversationReplyTarget(context, "resident-new", "message-19")).toBe(context.roomBackground?.at(-1));
+    expect(conversationReplyTarget(context, "resident-19", "message-19")).toBeUndefined();
+    expect(sceneConversationContextSchema.safeParse(context).success).toBe(true);
+  });
+
+  it("retains the active root and real reply edges into earlier background", () => {
+    const earlier = { ...row(0), authorId: "resident-a" };
+    const opening = { ...row(1), authorId: "resident-b", replyToMessageId: earlier.messageId };
+    const latest = { ...row(2), authorId: "resident-a", replyToMessageId: opening.messageId };
+    const context = buildConversationContext({
+      phase: "continuation", rootMessageId: opening.messageId,
+      messages: [opening, latest], backgroundMessages: [earlier],
+    });
+    expect(context).toMatchObject({
+      rootMessageId: opening.messageId, latestMessageId: latest.messageId,
+      publishedTurns: [opening, latest], roomBackground: [earlier],
+    });
+    expect(eligibleConversationReplyTargets(context, "resident-b").map((turn) => turn.messageId))
+      .toEqual([earlier.messageId, latest.messageId]);
+    expect(sceneConversationContextSchema.safeParse(context).success).toBe(true);
+  });
+
+  it("prioritizes the latest contribution's exact background reply target over newer background chatter", () => {
+    const background = Array.from({ length: 16 }, (_, index) => ({ ...row(index), authorId: `resident-${index}` }));
+    const latest = { ...row(16), authorId: "resident-16", replyToMessageId: "message-0" };
+    const context = buildConversationContext({
+      phase: "continuation", rootMessageId: latest.messageId, messages: [latest], backgroundMessages: background,
+    });
+    expect(context.publishedTurns).toEqual([latest]);
+    expect(context.roomBackground?.map((turn) => turn.messageId)).toEqual([
+      "message-0", ...background.slice(-10).map((turn) => turn.messageId),
+    ]);
+    expect(conversationReplyTarget(context, latest.authorId, latest.replyToMessageId)?.authorId).toBe("resident-0");
+    expect(JSON.stringify(context.roomBackground).length).toBeLessThanOrEqual(MAX_CONVERSATION_BACKGROUND_CHARACTERS);
+    expect(JSON.stringify(context).length).toBeLessThanOrEqual(MAX_CONVERSATION_CONTEXT_CHARACTERS);
+    expect(buildConversationContext({
+      phase: context.phase, rootMessageId: context.rootMessageId,
+      messages: context.publishedTurns, backgroundMessages: context.roomBackground,
+    })).toEqual(context);
+    expect(sceneConversationContextSchema.safeParse(context).success).toBe(true);
+  });
+
+  it("preserves the same total row and serialized bounds rather than adding another full transcript", () => {
+    const messages = Array.from({ length: 11 }, (_, index) => row(index + 20));
+    const background = Array.from({ length: 20 }, (_, index) => row(index));
+    const context = buildConversationContext({ phase: "continuation", messages, backgroundMessages: background });
+    expect(context.publishedTurns).toEqual(messages);
+    expect(context.roomBackground).toEqual([background.at(-1)]);
+    expect(context.publishedTurns.length + context.roomBackground!.length).toBe(MAX_CONVERSATION_TURNS);
+    expect(JSON.stringify(context).length).toBeLessThanOrEqual(MAX_CONVERSATION_CONTEXT_CHARACTERS);
+    expect(sceneConversationContextSchema.safeParse(context).success).toBe(true);
+  });
+
+  it("lets an eight-turn active exchange use only four rows of preceding background", () => {
+    const active = Array.from({ length: 8 }, (_, index) => row(index + 20));
+    const background = Array.from({ length: 20 }, (_, index) => row(index));
+    const context = buildConversationContext({
+      phase: "continuation", rootMessageId: active[0]!.messageId,
+      messages: active, backgroundMessages: background,
+    });
+    expect(context.publishedTurns).toEqual(active);
+    expect(context.roomBackground).toEqual(background.slice(-4));
+    expect(context.publishedTurns.length + context.roomBackground!.length).toBe(MAX_CONVERSATION_TURNS);
+    expect(JSON.stringify(context).length).toBeLessThanOrEqual(MAX_CONVERSATION_CONTEXT_CHARACTERS);
+    expect(sceneConversationContextSchema.safeParse(context).success).toBe(true);
+  });
+
+  it("bounds escape-heavy background without mutating or inventing rows and rebuilds idempotently", () => {
+    const background = Array.from({ length: 10 }, (_, index) => ({
+      ...row(index, `Exact background ${index}: ${"\n\t\u0000".repeat(400)}`),
+      authorId: `resident-${index}`,
+      ...(index > 0 ? { replyToMessageId: `message-${index - 1}` } : {}),
+    }));
+    const original = structuredClone(background);
+    const context = buildConversationContext({ phase: "opening", messages: [], backgroundMessages: background });
+    expect(background).toEqual(original);
+    expect(context.roomBackground!.length).toBeLessThanOrEqual(MAX_CONVERSATION_BACKGROUND_TURNS);
+    expect(JSON.stringify(context.roomBackground).length).toBeLessThanOrEqual(MAX_CONVERSATION_BACKGROUND_CHARACTERS);
+    expect(JSON.stringify(context).length).toBeLessThanOrEqual(MAX_CONVERSATION_CONTEXT_CHARACTERS);
+    for (const turn of context.roomBackground!) {
+      expect(original.find((source) => source.messageId === turn.messageId)?.content.startsWith(turn.content)).toBe(true);
+    }
+    expect(buildConversationContext({
+      phase: context.phase, messages: context.publishedTurns, backgroundMessages: context.roomBackground,
+    })).toEqual(context);
+    expect(sceneConversationContextSchema.safeParse(context).success).toBe(true);
+  });
+
+  it("does not allow background to displace a full active exchange", () => {
+    const active = Array.from({ length: 12 }, (_, index) => row(index + 20, "x".repeat(2_000)));
+    const context = buildConversationContext({
+      phase: "continuation", rootMessageId: "message-20", messages: active,
+      backgroundMessages: [row(0, "y".repeat(2_000))],
+    });
+    expect(context.latestMessageId).toBe("message-31");
+    expect(context.rootMessageId).toBe("message-20");
+    expect(JSON.stringify(context).length).toBeLessThanOrEqual(MAX_CONVERSATION_CONTEXT_CHARACTERS);
+    expect(sceneConversationContextSchema.safeParse(context).success).toBe(true);
+  });
+
+  it("deduplicates background against active identities and rejects invalid background bindings", () => {
+    const active = { ...row(1), authorId: "resident-a" };
+    const context = buildConversationContext({
+      phase: "continuation", messages: [active], backgroundMessages: [row(0), active],
+    });
+    expect(context.roomBackground).toEqual([row(0)]);
+    expect(sceneConversationContextSchema.safeParse({ ...context, roomBackground: [active] }).success).toBe(false);
+    expect(sceneConversationContextSchema.safeParse({
+      ...context, roomBackground: [{ ...row(0), replyToMessageId: active.messageId }],
+    }).success).toBe(false);
+    expect(sceneConversationContextSchema.safeParse({ ...context, rootMessageId: "message-0" }).success).toBe(false);
+    expect(sceneConversationContextSchema.safeParse({ ...context, latestMessageId: "message-0" }).success).toBe(false);
+  });
+
+  it("rejects an ad hoc background that exceeds the combined row allowance", () => {
+    const context = buildConversationContext({
+      phase: "continuation", messages: Array.from({ length: 12 }, (_, index) => row(index + 20)),
+    });
+    expect(sceneConversationContextSchema.safeParse({ ...context, roomBackground: [row(0)] }).success).toBe(false);
+  });
+
   it("retains the opening root and newest turns, with original order and wording", () => {
     const messages = Array.from({ length: 30 }, (_, index) => row(index));
     const context = buildConversationContext({ phase: "continuation", rootMessageId: "message-0", messages });

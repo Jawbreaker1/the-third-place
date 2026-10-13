@@ -1,0 +1,196 @@
+import { describe, expect, it, vi } from "vitest";
+import type { ChatMessage } from "../../shared/types.js";
+import type { SceneTranscriptLine } from "../../server/sceneTranscript.js";
+import {
+  boundedDmPublicMemoryPackets, buildDmPublicMemoryPackets, dmPublicMemoryPacketSchema,
+  MAX_DM_PUBLIC_MEMORY_NOTE_CHARACTERS, MAX_DM_PUBLIC_MEMORY_ROWS,
+  type BuildDmPublicMemoryPacketsInput, type DmPublicMemoryPacket,
+} from "./dmPublicMemoryPackets.js";
+
+const at = (minute: number) => new Date(Date.UTC(2026, 9, 13, 10, minute)).toISOString();
+const row = (id: string, authorId: string, minute: number, channelId = "one", content = id): ChatMessage => ({
+  id, authorId, channelId, content, createdAt: at(minute), reactions: [],
+});
+const toTranscript = (messages: readonly ChatMessage[]): SceneTranscriptLine[] => messages.map((message) => ({
+  messageId: message.id, author: message.authorId, kind: message.authorId === "resident" ? "ai" : "human",
+  content: message.content, createdAt: message.createdAt,
+}));
+const note = (...perspectives: string[]) => "PUBLIC RECOLLECTIONS\n" + JSON.stringify({
+  subjectivePublicRecollections: perspectives.map((perspective) => ({
+    perspective, eventKind: "shared_interest", timeBasis: "event", occurredAt: at(1),
+  })),
+});
+const input = (overrides: Partial<BuildDmPublicMemoryPacketsInput> = {}): BuildDmPublicMemoryPacketsInput => ({
+  ownerId: "resident", subjects: [{ id: "person-a", displayLabel: "First" }],
+  messages: [row("a-says", "person-a", 1), row("a-witness", "resident", 2)],
+  channels: [{ id: "one", name: "One" }, { id: "two", name: "Two" }],
+  trigger: { id: "dm-trigger", createdAt: at(30) },
+  getPublicNote: () => undefined, toTranscript,
+  ...overrides,
+});
+const packet = (): DmPublicMemoryPacket => buildDmPublicMemoryPackets(input())[0]!;
+
+describe("coherent per-person public DM memory packets", () => {
+  it("keeps each group's note and witnessed episode bound to its exact person", () => {
+    const getPublicNote = vi.fn((subjectId: string) => note(subjectId === "person-a" ? "Owns red books." : "Collects blue records."));
+    const packets = buildDmPublicMemoryPackets(input({
+      subjects: [{ id: "person-a", displayLabel: "Same label" }, { id: "person-b", displayLabel: "Same label" }],
+      messages: [
+        row("a-says", "person-a", 1, "one", "The red books."), row("a-witness", "resident", 2),
+        row("b-says", "person-b", 20, "two", "The blue records."), row("b-witness", "resident", 21, "two"),
+      ], getPublicNote,
+    }));
+    expect(getPublicNote.mock.calls).toEqual([["person-a"], ["person-b"]]);
+    expect(packets.map((value) => value.subjectId)).toEqual(["person-a", "person-b"]);
+    expect(packets[0]?.publicMemoryNote).toContain("red books");
+    expect(packets[0]?.roomRecall?.sourceChannel.id).toBe("one");
+    expect(packets[1]?.publicMemoryNote).toContain("blue records");
+    expect(packets[1]?.roomRecall?.sourceChannel.id).toBe("two");
+    expect(JSON.stringify(packets[0])).not.toContain("blue records");
+    expect(JSON.stringify(packets[1])).not.toContain("red books");
+    expect(packets.every((value) => dmPublicMemoryPacketSchema.safeParse(value).success)).toBe(true);
+  });
+
+  it("reports missing evidence without claiming missing acquaintance or private history", () => {
+    expect(buildDmPublicMemoryPackets(input({ messages: [] }))).toEqual([{
+      ownerId: "resident", subjectId: "person-a", displayName: "First",
+      publicMemoryNote: undefined, roomRecall: undefined,
+      coverage: { publicEvidence: "not_found", privateHistory: "unavailable", completeness: "partial" },
+    }]);
+    expect(buildDmPublicMemoryPackets(input({ subjects: [] }))).toEqual([]);
+  });
+
+  it("keeps authorized public notes when transcripts are pruned without inventing exact history", () => {
+    const [value] = buildDmPublicMemoryPackets(input({ messages: [], getPublicNote: () => note("Likes red books.") }));
+    expect(value?.publicMemoryNote).toContain("red books");
+    expect(value?.roomRecall).toBeUndefined();
+    expect(value?.coverage).toEqual({ publicEvidence: "supplied", privateHistory: "unavailable", completeness: "partial" });
+  });
+
+  it("does not retrieve private, removed, system, future or unwitnessed messages", () => {
+    const messages = [
+      row("private-a", "person-a", 1, "dm:elsewhere", "PRIVATE_DM_SENTINEL"),
+      row("private-witness", "resident", 2, "dm:elsewhere"),
+      row("removed-a", "person-a", 1, "removed", "REMOVED_SENTINEL"), row("removed-witness", "resident", 2, "removed"),
+      row("present-a", "person-a", 20), { ...row("system", "resident", 21), system: true },
+      row("other-resident", "someone-else", 22), row("too-late", "resident", 31),
+    ];
+    const [value] = buildDmPublicMemoryPackets(input({ messages }));
+    expect(value?.roomRecall).toBeUndefined();
+    expect(value?.coverage.publicEvidence).toBe("not_found");
+    expect(JSON.stringify(value)).not.toContain("SENTINEL");
+  });
+
+  it("recognizes reaction witnesses without requiring an authored resident reply", () => {
+    const message = row("reacted", "person-a", 1);
+    message.reactions = [{ emoji: "👀", memberIds: ["resident"] }];
+    const [value] = buildDmPublicMemoryPackets(input({ messages: [message] }));
+    expect(value?.roomRecall?.witnessPersonaIds).toEqual(["resident"]);
+    expect(value?.roomRecall?.witnessMessageIds).toEqual(["reacted"]);
+    expect(value?.roomRecall?.transcript).toHaveLength(1);
+  });
+
+  it("does not retrieve another author merely because their text contains the selected label", () => {
+    const [value] = buildDmPublicMemoryPackets(input({ messages: [
+      row("other", "different-id", 1, "one", "First owns red books."), row("resident-reply", "resident", 2),
+    ] }));
+    expect(value?.roomRecall).toBeUndefined();
+  });
+
+  it("keeps ID-based retrieval valid for non-word display labels", () => {
+    const [value] = buildDmPublicMemoryPackets(input({ subjects: [{ id: "person-a", displayLabel: "௰" }] }));
+    expect(value?.roomRecall?.provenance[0]?.authorId).toBe("person-a");
+  });
+
+  it("bounds two people's rows together without discarding either anchor/witness pair", () => {
+    const messages = ["one", "two"].flatMap((channelId, channelIndex) => Array.from({ length: 8 }, (_, index) => row(
+      `${channelId}-${index}`, index === 0 ? `person-${channelIndex ? "b" : "a"}` : index === 7 ? "resident" : "bystander",
+      index + channelIndex * 12, channelId,
+    )));
+    const packets = buildDmPublicMemoryPackets(input({
+      subjects: [{ id: "person-a", displayLabel: "First" }, { id: "person-b", displayLabel: "Second" }], messages,
+    }));
+    expect(packets.reduce((total, value) => total + (value.roomRecall?.transcript.length ?? 0), 0)).toBe(MAX_DM_PUBLIC_MEMORY_ROWS);
+    for (const [index, value] of packets.entries()) {
+      const prefix = index ? "two" : "one";
+      expect(value.roomRecall?.transcript).toHaveLength(4);
+      expect(value.roomRecall?.transcript.map((line) => line.messageId)).toEqual([`${prefix}-0`, `${prefix}-5`, `${prefix}-6`, `${prefix}-7`]);
+      expect(value.roomRecall?.witnessMessageIds).toEqual([`${prefix}-7`]);
+      expect(value.roomRecall?.provenance.find((line) => line.role === "anchor")?.authorId).toBe(value.subjectId);
+    }
+  });
+
+  it("shares note space using complete JSON records, retaining qualifications and both people", () => {
+    const perspectives = ["a", "b"].map((person) => Array.from({ length: 3 }, (_, index) => `${person}-${index}: ${"detail ".repeat(65)}only at that event.`));
+    const originals = perspectives.map((values) => note(...values));
+    const packets = buildDmPublicMemoryPackets(input({
+      subjects: [{ id: "person-a", displayLabel: "First" }, { id: "person-b", displayLabel: "Second" }],
+      messages: [], getPublicNote: (subjectId) => originals[subjectId === "person-a" ? 0 : 1],
+    }));
+    expect(packets.reduce((total, value) => total + (value.publicMemoryNote?.length ?? 0), 0)).toBeLessThanOrEqual(MAX_DM_PUBLIC_MEMORY_NOTE_CHARACTERS);
+    for (const [index, value] of packets.entries()) {
+      expect(value.publicMemoryNote).toBeDefined();
+      const json = JSON.parse(value.publicMemoryNote!.slice(value.publicMemoryNote!.indexOf("\n") + 1));
+      expect(json.subjectivePublicRecollections.length).toBeGreaterThan(0);
+      for (const record of json.subjectivePublicRecollections) expect(perspectives[index]).toContain(record.perspective);
+    }
+  });
+
+  it.each([
+    "PRIVATE\n{\"subjectiveRecollections\":[{\"perspective\":\"PRIVATE_SENTINEL\"}]}",
+    "RELATIONSHIP\n{\"directedRelationship\":{\"secret\":\"PRIVATE_SENTINEL\"}}",
+    "PUBLIC\n{}", "PUBLIC\n{broken", "Plain unstructured memory",
+  ])("does not promote invalid/private note shapes to public evidence: %j", (publicMemoryNote) => {
+    const [value] = buildDmPublicMemoryPackets(input({ messages: [], getPublicNote: () => publicMemoryNote }));
+    expect(value?.publicMemoryNote).toBeUndefined();
+    expect(value?.coverage.publicEvidence).toBe("not_found");
+  });
+
+  it("rejects a renderer that changes a source message ID or timestamp", () => {
+    for (const mutate of [
+      (line: SceneTranscriptLine) => ({ ...line, messageId: "different" }),
+      (line: SceneTranscriptLine) => ({ ...line, createdAt: at(15) }),
+    ]) {
+      const [value] = buildDmPublicMemoryPackets(input({ toTranscript: (messages) => toTranscript(messages).map(mutate) }));
+      expect(value?.roomRecall).toBeUndefined();
+    }
+  });
+
+  it("drops foreign owners and duplicate subjects without changing the caller's evidence", () => {
+    const original = packet();
+    const before = structuredClone(original);
+    expect(boundedDmPublicMemoryPackets([original], "other-resident")).toEqual([]);
+    expect(boundedDmPublicMemoryPackets([original, original], "resident")).toEqual([original]);
+    expect(original).toEqual(before);
+    const bounded = boundedDmPublicMemoryPackets([original], "resident");
+    expect(boundedDmPublicMemoryPackets(bounded, "resident")).toEqual(bounded);
+  });
+
+  it.each([
+    (value: DmPublicMemoryPacket) => { value.roomRecall!.provenance[0]!.authorId = "person-b"; },
+    (value: DmPublicMemoryPacket) => { value.roomRecall!.provenance[0]!.messageId = "wrong-row"; },
+    (value: DmPublicMemoryPacket) => { value.roomRecall!.provenance[0]!.anchorMatches = ["content"]; },
+    (value: DmPublicMemoryPacket) => { value.roomRecall!.witnessPersonaIds = ["other-resident"]; },
+    (value: DmPublicMemoryPacket) => { value.roomRecall!.witnessMessageIds = ["missing-row"]; },
+    (value: DmPublicMemoryPacket) => { value.roomRecall!.provenance.pop(); },
+    (value: DmPublicMemoryPacket) => { value.coverage.publicEvidence = "not_found"; },
+  ])("rejects misbound provenance or contradictory coverage without mixing partial packets", (mutate) => {
+    const value = packet();
+    mutate(value);
+    expect(dmPublicMemoryPacketSchema.safeParse(value).success).toBe(false);
+    expect(boundedDmPublicMemoryPackets([value], "resident")).toEqual([]);
+  });
+
+  it("rejects unknown packet fields and never takes more than two unique subjects", () => {
+    expect(dmPublicMemoryPacketSchema.safeParse({ ...packet(), privateExistence: true }).success).toBe(false);
+    const getPublicNote = vi.fn(() => undefined);
+    const packets = buildDmPublicMemoryPackets(input({
+      messages: [], subjects: [
+        { id: "person-a", displayLabel: "A" }, { id: "person-a", displayLabel: "duplicate" },
+        { id: "resident", displayLabel: "owner" }, { id: "person-b", displayLabel: "B" }, { id: "person-c", displayLabel: "C" },
+      ], getPublicNote,
+    }));
+    expect(packets.map((value) => value.subjectId)).toEqual(["person-a", "person-b"]);
+    expect(getPublicNote.mock.calls).toEqual([["person-a"], ["person-b"]]);
+  });
+});

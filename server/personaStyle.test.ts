@@ -321,13 +321,24 @@ describe("self-directed text style", () => {
     for (const habit of mira.style.conversationHabits) expect(note).toContain(`“${habit}”`);
   });
 
-  it("treats the normal range as preference but preserves the caller-supplied hard ceiling", () => {
+  it("lets the contribution choose its length without a usual range or sentence target", () => {
     const expanded = { ...mira, style: { ...mira.style, hardMaxWords: 120 } };
     const note = buildPersonaStylePromptNote(expanded, { selfDirected: true });
-    expect(note).toContain("usually 5–26 words and 1–2 sentence(s), not a compulsory range or shape");
+    expect(note).toContain("Length follows the contribution, not a word or sentence target");
+    expect(note).toContain("a fragment");
+    expect(note).toContain("several sentences or a compact paragraph");
+    expect(note).toContain("copy the length of preceding messages");
     expect(note).toContain("Hard maximum 120 words");
-    expect(note).toContain("do not pad a reaction or compress a developed point");
+    expect(note).not.toContain("usually 5–26 words");
+    expect(note).not.toContain("1–2 sentence(s)");
     expect(note).not.toContain("hard maximum 42 words");
+  });
+
+  it("keeps ordinary text and voice length policies unchanged", () => {
+    expect(buildPersonaStylePromptNote(mira)).toContain("usually 5–26 words and 1–2 sentence(s)");
+    expect(buildPersonaStylePromptNote(mira, { medium: "voice" })).toContain("hard maximum 25 words");
+    expect(buildPersonaStylePromptNote(mira, { medium: "voice", selfDirected: true }))
+      .toBe(buildPersonaStylePromptNote(mira, { medium: "voice" }));
   });
 
   it("preserves each resident's stable voice and never turns emoji-free into a random allowance", () => {

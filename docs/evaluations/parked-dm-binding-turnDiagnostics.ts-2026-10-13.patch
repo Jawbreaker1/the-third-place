@@ -1,0 +1,30 @@
+diff --git a/server/turnDiagnostics.ts b/server/turnDiagnostics.ts
+index b0f5165..38bc77b 100644
+--- a/server/turnDiagnostics.ts
++++ b/server/turnDiagnostics.ts
+@@ -11,7 +11,8 @@ const OUTCOMES = [
+   "unavailable", "failed", "cancelled", "deferred", "superseded", "expired",
+   "capacity_limited", "suppressed", "retrying", "selected", "invalid_output", "recovered",
+ ] as const;
+-const STAGES = ["turn", "routing", "selection", "capability", "queue", "generation", "draft", "review", "filter", "recovery", "publication"] as const;
++const STAGES = ["turn", "routing", "person_binding", "selection", "capability", "queue", "generation", "draft", "review", "filter", "recovery", "publication"] as const;
++const PERSON_BINDING_STATUSES = ["single", "group", "ambiguous", "unknown", "none", "unavailable"] as const;
+ const MECHANICAL_ISSUES = ["near_duplicate_self", "near_duplicate_peer", "reused_opening", "assistant_cliche", "ai_meta_language", "overly_polished", "register_mismatch", "list_like_reply", "evidence_denial", "evidence_ungrounded", "room_contract", "style_contract"] as const;
+ const CAPABILITY_STATES = ["grounding_available", "retrieved_only", "failed_temporary", "declined"] as const;
+ const NUMBER_FIELDS = [
+@@ -29,6 +30,7 @@ export type TurnDiagnosticEvent = {
+   reviewIssues?: readonly string[];
+   mechanicalIssues?: readonly string[];
+   capabilityState?: (typeof CAPABILITY_STATES)[number];
++  personBindingStatus?: (typeof PERSON_BINDING_STATUSES)[number];
+ } & Partial<Record<(typeof NUMBER_FIELDS)[number], number>>;
+ 
+ /** Operational metadata only. No body, query, URL, draft, memory or error text.
+@@ -61,6 +63,7 @@ export const recordTurnDiagnostic = (
+       }
+     }
+     if (event.analysisSource === "lm" || event.analysisSource === "fallback") entry.analysisSource = event.analysisSource;
++    if (event.personBindingStatus && PERSON_BINDING_STATUSES.includes(event.personBindingStatus)) entry.personBindingStatus = event.personBindingStatus;
+     if (event.replyExpected && ["none", "optional", "expected"].includes(event.replyExpected)) entry.replyExpected = event.replyExpected;
+     if (event.evidenceAction && ["none", ...TURN_CAPABILITIES].includes(event.evidenceAction)) entry.evidenceAction = event.evidenceAction;
+     if (event.capabilityState && CAPABILITY_STATES.includes(event.capabilityState)) entry.capabilityState = event.capabilityState;

@@ -1,0 +1,323 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ChatMessage, Member } from "../shared/types.js";
+import { ActorChannelRuntime } from "./actorChannels.js";
+import { SocialDirector } from "./director.js";
+import { createUnavailableDmPersonBinding, parseDmPersonBinding, type DmPersonBindingInput, type DmPersonBindingResult } from "./dmPersonBinding.js";
+import type { SceneRequest } from "./lmStudio.js";
+import { PERSONAS } from "./personas.js";
+import { createFailClosedTurnAnalysis, type TurnAnalysisInput } from "./semanticRouter.js";
+import { SocialMemoryStore } from "./socialMemory.js";
+import { SocialMemoryCoordinator } from "./socialMemoryCoordinator.js";
+import { RoomStore } from "./store.js";
+
+const member = (id: string, name: string): Member => ({
+  id, name, kind: "human", status: "online", avatar: { color: "#123", accent: "#456", glyph: name[0]! },
+});
+const asker = member("human-alex", "Alex");
+const subject = member("human-lumi", "Lumi");
+const secret = member("human-private-only", "Private Only");
+const mira = PERSONAS.find((persona) => persona.id === "ai-mira")!;
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
+
+const setup = async (options: { legacyNote?: string | null } = {}) => {
+  const directory = await mkdtemp(join(tmpdir(), "third-place-dm-public-memory-"));
+  const store = new RoomStore(join(directory, "rooms.json"));
+  const memory = new SocialMemoryStore({ filePath: ":memory:" });
+  const coordinator = new SocialMemoryCoordinator({
+    analyzeSocialEpisode: async () => ({ source: "lm", failureReason: null, events: [] }),
+  }, memory);
+  let profiles = [asker, subject, secret];
+  let referenceIds = [subject.id];
+  let confidence = 0.99;
+  let bindingStatus: DmPersonBindingResult["status"] | undefined;
+  let broadContextResolution: "none" | "ambiguous" = "none";
+  let broadUnavailable = false;
+  let duringRouting = () => {};
+  let duringGeneration: () => void | Promise<void> = () => {};
+  const analyzeTurn = vi.fn(async (_input: TurnAnalysisInput) => {
+    duringRouting();
+    const base = createFailClosedTurnAnalysis("disabled");
+    if (broadUnavailable) return base;
+    return {
+      ...base, source: "lm" as const, failureReason: null,
+      intent: { ...base.intent, isQuestion: true, kind: "question" as const, replyExpected: "expected" as const, confidence: 0.99 },
+      referencedHumanIds: referenceIds, referencedHumanConfidence: confidence,
+      currentContext: {
+        ...base.currentContext, resolution: broadContextResolution, confidence: 0.99,
+        focusMessageIds: broadContextResolution === "ambiguous" ? [_input.latestMessage.id] : [],
+      },
+    };
+  });
+  const bindDmPersons = vi.fn(async (input: DmPersonBindingInput) => {
+    const status = bindingStatus ?? (referenceIds.length === 2 ? "group" : referenceIds.length ? "single" : "none");
+    const selected = status === "single" || status === "group";
+    return parseDmPersonBinding({
+      status,
+      subjects: selected ? referenceIds.map((personId) => ({
+        personId, sourceMessageId: input.latestMessage.id,
+        mentionExcerpt: input.latestMessage.content.slice(0, 160), latestTurnExcerpt: input.latestMessage.content.slice(0, 400),
+      })) : [],
+      alternatives: status === "ambiguous" ? referenceIds : [],
+      confidence: status === "unavailable" ? 0 : confidence,
+    }, input) ?? createUnavailableDmPersonBinding();
+  });
+  const generateScene = vi.fn(async (_scene: SceneRequest) => {
+    await duringGeneration();
+    return [{ personaId: mira.id, content: "A reviewed test reply.", source: "lm" as const, sourceIds: [] }];
+  });
+  const director = new SocialDirector(
+    { to: () => ({ emit: vi.fn() }) } as never, store,
+    { analyzeTurn, bindDmPersons, generateScene, rememberDeliveredLine: vi.fn() } as never,
+    new ActorChannelRuntime(), { research: vi.fn(), researchSite: vi.fn() } as never,
+    {
+      listProfiles: () => profiles.map((entry) => ({ member: entry })),
+      promptNote: () => options.legacyNote === null ? undefined : options.legacyNote ?? "CURRENT ASKER PRIVATE ORIENTATION", getRelation: () => undefined,
+      updateRelation: vi.fn(),
+    } as never,
+    () => [asker, subject, ...PERSONAS], () => 1,
+    {
+      dmDebounceMs: 0, weatherForecastProvider: null, socialMemory: coordinator,
+      pageReader: { collectCandidates: () => ({ requestedAt: new Date().toISOString(), candidates: [] }) } as never,
+    },
+  );
+  const addPublic = (withWitness = true, person = subject, channelId = "pingu") => {
+    const time = Date.now() - 60_000;
+    const first: ChatMessage = {
+      id: `public-${person.id}`, channelId, authorId: person.id,
+      content: person.id === subject.id ? "I finally found the scarf plushie I wanted." : "My blue records arrived.",
+      createdAt: new Date(time).toISOString(), reactions: [], authorSnapshot: person,
+    };
+    store.addPublicMessage(first);
+    if (withWitness) store.addPublicMessage({
+      ...first, id: `public-mira-${person.id}`, authorId: mira.id, authorSnapshot: undefined,
+      content: person.id === subject.id ? "The wonky scarf is the best part!" : "The blue records look great!", replyToId: first.id,
+      createdAt: new Date(time + 1_000).toISOString(),
+    });
+  };
+  const remember = (visibility: "public" | "dm" | "voice", person = subject, ownerId = mira.id, sourceActorId = person.id) => {
+    const id = `${visibility}-${person.id}-${ownerId}`;
+    memory.recordEvent({
+      id, kind: "humor", origin: "human",
+      scope: visibility === "public" ? { kind: "public", channelId: "pingu" }
+        : visibility === "dm" ? { kind: "dm", threadId: "other-private-thread", participantIds: [person.id, ownerId] }
+          : { kind: "voice", roomId: "private-voice", participantIds: [person.id, ownerId] },
+      sourceMessageIds: [`source-${id}`], actorIds: [sourceActorId], subjectIds: [person.id], witnessIds: [ownerId],
+      occurredAt: Date.now() - 50_000, summary: "Synthetic memory.", salience: 0.9, confidence: 0.99,
+      memoryViews: [{ id: `memory-${id}`, ownerId, subjectIds: [person.id], perspective: visibility === "public"
+        ? person.id === subject.id ? "Lumi showed me a wonky scarf plushie in the public Pingu room and I found it endearing."
+          : `${person.name} showed me blue records in a public room.`
+        : `PRIVATE-${visibility}-SECRET`, salience: visibility === "public" ? 0.7 : 1, confidence: 0.99 }],
+    });
+  };
+  const run = async (text = "Vad tycker du om Lumi?") => {
+    const thread = store.openDm(asker.id, mira.id);
+    const message = store.addDmMessage(thread.id, asker.id, text)!;
+    await director.onDirectMessage(message, asker, mira);
+    return { scene: generateScene.mock.calls.at(-1)?.[0], messages: store.getDmMessages(thread.id) };
+  };
+  cleanups.push(async () => { director.stop(); await store.flush(); memory.close(); await rm(directory, { recursive: true, force: true }); });
+  return {
+    director, store, memory, coordinator, analyzeTurn, bindDmPersons, generateScene, addPublic, remember, run,
+    setReference: (ids: string[], certainty = 0.99) => { referenceIds = ids; confidence = certainty; },
+    setBindingStatus: (status: DmPersonBindingResult["status"]) => { bindingStatus = status; },
+    setBroadContextResolution: (resolution: "none" | "ambiguous") => { broadContextResolution = resolution; },
+    setBroadUnavailable: () => { broadUnavailable = true; },
+    setProfiles: (next: Member[]) => { profiles = next; },
+    duringRouting: (callback: () => void) => { duringRouting = callback; },
+    duringGeneration: (callback: () => void | Promise<void>) => { duringGeneration = callback; },
+  };
+};
+
+describe("DM third-person public continuity through the director", () => {
+  it("includes an online third person, their witnessed public exchange and own public memory without replacing the asker context", async () => {
+    const f = await setup(); f.addPublic(); f.remember("public"); f.remember("dm"); f.remember("voice"); f.remember("dm", secret);
+    const { scene } = await f.run();
+    expect(f.analyzeTurn.mock.calls[0]![0].humanCandidates).toEqual([{ id: subject.id, displayLabel: subject.name }]);
+    expect(f.analyzeTurn.mock.calls[0]![0]).toMatchObject({
+      publicParticipantRecallAvailable: true, historyRecallAvailable: false,
+    });
+    expect(scene?.history.at(-1)?.content).toBe("Vad tycker du om Lumi?");
+    expect(scene?.relationshipNotes?.[mira.id]).toContain("CURRENT ASKER PRIVATE ORIENTATION");
+    expect(scene?.publicParticipantNotes?.[mira.id]).toContain("wonky scarf plushie");
+    expect(scene?.roomRecall?.sourceChannel).toEqual({ id: "pingu", name: "pingu" });
+    expect(scene?.roomRecall?.witnessPersonaIds).toEqual([mira.id]);
+    expect(scene?.roomRecall?.transcript.map((row) => row.content)).toEqual([
+      "I finally found the scarf plushie I wanted.", "The wonky scarf is the best part!",
+    ]);
+    expect(JSON.stringify(scene)).not.toContain("PRIVATE-dm-SECRET");
+    expect(JSON.stringify(scene)).not.toContain("PRIVATE-voice-SECRET");
+    expect(scene?.requestOwnerIds).toEqual([mira.id]);
+    expect(f.bindDmPersons.mock.calls[0]?.[0].publicHumanCandidates).toEqual([{ id: subject.id, displayLabel: subject.name }]);
+  });
+
+  it("recalls an owned public memory after original public rows are no longer retained", async () => {
+    const f = await setup(); f.remember("public"); f.remember("dm", secret);
+    const { scene } = await f.run();
+    expect(scene?.publicParticipantNotes?.[mira.id]).toContain("wonky scarf plushie");
+    expect(scene?.roomRecall).toBeUndefined();
+    expect(f.analyzeTurn.mock.calls[0]![0].humanCandidates).toEqual([{ id: subject.id, displayLabel: subject.name }]);
+  });
+
+  it.each(["unknown", "low confidence", "ambiguous", "unrelated"])("does not retrieve a third party for %s routing", async (variant) => {
+    const f = await setup(); f.addPublic(); f.remember("public");
+    if (variant === "unknown") f.setReference(["unknown-person"]);
+    if (variant === "low confidence") f.setReference([subject.id], 0.4);
+    if (variant === "ambiguous") f.setProfiles([asker, subject, member("human-other-lumi", "LUMI")]);
+    if (variant === "unrelated") f.setReference([]);
+    const { scene } = await f.run();
+    expect(scene?.publicParticipantNotes).toEqual({});
+    expect(scene?.roomRecall).toBeUndefined();
+  });
+
+  it("does not borrow another resident's memory or claim an unwitnessed public encounter", async () => {
+    const f = await setup(); f.addPublic(false); f.remember("public", subject, "ai-juno");
+    const { scene } = await f.run();
+    expect(scene?.publicParticipantNotes).toEqual({});
+    expect(scene?.roomRecall).toBeUndefined();
+  });
+
+  it("drops a deleted identity after routing and a reset identity during generation", async () => {
+    const deleted = await setup(); deleted.addPublic(); deleted.remember("public");
+    deleted.duringRouting(() => deleted.setProfiles([asker]));
+    const { scene } = await deleted.run();
+    expect(scene?.publicParticipantNotes).toEqual({});
+    expect(scene?.roomRecall).toBeUndefined();
+
+    const reset = await setup(); reset.addPublic(); reset.remember("public");
+    reset.duringGeneration(() => reset.director.resetHumanMemoryWork(subject.id));
+    const result = await reset.run();
+    expect(result.messages.map((message) => message.authorId)).toEqual([asker.id]);
+  });
+
+  it("invalidates the complete group when one selected identity disappears during classification", async () => {
+    const other = member("human-other", "CedarGuest");
+    const f = await setup();
+    f.setProfiles([asker, subject, other]);
+    f.setReference([subject.id, other.id]);
+    f.addPublic(); f.addPublic(true, other, "lobby");
+    f.remember("public"); f.remember("public", other);
+    const readPublicNote = vi.spyOn(f.coordinator, "publicThirdPartyPromptNote");
+    f.duringRouting(() => f.setProfiles([asker, subject]));
+    const { scene } = await f.run("What do you think of both Lumi and CedarGuest?");
+    expect(scene?.publicParticipantNotes).toEqual({});
+    expect(scene?.roomRecall).toBeUndefined();
+    expect(readPublicNote).not.toHaveBeenCalled();
+    expect(scene?.relationshipNotes?.[mira.id]).toContain("CURRENT ASKER PRIVATE ORIENTATION");
+  });
+
+  it("excludes a retiring identity while profile deletion is still in progress", async () => {
+    const f = await setup(); f.addPublic(); f.remember("public");
+    // Identity retirement invalidates work before the asynchronous durable
+    // erase removes its profile and public rows. A new turn must not capture
+    // that already-advanced epoch as permission to reuse the old evidence.
+    f.director.invalidatePublicWorkForHumanActor(subject.id);
+    const { scene } = await f.run();
+    expect(f.analyzeTurn.mock.calls[0]![0].humanCandidates).toEqual([]);
+    expect(scene?.publicParticipantNotes).toEqual({});
+    expect(scene?.roomRecall).toBeUndefined();
+  });
+
+  it("does not publish a generated reply after the referenced identity retires", async () => {
+    const f = await setup(); f.addPublic(); f.remember("public");
+    f.duringGeneration(() => f.director.invalidatePublicWorkForHumanActor(subject.id));
+    const result = await f.run();
+    expect(result.messages.map((message) => message.authorId)).toEqual([asker.id]);
+  });
+
+  it("does not publish a copied public memory after another source actor is erased", async () => {
+    const f = await setup();
+    f.remember("public", subject, mira.id, "human-event-source");
+    f.duringGeneration(async () => { await f.coordinator.forgetActor("human-event-source"); });
+    const result = await f.run();
+    expect(result.scene?.publicParticipantNotes?.[mira.id]).toContain("wonky scarf plushie");
+    expect(f.memory.listMemories({ ownerId: mira.id })).toEqual([]);
+    expect(result.messages.map((message) => message.authorId)).toEqual([asker.id]);
+  });
+
+  it("keeps a memory-free DM reply when an unrelated actor is erased", async () => {
+    const f = await setup({ legacyNote: null });
+    f.setReference([]);
+    f.duringGeneration(async () => { await f.coordinator.forgetActor("human-unrelated"); });
+    const result = await f.run("Hello again!");
+    expect(result.scene?.publicParticipantNotes).toEqual({});
+    expect(result.scene?.roomRecall).toBeUndefined();
+    expect(result.messages.map((message) => message.authorId)).toEqual([asker.id, mira.id]);
+  });
+
+  it("keeps an explicit group eligible for existing public recall even when broad focus is ambiguous", async () => {
+    const other = member("human-other", "CedarGuest");
+    const f = await setup();
+    f.setProfiles([asker, subject, other]);
+    f.setReference([subject.id, other.id]);
+    f.setBroadContextResolution("ambiguous");
+    f.addPublic(); f.addPublic(true, other, "lobby");
+    f.remember("public"); f.remember("public", other);
+    const { scene } = await f.run("What do you think of both Lumi and CedarGuest?");
+    expect(scene?.currentDiscourseContext?.resolution).toBe("ambiguous");
+    expect((await f.bindDmPersons.mock.results[0]!.value).status).toBe("group");
+    // The isolated binding change intentionally retains the old one-note /
+    // latest-episode projection. This does not assert two coherent packets.
+    expect(scene?.publicParticipantNotes?.[mira.id]).toContain("wonky scarf plushie");
+    expect(scene?.publicParticipantNotes?.[mira.id]).not.toContain("blue records");
+    expect(scene?.roomRecall?.sourceChannel.id).toBe("lobby");
+    expect(scene?.roomRecall?.provenance.some((row) => row.role === "anchor" && row.authorId === other.id)).toBe(true);
+  });
+
+  it("keeps alternatives non-executable when the intended singular person is unresolved", async () => {
+    const other = member("human-other", "CedarGuest");
+    const f = await setup();
+    f.setProfiles([asker, subject, other]);
+    f.setReference([subject.id, other.id]);
+    f.setBindingStatus("ambiguous");
+    f.addPublic(); f.addPublic(true, other, "lobby");
+    f.remember("public"); f.remember("public", other);
+    const readPublicNote = vi.spyOn(f.coordinator, "publicThirdPartyPromptNote");
+    const { scene, messages } = await f.run("Lumi and CedarGuest were there. What do you think of that person?");
+    expect(await f.bindDmPersons.mock.results[0]!.value).toMatchObject({
+      status: "ambiguous", subjects: [], alternatives: [subject.id, other.id],
+    });
+    expect(scene?.publicParticipantNotes).toEqual({});
+    expect(scene?.roomRecall).toBeUndefined();
+    expect(readPublicNote).not.toHaveBeenCalled();
+    expect(scene?.relationshipNotes?.[mira.id]).toContain("CURRENT ASKER PRIVATE ORIENTATION");
+    expect(messages.map((message) => message.authorId)).toEqual([asker.id, mira.id]);
+  });
+
+  it("does not salvage broad-router person guesses when the narrow binding is unavailable", async () => {
+    const f = await setup(); f.addPublic(); f.remember("public");
+    f.setBindingStatus("unavailable");
+    const readPublicNote = vi.spyOn(f.coordinator, "publicThirdPartyPromptNote");
+    const { scene } = await f.run();
+    expect((await f.bindDmPersons.mock.results[0]!.value).status).toBe("unavailable");
+    expect(scene?.publicParticipantNotes).toEqual({});
+    expect(scene?.roomRecall).toBeUndefined();
+    expect(readPublicNote).not.toHaveBeenCalled();
+    expect(scene?.relationshipNotes?.[mira.id]).toContain("CURRENT ASKER PRIVATE ORIENTATION");
+  });
+
+  it("keeps a separately validated person binding if unrelated broad classification is unavailable", async () => {
+    const f = await setup(); f.addPublic(); f.remember("public");
+    f.setBroadUnavailable();
+    const { scene } = await f.run();
+    expect((await f.bindDmPersons.mock.results[0]!.value).status).toBe("single");
+    expect(scene?.roomRecall?.provenance.some((row) => row.role === "anchor" && row.authorId === subject.id)).toBe(true);
+    expect(scene?.publicParticipantNotes?.[mira.id]).toContain("wonky scarf plushie");
+    expect(scene?.requestOwnerIds).toEqual([mira.id]);
+  });
+
+  it("does not publish a copied episode after a surrounding public author is reset", async () => {
+    const f = await setup(); f.addPublic();
+    f.store.addPublicMessage({
+      id: "public-bystander", channelId: "pingu", authorId: "human-bystander",
+      content: "I saw that scarf too.", createdAt: new Date(Date.now() - 59_500).toISOString(), reactions: [],
+    });
+    f.duringGeneration(() => f.director.resetHumanMemoryWork("human-bystander"));
+    const result = await f.run();
+    expect(result.scene?.roomRecall?.provenance.some((row) => row.authorId === "human-bystander")).toBe(true);
+    expect(result.messages.map((message) => message.authorId)).toEqual([asker.id]);
+  });
+});

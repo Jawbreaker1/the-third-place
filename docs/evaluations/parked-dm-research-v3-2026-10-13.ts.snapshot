@@ -1,0 +1,11 @@
+import type { CapabilitySceneContract } from "./capabilities/registry.js";
+
+/** Keep capability instructions scoped to their source, never the entire DM. */
+export const scopeDmCapabilityScene = (scene: CapabilitySceneContract): CapabilitySceneContract => {
+  if (!scene.externalEvidence || scene.evidenceOutcome !== "failed") return scene;
+  return {
+    ...scene,
+    groundingInstruction: `For the external-information part of this DM only: ${scene.groundingInstruction}`,
+    premise: "The attempted external lookup supplied no usable answer. This status describes only that attempt; it does not invalidate separately supplied conversation or public-memory evidence. Answer the actual DM request within each source's limits, and acknowledge an unresolved external part when the request depends on it. Do not invent external facts or successful source access.",
+  };
+};

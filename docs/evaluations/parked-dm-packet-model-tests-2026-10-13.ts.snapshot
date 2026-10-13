@@ -1,0 +1,91 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { actorSubsetSceneRequest, LmStudioClient, type SceneRequest } from "./lmStudio.js";
+import type { ModelBackend } from "./modelBackend.js";
+import { PERSONAS } from "./personas.js";
+import { boundedDmPersonContext, type DmPersonContext } from "./dmPersonContext.js";
+import { createUnavailableDmPersonBinding } from "./dmPersonBinding.js";
+
+const mira = PERSONAS.find((person) => person.id === "ai-mira")!;
+const juno = PERSONAS.find((person) => person.id === "ai-juno")!;
+const context = (): DmPersonContext => ({
+  ownerId: mira.id,
+  binding: { status: "group", confidence: 1, alternatives: [], subjects: ["person-a", "person-b"].map((personId) => ({
+    personId, sourceMessageId: "turn", mentionExcerpt: personId, latestTurnExcerpt: personId,
+  })) },
+  packets: ["person-a", "person-b"].map((subjectId) => ({
+    ownerId: mira.id, subjectId, displayName: subjectId,
+    coverage: { publicEvidence: "not_found", privateHistory: "unavailable", completeness: "partial" },
+  })),
+});
+const request = (): SceneRequest => ({
+  kind: "dm", channelId: "dm-test", channelName: "private chat", selected: [mira], history: [],
+  dmPersonContext: context(), languageHint: "en", trigger: { author: "Sam", content: "Do you remember person-a and person-b?" },
+  humanizerBudget: { repairsRemaining: 1 }, responseRecoveryBudget: { retriesRemaining: 1 },
+  mustReplyIds: [mira.id],
+});
+beforeEach(() => {
+  vi.stubEnv("AI_ENABLED", "true"); vi.stubEnv("CANDIDATE_REVIEW_ENABLED", "true");
+  vi.stubEnv("HUMANIZER_REPAIR_ENABLED", "true");
+  vi.spyOn(console, "info").mockImplementation(() => undefined);
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+});
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+describe("DM per-person evidence boundary", () => {
+  it("does not turn ambiguous alternatives into executable memory subjects", () => {
+    const input = context();
+    input.binding = { status: "ambiguous", subjects: [], alternatives: ["person-a", "person-b"], confidence: 1 };
+    expect(boundedDmPersonContext(input, mira.id)?.packets).toEqual([]);
+    expect(boundedDmPersonContext(input, juno.id)).toBeUndefined();
+  });
+
+  it("invalidates a complete group rather than retaining a selected identity with no packet", () => {
+    const input = context();
+    input.packets.pop();
+    expect(boundedDmPersonContext(input, mira.id)).toEqual({
+      ownerId: mira.id, binding: createUnavailableDmPersonBinding(), packets: [],
+    });
+    const foreign = context();
+    foreign.packets[1]!.ownerId = juno.id;
+    expect(boundedDmPersonContext(foreign, mira.id)).toEqual({
+      ownerId: mira.id, binding: createUnavailableDmPersonBinding(), packets: [],
+    });
+  });
+
+  it("keeps actor-owned packets out of another actor, public scenes and voice", async () => {
+    const input = request();
+    expect(actorSubsetSceneRequest(input, [juno], true).dmPersonContext).toBeUndefined();
+    expect(actorSubsetSceneRequest(input, [mira], false).dmPersonContext).toBeUndefined();
+    expect(actorSubsetSceneRequest({ ...input, kind: "public" }, [mira], true).dmPersonContext).toBeUndefined();
+    expect(actorSubsetSceneRequest({ ...input, kind: "voice" }, [mira], true).dmPersonContext).toBeUndefined();
+  });
+
+  it.each([undefined, "assistant_register", "evidence_ungrounded"] as const)(
+    "supplies identical owner/subject packets through writer, review and repair/recovery (%s)", async (firstIssue) => {
+      const observed: Array<{ schema: string; context?: DmPersonContext }> = [];
+      let reviews = 0;
+      const backend: ModelBackend = {
+        providerId: "lmstudio", configuredModel: "test", probe: async () => ({ connected: true, id: "test", label: "Test" }),
+        complete: vi.fn(async (body: any) => {
+          const payload = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
+          const schema = body.response_format.json_schema.name;
+          observed.push({ schema, context: schema === "social_scene" ? payload.dmPersonContext : payload.candidates[0].dmPersonContext });
+          let result: unknown;
+          if (schema === "multilingual_candidate_review") {
+            const issue = ++reviews === 1 ? firstIssue : undefined;
+            result = { reviews: [{ personaId: mira.id, severity: issue ? "high" : "none", issues: issue ? [issue] : [],
+              rewriteInstruction: issue ? "State the supported uncertainty naturally." : null,
+              sameSceneOverlap: "none", outputLanguage: { tag: "en", confidence: 1 } }] };
+          } else result = { messages: [{ personaId: mira.id, content: "I don't have a clear recollection of either collection. What did they show you?", sourceIds: [] }] };
+          return { choices: [{ finish_reason: "stop", message: { content: JSON.stringify(result) } }] };
+        }),
+      };
+      const client = new LmStudioClient({ backend });
+      await client.generateScene(request());
+      expect(observed.some((entry) => entry.schema === "multilingual_candidate_review")).toBe(true);
+      expect(observed.length).toBeGreaterThanOrEqual(firstIssue ? 3 : 2);
+      for (const entry of observed) expect(entry.context).toEqual(context());
+      client.cancelPending();
+    },
+  );
+});

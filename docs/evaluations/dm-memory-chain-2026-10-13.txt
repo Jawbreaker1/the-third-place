@@ -1,0 +1,192 @@
+DM person selection and memory retrieval audit — 2026-10-13
+=========================================================
+
+Decision
+--------
+Keep the narrow, reproduced retrieval/erasure corrections. Do NOT claim that
+the remaining semantic person-selection or reviewer defects are solved. No
+classifier, writer, reviewer, language threshold or model configuration changed.
+The separate person resolver remains parked and is not imported by production.
+No regex, name-specific rule or language-specific routing was added.
+
+Only three compiled production modules differ from the turn-start runtime:
+channelRecall.js, director.js and socialMemoryCoordinator.js. Existing worktree
+changes from earlier work were preserved. No commit, push or server start was
+performed. No production accounts, memories or conversations were used in tests.
+
+Reproduced defects corrected
+---------------------------
+1. Exact-ID public recall still required tokenizable query/display-label text.
+   The same stable person ID and witnessed public episode could be retrieved
+   for an ordinary name but disappear for a valid non-word Unicode name.
+   Participant-bound retrieval now relies on the supplied stable ID. Unbound
+   text search still requires tokens. Author identity, public-channel boundary,
+   trigger time, actual resident witness and bounded episode checks remain.
+   Four new parameterized regression cases failed before the correction.
+
+2. forgetActor cleared the note cache before an asynchronous erasure checkpoint,
+   but a reentrant prompt read could repopulate it from not-yet-deleted rows.
+   The stale note then survived even though listMemories returned no rows.
+   The same race affected a note about B when its source/event actor C was
+   erased. Prompt projections and public subject discovery are now withheld
+   while any erasure barrier is active; caches are invalidated at completion
+   as well as admission. Ordinary captures do not trigger that barrier.
+
+3. Public replies lacked the referenced-person epoch fence already present in
+   DMs. A person's memory could be copied into a generation, that person could
+   retire/reset, and the stale reply could still publish. Public candidates
+   are now revalidated after routing, and used subjects plus exact recalled
+   row authors are checked through publication. DM recalled row authors join
+   its existing epoch fence too.
+
+   A memory event can depend on someone other than its named owner/subject.
+   A destructive-only coordinator revision therefore also fences persistent-
+   memory-bearing DM/public replies across erasure. This intentionally may
+   cancel an unrelated memory-bearing reply during a rare simultaneous erase;
+   it does not cancel ordinary no-memory replies or react to normal captures.
+   Exact dependency propagation would be a larger change, not needed here.
+   These publication additions cover DM and human-triggered public paths;
+   this audit did not expand autonomous/voice publication machinery.
+
+What was verified, not changed
+-----------------------------
+Public-third-party retrieval uses exact owner ID, exact subject ID and a
+public-only source-scope filter BEFORE ranking/limits. It does not borrow
+another resident's private memory or aggregate private-influenced relationship
+edge. The current asker's own authorized DM context stays separate.
+
+Private-only people do not enter the third-person public candidate inventory.
+Actual public author IDs and resident authors/reaction witnesses anchor exact
+history; room presence alone is not a witness. Writer and reviewer receive
+the same bounded source transcript/provenance and public memory note.
+
+The 32-person candidate cap is intentional and real profiles are ordered by
+recent activity; the audit did not find a reason to change that limit. The
+one-note perspective bound is also existing behavior, not a new identity fix.
+
+Live methodology
+----------------
+Model: configured google/gemma-4-26b-a4b through LM Studio. One evaluation lane,
+application stopped. Fresh synthetic room store and in-memory social database
+for every turn. Real Director -> classifier/verifier -> retrieval -> writer ->
+reviewer -> persisted reply. Background memory capture uses a no-events model
+double, so extraction cannot race the evaluated turn.
+
+The original eight scenarios remain unchanged and ran once on each runtime.
+A separate nine-case matrix ran twice on each runtime (36 additional turns):
+  Swedish named A; English named B; same English input with catalog reversed;
+  French correction A -> B; German contextual person reference; ambiguous
+  English antecedent; French private-information probe; German public memory
+  after transcript pruning; unknown English person.
+
+Every new fixture contains two known people with distinct resident-owned public
+memories and separate witnessed public episodes. Private DM and voice memories
+for BOTH people and another resident's public memory carry forbidden synthetic
+markers. Full raw outbound requests and published replies are scanned for those
+markers. The test traces selected IDs, memory query scope, retrieved/marked
+memory IDs, actual writer/reviewer packets and reviewed publication. This is
+mechanical source checking, not keyword/regex grading of generated prose.
+
+The new harness has separate deterministic seeds per inference stage; the
+catalog-order pair shares message IDs and seeds. Seeds do not make Gemma fully
+deterministic. The nine-case manifest is unchanged between runs:
+  ac20bf5e8f57592b6fd50fc38a353214d3601741787f0285a786652dadaabf5d
+Harness SHA-256:
+  75d89f97558b50e546100abfc2965c7bcb91b2e9981b00bf76f92c7d2cf48071
+
+Live results — distinguish data flow from answer quality
+------------------------------------------------------
+                                             Baseline       Corrected
+New matrix, clear positive public-memory cases 12/12          12/12
+New matrix, all structural/identity checks     17/18          16/18
+New matrix, published replies                 17/18          16/18
+New matrix, forbidden source marker exposures  0/18           0/18
+Original eight, published replies              8/8            8/8
+Original eight, forbidden marker exposures     0/8            0/8
+
+52 complete live turns in total; no forbidden marker reached the model or a
+published reply. This is evidence for these synthetic boundaries, NOT proof
+that arbitrary model answers are correct or that every possible privacy path
+has been audited.
+
+All 24 clear-positive runs in the new matrix used the correct identity,
+resident-owned public note and (when retained) exact witnessed episode; actual
+writer/reviewer evidence matched. Manual reading found relevant collection
+facts in the answers. Some casual personality/gender embellishment remains.
+
+The scored difference is the ambiguous-person scenario. Baseline failed one
+of two repetitions; corrected runtime failed both. The router's full user
+payload hash, system hash and inference settings were IDENTICAL in all 18
+matched pairs. The router/writer/reviewer compiled modules are byte-identical.
+In the differing repetition the model changed its selected IDs for the same
+request. This does not demonstrate a semantic improvement from the fixes,
+nor justify claiming the ambiguous path is reliable. The structural fixes are
+retained for their deterministic red/green regression evidence, not because
+this small stochastic matrix scored better.
+
+Unresolved semantic defects, explicitly retained in reports
+---------------------------------------------------------
+* With an unresolved singular reference after two people were mentioned,
+  Gemma sometimes emits both IDs at confidence 0.9. The bounded note selection
+  then supplies A's public note while latest witnessed history belongs to B.
+  Both sources are authentic/public, but they do not resolve whom the user
+  means. The writer picks A and the reviewer rejects/retries; no reply appears.
+
+  A proposed count/ambiguity guard was NOT implemented. Active-focus f and
+  catalog-person p.h are explicitly independent: valid explicit third-person
+  questions can also have f=ambiguous. Coupling them would suppress legitimate
+  two-person questions and let uncertain optional metadata revoke valid IDs.
+  A future identity-contract experiment must distinguish an actual group from
+  unresolved alternatives and include group + unrelated-focus-ambiguity
+  controls. It must not merely pick the first ID or relax the reviewer.
+
+* The model/reviewer can fabricate negative private-history claims. Original
+  private probes said variants of "there's no secret" in both runtimes even
+  though private data was withheld, not disproven. New French candidate probes
+  happened to decline instead; prompts were unchanged, so no fix is claimed.
+  Unknown-person answers can also invent "I've seen them around" despite no
+  selected identity or memory. Correct privacy filtering is not proof of
+  grounded wording.
+
+* Original en-unknown requested web research in both runtimes. The synthetic
+  provider refuses and records this attempt; no external website was called.
+  This causes the original harness's nonzero exit despite all eight replies.
+  The new matrix exits nonzero for the preserved ambiguity failures. These
+  failures were not discarded, relabeled as success or silently retried.
+
+Separate audit finding, not changed in this retrieval correction
+---------------------------------------------------------------
+The commitment UPDATE/extraction path #existingOpenLoops limits visible loops
+to three before testing mutable scope/participating actors. Three pinned public
+loops can crowd out a valid same-DM commitment that cannot then be resolved by
+the analyzer. A synthetic store/fake-analyzer reproduction confirmed this.
+The prompt-reading #firstVisibleOpenLoop already filters owner/subject/scope
+before limit and is not affected. The update path needs its own pre-limit
+eligibility correction; increasing limits would only mask it.
+
+Verification and artifacts
+--------------------------
+* 2,597 tests / 160 files pass with two workers; no timeout threshold changed.
+  Initial unrestricted parallel run had one 5-second timeout in the existing
+  heavy active-memory-cap store test. It passed alone (59/59 store tests) and
+  the entire suite then passed at bounded parallelism.
+* 17/17 original + new live-harness offline tests pass.
+* Whole-project typecheck and production build pass; git diff --check clean.
+* The build was generated but app/server/ngrok were not started or redeployed.
+
+Raw artifacts beside this report:
+  dm-memory-chain-baseline-2026-10-13.results.json.gz
+  dm-memory-chain-corrected-2026-10-13.results.json.gz
+  dm-memory-chain-original8-baseline-2026-10-13.results.json.gz
+  dm-memory-chain-original8-corrected-2026-10-13.results.json.gz
+  dm-memory-chain-comparison-2026-10-13.audit.json
+
+Baseline runtime:
+  /private/tmp/third-place-person-resolver-baseline-Fj4niJ/dist-server
+Corrected runtime:
+  /private/tmp/third-place-dm-chain-candidate-ZJlzyv/dist-server
+
+Bottom line: actual deterministic memory/erasure bugs were corrected without
+loosening privacy or review. Ordinary explicit-person retrieval worked before
+and after. The full semantic DM problem is NOT solved; ambiguous identity
+selection and unsupported familiarity/private-history wording remain visible.

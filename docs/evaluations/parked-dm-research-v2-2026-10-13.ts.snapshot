@@ -1,0 +1,14 @@
+import type { CapabilitySceneContract } from "./capabilities/registry.js";
+
+/** Source authority, not a relaxation of claim grounding or response ownership. */
+export const DM_EVIDENCE_SCOPE_GUIDANCE = `In a DM, assess the actual requested outcome before applying evidence rules. External lookup status describes that external attempt only, not the availability of every source in the conversation. A failed lookup neither erases supplied public recollections nor makes them fresh external evidence. Exact public excerpts support attributed statements about what was written there; actor-owned public memory notes support only their existing bounded, fallible recollection. Neither proves current outside facts, unseen events, another person's private exchanges or the absence of past contact. Use each source only for the claim it actually supports, with its person, channel and time intact. For a mixed request, deliver the supported local part and state the precise unresolved external part; do not replace either with an unrelated memory or a generic failure report. For a purely external request, a relevant limitation can be a complete response, but an old recollection cannot fill the missing current answer. Do not require reporting an incidental failed lookup when the actual question is fully answered by supplied local evidence. Every unsupported claim remains rejectable at the existing severity; there is no automatic approval for a remembered answer.`;
+
+/** Keep capability instructions scoped to their source, never the entire DM. */
+export const scopeDmCapabilityScene = (scene: CapabilitySceneContract): CapabilitySceneContract => {
+  if (!scene.externalEvidence || scene.evidenceOutcome !== "failed") return scene;
+  return {
+    ...scene,
+    groundingInstruction: `For the external-information part of this DM only: ${scene.groundingInstruction}`,
+    premise: "The attempted external lookup supplied no usable answer. This status describes only that attempt; it does not invalidate separately supplied conversation or public-memory evidence. Answer the actual DM request within each source's limits, and acknowledge an unresolved external part when the request depends on it. Do not invent external facts or successful source access.",
+  };
+};

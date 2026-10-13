@@ -1,0 +1,38 @@
+Evaluation archives
+===================
+
+The uncommitted October 12–13 evaluation result files were archived losslessly
+before publication. Each *.results.json.gz decodes to the exact original JSON
+bytes: no prompts, transcripts, fixture seeds, scores, or failures were removed.
+Human-readable reports, audit JSON, manifests, patches and parked source snapshots
+remain readable without decompression. Compression does not enable experiments.
+Archived unified diffs retain whitespace-only context lines verbatim; the scoped
+.gitattributes rule exempts only these patch artifacts from whitespace linting.
+
+archive-index-2026-10-13.json maps original filenames to gzip files and records
+both byte counts and SHA-256 checksums. The archive process verified every gzip
+by decompressing it and comparing the original bytes before removing the raw file.
+Gzip output contains no source filename or timestamp and uses level 9 compression.
+
+To read an archive without creating another file, from the repository root:
+
+  gzip -dc docs/evaluations/<name>.results.json.gz | less
+
+To obtain the exact original JSON at a chosen local path:
+
+  gzip -dc docs/evaluations/<name>.results.json.gz > /tmp/<name>.results.json
+
+To verify every archive and its decoded checksum:
+
+  node --test scripts/evaluation-archive.node-test.mjs
+
+The person-reference replay harness reads its compressed fixtures directly using
+scripts/evaluation-archive.mjs. Its manifest and decoded source hashes are unchanged.
+Existing tracked evaluation result files were intentionally left in their original
+format; the shared reader accepts both plain and gzip files.
+
+Historical audit JSON and archived result payloads retain their original archive
+filenames and runtime paths as provenance, not current filesystem promises. When
+an original *.results.json is mentioned there, use the index to locate *.json.gz.
+Any referenced temporary runtime or raw run directory may only exist on the host
+where the evaluation ran. The frozen scene-evaluation harness was not modified.

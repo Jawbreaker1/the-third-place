@@ -1,0 +1,178 @@
+// Parked experiment: this test suite is not part of the active application.
+import { describe, expect, it } from "vitest";
+import {
+  buildEvidencePlanVerifierResponseFormat, buildTurnAnalysisResponseFormat,
+  createEvidencePlanVerifierInput, createFailClosedTurnAnalysis,
+  parseEvidencePlanVerifierContent, parseTurnAnalysisContent, parseVoiceTurnDraftContent,
+  projectTrustedTurnAnalysis, recoverTurnAnalysisAfterVerifiedNoEvidence,
+  shouldVerifyEvidencePlan,
+  turnAnalysisInputSchema, type NormalizedTurnAnalysisInput,
+} from "./semanticRouter.js";
+import { CAPABILITY_CATALOG, TURN_CAPABILITIES } from "./capabilities/catalog.js";
+
+const input = (overrides: Partial<NormalizedTurnAnalysisInput> = {}) => turnAnalysisInputSchema.parse({
+  turnId: "coherent-plan", medium: "dm",
+  channel: { id: "private", name: "Mira", topic: "private conversation" },
+  latestMessage: { id: "turn", authorId: "asker", authorName: "Alex", content: "What do you think of Noor?" },
+  personaCandidates: [{ id: "mira", name: "Mira", interests: [] }],
+  humanCandidates: [{ id: "noor", displayLabel: "Noor" }],
+  publicParticipantRecallAvailable: true, historyRecallAvailable: false,
+  availableCapabilities: [...TURN_CAPABILITIES], recentMessages: [],
+  urlCandidates: [
+    { ref: "root", source: "latest_message", context: "host=example.com; path=/; source=message" },
+    { ref: "deep", source: "latest_message", context: "host=example.com; path=/article; source=message" },
+  ], ...overrides,
+});
+const wire = (e: Record<string, unknown> = { a: "none", r: "none", x: 1, cx: 1 }) => ({
+  sv: 3, l: "en", lx: 1, rl: "en", rlx: 1,
+  i: { k: "question", q: true, r: "expected", d: "normal", o: "general", j: 1, x: 1 },
+  p: { a: ["mira"], r: ["mira"], v: ["mira"], x: 1, y: 1, h: ["noor"], z: 1 },
+  f: { r: "none", p: [], m: [], x: 1 },
+  s: { w: 0.3, h: 0, p: 0, a: 0, u: 0, e: 0.3, o: 0, c: 0, x: 1 },
+  b: { k: "ordinary", t: "none", r: "none", c: 0, m: 0, x: 1 },
+  m: { r: "none", a: "none", c: [], x: 1 }, r: { k: "irrelevant", x: 1 },
+  e, c: { a: false, i: false, l: false, x: 1 }, h: { n: "none", q: null, x: 1 }, y: [],
+});
+const plans = [
+  { a: "web_search", g: "Acme latest announcement", q: "Acme latest announcement", m: "news" },
+  { a: "read_url", g: "Read the supplied article", u: "deep" },
+  { a: "local_datetime", g: "Current time in Tokyo", z: "Asia/Tokyo", k: "current_time", l: "Tokyo" },
+  { a: "weather_forecast", g: "Weather in Göteborg", l: "Göteborg", q: null },
+  { a: "football_data", g: "Latest World Cup results", c: "FIFA_WC_2026", w: "recent_results", f: null },
+  { a: "market_snapshot", g: "Overview of global headline markets", l: "GLOBAL_MAJOR" },
+] as const;
+const executable = (plan: Record<string, unknown>) => ({ ...plan, r: "execute", x: 0.96, cx: 0.95 });
+
+describe("atomic catalog-derived router plan v3", () => {
+  it("keeps a local acquaintance reference without manufacturing an evidence action", () => {
+    const parsed = parseTurnAnalysisContent(JSON.stringify(wire()), input());
+    expect(parsed).toMatchObject({ source: "lm", evidence: { action: "none" }, capabilities: { discussed: [], requestKind: "none", topicConfidence: 1 } });
+    expect(projectTrustedTurnAnalysis(parsed, ["noor"]).referencedHumanIds).toEqual(["noor"]);
+  });
+
+  it.each(plans)("projects one validated $a plan into existing descriptive contracts", (plan) => {
+    const parsed = parseTurnAnalysisContent(JSON.stringify(wire(executable(plan))), input());
+    expect(parsed).toMatchObject({
+      evidence: { action: plan.a, goal: plan.g, confidence: 0.96 },
+      capabilities: { discussed: [plan.a], requestKind: "execute", confidence: 0.95 },
+      referencedHumanIds: ["noor"],
+    });
+  });
+
+  it("rejects mixed authority, undeclared arguments and unknown versions without salvaging identity", () => {
+    const valid = wire(executable(plans[0]));
+    for (const broken of [
+      { ...valid, e: { ...valid.e, r: "none" } },
+      { ...valid, e: { ...valid.e, d: ["web_search"] } },
+      { ...valid, c: { ...valid.c, r: "none", d: [], x: 1 } },
+      { ...valid, e: { ...valid.e, z: "Europe/Stockholm" } },
+      { ...valid, e: { ...valid.e, u: null } },
+      { ...valid, sv: 4 }, { ...valid, sv: undefined },
+      wire({ a: "none", r: "none", x: 1, cx: 1, g: "invented inactive content" }),
+    ]) expect(parseTurnAnalysisContent(JSON.stringify(broken), input())).toBeUndefined();
+  });
+
+  it("does not recover missing executable arguments from goals or defaults in v3", () => {
+    expect(parseTurnAnalysisContent(JSON.stringify(wire({ a: "web_search", r: "execute", x: 1, cx: 1, g: "Acme latest news", m: "news" })), input())).toBeUndefined();
+    expect(parseTurnAnalysisContent(JSON.stringify(wire({ a: "web_search", r: "execute", x: 1, cx: 1, g: "Acme latest news", q: "Acme latest news" })), input())).toBeUndefined();
+  });
+
+  it("retains unavailable and uncertain request metadata without executable authority", () => {
+    const limited = input({ availableCapabilities: ["local_datetime"] });
+    expect(parseTurnAnalysisContent(JSON.stringify(wire({ a: "none", r: "retry", d: ["web_search"], x: 1, cx: 0.99 })), limited))
+      .toMatchObject({ evidence: { action: "none" }, capabilities: { discussed: ["web_search"], requestKind: "retry", confidence: 0.99 } });
+    expect(parseTurnAnalysisContent(JSON.stringify(wire({ a: "none", r: "execute", d: ["local_datetime"], x: 0.4, cx: 0.74 })), limited))
+      .toMatchObject({ evidence: { action: "none" }, capabilities: { discussed: ["local_datetime"], requestKind: "execute", confidence: 0.74 } });
+    expect(parseTurnAnalysisContent(JSON.stringify(wire({ a: "none", r: "execute", d: ["local_datetime"], x: 0.4, cx: 0.75 })), limited)).toBeUndefined();
+    expect(parseTurnAnalysisContent(JSON.stringify(wire(executable(plans[0]))), limited)).toBeUndefined();
+  });
+
+  it("allows availability without research and preserves independently calibrated tentative plans", () => {
+    expect(parseTurnAnalysisContent(JSON.stringify(wire({ a: "none", r: "availability", d: ["web_search"], x: 1, cx: 1 })), input()))
+      .toMatchObject({ evidence: { action: "none" }, capabilities: { requestKind: "availability" } });
+    expect(parseTurnAnalysisContent(JSON.stringify(wire({ ...executable(plans[0]), x: 0.5, cx: 0.74 })), input()))
+      .toMatchObject({ evidence: { confidence: 0.5 }, capabilities: { confidence: 0.74 } });
+    expect(parseTurnAnalysisContent(JSON.stringify(wire({ ...executable(plans[0]), x: 0.74, cx: 0.75 })), input())).toBeUndefined();
+  });
+
+  it("does not promote identity, acoustics or list flags through plan confidence", () => {
+    const raw = wire(executable(plans[0]));
+    raw.c = { a: true, i: true, l: true, x: 0.2 };
+    const parsed = parseTurnAnalysisContent(JSON.stringify(raw), input());
+    expect(projectTrustedTurnAnalysis(parsed)).toMatchObject({ capabilityTrusted: true, asksAboutAiIdentity: false, asksAboutAcoustics: false, asksForList: false });
+    const noPlan = wire({ a: "none", r: "none", x: 0.2, cx: 0.2 });
+    noPlan.c = { a: true, i: true, l: true, x: 1 };
+    expect(projectTrustedTurnAnalysis(parseTurnAnalysisContent(JSON.stringify(noPlan), input())))
+      .toMatchObject({ capabilityTrusted: false, asksAboutAiIdentity: true, asksAboutAcoustics: true, asksForList: true });
+  });
+
+  it("binds conditional catalog arguments to the selected opaque source reference", () => {
+    const root = { a: "read_url", g: "Today's news on the supplied source", u: "root", m: "news" };
+    expect(parseTurnAnalysisContent(JSON.stringify(wire(executable(root))), input())).toBeDefined();
+    expect(parseTurnAnalysisContent(JSON.stringify(wire(executable({ ...root, u: "deep" }))), input())).toBeUndefined();
+    expect(parseTurnAnalysisContent(JSON.stringify(wire(executable({ ...root, u: "unknown" }))), input())).toBeUndefined();
+  });
+
+  it("shares catalog argument variants with the verifier without duplicating executable metadata", () => {
+    const turn = input();
+    const verifierInput = createEvidencePlanVerifierInput(turn, createFailClosedTurnAnalysis("invalid_output"));
+    const primary = (buildTurnAnalysisResponseFormat(turn) as any).json_schema.schema.properties.e.anyOf;
+    const verifier = (buildEvidencePlanVerifierResponseFormat(verifierInput) as any).json_schema.schema.properties.e.anyOf;
+    for (const variant of [...primary, ...verifier]) {
+      // Experimental order: classify requested act before selecting a provider.
+      // The semantic contract and local validation are otherwise identical.
+      expect(Object.keys(variant.properties).slice(0, 2)).toEqual(["r", "a"]);
+      expect(variant.required.slice(0, 2)).toEqual(["r", "a"]);
+    }
+    for (const action of TURN_CAPABILITIES) {
+      for (const variants of [primary, verifier]) {
+        const matches = variants.filter((variant: any) => variant.properties.a.enum[0] === action);
+        expect(matches.length).toBeGreaterThan(0);
+        for (const variant of matches) {
+          const actualArgs = Object.keys(variant.properties).filter((key) => !["a", "r", "g", "x", "cx"].includes(key));
+          expect(actualArgs.every((field) => (CAPABILITY_CATALOG[action].arguments.allowed as readonly string[]).includes(field))).toBe(true);
+          expect(variant.properties.d).toBeUndefined();
+          expect(variant.properties.r.enum).toEqual(["execute", "retry", "correct_limitation"]);
+        }
+      }
+    }
+    for (const plan of plans) {
+      expect(parseEvidencePlanVerifierContent(JSON.stringify({ sv: 3, t: "en", tx: 1, e: { ...plan, r: "retry", x: 0.95 } }), verifierInput))
+        .toMatchObject({ decision: "use_action", capabilities: { discussed: [plan.a], requestKind: "retry" } });
+    }
+    const none = parseEvidencePlanVerifierContent(JSON.stringify({ sv: 3, t: "en", tx: 1, e: { a: "none", r: "none", x: 1 } }), verifierInput);
+    expect(none).toMatchObject({ decision: "keep_none" });
+    expect(recoverTurnAnalysisAfterVerifiedNoEvidence(JSON.stringify(wire({ ...executable(plans[0]), r: "none" })), turn, none)).toBeUndefined();
+  });
+
+  it("supports atomic ordinary voice drafts without advertising text-only capabilities", () => {
+    const turn = input({ medium: "voice", humanCandidates: [], availableCapabilities: ["local_datetime"] });
+    const { f: _focus, r: _romance, ...raw } = wire();
+    raw.p.h = [];
+    const voice = { ...raw, d: { p: "mira", t: "I'm listening, go on." } };
+    expect(parseTurnAnalysisContent(JSON.stringify(voice), turn)).toBeDefined();
+    expect(parseVoiceTurnDraftContent(JSON.stringify(voice), turn)?.content).toBe("I'm listening, go on.");
+    for (const extra of [{ f: _focus }, { r: _romance }, { unexpected: "legacy field" }]) {
+      expect(parseTurnAnalysisContent(JSON.stringify({ ...voice, ...extra }), turn)).toBeUndefined();
+      expect(parseVoiceTurnDraftContent(JSON.stringify({ ...voice, ...extra }), turn)).toBeUndefined();
+    }
+    expect(parseVoiceTurnDraftContent(JSON.stringify({ ...voice, e: executable(plans[2]) }), turn)).toBeUndefined();
+    const actions = (buildTurnAnalysisResponseFormat(turn) as any).json_schema.schema.properties.e.anyOf.map((variant: any) => variant.properties.a.enum[0]);
+    expect([...new Set(actions)]).toEqual(["none", "local_datetime"]);
+  });
+
+  it("intentionally treats a confident first-turn atomic plan as one provider, while retaining uncertainty and context verification", () => {
+    const turn = input();
+    const parsed = parseTurnAnalysisContent(JSON.stringify(wire(executable(plans[0]))), turn)!;
+    expect(parsed.capabilities.discussed).toEqual(["web_search"]);
+    // v3 has a single provider decision, not a second independently generated
+    // discussed list. Legacy multi-provider replay still gets its old check.
+    expect(shouldVerifyEvidencePlan(turn, parsed)).toBe(false);
+    expect(shouldVerifyEvidencePlan(turn, {
+      ...parsed, capabilities: { ...parsed.capabilities, discussed: ["web_search", "weather_forecast"] },
+    })).toBe(true);
+    const tentative = parseTurnAnalysisContent(JSON.stringify(wire({ ...executable(plans[0]), x: 0.6, cx: 0.6 })), turn)!;
+    expect(shouldVerifyEvidencePlan(turn, tentative)).toBe(true);
+    expect(shouldVerifyEvidencePlan(input({ recentMessages: [{ id: "previous", authorId: "asker", authorName: "Alex", content: "Can you look up the announcement?" }] }), parsed)).toBe(true);
+  });
+});
