@@ -43,6 +43,12 @@ export interface ChannelRecallInput {
   maxMessages?: number;
   /** Structural conversation boundary, independent of language or message content. */
   episodeGapMs?: number;
+  /**
+   * Default retrieval keeps its relevance ranking. Cross-surface recall may
+   * instead require the latest anchor with an allowed witness in the same
+   * bounded window; neither presence elsewhere nor denser old rows qualify.
+   */
+  selectionPolicy?: "relevance" | "latest_witnessed";
 }
 
 export interface ChannelRecallResult {
@@ -262,16 +268,27 @@ const bestBoundedWindow = (
   scoredById: ReadonlyMap<string, ScoredRecord>,
   seedId: string,
   maxMessages: number,
+  requiredWitnessIds?: ReadonlySet<string>,
 ): SourceRecord[] => {
-  if (episode.length <= maxMessages) return [...episode];
+  const hasWitness = (window: readonly SourceRecord[]): boolean =>
+    requiredWitnessIds === undefined || witnessesFor(window.map((record) => record.message), requiredWitnessIds).length > 0;
+  if (episode.length <= maxMessages) return hasWitness(episode) ? [...episode] : [];
   const seedIndex = episode.findIndex((record) => record.message.id === seedId);
-  let bestStart = 0;
+  if (seedIndex < 0) return [];
+  let bestStart: number | undefined;
   let bestIdentityCount = -1;
   let bestScore = -1;
   let bestMatchCount = -1;
   let bestCenterDistance = Number.POSITIVE_INFINITY;
-  for (let start = 0; start + maxMessages <= episode.length; start += 1) {
+  // The opt-in policy must retain both the chosen anchor and a real witness.
+  // The original relevance policy deliberately keeps its existing candidates.
+  const firstStart = requiredWitnessIds === undefined ? 0 : Math.max(0, seedIndex - maxMessages + 1);
+  const lastStart = requiredWitnessIds === undefined
+    ? episode.length - maxMessages
+    : Math.min(seedIndex, episode.length - maxMessages);
+  for (let start = firstStart; start <= lastStart; start += 1) {
     const window = episode.slice(start, start + maxMessages);
+    if (!hasWitness(window)) continue;
     const matches = window.flatMap((record) => {
       const scored = scoredById.get(record.message.id);
       return scored ? [scored] : [];
@@ -291,7 +308,7 @@ const bestBoundedWindow = (
     bestMatchCount = matches.length;
     bestCenterDistance = centerDistance;
   }
-  return episode.slice(bestStart, bestStart + maxMessages);
+  return bestStart === undefined ? [] : episode.slice(bestStart, bestStart + maxMessages);
 };
 
 const witnessesFor = (
@@ -313,9 +330,42 @@ const witnessesFor = (
 };
 
 /**
- * Retrieves one bounded, exact public-history episode using only Unicode token
- * identity and corpus rarity. It does not infer intent or meaning and therefore
- * fails closed when the only overlap is common room vocabulary.
+ * Finds structural eligibility once, without rescanning an entire episode for
+ * every old anchor. Two rows can share a bounded window exactly when they are
+ * in the same contiguous episode and fewer than maxMessages rows apart.
+ */
+const witnessedAnchorIds = (
+  eligible: readonly SourceRecord[],
+  scoredById: ReadonlyMap<string, ScoredRecord>,
+  allowedPersonaIds: ReadonlySet<string>,
+  maxMessages: number,
+  episodeGapMs: number,
+): Set<string> => {
+  const anchors = new Set<string>();
+  let episodeStart = 0;
+  for (let end = 0; end < eligible.length; end += 1) {
+    const next = eligible[end + 1];
+    const current = eligible[end]!;
+    if (next && next.ordinal === current.ordinal + 1 && next.time - current.time <= episodeGapMs) continue;
+    for (let witnessIndex = episodeStart; witnessIndex <= end; witnessIndex += 1) {
+      if (witnessesFor([eligible[witnessIndex]!.message], allowedPersonaIds).length === 0) continue;
+      const first = Math.max(episodeStart, witnessIndex - maxMessages + 1);
+      const last = Math.min(end, witnessIndex + maxMessages - 1);
+      for (let index = first; index <= last; index += 1) {
+        const id = eligible[index]!.message.id;
+        if (scoredById.has(id)) anchors.add(id);
+      }
+    }
+    episodeStart = end + 1;
+  }
+  return anchors;
+};
+
+/**
+ * Retrieves one bounded, exact public-history episode. Trusted participant
+ * bindings use exact author IDs independently of query tokenization; unbound
+ * text retrieval uses Unicode token identity and corpus rarity. Neither route
+ * infers intent or meaning from display labels or room vocabulary.
  */
 export const recallChannelHistory = (input: ChannelRecallInput): ChannelRecallResult | undefined => {
   const triggerTime = Date.parse(input.trigger.createdAt);
@@ -323,25 +373,26 @@ export const recallChannelHistory = (input: ChannelRecallInput): ChannelRecallRe
   const notBefore = input.notBefore === undefined ? Number.NEGATIVE_INFINITY : Date.parse(input.notBefore);
   if (!Number.isFinite(notBefore) && input.notBefore !== undefined) return undefined;
   if (notBefore > triggerTime) return undefined;
-  const queryTokens = channelRecallTokens(input.query.slice(0, MAX_QUERY_CHARACTERS), MAX_QUERY_TOKENS);
-  if (queryTokens.length === 0) return undefined;
-  const { eligible } = sourceHistory(input, triggerTime, notBefore);
-  if (eligible.length === 0) return undefined;
-
   const participantSubjects = (input.participantSubjects ?? [])
     .filter((subject, index, subjects) =>
       Boolean(subject.id) && subjects.findIndex((candidate) => candidate.id === subject.id) === index
     )
     .slice(0, 2);
+  const queryTokens = channelRecallTokens(input.query.slice(0, MAX_QUERY_CHARACTERS), MAX_QUERY_TOKENS);
+  if (queryTokens.length === 0 && participantSubjects.length === 0) return undefined;
+  const { eligible } = sourceHistory(input, triggerTime, notBefore);
+  if (eligible.length === 0) return undefined;
+
   const scored = scoredHistory(eligible, queryTokens, participantSubjects);
   if (scored.length === 0) return undefined;
   const identityMatches = scored.filter((record) => record.identityMatch);
   if (participantSubjects.length > 0 && identityMatches.length === 0) return undefined;
   const seedPool = identityMatches.length > 0 ? identityMatches : scored;
-  const seed = [...seedPool].sort((left, right) =>
-    right.score - left.score || right.time - left.time || left.message.id.localeCompare(right.message.id)
-  )[0];
-  if (!seed) return undefined;
+  const latestWitnessed = input.selectionPolicy === "latest_witnessed";
+  const orderedSeeds = [...seedPool].sort((left, right) => latestWitnessed
+    ? right.time - left.time || left.message.id.localeCompare(right.message.id)
+    : right.score - left.score || right.time - left.time || left.message.id.localeCompare(right.message.id)
+  );
 
   const episodeGapMs = boundedInteger(
     input.episodeGapMs,
@@ -350,10 +401,18 @@ export const recallChannelHistory = (input: ChannelRecallInput): ChannelRecallRe
     MAX_EPISODE_GAP_MS,
   );
   const maxMessages = boundedInteger(input.maxMessages, DEFAULT_MAX_MESSAGES, 1, HARD_MAX_MESSAGES);
-  const episode = episodeAround(eligible, seed, episodeGapMs);
-  if (episode.length === 0) return undefined;
   const scoredById = new Map(scored.map((record) => [record.message.id, record]));
-  const window = bestBoundedWindow(episode, scoredById, seed.message.id, maxMessages);
+  const requiredWitnessIds = latestWitnessed ? asIdSet(input.allowedPersonaIds) : undefined;
+  const eligibleAnchorIds = requiredWitnessIds === undefined
+    ? undefined
+    : witnessedAnchorIds(eligible, scoredById, requiredWitnessIds, maxMessages, episodeGapMs);
+  const seed = eligibleAnchorIds === undefined
+    ? orderedSeeds[0]
+    : orderedSeeds.find((record) => eligibleAnchorIds.has(record.message.id));
+  if (!seed) return undefined;
+  const episode = episodeAround(eligible, seed, episodeGapMs);
+  const window = bestBoundedWindow(episode, scoredById, seed.message.id, maxMessages, requiredWitnessIds);
+  if (window.length === 0) return undefined;
   const messages = window.map((record) => record.message);
   const anchorMessageIds = messages
     .filter((message) => scoredById.has(message.id))

@@ -31,8 +31,12 @@ import { buildSocialMemoryPromptNote } from "./socialMemoryProjection.js";
 const MAX_EXISTING_LOOPS = 12;
 const MAX_EXISTING_ROMANTIC_BOUNDARIES = 48;
 const MAX_PROMPT_MEMORIES = 3;
+const MAX_PUBLIC_MEMORY_SUBJECTS = 50;
 const MAX_TRACKED_EPISODES = 512;
 const PROMPT_NOTE_CACHE_MS = 30_000;
+// A public visibility query includes only public events across channels. This
+// is an internal read selector, never an actual room or a persisted scope.
+const PUBLIC_RECOLLECTION_VISIBILITY = { kind: "public", channelId: "public-recollections" } as const;
 
 const EMPTY_RELATIONSHIP: RelationshipVector = {
   familiarity: 0,
@@ -294,6 +298,12 @@ export class SocialMemoryCoordinator {
   #tail: Promise<void> = Promise.resolve();
   #pendingCount = 0;
   #accepting = true;
+  #erasureRevision = 0;
+
+  /** Destructive erasure only; ordinary captures must not invalidate live replies. */
+  get erasureRevision(): number {
+    return this.#erasureRevision;
+  }
 
   constructor(
     model: SocialMemoryAnalyzer,
@@ -421,6 +431,7 @@ export class SocialMemoryCoordinator {
     if (!this.#accepting) return Promise.reject(new Error("social-memory coordinator is closed"));
 
     this.#forgettingActors.add(actor);
+    this.#erasureRevision += 1;
     this.#promptNotes.clear();
     this.#actorEpochs.set(actor, (this.#actorEpochs.get(actor) ?? 0) + 1);
     for (const [episodeId, actorIds] of this.#episodeActors) {
@@ -439,6 +450,10 @@ export class SocialMemoryCoordinator {
       // re-entrant callers cannot enqueue an episode in the middle of erasure.
       .then(() => this.#store.forgetActor(actor))
       .finally(() => {
+        // An erased event may also back another actor's note. Invalidate at
+        // completion as well as admission, including failed/overlapping
+        // erasures; no projection read during the barrier may outlive it.
+        this.#promptNotes.clear();
         this.#forgettingActors.delete(actor);
         if (this.#forgetByActor.get(actor) === operation) this.#forgetByActor.delete(actor);
       });
@@ -508,6 +523,9 @@ export class SocialMemoryCoordinator {
     currentScope: SocialMemoryScope,
     options: RelationshipBehaviorProjectionOptions = {},
   ): string | undefined {
+    // Event/provenance dependencies can include somebody other than this
+    // owner or subject. Keep the short erasure barrier closed for all reads.
+    if (this.#forgettingActors.size > 0) return undefined;
     const cacheKey = this.#promptNoteCacheKey(
       "directed",
       ownerId,
@@ -574,18 +592,40 @@ export class SocialMemoryCoordinator {
   }
 
   /**
-   * Supplies one resident's fallible recollection about an absent third human
-   * to a public scene. Unlike `promptNote`, this projection deliberately never
+   * Metadata-only discovery for semantic identity resolution after a public
+   * transcript has aged out. Private memories and aggregate relationships do
+   * not establish candidates, and discovery does not count as memory recall.
+   */
+  publicMemorySubjectIds(ownerId: string): string[] {
+    if (this.#forgettingActors.size > 0) return [];
+    const memories = this.#store.listMemories({
+      ownerId,
+      visibleInScope: PUBLIC_RECOLLECTION_VISIBILITY,
+      limit: MAX_PUBLIC_MEMORY_SUBJECTS,
+    });
+    return [...new Set(memories.flatMap((memory) => memory.subjectIds))]
+      .filter((subjectId) => !this.#forgettingActors.has(subjectId))
+      .slice(0, MAX_PUBLIC_MEMORY_SUBJECTS);
+  }
+
+  /**
+   * Supplies one resident's public recollections about a third party to a
+   * public scene or the resident's current DM. The destination never widens
+   * the source visibility: even the current DM is excluded from this note.
+   * Unlike `promptNote`, this projection deliberately never
    * reads the relationship edge: that edge aggregates private DM/voice
    * influence and therefore is not safe evidence about an absent person in a
-   * public room. Store-side visibility is applied before ranking and limiting.
+   * third-party conversation. Store-side visibility is applied before ranking
+   * and limiting, so private events cannot crowd out public recollections.
    */
   publicThirdPartyPromptNote(
     ownerId: string,
     subjectId: string,
-    currentScope: Extract<SocialMemoryScope, { kind: "public" }>,
+    currentScope: Extract<SocialMemoryScope, { kind: "public" | "dm" }>,
   ): string | undefined {
-    if (currentScope.kind !== "public") return undefined;
+    if (currentScope.kind !== "public" && currentScope.kind !== "dm") return undefined;
+    if (currentScope.kind === "dm" && !currentScope.participantIds.includes(ownerId)) return undefined;
+    if (this.#forgettingActors.size > 0) return undefined;
     const cacheKey = this.#promptNoteCacheKey("public-third-party", ownerId, subjectId, currentScope);
     const cached = this.#promptNotes.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.note;
@@ -594,10 +634,10 @@ export class SocialMemoryCoordinator {
     const visibleMemories = this.#store.listMemories({
       ownerId,
       subjectId,
-      visibleInScope: currentScope,
+      visibleInScope: PUBLIC_RECOLLECTION_VISIBILITY,
       limit: MAX_PROMPT_MEMORIES,
     });
-    const openLoop = this.#firstVisibleOpenLoop(ownerId, subjectId, currentScope);
+    const openLoop = this.#firstVisibleOpenLoop(ownerId, subjectId, PUBLIC_RECOLLECTION_VISIBILITY);
     if (visibleMemories.length === 0 && !openLoop) return undefined;
 
     const { note, memoryIds } = buildSocialMemoryPromptNote({

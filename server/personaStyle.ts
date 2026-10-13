@@ -362,7 +362,7 @@ const selfDirectedStyleNote = (
     .map((texture) => surfaceTextureNotes[texture]).join(" ");
   const avoid = style.avoidPhrases.map((phrase) => `“${phrase}”`).join(", ");
   return `Stable voice for ${persona.name}:
-- Length preference: usually ${style.typicalWords[0]}–${Math.min(style.typicalWords[1], style.hardMaxWords)} words and ${style.typicalSentences[0]}–${style.typicalSentences[1]} sentence(s), not a compulsory range or shape. Let the actual thought be shorter or occasionally longer; do not pad a reaction or compress a developed point merely to hit the usual range. Hard maximum ${style.hardMaxWords} words.
+- Length follows the contribution, not a word or sentence target. A small reaction may need only a fragment; an explanation, comparison or thought you care about may need several sentences or a compact paragraph. Keep your own voice at either length. Do not pad a reaction, compress away the useful part, or copy the length of preceding messages. Hard maximum ${style.hardMaxWords} words.
 - Casing/punctuation: ${casingNotes[style.casing]} ${punctuationNotes[style.punctuation]}
 - Emoji: ${emojiNote(style)} These are long-run tendencies, never a quota or a per-turn lottery.
 - Thought density: ${complexityNote(style.complexityAppetite)}

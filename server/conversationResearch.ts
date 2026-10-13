@@ -31,6 +31,7 @@ export const normalizeConversationResearchInput = (input: ConversationResearchIn
     phase: input.conversation.phase,
     rootMessageId: input.conversation.rootMessageId,
     messages: input.conversation.publishedTurns,
+    backgroundMessages: input.conversation.roomBackground,
   }),
 });
 
